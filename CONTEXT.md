@@ -70,6 +70,14 @@ _Avoid_: Created at, extracted at
 When a task should be done by. It is separate from the task's validity window.
 _Avoid_: Deadline, valid until
 
+**World time**:
+Calendar time. Validity windows, phase, due dates and state confidence run on it, because the world doesn't pause when the user stops talking.
+_Avoid_: Real time, wall-clock (outside the code)
+
+**Bank time**:
+The clock that strength runs on. It runs at full speed while a bank is in conversation and slows down when the bank is quiet.
+_Avoid_: Activity time, psychological time, turn time
+
 ## Change
 
 **Ended**:
@@ -122,6 +130,26 @@ _Avoid_: Duplicate, repeat, re-extraction
 The kind of access where the user says a memory is still right.
 _Avoid_: Verified, acknowledged
 
+**Recent use**:
+The part of strength that comes from recent accesses and fades with disuse. It starts over when a memory's validity window closes.
+_Avoid_: Retrieval strength, base level (outside the formula)
+
+**Lasting floor**:
+The part of strength built up by accesses on separate occasions. It never goes down, and a memory whose floor is above the recall threshold can't fade out.
+_Avoid_: Storage strength (outside the formula), permanence
+
+**Recall threshold**:
+The strength below which a memory is no longer injected automatically. Explicit recall can still find it.
+_Avoid_: Cutoff, expiry threshold
+
+**Faded out**:
+A memory whose strength is below the recall threshold. It still exists and can still be recalled when asked for.
+_Avoid_: Forgotten, expired, dormant, deleted
+
+**State confidence**:
+How likely a state still holds, which fades with its age at a rate set by its volatility. It only lowers ranking.
+_Avoid_: Freshness, staleness, window confidence (that's about the window's dates)
+
 ## Recall
 
 **Recall**:
@@ -131,6 +159,10 @@ _Avoid_: Search (for the whole operation), lookup, access
 **Injection**:
 Recalled memories placed automatically into the agent's prompt before a turn.
 _Avoid_: Prefetch (that's the Hermes hook), context stuffing
+
+**Mental model**:
+A document that an LLM writes and keeps up to date from memories, to answer a standing question such as "who is the user?".
+_Avoid_: Observation, reflection, summary, profile (a profile is one mental model)
 
 ## Sources and organisation
 
