@@ -109,12 +109,6 @@
           <option value="hybrid">Active days (a quiet day counts as a fraction)</option>
           <option value="turns">Conversation turns only</option>
         </select>
-        <label>Accesses inside a window that has closed</label>
-        <select id="closedRule">
-          <option value="drop">Don't count at all (TIM-85)</option>
-          <option value="floor">Don't count for recent use, but keep the lasting floor</option>
-          <option value="keep">Count as normal</option>
-        </select>
         <label>When a memory is replaced (reschedule, correction, refinement)</label>
         <select id="inherit">
           <option value="supersede">New one inherits the old one's accesses</option>
@@ -135,8 +129,8 @@
         <h2>The formula</h2>
         <p><b>strength = significance boost + max(recent use, lasting floor)</b></p>
         <p><b>Recent use</b> (ACT-R base level): ln Σ weight × age<sup>−fade</sup> over counted accesses. Each access fades at its own rate. An access made while the memory is already fresh fades faster (Pavlik &amp; Anderson spacing), so 15 uses in one day mostly wash out.</p>
-        <p><b>Lasting floor</b> (Bjork storage strength): grows with the number of accesses at least one day apart and never goes down. When the floor is above the threshold, the memory can no longer fade out of recall.</p>
-        <p><b>Closed windows:</b> once an event or ended state's window closes, the close counts as one synthetic access (the recency boost), which then fades normally.</p>
+        <p><b>Lasting floor</b> (Bjork storage strength): grows with the number of accesses at least three days apart and never goes down. When the floor is above the threshold, the memory can no longer fade out of recall.</p>
+        <p><b>Closed windows:</b> once an event or ended state's window closes, recent use restarts from one synthetic access (the recency boost), placed when the end became known. The lasting floor keeps every access, so something used on many separate occasions stays in history.</p>
         <p><b>Pinned</b> memories are held just above the threshold.</p>
       </div>
     </div>
@@ -162,9 +156,8 @@ const Strength = (() => {
     turnsPerDay: 10,  // "normal" conversation volume
     minAge: 0.01,     // ~15 minutes, avoids age 0
     dMax: 2,          // cap on per-access fading, so massed accesses fade fast but finitely
-    spacing: 1,       // effective days between accesses for them to count towards the floor
+    spacing: 3,       // effective days between accesses for them to count towards the floor
     clock: 'hybrid',
-    closedRule: 'drop',
     inherit: 'supersede',
     volatilityDays: { hours: 0.25, days: 2, weeks: 14, months: 60, years: 365 },
     recentlyPastDays: 7,
@@ -221,13 +214,13 @@ const Strength = (() => {
     const all = lineage(world, mem, p).filter(x => x.t <= now)
       .map(x => ({ ...x, w: x.kind === 'created' ? p.w.created : p.w[x.kind] }));
     const closed = mem.until != null && (mem.untilKnownAt ?? mem.created) <= now && now >= mem.until;
-    let recentList = all, floorList = all;
-    if (closed && p.closedRule !== 'keep') {
-      const after = all.filter(x => x.t > mem.until);
-      recentList = [{ t: mem.until, w: p.wEnd, kind: 'window closed' }, ...after];
-      floorList = p.closedRule === 'floor' ? all : after;
-    } else if (closed) {
-      recentList = [...all, { t: mem.until, w: p.wEnd, kind: 'window closed' }].sort((x, y) => x.t - y.t);
+    // The floor counts every access ever. A closed window resets recent use to one synthetic
+    // access, placed when the end became known (max of valid_until and untilKnownAt), plus anything after valid_until.
+    const floorList = all;
+    let recentList = all;
+    if (closed) {
+      const boostAt = Math.max(mem.until, mem.untilKnownAt ?? mem.created);
+      recentList = [{ t: boostAt, w: p.wEnd, kind: 'window closed' }, ...all.filter(x => x.t > mem.until)].sort((x, y) => x.t - y.t);
     }
     const folded = fold(recentList, E, p);
     let sum = 0;
@@ -342,7 +335,7 @@ const SCENARIOS = [
   },
   {
     name: 'Dentist',
-    text: 'An event: "Dentist on 10 Oct at 3pm", mentioned on day 0 for day 10 (significance 0.3). It gets used while it\'s upcoming. When the window closes, TIM-85 says those accesses stop counting, and a recency boost carries it through "how did it go?" the next day. After that it drifts into the long past. Try the closed-window rule options on the right.',
+    text: 'An event: "Dentist on 10 Oct at 3pm", mentioned on day 0 for day 10 (significance 0.3). It gets used while it\'s upcoming. When the window closes, recent use restarts from a recency boost that carries it through "how did it go?" the next day. Four uses in ten days are not spread out enough to build a lasting floor, so it then drifts out of recall.',
     setup: () => newWorld([mem('a', 'User has a dentist appointment on 10 Oct at 3pm', 'event', 0.3, 0.5, { from: 10.6, until: 10.7 })]),
     steps: [
       ['Used on days 3, 7 and 9', w => { for (const d of [3, 7, 9]) { w.now = d; access(w, 'a', 'used'); } }],
@@ -367,7 +360,7 @@ const SCENARIOS = [
   },
   {
     name: 'Moved city',
-    text: '"User lives in Berlin" is a state (volatility: years), used about every 10 days for 3 months. Then the user moves to Lisbon. Berlin is ended (it stays in history) and Lisbon is created. Under TIM-85\'s rule every Berlin access falls inside a window that has now closed. Is it right that three months of living there is left with only a recency boost?',
+    text: '"User lives in Berlin" is a state (volatility: years), used about every 10 days for 3 months. Then the user moves to Lisbon. Berlin is ended (it stays in history) and Lisbon is created. Recent use restarts when Berlin ends, but its ten spaced accesses keep a lasting floor, so it stays in history.',
     setup: () => newWorld([mem('a', 'User lives in Berlin', 'state', 0.4, 0.5, { volatility: 'years' })]),
     steps: [
       ['3 months, used every 10 days', w => { for (let i = 0; i < 9; i++) { advance(w, 10); access(w, 'a', 'used'); } }],
@@ -376,7 +369,6 @@ const SCENARIOS = [
         addMemory(w, mem('b', 'User lives in Lisbon', 'state', 0.4, at(w, w.now), { volatility: 'years' }));
       }],
       ['2 months later', w => advance(w, 60)],
-      ['Try "keep the lasting floor"', w => { P.closedRule = 'floor'; syncControls(); }],
     ],
   },
   {
@@ -396,13 +388,13 @@ let current = 0, stepIdx = 0;
 
 function loadScenario(i) {
   current = i; stepIdx = 0; selected = 0;
-  P = { ...structuredClone(Strength.defaults), clock: P.clock, closedRule: P.closedRule, inherit: P.inherit };
+  P = { ...structuredClone(Strength.defaults), clock: P.clock, inherit: P.inherit };
   W = SCENARIOS[i].setup(); lastChange = 'Scenario started';
   syncControls(); render();
 }
 
 function syncControls() {
-  for (const k of ['clock', 'closedRule', 'inherit']) document.getElementById(k).value = P[k];
+  for (const k of ['clock', 'inherit']) document.getElementById(k).value = P[k];
   for (const k of ['a', 'c', 'S', 'tau', 'n0', 'g', 'wEnd', 'h', 'turnsPerDay']) document.getElementById('p_' + k).value = P[k];
   for (const k of ['used', 'mentioned_again', 'confirmed']) document.getElementById('p_w_' + k).value = P.w[k];
 }
@@ -453,7 +445,7 @@ function render() {
     if (r.hidden) { html += `<tr><td>${sw}${m.label}</td><td><span class="pill hidden">retracted, hidden</span></td><td></td><td></td></tr>`; return; }
     html += `<tr><td>${sw}${m.label}${r.pinned ? ' 📌' : ''}</td>
       <td><b>${fmt(r.strength)}</b> <span class="pill ${r.inRecall ? 'in' : 'out'}">${r.inRecall ? 'in recall' : 'faded out'}</span></td>
-      <td class="small">significance +${r.boost.toFixed(2)}<br>recent use ${fmt(r.recent)}<br>lasting floor ${fmt(r.floor)} (${r.spaced} spaced)<br>${r.counted} of ${r.total} accesses counted</td>
+      <td class="small">significance +${r.boost.toFixed(2)}<br>recent use ${fmt(r.recent)}<br>lasting floor ${fmt(r.floor)} (${r.spaced} spaced)<br>recent use counts ${r.counted} of ${r.total} accesses</td>
       <td class="small">${r.phase ?? ''}${r.confidence != null ? `<br>confidence ${r.confidence.toFixed(2)}` : ''}</td></tr>`;
   });
   document.getElementById('stateTable').innerHTML = html;
@@ -523,7 +515,7 @@ document.querySelectorAll('[data-act]').forEach(b => b.onclick = () => {
 });
 document.querySelectorAll('[data-adv]').forEach(b => b.onclick = () => { advance(W, +b.dataset.adv); lastChange = b.textContent; render(); });
 document.querySelectorAll('[data-hol]').forEach(b => b.onclick = () => { holiday(W, +b.dataset.hol); lastChange = b.textContent; render(); });
-for (const k of ['clock', 'closedRule', 'inherit']) document.getElementById(k).onchange = e => { P[k] = e.target.value; lastChange = 'Rule changed'; render(); };
+for (const k of ['clock', 'inherit']) document.getElementById(k).onchange = e => { P[k] = e.target.value; lastChange = 'Rule changed'; render(); };
 for (const k of ['a', 'c', 'S', 'tau', 'n0', 'g', 'wEnd', 'h', 'turnsPerDay']) document.getElementById('p_' + k).onchange = e => { P[k] = +e.target.value; lastChange = 'Knob changed'; render(); };
 for (const k of ['used', 'mentioned_again', 'confirmed']) document.getElementById('p_w_' + k).onchange = e => { P.w[k] = +e.target.value; lastChange = 'Weight changed'; render(); };
 
