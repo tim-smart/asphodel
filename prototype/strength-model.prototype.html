@@ -159,7 +159,8 @@ const Strength = (() => {
     spacing: 3,       // wall-clock days between accesses for them to count towards the floor
     clock: 'hybrid',
     inherit: 'supersede',
-    volatilityDays: { hours: 0.25, days: 2, weeks: 14, months: 60, years: 365 },
+    volatilityDays: { hours: 0.125, days: 3, weeks: 21, months: 91, years: 1826 }, // T: confidence 0.5 at 3 units (years: 5)
+    confK: 2,         // log-logistic shape: flat while young, 1/t² tail
     recentlyPastDays: 7,
   };
 
@@ -243,7 +244,7 @@ const Strength = (() => {
     if (mem.kind === 'state' && mem.volatility) {
       const resets = all.filter(x => !x.inherited && (x.kind === 'mentioned_again' || x.kind === 'confirmed')).map(x => x.t);
       const anchor = Math.max(mem.created, ...resets);
-      confidence = 1 / (1 + (now - anchor) / p.volatilityDays[mem.volatility]); // wall-clock: truth goes stale in real time
+      confidence = 1 / (1 + Math.pow((now - anchor) / p.volatilityDays[mem.volatility], p.confK)); // wall-clock: truth goes stale in real time
     }
 
     return {
