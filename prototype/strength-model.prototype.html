@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PROTOTYPE — Asphodel strength curves</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --accent: #6b4fbb; --ink: #1d1d22; --muted: #6b6b76; --line: #e4e4ea; --bg: #fafafc; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); background: var(--bg); margin: 0; }
+  main { max-width: 1180px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  p { margin: 0 0 8px; }
+  .banner { background: #fff4d6; border: 1px solid #f0d78a; padding: 6px 10px; border-radius: 6px; font-size: 12px; margin-bottom: 12px; display: inline-block; }
+  .intro { color: var(--muted); max-width: 900px; margin-bottom: 16px; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: 1fr 340px; gap: 16px; align-items: start; }
+  button { font: inherit; border: 1px solid var(--line); background: #fff; border-radius: 6px; padding: 5px 10px; cursor: pointer; margin: 0 6px 6px 0; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.done { opacity: .45; }
+  button:disabled { cursor: default; opacity: .35; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
+  .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; margin: 0; padding: 6px 10px; }
+  .tabs button.active { border-bottom-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .steps { display: flex; flex-direction: column; align-items: flex-start; }
+  .steps button { text-align: left; }
+  .now { font-size: 18px; font-weight: 600; }
+  .changed { color: var(--accent); font-size: 12px; min-height: 18px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  td, th { padding: 4px 6px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+  .pill { display: inline-block; padding: 0 6px; border-radius: 8px; font-size: 11px; }
+  .in { background: #e3f5e6; color: #1e6b2c; } .out { background: #f5e3e3; color: #8a2323; } .hidden { background: #eee; color: #555; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-top: 6px; }
+  select, input[type=number] { font: inherit; padding: 3px 4px; width: 100%; }
+  input[type=range] { width: 100%; }
+  .row { display: flex; gap: 8px; } .row > * { flex: 1; }
+  .small { font-size: 12px; color: var(--muted); }
+  svg text { font: 11px system-ui, sans-serif; fill: var(--muted); }
+  details summary { cursor: pointer; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <div class="banner">PROTOTYPE, throwaway. Answers one question for the ticket "Strength model: decay, reinforcement and significance" (TIM-91).</div>
+  <h1>How does a memory's strength rise and fade?</h1>
+  <p class="intro">
+    Each line is one memory. Its <b>strength</b> is worked out from scratch at every moment from three things: the log of times it was
+    used or mentioned (<b>accesses</b>), its <b>significance</b>, and the clock. Above the dashed <b>recall threshold</b> the memory can be recalled.
+    Below it, the memory has faded out of recall. The solid line is the past and the faint line is the future if nothing else happens.
+    The question: does this formula behave the way you'd expect memory to behave, and are the defaults sensible?
+  </p>
+
+  <div class="grid">
+    <div>
+      <div class="card">
+        <div class="tabs" id="tabs"></div>
+        <p id="scenarioText"></p>
+        <div class="steps" id="steps"></div>
+      </div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <div><span class="now" id="nowLabel"></span> <span class="changed" id="changed"></span></div>
+          <div class="small">Show <select id="horizon" style="width:auto"><option value="90">3 months</option><option value="365" selected>1 year</option><option value="730">2 years</option></select></div>
+        </div>
+        <svg id="chart" width="780" height="330"></svg>
+        <div class="small">Shaded bands: grey = days with no conversation (holiday), purple = the selected memory's validity window. Ticks under the line: accesses (circle = used, square = mentioned again, diamond = confirmed, bar = created).</div>
+        <svg id="conf" width="780" height="90"></svg>
+        <div class="small">Confidence for states (0 to 1). Only lowers ranking and never removes anything. Only mentioning again or confirming resets it, not the assistant using it.</div>
+      </div>
+      <div class="card">
+        <h2>Right now</h2>
+        <table id="stateTable"></table>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>Free play</h2>
+        <label>Memory</label>
+        <select id="memSel"></select>
+        <div style="margin-top:8px">
+          <button data-act="used">Assistant used it</button>
+          <button data-act="mentioned_again">User mentioned it again</button>
+          <button data-act="confirmed">User confirmed it</button>
+          <button data-act="chatty">Chatty day: used in 15 turns</button>
+          <button data-act="pin">Pin / unpin</button>
+          <button data-act="end">End it now</button>
+        </div>
+        <label>Significance of this memory: <b id="sigVal"></b></label>
+        <input type="range" id="sig" min="0" max="1" step="0.05">
+        <div style="margin-top:8px">
+          <button data-adv="1">+1 day</button>
+          <button data-adv="7">+1 week</button>
+          <button data-adv="30">+1 month</button>
+          <button data-adv="90">+3 months</button>
+          <button data-hol="21">Holiday: 3 weeks with no conversation</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Rules being tested</h2>
+        <label>Clock: what counts as time passing</label>
+        <select id="clock">
+          <option value="wall">Calendar days</option>
+          <option value="hybrid">Active days (a quiet day counts as a fraction)</option>
+          <option value="turns">Conversation turns only</option>
+        </select>
+        <label>Accesses inside a window that has closed</label>
+        <select id="closedRule">
+          <option value="drop">Don't count at all (TIM-85)</option>
+          <option value="floor">Don't count for recent use, but keep the lasting floor</option>
+          <option value="keep">Count as normal</option>
+        </select>
+        <label>When a memory is replaced (reschedule, correction, refinement)</label>
+        <select id="inherit">
+          <option value="supersede">New one inherits the old one's accesses</option>
+          <option value="none">New one starts fresh</option>
+        </select>
+        <details style="margin-top:10px">
+          <summary>Formula knobs</summary>
+          <div class="row"><div><label>Base fading rate</label><input type="number" step="0.05" id="p_a"></div><div><label>Extra fading when already fresh</label><input type="number" step="0.05" id="p_c"></div></div>
+          <div class="row"><div><label>Significance boost at 1.0</label><input type="number" step="0.25" id="p_S"></div><div><label>Recall threshold</label><input type="number" step="0.1" id="p_tau"></div></div>
+          <div class="row"><div><label>Floor start</label><input type="number" step="0.25" id="p_f0"></div><div><label>Floor growth</label><input type="number" step="0.1" id="p_g"></div></div>
+          <div class="row"><div><label>Weight: used</label><input type="number" step="0.25" id="p_w_used"></div><div><label>Weight: mentioned again</label><input type="number" step="0.25" id="p_w_mentioned_again"></div></div>
+          <div class="row"><div><label>Weight: confirmed</label><input type="number" step="0.25" id="p_w_confirmed"></div><div><label>Recency boost when a window closes</label><input type="number" step="0.25" id="p_wEnd"></div></div>
+          <div class="row"><div><label>A quiet day counts as</label><input type="number" step="0.05" id="p_h"></div><div><label>Turns in a normal day</label><input type="number" step="1" id="p_turnsPerDay"></div></div>
+        </details>
+      </div>
+
+      <div class="card small">
+        <h2>The formula</h2>
+        <p><b>strength = significance boost + max(recent use, lasting floor)</b></p>
+        <p><b>Recent use</b> (ACT-R base level): ln Σ weight × age<sup>−fade</sup> over counted accesses. Each access fades at its own rate. An access made while the memory is already fresh fades faster (Pavlik &amp; Anderson spacing), so 15 uses in one day mostly wash out.</p>
+        <p><b>Lasting floor</b> (Bjork storage strength): grows with the number of accesses at least one day apart and never goes down. When the floor is above the threshold, the memory can no longer fade out of recall.</p>
+        <p><b>Closed windows:</b> once an event or ended state's window closes, the close counts as one synthetic access (the recency boost), which then fades normally.</p>
+        <p><b>Pinned</b> memories are held just above the threshold.</p>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+/* ============================================================
+ * Strength model — the pure, liftable part.
+ * No DOM in here. Times are in calendar days (floats).
+ * ============================================================ */
+const Strength = (() => {
+  const defaults = {
+    a: 0.35,          // base fading exponent (per-access decay d = a + c·e^m)
+    c: 0.2,           // extra fading when accessed while already fresh
+    S: 2.0,           // significance boost at significance 1.0 (β = S × significance)
+    tau: -0.7,        // recall threshold
+    f0: -3.0,         // lasting floor with one spaced access
+    g: 0.8,           // floor growth per ln(spaced accesses)
+    w: { created: 1, used: 1, mentioned_again: 1.5, confirmed: 2 },
+    wEnd: 1,          // weight of the synthetic access when a window closes
+    h: 0.1,           // hybrid clock: a quiet day counts as this many days
+    turnsPerDay: 10,  // "normal" conversation volume
+    minAge: 0.01,     // ~15 minutes, avoids age 0
+    dMax: 2,          // cap on per-access fading, so massed accesses fade fast but finitely
+    spacing: 1,       // effective days between accesses for them to count towards the floor
+    clock: 'hybrid',
+    closedRule: 'drop',
+    inherit: 'supersede',
+    volatilityDays: { hours: 0.25, days: 2, weeks: 14, months: 60, years: 365 },
+    recentlyPastDays: 7,
+  };
+
+  // Effective clock. world.turns[day] = turns that day (undefined → normal).
+  function clockRate(world, day, p) {
+    const t = world.turns[day] ?? p.turnsPerDay;
+    if (p.clock === 'wall') return 1;
+    if (p.clock === 'turns') return t / p.turnsPerDay;
+    return t > 0 ? 1 : p.h; // hybrid
+  }
+  function makeClock(world, p, horizon) {
+    const prefix = [0];
+    for (let d = 0; d < horizon + 2; d++) prefix.push(prefix[d] + clockRate(world, d, p));
+    return t => {
+      const d = Math.max(0, Math.floor(t));
+      if (d >= prefix.length - 1) return prefix[prefix.length - 1];
+      return prefix[d] + (t - d) * (prefix[d + 1] - prefix[d]);
+    };
+  }
+
+  function lineage(world, mem, p) {
+    // accesses a memory counts: its own, plus its predecessors' if inheriting.
+    let list = world.accesses.filter(x => x.mem === mem.id);
+    if (p.inherit === 'supersede' && mem.predecessor) {
+      const pred = world.memories.find(m => m.id === mem.predecessor);
+      if (pred) list = list.concat(lineage(world, pred, p).map(x => ({ ...x, inherited: true })));
+    }
+    return list.sort((x, y) => x.t - y.t);
+  }
+
+  // Pavlik fold: each access gets its own decay from the activation just before it.
+  function fold(list, E, p) {
+    const out = [];
+    for (const x of list) {
+      let sum = 0;
+      for (const y of out) sum += y.w * Math.pow(Math.max(p.minAge, E(x.t) - E(y.t)), -y.d);
+      const m = sum > 0 ? Math.log(sum) : -Infinity;
+      out.push({ t: x.t, w: x.w, d: Math.min(p.dMax, p.a + p.c * Math.exp(m)) });
+    }
+    return out;
+  }
+  function spacedCount(list, E, p) {
+    let n = 0, last = -Infinity;
+    for (const x of list) if (E(x.t) - last >= p.spacing) { n++; last = E(x.t); }
+    return n;
+  }
+
+  // Everything about one memory at time `now`.
+  function evaluate(world, mem, now, E, p) {
+    if (now < mem.created) return null;
+    if (mem.retractedAt != null && now >= mem.retractedAt) return { hidden: true };
+    const all = lineage(world, mem, p).filter(x => x.t <= now)
+      .map(x => ({ ...x, w: x.kind === 'created' ? p.w.created : p.w[x.kind] }));
+    const closed = mem.until != null && (mem.untilKnownAt ?? mem.created) <= now && now >= mem.until;
+    let recentList = all, floorList = all;
+    if (closed && p.closedRule !== 'keep') {
+      const after = all.filter(x => x.t > mem.until);
+      recentList = [{ t: mem.until, w: p.wEnd, kind: 'window closed' }, ...after];
+      floorList = p.closedRule === 'floor' ? all : after;
+    } else if (closed) {
+      recentList = [...all, { t: mem.until, w: p.wEnd, kind: 'window closed' }].sort((x, y) => x.t - y.t);
+    }
+    const folded = fold(recentList, E, p);
+    let sum = 0;
+    for (const y of folded) sum += y.w * Math.pow(Math.max(p.minAge, E(now) - E(y.t)), -y.d);
+    const recent = sum > 0 ? Math.log(sum) : -Infinity;
+    const n = spacedCount(floorList, E, p);
+    const floor = n > 0 ? p.f0 + p.g * Math.log(n) : -Infinity;
+    const boost = p.S * mem.significance;
+    const pinned = mem.pinnedAt != null && mem.pinnedAt <= now;
+    let strength = boost + Math.max(recent, floor);
+    if (pinned) strength = Math.max(strength, p.tau + 0.5);
+
+    let phase = null;
+    if (mem.until != null && (mem.untilKnownAt ?? mem.created) <= now) {
+      if (now < mem.until) phase = mem.from != null && now < mem.from ? 'upcoming' : 'current';
+      else phase = now - mem.until < p.recentlyPastDays ? 'recently past' : 'long past';
+    } else if (mem.from != null && now < mem.from) phase = 'upcoming';
+
+    let confidence = null;
+    if (mem.kind === 'state' && mem.volatility) {
+      const resets = all.filter(x => !x.inherited && (x.kind === 'mentioned_again' || x.kind === 'confirmed')).map(x => x.t);
+      const anchor = Math.max(mem.created, ...resets);
+      confidence = 1 / (1 + (now - anchor) / p.volatilityDays[mem.volatility]); // wall-clock: truth goes stale in real time
+    }
+
+    return {
+      strength, recent, floor, boost, pinned, closed, phase, confidence,
+      inRecall: strength >= p.tau,
+      counted: recentList.filter(x => x.kind !== 'window closed').length,
+      total: all.length, spaced: n,
+    };
+  }
+
+  return { defaults, makeClock, evaluate };
+})();
+
+/* ============================================================
+ * Page shell — throwaway.
+ * ============================================================ */
+const COLORS = ['#6b4fbb', '#d9730d', '#0f7b6c', '#c4314b', '#2f6fd6', '#8a6d00'];
+let P = structuredClone(Strength.defaults);
+let W, selected = 0, lastChange = '';
+
+function mem(id, label, kind, significance, created, extra = {}) {
+  return { id, label, kind, significance, created, until: null, from: null, predecessor: null, retractedAt: null, pinnedAt: null, volatility: null, ...extra };
+}
+function newWorld(memories, now = 0) {
+  const w = { now, turns: {}, memories, accesses: [] };
+  for (const m of memories) w.accesses.push({ mem: m.id, t: m.created, kind: 'created' });
+  return w;
+}
+const at = (w, day) => day + 0.5; // accesses happen mid-day
+function access(w, id, kind, t = at(w, w.now)) { w.accesses.push({ mem: id, t, kind }); }
+function advance(w, days) { w.now += days; }
+function holiday(w, days) { for (let d = Math.floor(w.now) + 1; d <= Math.floor(w.now) + days; d++) w.turns[d] = 0; w.now += days + 1; }
+function addMemory(w, m) { w.memories.push(m); w.accesses.push({ mem: m.id, t: m.created, kind: 'created' }); }
+
+/* ---------- Scenarios ---------- */
+const SCENARIOS = [
+  {
+    name: 'Significance',
+    text: 'Three facts, each mentioned once on day 0 and never again. They differ only in significance. Watch how long each stays above the threshold. Significance is an offset on a power-law curve, so a small difference in significance becomes a large difference in lifetime.',
+    setup: () => newWorld([
+      mem('a', 'Sam prefers tabs over spaces (0.1)', 'fact', 0.1, 0.5),
+      mem('b', 'User is allergic to penicillin (0.5)', 'fact', 0.5, 0.5),
+      mem('c', "User's daughter is called Mia (0.9)", 'fact', 0.9, 0.5),
+    ]),
+    steps: [
+      ['Wait a week', w => advance(w, 7)],
+      ['Wait a month', w => advance(w, 23)],
+      ['Wait 3 months', w => advance(w, 60)],
+      ['Wait a year', w => advance(w, 275)],
+    ],
+  },
+  {
+    name: 'Use it or lose it',
+    text: 'Two ordinary facts (significance 0.3) learned on the same day. The assistant uses one every week or so for two months. The other is never used again. Watch the lasting floor build under the one that gets used. Once the floor clears the threshold, that memory can never fade out.',
+    setup: () => newWorld([
+      mem('a', 'User deploys with nix (used weekly)', 'fact', 0.3, 0.5),
+      mem('b', 'User once tried Bazel (never used)', 'fact', 0.3, 0.5),
+    ]),
+    steps: [
+      ['Weeks 1–4: used once a week', w => { for (let i = 1; i <= 4; i++) { advance(w, 7); access(w, 'a', 'used'); } }],
+      ['Weeks 5–8: used once a week', w => { for (let i = 1; i <= 4; i++) { advance(w, 7); access(w, 'a', 'used'); } }],
+      ['Weeks 9–12: used once a week', w => { for (let i = 1; i <= 4; i++) { advance(w, 7); access(w, 'a', 'used'); } }],
+      ['Then silence for 6 months', w => advance(w, 180)],
+    ],
+  },
+  {
+    name: 'Massed vs spaced',
+    text: 'This is the injection feedback loop. Memory A gets injected and used in 15 turns on one busy day. Memory B is used 5 times, a week apart. Both have significance 0.3. A spikes hard, but most of that fades within days, because accesses made while a memory is already fresh fade faster. Only one access per turn counts, so a loop can add at most one access per turn.',
+    setup: () => newWorld([
+      mem('a', 'A: used 15 times in one day', 'fact', 0.3, 0.5),
+      mem('b', 'B: used 5 times, a week apart', 'fact', 0.3, 0.5),
+    ]),
+    steps: [
+      ['Day 1: A used in 15 turns', w => { advance(w, 1); for (let i = 0; i < 15; i++) access(w, 'a', 'used', w.now + 0.3 + i * 0.03); }],
+      ['Weeks 1–5: B used weekly', w => { for (let i = 0; i < 5; i++) { access(w, 'b', 'used'); advance(w, 7); } }],
+      ['Wait 3 months', w => advance(w, 90)],
+    ],
+  },
+  {
+    name: 'Holiday',
+    text: 'A fact (significance 0.1) that was used once, then a 3-week holiday with no conversation. First run it on calendar days, then switch the clock rule on the right to "Active days" or "Conversation turns only" and compare. Does coming back from a holiday feel like coming back to an amnesiac assistant?',
+    setup: () => { P.clock = 'wall'; syncControls(); return newWorld([mem('a', 'User is refactoring the billing module', 'fact', 0.1, 0.5)]); },
+    steps: [
+      ['Used on day 4', w => { advance(w, 4); access(w, 'a', 'used'); }],
+      ['3 weeks of holiday', w => holiday(w, 21)],
+      ['Back for a week', w => advance(w, 7)],
+      ['Switch clock to "Active days"', w => { P.clock = 'hybrid'; syncControls(); }],
+    ],
+  },
+  {
+    name: 'Dentist',
+    text: 'An event: "Dentist on 10 Oct at 3pm", mentioned on day 0 for day 10 (significance 0.3). It gets used while it\'s upcoming. When the window closes, TIM-85 says those accesses stop counting, and a recency boost carries it through "how did it go?" the next day. After that it drifts into the long past. Try the closed-window rule options on the right.',
+    setup: () => newWorld([mem('a', 'User has a dentist appointment on 10 Oct at 3pm', 'event', 0.3, 0.5, { from: 10.6, until: 10.7 })]),
+    steps: [
+      ['Used on days 3, 7 and 9', w => { for (const d of [3, 7, 9]) { w.now = d; access(w, 'a', 'used'); } }],
+      ['Appointment passes (day 11)', w => { w.now = 11; }],
+      ['"How did the dentist go?" (used)', w => { access(w, 'a', 'used'); }],
+      ['A month later', w => advance(w, 30)],
+    ],
+  },
+  {
+    name: 'Reschedule',
+    text: 'The appointment for day 14 has been used a few times. On day 8 the user moves it to day 20. The old memory is retracted (hidden) and a new one takes its place. Should the new one start weak, or inherit the old one\'s history? Switch "When a memory is replaced" on the right to compare.',
+    setup: () => newWorld([mem('a', 'Dentist on 14 Oct (old)', 'event', 0.3, 0.5, { from: 14.6, until: 14.7 })]),
+    steps: [
+      ['Used on days 2, 4 and 6', w => { for (const d of [2, 4, 6]) { w.now = d; access(w, 'a', 'used'); } }],
+      ['Day 8: user reschedules to 20 Oct', w => {
+        w.now = 8; w.memories[0].retractedAt = at(w, 8);
+        addMemory(w, mem('b', 'Dentist on 20 Oct (new)', 'event', 0.3, at(w, 8), { from: 20.6, until: 20.7, predecessor: 'a' }));
+      }],
+      ['Day 12', w => { w.now = 12; }],
+      ['Appointment passes', w => { w.now = 22; }],
+    ],
+  },
+  {
+    name: 'Moved city',
+    text: '"User lives in Berlin" is a state (volatility: years), used about every 10 days for 3 months. Then the user moves to Lisbon. Berlin is ended (it stays in history) and Lisbon is created. Under TIM-85\'s rule every Berlin access falls inside a window that has now closed. Is it right that three months of living there is left with only a recency boost?',
+    setup: () => newWorld([mem('a', 'User lives in Berlin', 'state', 0.4, 0.5, { volatility: 'years' })]),
+    steps: [
+      ['3 months, used every 10 days', w => { for (let i = 0; i < 9; i++) { advance(w, 10); access(w, 'a', 'used'); } }],
+      ['User: "I just moved to Lisbon"', w => {
+        advance(w, 1); const m = w.memories[0]; m.until = at(w, w.now) - 0.1; m.untilKnownAt = at(w, w.now);
+        addMemory(w, mem('b', 'User lives in Lisbon', 'state', 0.4, at(w, w.now), { volatility: 'years' }));
+      }],
+      ['2 months later', w => advance(w, 60)],
+      ['Try "keep the lasting floor"', w => { P.closedRule = 'floor'; syncControls(); }],
+    ],
+  },
+  {
+    name: 'Stale state',
+    text: '"User is working on the Q3 report" (volatility: weeks). The assistant keeps using it, which keeps its strength up, but that\'s no evidence it\'s still true, so confidence keeps fading (bottom chart). When the user mentions it again, confidence resets.',
+    setup: () => newWorld([mem('a', 'User is working on the Q3 report', 'state', 0.3, 0.5, { volatility: 'weeks' })]),
+    steps: [
+      ['Used every 3 days for a month', w => { for (let i = 0; i < 10; i++) { advance(w, 3); access(w, 'a', 'used'); } }],
+      ['User mentions the report again', w => access(w, 'a', 'mentioned_again')],
+      ['Two quiet weeks', w => advance(w, 14)],
+    ],
+  },
+];
+
+/* ---------- Rendering ---------- */
+let current = 0, stepIdx = 0;
+
+function loadScenario(i) {
+  current = i; stepIdx = 0; selected = 0;
+  P = { ...structuredClone(Strength.defaults), clock: P.clock, closedRule: P.closedRule, inherit: P.inherit };
+  W = SCENARIOS[i].setup(); lastChange = 'Scenario started';
+  syncControls(); render();
+}
+
+function syncControls() {
+  for (const k of ['clock', 'closedRule', 'inherit']) document.getElementById(k).value = P[k];
+  for (const k of ['a', 'c', 'S', 'tau', 'f0', 'g', 'wEnd', 'h', 'turnsPerDay']) document.getElementById('p_' + k).value = P[k];
+  for (const k of ['used', 'mentioned_again', 'confirmed']) document.getElementById('p_w_' + k).value = P.w[k];
+}
+
+function renderTabs() {
+  const el = document.getElementById('tabs'); el.innerHTML = '';
+  SCENARIOS.forEach((s, i) => {
+    const b = document.createElement('button'); b.textContent = s.name; if (i === current) b.className = 'active';
+    b.onclick = () => loadScenario(i); el.appendChild(b);
+  });
+  document.getElementById('scenarioText').textContent = SCENARIOS[current].text;
+  const st = document.getElementById('steps'); st.innerHTML = '';
+  SCENARIOS[current].steps.forEach(([label, fn], i) => {
+    const b = document.createElement('button');
+    b.textContent = `${i + 1}. ${label}`;
+    b.className = i < stepIdx ? 'done' : i === stepIdx ? 'primary' : '';
+    b.disabled = i !== stepIdx;
+    b.onclick = () => { fn(W); stepIdx++; lastChange = label; render(); };
+    st.appendChild(b);
+  });
+  const r = document.createElement('button'); r.textContent = 'Restart scenario'; r.onclick = () => loadScenario(current); st.appendChild(r);
+}
+
+function fmt(x) { return x === -Infinity ? '—' : x.toFixed(2); }
+
+function render() {
+  renderTabs();
+  const horizon = +document.getElementById('horizon').value;
+  const E = Strength.makeClock(W, P, Math.max(horizon, Math.ceil(W.now) + 2));
+  document.getElementById('nowLabel').textContent = `Day ${Math.floor(W.now)}`;
+  document.getElementById('changed').textContent = lastChange ? '← ' + lastChange : '';
+
+  const sel = document.getElementById('memSel'); sel.innerHTML = '';
+  W.memories.forEach((m, i) => { const o = document.createElement('option'); o.value = i; o.textContent = m.label; sel.appendChild(o); });
+  sel.value = selected;
+  const sm = W.memories[selected];
+  document.getElementById('sig').value = sm.significance;
+  document.getElementById('sigVal').textContent = sm.significance.toFixed(2);
+
+  drawChart(E, horizon);
+
+  const now = at(W, W.now);
+  let html = '<tr><th>Memory</th><th>Strength</th><th>Made of</th><th>Phase / confidence</th></tr>';
+  W.memories.forEach((m, i) => {
+    const r = Strength.evaluate(W, m, now, E, P);
+    const sw = `<span class="swatch" style="background:${COLORS[i % COLORS.length]}"></span>`;
+    if (!r) return;
+    if (r.hidden) { html += `<tr><td>${sw}${m.label}</td><td><span class="pill hidden">retracted, hidden</span></td><td></td><td></td></tr>`; return; }
+    html += `<tr><td>${sw}${m.label}${r.pinned ? ' 📌' : ''}</td>
+      <td><b>${fmt(r.strength)}</b> <span class="pill ${r.inRecall ? 'in' : 'out'}">${r.inRecall ? 'in recall' : 'faded out'}</span></td>
+      <td class="small">significance +${r.boost.toFixed(2)}<br>recent use ${fmt(r.recent)}<br>lasting floor ${fmt(r.floor)} (${r.spaced} spaced)<br>${r.counted} of ${r.total} accesses counted</td>
+      <td class="small">${r.phase ?? ''}${r.confidence != null ? `<br>confidence ${r.confidence.toFixed(2)}` : ''}</td></tr>`;
+  });
+  document.getElementById('stateTable').innerHTML = html;
+}
+
+function drawChart(E, horizon) {
+  const svg = document.getElementById('chart'), conf = document.getElementById('conf');
+  const Wd = 780, H = 330, L = 36, R = 10, T = 10, B = 24, lo = -4, hi = 4;
+  const x = d => L + (d / horizon) * (Wd - L - R);
+  const y = v => T + (1 - (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo)) * (H - T - B);
+  let s = '';
+  for (let d = 0; d <= horizon; d++) if (W.turns[d] === 0) s += `<rect x="${x(d)}" y="${T}" width="${Math.max(1, x(1) - x(0))}" height="${H - T - B}" fill="#eee"/>`;
+  const sm = W.memories[selected];
+  if (sm.until != null) s += `<rect x="${x(sm.from ?? sm.created)}" y="${T}" width="${Math.max(2, x(sm.until) - x(sm.from ?? sm.created))}" height="${H - T - B}" fill="${COLORS[selected % COLORS.length]}" opacity=".12"/>`;
+  for (let v = lo; v <= hi; v++) s += `<line x1="${L}" x2="${Wd - R}" y1="${y(v)}" y2="${y(v)}" stroke="#f0f0f4"/><text x="4" y="${y(v) + 4}">${v}</text>`;
+  const step = horizon <= 90 ? 30 : horizon <= 365 ? 60 : 120;
+  for (let d = 0; d <= horizon; d += step) s += `<text x="${x(d) - 8}" y="${H - 6}">d${d}</text>`;
+  s += `<line x1="${L}" x2="${Wd - R}" y1="${y(P.tau)}" y2="${y(P.tau)}" stroke="#c4314b" stroke-dasharray="5 4"/><text x="${Wd - 110}" y="${y(P.tau) - 4}" style="fill:#c4314b">recall threshold</text>`;
+  s += `<line x1="${x(W.now + 0.5)}" x2="${x(W.now + 0.5)}" y1="${T}" y2="${H - B}" stroke="#999"/><text x="${x(W.now + 0.5) + 3}" y="${T + 10}">now</text>`;
+
+  let cs = '';
+  const cy = v => 8 + (1 - v) * 64, cH = 90;
+  cs += `<line x1="${L}" x2="${Wd - R}" y1="${cy(0)}" y2="${cy(0)}" stroke="#eee"/><line x1="${L}" x2="${Wd - R}" y1="${cy(1)}" y2="${cy(1)}" stroke="#eee"/><text x="4" y="${cy(1) + 4}">1</text><text x="4" y="${cy(0) + 4}">0</text>`;
+  cs += `<line x1="${x(W.now + 0.5)}" x2="${x(W.now + 0.5)}" y1="4" y2="${cH - 10}" stroke="#999"/>`;
+
+  const n = 500, nowT = at(W, W.now);
+  W.memories.forEach((m, i) => {
+    const col = COLORS[i % COLORS.length];
+    let past = '', fut = '', cPast = '', cFut = '';
+    for (let k = 0; k <= n; k++) {
+      const t = (k / n) * horizon;
+      // The future is drawn assuming no new accesses; the past uses only accesses known by then.
+      const r = Strength.evaluate(W, m, t, E, P);
+      if (!r || r.hidden) continue;
+      const pt = `${x(t).toFixed(1)},${y(r.strength).toFixed(1)} `;
+      if (t <= nowT) past += pt; else fut += pt;
+      if (r.confidence != null) { const cp = `${x(t).toFixed(1)},${cy(r.confidence).toFixed(1)} `; if (t <= nowT) cPast += cp; else cFut += cp; }
+    }
+    const wdt = i === selected ? 2.5 : 1.5;
+    if (past) s += `<polyline points="${past}" fill="none" stroke="${col}" stroke-width="${wdt}"/>`;
+    if (fut) s += `<polyline points="${fut}" fill="none" stroke="${col}" stroke-width="${wdt}" opacity=".3"/>`;
+    if (cPast) cs += `<polyline points="${cPast}" fill="none" stroke="${col}" stroke-width="2"/>`;
+    if (cFut) cs += `<polyline points="${cFut}" fill="none" stroke="${col}" stroke-width="2" opacity=".3"/>`;
+    const baseY = H - B - 4 - i * 6;
+    for (const a of W.accesses.filter(a => a.mem === m.id)) {
+      const ax = x(a.t);
+      if (a.kind === 'created') s += `<rect x="${ax - 1}" y="${baseY - 5}" width="2" height="8" fill="${col}"/>`;
+      else if (a.kind === 'used') s += `<circle cx="${ax}" cy="${baseY}" r="2.5" fill="${col}"/>`;
+      else if (a.kind === 'mentioned_again') s += `<rect x="${ax - 2.5}" y="${baseY - 2.5}" width="5" height="5" fill="${col}"/>`;
+      else s += `<rect x="${ax - 2.5}" y="${baseY - 2.5}" width="5" height="5" fill="${col}" transform="rotate(45 ${ax} ${baseY})"/>`;
+    }
+  });
+  svg.innerHTML = s; conf.innerHTML = cs;
+}
+
+/* ---------- Controls ---------- */
+document.getElementById('memSel').onchange = e => { selected = +e.target.value; render(); };
+document.getElementById('sig').oninput = e => { W.memories[selected].significance = +e.target.value; lastChange = 'Significance changed'; render(); };
+document.getElementById('horizon').onchange = render;
+document.querySelectorAll('[data-act]').forEach(b => b.onclick = () => {
+  const m = W.memories[selected], act = b.dataset.act;
+  if (act === 'chatty') { for (let i = 0; i < 15; i++) access(W, m.id, 'used', W.now + 0.3 + i * 0.03); W.turns[Math.floor(W.now)] = 25; }
+  else if (act === 'pin') m.pinnedAt = m.pinnedAt == null ? at(W, W.now) : null;
+  else if (act === 'end') { m.until = at(W, W.now); m.untilKnownAt = at(W, W.now); }
+  else access(W, m.id, act);
+  lastChange = `${b.textContent}: ${m.label}`; render();
+});
+document.querySelectorAll('[data-adv]').forEach(b => b.onclick = () => { advance(W, +b.dataset.adv); lastChange = b.textContent; render(); });
+document.querySelectorAll('[data-hol]').forEach(b => b.onclick = () => { holiday(W, +b.dataset.hol); lastChange = b.textContent; render(); });
+for (const k of ['clock', 'closedRule', 'inherit']) document.getElementById(k).onchange = e => { P[k] = e.target.value; lastChange = 'Rule changed'; render(); };
+for (const k of ['a', 'c', 'S', 'tau', 'f0', 'g', 'wEnd', 'h', 'turnsPerDay']) document.getElementById('p_' + k).onchange = e => { P[k] = +e.target.value; lastChange = 'Knob changed'; render(); };
+for (const k of ['used', 'mentioned_again', 'confirmed']) document.getElementById('p_w_' + k).onchange = e => { P.w[k] = +e.target.value; lastChange = 'Weight changed'; render(); };
+
+loadScenario(0);
+</script>
+</body>
+</html>
