@@ -156,7 +156,7 @@ const Strength = (() => {
     turnsPerDay: 10,  // "normal" conversation volume
     minAge: 0.01,     // ~15 minutes, avoids age 0
     dMax: 2,          // cap on per-access fading, so massed accesses fade fast but finitely
-    spacing: 3,       // effective days between accesses for them to count towards the floor
+    spacing: 3,       // wall-clock days between accesses for them to count towards the floor
     clock: 'hybrid',
     inherit: 'supersede',
     volatilityDays: { hours: 0.25, days: 2, weeks: 14, months: 60, years: 365 },
@@ -203,7 +203,7 @@ const Strength = (() => {
   }
   function spacedCount(list, E, p) {
     let n = 0, last = -Infinity;
-    for (const x of list) if (E(x.t) - last >= p.spacing) { n++; last = E(x.t); }
+    for (const x of list) if (x.t - last >= p.spacing) { n++; last = x.t; } // wall days: separate occasions are a world-time notion
     return n;
   }
 
