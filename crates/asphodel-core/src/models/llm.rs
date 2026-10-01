@@ -375,6 +375,93 @@ pub struct FakeLlm {
 enum Mode {
     Scripted(Mutex<VecDeque<Value>>),
     Failing(fn() -> LlmError),
+    Script(Mutex<VecDeque<ScriptStep>>),
+}
+
+/// One step of a script for [`FakeLlm::from_script`]: a reply or a failure,
+/// optionally after a delay. A script file is a JSON array of them:
+///
+/// ```json
+/// [
+///   {"reply": {"claims": [], "used": []}},
+///   {"fail": "status", "status": 503},
+///   {"fail": "usage_limited", "resets_at": "2026-10-02T00:00:00Z"},
+///   {"reply": {"claims": [], "used": []}, "delay_ms": 2000}
+/// ]
+/// ```
+///
+/// It's how integration tests drive the daemon's extraction worker
+/// without an LLM (`ASPHODEL_LLM_SCRIPT`), and the delay lets them catch a
+/// chunk in flight.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptStep {
+    /// The reply's JSON. Exactly one of `reply` and `fail` is set.
+    #[serde(default)]
+    pub reply: Option<Value>,
+    /// The failure to return instead.
+    #[serde(default)]
+    pub fail: Option<ScriptedFailure>,
+    /// The HTTP status for `"fail": "status"`; 500 when absent.
+    #[serde(default)]
+    pub status: Option<u16>,
+    /// When the usage window resets, for `"fail": "usage_limited"`.
+    #[serde(default)]
+    pub resets_at: Option<Timestamp>,
+    /// How long the call takes before it answers, in milliseconds.
+    #[serde(default)]
+    pub delay_ms: u64,
+}
+
+/// The [`LlmError`] a [`ScriptStep`] fails with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptedFailure {
+    Transport,
+    Timeout,
+    Status,
+    NoContent,
+    NotJson,
+    Refused,
+    LoginRequired,
+    UsageLimited,
+}
+
+/// Why a script didn't load. It names the step, never its content.
+#[derive(Debug, thiserror::Error)]
+pub enum ScriptError {
+    #[error("the LLM script isn't a JSON array of steps: {reason}")]
+    Parse { reason: String },
+    #[error("step {step} of the LLM script needs exactly one of `reply` and `fail`")]
+    Ambiguous { step: usize },
+    #[error("step {step} of the LLM script fails with usage_limited but has no `resets_at`")]
+    NoReset { step: usize },
+}
+
+impl ScriptStep {
+    fn outcome(&self) -> Result<Value, LlmError> {
+        if let Some(reply) = &self.reply {
+            return Ok(reply.clone());
+        }
+        Err(match self.fail.unwrap_or(ScriptedFailure::NoContent) {
+            ScriptedFailure::Transport => LlmError::Transport {
+                reason: "scripted".into(),
+            },
+            ScriptedFailure::Timeout => LlmError::Timeout,
+            ScriptedFailure::Status => LlmError::Status {
+                status: self.status.unwrap_or(500),
+            },
+            ScriptedFailure::NoContent => LlmError::NoContent,
+            ScriptedFailure::NotJson => LlmError::NotJson { bytes: 0 },
+            ScriptedFailure::Refused => LlmError::Refused,
+            ScriptedFailure::LoginRequired => LlmError::LoginRequired,
+            ScriptedFailure::UsageLimited => LlmError::UsageLimited {
+                resets_at: self
+                    .resets_at
+                    .expect("a usage_limited step was checked for resets_at"),
+            },
+        })
+    }
 }
 
 impl FakeLlm {
@@ -386,6 +473,29 @@ impl FakeLlm {
             mode: Mode::Scripted(Mutex::new(replies.into())),
             requests: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Plays `script`, a JSON array of [`ScriptStep`]s, one step per call,
+    /// then fails with [`LlmError::NoContent`] once it runs out.
+    pub fn from_script(model: &str, script: &str) -> Result<Self, ScriptError> {
+        let steps: Vec<ScriptStep> =
+            serde_json::from_str(script).map_err(|error| ScriptError::Parse {
+                reason: error.to_string(),
+            })?;
+        for (index, step) in steps.iter().enumerate() {
+            let step_number = index + 1;
+            if step.reply.is_some() == step.fail.is_some() {
+                return Err(ScriptError::Ambiguous { step: step_number });
+            }
+            if step.fail == Some(ScriptedFailure::UsageLimited) && step.resets_at.is_none() {
+                return Err(ScriptError::NoReset { step: step_number });
+            }
+        }
+        Ok(Self {
+            model: model.to_string(),
+            mode: Mode::Script(Mutex::new(steps.into())),
+            requests: Mutex::new(Vec::new()),
+        })
     }
 
     /// Fails every call with the error `make` builds.
@@ -430,6 +540,21 @@ impl LlmClient for FakeLlm {
                 })
             }
             Mode::Failing(make) => Err(make()),
+            Mode::Script(steps) => {
+                let step = steps
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pop_front()
+                    .ok_or(LlmError::NoContent)?;
+                if step.delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(step.delay_ms));
+                }
+                Ok(LlmResponse {
+                    json: step.outcome()?,
+                    usage: None,
+                    latency: Duration::from_millis(step.delay_ms),
+                })
+            }
         }
     }
 }

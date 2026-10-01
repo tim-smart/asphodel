@@ -1,0 +1,437 @@
+//! The HTTP API under `/v1` (TIM-94, decision 10). JSON bodies are the
+//! service layer's own types, and every handler is a thin call into
+//! [`Service`] on a blocking thread, the same calls the replay harness makes
+//! (TIM-96, decision 3).
+//!
+//! `/v1/health` answers before the daemon is ready, with 503, so a
+//! supervisor can gate readiness on it. Every other route answers 503 until
+//! the daemon is ready, and needs the bearer token when one is configured.
+//! After SIGTERM, health and ingest answer 503 while the daemon drains.
+
+use std::sync::Arc;
+
+use asphodel_core::config::Secret;
+use asphodel_core::ingest::{Document, IngestError, Ingested, Outcome, Turn};
+use asphodel_core::keep::{KeepError, Kept, MemoryIds, Unkept};
+use asphodel_core::queue::{ChunkList, QueueError, Retried, RetryRequest};
+use asphodel_core::retrieval::{Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
+use asphodel_core::store::StoreError;
+use asphodel_core::store::bank::{Bank, BankError, BankIdentity};
+use asphodel_core::{Health, ResolvedConfig, Service};
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+use super::{App, Shared};
+
+/// The largest request body: a document of a few megabytes, with room to
+/// spare. Anything larger is refused before it's read.
+const BODY_LIMIT: usize = 16 * 1024 * 1024;
+
+pub(crate) fn router(app: Shared) -> Router {
+    let authorized = Router::new()
+        .route("/v1/config", get(config))
+        .route("/v1/banks/{bank}", put(put_bank))
+        .route("/v1/banks/{bank}/turns", post(turns))
+        .route("/v1/banks/{bank}/documents", post(documents))
+        .route("/v1/banks/{bank}/prefetch", post(prefetch))
+        .route("/v1/banks/{bank}/recall", post(recall))
+        .route("/v1/banks/{bank}/keep", post(keep))
+        .route("/v1/banks/{bank}/unkeep", post(unkeep))
+        .route(
+            "/v1/banks/{bank}/sessions/{session}/clear",
+            post(clear_session),
+        )
+        .route("/v1/banks/{bank}/chunks", get(chunks))
+        .route("/v1/banks/{bank}/chunks/retry", post(retry_chunks))
+        .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize));
+    Router::new()
+        .route("/v1/health", get(health))
+        .merge(authorized)
+        .fallback(not_found)
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .with_state(app)
+}
+
+/// An error as the API returns it: a status and `{"error": "..."}`. No
+/// message carries content (ADR 0010): the service's errors name kinds and
+/// ids only.
+#[derive(Debug)]
+pub(crate) struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ErrorBody<'a> {
+    error: &'a str,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn not_ready() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the daemon is starting: the store and models aren't ready yet",
+        )
+    }
+
+    fn draining() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the daemon is shutting down and accepts no more ingest",
+        )
+    }
+
+    fn internal(error: impl std::fmt::Display) -> Self {
+        warn!(%error, "request failed");
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let mut response = (
+            self.status,
+            Json(ErrorBody {
+                error: &self.message,
+            }),
+        )
+            .into_response();
+        if self.status == StatusCode::UNAUTHORIZED {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        response
+    }
+}
+
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        Self::new(rejection.status(), rejection.body_text())
+    }
+}
+
+impl From<QueryRejection> for ApiError {
+    fn from(rejection: QueryRejection) -> Self {
+        Self::new(rejection.status(), rejection.body_text())
+    }
+}
+
+impl From<StoreError> for ApiError {
+    fn from(error: StoreError) -> Self {
+        Self::internal(error)
+    }
+}
+
+impl From<IngestError> for ApiError {
+    fn from(error: IngestError) -> Self {
+        match error {
+            IngestError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            IngestError::InvalidTimezone => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
+            IngestError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<BankError> for ApiError {
+    fn from(error: BankError) -> Self {
+        match error {
+            BankError::EmptyName | BankError::InvalidTimezone => {
+                Self::new(StatusCode::BAD_REQUEST, error.to_string())
+            }
+            BankError::NoModels => Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+            BankError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<RecallError> for ApiError {
+    fn from(error: RecallError) -> Self {
+        match error {
+            RecallError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            RecallError::InvertedRange => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
+            RecallError::NoModels => Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+            RecallError::Model { .. } => Self::internal(error),
+            RecallError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<KeepError> for ApiError {
+    fn from(error: KeepError) -> Self {
+        match error {
+            KeepError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            KeepError::TooMany { .. } => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
+            KeepError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<QueueError> for ApiError {
+    fn from(error: QueueError) -> Self {
+        match error {
+            QueueError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            QueueError::NotHeld { .. } => Self::new(StatusCode::CONFLICT, error.to_string()),
+            QueueError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl App {
+    /// Runs `call` on the service on a blocking thread: every service call
+    /// touches SQLite, and recall runs the models.
+    async fn call<T, E>(
+        &self,
+        call: impl FnOnce(&Service) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, ApiError>
+    where
+        T: Send + 'static,
+        E: Into<ApiError> + Send + 'static,
+    {
+        let service = Arc::clone(&self.ready().ok_or_else(ApiError::not_ready)?.service);
+        tokio::task::spawn_blocking(move || call(&service).map_err(Into::into))
+            .await
+            .map_err(ApiError::internal)?
+    }
+
+    /// Refuses ingest once SIGTERM has arrived (TIM-94, decision 3).
+    fn accepting_ingest(&self) -> Result<(), ApiError> {
+        if self.draining() {
+            Err(ApiError::draining())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Wakes `bank`'s extraction worker after something was queued.
+    fn wake(&self, bank: &str) {
+        if let Some(workers) = self.ready().and_then(|ready| ready.workers.as_ref()) {
+            workers.wake(bank);
+        }
+    }
+}
+
+/// Checks the bearer token, when the daemon has one. Off loopback it always
+/// has one (TIM-94, decision 2); on loopback it's optional, and checked
+/// when set.
+async fn authorize(
+    State(app): State<Shared>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if let Some(token) = &app.token {
+        let given = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        if !given.is_some_and(|given| token_matches(token, given)) {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "a bearer token is required: set ASPHODEL_TOKEN on the client",
+            ));
+        }
+    }
+    Ok(next.run(request).await)
+}
+
+/// Compares the token in time independent of where the first difference
+/// is, so the comparison doesn't leak a prefix.
+fn token_matches(token: &Secret, given: &str) -> bool {
+    let expected = token.expose().as_bytes();
+    let given = given.trim().as_bytes();
+    let mut difference = expected.len() ^ given.len();
+    for (index, byte) in expected.iter().enumerate() {
+        difference |= usize::from(byte ^ given.get(index).copied().unwrap_or(0));
+    }
+    difference == 0
+}
+
+async fn not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "no such route")
+}
+
+/// `GET /v1/health`: 503 while the store migrates and the models load, and
+/// again once the daemon is draining; 200 with the version once ready.
+async fn health(State(app): State<Shared>) -> (StatusCode, Json<Health>) {
+    match app.ready() {
+        Some(ready) if !app.draining() => (StatusCode::OK, Json(ready.service.health())),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(Health::starting(app.clock.now())),
+        ),
+    }
+}
+
+/// `GET /v1/config`: the resolved config, secrets redacted (ADR 0009).
+async fn config(State(app): State<Shared>) -> Result<Json<ResolvedConfig>, ApiError> {
+    let ready = app.ready().ok_or_else(ApiError::not_ready)?;
+    Ok(Json(ready.config.clone()))
+}
+
+/// `PUT /v1/banks/{bank}`: creates the bank or merges the identity into it
+/// (TIM-94, decision 7). 201 when it created the bank.
+async fn put_bank(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<BankIdentity>, JsonRejection>,
+) -> Result<(StatusCode, Json<Bank>), ApiError> {
+    let Json(identity) = body?;
+    let bank = app
+        .call(move |service| service.ensure_bank_with_models(&bank, &identity))
+        .await?;
+    let status = if bank.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(bank)))
+}
+
+/// `POST /v1/banks/{bank}/turns`: `sync_turn`.
+async fn turns(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<Turn>, JsonRejection>,
+) -> Result<Json<Ingested>, ApiError> {
+    app.accepting_ingest()?;
+    let Json(turn) = body?;
+    let name = bank.clone();
+    let ingested = app
+        .call(move |service| service.ingest_turn(&name, &turn))
+        .await?;
+    if ingested.outcome == Outcome::Stored && ingested.chunks_queued > 0 {
+        app.wake(&bank);
+    }
+    Ok(Json(ingested))
+}
+
+/// `POST /v1/banks/{bank}/documents`: `asphodel ingest`.
+async fn documents(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<Document>, JsonRejection>,
+) -> Result<Json<Ingested>, ApiError> {
+    app.accepting_ingest()?;
+    let Json(document) = body?;
+    let name = bank.clone();
+    let ingested = app
+        .call(move |service| service.ingest_document(&name, &document))
+        .await?;
+    if ingested.chunks_queued > 0 {
+        app.wake(&bank);
+    }
+    Ok(Json(ingested))
+}
+
+/// `POST /v1/banks/{bank}/prefetch`: the injection for a user message.
+async fn prefetch(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<PrefetchRequest>, JsonRejection>,
+) -> Result<Json<Prefetch>, ApiError> {
+    let Json(request) = body?;
+    let prefetch = app
+        .call(move |service| service.prefetch(&bank, &request))
+        .await?;
+    Ok(Json(prefetch))
+}
+
+/// `POST /v1/banks/{bank}/recall`: `memory_recall` and `asphodel recall`.
+async fn recall(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<RecallRequest>, JsonRejection>,
+) -> Result<Json<Recall>, ApiError> {
+    let Json(request) = body?;
+    let recall = app
+        .call(move |service| service.recall(&bank, &request))
+        .await?;
+    Ok(Json(recall))
+}
+
+/// `POST /v1/banks/{bank}/keep`: `memory_keep`.
+async fn keep(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<MemoryIds>, JsonRejection>,
+) -> Result<Json<Kept>, ApiError> {
+    let Json(MemoryIds { ids }) = body?;
+    let kept = app.call(move |service| service.keep(&bank, &ids)).await?;
+    Ok(Json(kept))
+}
+
+/// `POST /v1/banks/{bank}/unkeep`: `memory_unkeep`.
+async fn unkeep(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<MemoryIds>, JsonRejection>,
+) -> Result<Json<Unkept>, ApiError> {
+    let Json(MemoryIds { ids }) = body?;
+    let unkept = app.call(move |service| service.unkeep(&bank, &ids)).await?;
+    Ok(Json(unkept))
+}
+
+/// `POST /v1/banks/{bank}/sessions/{id}/clear`: Hermes'
+/// `on_session_switch` on compression, reset or rewind. 204.
+async fn clear_session(
+    State(app): State<Shared>,
+    Path((bank, session)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    app.call(move |service| service.clear_session(&bank, &session))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChunksQuery {
+    /// Only the failed chunks.
+    #[serde(default)]
+    failed: bool,
+}
+
+/// `GET /v1/banks/{bank}/chunks[?failed=true]`: the bank's queue and its
+/// failed chunks, or only the failed ones.
+async fn chunks(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    query: Result<Query<ChunksQuery>, QueryRejection>,
+) -> Result<Json<ChunkList>, ApiError> {
+    let Query(query) = query?;
+    let chunks = app
+        .call(move |service| service.chunks(&bank, query.failed))
+        .await?;
+    Ok(Json(chunks))
+}
+
+/// `POST /v1/banks/{bank}/chunks/retry`: puts failed chunks back on the
+/// queue, the ones named or all of them.
+async fn retry_chunks(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<RetryRequest>, JsonRejection>,
+) -> Result<Json<Retried>, ApiError> {
+    let Json(request) = body?;
+    let name = bank.clone();
+    let retried = app
+        .call(move |service| service.retry_chunks(&name, request.chunks.as_deref()))
+        .await?;
+    if !retried.retried.is_empty() {
+        app.wake(&bank);
+    }
+    Ok(Json(retried))
+}

@@ -3,6 +3,7 @@
 //! exception, opening its own store under `ASPHODEL_REPLAY_DIR` (TIM-96).
 
 mod cli;
+mod client;
 mod listen;
 mod serve;
 

@@ -1,16 +1,18 @@
 //! `asphodel serve`: the daemon.
 //!
-//! It builds the service layer on the system clock, binds the listen address
-//! and serves the HTTP API under `/v1`. The handlers stay thin and call the
-//! same service functions the replay harness does (TIM-96, decision 3). Only
-//! `health` exists so far.
+//! It binds the listen address first, so `/v1/health` can answer 503 while
+//! the store opens and migrates and the models load, then builds the service
+//! layer on the system clock and serves the HTTP API under `/v1` ([`api`]).
+//! The handlers stay thin and call the same service functions the replay
+//! harness does (TIM-96, decision 3). Each bank's chunks are extracted by a
+//! worker of its own ([`worker`]).
 
 use std::{
     fs::{self, Metadata},
     io::ErrorKind,
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::{Arc, OnceLock, Weak},
     time::Duration,
 };
 
@@ -18,18 +20,23 @@ use anyhow::{Context, bail};
 use asphodel_core::config::{
     Deployment, LLM_API_KEY_ENV, LlmAuth, ModelsConfig, Secret, TOKEN_ENV,
 };
-use asphodel_core::models::{LlmSettings, LlmStatus, ModelOptions, Models, TokenStore};
+use asphodel_core::models::{
+    CodexResponses, FakeLlm, LlmClient, LlmSettings, LlmStatus, ModelOptions, Models,
+    OpenAiCompatible, TokenStore,
+};
 use asphodel_core::store::{OpenOptions, Store};
-use asphodel_core::{Clock, Health, ResolvedConfig, Service, SystemClock, Tuning};
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use asphodel_core::{Clock, ResolvedConfig, Service, SystemClock, Tuning};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::signal;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::cli::ServeArgs;
 use crate::listen::Listen;
+use worker::Workers;
 
-type Shared = Arc<Service>;
+mod api;
+mod worker;
 
 /// The longest the daemon waits between housekeeping passes. It normally
 /// wakes at the next copy's deadline (ADR 0010); this cap bounds how late
@@ -45,8 +52,58 @@ const HOUSEKEEPING_MIN_WAIT: Duration = Duration::from_secs(1);
 #[cfg(test)]
 mod tests;
 
+pub(crate) type Shared = Arc<App>;
+
+/// What the HTTP handlers share. The service only exists once the store is
+/// open and the models are loaded; until then `/v1/health` answers 503 and
+/// every other route refuses (TIM-94, decision 3).
+pub(crate) struct App {
+    /// The clock `/v1/health` reads before the service exists.
+    clock: Arc<dyn Clock>,
+    /// The bearer token clients must send, when one is configured.
+    token: Option<Secret>,
+    ready: OnceLock<Ready>,
+    /// Set on SIGTERM or SIGINT: ingest stops, and so do the workers once
+    /// their chunk in flight is done.
+    stop: watch::Receiver<bool>,
+}
+
+/// The daemon once it's ready.
+pub(crate) struct Ready {
+    service: Arc<Service>,
+    config: ResolvedConfig,
+    /// `None` when no LLM is configured: chunks wait on the queue.
+    workers: Option<Arc<Workers>>,
+}
+
+impl App {
+    fn ready(&self) -> Option<&Ready> {
+        self.ready.get()
+    }
+
+    fn draining(&self) -> bool {
+        *self.stop.borrow()
+    }
+}
+
+/// What startup builds on a blocking thread before the daemon is ready.
+struct Started {
+    service: Service,
+    config: ResolvedConfig,
+    llm: Option<Arc<dyn LlmClient>>,
+    /// Every bank in the store, each of which gets a worker at once, since
+    /// the queue may hold chunks from before a restart.
+    banks: Vec<String>,
+}
+
+/// The bound listener, before axum takes it.
+enum Bound {
+    Tcp(TcpListener),
+    Unix(UnixListener, UnixSocketCleanup),
+}
+
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
-    let mut config = resolve_config(&args)?;
+    let config = resolve_config(&args)?;
     if !args.listen.is_local() && config.deployment.token.is_none() {
         bail!(
             "listening on {} is reachable off this machine, so a bearer token is required: \
@@ -54,11 +111,174 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             args.listen
         );
     }
+    // The switches are read before anything binds, so a bad value stops the
+    // daemon before it exists to a client.
+    let models = models_switch()?;
+    let script = llm_script()?;
+    let gate = startup_gate();
 
-    // The store is opened before anything listens: the lock, the filesystem
-    // check and the migrations all have to pass before the daemon exists to
-    // a client (TIM-94, decision 4; ADR 0010).
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let (stop_tx, stop) = watch::channel(false);
+    let app: Shared = Arc::new(App {
+        clock: Arc::clone(&clock),
+        token: config.deployment.token.clone(),
+        ready: OnceLock::new(),
+        stop: stop.clone(),
+    });
+
+    let (bound, address) = bind(&args.listen).await?;
+    info!(
+        version = asphodel_core::VERSION,
+        listen = %address,
+        "asphodel starting: /v1/health answers 503 until the store and models are ready"
+    );
+    let signals = tokio::spawn({
+        let stop_tx = stop_tx.clone();
+        async move {
+            shutdown_signal().await;
+            let _ = stop_tx.send(true);
+        }
+    });
+    let router = api::router(Arc::clone(&app));
+    let (server, cleanup) = match bound {
+        Bound::Tcp(listener) => (
+            tokio::spawn(
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(stopped(stop.clone()))
+                    .into_future(),
+            ),
+            None,
+        ),
+        Bound::Unix(listener, cleanup) => (
+            tokio::spawn(
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(stopped(stop.clone()))
+                    .into_future(),
+            ),
+            Some(cleanup),
+        ),
+    };
+
+    // The store opens, migrates and loads its models while the listener
+    // answers 503: the lock, the filesystem check, the migrations and the
+    // floors all have to pass before the daemon is ready (TIM-94,
+    // decisions 3 and 4; ADR 0010).
+    let started = {
+        let clock = Arc::clone(&clock);
+        let stop = stop.clone();
+        tokio::task::spawn_blocking(move || {
+            start(&args, config, clock, models, script, gate, &stop)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("startup panicked: {error}"))
+        .and_then(|started| started)
+    };
+    let started = match started {
+        Ok(Some(started)) => started,
+        Ok(None) | Err(_) => {
+            let _ = stop_tx.send(true);
+            let served = server.await;
+            signals.abort();
+            if let Some(cleanup) = cleanup {
+                cleanup.remove()?;
+            }
+            served??;
+            return started.map(|_| ());
+        }
+    };
+
+    let service = Arc::new(started.service);
+    tokio::spawn(housekeeping(Arc::downgrade(&service)));
+    let workers = match started.llm {
+        Some(llm) => Some(Workers::start(
+            Arc::clone(&service),
+            llm,
+            &started.banks,
+            stop.clone(),
+        )),
+        None => None,
+    };
+    let _ = app.ready.set(Ready {
+        service: Arc::clone(&service),
+        config: started.config,
+        workers: workers.clone(),
+    });
+    info!(version = asphodel_core::VERSION, listen = %address, "asphodel listening");
+
+    // SIGTERM: ingest is refused and the listener stops; each worker
+    // finishes its chunk in flight; then the WAL is checkpointed (TIM-94,
+    // decision 3). The queue is in SQLite, so nothing waiting is lost.
+    let served = server.await;
+    let _ = stop_tx.send(true);
+    signals.abort();
+    if let Some(workers) = &workers {
+        workers.join().await;
+    }
+    let checkpoint = tokio::task::spawn_blocking({
+        let service = Arc::clone(&service);
+        move || service.checkpoint()
+    })
+    .await?;
+    match checkpoint {
+        Ok(()) => info!("checkpointed the WAL"),
+        Err(error) => warn!(%error, "checkpointing the WAL failed"),
+    }
+    if let Some(cleanup) = cleanup {
+        cleanup.remove()?;
+    }
+    served??;
+    info!("asphodel stopped");
+    Ok(())
+}
+
+/// Resolves once a stop has been signalled.
+async fn stopped(mut stop: watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stop| *stop).await;
+}
+
+/// Binds the listen address, and says where it ended up: with port 0 the
+/// system picks the port, and the log line is how a test finds it.
+async fn bind(listen: &Listen) -> anyhow::Result<(Bound, String)> {
+    match listen {
+        Listen::Tcp(addr) => {
+            let listener = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding {addr}"))?;
+            let address = listener.local_addr()?.to_string();
+            Ok((Bound::Tcp(listener), address))
+        }
+        Listen::Unix(path) => {
+            let (listener, cleanup) = bind_unix(path).await?;
+            Ok((Bound::Unix(listener, cleanup), listen.to_string()))
+        }
+    }
+}
+
+/// Opens the store, loads the models and builds the service and the LLM
+/// client, on a blocking thread. `Ok(None)` when a stop arrived while the
+/// startup gate held it.
+fn start(
+    args: &ServeArgs,
+    mut config: ResolvedConfig,
+    clock: Arc<dyn Clock>,
+    models: ModelsSwitch,
+    script: Option<String>,
+    gate: Option<PathBuf>,
+    stop: &watch::Receiver<bool>,
+) -> anyhow::Result<Option<Started>> {
+    if let Some(gate) = gate {
+        warn!(
+            "{STARTUP_GATE_ENV} is set: startup waits until {} exists",
+            gate.display()
+        );
+        while !gate.exists() {
+            if *stop.borrow() {
+                return Ok(None);
+            }
+            std::thread::sleep(STARTUP_GATE_POLL);
+        }
+    }
+
     let options = OpenOptions {
         allow_network_fs: args.allow_network_fs,
     };
@@ -66,7 +286,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         .with_context(|| format!("opening the store in {}", args.data_dir.display()))?;
     config.purge = store.check_fingerprint(&config.deletion_fingerprint)?;
     config.llm = llm_status(&config, &args.data_dir)?;
-    let service = match models_switch()? {
+    let service = match models {
         ModelsSwitch::Fake => {
             warn!(
                 "{MODELS_ENV}=fake: serving with the deterministic fake models, not the ONNX ones"
@@ -77,7 +297,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 true,
                 args.onnx_threads.map(std::num::NonZeroUsize::get),
             ));
-            Service::with_models(clock, store, config.tuning.clone(), models)?
+            Service::with_models(Arc::clone(&clock), store, config.tuning.clone(), models)?
         }
         ModelsSwitch::None => {
             let dir = crate::cli::resolve_model_dir(args.model_dir.as_deref())?;
@@ -93,40 +313,85 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 false,
                 args.onnx_threads.map(std::num::NonZeroUsize::get),
             ));
-            Service::with_models(clock, store, config.tuning.clone(), models)?
+            Service::with_models(Arc::clone(&clock), store, config.tuning.clone(), models)?
         }
     };
+    let llm = llm_client(&config, &args.data_dir, clock, script)?;
+    config.fake_llm = llm.as_ref().is_some_and(|(_, fake)| *fake);
     info!(
         config = %serde_json::to_string(&config)?,
         "resolved config"
     );
-    let service: Shared = Arc::new(service);
-    tokio::spawn(housekeeping(Arc::downgrade(&service)));
-    let app = Router::new()
-        .route("/v1/health", get(health))
-        .with_state(service);
+    let banks = service.bank_names()?;
+    Ok(Some(Started {
+        service,
+        config,
+        llm: llm.map(|(llm, _)| llm),
+        banks,
+    }))
+}
 
-    info!(version = asphodel_core::VERSION, listen = %args.listen, "asphodel listening");
-    match &args.listen {
-        Listen::Tcp(addr) => {
-            let listener = TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("binding {addr}"))?;
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
-        }
-        Listen::Unix(path) => {
-            let (listener, cleanup) = bind_unix(path).await?;
-            let result = axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await;
-            cleanup.remove()?;
-            result?;
-        }
+/// `ASPHODEL_LLM_SCRIPT=<file>` runs extraction on a scripted fake LLM that
+/// plays the file's steps in order ([`FakeLlm::from_script`]). It is for
+/// integration tests, environment only, never in `--help`, and the resolved
+/// config says so.
+const LLM_SCRIPT_ENV: &str = "ASPHODEL_LLM_SCRIPT";
+
+/// The model name the scripted LLM reports when `llm.model` isn't set.
+const FAKE_LLM_MODEL: &str = "fake-llm";
+
+/// Reads the LLM script, if there is one, before anything binds.
+fn llm_script() -> anyhow::Result<Option<String>> {
+    let Some(path) = std::env::var_os(LLM_SCRIPT_ENV) else {
+        return Ok(None);
+    };
+    let script = fs::read_to_string(&path)
+        .with_context(|| format!("reading {LLM_SCRIPT_ENV} {}", Path::new(&path).display()))?;
+    Ok(Some(script))
+}
+
+/// `ASPHODEL_STARTUP_GATE=<path>` holds startup, after the listener is bound
+/// and before the store opens, until the path exists. It lets an
+/// integration test see `/v1/health` answer 503 while the daemon starts,
+/// which the fake models otherwise make too quick to catch. Environment
+/// only, never in `--help`.
+const STARTUP_GATE_ENV: &str = "ASPHODEL_STARTUP_GATE";
+const STARTUP_GATE_POLL: Duration = Duration::from_millis(50);
+
+fn startup_gate() -> Option<PathBuf> {
+    std::env::var_os(STARTUP_GATE_ENV).map(PathBuf::from)
+}
+
+/// The LLM extraction calls, and whether it's the scripted fake. `None`
+/// when `[llm]` isn't configured and there's no script: the daemon serves,
+/// and chunks wait on the queue.
+fn llm_client(
+    config: &ResolvedConfig,
+    data_dir: &Path,
+    clock: Arc<dyn Clock>,
+    script: Option<String>,
+) -> anyhow::Result<Option<(Arc<dyn LlmClient>, bool)>> {
+    if let Some(script) = script {
+        let model = config.tuning.llm.model.as_deref().unwrap_or(FAKE_LLM_MODEL);
+        warn!("{LLM_SCRIPT_ENV} is set: extraction runs on a scripted fake LLM, not a real one");
+        let llm = FakeLlm::from_script(model, &script)?;
+        return Ok(Some((Arc::new(llm), true)));
     }
-    info!("asphodel stopped");
-    Ok(())
+    let Some(settings) = LlmSettings::from_config(&config.tuning, &config.deployment)? else {
+        warn!("[llm] isn't configured: chunks wait on the queue until it is");
+        return Ok(None);
+    };
+    let llm: Arc<dyn LlmClient> = match settings.auth {
+        LlmAuth::ApiKey => Arc::new(OpenAiCompatible::new(settings)),
+        LlmAuth::Chatgpt => {
+            let mut client = CodexResponses::new(settings, TokenStore::open(data_dir), clock);
+            if let Ok(issuer) = std::env::var(crate::cli::LLM_ISSUER_ENV) {
+                client = client.with_issuer(&issuer);
+            }
+            Arc::new(client)
+        }
+    };
+    Ok(Some((llm, false)))
 }
 
 /// `ASPHODEL_MODELS=fake` runs the daemon on the deterministic fake models.
@@ -315,21 +580,8 @@ async fn housekeeping(service: Weak<Service>) {
     }
 }
 
-/// `GET /v1/health`: 503 until the daemon is ready, then 200 with the version.
-async fn health(State(service): State<Shared>) -> (StatusCode, Json<Health>) {
-    let health = service.health();
-    let status = if health.ready {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (status, Json(health))
-}
-
-/// Resolves on SIGINT or SIGTERM. On SIGTERM the daemon stops accepting
-/// ingest, finishes the chunk in flight and checkpoints the WAL (TIM-94,
-/// decision 3). There is no ingest yet, so it is a graceful HTTP shutdown
-/// and the store checkpoints as it closes.
+/// Resolves on SIGINT or SIGTERM. Either one stops the daemon as
+/// [`run`] describes.
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(error) = signal::ctrl_c().await {

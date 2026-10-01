@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use jiff::Timestamp;
 use rusqlite::OptionalExtension;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::constants::CHUNK_RETRY_CAP;
@@ -345,4 +345,165 @@ pub(crate) fn failed(store: &Store, bank: &str) -> Result<Vec<FailedChunk>, Queu
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// A chunk on the queue, waiting or in flight, as `chunks` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueuedChunk {
+    pub chunk: Uuid,
+    pub source: Uuid,
+    pub source_kind: SourceKind,
+    /// The chunk's position in its source.
+    pub position: u32,
+    pub observed_at: Timestamp,
+    /// Failed attempts so far, below the retry cap.
+    pub error_count: u32,
+    /// Whether the bank's worker holds it now.
+    pub in_flight: bool,
+}
+
+/// What `chunks` lists: the bank's queue in the order it runs, and its
+/// failed chunks, oldest failure first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChunkList {
+    pub queued: Vec<QueuedChunk>,
+    pub failed: Vec<FailedChunk>,
+}
+
+/// What `chunks/retry` takes: the failed chunks to put back on the queue,
+/// or every failed chunk in the bank when `chunks` is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RetryRequest {
+    #[serde(default)]
+    pub chunks: Option<Vec<Uuid>>,
+}
+
+/// What a retry did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Retried {
+    /// The failed chunks put back on the queue.
+    pub retried: Vec<Uuid>,
+    /// Asked-for chunks that aren't failed chunks of the bank.
+    pub unknown: Vec<Uuid>,
+}
+
+/// The bank's queue in the order [`claim`] hands it out.
+pub(crate) fn queued(
+    store: &Store,
+    leases: &Leases,
+    bank: &str,
+) -> Result<Vec<QueuedChunk>, QueueError> {
+    let conn = store.connection();
+    let bank_id = bank_id(&conn, bank)?;
+    let held = leases.lock().get(&bank_id).copied();
+    let mut statement = conn.prepare(
+        "SELECT q.id, c.uuid, s.uuid, s.kind, c.position, q.observed_at, c.error_count
+         FROM extraction_queue q
+         JOIN chunks c ON c.id = q.chunk_id
+         JOIN sources s ON s.id = c.source_id
+         WHERE q.bank_id = ?1 AND q.kind = 'chunk'
+         ORDER BY q.priority, q.observed_at, s.ingested_at, q.id",
+    )?;
+    let rows = statement.query_map([bank_id], |row| {
+        let queue_id: i64 = row.get(0)?;
+        Ok(QueuedChunk {
+            chunk: row
+                .get::<_, String>(1)?
+                .parse()
+                .expect("a stored uuid parses"),
+            source: row
+                .get::<_, String>(2)?
+                .parse()
+                .expect("a stored uuid parses"),
+            source_kind: if row.get::<_, String>(3)? == "turn" {
+                SourceKind::Turn
+            } else {
+                SourceKind::Document
+            },
+            position: u32::try_from(row.get::<_, i64>(4)?).unwrap_or(u32::MAX),
+            observed_at: timestamp(row.get(5)?),
+            error_count: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(u32::MAX),
+            in_flight: held == Some(queue_id),
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Puts failed chunks back on their bank's queue with a fresh error count,
+/// at the place their source's time gives them. `chunks` names the ones to
+/// retry; `None` retries every failed chunk in the bank. A chunk whose text
+/// is gone, swept or erased, can't be extracted again and counts as
+/// unknown. Call 1's saved reply, if any, stays, so a chunk that failed in
+/// call 2 resumes there.
+pub(crate) fn retry(
+    store: &Store,
+    bank: &str,
+    chunks: Option<&[Uuid]>,
+) -> Result<Retried, QueueError> {
+    let now = micros(store.now());
+    let mut conn = store.connection();
+    let tx = conn.transaction()?;
+    let bank_id = bank_id(&tx, bank)?;
+    let failed: Vec<(i64, Uuid, String, i64)> = {
+        let mut statement = tx.prepare(
+            "SELECT c.id, c.uuid, s.kind, s.observed_at
+             FROM chunks c JOIN sources s ON s.id = c.source_id
+             WHERE c.bank_id = ?1 AND c.failed_at IS NOT NULL AND c.text IS NOT NULL
+               AND c.tombstoned_at IS NULL
+             ORDER BY c.failed_at, c.id",
+        )?;
+        let rows = statement.query_map([bank_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, String>(1)?
+                    .parse()
+                    .expect("a stored uuid parses"),
+                row.get(2)?,
+                row.get(3)?,
+            ))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let wanted: Option<std::collections::BTreeSet<Uuid>> =
+        chunks.map(|chunks| chunks.iter().copied().collect());
+    let mut retried = Vec::new();
+    for (chunk_id, chunk, kind, observed_at) in failed {
+        if wanted
+            .as_ref()
+            .is_some_and(|wanted| !wanted.contains(&chunk))
+        {
+            continue;
+        }
+        let priority = if kind == "turn" {
+            crate::ingest::PRIORITY_TURN
+        } else {
+            crate::ingest::PRIORITY_DOCUMENT
+        };
+        tx.execute(
+            "UPDATE chunks SET failed_at = NULL, error_count = 0 WHERE id = ?1",
+            [chunk_id],
+        )?;
+        tx.execute(
+            "INSERT INTO extraction_queue (bank_id, kind, chunk_id, priority, observed_at, enqueued_at)
+             VALUES (?1, 'chunk', ?2, ?3, ?4, ?5)",
+            (bank_id, chunk_id, priority, observed_at, now),
+        )?;
+        retried.push(chunk);
+    }
+    tx.commit()?;
+    let unknown = match chunks {
+        None => Vec::new(),
+        Some(chunks) => {
+            let mut seen = std::collections::BTreeSet::new();
+            chunks
+                .iter()
+                .copied()
+                .filter(|chunk| !retried.contains(chunk) && seen.insert(*chunk))
+                .collect()
+        }
+    };
+    if !retried.is_empty() {
+        tracing::info!(count = retried.len(), "failed chunks put back on the queue");
+    }
+    Ok(Retried { retried, unknown })
 }

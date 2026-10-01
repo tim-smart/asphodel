@@ -16,8 +16,11 @@ use crate::config::{ConfigError, Tuning};
 use crate::constants::RERANKER_DEADLINE;
 use crate::extraction::{Call1Input, Call2Input, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Outcome, Turn};
+use crate::keep::{KeepError, Kept, Unkept};
 use crate::models::{LlmClient, Models};
-use crate::queue::{ChunkError, FailedChunk, Failure, Lease, Leases, QueueError};
+use crate::queue::{
+    ChunkError, ChunkList, FailedChunk, Failure, Lease, Leases, QueueError, Retried, SourceKind,
+};
 use crate::retrieval::{Permit, Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
 use crate::sessions::Sessions;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
@@ -339,6 +342,92 @@ impl Service {
         crate::queue::failed(&self.store, bank)
     }
 
+    /// `bank`'s queue in the order it runs, and its failed chunks, as
+    /// `chunks` lists them. With `failed_only` the queue is left out.
+    pub fn chunks(&self, bank: &str, failed_only: bool) -> Result<ChunkList, QueueError> {
+        let queued = if failed_only {
+            Vec::new()
+        } else {
+            crate::queue::queued(&self.store, &self.leases, bank)?
+        };
+        Ok(ChunkList {
+            queued,
+            failed: crate::queue::failed(&self.store, bank)?,
+        })
+    }
+
+    /// Puts `bank`'s failed chunks back on its queue: the ones `chunks`
+    /// names, or all of them when it's `None` (`chunks --failed --retry`).
+    pub fn retry_chunks(&self, bank: &str, chunks: Option<&[Uuid]>) -> Result<Retried, QueueError> {
+        crate::queue::retry(&self.store, bank, chunks)
+    }
+
+    /// Takes the head of `bank`'s queue and extracts it with `llm`, giving
+    /// call 1 the in-context set of the turn's session. `Ok(None)` when the
+    /// queue is empty or the bank's worker already holds a lease. This is
+    /// the step the daemon's per-bank worker repeats, and the replay harness
+    /// runs it the same way (TIM-96, decision 3).
+    pub fn extract_next(
+        &self,
+        bank: &str,
+        llm: &dyn LlmClient,
+    ) -> Result<Option<Extracted>, ExtractError> {
+        let Some(lease) = self.claim_chunk(bank)? else {
+            return Ok(None);
+        };
+        let in_context = match lease.source_kind {
+            SourceKind::Document => Vec::new(),
+            SourceKind::Turn => {
+                let session: Option<String> = {
+                    let conn = self.store.connection();
+                    conn.query_row(
+                        "SELECT session_id FROM sources WHERE uuid = ?1",
+                        [lease.source.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(StoreError::Sqlite)?
+                };
+                match session {
+                    Some(session) => {
+                        self.sessions
+                            .in_context(lease.bank_id(), &session, self.now())
+                    }
+                    None => Vec::new(),
+                }
+            }
+        };
+        self.extract_chunk(lease, llm, &in_context).map(Some)
+    }
+
+    /// The names of every bank in the store, so the daemon can start a
+    /// worker for each.
+    pub fn bank_names(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.store.connection();
+        let mut statement = conn.prepare("SELECT name FROM banks ORDER BY id")?;
+        let names = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(names)
+    }
+
+    /// Keeps the memories `ids` names in `bank`, so they never fade
+    /// (`memory_keep`, TIM-94, decision 9).
+    pub fn keep(&self, bank: &str, ids: &[String]) -> Result<Kept, KeepError> {
+        crate::keep::keep(&self.store, bank, ids)
+    }
+
+    /// Hands the memories `ids` names in `bank` back to the significance
+    /// extraction gave them (`memory_unkeep`).
+    pub fn unkeep(&self, bank: &str, ids: &[String]) -> Result<Unkept, KeepError> {
+        crate::keep::unkeep(&self.store, bank, ids)
+    }
+
+    /// Checkpoints the WAL into the database file, as the daemon does on
+    /// SIGTERM once the chunk in flight is done (TIM-94, decision 3).
+    pub fn checkpoint(&self) -> Result<(), StoreError> {
+        self.store.checkpoint()
+    }
+
     /// The periodic store upkeep. `serve` calls it on a timer and the replay
     /// harness after advancing its clock, so it runs on this service's clock
     /// either way (TIM-96, decision 3). It runs whether or not purge is
@@ -356,14 +445,27 @@ impl Service {
         })
     }
 
-    /// What `/v1/health` reports. The daemon is not ready while models load
-    /// and migrations run; both happen before the service is built, so once
-    /// it exists it is ready.
+    /// What `/v1/health` reports once the service exists. The daemon is not
+    /// ready while migrations run and models load; both happen before the
+    /// service is built, and the daemon answers with [`Health::starting`]
+    /// until then.
     pub fn health(&self) -> Health {
         Health {
             version: crate::VERSION,
             ready: true,
             now: self.now(),
+        }
+    }
+}
+
+impl Health {
+    /// What `/v1/health` reports before the service exists: while the store
+    /// opens and migrates and the models load.
+    pub fn starting(now: Timestamp) -> Self {
+        Self {
+            version: crate::VERSION,
+            ready: false,
+            now,
         }
     }
 }

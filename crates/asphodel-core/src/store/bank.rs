@@ -11,7 +11,7 @@
 
 use jiff::tz::TimeZone;
 use rusqlite::{OptionalExtension, Transaction};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{Store, StoreError, micros, nfc};
@@ -30,9 +30,11 @@ pub const PROFILE_QUESTION: &str = "Who is the user: their preferences, importan
 pub const PROFILE_FILTER_KINDS: &str = r#"["fact","state"]"#;
 pub const PROFILE_MIN_VOLATILITY: &str = "weeks";
 
-/// What `initialize` and `bank config` send. Every field is optional; an
-/// absent one is left as it is.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// What `initialize` and `bank config` send, as the body of
+/// `PUT /v1/banks/{bank}`. Every field is optional; an absent one is left as
+/// it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BankIdentity {
     pub owner_name: Option<String>,
     /// Platform ids of the owner, such as `discord:1234`. Each becomes the

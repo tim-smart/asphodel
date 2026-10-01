@@ -33,6 +33,11 @@ pub struct ResolvedConfig {
     /// The LLM's auth mode and login state. `None` when `[llm]` isn't
     /// configured. Never a key or a token.
     pub llm: Option<LlmStatus>,
+
+    /// Whether extraction runs on a scripted fake LLM rather than the
+    /// configured one, as integration tests start the daemon. Like
+    /// [`ModelsConfig::fake`], it's here so nobody mistakes one for the other.
+    pub fake_llm: bool,
 }
 
 /// Whether purge and the sweep are running, given the fingerprint stored in
@@ -91,6 +96,7 @@ impl ResolvedConfig {
             purge: PurgePause::Unchecked,
             models: None,
             llm: None,
+            fake_llm: false,
         }
     }
 }

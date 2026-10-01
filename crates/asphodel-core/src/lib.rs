@@ -11,6 +11,7 @@ pub mod config;
 pub mod constants;
 pub mod extraction;
 pub mod ingest;
+pub mod keep;
 pub mod logging;
 pub mod models;
 pub mod queue;

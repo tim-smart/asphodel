@@ -78,6 +78,15 @@ cassette records the logical request (template, prompts, schema), never
 the wire body or headers, so a recording made in one mode replays in the
 other.
 
+`ASPHODEL_LLM_SCRIPT=<file>` runs the daemon's extraction workers on a
+`FakeLlm` that plays the file's steps in order, one per call: a JSON array
+of `{"reply": <json>}` or `{"fail": "<kind>"}` steps, each with an optional
+`delay_ms`. The kinds are `transport`, `timeout`, `status` (with `status`,
+default 500), `no_content`, `not_json`, `refused`, `login_required` and
+`usage_limited` (with `resets_at`). Once the script runs out, every call
+fails with `no_content`. It is for integration tests, environment only, and
+the resolved config shows `fake_llm = true`.
+
 ### `auth = "api_key"` (the default)
 
 Any OpenAI-compatible `chat/completions` endpoint. `llm.endpoint` is
