@@ -14,7 +14,8 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use asphodel_core::{Health, Service, SystemClock};
+use asphodel_core::config::{Deployment, LLM_API_KEY_ENV, Secret, TOKEN_ENV};
+use asphodel_core::{Health, ResolvedConfig, Service, SystemClock, Tuning};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::signal;
@@ -29,16 +30,21 @@ type Shared = Arc<Service>;
 mod tests;
 
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
-    if !args.listen.is_local() && args.token.as_deref().unwrap_or("").is_empty() {
+    let config = resolve_config(&args)?;
+    if !args.listen.is_local() && config.deployment.token.is_none() {
         bail!(
             "listening on {} is reachable off this machine, so a bearer token is required: \
-             set ASPHODEL_TOKEN or pass --token",
+             set {TOKEN_ENV}",
             args.listen
         );
     }
     if args.data_dir.is_none() {
         warn!("no --data-dir given; the store arrives in a later stage, so nothing is persisted");
     }
+    info!(
+        config = %serde_json::to_string(&config)?,
+        "resolved config"
+    );
 
     let service: Shared = Arc::new(Service::new(Arc::new(SystemClock)));
     let app = Router::new()
@@ -66,6 +72,22 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     }
     info!("asphodel stopped");
     Ok(())
+}
+
+/// Loads the tuning file and records the deployment. An unreadable file,
+/// an unknown key or an out-of-range value stops the daemon starting.
+fn resolve_config(args: &ServeArgs) -> anyhow::Result<ResolvedConfig> {
+    let tuning = Tuning::load(args.config.as_deref())?;
+    let deployment = Deployment {
+        listen: args.listen.to_string(),
+        data_dir: args.data_dir.clone(),
+        config: args.config.clone(),
+        allow_network_fs: args.allow_network_fs,
+        model_dir: args.model_dir.clone(),
+        token: Secret::from_env(TOKEN_ENV),
+        llm_api_key: Secret::from_env(LLM_API_KEY_ENV),
+    };
+    Ok(ResolvedConfig::new(tuning, deployment))
 }
 
 /// Binds a Unix socket, recovering only a stale socket (never a file,

@@ -68,23 +68,31 @@ pub struct ClientArgs {
     pub token: Option<String>,
 }
 
+/// Deployment flags (ADR 0009). Each has an `ASPHODEL_*` environment
+/// variable, and a flag wins over its variable. The secrets, `ASPHODEL_TOKEN`
+/// and `ASPHODEL_LLM_API_KEY`, have no flag: they come from the environment
+/// only, so they never show up in a process list.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
     /// Address to listen on: `host:port`, or `unix:/path` for a socket.
-    #[arg(long, default_value_t = Listen::default())]
+    #[arg(long, env = "ASPHODEL_LISTEN", default_value_t = Listen::default())]
     pub listen: Listen,
 
     /// Directory holding the SQLite store and its lock.
     #[arg(long, env = "ASPHODEL_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
-    /// Bearer token required of clients. Mandatory off loopback.
-    #[arg(long, env = "ASPHODEL_TOKEN", hide_env_values = true)]
-    pub token: Option<String>,
+    /// The tuning file (TOML). Without one, the code defaults apply.
+    #[arg(long, env = "ASPHODEL_CONFIG")]
+    pub config: Option<PathBuf>,
 
     /// Run even when the data dir is on a network filesystem.
-    #[arg(long)]
+    #[arg(long, env = "ASPHODEL_ALLOW_NETWORK_FS")]
     pub allow_network_fs: bool,
+
+    /// Directory holding the embedding and reranker models.
+    #[arg(long, env = "ASPHODEL_MODEL_DIR")]
+    pub model_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
