@@ -256,6 +256,11 @@ pub(crate) fn finish(
              WHERE source_id = (SELECT source_id FROM chunks WHERE id = ?1)",
             [lease.chunk_id],
         )?;
+        tx.execute(
+            "DELETE FROM turn_entries
+             WHERE source_id = (SELECT source_id FROM chunks WHERE id = ?1)",
+            [lease.chunk_id],
+        )?;
     }
     tx.execute(
         "DELETE FROM extraction_queue WHERE id = ?1",

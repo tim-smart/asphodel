@@ -476,6 +476,7 @@ impl Harness {
                     session_id: session.into(),
                     query: query.into(),
                     previous_query: previous.map(Into::into),
+                    block_id: None,
                 },
             )
             .unwrap()

@@ -190,8 +190,9 @@ pub(crate) fn refresh_input(
 }
 
 /// Refreshes `model` with `llm`. Unless `force`, it's skipped when the
-/// fingerprint matches the last completed refresh's. An LLM failure or a
-/// malformed reply is `Ok(Outcome::Failed)`, recorded on the model.
+/// fingerprint matches the last completed refresh's. A failed retrieval,
+/// an LLM failure or a malformed reply is `Ok(Outcome::Failed)`, recorded
+/// on the model so the schedule waits before trying again.
 pub(crate) fn refresh(
     cx: &Context<'_>,
     model: &ModelRow,
@@ -199,7 +200,16 @@ pub(crate) fn refresh(
     force: bool,
 ) -> Result<Outcome, ModelError> {
     let started = cx.store.now();
-    let selection = select(cx, model, true)?;
+    // A failed retrieval is a failed refresh like any other: recorded, and
+    // tried again once the interval has passed, never on every timer pass.
+    let selection = match select(cx, model, true) {
+        Ok(selection) => selection,
+        Err(ModelError::Retrieval(error)) => {
+            tracing::warn!(model = %model.uuid, %error, "a mental model refresh's retrieval failed");
+            return failed(cx, model, FailureKind::Retrieval);
+        }
+        Err(error) => return Err(error),
+    };
     if !force && model.last_fingerprint.as_deref() == Some(selection.input.fingerprint.as_str()) {
         let conn = cx.store.connection();
         conn.execute(

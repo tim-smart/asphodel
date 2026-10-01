@@ -22,6 +22,12 @@
 //!   block per session and restores it after a restart without asking
 //!   again, so the mapping lives in the store and expires after
 //!   `sessions.mapping_expiry_days` without a turn.
+//! - **The fallback.** Every built block is kept by id (`prompt_blocks`),
+//!   with what it lists and cites and its rendered entries. A plugin that
+//!   got a block without a session id sends the id with its first prefetch,
+//!   and the session is mapped to that block then, even if the cache has
+//!   rebuilt since. The block's entries are also what a turn's snapshot
+//!   takes, so call 1 is shown the entries the session could see.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -62,6 +68,16 @@ impl Block {
         }
         ids
     }
+}
+
+/// A rendered entry as the block held it, with the memories it cites. It's
+/// what call 1 is shown, by handle, for a turn in a session holding the
+/// block (TIM-95, decision 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockEntry {
+    pub entry: Uuid,
+    pub text: String,
+    pub cites: Vec<Uuid>,
 }
 
 /// Each bank's block, with the local date it was built for. Each clear
@@ -158,6 +174,7 @@ pub(crate) fn build(
     }
 
     let mut cited: Vec<Uuid> = Vec::new();
+    let mut entries: Vec<BlockEntry> = Vec::new();
     for model in load_models(&conn, bank_id)?
         .into_iter()
         .filter(|model| model.enabled)
@@ -173,6 +190,11 @@ pub(crate) fn build(
                     cited.push(*uuid);
                 }
             }
+            entries.push(BlockEntry {
+                entry: entry.uuid,
+                text: entry.text.clone(),
+                cites: entry.cites.iter().map(|(_, uuid)| *uuid).collect(),
+            });
         }
         // An empty model renders nothing, not even a header (decision 5).
         if !lines.is_empty() {
@@ -181,13 +203,27 @@ pub(crate) fn build(
     }
     sections.push(pointer(now, tz));
 
-    Ok(Block {
+    let block = Block {
         id: store.new_id(),
         built_at: now,
         text: sections.join("\n\n"),
         agenda: agenda.agenda.listed(),
         cited,
-    })
+    };
+    // Kept by id, for the plugin that sends it with its first prefetch and
+    // for the entries a turn's snapshot takes.
+    conn.execute(
+        "INSERT INTO prompt_blocks (uuid, bank_id, in_context, entries, built_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (
+            block.id.to_string(),
+            bank_id,
+            serde_json::to_string(&block.in_context()).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into()),
+            micros(now),
+        ),
+    )?;
+    Ok(block)
 }
 
 /// An entry's line, or `None` when any memory it cites is retracted,
@@ -257,15 +293,15 @@ pub(crate) fn map_session(
     Ok(())
 }
 
-/// What the session's block put in context, unless the mapping expired, in
-/// which case it's deleted.
+/// What the session's block put in context, or `None` when the session has
+/// no mapping. An expired mapping is deleted and counts as none.
 pub(crate) fn mapped(
     conn: &Connection,
     bank_id: i64,
     session: &str,
     now: Timestamp,
     expiry: SignedDuration,
-) -> Result<Vec<Uuid>, rusqlite::Error> {
+) -> Result<Option<Vec<Uuid>>, rusqlite::Error> {
     let found: Option<(String, i64)> = conn
         .query_row(
             "SELECT cited, last_turn_at FROM session_blocks
@@ -275,13 +311,61 @@ pub(crate) fn mapped(
         )
         .optional()?;
     let Some((ids, last_turn_at)) = found else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if expired(timestamp(last_turn_at), now, expiry) {
         unmap_session(conn, bank_id, session)?;
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    Ok(serde_json::from_str(&ids).unwrap_or_default())
+    Ok(Some(serde_json::from_str(&ids).unwrap_or_default()))
+}
+
+/// The block-id fallback (TIM-95, decision 4): when Hermes gave no session
+/// id at `system_prompt_block()` time, the plugin sends the block's id with
+/// its first prefetch, and the session is mapped to that block then. Only a
+/// block of the same bank counts, an unknown id maps nothing, and a session
+/// that already has a mapping keeps it. Returns whether it mapped.
+pub(crate) fn map_held_block(
+    conn: &Connection,
+    bank_id: i64,
+    session: &str,
+    block: Uuid,
+    now: Timestamp,
+) -> Result<bool, rusqlite::Error> {
+    let mapped = conn.execute(
+        "INSERT INTO session_blocks (bank_id, session_id, block_id, cited, built_at, last_turn_at)
+         SELECT bank_id, ?2, uuid, in_context, built_at, ?4 FROM prompt_blocks
+         WHERE uuid = ?3 AND bank_id = ?1
+         ON CONFLICT (bank_id, session_id) DO NOTHING",
+        (bank_id, session, block.to_string(), micros(now)),
+    )?;
+    Ok(mapped > 0)
+}
+
+/// The entries of the block the session holds, for the turn's snapshot.
+/// Empty when the session has no live mapping or its block is gone.
+pub(crate) fn mapped_entries(
+    conn: &Connection,
+    bank_id: i64,
+    session: &str,
+    now: Timestamp,
+    expiry: SignedDuration,
+) -> Result<Vec<BlockEntry>, rusqlite::Error> {
+    let found: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT b.entries, s.last_turn_at FROM session_blocks s
+             JOIN prompt_blocks b ON b.uuid = s.block_id AND b.bank_id = s.bank_id
+             WHERE s.bank_id = ?1 AND s.session_id = ?2",
+            (bank_id, session),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match found {
+        Some((entries, last_turn_at)) if !expired(timestamp(last_turn_at), now, expiry) => {
+            Ok(serde_json::from_str(&entries).unwrap_or_default())
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// A turn arrived in the session: its mapping's expiry starts over.
@@ -319,10 +403,20 @@ pub(crate) fn expire_mappings(
     expiry: SignedDuration,
 ) -> Result<usize, rusqlite::Error> {
     let cutoff = now.checked_sub(expiry).unwrap_or(Timestamp::MIN);
-    conn.execute(
+    let mappings = conn.execute(
         "DELETE FROM session_blocks WHERE last_turn_at <= ?1",
         [micros(cutoff)],
-    )
+    )?;
+    // A block no session holds is only waiting for a prefetch to name it,
+    // which a plugin does at once or not at all.
+    conn.execute(
+        "DELETE FROM prompt_blocks WHERE built_at <= ?1
+           AND NOT EXISTS (SELECT 1 FROM session_blocks s
+                           WHERE s.bank_id = prompt_blocks.bank_id
+                             AND s.block_id = prompt_blocks.uuid)",
+        [micros(cutoff)],
+    )?;
+    Ok(mappings)
 }
 
 fn expired(last_turn_at: Timestamp, now: Timestamp, expiry: SignedDuration) -> bool {

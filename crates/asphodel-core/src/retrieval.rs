@@ -75,6 +75,12 @@ pub struct PrefetchRequest {
     /// follow-up borrows. The plugin drops it on `memory_forget`.
     #[serde(default)]
     pub previous_query: Option<String>,
+    /// The block `system_prompt_block()` returned, when Hermes gave no
+    /// session id then. The plugin sends it with the session's first
+    /// prefetch, and the daemon maps the session to that block unless it
+    /// already holds one (TIM-95, decision 4).
+    #[serde(default)]
+    pub block_id: Option<Uuid>,
 }
 
 /// What `prefetch` returns.

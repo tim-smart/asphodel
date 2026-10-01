@@ -217,6 +217,9 @@ pub enum FailureKind {
     Llm,
     /// The reply didn't parse as operations.
     Malformed,
+    /// The retrieval for the question failed, such as the embedder
+    /// erroring, so there was nothing to send.
+    Retrieval,
 }
 
 impl FailureKind {
@@ -224,6 +227,7 @@ impl FailureKind {
         match self {
             FailureKind::Llm => "llm",
             FailureKind::Malformed => "malformed",
+            FailureKind::Retrieval => "retrieval",
         }
     }
 
@@ -231,6 +235,7 @@ impl FailureKind {
         match text {
             "llm" => Some(FailureKind::Llm),
             "malformed" => Some(FailureKind::Malformed),
+            "retrieval" => Some(FailureKind::Retrieval),
             _ => None,
         }
     }

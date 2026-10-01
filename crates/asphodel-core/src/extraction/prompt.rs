@@ -73,7 +73,7 @@ Link each claim to the entities it's about. Known entities are listed with a han
 
 # Used
 
-The memories already in the assistant's context are listed with handles (`m1`, `m2`, …). In `used_injected_ids`, give the handles of those the assistant's reply actually relied on. Being shown a memory isn't using it, and a document has no reply, so for a document this is empty."#;
+The memories already in the assistant's context are listed with handles (`m1`, `m2`, …), and so are any entries of the assistant's standing notes about the user (`n1`, `n2`, …), each with the memories it rests on. In `used_injected_ids`, give the handles of those the assistant's reply actually relied on: a memory's, or an entry's when the reply relied on the entry. Being shown a memory or an entry isn't using it, and a document has no reply, so for a document this is empty."#;
 
 /// Call 1's request for `input`. The reply schema is strict, every property
 /// required.
@@ -155,6 +155,18 @@ fn render(input: &Call1Input) -> String {
     }
     for memory in &input.in_context {
         let _ = writeln!(out, "- {}: {}", memory.handle, memory.content);
+    }
+    if !input.entries.is_empty() {
+        out.push_str("\nEntries in the assistant's context, with the memories each rests on:\n");
+        for entry in &input.entries {
+            let _ = writeln!(
+                out,
+                "- {}: {} [rests on {}]",
+                entry.handle,
+                entry.text,
+                entry.cites.join(", ")
+            );
+        }
     }
 
     if !input.context.is_empty() {

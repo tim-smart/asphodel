@@ -32,7 +32,7 @@ use crate::retrieval::{Permit, Prefetch, PrefetchRequest, Recall, RecallError, R
 use crate::sessions::Sessions;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
-use crate::system_prompt::{Block, Blocks};
+use crate::system_prompt::{Block, BlockEntry, Blocks};
 
 /// One running store: the daemon's banks, models, extraction queue and jobs,
 /// driven by a clock.
@@ -211,9 +211,21 @@ impl Service {
             let conn = self.store.connection();
             crate::ingest::find_bank(&conn, bank)?.map(|(bank_id, _)| bank_id)
         };
-        if let Some(bank_id) = bank_id {
-            self.restore_block(bank_id, &turn.session_id)?;
-        }
+        let entries = match bank_id {
+            Some(bank_id) => {
+                self.restore_block(bank_id, &turn.session_id)?;
+                let conn = self.store.connection();
+                crate::system_prompt::mapped_entries(
+                    &conn,
+                    bank_id,
+                    &turn.session_id,
+                    self.now(),
+                    self.mapping_expiry(),
+                )
+                .map_err(StoreError::Sqlite)?
+            }
+            None => Vec::new(),
+        };
         let in_context = bank_id.map_or_else(Vec::new, |bank_id| {
             self.sessions.after_turn(
                 bank_id,
@@ -222,7 +234,7 @@ impl Service {
                 self.now(),
             )
         });
-        let ingested = crate::ingest::ingest_turn(&self.store, bank, turn, &in_context)?;
+        let ingested = crate::ingest::ingest_turn(&self.store, bank, turn, &in_context, &entries)?;
         if ingested.outcome == Outcome::Duplicate {
             return Ok(ingested);
         }
@@ -315,6 +327,19 @@ impl Service {
         llm: &dyn LlmClient,
         in_context: &[Uuid],
     ) -> Result<Extracted, ExtractError> {
+        self.extract_with_entries(lease, llm, in_context, &[])
+    }
+
+    /// [`Service::extract_chunk`] with the entries of the block the turn's
+    /// session held, which call 1 is shown with the memories they cite
+    /// (TIM-95, decision 4).
+    fn extract_with_entries(
+        &self,
+        lease: Lease,
+        llm: &dyn LlmClient,
+        in_context: &[Uuid],
+        entries: &[BlockEntry],
+    ) -> Result<Extracted, ExtractError> {
         let models = self.models.as_ref().ok_or(ExtractError::NoModels)?;
         let bank_id = lease.bank_id();
         let watermark = {
@@ -329,6 +354,7 @@ impl Service {
             lease,
             llm,
             in_context,
+            entries,
         )?;
         self.after_writes(bank_id, watermark, &extracted.memories)?;
         Ok(extracted)
@@ -339,6 +365,9 @@ impl Service {
     /// that echoes its `recall_id` ([`crate::retrieval`]).
     pub fn prefetch(&self, bank: &str, request: &PrefetchRequest) -> Result<Prefetch, RecallError> {
         if let Ok(bank_id) = self.bank_id(bank) {
+            if let Some(block) = request.block_id {
+                self.map_held_block(bank_id, &request.session_id, block)?;
+            }
             self.restore_block(bank_id, &request.session_id)?;
         }
         crate::retrieval::prefetch(&self.retrieval()?, bank, request)
@@ -433,37 +462,45 @@ impl Service {
         let Some(lease) = self.claim_chunk(bank)? else {
             return Ok(None);
         };
-        let in_context = match lease.source_kind {
-            SourceKind::Document => Vec::new(),
+        let (in_context, entries) = match lease.source_kind {
+            SourceKind::Document => (Vec::new(), Vec::new()),
             SourceKind::Turn => {
-                let stored: Option<String> = {
+                let stored: Option<(String, Option<String>)> = {
                     let conn = self.store.connection();
                     conn.query_row(
-                        "SELECT t.memories FROM turn_in_context t
+                        "SELECT t.memories, e.entries FROM turn_in_context t
                          JOIN sources s ON s.id = t.source_id
+                         LEFT JOIN turn_entries e ON e.source_id = t.source_id
                          WHERE s.uuid = ?1",
                         [lease.source.to_string()],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()
                     .map_err(StoreError::Sqlite)?
                 };
                 // No row is an empty set, including for a turn ingested
-                // before version 5: the session can't stand in for it.
+                // before version 5: the session can't stand in for it. No
+                // entries is none, including for a turn before version 6.
                 match stored {
-                    Some(stored) => serde_json::from_str(&stored).unwrap_or_else(|error| {
-                        tracing::warn!(
-                            source = %lease.source,
-                            %error,
-                            "a turn's stored in-context set doesn't parse; extracting without it"
-                        );
-                        Vec::new()
-                    }),
-                    None => Vec::new(),
+                    Some((memories, entries)) => (
+                        serde_json::from_str(&memories).unwrap_or_else(|error| {
+                            tracing::warn!(
+                                source = %lease.source,
+                                %error,
+                                "a turn's stored in-context set doesn't parse; extracting without it"
+                            );
+                            Vec::new()
+                        }),
+                        entries
+                            .and_then(|entries| serde_json::from_str(&entries).ok())
+                            .unwrap_or_default(),
+                    ),
+                    None => (Vec::new(), Vec::new()),
                 }
             }
         };
-        self.extract_chunk(lease, llm, &in_context).map(Some)
+        self.extract_with_entries(lease, llm, &in_context, &entries)
+            .map(Some)
     }
 
     /// The names of every bank in the store, so the daemon can start a
@@ -671,7 +708,7 @@ impl Service {
                     }
                     Err(error) => {
                         tracing::warn!(bank = %bank, model = %model.uuid, %error,
-                            "a mental model refresh failed before its LLM call");
+                            "a mental model refresh failed in the store");
                     }
                 }
             }
@@ -758,9 +795,29 @@ impl Service {
         let ids = {
             let conn = self.store.connection();
             crate::system_prompt::mapped(&conn, bank_id, session_id, now, self.mapping_expiry())?
+                .unwrap_or_default()
         };
         if !ids.is_empty() {
             self.sessions.add(bank_id, session_id, &ids, now);
+        }
+        Ok(())
+    }
+
+    /// The block-id fallback: maps the session to the block the plugin
+    /// holds, unless it already has a live mapping ([`crate::system_prompt::map_held_block`]).
+    fn map_held_block(
+        &self,
+        bank_id: i64,
+        session_id: &str,
+        block: Uuid,
+    ) -> Result<(), StoreError> {
+        let now = self.now();
+        let conn = self.store.connection();
+        let expiry = self.mapping_expiry();
+        if crate::system_prompt::mapped(&conn, bank_id, session_id, now, expiry)?.is_none()
+            && !crate::system_prompt::map_held_block(&conn, bank_id, session_id, block, now)?
+        {
+            tracing::debug!(%block, "a prefetch named a block this bank never built");
         }
         Ok(())
     }
