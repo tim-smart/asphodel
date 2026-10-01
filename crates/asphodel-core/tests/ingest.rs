@@ -27,7 +27,7 @@ use asphodel_core::Service;
 use asphodel_core::clock::{Clock, SimulatedClock};
 use asphodel_core::config::Tuning;
 use asphodel_core::store::bank::{BankIdentity, ModelIds};
-use asphodel_core::store::{DB_FILE, OpenOptions, Store, micros};
+use asphodel_core::store::{DB_FILE, OpenOptions, Store, micros, migrations};
 use jiff::civil::{Date, date};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
@@ -2338,4 +2338,370 @@ fn a_repeated_section_in_an_edit_is_queued_when_no_earlier_version_had_it() {
     let second = ingest_doc(&h, "main", &document("life.md", &v2, date(2026, 9, 8)));
     assert_eq!(second.chunks_skipped, 1, "Plans was in v1");
     assert_eq!(second.chunks_queued, 2, "both Home sections are new");
+}
+
+// Speaker ids and the version 2 migration (TIM-94 decision 1; the TIM-106
+// review)
+
+/// Puts the harness's store back to schema version 1, as the version 1
+/// binary would have left it after the same calls: drops `speaker_ids` and
+/// the edits only version 2 writes, and leaves one `migrations` row 0 to 1.
+/// Every alias, entity and `entity_created` edit stays as written, because
+/// version 1 bank config and ingest wrote them the same way. Reopening
+/// migrates it to version 2.
+fn downgrade_to_v1_and_reopen(h: Harness) -> Harness {
+    {
+        let store = h.service.store().unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "DROP TABLE speaker_ids;
+                 DELETE FROM edits WHERE kind = 'speaker_id_set';
+                 DELETE FROM migrations;
+                 INSERT INTO migrations (from_version, to_version, binary_version, started_at,
+                                         completed_at)
+                   VALUES (0, 1, 'v1', 0, 0);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+    }
+    h.restart()
+}
+
+/// The `speaker_ids` of `bank`: platform id to entity uuid.
+fn speaker_ids(h: &Harness, bank: &str) -> Vec<(String, Uuid)> {
+    let store = h.service.store().unwrap();
+    let conn = store.connection();
+    let mut statement = conn
+        .prepare(
+            "SELECT s.platform_id, e.uuid FROM speaker_ids s
+             JOIN entities e ON e.id = s.entity_id JOIN banks b ON b.id = s.bank_id
+             WHERE b.name = ?1 ORDER BY s.platform_id",
+        )
+        .unwrap();
+    statement
+        .query_map([bank], |row| {
+            Ok((row.get(0)?, row.get::<_, String>(1)?.parse().unwrap()))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn speaker(h: &Harness, bank: &str, platform: &str, id: &str, name: &str) -> (Uuid, bool) {
+    let got = ingest(
+        h,
+        bank,
+        &Turn {
+            platform: Some(platform.into()),
+            ..discord_turn(&next_message_at(), "Hello.", author(id, name))
+        },
+    );
+    let speaker = got.speaker.expect("a stored turn has a speaker");
+    (speaker.entity, speaker.owner)
+}
+
+/// A message time no other call has used, so no turn is a duplicate.
+fn next_message_at() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("2026-10-01T05:{:02}:{:02}Z", (n / 60) % 60, n % 60)
+}
+
+#[test]
+fn an_upgrade_from_version_1_records_one_migration_and_keeps_a_copy() {
+    let h = downgrade_to_v1_and_reopen(Harness::new());
+    let store = h.service.store().unwrap();
+    let applied = store.applied().expect("version 1 is migrated");
+    assert_eq!((applied.from, applied.to), (1, 2));
+    assert_eq!(store.schema_version().unwrap(), 2);
+    let copy = migrations::copy_path(&h.dir.data(), 1);
+    assert_eq!(applied.copy.as_deref(), Some(copy.as_path()));
+    assert!(
+        copy.exists(),
+        "the pre-migration copy is keyed by version 1"
+    );
+
+    let conn = store.connection();
+    let mut statement = conn
+        .prepare("SELECT from_version, to_version FROM migrations ORDER BY id")
+        .unwrap();
+    let rows: Vec<(i64, i64)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, [(0, 1), (1, 2)], "one row for the upgrade");
+}
+
+#[test]
+fn an_upgrade_maps_the_owners_platform_ids_and_not_their_names() {
+    // In version 1 only bank config wrote aliases of `user`: the owner's
+    // names, renames included, and platform ids. Only the ids are
+    // identities.
+    let h = Harness::new();
+    h.service
+        .ensure_bank(
+            "main",
+            &BankIdentity {
+                owner_name: Some("Timothy".into()),
+                owner_platform_ids: vec!["telegram:42".into()],
+                ..BankIdentity::default()
+            },
+            &models(),
+        )
+        .unwrap();
+    let h = downgrade_to_v1_and_reopen(h);
+    let user = h.seeded("main", "user");
+    assert_eq!(
+        speaker_ids(&h, "main"),
+        [
+            ("discord:1234".to_string(), user),
+            ("telegram:42".to_string(), user),
+        ]
+    );
+    assert_eq!(speaker(&h, "main", "discord", "1234", "Tim"), (user, true));
+    assert_eq!(speaker(&h, "main", "telegram", "42", "Tim"), (user, true));
+}
+
+#[test]
+#[ignore = "TIM-106: the migration maps an owner name shaped like a platform id; activate with its fix"]
+fn an_upgrade_does_not_map_an_owner_name_shaped_like_a_platform_id() {
+    // The trust boundary of the backfill. An owner whose configured name
+    // looks like a platform id still has a name, not an id: a stranger
+    // whose platform id happens to match it must not become the owner.
+    // The same goes for the assistant's name.
+    let h = Harness::new();
+    h.service
+        .ensure_bank(
+            "odd",
+            &BankIdentity {
+                owner_name: Some("discord:9999".into()),
+                owner_platform_ids: vec!["discord:1234".into()],
+                assistant_name: Some("discord:8888".into()),
+                timezone: Some(TZ.into()),
+            },
+            &models(),
+        )
+        .unwrap();
+    let h = downgrade_to_v1_and_reopen(h);
+    let user = h.seeded("odd", "user");
+    assert_eq!(
+        speaker_ids(&h, "odd"),
+        [("discord:1234".to_string(), user)],
+        "only the configured platform id is an identity"
+    );
+    let (entity, owner) = speaker(&h, "odd", "discord", "9999", "Stranger");
+    assert!(
+        !owner,
+        "a stranger with the owner's name as their id isn't the owner"
+    );
+    assert_ne!(entity, user);
+    let (entity, owner) = speaker(&h, "odd", "discord", "8888", "Other");
+    assert!(!owner);
+    assert_ne!(entity, h.seeded("odd", "assistant"));
+}
+
+#[test]
+fn an_owner_name_shaped_like_a_platform_id_is_not_a_speaker_id() {
+    // The same boundary on a version 2 store: bank config maps platform ids
+    // only.
+    let h = Harness::new();
+    h.service
+        .ensure_bank(
+            "odd",
+            &BankIdentity {
+                owner_name: Some("discord:9999".into()),
+                owner_platform_ids: vec!["discord:1234".into()],
+                assistant_name: Some("discord:8888".into()),
+                timezone: Some(TZ.into()),
+            },
+            &models(),
+        )
+        .unwrap();
+    let user = h.seeded("odd", "user");
+    assert_eq!(speaker_ids(&h, "odd"), [("discord:1234".to_string(), user)]);
+    let (entity, owner) = speaker(&h, "odd", "discord", "9999", "Stranger");
+    assert!(!owner);
+    assert_ne!(entity, user);
+}
+
+#[test]
+fn an_upgrade_keeps_the_speakers_version_1_ingest_created() {
+    let h = Harness::new();
+    let (sam, _) = speaker(&h, "main", "discord", "5678", "Sam");
+    let (impostor, _) = speaker(&h, "main", "discord", "2000", "discord:3000");
+    let h = downgrade_to_v1_and_reopen(h);
+
+    let user = h.seeded("main", "user");
+    assert_eq!(
+        speaker_ids(&h, "main"),
+        [
+            ("discord:1234".to_string(), user),
+            ("discord:2000".to_string(), impostor),
+            ("discord:5678".to_string(), sam),
+        ],
+        "each speaker's first alias, and no display name"
+    );
+    assert_eq!(speaker(&h, "main", "discord", "5678", "Sam"), (sam, false));
+    assert_eq!(
+        speaker(&h, "main", "discord", "2000", "discord:3000"),
+        (impostor, false)
+    );
+    let (real, owner) = speaker(&h, "main", "discord", "3000", "Sam");
+    assert!(!owner);
+    assert_ne!(real, impostor, "a display name didn't become an identity");
+}
+
+#[test]
+fn an_upgrade_gives_the_owner_an_id_a_stranger_held_first() {
+    // Version 1: the owner spoke from discord:1234 before it was configured,
+    // so ingest made them a stranger; then bank config added the id to
+    // `user`. Bank config wins.
+    let h = Harness::new();
+    let late = BankIdentity {
+        owner_platform_ids: Vec::new(),
+        ..identity()
+    };
+    h.service.ensure_bank("late", &late, &models()).unwrap();
+    let (stranger, owner) = speaker(&h, "late", "discord", "1234", "Tim");
+    assert!(!owner);
+    h.service
+        .ensure_bank(
+            "late",
+            &BankIdentity {
+                owner_platform_ids: vec!["discord:1234".into()],
+                ..BankIdentity::default()
+            },
+            &models(),
+        )
+        .unwrap();
+    let h = downgrade_to_v1_and_reopen(h);
+    let user = h.seeded("late", "user");
+    assert_eq!(
+        speaker_ids(&h, "late"),
+        [("discord:1234".to_string(), user)]
+    );
+    assert_eq!(speaker(&h, "late", "discord", "1234", "Tim"), (user, true));
+    assert_ne!(stranger, user);
+}
+
+#[test]
+fn an_upgrade_does_not_trust_an_alias_of_unknown_origin() {
+    // Shape alone proves nothing: an alias on an entity ingest didn't
+    // create, or a later alias of one it did, isn't a platform id.
+    let h = Harness::new();
+    let (sam, _) = speaker(&h, "main", "discord", "5678", "Sam");
+    let bank: i64 = h.one("SELECT id FROM banks WHERE name = 'main'", []);
+    h.execute(
+        "INSERT INTO entities (uuid, bank_id, name, kind, created_at, updated_at)
+         VALUES ('01a0f000-0000-7000-8000-0000000000aa', ?1, 'Maya', 'person', ?2, ?2)",
+        (bank, h.now()),
+    );
+    let maya: i64 = h.one(
+        "SELECT id FROM entities WHERE uuid = '01a0f000-0000-7000-8000-0000000000aa'",
+        [],
+    );
+    let sam_id: i64 = h.one("SELECT id FROM entities WHERE uuid = ?1", [sam.to_string()]);
+    for (entity, alias) in [(maya, "slack:77"), (sam_id, "slack:88")] {
+        h.execute(
+            "INSERT INTO entity_aliases (bank_id, entity_id, alias, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            (bank, entity, alias, h.now()),
+        );
+    }
+    let h = downgrade_to_v1_and_reopen(h);
+    let ids: Vec<String> = speaker_ids(&h, "main")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ids, ["discord:1234", "discord:5678"]);
+    let (entity, _) = speaker(&h, "main", "slack", "77", "Maya");
+    assert_ne!(
+        entity,
+        "01a0f000-0000-7000-8000-0000000000aa"
+            .parse::<Uuid>()
+            .unwrap()
+    );
+    let (entity, _) = speaker(&h, "main", "slack", "88", "Sam");
+    assert_ne!(entity, sam);
+}
+
+#[test]
+fn bank_config_takes_a_platform_id_over_from_a_stranger_and_logs_it() {
+    let h = Harness::new();
+    let late = BankIdentity {
+        owner_platform_ids: Vec::new(),
+        ..identity()
+    };
+    h.service.ensure_bank("late", &late, &models()).unwrap();
+    let (stranger, owner) = speaker(&h, "late", "discord", "1234", "Tim");
+    assert!(!owner);
+    let set_edits = |h: &Harness| -> i64 {
+        h.one(
+            "SELECT COUNT(*) FROM edits e JOIN banks b ON b.id = e.bank_id
+             WHERE b.name = 'late' AND e.kind = 'speaker_id_set'",
+            [],
+        )
+    };
+    let before = set_edits(&h);
+
+    let config = BankIdentity {
+        owner_platform_ids: vec!["discord:1234".into()],
+        ..BankIdentity::default()
+    };
+    h.service.ensure_bank("late", &config, &models()).unwrap();
+    let user = h.seeded("late", "user");
+    assert_eq!(speaker(&h, "late", "discord", "1234", "Tim"), (user, true));
+    assert_eq!(set_edits(&h), before + 1, "the takeover is logged");
+    let details: String = h.one(
+        "SELECT e.details FROM edits e JOIN entities n ON n.id = e.entity_id
+         WHERE e.kind = 'speaker_id_set' AND n.uuid = ?1 ORDER BY e.id DESC LIMIT 1",
+        [user.to_string()],
+    );
+    let details: serde_json::Value = serde_json::from_str(&details).unwrap();
+    assert!(
+        details["speaker_id"].is_i64(),
+        "the edit names the mapping by rowid, never the id itself: {details}"
+    );
+    assert!(!details.to_string().contains("1234"));
+    assert_eq!(
+        h.one::<i64, _>(
+            "SELECT COUNT(*) FROM entities WHERE uuid = ?1",
+            [stranger.to_string()]
+        ),
+        1,
+        "the stranger's entity stays"
+    );
+
+    // Every Hermes instance sends the same config on start; repeating it
+    // changes nothing and logs nothing.
+    h.service.ensure_bank("late", &config, &models()).unwrap();
+    assert_eq!(set_edits(&h), before + 1);
+}
+
+#[test]
+fn a_merged_speaker_resolves_to_the_surviving_entity() {
+    // ADR 0010: a merge sets `merged_into` and keeps the row. A speaker id
+    // pointing at the merged entity resolves through it.
+    let h = Harness::new();
+    let (a, _) = speaker(&h, "main", "discord", "5678", "Sam");
+    let (b, _) = speaker(&h, "main", "slack", "U77", "Samuel");
+    h.execute(
+        "UPDATE entities SET merged_into = (SELECT id FROM entities WHERE uuid = ?1)
+         WHERE uuid = ?2",
+        [b.to_string(), a.to_string()],
+    );
+    assert_eq!(speaker(&h, "main", "discord", "5678", "Sam"), (b, false));
+
+    // Merged into `user` (the owner's second account), the speaker is the
+    // owner.
+    let user = h.seeded("main", "user");
+    h.execute(
+        "UPDATE entities SET merged_into = (SELECT id FROM entities WHERE uuid = ?1)
+         WHERE uuid = ?2",
+        [user.to_string(), b.to_string()],
+    );
+    assert_eq!(speaker(&h, "main", "discord", "5678", "Sam"), (user, true));
+    assert_eq!(speaker(&h, "main", "slack", "U77", "Samuel"), (user, true));
 }
