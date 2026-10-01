@@ -5,11 +5,15 @@
 //! every operation takes its notion of "now" from the [`clock::Clock`] it was
 //! given, so a replay can run years of bank time in minutes (ADR 0004).
 
+pub mod chunking;
 pub mod clock;
 pub mod config;
 pub mod constants;
+pub mod ingest;
 pub mod logging;
 pub mod models;
+pub mod queue;
+pub mod secrets;
 pub mod service;
 pub mod store;
 pub mod strength;

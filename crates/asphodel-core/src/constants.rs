@@ -161,6 +161,16 @@ impl Volatility {
 /// the daemon, 3 s in the plugin and 8 s in Hermes.
 pub const RERANKER_DEADLINE: Duration = Duration::from_millis(1500);
 
+// Extraction (TIM-92, TIM-98):
+
+/// The size a document section is split down to when it's too long, in
+/// characters ("at about 3,000 characters").
+pub const CHUNK_CHARS: usize = 3_000;
+
+/// How many failed attempts mark a chunk `failed`. A failed chunk leaves the
+/// queue and is surfaced by `asphodel chunks --failed` instead of retried.
+pub const CHUNK_RETRY_CAP: u32 = 5;
+
 /// The snapshot of the fixed constants that `GET /v1/config` shows as a
 /// read-only section.
 #[derive(Debug, Clone, PartialEq, Serialize)]

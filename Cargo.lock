@@ -115,6 +115,7 @@ dependencies = [
  "fastembed",
  "jiff",
  "libc",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

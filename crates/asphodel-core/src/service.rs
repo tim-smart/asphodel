@@ -11,13 +11,14 @@ use serde::Serialize;
 
 use crate::clock::Clock;
 use crate::config::{ConfigError, Tuning};
+use crate::ingest::{Document, IngestError, Ingested, Turn};
 use crate::models::Models;
+use crate::queue::{ChunkError, FailedChunk, Failure, Lease, Leases, QueueError};
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
 
-/// One running store: the daemon's banks, models and jobs, driven by a clock.
-///
-/// Later stages add the extraction queue behind this type.
+/// One running store: the daemon's banks, models, extraction queue and jobs,
+/// driven by a clock.
 pub struct Service {
     clock: Arc<dyn Clock>,
     store: Store,
@@ -25,6 +26,9 @@ pub struct Service {
     /// `None` only for a service built with [`Service::open`], which the
     /// existing callers use; [`Service::with_models`] always sets it.
     models: Option<Models>,
+    /// The extraction queue's leases, one per bank at most. They live here
+    /// rather than in the store so a restart releases them.
+    leases: Leases,
 }
 
 /// Why a service couldn't be built on a store and models.
@@ -45,6 +49,7 @@ impl Service {
             store,
             tuning,
             models: None,
+            leases: Leases::default(),
         }
     }
 
@@ -67,6 +72,7 @@ impl Service {
             store,
             tuning,
             models: Some(models),
+            leases: Leases::default(),
         })
     }
 
@@ -125,6 +131,51 @@ impl Service {
     ) -> Result<Bank, BankError> {
         let models = self.models.as_ref().ok_or(BankError::NoModels)?;
         self.ensure_bank(name, identity, &models.ids())
+    }
+
+    /// Ingests a turn into `bank`: scans it for secrets, stores it as a
+    /// source and queues it as one chunk, or stores only a tombstone when it
+    /// asked to forget ([`crate::ingest`]).
+    pub fn ingest_turn(&self, bank: &str, turn: &Turn) -> Result<Ingested, IngestError> {
+        crate::ingest::ingest_turn(&self.store, bank, turn)
+    }
+
+    /// Ingests a document into `bank`: scans it for secrets, stores it as a
+    /// source and queues each chunk no earlier version of it had.
+    pub fn ingest_document(
+        &self,
+        bank: &str,
+        document: &Document,
+    ) -> Result<Ingested, IngestError> {
+        crate::ingest::ingest_document(&self.store, bank, document)
+    }
+
+    /// The head of `bank`'s extraction queue, or `None` when the queue is
+    /// empty or the bank's worker already holds a lease ([`crate::queue`]).
+    pub fn claim_chunk(&self, bank: &str) -> Result<Option<Lease>, QueueError> {
+        crate::queue::claim(&self.store, &self.leases, bank)
+    }
+
+    /// Marks a leased chunk extracted and takes it off the queue.
+    pub fn complete_chunk(&self, lease: Lease) -> Result<(), QueueError> {
+        crate::queue::complete(&self.store, &self.leases, lease)
+    }
+
+    /// Counts a failed attempt on a leased chunk. At
+    /// [`CHUNK_RETRY_CAP`](crate::constants::CHUNK_RETRY_CAP) the chunk is
+    /// marked failed.
+    pub fn fail_chunk(&self, lease: Lease, error: ChunkError) -> Result<Failure, QueueError> {
+        crate::queue::fail(&self.store, &self.leases, lease, error)
+    }
+
+    /// Chunks waiting or in flight in `bank`, not counting failed ones.
+    pub fn queue_depth(&self, bank: &str) -> Result<usize, QueueError> {
+        crate::queue::depth(&self.store, bank)
+    }
+
+    /// `bank`'s failed chunks, oldest failure first.
+    pub fn failed_chunks(&self, bank: &str) -> Result<Vec<FailedChunk>, QueueError> {
+        crate::queue::failed(&self.store, bank)
     }
 
     /// The periodic store upkeep. `serve` calls it on a timer and the replay

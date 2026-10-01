@@ -389,12 +389,18 @@ fn register_extensions() {
 
 /// Per-connection settings: WAL with `synchronous=NORMAL` (TIM-89), foreign
 /// keys on, and a busy timeout so a checkpoint never fails a request.
+///
+/// `secure_delete` zeroes deleted content instead of leaving it in free
+/// pages. Without it, a deleted recall row of a forget request, a swept
+/// source or an erased passage stays readable in the database file (ADR
+/// 0002, ADR 0010).
 fn configure(conn: &Connection) -> Result<(), StoreError> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
+         PRAGMA secure_delete = ON;
          PRAGMA temp_store = MEMORY;",
     )?;
     Ok(())

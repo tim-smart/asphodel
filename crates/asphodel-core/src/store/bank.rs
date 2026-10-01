@@ -306,18 +306,18 @@ fn rename_entity(
             (name, micros(store.now()), entity_id),
         )?;
     }
-    add_alias(tx, store, bank_id, entity_id, name)
+    Ok(add_alias(tx, store, bank_id, entity_id, name)?)
 }
 
 /// Adds an alias, logging it as an edit so a mislink can be undone
 /// (TIM-92). An alias the entity already has is left alone and not logged.
-fn add_alias(
+pub(crate) fn add_alias(
     tx: &Transaction<'_>,
     store: &Store,
     bank_id: i64,
     entity_id: i64,
     alias: &str,
-) -> Result<(), BankError> {
+) -> Result<(), rusqlite::Error> {
     let alias = alias.trim();
     if alias.is_empty() {
         return Ok(());
@@ -341,14 +341,14 @@ fn add_alias(
     Ok(())
 }
 
-fn log_edit(
+pub(crate) fn log_edit(
     tx: &Transaction<'_>,
     store: &Store,
     bank_id: i64,
     kind: &str,
     entity_id: Option<i64>,
     details: &str,
-) -> Result<(), BankError> {
+) -> Result<(), rusqlite::Error> {
     tx.execute(
         "INSERT INTO edits (uuid, bank_id, kind, entity_id, details, at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
