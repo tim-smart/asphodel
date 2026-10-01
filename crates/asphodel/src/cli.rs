@@ -78,9 +78,10 @@ pub struct ServeArgs {
     #[arg(long, env = "ASPHODEL_LISTEN", default_value_t = Listen::default())]
     pub listen: Listen,
 
-    /// Directory holding the SQLite store and its lock.
+    /// Directory holding the SQLite store and its lock. Required, with no
+    /// default, so an unmounted volume can't become an empty store.
     #[arg(long, env = "ASPHODEL_DATA_DIR")]
-    pub data_dir: Option<PathBuf>,
+    pub data_dir: PathBuf,
 
     /// The tuning file (TOML). Without one, the code defaults apply.
     #[arg(long, env = "ASPHODEL_CONFIG")]

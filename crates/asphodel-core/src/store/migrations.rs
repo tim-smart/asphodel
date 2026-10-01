@@ -5,14 +5,16 @@
 //! version, so a crash mid-way leaves the store at the old version with no
 //! half-applied schema. Before the first pending migration the daemon copies
 //! the database into the data dir, keyed by the version it came from. The
-//! copy is never overwritten for the same version, so a migration that
-//! crash-loops can't replace the clean copy with a damaged one, and it is
-//! deleted seven days after the migration that follows it completes.
+//! copy is integrity-checked like backup's, and never overwritten for the
+//! same version, so a migration that crash-loops can't replace the clean
+//! copy with a damaged one. It is deleted seven days after the migration
+//! that follows it completes, by [`expire_copies`] at open and from the
+//! service's housekeeping while the daemon runs.
 
 use std::path::{Path, PathBuf};
 
 use jiff::{SignedDuration, Timestamp};
-use rusqlite::{Connection, backup::Backup};
+use rusqlite::{Connection, OpenFlags, backup::Backup};
 
 use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
@@ -49,11 +51,15 @@ pub fn copy_path(dir: &Path, from: u32) -> PathBuf {
 
 /// Copies the database before migrating from `from`, unless a copy for that
 /// version is already there, in which case it is kept as it is. The copy is
-/// written to a temporary name and renamed, so a crash can't leave a
-/// partial file under the final name.
+/// written to a temporary name, integrity-checked and renamed, so a crash or
+/// a bad copy can't leave a file under the final name. An existing copy that
+/// fails the check refuses the migration rather than being replaced: the
+/// never-overwrite rule is what protects a crash-looping migration.
 pub fn take_copy(conn: &Connection, dir: &Path, from: u32) -> Result<PathBuf, StoreError> {
     let path = copy_path(dir, from);
     if path.exists() {
+        let existing = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        check_integrity(&existing, &path)?;
         tracing::info!(copy = %path.display(), "keeping the existing pre-migration copy");
         return Ok(path);
     }
@@ -61,8 +67,20 @@ pub fn take_copy(conn: &Connection, dir: &Path, from: u32) -> Result<PathBuf, St
     let _ = std::fs::remove_file(&partial);
     {
         let mut target = Connection::open(&partial)?;
-        let backup = Backup::new(conn, &mut target)?;
-        backup.run_to_completion(256, std::time::Duration::from_millis(5), None)?;
+        Backup::new(conn, &mut target)?.run_to_completion(
+            256,
+            std::time::Duration::from_millis(5),
+            None,
+        )?;
+        // The backup carries the live database's WAL flag. A copy in
+        // rollback mode is one self-contained file, and reading it later
+        // leaves no `-wal` or `-shm` beside it.
+        target.pragma_update(None, "journal_mode", "DELETE")?;
+        if let Err(error) = check_integrity(&target, &path) {
+            drop(target);
+            let _ = std::fs::remove_file(&partial);
+            return Err(error);
+        }
     }
     std::fs::rename(&partial, &path).map_err(StoreError::io(format!(
         "renaming pre-migration copy to {}",
@@ -70,6 +88,26 @@ pub fn take_copy(conn: &Connection, dir: &Path, from: u32) -> Result<PathBuf, St
     )))?;
     tracing::info!(copy = %path.display(), from, "took the pre-migration copy");
     Ok(path)
+}
+
+/// Runs `PRAGMA integrity_check` on a copy, naming `path` on failure. A file
+/// SQLite can't read as a database fails the same way as a damaged one.
+fn check_integrity(copy: &Connection, path: &Path) -> Result<(), StoreError> {
+    let corrupt = |detail: String| StoreError::CorruptCopy {
+        path: path.to_owned(),
+        detail,
+    };
+    let mut statement = copy
+        .prepare("PRAGMA integrity_check")
+        .map_err(|error| corrupt(error.to_string()))?;
+    let problems = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| corrupt(error.to_string()))?;
+    match problems.as_slice() {
+        [ok] if ok == "ok" => Ok(()),
+        _ => Err(corrupt(problems.join("; "))),
+    }
 }
 
 /// Applies every migration past the current version, each in its own

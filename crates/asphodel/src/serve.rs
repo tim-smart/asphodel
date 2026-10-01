@@ -10,7 +10,8 @@ use std::{
     io::ErrorKind,
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
+    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -20,12 +21,17 @@ use asphodel_core::{Clock, Health, ResolvedConfig, Service, SystemClock, Tuning}
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::signal;
+use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::cli::ServeArgs;
 use crate::listen::Listen;
 
 type Shared = Arc<Service>;
+
+/// How often the daemon runs its housekeeping. Hourly keeps a pre-migration
+/// copy within an hour of its seven days (ADR 0010).
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[cfg(test)]
 mod tests;
@@ -44,26 +50,19 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // check and the migrations all have to pass before the daemon exists to
     // a client (TIM-94, decision 4; ADR 0010).
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let service = match &args.data_dir {
-        Some(dir) => {
-            let options = OpenOptions {
-                allow_network_fs: args.allow_network_fs,
-            };
-            let store = Store::open(dir, options, Arc::clone(&clock))
-                .with_context(|| format!("opening the store in {}", dir.display()))?;
-            config.purge = store.check_fingerprint(&config.deletion_fingerprint)?;
-            Service::open(clock, store, config.tuning.clone())
-        }
-        None => {
-            warn!("no --data-dir given; nothing is persisted and bank calls fail");
-            Service::new(clock)
-        }
+    let options = OpenOptions {
+        allow_network_fs: args.allow_network_fs,
     };
+    let store = Store::open(&args.data_dir, options, Arc::clone(&clock))
+        .with_context(|| format!("opening the store in {}", args.data_dir.display()))?;
+    config.purge = store.check_fingerprint(&config.deletion_fingerprint)?;
+    let service = Service::open(clock, store, config.tuning.clone());
     info!(
         config = %serde_json::to_string(&config)?,
         "resolved config"
     );
     let service: Shared = Arc::new(service);
+    tokio::spawn(housekeeping(Arc::downgrade(&service)));
     let app = Router::new()
         .route("/v1/health", get(health))
         .with_state(service);
@@ -97,7 +96,7 @@ fn resolve_config(args: &ServeArgs) -> anyhow::Result<ResolvedConfig> {
     let tuning = Tuning::load(args.config.as_deref())?;
     let deployment = Deployment {
         listen: args.listen.to_string(),
-        data_dir: args.data_dir.clone(),
+        data_dir: Some(args.data_dir.clone()),
         config: args.config.clone(),
         allow_network_fs: args.allow_network_fs,
         model_dir: args.model_dir.clone(),
@@ -197,6 +196,27 @@ impl UnixSocketCleanup {
     }
 }
 
+/// Runs [`Service::housekeeping`] every [`HOUSEKEEPING_INTERVAL`] until the
+/// service is dropped. It holds the service weakly so the store still closes,
+/// and checkpoints, when `run` returns.
+async fn housekeeping(service: Weak<Service>) {
+    let mut interval = tokio::time::interval(HOUSEKEEPING_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick is immediate, and opening the store just did the work.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let Some(service) = service.upgrade() else {
+            return;
+        };
+        match tokio::task::spawn_blocking(move || service.housekeeping()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "housekeeping failed"),
+            Err(error) => warn!(%error, "housekeeping panicked"),
+        }
+    }
+}
+
 /// `GET /v1/health`: 503 until the daemon is ready, then 200 with the version.
 async fn health(State(service): State<Shared>) -> (StatusCode, Json<Health>) {
     let health = service.health();
@@ -210,7 +230,8 @@ async fn health(State(service): State<Shared>) -> (StatusCode, Json<Health>) {
 
 /// Resolves on SIGINT or SIGTERM. On SIGTERM the daemon stops accepting
 /// ingest, finishes the chunk in flight and checkpoints the WAL (TIM-94,
-/// decision 3); with no store yet, that is just a graceful HTTP shutdown.
+/// decision 3). There is no ingest yet, so it is a graceful HTTP shutdown
+/// and the store checkpoints as it closes.
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(error) = signal::ctrl_c().await {

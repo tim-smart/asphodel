@@ -14,7 +14,7 @@ pub mod store;
 
 pub use clock::{Clock, SimulatedClock, SystemClock};
 pub use config::{ResolvedConfig, Tuning};
-pub use service::{Health, Service};
+pub use service::{Health, Housekeeping, Service};
 pub use store::Store;
 
 /// The version of this build, as reported by `/v1/health`.

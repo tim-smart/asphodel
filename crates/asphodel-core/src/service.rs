@@ -3,6 +3,7 @@
 //! Handlers stay thin: anything that would be skipped by replay if it lived
 //! in a handler belongs here instead (TIM-96, decision 3).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use jiff::Timestamp;
@@ -10,14 +11,14 @@ use serde::Serialize;
 
 use crate::clock::Clock;
 use crate::config::Tuning;
-use crate::store::Store;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
+use crate::store::{Store, StoreError};
 
 /// One running store: the daemon's banks, models and jobs, driven by a clock.
 ///
 /// Later stages add the models and the extraction queue behind this type.
-/// It can run without a store, which `serve` does when no `--data-dir` is
-/// given; then nothing is persisted and bank calls fail.
+/// `serve` always builds it on a store; [`Service::new`] still builds one
+/// without, where nothing is persisted and bank calls fail.
 pub struct Service {
     clock: Arc<dyn Clock>,
     store: Option<Store>,
@@ -80,6 +81,19 @@ impl Service {
         )
     }
 
+    /// The periodic store upkeep. `serve` calls it on a timer and the replay
+    /// harness after advancing its clock, so it runs on this service's clock
+    /// either way (TIM-96, decision 3). It runs whether or not purge is
+    /// paused: deleting an expired pre-migration copy is ADR 0010's bound on
+    /// how long forgotten content survives, not a purge.
+    pub fn housekeeping(&self) -> Result<Housekeeping, StoreError> {
+        let copies_removed = match &self.store {
+            Some(store) => store.expire_copies()?,
+            None => Vec::new(),
+        };
+        Ok(Housekeeping { copies_removed })
+    }
+
     /// What `/v1/health` reports. The daemon is not ready while models load
     /// and migrations run; both happen before the service is built, so once
     /// it exists it is ready.
@@ -99,6 +113,13 @@ impl std::fmt::Debug for Service {
             .field("store", &self.store)
             .finish_non_exhaustive()
     }
+}
+
+/// What one [`Service::housekeeping`] pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Housekeeping {
+    /// The pre-migration copies it deleted.
+    pub copies_removed: Vec<PathBuf>,
 }
 
 /// The health response. The plugin compares `version`'s major against the

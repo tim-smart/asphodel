@@ -24,6 +24,12 @@ pub const PROFILE_NAME: &str = "User profile";
 pub const PROFILE_QUESTION: &str = "Who is the user: their preferences, important people, work and home, \
      the platforms they use, and how they like to be helped. Not upcoming events, tasks or routines.";
 
+/// The seeded profile's filters (TIM-95, decision 3): facts, plus states of
+/// volatility weeks or slower. A memory with no volatility passes, and there
+/// is no entity filter, since the profile is about the whole bank.
+pub const PROFILE_FILTER_KINDS: &str = r#"["fact","state"]"#;
+pub const PROFILE_MIN_VOLATILITY: &str = "weeks";
+
 /// What `initialize` and `bank config` send. Every field is optional; an
 /// absent one is left as it is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -199,15 +205,17 @@ fn create(
     }
 
     tx.execute(
-        "INSERT INTO mental_models (uuid, bank_id, name, question, max_tokens, enabled,
-                                    created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
+        "INSERT INTO mental_models (uuid, bank_id, name, question, max_tokens, filter_kinds,
+                                    filter_min_volatility, enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)",
         (
             store.new_id().to_string(),
             bank_id,
             PROFILE_NAME,
             PROFILE_QUESTION,
             profile_max_tokens,
+            PROFILE_FILTER_KINDS,
+            PROFILE_MIN_VOLATILITY,
             now,
         ),
     )?;

@@ -13,6 +13,8 @@
 //! 5. take the pre-migration copy and run any pending migrations (ADR 0010);
 //! 6. delete pre-migration copies older than seven days.
 //!
+//! The service repeats step 6 on a timer through [`Store::expire_copies`].
+//!
 //! Every timestamp written here comes from the [`Clock`] the store was
 //! opened with; no SQL reads SQLite's clock (TIM-90).
 
@@ -94,6 +96,12 @@ pub enum StoreError {
         from: u32,
         error: rusqlite::Error,
     },
+
+    #[error(
+        "pre-migration copy {} failed its integrity check ({detail}); it is never overwritten, so move it aside to migrate",
+        path.display()
+    )]
+    CorruptCopy { path: PathBuf, detail: String },
 
     #[error("{context}: {error}")]
     Io {
@@ -177,9 +185,7 @@ impl Store {
         } else {
             None
         };
-        for removed in migrations::expire_copies(&conn, dir, clock.now())? {
-            info!(copy = %removed.display(), "deleted an expired pre-migration copy");
-        }
+        expire_copies(&conn, dir, clock.now())?;
 
         info!(
             dir = %dir.display(),
@@ -283,6 +289,13 @@ impl Store {
         }
     }
 
+    /// Deletes the pre-migration copies past their seven days on the store's
+    /// clock (ADR 0010). Open does this once; the service's housekeeping does
+    /// it while the daemon runs, so the bound holds without a restart.
+    pub fn expire_copies(&self) -> Result<Vec<PathBuf>, StoreError> {
+        expire_copies(&self.connection(), &self.dir, self.clock.now())
+    }
+
     /// Checkpoints the WAL into the database file, as the daemon does on
     /// SIGTERM (TIM-94, decision 3).
     pub fn checkpoint(&self) -> Result<(), StoreError> {
@@ -307,6 +320,19 @@ impl std::fmt::Debug for Store {
             .field("filesystem", &self.filesystem)
             .finish_non_exhaustive()
     }
+}
+
+/// [`migrations::expire_copies`], logging each copy it deletes.
+fn expire_copies(
+    conn: &Connection,
+    dir: &Path,
+    now: Timestamp,
+) -> Result<Vec<PathBuf>, StoreError> {
+    let removed = migrations::expire_copies(conn, dir, now)?;
+    for path in &removed {
+        info!(copy = %path.display(), "deleted an expired pre-migration copy");
+    }
+    Ok(removed)
 }
 
 /// Makes sure `dir` is a directory, creating it when nothing is there. A

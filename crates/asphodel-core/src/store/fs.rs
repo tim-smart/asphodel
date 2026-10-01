@@ -5,8 +5,9 @@
 //! So the daemon calls `statfs` at startup and refuses NFS, SMB/CIFS, CephFS
 //! and FUSE unless given `--allow-network-fs` (TIM-94, decision 4).
 //!
-//! [`classify`] is a pure function of the filesystem magic so the refusal
-//! can be tested without mounting anything.
+//! [`classify`] is a pure function of the filesystem magic, and
+//! [`apply_policy`] of the kind it gives, so the refusal can be tested
+//! without mounting anything.
 
 use std::fmt;
 use std::io;
@@ -102,19 +103,28 @@ pub fn check_data_dir(dir: &Path, allow_network_fs: bool) -> Result<FilesystemKi
         "checking the filesystem of {}",
         dir.display()
     )))?;
+    apply_policy(dir, kind, allow_network_fs)
+}
+
+/// The refusal itself, apart from the probe: a network `kind` is refused
+/// unless `allow_network_fs`, and let through with a warning when it is.
+pub fn apply_policy(
+    dir: &Path,
+    kind: FilesystemKind,
+    allow_network_fs: bool,
+) -> Result<FilesystemKind, StoreError> {
     if kind.is_network() {
-        if allow_network_fs {
-            tracing::warn!(
-                dir = %dir.display(),
-                filesystem = %kind,
-                "running on a network filesystem because --allow-network-fs was given"
-            );
-        } else {
+        if !allow_network_fs {
             return Err(StoreError::NetworkFilesystem {
                 dir: dir.to_owned(),
                 kind,
             });
         }
+        tracing::warn!(
+            dir = %dir.display(),
+            filesystem = %kind,
+            "running on a network filesystem because --allow-network-fs was given"
+        );
     }
     Ok(kind)
 }
