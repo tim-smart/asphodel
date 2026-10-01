@@ -190,6 +190,14 @@ _Avoid_: Loaded, seen, in the context window
 The exact input a memory came from, either a conversation turn or a document, kept verbatim. Once no memory rests on it and it's 90 days old, its text is swept and only its key is kept, so it can't be ingested again.
 _Avoid_: Episode, chunk, input, raw message
 
+**Tombstone**:
+What's left of a source, or of a passage in one, once its text is gone: the key and content hash, with no text. It stops the same input being ingested and extracted again. A turn that asked to forget is stored as a tombstone from the start.
+_Avoid_: Marker, stub, deleted row
+
+**Sweep**:
+The nightly job that purges memories and deletes the text of sources, failed chunks and recall rows past their 90-day horizon. It records only counts, and it pauses when the settings that decide deletion change, until an operator acknowledges them.
+_Avoid_: Garbage collection, cleanup, vacuum
+
 **Turn**:
 A source made up of one message and the assistant's reply to it, as Hermes hands them over. The message may come from the owner or from anyone else in the conversation.
 _Avoid_: Message, exchange
