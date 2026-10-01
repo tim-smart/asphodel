@@ -492,9 +492,9 @@ fn a_pre_migration_copy_is_deleted_at_its_deadline_while_the_daemon_runs() {
     let data = dir.data_dir();
     let copy = {
         // A store with a copy whose migration completed 7 days ago, less
-        // LEAD. There is only one migration so far, so the row is a fixture
-        // for the second: `expire_copies` reads `from_version` and
-        // `completed_at`, not the live schema version.
+        // LEAD. The row is a fixture, and replaces the fresh store's own row
+        // where their `to_version`s meet: `expire_copies` reads
+        // `from_version` and `completed_at`, not the live schema version.
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let store = Store::open(&data, OpenOptions::default(), clock.clone()).unwrap();
         let conn = store.connection();
@@ -506,7 +506,7 @@ fn a_pre_migration_copy_is_deleted_at_its_deadline_while_the_daemon_runs() {
             .checked_add(LEAD)
             .unwrap();
         conn.execute(
-            "INSERT INTO migrations (from_version, to_version, binary_version, started_at,
+            "INSERT OR REPLACE INTO migrations (from_version, to_version, binary_version, started_at,
                                      completed_at)
              VALUES (1, 2, 'fixture', ?1, ?1)",
             [micros(completed_at)],

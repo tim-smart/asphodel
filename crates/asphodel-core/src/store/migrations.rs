@@ -1,9 +1,10 @@
 //! Schema migrations and the pre-migration copy (ADR 0010).
 //!
-//! The schema version is SQLite's `user_version`. Each migration runs in
-//! one transaction that also records a row in `migrations` and bumps the
-//! version, so a crash mid-way leaves the store at the old version with no
-//! half-applied schema. Before the first pending migration the daemon copies
+//! The schema version is SQLite's `user_version`. The pending migrations
+//! run in one transaction that also records one row in `migrations` and
+//! bumps the version, so a crash mid-way leaves the store at the old version
+//! with no half-applied schema. A fresh store is created at the current
+//! version in one step, with one row from version 0. Before the first pending migration the daemon copies
 //! the database into the data dir, keyed by the version it came from. The
 //! copy is integrity-checked like backup's, and never overwritten for the
 //! same version, so a migration that crash-loops can't replace the clean
@@ -20,14 +21,17 @@ use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
 
 /// The schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// How long a pre-migration copy is kept after its migration completes.
 pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
 
 /// Every migration, in order: the version it brings the store to and the
 /// SQL that does it.
-const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../../migrations/0001_initial.sql"))];
+const MIGRATIONS: &[(u32, &str)] = &[
+    (1, include_str!("../../migrations/0001_initial.sql")),
+    (2, include_str!("../../migrations/0002_speaker_ids.sql")),
+];
 
 /// What one open applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,8 +114,9 @@ fn check_integrity(copy: &Connection, path: &Path) -> Result<(), StoreError> {
     }
 }
 
-/// Applies every migration past the current version, each in its own
-/// transaction with its `migrations` row. Times come from `clock`.
+/// Applies every migration past the current version in one transaction,
+/// with one `migrations` row from the version found to the version reached.
+/// Times come from `clock`.
 pub fn apply(
     conn: &mut Connection,
     clock: &dyn Clock,
@@ -119,28 +124,30 @@ pub fn apply(
 ) -> Result<Applied, rusqlite::Error> {
     let from = version(conn)?;
     let mut current = from;
+    let started_at = clock.now();
+    let tx = conn.transaction()?;
     for (to, sql) in MIGRATIONS.iter().copied() {
         if to <= current {
             continue;
         }
-        let started_at = clock.now();
-        let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
+        current = to;
+    }
+    if current > from {
         tx.execute(
             "INSERT INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             (
+                from,
                 current,
-                to,
                 crate::VERSION,
                 micros(started_at),
                 micros(clock.now()),
             ),
         )?;
-        tx.pragma_update(None, "user_version", to)?;
-        tx.commit()?;
-        current = to;
+        tx.pragma_update(None, "user_version", current)?;
     }
+    tx.commit()?;
     Ok(Applied {
         from,
         to: current,

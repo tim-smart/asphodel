@@ -35,8 +35,9 @@ pub const PROFILE_MIN_VOLATILITY: &str = "weeks";
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BankIdentity {
     pub owner_name: Option<String>,
-    /// Platform ids of the owner, such as `discord:1234`, added as aliases
-    /// of the `user` entity (TIM-94, decision 1).
+    /// Platform ids of the owner, such as `discord:1234`. Each becomes the
+    /// `user` entity's speaker id, the only thing a turn's speaker is
+    /// resolved through, and an alias of it (TIM-94, decision 1).
     pub owner_platform_ids: Vec<String>,
     pub assistant_name: Option<String>,
     /// An IANA timezone name, the default for sources without one.
@@ -191,6 +192,7 @@ fn create(
     }
     for platform_id in &identity.owner_platform_ids {
         add_alias(tx, store, bank_id, user, platform_id)?;
+        set_speaker_id(tx, store, bank_id, platform_id, user)?;
     }
 
     let assistant = seed_entity(
@@ -243,6 +245,7 @@ fn merge(
     }
     for platform_id in &identity.owner_platform_ids {
         add_alias(tx, store, bank_id, user, platform_id)?;
+        set_speaker_id(tx, store, bank_id, platform_id, user)?;
     }
     if let Some(assistant_name) = &identity.assistant_name {
         tx.execute(
@@ -336,6 +339,48 @@ pub(crate) fn add_alias(
             "alias_added",
             Some(entity_id),
             &format!("{{\"alias_id\":{alias_id}}}"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Maps a platform id to the speaker entity it identifies. Bank config
+/// asserts the owner's ids, so it takes an id over from whichever entity
+/// held it, such as one ingest created when the owner spoke before the id
+/// was configured. A change is logged as an edit, by rowid only.
+pub(crate) fn set_speaker_id(
+    tx: &Transaction<'_>,
+    store: &Store,
+    bank_id: i64,
+    platform_id: &str,
+    entity_id: i64,
+) -> Result<(), rusqlite::Error> {
+    let platform_id = platform_id.trim();
+    if platform_id.is_empty() {
+        return Ok(());
+    }
+    let now = micros(store.now());
+    let changed = tx.execute(
+        "INSERT INTO speaker_ids (bank_id, platform_id, entity_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)
+         ON CONFLICT (bank_id, platform_id) DO UPDATE
+           SET entity_id = excluded.entity_id, updated_at = excluded.updated_at
+           WHERE entity_id != excluded.entity_id",
+        (bank_id, platform_id, entity_id, now),
+    )?;
+    if changed == 1 {
+        let speaker_id: i64 = tx.query_row(
+            "SELECT id FROM speaker_ids WHERE bank_id = ?1 AND platform_id = ?2",
+            (bank_id, platform_id),
+            |row| row.get(0),
+        )?;
+        log_edit(
+            tx,
+            store,
+            bank_id,
+            "speaker_id_set",
+            Some(entity_id),
+            &format!("{{\"speaker_id\":{speaker_id}}}"),
         )?;
     }
     Ok(())

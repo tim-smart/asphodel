@@ -812,7 +812,7 @@ fn the_copy_is_deleted_seven_days_after_its_migration_completes() {
     let copy = migrations::take_copy(&conn, &dir.data(), 1).unwrap();
     let completed_at = clock.now();
     conn.execute(
-        "INSERT INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
+        "INSERT OR REPLACE INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
          VALUES (1, 2, 'test', ?1, ?1)",
         [micros(completed_at)],
     )
@@ -854,7 +854,7 @@ fn reopening_after_seven_days_deletes_the_copy() {
         let conn = store.connection();
         let copy = migrations::take_copy(&conn, &dir.data(), 1).unwrap();
         conn.execute(
-            "INSERT INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
+            "INSERT OR REPLACE INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
              VALUES (1, 2, 'test', ?1, ?1)",
             [micros(clock.now())],
         )
@@ -919,7 +919,7 @@ fn check_housekeeping_expiry(paused: bool) {
         let copy = migrations::take_copy(&conn, &dir.data(), 1).unwrap();
         let incomplete = migrations::take_copy(&conn, &dir.data(), 3).unwrap();
         conn.execute(
-            "INSERT INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
+            "INSERT OR REPLACE INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
              VALUES (1, 2, 'test', ?1, ?2)",
             (micros(start()), micros(clock.now())),
         ).unwrap();
@@ -993,7 +993,7 @@ fn completed_copy(store: &Store, from: u32, completed: Timestamp) -> PathBuf {
     let conn = store.connection();
     let copy = migrations::take_copy(&conn, store.dir(), from).unwrap();
     conn.execute(
-        "INSERT INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
+        "INSERT OR REPLACE INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
          VALUES (?1, ?2, 'test', ?3, ?3)",
         (from, from + 1, micros(completed)),
     )

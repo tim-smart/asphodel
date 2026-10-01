@@ -121,8 +121,8 @@ pub struct FailedChunk {
 pub enum QueueError {
     #[error("unknown bank")]
     UnknownBank,
-    /// The lease isn't the one its bank's worker holds, such as a lease from
-    /// before a restart.
+    /// The lease isn't the one its bank's worker holds in this service, such
+    /// as a lease from before a restart or from another store.
     #[error("the lease on chunk {chunk} is no longer held")]
     NotHeld { chunk: Uuid },
     #[error(transparent)]
@@ -200,9 +200,14 @@ pub(crate) fn claim(
     }))
 }
 
-/// Checks that `lease` is the one its bank's worker holds.
+/// Checks that `lease` is the one its bank's worker holds in this service.
+/// Rowids alone don't identify a lease: after a restart the same chunk is
+/// claimed again under the same rowids, and another store's rowids can
+/// coincide. So the lease must also come from this service's registry.
 fn check_held(leases: &Leases, lease: &Lease) -> Result<(), QueueError> {
-    if leases.lock().get(&lease.bank_id) == Some(&lease.queue_id) {
+    if Arc::ptr_eq(&leases.0, &lease.leases.0)
+        && leases.lock().get(&lease.bank_id) == Some(&lease.queue_id)
+    {
         Ok(())
     } else {
         Err(QueueError::NotHeld { chunk: lease.chunk })

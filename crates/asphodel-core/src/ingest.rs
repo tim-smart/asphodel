@@ -17,10 +17,11 @@
 //! - **The turn that asks to forget** is stored as a tombstone only: its key
 //!   and nothing else. It's never chunked or queued, and its recall row is
 //!   deleted (ADR 0010).
-//! - **Speakers** (TIM-94, decision 1): the owner's platform ids are aliases
-//!   of the seeded `user`, a turn with no author is the owner's, and anyone
-//!   else becomes a `person` entity with `<platform>:<id>` as an alias.
-//!   Ownership comes from platform ids alone, never from a display name.
+//! - **Speakers** (TIM-94, decision 1) are resolved by `<platform>:<id>`
+//!   through `speaker_ids`, never through aliases. The owner's platform ids
+//!   map to the seeded `user`, a turn with no author is the owner's, and
+//!   anyone else becomes a `person` entity with a speaker id of their own.
+//!   A display name is only ever an alias, so it can't capture an identity.
 //!
 //! Everything for one ingest commits in one transaction.
 
@@ -36,14 +37,14 @@ use uuid::Uuid;
 
 use crate::chunking::{chunk_hash, hex, split_document};
 use crate::secrets::{SecretKind, scan};
-use crate::store::bank::{add_alias, log_edit};
+use crate::store::bank::{add_alias, log_edit, set_speaker_id};
 use crate::store::{Store, StoreError, micros};
 
 /// Hermes' `turn_author` (TIM-94, decision 1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnAuthor {
     /// The platform's id for the speaker, such as a Discord user id. The
-    /// speaker is resolved by the alias `<platform>:<id>`, the form the
+    /// speaker is resolved by the speaker id `<platform>:<id>`, the form the
     /// owner's platform ids take in bank config.
     pub id: String,
     pub name: Option<String>,
@@ -355,7 +356,7 @@ pub fn ingest_document(
             end: chunk.end,
             text: &chunk.text,
         };
-        if seen_before(&tx, bank_id, &document.document_id, &new.hash())? {
+        if seen_before(&tx, bank_id, &document.document_id, source_id, &new.hash())? {
             skipped += 1;
             continue;
         }
@@ -441,20 +442,23 @@ fn count_turn(tx: &Transaction<'_>, bank_id: i64, message_at: i64) -> Result<(),
 }
 
 /// Whether a chunk with this hash was stored for an earlier version of the
-/// document, whatever has happened to its text since.
+/// document, whatever has happened to its text since. The version being
+/// ingested (`source_id`) doesn't count, so a section repeated within it is
+/// stored and queued each time (TIM-92 skips earlier versions only).
 fn seen_before(
     tx: &Transaction<'_>,
     bank_id: i64,
     document_id: &str,
+    source_id: i64,
     hash: &str,
 ) -> Result<bool, IngestError> {
     Ok(tx
         .query_row(
             "SELECT 1 FROM chunks c JOIN sources s ON s.id = c.source_id
              WHERE c.bank_id = ?1 AND c.content_hash = ?2
-               AND s.kind = 'document' AND s.document_id = ?3
+               AND s.kind = 'document' AND s.document_id = ?3 AND s.id != ?4
              LIMIT 1",
-            (bank_id, hash, document_id),
+            (bank_id, hash, document_id, source_id),
             |_| Ok(()),
         )
         .optional()?
@@ -530,15 +534,16 @@ fn resolve_speaker(
         // The CLI, TUI and Hermes UI send no author: the owner's turn.
         return seeded_user(tx, bank_id);
     };
-    let alias = match &turn.platform {
+    let platform_id = match &turn.platform {
         Some(platform) => format!("{platform}:{}", author.id),
         None => author.id.clone(),
     };
+    // Only `speaker_ids` identifies a speaker. Aliases are free text, and a
+    // display name shaped like a platform id must not capture that id.
     let found: Option<i64> = tx
         .query_row(
-            "SELECT entity_id FROM entity_aliases WHERE bank_id = ?1 AND alias = ?2
-             ORDER BY id LIMIT 1",
-            (bank_id, &alias),
+            "SELECT entity_id FROM speaker_ids WHERE bank_id = ?1 AND platform_id = ?2",
+            (bank_id, platform_id.trim()),
             |row| row.get(0),
         )
         .optional()?;
@@ -555,7 +560,7 @@ fn resolve_speaker(
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .unwrap_or(&alias);
+        .unwrap_or(&platform_id);
     let uuid = store.new_id();
     let now = micros(store.now());
     tx.execute(
@@ -565,8 +570,10 @@ fn resolve_speaker(
     )?;
     let entity_id = tx.last_insert_rowid();
     log_edit(tx, store, bank_id, "entity_created", Some(entity_id), "{}")?;
-    add_alias(tx, store, bank_id, entity_id, &alias)?;
-    if name != alias {
+    set_speaker_id(tx, store, bank_id, &platform_id, entity_id)?;
+    // Both go in as aliases too, for entity search; neither is an identity.
+    add_alias(tx, store, bank_id, entity_id, &platform_id)?;
+    if name != platform_id {
         add_alias(tx, store, bank_id, entity_id, name)?;
     }
     Ok(Speaker {

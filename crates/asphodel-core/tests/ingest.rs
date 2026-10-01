@@ -2153,7 +2153,6 @@ fn the_queue_order_survives_a_restart() {
 // Regressions from the TIM-106 review
 
 #[test]
-#[ignore = "TIM-106 review finding (lease identity); activate with its fix"]
 fn a_lease_from_before_a_restart_cannot_complete_the_new_workers_chunk() {
     // A lease belongs to the service that issued it. After a restart the
     // chunk is claimed again; the old lease must not take it off the queue
@@ -2177,7 +2176,6 @@ fn a_lease_from_before_a_restart_cannot_complete_the_new_workers_chunk() {
 }
 
 #[test]
-#[ignore = "TIM-106 review finding (lease identity); activate with its fix"]
 fn a_lease_from_before_a_restart_cannot_fail_the_new_workers_chunk() {
     let h = Harness::new();
     ingest(&h, "main", &turn("s", "2026-10-01T06:00:00Z", "A.", "Ok."));
@@ -2202,7 +2200,6 @@ fn a_lease_from_before_a_restart_cannot_fail_the_new_workers_chunk() {
 }
 
 #[test]
-#[ignore = "TIM-106 review finding (lease identity); activate with its fix"]
 fn a_lease_from_another_store_is_refused() {
     // Two stores whose bank and queue rowids coincide: one store's lease
     // must not complete or fail the other's chunk.
@@ -2229,7 +2226,6 @@ fn a_lease_from_another_store_is_refused() {
 }
 
 #[test]
-#[ignore = "TIM-106 review finding (speaker identity); activate with its fix"]
 fn a_display_name_cannot_capture_another_speakers_platform_id() {
     // TIM-94, decision 1: speakers are attributed by platform id. A display
     // name that looks like a platform id is free text, not an identity.
@@ -2257,7 +2253,6 @@ fn a_display_name_cannot_capture_another_speakers_platform_id() {
 }
 
 #[test]
-#[ignore = "TIM-106 review finding (speaker identity); activate with its fix"]
 fn a_display_name_cannot_capture_the_owners_platform_id() {
     // The owner's platform id can be added after strangers have spoken
     // (`PUT /v1/banks/{bank}` merges, TIM-94 decision 7). A stranger who
@@ -2315,7 +2310,6 @@ fn a_display_name_cannot_capture_the_owners_platform_id() {
 }
 
 #[test]
-#[ignore = "TIM-106 review finding (same-version dedup); activate with its fix"]
 fn a_repeated_section_in_a_first_version_is_queued_each_time() {
     // TIM-92 skips chunks seen in earlier versions of a document, not
     // chunks repeated within the version being ingested.
@@ -2337,7 +2331,6 @@ fn a_repeated_section_in_a_first_version_is_queued_each_time() {
 }
 
 #[test]
-#[ignore = "TIM-106 review finding (same-version dedup); activate with its fix"]
 fn a_repeated_section_in_an_edit_is_queued_when_no_earlier_version_had_it() {
     let h = Harness::new();
     ingest_doc(&h, "main", &document("life.md", PLANS, date(2026, 9, 1)));
