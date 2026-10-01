@@ -3371,7 +3371,6 @@ fn candidates_for(aliases: &[&str], message: &str) -> (Vec<Uuid>, BTreeSet<Uuid>
 }
 
 #[test]
-#[ignore = "TIM-107 re-review finding (normalization); activate with its fix"]
 fn a_decomposed_name_matches_a_precomposed_alias() {
     // "Luci\u{301}a" is "Lucía" with a combining acute: the same name, which
     // the alias FTS indexes as "lucia" either way.
@@ -3380,14 +3379,12 @@ fn a_decomposed_name_matches_a_precomposed_alias() {
 }
 
 #[test]
-#[ignore = "TIM-107 re-review finding (normalization); activate with its fix"]
 fn a_precomposed_name_matches_a_decomposed_alias() {
     let (entities, found) = candidates_for(&["Luci\u{301}a"], "Lucía called.");
     assert_eq!(found, BTreeSet::from([entities[0]]));
 }
 
 #[test]
-#[ignore = "TIM-107 re-review finding (normalization); activate with its fix"]
 fn an_accented_greek_name_matches_itself() {
     // The FTS keeps Greek accents, so an identical name must still match.
     let (entities, found) = candidates_for(&["Νίκος"], "Ο Νίκος ήρθε.");
@@ -3395,7 +3392,6 @@ fn an_accented_greek_name_matches_itself() {
 }
 
 #[test]
-#[ignore = "TIM-107 re-review finding (normalization); activate with its fix"]
 fn a_devanagari_name_matches_itself() {
     // A vowel sign is a combining mark, and part of the name.
     let (entities, found) = candidates_for(&["किरण"], "किरण आया।");

@@ -9,7 +9,6 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use rusqlite::{Connection, OptionalExtension};
 use unicode_normalization::UnicodeNormalization;
-use unicode_normalization::char::is_combining_mark;
 use uuid::Uuid;
 
 use super::{
@@ -377,70 +376,41 @@ pub(super) fn survivor(conn: &Connection, mut entity_id: i64) -> Result<i64, rus
     Ok(entity_id)
 }
 
-/// Runs of letters and digits, folded the way the alias FTS folds them
-/// (`unicode61 remove_diacritics 2`) closely enough to confirm its matches:
-/// canonically decomposed (NFD), with every combining mark removed, then
-/// lowercased. "Lucía" and "Lucia", or "Zoë" and "Zoe", are the same word.
-pub(super) fn words(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(fold)
-        .filter(|word| !word.is_empty())
-        .collect()
-}
-
-fn fold(word: &str) -> String {
-    word.nfd()
-        .filter(|c| !is_combining_mark(*c))
-        .collect::<String>()
-        .to_lowercase()
-}
+/// The alias FTS's tokenizer, as `entity_aliases_fts` declares it in the
+/// version 1 migration. The passages are searched with the same one, so a
+/// name matches exactly when SQLite would match it.
+const ALIAS_TOKENIZER: &str = "unicode61 remove_diacritics 2";
 
 /// Entities other than `always` whose aliases appear in a passage, as their
 /// surviving entities, ranked by how many memories link to them and capped
 /// at [`ENTITY_CANDIDATE_CAP`].
+///
+/// SQLite does all the tokenizing and folding, so matching is exactly the
+/// alias FTS's: Latin diacritics and case are folded, everything else is
+/// kept. The passages go into an in-memory FTS table of their own (NFC
+/// first, so precomposed and decomposed spellings agree). Its vocabulary,
+/// the terms as SQLite folded them, is the query that finds aliases sharing
+/// any term. Each alias found then has to match a passage as a whole phrase,
+/// in that same table, so a term shared with one word of an alias never
+/// matches the rest of it loosely.
 fn found_entities(
     conn: &Connection,
     bank_id: i64,
     passages: &[&str],
     always: &[i64],
 ) -> Result<Vec<i64>, rusqlite::Error> {
-    let passage_words: Vec<Vec<String>> = passages.iter().map(|p| words(p)).collect();
-    let terms: BTreeSet<&str> = passage_words.iter().flatten().map(String::as_str).collect();
-    if terms.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Every term is letters and digits only, so quoting is enough.
-    let query = terms
-        .iter()
-        .map(|term| format!("\"{term}\""))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let mut statement = conn.prepare_cached(
-        "SELECT a.entity_id, a.alias FROM entity_aliases_fts f
-         JOIN entity_aliases a ON a.id = f.rowid
-         WHERE entity_aliases_fts MATCH ?1 AND a.bank_id = ?2",
-    )?;
-    let hits: Vec<(i64, String)> = statement
-        .query_map((query, bank_id), |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-
-    let mut found = BTreeSet::new();
-    for (entity_id, alias) in hits {
-        let alias_words = words(&alias);
-        let named = !alias_words.is_empty()
-            && passage_words.iter().any(|passage| {
-                passage
-                    .windows(alias_words.len())
-                    .any(|window| window == alias_words.as_slice())
-            });
-        if named {
-            let entity_id = survivor(conn, entity_id)?;
-            if !always.contains(&entity_id) {
-                found.insert(entity_id);
-            }
-        }
-    }
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.extraction_passages
+           USING fts5(text, tokenize = '{ALIAS_TOKENIZER}');
+         CREATE VIRTUAL TABLE IF NOT EXISTS temp.extraction_passage_terms
+           USING fts5vocab('temp', 'extraction_passages', 'row');
+         DELETE FROM temp.extraction_passages;"
+    ))?;
+    let found = named_entities(conn, bank_id, passages, always);
+    // The passages are memory content: don't leave them behind, even after
+    // an error. The temp store is in memory (`temp_store = MEMORY`).
+    conn.execute("DELETE FROM temp.extraction_passages", [])?;
+    let found = found?;
 
     let mut ranked = Vec::with_capacity(found.len());
     for entity_id in found {
@@ -459,6 +429,65 @@ fn found_entities(
         .take(ENTITY_CANDIDATE_CAP)
         .map(|(_, entity_id)| entity_id)
         .collect())
+}
+
+fn named_entities(
+    conn: &Connection,
+    bank_id: i64,
+    passages: &[&str],
+    always: &[i64],
+) -> Result<BTreeSet<i64>, rusqlite::Error> {
+    let mut insert =
+        conn.prepare_cached("INSERT INTO temp.extraction_passages (text) VALUES (?1)")?;
+    for passage in passages {
+        insert.execute([passage.nfc().collect::<String>()])?;
+    }
+    let mut terms = conn.prepare_cached("SELECT term FROM temp.extraction_passage_terms")?;
+    let terms: Vec<String> = terms
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if terms.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let query = terms
+        .iter()
+        .map(|term| phrase(term))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let mut statement = conn.prepare_cached(
+        "SELECT a.entity_id, a.alias FROM entity_aliases_fts f
+         JOIN entity_aliases a ON a.id = f.rowid
+         WHERE entity_aliases_fts MATCH ?1 AND a.bank_id = ?2",
+    )?;
+    let hits: Vec<(i64, String)> = statement
+        .query_map((query, bank_id), |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+
+    let mut whole = conn.prepare_cached(
+        "SELECT 1 FROM temp.extraction_passages WHERE extraction_passages MATCH ?1 LIMIT 1",
+    )?;
+    let mut found = BTreeSet::new();
+    for (entity_id, alias) in hits {
+        // An alias with no letters or digits has no terms, and an empty
+        // phrase is a syntax error, so it can't be named.
+        if !alias.chars().any(char::is_alphanumeric) {
+            continue;
+        }
+        let alias: String = alias.nfc().collect();
+        if whole.exists([phrase(&alias)])? {
+            let entity_id = survivor(conn, entity_id)?;
+            if !always.contains(&entity_id) {
+                found.insert(entity_id);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// `text` as one FTS5 phrase: in double quotes, with any double quote
+/// doubled, so nothing in it is read as query syntax.
+fn phrase(text: &str) -> String {
+    format!("\"{}\"", text.replace('"', "\"\""))
 }
 
 fn candidate(
