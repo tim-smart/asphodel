@@ -156,9 +156,11 @@ impl Volatility {
     }
 }
 
-/// The reranker deadline in prefetch. Past it, the reranker is skipped and
-/// RRF order is used. It's the first link in a chain of timeouts: 1.5 s in
-/// the daemon, 3 s in the plugin and 8 s in Hermes.
+/// The reranker deadline in prefetch and recall. Past it, the reranker is
+/// skipped: explicit recall uses RRF order and prefetch injects nothing
+/// (TIM-93, decision 8, as amended by TIM-109). It's the first link in a
+/// chain of timeouts: 1.5 s in the daemon, 3 s in the plugin and 8 s in
+/// Hermes.
 pub const RERANKER_DEADLINE: Duration = Duration::from_millis(1500);
 
 // Retrieval (TIM-93, placed in code by TIM-98):
@@ -207,15 +209,6 @@ pub const STATE_AGE_SHOWN_BELOW: f64 = 0.9;
 pub const RECALL_LIMIT_DEFAULT: usize = 10;
 pub const RECALL_LIMIT_MAX: usize = 30;
 
-/// A session's in-context set and pending injection are dropped after this
-/// long without a prefetch, recall or turn, on the service's clock. If it
-/// lapses while Hermes still holds the session, the worst case is one
-/// repeated injection (TIM-94, decision 6).
-///
-/// Provisional: TIM-98 fixes the timeout in code, but its value is waiting
-/// on Tim (TIM-109).
-pub const IN_CONTEXT_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
-
 // Extraction (TIM-92, TIM-98):
 
 /// The size a document section is split down to when it's too long, in
@@ -263,7 +256,6 @@ pub struct RetrievalConstants {
     pub state_age_shown_below: f64,
     pub recall_limit_default: usize,
     pub recall_limit_max: usize,
-    pub in_context_idle_timeout_hours: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -344,7 +336,6 @@ impl FixedConstants {
                 state_age_shown_below: STATE_AGE_SHOWN_BELOW,
                 recall_limit_default: RECALL_LIMIT_DEFAULT,
                 recall_limit_max: RECALL_LIMIT_MAX,
-                in_context_idle_timeout_hours: IN_CONTEXT_IDLE_TIMEOUT.as_secs_f64() / 3600.0,
             },
         }
     }

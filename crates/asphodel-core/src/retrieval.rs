@@ -14,9 +14,12 @@
 //!    recall applies its filters.
 //! 3. **Fusion.** Unweighted RRF ([`fuse`]); an empty arm contributes
 //!    nothing.
-//! 4. **Reranking.** The top [`RERANKED`] go to the reranker. In prefetch
-//!    it runs under [`RERANKER_DEADLINE`](crate::constants::RERANKER_DEADLINE), measured from the start of the
-//!    request; past it the reranker is skipped and RRF order is used.
+//! 4. **Reranking.** The top [`RERANKED`] go to the reranker, under
+//!    [`RERANKER_DEADLINE`](crate::constants::RERANKER_DEADLINE) measured
+//!    from the start of the request. Past it, explicit recall keeps RRF
+//!    order and prefetch injects nothing: without the logit there's no
+//!    relevance to gate on, and a wrong injection is replayed for the rest
+//!    of the session (TIM-93, decision 8, as amended by TIM-109).
 //! 5. **Score.** [`score`]: relevance (the reranker logit), plus w_s times
 //!    strength, plus the clamped log of state confidence, plus the phase
 //!    term. w_s is `ranking.w_s_inject` or `ranking.w_s_recall`, and the
@@ -78,12 +81,13 @@ pub struct Prefetch {
     /// The recall log row's id. `sync_turn` echoes it to commit the
     /// injection to the session's in-context set.
     pub recall_id: Uuid,
-    /// The injection, or empty when nothing passed the gate.
+    /// The injection, or empty when nothing passed the gate or the
+    /// reranker missed its deadline.
     pub text: String,
     /// The memories injected, in the order they're listed.
     pub injected: Vec<Uuid>,
-    /// Whether the reranker answered in time. When it didn't, the
-    /// candidates are in RRF order.
+    /// Whether the reranker answered in time. When it didn't, nothing is
+    /// injected.
     pub reranked: bool,
 }
 
@@ -157,8 +161,8 @@ pub struct RecallRequest {
 pub struct Recall {
     pub recall_id: Uuid,
     pub results: Vec<Recalled>,
-    /// Whether the reranker answered. When it failed, the results are in
-    /// RRF order.
+    /// Whether the reranker answered in time. When it didn't, the results
+    /// are in RRF order.
     pub reranked: bool,
 }
 
@@ -406,7 +410,7 @@ pub(crate) fn prefetch(
         |candidate: &Candidate| candidate.strength >= TAU && !in_context.contains(&candidate.uuid);
     let found = gather(cx, bank_id, &query, now, &keep, None)?;
     let documents = found.iter().map(|c| c.content.clone()).collect();
-    let logits = rerank::logits(&cx.models.reranker, &query, documents, Some(deadline));
+    let logits = rerank::logits(&cx.models.reranker, &query, documents, deadline);
     let reranked = logits.is_some();
     let ranking = &cx.tuning.ranking;
     let ranked = rank(found, logits, |candidate, logit| {
@@ -442,11 +446,10 @@ pub(crate) fn prefetch(
     let mut injected = Vec::new();
     let mut logged = Vec::with_capacity(ranked.len());
     for item in &ranked {
-        // Past the deadline there's no logit to gate on, so the gate is
-        // skipped and RRF order stands; τ, the in-context skip and the caps
-        // still hold (TIM-93, decision 8). Whether a late reranker should
-        // inject nothing instead is waiting on Tim (TIM-109).
-        let passes = item.logit.is_none_or(|logit| logit >= floor);
+        // Past the deadline, or when the reranker fails, there's no logit,
+        // so nothing passes the gate and nothing is injected; the candidates
+        // are still logged (TIM-93, decision 8, as amended by TIM-109).
+        let passes = item.logit.is_some_and(|logit| logit >= floor);
         let mut take = false;
         if passes && injected.len() < cap {
             let line = format::line(&item.candidate, now);
@@ -519,6 +522,7 @@ pub(crate) fn recall(
     request: &RecallRequest,
 ) -> Result<Recall, RecallError> {
     let started = Instant::now();
+    let deadline = started + cx.deadline;
     let now = cx.store.now();
     if let (Some(from), Some(to)) = (request.from, request.to)
         && from > to
@@ -546,7 +550,7 @@ pub(crate) fn recall(
     };
     let found = gather(cx, bank_id, &query, now, &keep, linked.as_ref())?;
     let documents = found.iter().map(|c| c.content.clone()).collect();
-    let logits = rerank::logits(&cx.models.reranker, &query, documents, None);
+    let logits = rerank::logits(&cx.models.reranker, &query, documents, deadline);
     let reranked = logits.is_some();
     let ranking = &cx.tuning.ranking;
     let with_phase = request.phase != PhaseFilter::Any;

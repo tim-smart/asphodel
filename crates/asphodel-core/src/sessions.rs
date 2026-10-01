@@ -13,7 +13,8 @@
 //!   agenda). Injection skips it, and extraction gets it to judge `used`
 //!   (ADR 0001). It's cleared on compaction.
 //! - **Idle timeout.** A session untouched for
-//!   [`IN_CONTEXT_IDLE_TIMEOUT`] on the service's clock is dropped.
+//!   `sessions.in_context_idle_days` on the service's clock is dropped. It's
+//!   garbage collection only.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -21,12 +22,11 @@ use std::sync::{Mutex, MutexGuard};
 use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
 
-use crate::constants::IN_CONTEXT_IDLE_TIMEOUT;
-
 /// Every live session's state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Sessions {
     inner: Mutex<HashMap<Key, Session>>,
+    idle: SignedDuration,
 }
 
 /// A bank's rowid and a Hermes session id.
@@ -47,6 +47,14 @@ struct Pending {
 }
 
 impl Sessions {
+    /// No sessions yet, each to be dropped after `idle_days` untouched.
+    pub(crate) fn new(idle_days: u32) -> Self {
+        Self {
+            inner: Mutex::default(),
+            idle: SignedDuration::from_hours(24 * i64::from(idle_days)),
+        }
+    }
+
     /// The session's in-context set, oldest first.
     pub(crate) fn in_context(&self, bank_id: i64, session_id: &str, now: Timestamp) -> Vec<Uuid> {
         let mut sessions = self.live(now);
@@ -122,12 +130,11 @@ impl Sessions {
     /// The map, with every session idle past the timeout dropped.
     fn live(&self, now: Timestamp) -> MutexGuard<'_, HashMap<Key, Session>> {
         let mut sessions = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let timeout = SignedDuration::try_from(IN_CONTEXT_IDLE_TIMEOUT)
-            .expect("the idle timeout fits a signed duration");
+        let idle = self.idle;
         sessions.retain(|_, session| {
             session
                 .touched_at
-                .checked_add(timeout)
+                .checked_add(idle)
                 .is_ok_and(|expires| now < expires)
         });
         sessions

@@ -38,7 +38,7 @@ pub struct Service {
     /// Pending injections and in-context sets, per Hermes session. In
     /// memory, so a restart costs at most one repeated injection.
     sessions: Sessions,
-    /// Prefetch's reranker deadline: [`RERANKER_DEADLINE`], fixed in code
+    /// The reranker deadline: [`RERANKER_DEADLINE`], fixed in code
     /// (ADR 0009), unless [`Service::with_reranker_deadline`] set another.
     reranker_deadline: Duration,
 }
@@ -56,13 +56,14 @@ impl Service {
     /// without models. Retained for existing callers; `serve` and replay
     /// use [`Service::with_models`].
     pub fn open(clock: Arc<dyn Clock>, store: Store, tuning: Tuning) -> Self {
+        let sessions = Sessions::new(tuning.sessions.in_context_idle_days);
         Self {
             clock,
             store,
             tuning,
             models: None,
             leases: Leases::default(),
-            sessions: Sessions::default(),
+            sessions,
             reranker_deadline: RERANKER_DEADLINE,
         }
     }
@@ -81,18 +82,19 @@ impl Service {
     ) -> Result<Self, OpenError> {
         let ids = models.ids();
         tuning.check_floors(&ids.embedding, &ids.reranker)?;
+        let sessions = Sessions::new(tuning.sessions.in_context_idle_days);
         Ok(Self {
             clock,
             store,
             tuning,
             models: Some(models),
             leases: Leases::default(),
-            sessions: Sessions::default(),
+            sessions,
             reranker_deadline: RERANKER_DEADLINE,
         })
     }
 
-    /// The same service with prefetch's reranker deadline set to
+    /// The same service with the reranker deadline set to
     /// `deadline`. The deadline is fixed in code (ADR 0009); this is for
     /// tests of the fallback and for the bench, which shouldn't wait 1.5 s
     /// per slow call.

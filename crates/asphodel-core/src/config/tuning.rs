@@ -241,12 +241,21 @@ impl Default for MentalModelsTuning {
 pub struct SessionsTuning {
     /// A mapping expires after this many days without a turn.
     pub mapping_expiry_days: u32,
+
+    /// A session's in-context set and pending injection are dropped after
+    /// this many days without a prefetch, recall or turn, on the service's
+    /// clock. It's garbage collection only: compaction, reset and rewind
+    /// already clear the set, and a thread resumed days later is the same
+    /// Hermes session, so expiring early would re-inject what Hermes still
+    /// holds (TIM-93, amended by TIM-109).
+    pub in_context_idle_days: u32,
 }
 
 impl Default for SessionsTuning {
     fn default() -> Self {
         Self {
             mapping_expiry_days: 30,
+            in_context_idle_days: 7,
         }
     }
 }
@@ -529,6 +538,9 @@ impl Tuning {
 
         if self.sessions.mapping_expiry_days == 0 {
             fail("sessions.mapping_expiry_days", "must be at least 1".into());
+        }
+        if self.sessions.in_context_idle_days == 0 {
+            fail("sessions.in_context_idle_days", "must be at least 1".into());
         }
 
         if let Some(model) = &self.llm.model
