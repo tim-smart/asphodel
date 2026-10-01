@@ -25,6 +25,13 @@ CREATE TABLE accesses_v4 (
 );
 INSERT INTO accesses_v4 (id, bank_id, memory_id, kind, at, turn, source_id)
   SELECT id, bank_id, memory_id, kind, at, turn, source_id FROM accesses;
+-- AUTOINCREMENT's high-water mark goes with the old table when it's
+-- dropped, and the copy only knows the highest id still there. Carry the
+-- old mark over, so an id deleted before the upgrade is never handed out
+-- again. The rename takes it along to the new name.
+DELETE FROM sqlite_sequence WHERE name = 'accesses_v4';
+INSERT INTO sqlite_sequence (name, seq)
+  SELECT 'accesses_v4', seq FROM sqlite_sequence WHERE name = 'accesses';
 DROP TABLE accesses;
 ALTER TABLE accesses_v4 RENAME TO accesses;
 

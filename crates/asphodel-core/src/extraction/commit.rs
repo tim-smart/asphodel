@@ -10,8 +10,8 @@ use super::claims::{Checked, Link, NewMemory, Stamp, is_pronoun};
 use super::input::{Unit, survivor};
 use super::reconcile::{Edit, Fate, Neighbour, Plan, end_at};
 use super::{
-    Call1Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT, EDIT_REFINED,
-    EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted,
+    Call1Input, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT, EDIT_REFINED, EDIT_RETRACTED,
+    EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted,
 };
 use crate::constants::{
     Significance, Volatility, WEIGHT_CONFIRMED, WEIGHT_CREATED, WEIGHT_MENTIONED_AGAIN, WEIGHT_USED,
@@ -116,10 +116,7 @@ pub(super) fn commit(
                         micros(input.observed_at)
                     ),
                 )?;
-                let same_kind = by_id
-                    .get(&neighbour)
-                    .is_some_and(|n| n.kind == checked.memories[index].kind.window_kind());
-                reopen(&tx, store, unit, neighbour, by, same_kind)?;
+                reopen(&tx, store, unit, neighbour, by)?;
             }
             Edit::Refines => {
                 tx.execute(
@@ -510,49 +507,30 @@ fn end(
     )
 }
 
-/// The memories `retracted` had ended (TIM-92, "Reopening"). Retracted by a
-/// successor of the same kind, a reschedule, their end follows the
-/// successor. Retracted by anything else, such as "I haven't filed it after
-/// all", they're open again. Either way the edit is logged.
+/// The memories `retracted` had ended (TIM-92, "Reopening"). A retraction
+/// here always has a successor, the claim that retracted it, so their end
+/// follows the successor, whatever its kind, and the edit is logged.
 fn reopen(
     tx: &Transaction<'_>,
     store: &Store,
     unit: &Unit,
     retracted: i64,
     successor: &Written,
-    reschedule: bool,
 ) -> Result<(), rusqlite::Error> {
     let mut statement = tx.prepare_cached("SELECT id FROM memories WHERE ended_by = ?1")?;
     let ended: Vec<i64> = statement
         .query_map([retracted], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
     for memory in ended {
-        if reschedule {
-            end(
-                tx,
-                store,
-                unit,
-                memory,
-                successor.id,
-                successor.end,
-                EDIT_END_REPOINTED,
-            )?;
-        } else {
-            tx.execute(
-                "UPDATE memories SET valid_until = NULL, valid_until_precision = NULL,
-                        ended_by = NULL, updated_at = ?2
-                 WHERE id = ?1",
-                (memory, micros(store.now())),
-            )?;
-            log_memory_edit(
-                tx,
-                store,
-                unit.bank_id,
-                EDIT_END_CLEARED,
-                memory,
-                &format!("{{\"ended_by\":{retracted}}}"),
-            )?;
-        }
+        end(
+            tx,
+            store,
+            unit,
+            memory,
+            successor.id,
+            successor.end,
+            EDIT_END_REPOINTED,
+        )?;
     }
     Ok(())
 }

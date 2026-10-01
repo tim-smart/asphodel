@@ -82,14 +82,10 @@ pub const EDIT_REFINED: &str = "memory_refined";
 pub const EDIT_SIGNIFICANCE_RAISED: &str = "significance_raised";
 /// A remember-this on a neighbour sets the owner's significance to kept.
 pub const EDIT_KEPT: &str = "memory_kept";
-/// The memory that ended another was retracted by a successor of the same
-/// kind, a reschedule, so the ended memory's `ended_by` and `valid_until`
-/// follow the successor (TIM-92, "Reopening").
+/// The memory that ended another was retracted with a successor, so the
+/// ended memory's `ended_by` and `valid_until` follow the successor (TIM-92,
+/// "Reopening").
 pub const EDIT_END_REPOINTED: &str = "end_repointed";
-/// The memory that ended another was retracted by a claim of another kind,
-/// such as "I haven't filed it after all", so the ended memory is open again
-/// (TIM-92, "Reopening").
-pub const EDIT_END_CLEARED: &str = "end_cleared";
 
 /// Earlier clean turns of the session given as context (TIM-92, "up to 3
 /// previous clean turns").

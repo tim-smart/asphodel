@@ -80,17 +80,6 @@ pub(super) enum Kind {
 }
 
 impl Kind {
-    /// The same kind as the strength model names it.
-    pub fn window_kind(self) -> crate::strength::Kind {
-        match self {
-            Kind::Fact => crate::strength::Kind::Fact,
-            Kind::Event => crate::strength::Kind::Event,
-            Kind::State => crate::strength::Kind::State,
-            Kind::Task => crate::strength::Kind::Task,
-            Kind::Recurring => crate::strength::Kind::Recurring,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Fact => "fact",

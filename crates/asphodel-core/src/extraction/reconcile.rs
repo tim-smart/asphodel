@@ -47,8 +47,10 @@ use crate::constants::Significance;
 use crate::store::{SqliteVec, VectorError, VectorIndex, timestamp};
 use crate::strength::{Kind, Link as ChainLink, chain_head};
 
-/// Hits taken from each retriever before collapsing chains and dropping
-/// retracted memories, so the fused list can still fill its five.
+/// Hits each retriever takes at first. Superseded versions collapse into
+/// their chain's head and retracted memories drop out, so when fewer than
+/// [`NEIGHBOURS_PER_CLAIM`] distinct memories are left, the retriever asks
+/// for twice as many, until it has them or runs out (the TIM-108 review).
 const HITS_PER_RETRIEVER: usize = NEIGHBOURS_PER_CLAIM * 4;
 
 /// Reciprocal rank fusion's constant: a hit at rank r scores 1 / (k + r).
@@ -105,24 +107,50 @@ pub(super) fn search(
 
     for (memory, vector) in checked.memories.iter().zip(vectors) {
         let mut vector_ranked = Vec::new();
-        for hit in nearest(conn, unit.bank_id, vector)? {
-            let similarity = 1.0 - f64::from(hit.distance);
-            if !memory.flagged && similarity < floor {
-                continue;
+        let mut limit = HITS_PER_RETRIEVER;
+        loop {
+            let hits = nearest(conn, unit.bank_id, vector, limit)?;
+            vector_ranked.clear();
+            // Hits come nearest first, so once one is below the floor every
+            // later one is too.
+            let mut below_floor = false;
+            for hit in &hits {
+                let similarity = 1.0 - f64::from(hit.distance);
+                if !memory.flagged && similarity < floor {
+                    below_floor = true;
+                    break;
+                }
+                let Some(head) = shown(conn, &links, &mut loaded, hit.memory_id)? else {
+                    continue;
+                };
+                if similarity >= floor {
+                    runs = true;
+                }
+                if !vector_ranked.contains(&head) {
+                    vector_ranked.push(head);
+                }
             }
-            let Some(head) = shown(conn, &links, &mut loaded, hit.memory_id)? else {
-                continue;
-            };
-            if similarity >= floor {
-                runs = true;
+            if below_floor || hits.len() < limit || vector_ranked.len() >= NEIGHBOURS_PER_CLAIM {
+                break;
             }
-            vector_ranked.push(head);
+            limit *= 2;
         }
         let mut bm25_ranked = Vec::new();
-        for hit in bm25(conn, unit.bank_id, &memory.content)? {
-            if let Some(head) = shown(conn, &links, &mut loaded, hit)? {
-                bm25_ranked.push(head);
+        let mut limit = HITS_PER_RETRIEVER;
+        loop {
+            let hits = bm25(conn, unit.bank_id, &memory.content, limit)?;
+            bm25_ranked.clear();
+            for hit in &hits {
+                if let Some(head) = shown(conn, &links, &mut loaded, *hit)?
+                    && !bm25_ranked.contains(&head)
+                {
+                    bm25_ranked.push(head);
+                }
             }
+            if hits.len() < limit || bm25_ranked.len() >= NEIGHBOURS_PER_CLAIM {
+                break;
+            }
+            limit *= 2;
         }
         let mut found = fuse(&[&vector_ranked, &bm25_ranked]);
         found.truncate(NEIGHBOURS_PER_CLAIM);
@@ -225,9 +253,10 @@ fn nearest(
     conn: &Connection,
     bank_id: i64,
     vector: &[f32],
+    limit: usize,
 ) -> Result<Vec<crate::store::Neighbour>, rusqlite::Error> {
     SqliteVec
-        .nearest(conn, bank_id, vector, HITS_PER_RETRIEVER)
+        .nearest(conn, bank_id, vector, limit)
         .map_err(|error| match error {
             VectorError::Sqlite(error) => error,
             other => rusqlite::Error::ToSqlConversionFailure(Box::new(other)),
@@ -236,7 +265,12 @@ fn nearest(
 
 /// BM25 over memory content within the bank, best first: any of the
 /// claim's words, each as a quoted phrase so nothing is read as syntax.
-fn bm25(conn: &Connection, bank_id: i64, content: &str) -> Result<Vec<i64>, rusqlite::Error> {
+fn bm25(
+    conn: &Connection,
+    bank_id: i64,
+    content: &str,
+    limit: usize,
+) -> Result<Vec<i64>, rusqlite::Error> {
     let words: BTreeSet<String> = content
         .split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
@@ -257,9 +291,10 @@ fn bm25(conn: &Connection, bank_id: i64, content: &str) -> Result<Vec<i64>, rusq
          LIMIT ?3",
     )?;
     statement
-        .query_map((query, bank_id, HITS_PER_RETRIEVER as i64), |row| {
-            row.get(0)
-        })?
+        .query_map(
+            (query, bank_id, i64::try_from(limit).unwrap_or(i64::MAX)),
+            |row| row.get(0),
+        )?
         .collect()
 }
 
