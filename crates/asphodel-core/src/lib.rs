@@ -10,10 +10,12 @@ pub mod config;
 pub mod constants;
 pub mod logging;
 pub mod service;
+pub mod store;
 
 pub use clock::{Clock, SimulatedClock, SystemClock};
 pub use config::{ResolvedConfig, Tuning};
 pub use service::{Health, Service};
+pub use store::Store;
 
 /// The version of this build, as reported by `/v1/health`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

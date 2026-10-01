@@ -15,7 +15,8 @@ use std::{
 
 use anyhow::{Context, bail};
 use asphodel_core::config::{Deployment, LLM_API_KEY_ENV, Secret, TOKEN_ENV};
-use asphodel_core::{Health, ResolvedConfig, Service, SystemClock, Tuning};
+use asphodel_core::store::{OpenOptions, Store};
+use asphodel_core::{Clock, Health, ResolvedConfig, Service, SystemClock, Tuning};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::signal;
@@ -30,7 +31,7 @@ type Shared = Arc<Service>;
 mod tests;
 
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
-    let config = resolve_config(&args)?;
+    let mut config = resolve_config(&args)?;
     if !args.listen.is_local() && config.deployment.token.is_none() {
         bail!(
             "listening on {} is reachable off this machine, so a bearer token is required: \
@@ -38,15 +39,31 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             args.listen
         );
     }
-    if args.data_dir.is_none() {
-        warn!("no --data-dir given; the store arrives in a later stage, so nothing is persisted");
-    }
+
+    // The store is opened before anything listens: the lock, the filesystem
+    // check and the migrations all have to pass before the daemon exists to
+    // a client (TIM-94, decision 4; ADR 0010).
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let service = match &args.data_dir {
+        Some(dir) => {
+            let options = OpenOptions {
+                allow_network_fs: args.allow_network_fs,
+            };
+            let store = Store::open(dir, options, Arc::clone(&clock))
+                .with_context(|| format!("opening the store in {}", dir.display()))?;
+            config.purge = store.check_fingerprint(&config.deletion_fingerprint)?;
+            Service::open(clock, store, config.tuning.clone())
+        }
+        None => {
+            warn!("no --data-dir given; nothing is persisted and bank calls fail");
+            Service::new(clock)
+        }
+    };
     info!(
         config = %serde_json::to_string(&config)?,
         "resolved config"
     );
-
-    let service: Shared = Arc::new(Service::new(Arc::new(SystemClock)));
+    let service: Shared = Arc::new(service);
     let app = Router::new()
         .route("/v1/health", get(health))
         .with_state(service);

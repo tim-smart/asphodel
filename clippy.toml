@@ -5,4 +5,6 @@ disallowed-methods = [
   { path = "std::time::SystemTime::now", reason = "read the time through the Clock trait" },
   { path = "jiff::Timestamp::now", reason = "read the time through the Clock trait" },
   { path = "jiff::Zoned::now", reason = "read the time through the Clock trait" },
+  { path = "uuid::Uuid::now_v7", reason = "mint ids from the Clock through Store::new_id" },
+  { path = "uuid::Timestamp::now", reason = "mint ids from the Clock through Store::new_id" },
 ]

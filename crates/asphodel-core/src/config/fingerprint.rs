@@ -81,6 +81,11 @@ impl Fingerprint {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A fingerprint read back from the store, as it was recorded.
+    pub(crate) fn from_stored(hex: String) -> Self {
+        Self(hex)
+    }
 }
 
 impl fmt::Display for Fingerprint {
