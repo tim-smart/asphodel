@@ -433,6 +433,52 @@ impl Harness {
         uuid
     }
 
+    /// `count` versions of one fact in `main`, each refined into the next,
+    /// inserted in one transaction as [`Harness::insert_memory`] would insert
+    /// each. Returns the head.
+    fn insert_chain(&self, content: &str, count: usize) -> Uuid {
+        let chunk = self.fixture_chunk("main");
+        let bank_id = self.bank_id("main");
+        let vector = FakeEmbedder.embed(&[content]).unwrap().remove(0);
+        let earlier = micros(at(EARLIER));
+        let now = micros(self.now());
+        let store = self.service.store().unwrap();
+        let mut conn = store.connection();
+        let tx = conn.transaction().unwrap();
+        let mut previous: Option<i64> = None;
+        let mut head = None;
+        for _ in 0..count {
+            let uuid = next_uuid();
+            tx.execute(
+                "INSERT INTO memories (uuid, bank_id, content, kind, significance, chunk_id,
+                                       source_start, source_end, observed_at, window_confidence,
+                                       created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'fact', 'minor', ?4, 0, 9, ?5, 'high', ?6, ?6)",
+                (uuid.to_string(), bank_id, content, chunk, earlier, now),
+            )
+            .unwrap();
+            let id = tx.last_insert_rowid();
+            store.vectors().upsert(&tx, bank_id, id, &vector).unwrap();
+            tx.execute(
+                "INSERT INTO accesses (bank_id, memory_id, kind, at, turn)
+                 VALUES (?1, ?2, 'created', ?3, 0)",
+                (bank_id, id, earlier),
+            )
+            .unwrap();
+            if let Some(previous) = previous {
+                tx.execute(
+                    "UPDATE memories SET superseded_by = ?2 WHERE id = ?1",
+                    (previous, id),
+                )
+                .unwrap();
+            }
+            previous = Some(id);
+            head = Some(uuid);
+        }
+        tx.commit().unwrap();
+        head.expect("a chain has a version")
+    }
+
     fn fact(&self, content: &str) -> Uuid {
         self.insert_memory("main", content, "fact", "minor")
     }
@@ -1296,6 +1342,50 @@ fn a_hit_on_a_refined_memory_shows_its_chain_head() {
     let found = shown(&input);
     assert!(found.contains(&tokyo), "{found:?}");
     assert!(!found.contains(&japan), "{found:?}");
+}
+
+/// sqlite-vec 0.1.9 refuses a KNN query for more than this many neighbours
+/// (`SQLITE_VEC_VEC0_K_MAX`).
+const KNN_K_MAX: usize = 4096;
+
+#[test]
+#[ignore = "pending fix (TIM-108 re-review): vector search asks sqlite-vec for more than 4,096 neighbours"]
+fn a_chain_past_the_knn_limit_doesnt_abort_extraction() {
+    // 2,600 versions of one fact all clear the floor and collapse to one
+    // head, so the search keeps asking for more: 2,560 hits still leave it
+    // short, and the next request would be 5,120, past what sqlite-vec
+    // allows. Reconciliation has to stay within the limit and still finish,
+    // or the chunk fails instead of becoming an access.
+    let h = Harness::new();
+    let versions = 2_600;
+    assert!(versions > 2_560 && 2 * 2_560 > KNN_K_MAX);
+    let head = h.insert_chain(TEA, versions);
+    let source = owner_says(&h, "I like green tea.");
+
+    let call1 = reply(vec![claim(TEA, "fact", "I like green tea")]);
+    let input = call2(&h, &call1).expect("call 2 runs");
+    assert_eq!(shown_for(&input, 0), BTreeSet::from([head]));
+    let extracted = one_label(&h, call1, head, "mentioned_again");
+    assert!(extracted.memories.is_empty());
+    let last = h.accesses(head).pop().unwrap();
+    assert_eq!(last.kind, "mentioned_again");
+    assert_eq!(last.source, Some(source));
+}
+
+#[test]
+#[ignore = "pending fix (TIM-108 re-review): vector search can't see past sqlite-vec's 4,096-neighbour limit"]
+fn a_memory_past_the_knn_limit_is_still_a_neighbour() {
+    // More versions of one fact than sqlite-vec returns from one KNN query
+    // all sit nearer the claim than another matching memory. Stopping at the
+    // limit would leave that memory out of call 2 and bring back the
+    // crowding the 22-version regression covers, just later (ADR 0005).
+    let h = Harness::new();
+    let head = h.insert_chain(TEA, KNN_K_MAX + 4);
+    let lot = h.fact(TEA_A_LOT);
+    owner_says(&h, "I like green tea.");
+    let input =
+        call2(&h, &reply(vec![claim(TEA, "fact", "I like green tea")])).expect("call 2 runs");
+    assert_eq!(shown_for(&input, 0), BTreeSet::from([head, lot]));
 }
 
 #[test]
