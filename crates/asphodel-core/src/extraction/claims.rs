@@ -25,6 +25,7 @@ use serde_json::Value;
 use super::input::Unit;
 use super::{Call1Input, DropReason, Dropped, EntityKind};
 use crate::constants::{Significance, Volatility};
+use crate::ingest::TURN_SEPARATOR;
 use crate::queue::SourceKind;
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +222,13 @@ fn check_claim(claim: RawClaim, input: &Call1Input, unit: &Unit) -> Result<NewMe
     }
     let (start, end) = locate(&input.text, &claim.quote).ok_or(DropReason::QuoteNotFound)?;
     let from_reply = input.reply_start.is_some_and(|reply| start >= reply);
+    let only_in_message = input.reply_start.is_some_and(|reply| {
+        only_before(
+            &input.text,
+            &claim.quote,
+            reply.saturating_sub(SEPARATOR_CHARS),
+        )
+    });
 
     let tz = &unit.tz;
     let mut low = claim.window_confidence == Confidence::Low;
@@ -305,11 +313,13 @@ fn check_claim(claim: RawClaim, input: &Call1Input, unit: &Unit) -> Result<NewMe
 
     // TIM-92 other decision 3 and TIM-94 decision 1: only the owner's own
     // message keeps a memory. Anyone else, a document or the reply keeps the
-    // level call 1 gave, which is at most critical.
+    // level call 1 gave, which is at most critical. A quote that's also in
+    // the reply, or runs into it, can't be shown to be the owner's, so it
+    // isn't kept either.
     let kept = claim.remember_this
         && input.source_kind == SourceKind::Turn
         && unit.owner_speaking
-        && !from_reply;
+        && only_in_message;
 
     let links = claim
         .entities
@@ -351,6 +361,30 @@ fn locate(text: &str, quote: &str) -> Option<(usize, usize)> {
     let byte = text.find(quote)?;
     let start = text[..byte].chars().count();
     Some((start, start + quote.chars().count()))
+}
+
+/// [`TURN_SEPARATOR`] in characters. It's ASCII, so its length in bytes.
+const SEPARATOR_CHARS: usize = TURN_SEPARATOR.len();
+
+/// Whether every occurrence of `quote` in `text` ends by character
+/// `message_end`: the quote is in the message and nowhere in the reply.
+fn only_before(text: &str, quote: &str, message_end: usize) -> bool {
+    if quote.is_empty() {
+        return false;
+    }
+    let quote_chars = quote.chars().count();
+    // Overlapping occurrences count too, so step one character at a time.
+    let mut found = false;
+    for (byte, _) in text.char_indices() {
+        if text[byte..].starts_with(quote) {
+            let start = text[..byte].chars().count();
+            if start + quote_chars > message_end {
+                return false;
+            }
+            found = true;
+        }
+    }
+    found
 }
 
 /// A time call 1 gave, as the instant at the start of its unit in `tz`.
@@ -446,9 +480,10 @@ const WEEKDAYS: [(&str, Weekday); 7] = [
     ("sunday", Weekday::Sunday),
 ];
 
-/// Whether the quote names a weekday and none of the claim's dates at day
-/// precision or finer falls on one it names (TIM-92: a mismatch lowers
-/// window confidence rather than dropping the window).
+/// Whether the quote names a weekday that none of the claim's dates at day
+/// precision or finer falls on (TIM-92: a mismatch lowers window confidence
+/// rather than dropping the window). Every named weekday must match a date,
+/// so one that matches can't hide another that doesn't.
 fn weekday_mismatch(quote: &str, dates: &[Option<Stamp>], tz: &TimeZone) -> bool {
     let quote = quote.to_lowercase();
     let named: Vec<Weekday> = WEEKDAYS
@@ -465,7 +500,7 @@ fn weekday_mismatch(quote: &str, dates: &[Option<Stamp>], tz: &TimeZone) -> bool
         .filter(|stamp| stamp.precision >= Precision::Day)
         .map(|stamp| stamp.at.to_zoned(tz.clone()).weekday())
         .collect();
-    !checked.is_empty() && !checked.iter().any(|weekday| named.contains(weekday))
+    !checked.is_empty() && named.iter().any(|weekday| !checked.contains(weekday))
 }
 
 fn strip_rrule_prefix(rule: &str) -> &str {

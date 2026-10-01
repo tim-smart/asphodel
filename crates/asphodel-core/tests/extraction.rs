@@ -2550,7 +2550,6 @@ fn a_new_entity_beside_one_call_1_saw_is_a_second_entity() {
 }
 
 #[test]
-#[ignore = "TIM-107 review finding (proposed entities); activate with its fix"]
 fn a_proposed_entity_never_reuses_one_that_existed_before_call_1() {
     let h = Harness::new();
     let (entities, message) = crowded(&h);
@@ -3088,8 +3087,7 @@ fn an_embedding_failure_writes_nothing() {
     assert_eq!(h.service.queue_depth("main").unwrap(), 1);
 }
 
-// The TIM-107 review. Findings that fail against the current implementation
-// are ignored until their fixes land; the rest pin guarantees the review
+// The TIM-107 review: regressions for its findings, and the guarantees it
 // found untested.
 
 /// Ana with three fresh memories linked, at major, notable and minor.
@@ -3117,7 +3115,6 @@ fn candidate_memories(h: &Harness, entity: Uuid) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "TIM-107 review finding (candidate strength); activate with its fix"]
 fn inherited_accesses_rank_a_candidates_memories() {
     let h = Harness::new();
     let ana = ana_with_memories(&h);
@@ -3148,7 +3145,6 @@ fn inherited_accesses_rank_a_candidates_memories() {
 }
 
 #[test]
-#[ignore = "TIM-107 review finding (candidate strength); activate with its fix"]
 fn a_closed_window_ranks_a_candidates_memories() {
     let h = Harness::new();
     let ana = h.insert_entity("main", "Ana", "person", &["Ana"]);
@@ -3218,7 +3214,6 @@ fn retracted_memories_are_not_candidate_examples() {
 }
 
 #[test]
-#[ignore = "TIM-107 review finding (repeated quotes); activate with its fix"]
 fn remember_this_on_a_quote_the_reply_repeats_is_not_kept() {
     let h = Harness::new();
     // The owner asks about the sentence and the reply repeats it with
@@ -3245,7 +3240,6 @@ fn remember_this_on_a_quote_the_reply_repeats_is_not_kept() {
 }
 
 #[test]
-#[ignore = "TIM-107 review finding (weekday check); activate with its fix"]
 fn every_named_weekday_must_fall_on_one_of_the_dates() {
     let h = Harness::new();
     // 5 October 2026 is a Monday and the 8th a Thursday. The Monday start
@@ -3350,7 +3344,6 @@ fn aliases_match_whole_words_in_order() {
 }
 
 #[test]
-#[ignore = "TIM-107 review finding (diacritics); activate with its fix"]
 fn aliases_match_with_or_without_diacritics() {
     let h = Harness::new();
     // The alias FTS removes diacritics (`remove_diacritics 2`), so matching
@@ -3461,7 +3454,6 @@ fn vectors(h: &Harness) -> i64 {
 }
 
 #[test]
-#[ignore = "TIM-107 review finding (vector width); activate with its fix"]
 fn a_vector_of_the_wrong_width_is_an_embedding_failure() {
     let h = Harness::with_models(Models {
         embedder: Arc::new(ShortEmbedder),
@@ -3535,7 +3527,6 @@ fn a_failed_commit_rolls_back_everything_and_is_counted() {
 }
 
 #[test]
-#[ignore = "TIM-107 review finding (commit failure reporting); activate with its fix"]
 fn a_failed_commit_reports_the_queues_count() {
     let h = Harness::new();
     ingest(&h, &turn("s1", T1, "I like tea.", "Noted."));

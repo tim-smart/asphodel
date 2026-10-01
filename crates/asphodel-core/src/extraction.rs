@@ -38,7 +38,7 @@ use uuid::Uuid;
 use crate::config::Tuning;
 use crate::models::{Embedder, LlmClient, LlmError, ModelError};
 use crate::queue::{self, ChunkError, Failure, Lease, Leases, QueueError, SourceKind};
-use crate::store::{Store, StoreError, VectorError};
+use crate::store::{Store, StoreError, VectorIndex};
 
 pub use prompt::call1_request;
 
@@ -250,9 +250,11 @@ pub enum ExtractError {
     #[error("no models are loaded, so nothing can be extracted")]
     NoModels,
 
-    /// A vector didn't fit the index. Nothing is committed.
-    #[error(transparent)]
-    Vector(#[from] VectorError),
+    /// The commit transaction failed and was rolled back, and the queue
+    /// counted it, so a fault that recurs reaches the retry cap rather than
+    /// holding the bank's queue.
+    #[error("committing the chunk failed: {error}")]
+    Commit { error: StoreError, failure: Failure },
 
     #[error(transparent)]
     Queue(#[from] QueueError),
@@ -268,10 +270,10 @@ impl ExtractError {
         match self {
             ExtractError::Call1 { failure, .. }
             | ExtractError::InvalidReply { failure, .. }
-            | ExtractError::Embedding { failure, .. } => Some(*failure),
+            | ExtractError::Embedding { failure, .. }
+            | ExtractError::Commit { failure, .. } => Some(*failure),
             ExtractError::Held { .. }
             | ExtractError::NoModels
-            | ExtractError::Vector(_)
             | ExtractError::Queue(_)
             | ExtractError::Store(_) => None,
         }
@@ -340,12 +342,22 @@ pub(crate) fn extract(
         .iter()
         .map(|memory| memory.content.as_str())
         .collect();
+    // Every vector must fit the index before the commit starts, so a bad
+    // embedder is an embedding failure rather than a failed commit.
+    let width = store.vectors().dimensions();
     let vectors = match embedder.embed(&contents) {
-        Ok(vectors) if vectors.len() == contents.len() => vectors,
+        Ok(vectors)
+            if vectors.len() == contents.len()
+                && vectors.iter().all(|vector| vector.len() == width) =>
+        {
+            vectors
+        }
         Ok(_) => {
             let error = ModelError::Inference {
                 model: embedder.model_id().to_owned(),
-                reason: "returned a different number of vectors than texts".into(),
+                reason: format!(
+                    "returned vectors that don't fit the index: one {width}-wide vector per text"
+                ),
             };
             let failure = queue::fail(store, leases, lease, EMBEDDING)?;
             return Err(ExtractError::Embedding { error, failure });
@@ -371,8 +383,8 @@ pub(crate) fn extract(
         Err(error) => {
             // A commit that fails every time must still reach the retry cap
             // rather than hold the bank's queue for ever.
-            queue::fail(store, leases, lease, COMMIT)?;
-            Err(error)
+            let failure = queue::fail(store, leases, lease, COMMIT)?;
+            Err(ExtractError::Commit { error, failure })
         }
     }
 }

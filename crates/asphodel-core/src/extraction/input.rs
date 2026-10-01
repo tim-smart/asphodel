@@ -8,6 +8,8 @@ use jiff::ToSpan;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use rusqlite::{Connection, OptionalExtension};
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
 use uuid::Uuid;
 
 use super::{
@@ -16,11 +18,10 @@ use super::{
     SpeakerRef,
 };
 use crate::config::Tuning;
-use crate::constants::{SIGNIFICANCE_KEPT, Significance};
 use crate::ingest::TURN_SEPARATOR;
 use crate::queue::{Lease, SourceKind};
+use crate::store::strength::StrengthLoader;
 use crate::store::timestamp;
-use crate::strength::{Access, AccessKind, BankTime, strength};
 
 /// What the checks and the commit need beyond the input itself.
 pub(super) struct Unit {
@@ -33,6 +34,10 @@ pub(super) struct Unit {
     /// bank's counter just after it was counted; for a document, the
     /// counter when it was ingested.
     pub turn: i64,
+    /// The highest entity rowid when the input was assembled. Rowids are
+    /// never reused, so an entity above it was created after call 1's input
+    /// was read (TIM-92: commit reuses only those).
+    pub entity_boundary: i64,
     /// Whether the speaker is the owner. False for a document.
     pub owner_speaking: bool,
     /// Candidate handle to entity rowid.
@@ -150,20 +155,12 @@ pub(super) fn assemble(
     passages.extend(context.iter().map(String::as_str));
     let found = found_entities(conn, bank_id, &passages, &always)?;
 
-    let mut bank_time: Option<BankTime> = None;
+    let mut loader: Option<StrengthLoader> = None;
     let mut candidates = Vec::new();
     let mut handles = BTreeMap::new();
     for (index, entity_id) in always.iter().chain(found.iter()).enumerate() {
         let handle = format!("e{}", index + 1);
-        let candidate = candidate(
-            conn,
-            tuning,
-            now,
-            bank_id,
-            *entity_id,
-            &handle,
-            &mut bank_time,
-        )?;
+        let candidate = candidate(conn, tuning, now, bank_id, *entity_id, &handle, &mut loader)?;
         handles.insert(handle, *entity_id);
         candidates.push(candidate);
     }
@@ -214,6 +211,10 @@ pub(super) fn assemble(
     }
 
     let turn = turn_number(conn, bank_id, source.source_id, is_turn)?;
+    let entity_boundary: i64 =
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM entities", [], |row| {
+            row.get(0)
+        })?;
     let unit = Unit {
         bank_id,
         chunk_id,
@@ -221,6 +222,7 @@ pub(super) fn assemble(
         tz,
         ingested_at: source.ingested_at,
         turn,
+        entity_boundary,
         owner_speaking: speaker_ref.as_ref().is_some_and(|speaker| speaker.owner),
         candidates: handles,
         in_context: in_context_handles,
@@ -375,13 +377,23 @@ pub(super) fn survivor(conn: &Connection, mut entity_id: i64) -> Result<i64, rus
     Ok(entity_id)
 }
 
-/// Lowercase runs of letters and digits, the way the alias FTS tokenises
-/// closely enough to confirm its matches.
+/// Runs of letters and digits, folded the way the alias FTS folds them
+/// (`unicode61 remove_diacritics 2`) closely enough to confirm its matches:
+/// canonically decomposed (NFD), with every combining mark removed, then
+/// lowercased. "Lucía" and "Lucia", or "Zoë" and "Zoe", are the same word.
 pub(super) fn words(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
+        .map(fold)
+        .filter(|word| !word.is_empty())
         .collect()
+}
+
+fn fold(word: &str) -> String {
+    word.nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .collect::<String>()
+        .to_lowercase()
 }
 
 /// Entities other than `always` whose aliases appear in a passage, as their
@@ -456,7 +468,7 @@ fn candidate(
     bank_id: i64,
     entity_id: i64,
     handle: &str,
-    bank_time: &mut Option<BankTime>,
+    loader: &mut Option<StrengthLoader>,
 ) -> Result<Candidate, rusqlite::Error> {
     let (uuid, name, kind): (String, String, String) = conn.query_row(
         "SELECT uuid, name, kind FROM entities WHERE id = ?1",
@@ -474,67 +486,47 @@ fn candidate(
         name,
         kind: EntityKind::parse(&kind).unwrap_or(EntityKind::Thing),
         aliases,
-        memories: strongest_memories(conn, tuning, now, bank_id, entity_id, bank_time)?,
+        memories: strongest_memories(conn, tuning, now, bank_id, entity_id, loader)?,
     })
 }
 
 /// The sentences of up to [`CANDIDATE_MEMORIES`] memories linked to the
 /// entity, strongest now first, leaving out hidden and retracted ones.
-///
-/// Strength here is a memory's own accesses and significance on the bank's
-/// clock. It doesn't follow supersession or restart at a window's close,
-/// which only matters for ranking three example sentences.
+/// Strength is the full TIM-91 strength, inherited accesses and window
+/// closes included ([`StrengthLoader`]); ties go to the older memory.
 fn strongest_memories(
     conn: &Connection,
     tuning: &Tuning,
     now: Timestamp,
     bank_id: i64,
     entity_id: i64,
-    bank_time: &mut Option<BankTime>,
+    loader: &mut Option<StrengthLoader>,
 ) -> Result<Vec<String>, rusqlite::Error> {
     let mut statement = conn.prepare_cached(
-        "SELECT m.id, m.content, m.significance, m.owner_significance
+        "SELECT m.id, m.content
          FROM memory_entities me JOIN memories m ON m.id = me.memory_id
          WHERE me.entity_id = ?1 AND m.hidden_at IS NULL AND m.invalidated_at IS NULL
          ORDER BY m.id",
     )?;
-    let linked: Vec<(i64, String, String, Option<String>)> = statement
-        .query_map([entity_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
+    let linked: Vec<(i64, String)> = statement
+        .query_map([entity_id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
     if linked.is_empty() {
         return Ok(Vec::new());
     }
-    if bank_time.is_none() {
-        let mut turns = conn.prepare_cached(
-            "SELECT message_at FROM sources WHERE bank_id = ?1 AND kind = 'turn'",
-        )?;
-        let at: Vec<Timestamp> = turns
-            .query_map([bank_id], |row| row.get::<_, i64>(0))?
-            .map(|micros| micros.map(timestamp))
-            .collect::<Result<_, _>>()?;
-        *bank_time = Some(BankTime::new(&at, tuning.clock.quiet_rate));
-    }
-    let bank_time = bank_time.as_ref().expect("built above");
+    let loader = match loader {
+        Some(loader) => loader,
+        None => loader.insert(StrengthLoader::new(
+            conn,
+            bank_id,
+            tuning.clock.quiet_rate,
+            now,
+        )?),
+    };
 
-    let mut accesses = conn.prepare_cached("SELECT kind, at FROM accesses WHERE memory_id = ?1")?;
     let mut scored = Vec::with_capacity(linked.len());
-    for (memory_id, content, level, owner) in linked {
-        let log: Vec<Access> = accesses
-            .query_map([memory_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .filter_map(|row| {
-                let (kind, at) = row.ok()?;
-                Some(Access {
-                    kind: access_kind(&kind)?,
-                    at: timestamp(at),
-                })
-            })
-            .collect();
-        let significance = significance_value(owner.as_deref().unwrap_or(&level));
-        let value = strength(significance, &log, None, bank_time, now).value;
+    for (memory_id, content) in linked {
+        let value = loader.strength(conn, memory_id)?.value;
         scored.push((value, memory_id, content));
     }
     scored.sort_by(|(left, left_id, _), (right, right_id, _)| {
@@ -545,28 +537,6 @@ fn strongest_memories(
         .take(CANDIDATE_MEMORIES)
         .map(|(_, _, content)| content)
         .collect())
-}
-
-fn access_kind(kind: &str) -> Option<AccessKind> {
-    match kind {
-        "created" => Some(AccessKind::Created),
-        "used" => Some(AccessKind::Used),
-        "mentioned_again" => Some(AccessKind::MentionedAgain),
-        "confirmed" => Some(AccessKind::Confirmed),
-        _ => None,
-    }
-}
-
-/// A stored significance level, or `kept`, as its value.
-fn significance_value(level: &str) -> f64 {
-    match level {
-        "kept" => SIGNIFICANCE_KEPT,
-        "trivial" => Significance::Trivial.value(),
-        "minor" => Significance::Minor.value(),
-        "notable" => Significance::Notable.value(),
-        "major" => Significance::Major.value(),
-        _ => Significance::Critical.value(),
-    }
 }
 
 /// The turn number for accesses from this source. Ingest counts every turn,

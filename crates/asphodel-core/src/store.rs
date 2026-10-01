@@ -24,6 +24,7 @@ pub mod fs;
 mod ids;
 mod lock;
 pub mod migrations;
+pub(crate) mod strength;
 mod time;
 pub mod vector;
 

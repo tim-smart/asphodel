@@ -8,11 +8,11 @@ use uuid::Uuid;
 
 use super::claims::{Checked, Link, NewMemory, Stamp, is_pronoun};
 use super::input::{Unit, survivor};
-use super::{Call1Input, EntityKind, ExtractError, Extracted};
+use super::{Call1Input, EntityKind, Extracted};
 use crate::constants::{Significance, Volatility};
 use crate::queue::{self, Lease};
 use crate::store::bank::{add_alias, log_edit};
-use crate::store::{Store, VectorIndex, micros};
+use crate::store::{Store, StoreError, VectorError, VectorIndex, micros};
 
 pub(super) fn commit(
     store: &Store,
@@ -21,7 +21,7 @@ pub(super) fn commit(
     unit: &Unit,
     checked: &Checked,
     vectors: &[Vec<f32>],
-) -> Result<Extracted, ExtractError> {
+) -> Result<Extracted, StoreError> {
     let now = store.now();
     let mut conn = store.connection();
     let tx = conn.transaction()?;
@@ -32,9 +32,17 @@ pub(super) fn commit(
     for (memory, vector) in checked.memories.iter().zip(vectors) {
         let uuid = store.new_id();
         let memory_id = insert_memory(&tx, store, unit, input, memory, uuid)?;
+        // The caller checked every vector's width, so only SQLite can fail
+        // here.
         store
             .vectors()
-            .upsert(&tx, unit.bank_id, memory_id, vector)?;
+            .upsert(&tx, unit.bank_id, memory_id, vector)
+            .map_err(|error| match error {
+                VectorError::Sqlite(error) => StoreError::Sqlite(error),
+                other => {
+                    StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(other)))
+                }
+            })?;
         link_entities(&tx, store, unit, memory_id, &memory.links, &proposed)?;
         // TIM-92: the created access carries the source's ingested_at, never
         // the time extraction ran.
@@ -64,14 +72,15 @@ pub(super) fn commit(
 /// The entity each proposed name resolves to, keyed by its lowercase name,
 /// and the entities created for them. A name call 1 proposed twice is one
 /// entity. At commit, code repeats the exact alias lookup and links to an
-/// entity call 1 wasn't shown, such as one created after it ran; it never
-/// links to one call 1 saw and chose not to use (TIM-92).
+/// entity created after call 1's input was read. It never links to one that
+/// existed before, whether call 1 saw it and chose not to use it or never
+/// compared it at all, such as one the candidate cap left out (TIM-92).
 fn resolve_proposals(
     tx: &Transaction<'_>,
     store: &Store,
     unit: &Unit,
     checked: &Checked,
-) -> Result<(BTreeMap<String, i64>, Vec<Uuid>), ExtractError> {
+) -> Result<(BTreeMap<String, i64>, Vec<Uuid>), rusqlite::Error> {
     let seen = unit.seen();
     let mut resolved = BTreeMap::new();
     let mut created = Vec::new();
@@ -84,7 +93,7 @@ fn resolve_proposals(
             if resolved.contains_key(&key) {
                 continue;
             }
-            let entity_id = match unseen_alias(tx, unit.bank_id, name, &seen)? {
+            let entity_id = match created_meanwhile(tx, unit, name, &seen)? {
                 Some(entity_id) => entity_id,
                 None => {
                     let (entity_id, uuid) = create_entity(tx, store, unit.bank_id, name, *kind)?;
@@ -98,11 +107,11 @@ fn resolve_proposals(
     Ok((resolved, created))
 }
 
-/// The first entity, as its survivor, with `name` as an alias that call 1
-/// wasn't shown.
-fn unseen_alias(
+/// The first entity, as its survivor, with `name` as an alias that was
+/// created after the input's entity boundary and that call 1 wasn't shown.
+fn created_meanwhile(
     tx: &Transaction<'_>,
-    bank_id: i64,
+    unit: &Unit,
     name: &str,
     seen: &BTreeSet<i64>,
 ) -> Result<Option<i64>, rusqlite::Error> {
@@ -112,11 +121,11 @@ fn unseen_alias(
          ORDER BY id",
     )?;
     let hits: Vec<i64> = statement
-        .query_map((bank_id, name), |row| row.get(0))?
+        .query_map((unit.bank_id, name), |row| row.get(0))?
         .collect::<Result<_, _>>()?;
     for entity_id in hits {
         let entity_id = survivor(tx, entity_id)?;
-        if !seen.contains(&entity_id) {
+        if entity_id > unit.entity_boundary && !seen.contains(&entity_id) {
             return Ok(Some(entity_id));
         }
     }
