@@ -451,3 +451,73 @@ fn a_data_dir_that_is_a_regular_file_is_refused_and_preserved() {
     );
     assert_eq!(fs::read(&file).unwrap(), b"irreplaceable contents");
 }
+
+#[test]
+#[ignore = "housekeeping only polls hourly; activate with the TIM-103 deadline wake"]
+fn a_pre_migration_copy_is_deleted_at_its_deadline_while_the_daemon_runs() {
+    // ADR 0010: the copy is deleted 7 days after its migration completes,
+    // and forget reaches it within 7 days. A daemon started just before
+    // that deadline keeps the copy at open, so the deletion has to come from
+    // a wake at the deadline itself, not from the next hourly poll.
+    use asphodel_core::store::migrations::{self, PRE_MIGRATION_COPY_TTL};
+    use asphodel_core::store::{OpenOptions, Store, micros};
+    use asphodel_core::{Clock, SystemClock};
+    use std::sync::Arc;
+
+    /// How long before its deadline the daemon starts, and how late past it
+    /// the deletion may land: scheduler latency, not a polling interval.
+    const LEAD: Duration = Duration::from_secs(5);
+    const GRACE: Duration = Duration::from_secs(5);
+
+    let dir = TestDir::new();
+    let data = dir.data_dir();
+    let copy = {
+        // A store with a copy whose migration completed 7 days ago, less
+        // LEAD. There is only one migration so far, so the row is a fixture
+        // for the second: `expire_copies` reads `from_version` and
+        // `completed_at`, not the live schema version.
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let store = Store::open(&data, OpenOptions::default(), clock.clone()).unwrap();
+        let conn = store.connection();
+        let copy = migrations::take_copy(&conn, &data, 1).unwrap();
+        let completed_at = clock
+            .now()
+            .checked_sub(PRE_MIGRATION_COPY_TTL)
+            .unwrap()
+            .checked_add(LEAD)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO migrations (from_version, to_version, binary_version, started_at,
+                                     completed_at)
+             VALUES (1, 2, 'fixture', ?1, ?1)",
+            [micros(completed_at)],
+        )
+        .unwrap();
+        copy
+    };
+    let deadline = Instant::now() + LEAD;
+
+    let daemon = start(&data, &dir.socket("daemon"));
+    daemon.wait_ready();
+    assert!(
+        Instant::now() < deadline,
+        "the daemon took longer than {LEAD:?} to become ready, so this run can't tell \
+         an open-time deletion from a timed one:\n{}",
+        daemon.log
+    );
+    assert!(
+        copy.exists(),
+        "the copy was deleted before its deadline:\n{}",
+        daemon.log
+    );
+
+    while copy.exists() {
+        assert!(
+            Instant::now() < deadline + GRACE,
+            "the copy was still there {GRACE:?} past its deadline:\n{}",
+            daemon.log
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(daemon.health().0, 200);
+}
