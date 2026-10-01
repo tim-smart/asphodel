@@ -30,10 +30,12 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use asphodel_core::ingest::Turn;
-use asphodel_core::models::{Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmError, Models};
+use asphodel_core::models::{
+    Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmError, ModelError as EmbedError, Models,
+};
 use asphodel_core::retrieval::{PrefetchRequest, estimate_tokens};
 use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME, PROFILE_QUESTION};
 use asphodel_core::store::{OpenOptions, Store, VectorIndex, micros};
@@ -233,6 +235,15 @@ impl Harness {
 
     /// `extra` is more tuning TOML, appended to the floors the fakes need.
     fn with_tuning(extra: &str) -> Self {
+        Self::build(extra, Models::fake())
+    }
+
+    /// Default tuning on `models`.
+    fn with_models(models: Models) -> Self {
+        Self::build("", models)
+    }
+
+    fn build(extra: &str, models: Models) -> Self {
         let tuning = Tuning::from_toml(&format!(
             "[injection.reranker_floors]\n\"{}\" = 1.0\n\
              [reconcile.embedding_floors]\n\"{}\" = 0.5\n{extra}",
@@ -243,8 +254,7 @@ impl Harness {
         let dir = TestDir::new();
         let clock = Arc::new(SimulatedClock::new(at(START)));
         let store = Store::open(&dir.0, OpenOptions::default(), clock.clone()).unwrap();
-        let service =
-            Service::with_models(clock.clone(), store, tuning.clone(), Models::fake()).unwrap();
+        let service = Service::with_models(clock.clone(), store, tuning.clone(), models).unwrap();
         service
             .ensure_bank_with_models(
                 BANK,
@@ -2194,4 +2204,286 @@ fn the_agenda_is_built_without_an_llm_or_an_access() {
     let accesses = h.accesses();
     h.agenda();
     assert_eq!(h.accesses(), accesses);
+}
+
+// Regressions from the TIM-111 implementation run (1429a07), fixed in a8e3e31
+
+/// An embedder that answers like `FakeEmbedder` until a test makes it
+/// fail, counting every call.
+#[derive(Default)]
+struct FlakyEmbedder {
+    failing: AtomicBool,
+    calls: AtomicUsize,
+}
+
+impl Embedder for FlakyEmbedder {
+    fn model_id(&self) -> &str {
+        FakeEmbedder::MODEL_ID
+    }
+
+    fn dimensions(&self) -> usize {
+        FakeEmbedder.dimensions()
+    }
+
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(EmbedError::Inference {
+                model: FakeEmbedder::MODEL_ID.into(),
+                reason: "the test made it fail".into(),
+            });
+        }
+        FakeEmbedder.embed(texts)
+    }
+}
+
+#[test]
+fn a_refresh_whose_retrieval_fails_waits_thirty_minutes_like_any_failure() {
+    // TIM-95 amendment, decision 1: "A failed refresh is retried once the
+    // 30-minute interval has passed". At 1429a07 a refresh whose retrieval
+    // failed was only logged, so the request stayed due and every timer
+    // pass, a minute apart in `serve`, retried it.
+    let embedder = Arc::new(FlakyEmbedder::default());
+    let h = Harness::with_models(Models {
+        embedder: embedder.clone(),
+        reranker: Arc::new(FakeReranker),
+    });
+    h.says(notable(TEA));
+    h.advance(minutes(5));
+    let failed_at = h.now();
+    embedder.failing.store(true, Ordering::SeqCst);
+    let llm = quiet_llm(1);
+    let ran = h.tick(&llm);
+    assert_eq!(refresh_calls(&llm), 0);
+    let profile = h.profile();
+    assert!(
+        profile.last_error.is_some(),
+        "the failed retrieval wasn't recorded"
+    );
+    assert_eq!(profile.last_error_at, Some(failed_at));
+    assert_eq!(profile.last_refreshed_at, None);
+    assert_eq!(ran.next_due, Some(failed_at + minutes(30)));
+
+    // The embedder recovers, but nothing is tried before the interval.
+    embedder.failing.store(false, Ordering::SeqCst);
+    let calls = embedder.calls.load(Ordering::SeqCst);
+    h.advance(minutes(1));
+    assert!(h.tick(&llm).ran.is_empty());
+    assert_eq!(
+        embedder.calls.load(Ordering::SeqCst),
+        calls,
+        "retried early"
+    );
+
+    h.set(failed_at + minutes(30));
+    assert_eq!(h.tick(&llm).ran.len(), 1);
+    assert_eq!(refresh_calls(&llm), 1);
+    let profile = h.profile();
+    assert_eq!(profile.last_error, None);
+    assert_eq!(profile.last_refreshed_at, Some(failed_at + minutes(30)));
+}
+
+// Call 1 sees the entries a session's block holds (TIM-95, decision 4:
+// "Extraction receives each entry's text with its memory ids, so a reply
+// that relies on an entry counts as `used` on every memory the entry
+// cites"). Entries get their own handles, `n1`, `n2`, ..., listed with the
+// handles of the in-context memories they cite, and a `used_injected_ids`
+// naming an entry credits each memory it cites once. They're snapshotted
+// with the turn when it's ingested, as its in-context set is.
+
+/// Session `s1` holds a block whose profile entry cites `cat` and `tea`,
+/// and the owner's turn in it is queued.
+fn a_turn_after_the_block() -> (Harness, Uuid, Uuid) {
+    let h = Harness::new();
+    let cat = h.insert(fact(CAT));
+    let tea = h.insert(fact(TEA));
+    h.refresh_adding(
+        PROFILE_NAME,
+        &[(
+            "Tim drinks green tea with his cat Miso nearby.",
+            &[cat, tea],
+        )],
+    );
+    h.block(Some("s1"));
+    h.service
+        .ingest_turn(BANK, &turn("s1", h.now() - minutes(1), "Tea time?"))
+        .unwrap();
+    (h, cat, tea)
+}
+
+#[test]
+fn call_1_is_shown_each_entry_with_the_memories_it_cites() {
+    let (h, _, _) = a_turn_after_the_block();
+    let llm = FakeLlm::scripted(MODEL, vec![json!({"claims": [], "used_injected_ids": []})]);
+    h.service.extract_next(BANK, &llm).unwrap().unwrap();
+    let user = &llm.requests()[0].user;
+    assert!(
+        user.contains("Tim drinks green tea with his cat Miso nearby."),
+        "call 1 wasn't shown the entry:\n{user}"
+    );
+    assert!(user.contains("n1"), "the entry has no handle:\n{user}");
+}
+
+#[test]
+fn a_reply_relying_on_an_entry_is_credited_on_every_memory_it_cites() {
+    let (h, cat, tea) = a_turn_after_the_block();
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![json!({"claims": [], "used_injected_ids": ["n1"]})],
+    );
+    let extracted = h.service.extract_next(BANK, &llm).unwrap().unwrap();
+    let used: BTreeSet<Uuid> = extracted.used.iter().copied().collect();
+    assert_eq!(used, BTreeSet::from([cat, tea]));
+    assert_eq!(h.used(cat), 1);
+    assert_eq!(h.used(tea), 1);
+}
+
+#[test]
+fn a_turns_entries_are_the_ones_its_session_held_when_it_was_synced() {
+    // The worker reaches the turn later. A refresh rewording the entry in
+    // between changes neither what call 1 is shown nor what's credited, and
+    // the snapshot goes once the turn is extracted (TIM-110 review).
+    let (h, cat, tea) = a_turn_after_the_block();
+    let snapshots = |h: &Harness| -> i64 { h.one("SELECT COUNT(*) FROM turn_entries", []) };
+    assert_eq!(snapshots(&h), 1);
+
+    let input = h.input(PROFILE_NAME);
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![reply(vec![edit(
+            &input.entries[0].handle,
+            "Tim only drinks tea when Miso the cat is asleep.",
+            &handles(&input, &[cat, tea]),
+        )])],
+    );
+    h.service
+        .refresh_model(BANK, PROFILE_NAME, &llm, true)
+        .unwrap();
+
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![json!({"claims": [], "used_injected_ids": ["n1"]})],
+    );
+    let extracted = h.service.extract_next(BANK, &llm).unwrap().unwrap();
+    let user = &llm.requests()[0].user;
+    assert!(
+        user.contains("Tim drinks green tea with his cat Miso nearby."),
+        "{user}"
+    );
+    assert!(
+        !user.contains("asleep"),
+        "call 1 saw the reworded entry:\n{user}"
+    );
+    let used: BTreeSet<Uuid> = extracted.used.iter().copied().collect();
+    assert_eq!(used, BTreeSet::from([cat, tea]));
+    assert_eq!(snapshots(&h), 0, "the snapshot outlived the extraction");
+}
+
+// The block-id fallback (TIM-95, decision 4): "if Hermes gives no session
+// id at `system_prompt_block()` time, the plugin sends the block id with
+// its first `prefetch`, and the daemon persists the mapping then."
+// `PrefetchRequest::block_id` names the block. The daemon keeps what each
+// built block lists and cites by block id, since the cache may have rebuilt
+// by then; a session that already has a mapping keeps it, and an unknown
+// id, or another bank's, maps nothing.
+
+fn prefetch_holding(h: &Harness, session: &str, query: &str, block: Option<Uuid>) -> Vec<Uuid> {
+    h.service
+        .prefetch(
+            BANK,
+            &PrefetchRequest {
+                session_id: session.into(),
+                query: query.into(),
+                previous_query: None,
+                block_id: block,
+            },
+        )
+        .unwrap()
+        .injected
+}
+
+fn mapped_block(h: &Harness, session: &str) -> Option<String> {
+    let bank_id = h.bank_id();
+    h.service
+        .store()
+        .unwrap()
+        .connection()
+        .query_row(
+            "SELECT block_id FROM session_blocks WHERE bank_id = ?1 AND session_id = ?2",
+            (bank_id, session),
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+#[test]
+fn a_prefetch_carrying_the_block_id_maps_a_session_that_fetched_without_one() {
+    let h = Harness::new();
+    let cat = h.insert(fact(CAT));
+    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[cat])]);
+    let block = h.block(None);
+    assert!(h.in_context("s1").is_empty());
+
+    let injected = prefetch_holding(&h, "s1", "is the cat called Miso", Some(block.id));
+    assert!(!injected.contains(&cat), "a cited memory was injected");
+    assert_eq!(h.in_context("s1"), vec![cat]);
+    assert_eq!(mapped_block(&h, "s1"), Some(block.id.to_string()));
+
+    let h = h.restart();
+    assert_eq!(h.in_context("s1"), vec![cat]);
+}
+
+#[test]
+fn the_block_id_finds_a_block_the_cache_has_since_replaced() {
+    // The plugin holds the id of the block Hermes froze, which the cache
+    // may have rebuilt since.
+    let h = Harness::new();
+    let cat = h.insert(fact(CAT));
+    let tea = h.insert(fact(TEA));
+    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[cat])]);
+    let held = h.block(None);
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+    let newer = h.block(None);
+    assert_ne!(newer.id, held.id);
+    assert!(newer.cited.contains(&tea));
+
+    prefetch_holding(&h, "s1", "hello there", Some(held.id));
+    assert_eq!(h.in_context("s1"), vec![cat]);
+    assert_eq!(mapped_block(&h, "s1"), Some(held.id.to_string()));
+}
+
+#[test]
+fn a_block_id_never_replaces_a_mapping_and_an_unknown_one_maps_nothing() {
+    let h = Harness::new();
+    let cat = h.insert(fact(CAT));
+    let tea = h.insert(fact(TEA));
+    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[cat])]);
+    let held = h.block(Some("s1"));
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+    let newer = h.block(None);
+
+    prefetch_holding(&h, "s1", "hello there", Some(newer.id));
+    assert_eq!(mapped_block(&h, "s1"), Some(held.id.to_string()));
+    assert_eq!(h.in_context("s1"), vec![cat]);
+
+    prefetch_holding(&h, "s2", "hello there", Some(Uuid::nil()));
+    assert_eq!(mapped_block(&h, "s2"), None);
+    assert!(h.in_context("s2").is_empty());
+}
+
+#[test]
+fn a_block_id_from_another_bank_maps_nothing() {
+    // Nothing refers across banks (CONTEXT.md, "Bank").
+    let h = Harness::new();
+    h.service
+        .ensure_bank_with_models("other", &BankIdentity::default())
+        .unwrap();
+    let cat = h.insert(fact(CAT));
+    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[cat])]);
+    h.block(None);
+    let theirs = h.service.system_prompt("other", None).unwrap();
+
+    prefetch_holding(&h, "s1", "hello there", Some(theirs.id));
+    assert_eq!(mapped_block(&h, "s1"), None);
+    assert!(h.in_context("s1").is_empty());
 }
