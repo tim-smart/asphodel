@@ -182,6 +182,13 @@ impl Store {
                 copy = applied.copy.as_ref().map(|path| path.display().to_string()),
                 "migrated the store"
             );
+            if (1..2).contains(&applied.from) {
+                warn!(
+                    "the owner's platform ids were not carried over from schema version 1; \
+                     send each bank's config again (restart Hermes) so the owner's turns are \
+                     attributed to them, see docs/upgrading.md"
+                );
+            }
             Some(applied)
         } else {
             None

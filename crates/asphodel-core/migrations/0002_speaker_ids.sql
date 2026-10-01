@@ -19,31 +19,23 @@ CREATE TABLE speaker_ids (
 );
 CREATE INDEX speaker_ids_entity ON speaker_ids(entity_id);
 
--- Backfill for a version 1 store. No alias is trusted for its shape alone;
--- each mapping below comes from a row whose origin is known.
+-- Backfill for a version 1 store. It fails closed: a mapping is written
+-- only where version 1 recorded where the alias came from, and no alias is
+-- trusted for its shape.
 --
--- 1. The owner's platform ids. In version 1, every alias of the seeded
---    `user` entity was written by bank config (`PUT /v1/banks/{bank}` and
---    `asphodel bank config`): the owner's name, its renames and the owner's
---    platform ids. Ingest never added an alias to `user`. Of those, the
---    platform ids are the ones of the form `<platform>:<id>` with no
---    whitespace; names are left out. Plugin instances that keep running
---    across a daemon upgrade don't call `initialize` again, so waiting for
---    the next bank config would credit the owner's turns to a stranger
---    until then.
-INSERT INTO speaker_ids (bank_id, platform_id, entity_id, created_at, updated_at)
-SELECT a.bank_id, a.alias, a.entity_id, a.created_at, a.created_at
-FROM entity_aliases a
-JOIN entities e ON e.id = a.entity_id
-WHERE e.seeded = 'user'
-  AND a.alias GLOB '?*:?*'
-  AND a.alias NOT GLOB '*[ 	]*'
-ORDER BY a.id;
-
--- 2. Speakers version 1 ingest created. Only ingest wrote an
---    `entity_created` edit, and it always added the speaker's platform id
---    as the entity's first alias, before the display name. Where the owner
---    already holds the id, bank config wins.
+-- The owner's platform ids are not carried over. Version 1 kept them only
+-- as aliases of the seeded `user`, next to the owner's current and former
+-- names, and nothing records which alias was which: a former name shaped
+-- like a platform id can't be told from an id. Inferring the owner from
+-- them could make a stranger the owner. After the upgrade, each bank's
+-- config has to be sent again (`PUT /v1/banks/{bank}`, which every Hermes
+-- plugin instance sends from `initialize`) before the owner's turns are
+-- attributed to `user`; until then they go to a stranger entity, which the
+-- config then takes the id back from. See docs/upgrading.md.
+--
+-- Speakers version 1 ingest created are carried over. Only ingest wrote an
+-- `entity_created` edit, and it always added the speaker's platform id as
+-- the entity's first alias, before the display name.
 INSERT OR IGNORE INTO speaker_ids (bank_id, platform_id, entity_id, created_at, updated_at)
 SELECT a.bank_id, a.alias, a.entity_id, a.created_at, a.created_at
 FROM entity_aliases a
