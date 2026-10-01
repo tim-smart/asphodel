@@ -33,7 +33,7 @@ A memory of something that repeats on a schedule, held as one memory rather than
 _Avoid_: Rule, routine, repeating event
 
 **Significance**:
-How much a memory matters on its own terms, judged at extraction as one of five levels (trivial, minor, notable, major, critical) and adjustable by the user. It's the fixed baseline beneath strength.
+How much a memory matters on its own terms, judged at extraction as one of five levels (trivial, minor, notable, major, critical) and adjustable by the owner. It's the fixed baseline beneath strength.
 _Avoid_: Importance, poignancy, priority
 
 **Volatility**:
@@ -97,8 +97,12 @@ The link from a memory to the memory that replaced it, whether the old one was r
 _Avoid_: Update, overwrite
 
 **Forget**:
-A user's explicit request to erase a memory and the passage it came from, as if the store had never been told.
+The owner's explicit request to erase a memory and the passage it came from, as if the store had never been told.
 _Avoid_: Delete, purge, expire
+
+**Kept**:
+Said of a memory the owner has asked to remember, which sets its significance as high as it goes so that it never fades. The owner can take it back, and the memory returns to the significance extraction gave it.
+_Avoid_: Pinned, starred, saved
 
 **Purge**:
 Asphodel removing a memory that has faded long enough to be worthless on its own.
@@ -175,7 +179,7 @@ The exact input a memory came from, either a conversation turn or a document, ke
 _Avoid_: Episode, chunk, input, raw message
 
 **Turn**:
-A source made up of one user message and the assistant reply to it, as Hermes hands them over.
+A source made up of one message and the assistant's reply to it, as Hermes hands them over. The message may come from the owner or from anyone else in the conversation.
 _Avoid_: Message, exchange
 
 **Document**:
@@ -206,10 +210,18 @@ _Avoid_: Deduplication, merging, consolidation
 A person, place, organisation or thing that memories are about, recognised under several aliases. Every bank starts with the user and the assistant as entities.
 _Avoid_: Node, tag, subject
 
+**Speaker**:
+Whoever wrote the message in a turn. A speaker's "I" and "me" resolve to them: the owner's to the user entity, and anyone else's to an entity of their own.
+_Avoid_: Author, sender, user (the user is one speaker)
+
+**Owner**:
+The one person a bank belongs to, who is the user entity on every platform they speak from. Only the owner can forget, keep or unkeep a memory.
+_Avoid_: Account, admin, operator
+
 **Bank**:
-An isolated set of memories, entities and sources. Nothing refers across banks.
+An isolated set of memories, entities and sources, one for each Hermes profile. Nothing refers across banks.
 _Avoid_: Namespace, tenant, collection, profile
 
 **Store**:
-One Asphodel installation, which holds all of its banks.
+One Asphodel daemon and its data, which holds all of its banks.
 _Avoid_: Database, instance
