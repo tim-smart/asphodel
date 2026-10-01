@@ -1100,65 +1100,27 @@ fn endpoint_toml(endpoint: &str) -> String {
 }
 
 macro_rules! rejected_endpoint {
-    ($name:ident, $endpoint:literal $(, $ignore:meta)?) => {
+    ($name:ident, $endpoint:literal) => {
         #[test]
-        $(#[$ignore])?
         fn $name() {
             assert_eq!(invalid_keys(&endpoint_toml($endpoint)), ["llm.endpoint"]);
         }
     };
 }
 
-rejected_endpoint!(
-    llm_endpoint_rejects_scheme_only_http,
-    "http://",
-    ignore = "known endpoint-validation bug; activate with production fix"
-);
-rejected_endpoint!(
-    llm_endpoint_rejects_scheme_only_https,
-    "https://",
-    ignore = "known endpoint-validation bug; activate with production fix"
-);
-rejected_endpoint!(
-    llm_endpoint_rejects_port_without_host,
-    "https://:8080",
-    ignore = "known endpoint-validation bug; activate with production fix"
-);
-rejected_endpoint!(
-    llm_endpoint_rejects_port_99999,
-    "http://localhost:99999",
-    ignore = "known endpoint-validation bug; activate with production fix"
-);
-rejected_endpoint!(
-    llm_endpoint_rejects_port_65536,
-    "http://localhost:65536",
-    ignore = "known endpoint-validation bug; activate with production fix"
-);
+rejected_endpoint!(llm_endpoint_rejects_scheme_only_http, "http://");
+rejected_endpoint!(llm_endpoint_rejects_scheme_only_https, "https://");
+rejected_endpoint!(llm_endpoint_rejects_port_without_host, "https://:8080");
+rejected_endpoint!(llm_endpoint_rejects_port_99999, "http://localhost:99999");
+rejected_endpoint!(llm_endpoint_rejects_port_65536, "http://localhost:65536");
 rejected_endpoint!(
     llm_endpoint_rejects_nonnumeric_port,
-    "http://localhost:port",
-    ignore = "known endpoint-validation bug; activate with production fix"
+    "http://localhost:port"
 );
-rejected_endpoint!(
-    llm_endpoint_rejects_zero_port,
-    "http://localhost:0",
-    ignore = "known endpoint-validation bug; activate with production fix"
-);
-rejected_endpoint!(
-    llm_endpoint_rejects_host_space,
-    "http://exa mple.com",
-    ignore = "known endpoint-validation bug; activate with production fix"
-);
-rejected_endpoint!(
-    llm_endpoint_rejects_unclosed_ipv6,
-    "http://[::1",
-    ignore = "known endpoint-validation bug; activate with production fix"
-);
-rejected_endpoint!(
-    llm_endpoint_rejects_invalid_ipv6,
-    "http://[::g]/",
-    ignore = "known endpoint-validation bug; activate with production fix"
-);
+rejected_endpoint!(llm_endpoint_rejects_zero_port, "http://localhost:0");
+rejected_endpoint!(llm_endpoint_rejects_host_space, "http://exa mple.com");
+rejected_endpoint!(llm_endpoint_rejects_unclosed_ipv6, "http://[::1");
+rejected_endpoint!(llm_endpoint_rejects_invalid_ipv6, "http://[::g]/");
 rejected_endpoint!(llm_endpoint_rejects_missing_slashes, "http:localhost:8080");
 rejected_endpoint!(llm_endpoint_rejects_single_slash, "http:/localhost");
 rejected_endpoint!(llm_endpoint_rejects_backslashes, "http:\\localhost");
@@ -1169,32 +1131,21 @@ rejected_endpoint!(llm_endpoint_rejects_no_scheme, "localhost:8080");
 rejected_endpoint!(llm_endpoint_rejects_scheme_relative, "//host/v1");
 rejected_endpoint!(
     llm_endpoint_rejects_userinfo_password,
-    "https://user:pass@llm.example/v1",
-    ignore = "known endpoint-validation bug; activate with production fix"
+    "https://user:pass@llm.example/v1"
 );
 rejected_endpoint!(
     llm_endpoint_rejects_userinfo_username,
-    "https://key@llm.example",
-    ignore = "known endpoint-validation bug; activate with production fix"
+    "https://key@llm.example"
 );
-rejected_endpoint!(
-    llm_endpoint_rejects_query,
-    "https://llm.example/v1?key=abc",
-    ignore = "known endpoint-validation bug; activate with production fix"
-);
-rejected_endpoint!(
-    llm_endpoint_rejects_fragment,
-    "https://llm.example/v1#x",
-    ignore = "known endpoint-validation bug; activate with production fix"
-);
+rejected_endpoint!(llm_endpoint_rejects_query, "https://llm.example/v1?key=abc");
+rejected_endpoint!(llm_endpoint_rejects_fragment, "https://llm.example/v1#x");
 rejected_endpoint!(
     llm_endpoint_rejects_leading_whitespace,
     " https://llm.example/v1"
 );
 rejected_endpoint!(
     llm_endpoint_rejects_trailing_whitespace,
-    "https://llm.example/v1 ",
-    ignore = "known endpoint-validation bug; activate with production fix"
+    "https://llm.example/v1 "
 );
 rejected_endpoint!(llm_endpoint_rejects_empty, "");
 
@@ -1220,7 +1171,6 @@ fn llm_endpoint_can_be_unset() {
 }
 
 #[test]
-#[ignore = "known endpoint-validation bug; activate with production fix"]
 fn llm_endpoint_error_does_not_echo_credentials() {
     let password = "recognisable-endpoint-password-7913";
     let endpoint = format!("https://user:{password}@llm.example/v1");

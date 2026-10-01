@@ -320,7 +320,6 @@ fn the_startup_log_carries_the_resolved_config() {
 }
 
 #[test]
-#[ignore = "known endpoint-validation bug; activate with production fix"]
 fn a_malformed_llm_endpoint_stops_startup() {
     let dir = TestDir::new();
     let path = dir.file("tuning.toml", "[llm]\nendpoint = \"http://\"\n");
