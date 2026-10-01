@@ -689,16 +689,19 @@ impl CodexResponses {
 
     /// Refreshes `stale`, unless the file already holds something newer (a
     /// refresh by another thread, client or process, or a new login), which
-    /// is used instead. A refresh token is single-use, so the store's lock
+    /// is used instead. A file cleared since the caller loaded it counts as
+    /// a logout: refresh returns LoginRequired and never recreates it.
+    /// A refresh token is single-use, so the store's lock
     /// is held from that re-read to the save: no one else spends the same
     /// token, and no login or clear lands in between to be overwritten. The
     /// rotated tokens are saved before this returns, so a crash after the
     /// refresh never loses the only valid refresh token.
     fn refresh(&self, stale: &ChatgptTokens) -> Result<ChatgptTokens, LlmError> {
         let lock = self.store.lock()?;
-        if let Some(current) = lock.load()?
-            && current.access_token != stale.access_token
-        {
+        let Some(current) = lock.load()? else {
+            return Err(LlmError::LoginRequired);
+        };
+        if current.access_token != stale.access_token {
             return Ok(current);
         }
         self.refreshes.fetch_add(1, Ordering::SeqCst);

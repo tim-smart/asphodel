@@ -108,7 +108,9 @@ Every write of the token file goes through an exclusive `flock` on
 its re-read of the file to its save, so a login, from the CLI or anywhere
 else, waits for a refresh in flight and then replaces what it wrote rather
 than being overwritten by it. The login takes the lock only for its final
-save, never while it waits for approval. Writes go to a new temp file,
+save, never while it waits for approval. If the file was cleared before
+a refresh takes the lock, that counts as a logout: the refresh requires
+a new login and never recreates the file. Writes go to a new temp file,
 created exclusively under a fresh name, and a rename; nothing already in
 the data dir is followed or overwritten.
 
