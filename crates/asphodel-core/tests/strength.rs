@@ -703,6 +703,150 @@ fn a_kept_memory_never_fades_and_a_critical_one_does() {
     assert_relative(fades, 12.0 * DAYS_PER_YEAR, TABLE);
 }
 
+// Equal-time accesses use timestamp ascending, then weight descending.
+// These are distinct accesses, including inherited ones; same-turn
+// deduplication is deliberately outside this pure-function contract.
+
+fn access_permutations(accesses: &[Access]) -> Vec<Vec<Access>> {
+    if accesses.is_empty() {
+        return vec![vec![]];
+    }
+    let mut permutations = Vec::new();
+    for (i, first) in accesses.iter().enumerate() {
+        let mut rest = accesses.to_vec();
+        rest.remove(i);
+        for mut tail in access_permutations(&rest) {
+            tail.insert(0, *first);
+            permutations.push(tail);
+        }
+    }
+    permutations
+}
+
+#[test]
+#[ignore = "TIM-104: pending heaviest-first equal-time access ordering in production"]
+fn tie_order_mixed_weights_are_heaviest_first() {
+    let expected = strength_at(0.1, &[confirmed(0.0), created(0.0)], 100.0);
+    // confirmed has d = a; the massed created access has d capped at 2.
+    let recent = (WEIGHT_CONFIRMED * 100f64.powf(-A) + WEIGHT_CREATED * 100f64.powf(-D_MAX)).ln();
+    assert_near(expected.recent_use, recent, EXACT);
+    assert_near(expected.value, -0.668_411_822, EXACT);
+    for accesses in access_permutations(&[created(0.0), confirmed(0.0)]) {
+        assert_eq!(strength_at(0.1, &accesses, 100.0), expected);
+    }
+}
+
+#[test]
+#[ignore = "TIM-104: pending heaviest-first equal-time access ordering in production"]
+fn tie_order_inherited_logs_are_independent_of_concatenation_order() {
+    let maya = [created(0.0), mentioned(20.0)];
+    let mia = [created(20.0)];
+    let inherited_first: Vec<_> = maya.iter().chain(&mia).copied().collect();
+    let own_first: Vec<_> = mia.iter().chain(&maya).copied().collect();
+    let expected = strength_at(0.1, &inherited_first, 120.0);
+    // created@0 supplies m at day 20. mentioned@20 goes first among
+    // the ties; created@20 then receives the capped massed decay.
+    let d = (A + C * WEIGHT_CREATED * 20f64.powf(-A)).min(D_MAX);
+    let recent = (WEIGHT_CREATED * 120f64.powf(-A)
+        + WEIGHT_MENTIONED_AGAIN * 100f64.powf(-d)
+        + WEIGHT_CREATED * 100f64.powf(-D_MAX))
+    .ln();
+    assert_near(expected.recent_use, recent, EXACT);
+    assert_near(expected.value, -0.656_301_673, EXACT);
+    assert_eq!(strength_at(0.1, &own_first, 120.0), expected);
+    for accesses in access_permutations(&inherited_first) {
+        assert_eq!(strength_at(0.1, &accesses, 120.0), expected);
+    }
+}
+
+fn assert_synthetic_tie(kind: AccessKind) {
+    let accesses = [created(0.0), access(kind, 12.0)];
+    let expected = closed_strength(0.1, &accesses, close(10.0, 12.0), 100.0);
+    // The real access outweighs the synthetic restart, both aged 88 days.
+    let d = (A + C * kind.weight() * MIN_ACCESS_AGE_DAYS.powf(-A)).min(D_MAX);
+    let recent = (kind.weight() * 88f64.powf(-A) + WEIGHT_WINDOW_CLOSE * 88f64.powf(-d)).ln();
+    assert_near(expected.recent_use, recent, EXACT);
+    for permutation in access_permutations(&accesses) {
+        assert_eq!(
+            closed_strength(0.1, &permutation, close(10.0, 12.0), 100.0),
+            expected
+        );
+    }
+}
+
+#[test]
+fn tie_order_confirmed_precedes_synthetic_restart() {
+    assert_synthetic_tie(AccessKind::Confirmed);
+    let s = closed_strength(
+        0.1,
+        &[created(0.0), confirmed(12.0)],
+        close(10.0, 12.0),
+        100.0,
+    );
+    assert_near(s.value, -0.623_611_314, EXACT);
+}
+
+#[test]
+fn tie_order_mentioned_precedes_synthetic_restart() {
+    assert_synthetic_tie(AccessKind::MentionedAgain);
+}
+
+#[test]
+#[ignore = "TIM-104: pending heaviest-first equal-time access ordering in production"]
+fn tie_order_mixed_real_accesses_at_synthetic_restart_are_heaviest_first() {
+    let accesses = [created(0.0), confirmed(12.0), mentioned(12.0)];
+    let expected = closed_strength(0.1, &accesses, close(10.0, 12.0), 100.0);
+    // confirmed, mentioned_again, then synthetic. Both later decays cap.
+    let recent = (WEIGHT_CONFIRMED * 88f64.powf(-A)
+        + (WEIGHT_MENTIONED_AGAIN + WEIGHT_WINDOW_CLOSE) * 88f64.powf(-D_MAX))
+    .ln();
+    assert_near(expected.recent_use, recent, EXACT);
+    for permutation in access_permutations(&accesses) {
+        assert_eq!(
+            closed_strength(0.1, &permutation, close(10.0, 12.0), 100.0),
+            expected
+        );
+    }
+}
+
+#[test]
+#[ignore = "TIM-104: pending heaviest-first equal-time access ordering in production"]
+fn tie_order_adding_tied_accesses_never_weakens_the_heaviest_alone() {
+    let sets = [
+        vec![created(0.0), confirmed(0.0)],
+        vec![used(0.0), mentioned(0.0)],
+        vec![created(0.0), used(0.0), mentioned(0.0), confirmed(0.0)],
+    ];
+    for accesses in sets {
+        let heaviest = *accesses
+            .iter()
+            .max_by(|a, b| a.kind.weight().total_cmp(&b.kind.weight()))
+            .unwrap();
+        for day in [1.0, 15.0, 100.0, 1000.0] {
+            let alone = strength_at(0.1, &[heaviest], day);
+            for permutation in access_permutations(&accesses) {
+                let together = strength_at(0.1, &permutation, day);
+                assert!(
+                    together.value >= alone.value,
+                    "{permutation:?} at day {day}: {together:?} < {alone:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn tie_order_equal_weights_are_unchanged() {
+    let expected = strength_at(0.1, &[created(0.0), used(0.0)], 100.0);
+    let d = (A + C * WEIGHT_CREATED * MIN_ACCESS_AGE_DAYS.powf(-A)).min(D_MAX);
+    let recent = (WEIGHT_CREATED * 100f64.powf(-A) + WEIGHT_USED * 100f64.powf(-d)).ln();
+    assert_near(expected.recent_use, recent, EXACT);
+    assert_near(expected.value, -1.351_966_916, EXACT);
+    for accesses in access_permutations(&[created(0.0), used(0.0)]) {
+        assert_eq!(strength_at(0.1, &accesses, 100.0), expected);
+    }
+}
+
 // Window close (ADR 0003).
 
 fn close(closes: f64, known: f64) -> Option<WindowClose> {
