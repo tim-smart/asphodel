@@ -1848,7 +1848,6 @@ fn a_queued_turn_extracted_at_once_is_credited_with_its_injection() {
 }
 
 #[test]
-#[ignore = "pending fix (TIM-110 review): extract_next reads the session's current in-context set, not the turn's"]
 fn a_session_cleared_before_extraction_keeps_the_turns_in_context_set() {
     // Hermes compacts the session after the turn and before the worker
     // reaches it. The reply was still written with the memory in view.
@@ -1868,7 +1867,6 @@ fn a_session_cleared_before_extraction_keeps_the_turns_in_context_set() {
 }
 
 #[test]
-#[ignore = "pending fix (TIM-110 review): extract_next reads the session's current in-context set, not the turn's"]
 fn a_recall_after_the_turn_isnt_in_the_turns_in_context_set() {
     // A later turn's recall adds to the session; the queued turn's reply
     // was written before it and can't have used what it returned.
@@ -1893,7 +1891,6 @@ fn a_recall_after_the_turn_isnt_in_the_turns_in_context_set() {
 }
 
 #[test]
-#[ignore = "pending fix (TIM-110 review): extract_next reads the session's current in-context set, not the turn's"]
 fn a_turn_queued_across_a_restart_keeps_its_in_context_set() {
     // SIGTERM finishes only the chunk in flight; a turn behind it is
     // extracted by the next daemon, whose sessions start empty.
