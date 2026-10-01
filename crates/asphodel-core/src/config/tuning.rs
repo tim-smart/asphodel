@@ -213,12 +213,29 @@ impl Default for SessionsTuning {
     }
 }
 
+/// `[llm] auth`. `api_key` is the default and stays fully supported;
+/// `chatgpt` is the subscription over the Codex backend, whose login lives
+/// in a token file under the data dir and never in the tuning file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmAuth {
+    #[default]
+    ApiKey,
+    Chatgpt,
+}
+
 /// `[llm]`: the one LLM for extraction, reconciliation and refresh. Its API
-/// key is a secret and comes from the environment only.
+/// key is a secret and comes from the environment only; so does the
+/// subscription's token file.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmTuning {
-    /// The exact model string.
+    /// How the LLM is authenticated: an API key (the default) or a ChatGPT
+    /// subscription.
+    pub auth: LlmAuth,
+
+    /// The exact model string. Required in both modes: calibration runs
+    /// against one model, and the subscription doesn't choose it.
     pub model: Option<String>,
 
     /// The base URL of the LLM's HTTP API.

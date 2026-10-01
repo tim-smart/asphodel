@@ -12,14 +12,21 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::{Deployment, Secret, Tuning};
+use jiff::Timestamp;
+
+use super::chatgpt::CODEX_ENDPOINT;
+use crate::config::{Deployment, LLM_API_KEY_ENV, LlmAuth, Secret, Tuning};
 
 /// Where the LLM is and how to talk to it. The endpoint and model come from
 /// `[llm]` in the tuning file, and the key from `ASPHODEL_LLM_API_KEY`
 /// (ADR 0009).
 #[derive(Debug, Clone)]
 pub struct LlmSettings {
-    /// The base URL, without the `/chat/completions` path.
+    /// Which wire format and credentials: Chat Completions with a key, or
+    /// the Codex backend's Responses API with a subscription login.
+    pub auth: LlmAuth,
+    /// The base URL, without the `/chat/completions` or `/responses` path.
+    /// In `chatgpt` mode it defaults to [`CODEX_ENDPOINT`].
     pub endpoint: String,
     /// The exact model string, sent as `model`.
     pub model: String,
@@ -32,24 +39,52 @@ pub struct LlmSettings {
 impl LlmSettings {
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
-    /// `Ok(None)` when neither `llm.endpoint` nor `llm.model` is set,
-    /// `Ok(Some)` when both are, and [`LlmError::NotConfigured`] naming the
-    /// missing key when only one is.
+    /// `api_key` mode: `Ok(None)` when neither `llm.endpoint` nor
+    /// `llm.model` is set, `Ok(Some)` when both are, and
+    /// [`LlmError::NotConfigured`] naming the missing key when only one is.
+    /// `chatgpt` mode: the endpoint defaults to the Codex backend,
+    /// `llm.model` is still required, and a key that is also set is
+    /// [`LlmError::Conflicting`] rather than silently ignored.
     pub fn from_config(tuning: &Tuning, deployment: &Deployment) -> Result<Option<Self>, LlmError> {
-        match (&tuning.llm.endpoint, &tuning.llm.model) {
-            (None, None) => Ok(None),
-            (Some(_), None) => Err(LlmError::NotConfigured {
-                missing: "llm.model",
-            }),
-            (None, Some(_)) => Err(LlmError::NotConfigured {
-                missing: "llm.endpoint",
-            }),
-            (Some(endpoint), Some(model)) => Ok(Some(Self {
-                endpoint: endpoint.clone(),
-                model: model.clone(),
-                api_key: deployment.llm_api_key.clone(),
-                timeout: Self::DEFAULT_TIMEOUT,
-            })),
+        let llm = &tuning.llm;
+        match llm.auth {
+            LlmAuth::ApiKey => match (&llm.endpoint, &llm.model) {
+                (None, None) => Ok(None),
+                (Some(_), None) => Err(LlmError::NotConfigured {
+                    missing: "llm.model",
+                }),
+                (None, Some(_)) => Err(LlmError::NotConfigured {
+                    missing: "llm.endpoint",
+                }),
+                (Some(endpoint), Some(model)) => Ok(Some(Self {
+                    auth: LlmAuth::ApiKey,
+                    endpoint: endpoint.clone(),
+                    model: model.clone(),
+                    api_key: deployment.llm_api_key.clone(),
+                    timeout: Self::DEFAULT_TIMEOUT,
+                })),
+            },
+            LlmAuth::Chatgpt => {
+                if deployment.llm_api_key.is_some() {
+                    return Err(LlmError::Conflicting {
+                        first: "llm.auth = \"chatgpt\"",
+                        second: LLM_API_KEY_ENV,
+                    });
+                }
+                let model = llm.model.clone().ok_or(LlmError::NotConfigured {
+                    missing: "llm.model",
+                })?;
+                Ok(Some(Self {
+                    auth: LlmAuth::Chatgpt,
+                    endpoint: llm
+                        .endpoint
+                        .clone()
+                        .unwrap_or_else(|| CODEX_ENDPOINT.to_string()),
+                    model,
+                    api_key: None,
+                    timeout: Self::DEFAULT_TIMEOUT,
+                }))
+            }
         }
     }
 }
@@ -120,19 +155,47 @@ pub enum LlmError {
     /// The model refused (`message.refusal`).
     #[error("the LLM refused the request")]
     Refused,
+
+    /// Two settings that can't both hold, named by key.
+    #[error("{first} and {second} are both set; unset one")]
+    Conflicting {
+        first: &'static str,
+        second: &'static str,
+    },
+
+    /// No token file, or a refreshed credential the backend still rejects.
+    /// The queue can't proceed until the owner logs in again.
+    #[error("the ChatGPT login is missing or no longer valid: run `asphodel llm login`")]
+    LoginRequired,
+
+    /// The subscription's usage window is spent. Not a failure: the
+    /// extraction queue holds until `resets_at` (world time).
+    #[error("the ChatGPT usage limit is reached until {resets_at}")]
+    UsageLimited { resets_at: Timestamp },
+
+    /// The backend reported a failed or incomplete response. Only the code
+    /// is kept.
+    #[error("the LLM backend failed the request: {code}")]
+    Backend { code: String },
 }
 
 impl LlmError {
     /// Whether the caller's retry policy may try again: transport errors,
     /// timeouts, 408, 429 and 5xx. Never for a reply that came back and was
-    /// wrong.
+    /// wrong, and never for a usage limit, which is deferred to `resets_at`
+    /// instead.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport { .. } | Self::Timeout => true,
             Self::Status { status } => matches!(status, 408 | 429 | 500..=599),
-            Self::NotConfigured { .. } | Self::NoContent | Self::NotJson { .. } | Self::Refused => {
-                false
-            }
+            Self::NotConfigured { .. }
+            | Self::NoContent
+            | Self::NotJson { .. }
+            | Self::Refused
+            | Self::Conflicting { .. }
+            | Self::LoginRequired
+            | Self::UsageLimited { .. }
+            | Self::Backend { .. } => false,
         }
     }
 }
@@ -237,7 +300,7 @@ impl LlmClient for OpenAiCompatible {
 }
 
 /// Maps a ureq error. The message names the error kind, never the body.
-fn transport(error: ureq::Error) -> LlmError {
+pub(super) fn transport(error: ureq::Error) -> LlmError {
     match error {
         ureq::Error::Timeout(_) => LlmError::Timeout,
         ureq::Error::StatusCode(status) => LlmError::Status { status },
@@ -279,7 +342,7 @@ fn parse_content(reply: &Value) -> Result<Value, LlmError> {
 
 /// Strips a ```json ... ``` fence, if there is one, and surrounding
 /// whitespace.
-fn unfence(content: &str) -> &str {
+pub(super) fn unfence(content: &str) -> &str {
     let content = content.trim();
     let Some(rest) = content.strip_prefix("```") else {
         return content;

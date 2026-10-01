@@ -55,3 +55,25 @@ If the hash at startup differs from the stored one, purge and the sweep of sourc
 - The timeouts and the spool and breaker settings in the plugin are fixed, and its config schema stays as ADR 0006 left it.
 
 Decided in "Configuration surface: which settings are exposed and where" (TIM-98) on 2026-10-01.
+
+## Amendment: the LLM's auth mode (2026-10-01, TIM-105)
+
+The LLM can be reached with an API key or with a ChatGPT subscription.
+This adds one tuning key and one file; the decision above stands.
+
+- `[llm] auth = "api_key" | "chatgpt"`, default `api_key`. It's tuning,
+  not deployment: it changes the wire format, not where the daemon runs.
+- The API key stays environment-only. In `chatgpt` mode a set
+  `ASPHODEL_LLM_API_KEY` stops the daemon rather than being ignored.
+- The subscription's tokens live in one file under the data dir
+  (`llm-tokens.json`, mode 0600), written by `asphodel llm login` and
+  refreshed by the daemon. They never appear in the tuning file, the
+  resolved config, `Debug` output, logs or cassettes. The resolved config
+  shows the mode, the file's path and whether a login is present.
+- `llm.model` stays required in both modes. The floors are calibrated
+  against one model, and the subscription doesn't choose it.
+- In `chatgpt` mode `llm.endpoint` defaults to the Codex backend; an
+  explicit endpoint still wins.
+- A usage limit on the subscription is not a failure. The daemon reports
+  when the window resets, and the extraction queue holds until then
+  instead of failing chunks or counting retries.

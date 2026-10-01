@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::config::{Deployment, Fingerprint, Tuning};
 use crate::constants::FixedConstants;
-use crate::models::Models;
+use crate::models::{LlmStatus, Models};
 
 /// Everything the daemon is running with, safe to show: secrets serialise
 /// as `[redacted]`.
@@ -29,6 +29,10 @@ pub struct ResolvedConfig {
 
     /// The models the daemon serves with. `None` until they're loaded.
     pub models: Option<ModelsConfig>,
+
+    /// The LLM's auth mode and login state. `None` when `[llm]` isn't
+    /// configured. Never a key or a token.
+    pub llm: Option<LlmStatus>,
 }
 
 /// Whether purge and the sweep are running, given the fingerprint stored in
@@ -86,6 +90,7 @@ impl ResolvedConfig {
             constants: FixedConstants::current(),
             purge: PurgePause::Unchecked,
             models: None,
+            llm: None,
         }
     }
 }

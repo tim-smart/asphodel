@@ -66,12 +66,64 @@ environment only, and the resolved config shows `models.fake = true`.
 
 ## The LLM
 
-One OpenAI-compatible `chat/completions` endpoint serves extraction,
-reconciliation and refresh. `llm.endpoint` and `llm.model` come from the
-tuning file; the API key comes from `ASPHODEL_LLM_API_KEY` only.
+One LLM serves extraction, reconciliation and refresh. `llm.model` comes
+from the tuning file in both modes and is required: the floors are
+calibrated against one model.
 
-Every call asks for structured output (`response_format.json_schema`,
-strict) at temperature 0. A reply fenced in ```` ```json ```` is unwrapped.
-Errors carry statuses and sizes, never the prompt or the reply, so logs hold
-no memory content. `FakeLlm` hands out scripted replies and records the
-requests it was given.
+Every call asks for structured output and expects JSON back; a reply
+fenced in ```` ```json ```` is unwrapped. Errors carry statuses and sizes,
+never the prompt or the reply, so logs hold no memory content. `FakeLlm`
+hands out scripted replies and records the requests it was given. The
+cassette records the logical request (template, prompts, schema), never
+the wire body or headers, so a recording made in one mode replays in the
+other.
+
+### `auth = "api_key"` (the default)
+
+Any OpenAI-compatible `chat/completions` endpoint. `llm.endpoint` is
+required and the key comes from `ASPHODEL_LLM_API_KEY` only. Requests use
+`response_format.json_schema` (strict) at temperature 0.
+
+### `auth = "chatgpt"`
+
+A ChatGPT subscription over the Codex backend
+(`https://chatgpt.com/backend-api/codex`, the default `llm.endpoint`).
+Requests go to `/responses`, streamed, with `text.format` for the schema
+and no temperature (the GPT-5 family rejects it). The protocol was read
+from `openai/codex` at `6b4daaf`; it is undocumented and OpenAI can change
+it, which is why `api_key` stays the default.
+
+**Logging in.** `asphodel llm login --data-dir <dir>` runs the device-code
+flow: it prints a URL and a one-time code, waits for approval, and writes
+`<dir>/llm-tokens.json` with mode 0600. The daemon reads that file before
+every call, so a login while it runs takes effect without a restart.
+
+Asphodel never reads `~/.codex/auth.json` and the file must not be copied
+from it. Refresh tokens are single-use: if Asphodel and the Codex CLI
+shared one token chain, whichever refreshed first would log the other out.
+
+**Refresh.** The daemon refreshes the access token when its expiry is
+within five minutes, or after a 401, once. The rotated tokens are written
+before the retried request goes out, and concurrent calls share one
+refresh. A second 401, or a refresh the issuer rejects, surfaces as "run
+`asphodel llm login`"; the old file is kept until the next login replaces
+it.
+
+**Usage limits.** A 429 whose body says `usage_limit_reached` carries the
+time the window resets. The client returns `UsageLimited { resets_at }`,
+which is not a retry: extraction holds the queue until then.
+
+**Secrets.** Tokens never appear in `Debug` output, logs, errors, the
+resolved config or cassettes. The resolved config's `llm` section shows
+the mode, the token file's path and whether a login is present.
+
+**Unverified against the real backend.** Two details could not be
+confirmed from the codex-rs source and wait for the ignored real-backend
+test: whether the backend accepts an `originator` other than
+`codex_cli_rs` (Asphodel sends `asphodel`), and whether an `OpenAI-Beta`
+header is needed (codex-rs sends one only on its websocket transport, so
+Asphodel sends none).
+
+**Settings that aren't exposed.** `ASPHODEL_LLM_API_KEY` set together with
+`auth = "chatgpt"` stops the daemon. `ASPHODEL_LLM_ISSUER` points the
+login at another issuer; it exists for tests and is not in `--help`. Reasoning effort is left to the backend's default.

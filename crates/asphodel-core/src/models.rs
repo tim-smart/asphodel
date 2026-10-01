@@ -18,6 +18,7 @@
 //! live here rather than in tests, because the scripted replay scenarios
 //! run on them under `cargo test` (TIM-96, decision 2).
 
+mod chatgpt;
 mod dir;
 mod fake;
 mod fetch;
@@ -30,6 +31,11 @@ use std::sync::Arc;
 
 use crate::store::bank::ModelIds;
 
+pub use crate::config::LlmAuth;
+pub use chatgpt::{
+    AUTH_ISSUER, CLIENT_ID, CODEX_ENDPOINT, ChatgptTokens, CodexResponses, DeviceCode, LlmStatus,
+    LoginError, ORIGINATOR, REFRESH_WINDOW, TOKEN_FILE, TokenError, TokenStore, device_code_login,
+};
 pub use dir::{ModelDir, ModelError};
 pub use fake::{FakeEmbedder, FakeReranker};
 pub use fetch::{FetchError, FetchFailure, FetchReport, Fetcher, HttpFetcher, fetch_models};

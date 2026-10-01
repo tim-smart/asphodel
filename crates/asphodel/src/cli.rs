@@ -7,7 +7,11 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use asphodel_core::models::{HttpFetcher, ModelDir, fetch_models, manifest};
+use asphodel_core::SystemClock;
+use asphodel_core::models::{
+    AUTH_ISSUER, DeviceCode, HttpFetcher, ModelDir, TokenStore, device_code_login, fetch_models,
+    manifest,
+};
 use clap::{Args, Parser, Subcommand};
 
 use crate::listen::Listen;
@@ -50,6 +54,10 @@ enum Command {
     /// Fetch and manage the local models.
     #[command(subcommand)]
     Models(ModelsCommand),
+
+    /// Log in to the LLM subscription.
+    #[command(subcommand)]
+    Llm(LlmCommand),
 
     /// Replay recorded sessions on a simulated clock.
     Replay(ReplayArgs),
@@ -200,6 +208,20 @@ pub enum ModelsCommand {
     },
 }
 
+/// `asphodel llm login` writes the token file under the data dir. It
+/// never goes through the daemon and never reads the Codex CLI's
+/// credentials. `ASPHODEL_LLM_ISSUER` (environment only, for tests) points
+/// the flow at another issuer.
+#[derive(Debug, Subcommand)]
+pub enum LlmCommand {
+    /// Log in to a ChatGPT subscription with a device code.
+    Login {
+        /// The daemon's data dir, where the token file goes.
+        #[arg(long, env = "ASPHODEL_DATA_DIR")]
+        data_dir: PathBuf,
+    },
+}
+
 #[derive(Debug, Args)]
 pub struct ReplayArgs {
     /// The private directory holding the corpus, cassettes and reports.
@@ -226,6 +248,7 @@ impl Cli {
             Command::Keep(_) => stub("keep"),
             Command::Unkeep(_) => stub("unkeep"),
             Command::Models(ModelsCommand::Fetch { model_dir }) => models_fetch(model_dir),
+            Command::Llm(LlmCommand::Login { data_dir }) => llm_login(&data_dir),
             Command::Replay(_) => stub("replay"),
             Command::Bench(_) => stub("bench"),
         }
@@ -271,6 +294,29 @@ fn models_fetch(model_dir: Option<PathBuf>) -> anyhow::Result<()> {
         report.fetched.len(),
         report.skipped.len()
     );
+    Ok(())
+}
+
+/// The issuer override, for tests against a loopback stub. Hidden from
+/// `--help` on purpose.
+const LLM_ISSUER_ENV: &str = "ASPHODEL_LLM_ISSUER";
+
+/// `asphodel llm login`: the device-code flow, printing the URL and the
+/// code and nothing else. The daemon picks the file up on its next call.
+fn llm_login(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let issuer = std::env::var(LLM_ISSUER_ENV).unwrap_or_else(|_| AUTH_ISSUER.to_string());
+    let store = TokenStore::open(data_dir);
+    let mut show = |code: &DeviceCode| {
+        println!("Sign in to ChatGPT to let Asphodel use your subscription:");
+        println!();
+        println!("  1. Open {}", code.verification_url);
+        println!("  2. Enter the code {}", code.user_code);
+        println!();
+        println!("The code expires in 15 minutes. Waiting for approval...");
+    };
+    device_code_login(&issuer, &store, &SystemClock, &mut show)
+        .with_context(|| format!("logging in at {issuer}"))?;
+    println!("Logged in. Tokens saved to {}", store.path().display());
     Ok(())
 }
 

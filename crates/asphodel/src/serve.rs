@@ -15,8 +15,10 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use asphodel_core::config::{Deployment, LLM_API_KEY_ENV, ModelsConfig, Secret, TOKEN_ENV};
-use asphodel_core::models::Models;
+use asphodel_core::config::{
+    Deployment, LLM_API_KEY_ENV, LlmAuth, ModelsConfig, Secret, TOKEN_ENV,
+};
+use asphodel_core::models::{LlmSettings, LlmStatus, Models, TokenStore};
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::{Clock, Health, ResolvedConfig, Service, SystemClock, Tuning};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
@@ -63,6 +65,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let store = Store::open(&args.data_dir, options, Arc::clone(&clock))
         .with_context(|| format!("opening the store in {}", args.data_dir.display()))?;
     config.purge = store.check_fingerprint(&config.deletion_fingerprint)?;
+    config.llm = llm_status(&config, &args.data_dir)?;
     let service = match models_switch()? {
         ModelsSwitch::Fake => {
             warn!(
@@ -135,6 +138,28 @@ fn models_switch() -> anyhow::Result<ModelsSwitch> {
             value
         ),
     }
+}
+
+/// Resolves the LLM settings so a misconfiguration stops the daemon
+/// (ADR 0009): a half-set `[llm]`, or a key set together with
+/// `auth = "chatgpt"`. In `chatgpt` mode the token file under the data dir
+/// decides whether the daemon is logged in; it can start logged out, and
+/// extraction waits for `asphodel llm login`.
+fn llm_status(config: &ResolvedConfig, data_dir: &Path) -> anyhow::Result<Option<LlmStatus>> {
+    let Some(settings) = LlmSettings::from_config(&config.tuning, &config.deployment)? else {
+        return Ok(None);
+    };
+    let status = match settings.auth {
+        LlmAuth::ApiKey => LlmStatus::api_key(settings.api_key.is_some()),
+        LlmAuth::Chatgpt => TokenStore::open(data_dir).status(),
+    };
+    if status.auth == LlmAuth::Chatgpt && !status.logged_in {
+        warn!(
+            "llm.auth is chatgpt but there is no login: run `asphodel llm login --data-dir {}`",
+            data_dir.display()
+        );
+    }
+    Ok(Some(status))
 }
 
 /// Loads the tuning file and records the deployment. An unreadable file,
