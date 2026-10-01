@@ -25,6 +25,9 @@ use crate::listen::Listen;
 
 type Shared = Arc<Service>;
 
+#[cfg(test)]
+mod tests;
+
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     if !args.listen.is_local() && args.token.as_deref().unwrap_or("").is_empty() {
         bail!(
