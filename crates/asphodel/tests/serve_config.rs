@@ -1,0 +1,320 @@
+//! `asphodel serve`'s deployment flags and tuning file, run as a process.
+//!
+//! ADR 0009: each deployment flag has an `ASPHODEL_*` environment variable,
+//! secrets come from the environment only, and an unknown key or
+//! out-of-range value in the tuning file stops the daemon starting.
+
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
+
+const TOKEN: &str = "tok-7f3a9c-secret";
+const LLM_KEY: &str = "sk-live-41b2e8-secret";
+
+/// `asphodel serve` with a clean environment, so the caller's `ASPHODEL_*`
+/// variables can't leak in.
+fn serve() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
+    command.env_clear().arg("serve");
+    command
+}
+
+fn run(command: &mut Command) -> Output {
+    command.stdin(Stdio::null()).output().unwrap()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// A temporary directory removed even when an assertion unwinds.
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "asphodel-serve-config-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn file(&self, name: &str, text: &str) -> PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A running daemon, killed on drop.
+struct Daemon {
+    child: Child,
+    log: String,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Starts the daemon on an ephemeral loopback port and collects its log up
+/// to the "listening" line. Panics if it exits or stalls first.
+fn start(command: &mut Command) -> Daemon {
+    let mut child = command
+        .args(["--listen", "127.0.0.1:0"])
+        .env("ASPHODEL_LOG", "trace")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (lines, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut log = String::new();
+    loop {
+        match received.recv_timeout(Duration::from_secs(10)) {
+            Ok(line) => {
+                log.push_str(&line);
+                log.push('\n');
+                if line.contains("asphodel listening") {
+                    return Daemon { child, log };
+                }
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the daemon never started listening:\n{log}");
+            }
+        }
+    }
+}
+
+/// The JSON of the "resolved config" log line.
+fn resolved_config(log: &str) -> serde_json::Value {
+    let line = log
+        .lines()
+        .find(|line| line.contains("resolved config"))
+        .unwrap_or_else(|| panic!("no resolved config line in:\n{log}"));
+    let start = line.find("config=").expect("a config field") + "config=".len();
+    let text = &line[start..];
+    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
+    stream.next().unwrap().unwrap()
+}
+
+#[test]
+fn every_deployment_flag_has_an_environment_variable() {
+    let output = run(serve().arg("--help"));
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    for (flag, env) in [
+        ("--listen", "ASPHODEL_LISTEN"),
+        ("--data-dir", "ASPHODEL_DATA_DIR"),
+        ("--config", "ASPHODEL_CONFIG"),
+        ("--allow-network-fs", "ASPHODEL_ALLOW_NETWORK_FS"),
+        ("--model-dir", "ASPHODEL_MODEL_DIR"),
+    ] {
+        let line = help
+            .lines()
+            .find(|line| line.trim_start().starts_with(flag))
+            .unwrap_or_else(|| panic!("no {flag} in:\n{help}"));
+        assert!(line.contains(env), "{flag} doesn't name {env}: {line}");
+    }
+}
+
+#[test]
+fn secrets_have_no_flag() {
+    let output = run(serve().arg("--help"));
+    let help = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert!(!help.contains("--token"), "{help}");
+    assert!(!help.contains("api-key"), "{help}");
+    assert!(!help.contains("--llm-key"), "{help}");
+
+    for args in [
+        ["--token", TOKEN],
+        ["--llm-api-key", LLM_KEY],
+        ["--api-key", LLM_KEY],
+    ] {
+        let output = run(serve().args(args));
+        assert!(!output.status.success(), "{args:?} was accepted");
+    }
+}
+
+#[test]
+fn an_unknown_tuning_key_stops_startup() {
+    let dir = TestDir::new();
+    let path = dir.file("tuning.toml", "[clock]\nquiet_rat = 0.2\n");
+    let output = run(serve().arg("--config").arg(&path));
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("quiet_rat"), "{}", stderr(&output));
+}
+
+#[test]
+fn an_out_of_range_tuning_value_stops_startup() {
+    let dir = TestDir::new();
+    let path = dir.file("tuning.toml", "[purge]\ndelta = -1.0\n");
+    let output = run(serve().arg("--config").arg(&path));
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("purge.delta"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_missing_tuning_file_stops_startup() {
+    let dir = TestDir::new();
+    let output = run(serve().arg("--config").arg(dir.0.join("missing.toml")));
+    assert!(!output.status.success());
+}
+
+#[test]
+fn the_tuning_file_can_come_from_the_environment() {
+    let dir = TestDir::new();
+    let path = dir.file("tuning.toml", "[injection]\ncap = 0\n");
+    let output = run(serve().env("ASPHODEL_CONFIG", &path));
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("injection.cap"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn the_config_flag_wins_over_its_variable() {
+    let dir = TestDir::new();
+    let bad = dir.file("bad.toml", "[injection]\ncap = 0\n");
+    let good = dir.file("good.toml", "[clock]\nquiet_rate = 0.3\n");
+    let daemon = start(
+        serve()
+            .env("ASPHODEL_CONFIG", &bad)
+            .arg("--config")
+            .arg(&good),
+    );
+    let config = resolved_config(&daemon.log);
+    assert_eq!(config["tuning"]["clock"]["quiet_rate"], 0.3);
+}
+
+#[test]
+fn deployment_values_come_from_the_environment() {
+    let dir = TestDir::new();
+    let tuning = dir.file("tuning.toml", "[purge]\nsource_horizon_days = 60\n");
+    let data = dir.0.join("data");
+    let models = dir.0.join("models");
+    let daemon = start(
+        serve()
+            .env("ASPHODEL_CONFIG", &tuning)
+            .env("ASPHODEL_DATA_DIR", &data)
+            .env("ASPHODEL_MODEL_DIR", &models)
+            .env("ASPHODEL_ALLOW_NETWORK_FS", "true"),
+    );
+    let config = resolved_config(&daemon.log);
+    let deployment = &config["deployment"];
+    assert_eq!(deployment["data_dir"], data.to_str().unwrap());
+    assert_eq!(deployment["model_dir"], models.to_str().unwrap());
+    assert_eq!(deployment["allow_network_fs"], true);
+    assert_eq!(config["tuning"]["purge"]["source_horizon_days"], 60);
+}
+
+#[test]
+fn listen_comes_from_its_variable_and_the_flag_wins() {
+    // An unparseable address in the variable must lose to the flag.
+    let daemon = start(serve().env("ASPHODEL_LISTEN", "not-an-address"));
+    let config = resolved_config(&daemon.log);
+    assert_eq!(config["deployment"]["listen"], "127.0.0.1:0");
+
+    let output = run(serve().env("ASPHODEL_LISTEN", "not-an-address"));
+    assert!(!output.status.success(), "ASPHODEL_LISTEN was ignored");
+}
+
+#[test]
+fn secrets_are_read_from_the_environment_and_never_logged() {
+    let daemon = start(
+        serve()
+            .env("ASPHODEL_TOKEN", TOKEN)
+            .env("ASPHODEL_LLM_API_KEY", LLM_KEY),
+    );
+    assert!(!daemon.log.contains(TOKEN), "{}", daemon.log);
+    assert!(!daemon.log.contains(LLM_KEY), "{}", daemon.log);
+    assert!(!daemon.log.contains("7f3a9c"));
+    assert!(!daemon.log.contains("41b2e8"));
+
+    let config = resolved_config(&daemon.log);
+    let deployment = &config["deployment"];
+    assert!(
+        deployment["token"].is_string(),
+        "token not recorded: {config}"
+    );
+    assert!(
+        deployment["llm_api_key"].is_string(),
+        "LLM key not recorded: {config}"
+    );
+}
+
+#[test]
+fn absent_secrets_are_recorded_as_absent() {
+    let daemon = start(&mut serve());
+    let config = resolved_config(&daemon.log);
+    assert!(config["deployment"]["token"].is_null());
+    assert!(config["deployment"]["llm_api_key"].is_null());
+}
+
+#[test]
+fn off_loopback_needs_a_token_from_the_environment() {
+    for env in [None, Some("")] {
+        let mut command = serve();
+        command.args(["--listen", "0.0.0.0:0"]);
+        if let Some(value) = env {
+            command.env("ASPHODEL_TOKEN", value);
+        }
+        let output = run(&mut command);
+        assert!(
+            !output.status.success(),
+            "started without a token ({env:?})"
+        );
+        assert!(
+            stderr(&output).contains("ASPHODEL_TOKEN"),
+            "{}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn the_startup_log_carries_the_resolved_config() {
+    let daemon = start(&mut serve());
+    let config = resolved_config(&daemon.log);
+    for key in [
+        "tuning",
+        "deployment",
+        "constants",
+        "deletion_fingerprint",
+        "purge",
+    ] {
+        assert!(!config[key].is_null(), "missing {key} in {config}");
+    }
+}
