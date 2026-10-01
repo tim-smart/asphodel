@@ -106,6 +106,11 @@ pub struct Strength {
 ///   than `MIN_ACCESS_AGE_DAYS`. An access made while the memory is already
 ///   fresh fades faster: its `d` grows with the recent use just before it
 ///   (Pavlik & Anderson), capped at `D_MAX`. The first has `d = a`.
+///   Weighted accesses are ordered by time ascending, then weight descending
+///   (`f64::total_cmp`), including the synthetic access. Heaviest-first ties
+///   keep the result independent of input order without letting lighter tied
+///   accesses increase the heaviest access's decay. Equal-time, equal-weight
+///   entries are interchangeable.
 /// - Once `close` is given and `max(closes_at, known_at)` has passed, recent
 ///   use starts over. It counts one synthetic access of weight
 ///   `WEIGHT_WINDOW_CLOSE` at that instant, plus the accesses strictly after
@@ -136,7 +141,7 @@ pub fn strength(
     let restart = close
         .map(|c| (c.closes_at, c.closes_at.max(c.known_at)))
         .filter(|&(_, restart)| restart <= now);
-    let counted: Vec<(f64, Timestamp)> = match restart {
+    let mut counted: Vec<(f64, Timestamp)> = match restart {
         None => accesses.iter().map(|a| (a.kind.weight(), a.at)).collect(),
         Some((closes_at, restart)) => {
             let mut counted: Vec<_> = accesses
@@ -145,10 +150,14 @@ pub fn strength(
                 .map(|a| (a.kind.weight(), a.at))
                 .collect();
             counted.push((WEIGHT_WINDOW_CLOSE, restart));
-            counted.sort_by_key(|&(_, at)| at);
             counted
         }
     };
+    counted.sort_by(|(left_weight, left_at), (right_weight, right_at)| {
+        left_at
+            .cmp(right_at)
+            .then_with(|| right_weight.total_cmp(left_weight))
+    });
     let recent_use = recent_use(&counted, bank_time, now);
 
     Strength {
@@ -172,7 +181,8 @@ fn occasions(sorted: &[Access]) -> u32 {
     count
 }
 
-/// `ln Σ w_j · age_j^(−d_j)` over weighted accesses sorted by time.
+/// `ln Σ w_j · age_j^(−d_j)` over weighted accesses sorted by time ascending,
+/// then weight descending.
 ///
 /// Each `d_j` needs the recent use at the time of access j, so this is
 /// quadratic in the number of accesses. One access per memory per turn keeps
