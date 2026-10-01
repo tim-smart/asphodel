@@ -4,10 +4,13 @@
 //! injection.
 //!
 //! - **Pending injections.** `prefetch` holds what it injected under its
-//!   `recall_id`. The turn that echoes that id commits the set to the
-//!   session's in-context set. A turn with a missing or different id
-//!   discards it, which covers a prefetch Hermes timed out on and trivial
-//!   prompts it never prefetched.
+//!   `recall_id`, and the turn that echoes that id commits that set to the
+//!   session's in-context set. A turn's sync can arrive after the next
+//!   prefetch (TIM-99), so several can be pending at once, and a turn with
+//!   a missing or unknown id changes nothing: it can't be matched to any of
+//!   them. A set no turn acknowledges never enters the in-context set, which
+//!   covers a prefetch Hermes timed out on; it waits until
+//!   [`PENDING_PER_SESSION`] newer ones push it out, or the session idles.
 //! - **The in-context set** is what the agent can already see this session:
 //!   committed injections and recall-tool results (and, once it exists, the
 //!   agenda). Injection skips it, and extraction gets it to judge `used`
@@ -21,6 +24,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
+
+/// The pending injections a session keeps; holding another drops the
+/// oldest. Syncs trail prefetches by a turn or so, so a few is plenty.
+const PENDING_PER_SESSION: usize = 4;
 
 /// Every live session's state.
 #[derive(Debug)]
@@ -36,7 +43,8 @@ type Key = (i64, String);
 struct Session {
     /// In the order the memories came into context, each once.
     in_context: Vec<Uuid>,
-    pending: Option<Pending>,
+    /// Oldest first.
+    pending: Vec<Pending>,
     touched_at: Timestamp,
 }
 
@@ -67,8 +75,8 @@ impl Sessions {
         }
     }
 
-    /// Holds `memories` as the session's pending injection under
-    /// `recall_id`, replacing any earlier one that no turn committed.
+    /// Holds `memories` as a pending injection under `recall_id`, alongside
+    /// any others still waiting for their turn.
     pub(crate) fn hold(
         &self,
         bank_id: i64,
@@ -79,14 +87,21 @@ impl Sessions {
     ) {
         let mut sessions = self.live(now);
         let session = session(&mut sessions, bank_id, session_id, now);
-        session.pending = Some(Pending {
+        session.pending.push(Pending {
             recall_id,
             memories,
         });
+        if session.pending.len() > PENDING_PER_SESSION {
+            let dropped = session.pending.remove(0);
+            tracing::debug!(
+                recall = %dropped.recall_id,
+                "no turn acknowledged a pending injection, so it's dropped"
+            );
+        }
     }
 
     /// A turn arrived echoing `recall_id`: commits the pending injection
-    /// when the ids match, and discards it otherwise.
+    /// held under that id. A missing or unknown id changes nothing.
     pub(crate) fn turn(
         &self,
         bank_id: i64,
@@ -96,19 +111,16 @@ impl Sessions {
     ) {
         let mut sessions = self.live(now);
         let session = session(&mut sessions, bank_id, session_id, now);
-        let Some(pending) = session.pending.take() else {
+        let Some(recall_id) = recall_id.and_then(|id| id.trim().parse::<Uuid>().ok()) else {
             return;
         };
-        let matches = recall_id
-            .and_then(|id| id.trim().parse::<Uuid>().ok())
-            .is_some_and(|id| id == pending.recall_id);
-        if matches {
+        if let Some(index) = session
+            .pending
+            .iter()
+            .position(|pending| pending.recall_id == recall_id)
+        {
+            let pending = session.pending.remove(index);
             add(&mut session.in_context, &pending.memories);
-        } else {
-            tracing::debug!(
-                recall = %pending.recall_id,
-                "a turn didn't echo the pending injection's recall id, so it's discarded"
-            );
         }
     }
 
@@ -120,7 +132,7 @@ impl Sessions {
         add(&mut session.in_context, memories);
     }
 
-    /// Clears the session's in-context set and pending injection, as Hermes
+    /// Clears the session's in-context set and pending injections, as Hermes
     /// asks on compaction, reset or rewind.
     pub(crate) fn clear(&self, bank_id: i64, session_id: &str, now: Timestamp) {
         let mut sessions = self.live(now);
@@ -151,7 +163,7 @@ fn session<'a>(
         .entry((bank_id, session_id.to_owned()))
         .or_insert_with(|| Session {
             in_context: Vec::new(),
-            pending: None,
+            pending: Vec::new(),
             touched_at: now,
         });
     session.touched_at = now;

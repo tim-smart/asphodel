@@ -15,10 +15,10 @@ use crate::clock::Clock;
 use crate::config::{ConfigError, Tuning};
 use crate::constants::RERANKER_DEADLINE;
 use crate::extraction::{Call1Input, Call2Input, ExtractError, Extracted};
-use crate::ingest::{Document, IngestError, Ingested, Turn};
+use crate::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use crate::models::{LlmClient, Models};
 use crate::queue::{ChunkError, FailedChunk, Failure, Lease, Leases, QueueError};
-use crate::retrieval::{Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
+use crate::retrieval::{Permit, Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
 use crate::sessions::Sessions;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
@@ -38,6 +38,10 @@ pub struct Service {
     /// Pending injections and in-context sets, per Hermes session. In
     /// memory, so a restart costs at most one repeated injection.
     sessions: Sessions,
+    /// The right to run the reranker, one inference at a time, shared by
+    /// prefetch and explicit recall so a timed-out call never queues work
+    /// behind the one running.
+    reranker_permit: Arc<Permit>,
     /// The reranker deadline: [`RERANKER_DEADLINE`], fixed in code
     /// (ADR 0009), unless [`Service::with_reranker_deadline`] set another.
     reranker_deadline: Duration,
@@ -64,6 +68,7 @@ impl Service {
             models: None,
             leases: Leases::default(),
             sessions,
+            reranker_permit: Arc::default(),
             reranker_deadline: RERANKER_DEADLINE,
         }
     }
@@ -90,6 +95,7 @@ impl Service {
             models: Some(models),
             leases: Leases::default(),
             sessions,
+            reranker_permit: Arc::default(),
             reranker_deadline: RERANKER_DEADLINE,
         })
     }
@@ -164,11 +170,15 @@ impl Service {
     /// source and queues it as one chunk, or stores only a tombstone when it
     /// asked to forget ([`crate::ingest`]).
     ///
-    /// The turn also settles the session's pending injection: echoing the
-    /// `recall_id` of the session's last prefetch commits it to the
-    /// in-context set, and anything else discards it (TIM-94, decision 6).
+    /// A new turn also settles its prefetch: echoing a pending injection's
+    /// `recall_id` commits it to the session's in-context set (TIM-94,
+    /// decision 6). A duplicate, such as a resend from the plugin's spool,
+    /// settles nothing, since the turn it repeats already did.
     pub fn ingest_turn(&self, bank: &str, turn: &Turn) -> Result<Ingested, IngestError> {
         let ingested = crate::ingest::ingest_turn(&self.store, bank, turn)?;
+        if ingested.outcome == Outcome::Duplicate {
+            return Ok(ingested);
+        }
         let bank_id = {
             let conn = self.store.connection();
             crate::ingest::find_bank(&conn, bank)?.map(|(bank_id, _)| bank_id)
@@ -307,6 +317,7 @@ impl Service {
             tuning: &self.tuning,
             models: self.models.as_ref().ok_or(RecallError::NoModels)?,
             sessions: &self.sessions,
+            permit: &self.reranker_permit,
             deadline: self.reranker_deadline,
         })
     }

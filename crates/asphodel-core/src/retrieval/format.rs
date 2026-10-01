@@ -56,19 +56,19 @@ fn annotations(candidate: &Candidate, now: Timestamp) -> Vec<String> {
     match candidate.phase {
         Phase::Upcoming => {
             if let Some(from) = window.valid_from {
-                annotations.push(format!("upcoming {}", date(from, tz, now, true)));
+                annotations.push(format!("upcoming {}", date(from, tz, now)));
             }
         }
         Phase::Overdue => {
             if let Some(due) = window.due_at {
-                annotations.push(format!("overdue since {}", date(due, tz, now, false)));
+                annotations.push(format!("overdue since {}", date(due, tz, now)));
             }
         }
         // A point event's sentence already says when it happened; only a
         // stated end is news.
         Phase::RecentlyPast | Phase::LongPast => {
             if let Some(until) = window.valid_until {
-                annotations.push(format!("ended {}", date(until, tz, now, false)));
+                annotations.push(format!("ended {}", date(until, tz, now)));
             }
         }
         Phase::Current => {}
@@ -101,17 +101,16 @@ fn annotations(candidate: &Candidate, now: Timestamp) -> Vec<String> {
     annotations
 }
 
-/// A stored time as its precision allows: `Thu 3 Oct 15:00` with the
-/// weekday, `3 Oct` without, `Oct 2027`, `2027`. The year is added to a
-/// day when it isn't the current one.
-fn date(time: WorldTime, tz: &TimeZone, now: Timestamp, weekday: bool) -> String {
+/// A stored time as its precision allows: `Thu 3 Oct 15:00`, `Sat 12 Sep`,
+/// `Oct 2027`, `2027`. A day always carries its weekday (decision 10), and
+/// its year when it isn't the current one.
+fn date(time: WorldTime, tz: &TimeZone, now: Timestamp) -> String {
     let zoned = time.at.to_zoned(tz.clone());
     let this_year = now.to_zoned(tz.clone()).year() == zoned.year();
-    let day = match (weekday, this_year) {
-        (true, true) => "%a %-d %b",
-        (true, false) => "%a %-d %b %Y",
-        (false, true) => "%-d %b",
-        (false, false) => "%-d %b %Y",
+    let day = if this_year {
+        "%a %-d %b"
+    } else {
+        "%a %-d %b %Y"
     };
     match time.precision {
         TimePrecision::Year => zoned.strftime("%Y").to_string(),

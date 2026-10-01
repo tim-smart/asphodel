@@ -29,7 +29,11 @@ impl RecallKind {
 /// One `recall_results` row: a memory that came back, at its rank.
 pub(super) struct Logged {
     pub memory_id: i64,
-    /// The final score, or `None` when the reranker was skipped.
+    /// The final score, or `None` when the reranker was skipped. It's not
+    /// the reranker's logit: calibrating the gate floor (TIM-93, decision 9)
+    /// recomputes logits from the logged query and memories, which the
+    /// deterministic reranker reproduces exactly. Add a logit column only if
+    /// calibration finds that impractical.
     pub score: Option<f64>,
     pub injected: bool,
 }

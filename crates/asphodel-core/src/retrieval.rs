@@ -38,6 +38,7 @@ mod log;
 mod rerank;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jiff::tz::TimeZone;
@@ -47,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub(crate) use arms::bm25;
+pub(crate) use rerank::Permit;
 
 use crate::config::{RankingTuning, Tuning};
 use crate::constants::{
@@ -96,8 +98,8 @@ pub struct Prefetch {
 #[serde(rename_all = "snake_case")]
 pub enum On {
     /// The validity window. A low-confidence window is widened by one unit
-    /// of its precision at each end, and a fact matches only through a
-    /// stated start inside the range.
+    /// of its precision at each end, and either end can be open. A fact
+    /// with no end matches only through a stated start inside the range.
     #[default]
     Happened,
     /// `observed_at`, exactly.
@@ -383,6 +385,8 @@ pub(crate) struct Context<'a> {
     pub tuning: &'a Tuning,
     pub models: &'a Models,
     pub sessions: &'a Sessions,
+    /// The service's permit to run its reranker.
+    pub permit: &'a Arc<Permit>,
     /// [`RERANKER_DEADLINE`](crate::constants::RERANKER_DEADLINE) unless a
     /// test or bench set another.
     pub deadline: Duration,
@@ -410,7 +414,7 @@ pub(crate) fn prefetch(
         |candidate: &Candidate| candidate.strength >= TAU && !in_context.contains(&candidate.uuid);
     let found = gather(cx, bank_id, &query, now, &keep, None)?;
     let documents = found.iter().map(|c| c.content.clone()).collect();
-    let logits = rerank::logits(&cx.models.reranker, &query, documents, deadline);
+    let logits = rerank::logits(&cx.models.reranker, cx.permit, &query, documents, deadline);
     let reranked = logits.is_some();
     let ranking = &cx.tuning.ranking;
     let ranked = rank(found, logits, |candidate, logit| {
@@ -550,7 +554,7 @@ pub(crate) fn recall(
     };
     let found = gather(cx, bank_id, &query, now, &keep, linked.as_ref())?;
     let documents = found.iter().map(|c| c.content.clone()).collect();
-    let logits = rerank::logits(&cx.models.reranker, &query, documents, deadline);
+    let logits = rerank::logits(&cx.models.reranker, cx.permit, &query, documents, deadline);
     let reranked = logits.is_some();
     let ranking = &cx.tuning.ranking;
     let with_phase = request.phase != PhaseFilter::Any;
@@ -823,21 +827,22 @@ fn in_range(candidate: &Candidate, request: &RecallRequest) -> bool {
             let window = &candidate.window;
             let tz = &candidate.tz;
             let widen = candidate.low_confidence;
-            if window.kind == Kind::Fact {
-                // A fact holds from its start on; only a stated start in the
-                // range places it there.
+            if window.kind == Kind::Fact && window.valid_until.is_none() {
+                // A fact with no end holds from its start on; only a stated
+                // start in the range places it there. An ended fact has a
+                // bounded window and is matched like anything else.
                 let Some(start) = window.valid_from else {
                     return false;
                 };
                 let (begins, ends) = unit(start, tz, widen);
                 return begins <= to && ends > from;
             }
-            // Anything else with no stated start is known to hold from
-            // when it was said, as an event with no stated time is (TIM-92).
+            // Either end can be open (CONTEXT.md): with no stated start,
+            // there's no lower bound.
             let begins = window
                 .valid_from
                 .map(|start| unit(start, tz, widen).0)
-                .unwrap_or(candidate.observed_at);
+                .unwrap_or(Timestamp::MIN);
             let ends = match window.closes_at(tz) {
                 Some(closes) if widen => {
                     let precision = window

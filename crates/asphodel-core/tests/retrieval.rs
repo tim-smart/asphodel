@@ -20,13 +20,13 @@
 //! Thursday 1 October 2026 in Auckland unless a test advances it.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use asphodel_core::config::RankingTuning;
 use asphodel_core::constants::{CANDIDATES_PER_ARM, RERANKED, RRF_K, SHORT_FOLLOW_UP_WORDS, TAU};
-use asphodel_core::ingest::Turn;
+use asphodel_core::ingest::{Outcome, Turn};
 use asphodel_core::models::{Embedder, FakeEmbedder, FakeReranker, ModelError, Models, Reranker};
 use asphodel_core::retrieval::{
     Band, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, band, effective_query,
@@ -103,6 +103,56 @@ impl Reranker for SlowReranker {
     fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, ModelError> {
         std::thread::sleep(self.0);
         FakeReranker.rerank(query, documents)
+    }
+}
+
+/// A reranker that answers like `FakeReranker` once a test opens its gate,
+/// counting the calls that reached it and signalling each arrival and each
+/// answer, so a test can tell what ran without timing it.
+struct GatedReranker {
+    entered: AtomicUsize,
+    open: Mutex<bool>,
+    opened: Condvar,
+    arrivals: Mutex<mpsc::Sender<()>>,
+    answers: Mutex<mpsc::Sender<()>>,
+}
+
+impl GatedReranker {
+    fn new() -> (Arc<Self>, mpsc::Receiver<()>, mpsc::Receiver<()>) {
+        let (arrivals, arrived) = mpsc::channel();
+        let (answers, answered) = mpsc::channel();
+        let reranker = Arc::new(Self {
+            entered: AtomicUsize::new(0),
+            open: Mutex::new(false),
+            opened: Condvar::new(),
+            arrivals: Mutex::new(arrivals),
+            answers: Mutex::new(answers),
+        });
+        (reranker, arrived, answered)
+    }
+
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+impl Reranker for GatedReranker {
+    fn model_id(&self) -> &str {
+        FakeReranker::MODEL_ID
+    }
+
+    fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, ModelError> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let _ = self.arrivals.lock().unwrap().send(());
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.opened.wait(open).unwrap();
+        }
+        drop(open);
+        let answer = FakeReranker.rerank(query, documents);
+        let _ = self.answers.lock().unwrap().send(());
+        answer
     }
 }
 
@@ -1100,8 +1150,10 @@ fn annotations_give_absolute_dates() {
     };
     // 3 October 2026 is a Saturday, and 27 September a Sunday.
     has(&format!("- {dentist} [upcoming Sat 3 Oct 15:00]"));
-    has(&format!("- {passport} [overdue since 30 Sep]"));
-    has(&format!("- {berlin} [ended 12 Sep]"));
+    // Every annotation date carries its weekday (decision 10): 30 September
+    // 2026 is a Wednesday and 12 September a Saturday.
+    has(&format!("- {passport} [overdue since Wed 30 Sep]"));
+    has(&format!("- {berlin} [ended Sat 12 Sep]"));
     has(&format!("- {yoga} [recurring: every Tuesday]"));
     has(&format!("- {lisbon} [observed 4 days ago, Sun 27 Sep]"));
     has(&format!("- {tax}"));
@@ -1131,30 +1183,66 @@ fn a_committed_injection_isnt_injected_again_in_that_session() {
 }
 
 #[test]
-fn a_turn_without_the_recall_id_discards_the_pending_injection() {
+fn a_turn_without_a_recall_id_commits_nothing() {
+    // A turn with no id can't be matched to any pending injection: syncs
+    // can arrive after the next prefetch (TIM-99), so it leaves them all
+    // pending, and only an echo of an injection's own id commits it.
     let h = Harness::new();
     let pottery = h.insert(fact("Tim takes a pottery class."));
     let first = h.prefetch("s", "pottery class schedule");
     h.sync_turn("s", None);
     assert!(h.in_context("s").is_empty());
-    // It was discarded, not held: echoing it later commits nothing.
     h.sync_turn("s", Some(first.recall_id.to_string()));
-    assert!(h.in_context("s").is_empty());
-    assert_eq!(
-        h.prefetch("s", "pottery class schedule").injected,
-        vec![pottery]
-    );
+    assert_eq!(h.in_context("s"), vec![pottery]);
 }
 
 #[test]
-fn a_turn_with_another_recall_id_discards_the_pending_injection() {
+fn a_turn_with_an_unknown_recall_id_commits_nothing() {
     let h = Harness::new();
-    h.insert(fact("Tim takes a pottery class."));
+    let pottery = h.insert(fact("Tim takes a pottery class."));
     let first = h.prefetch("s", "pottery class schedule");
     h.sync_turn("s", Some(Uuid::from_u128(7).to_string()));
     assert!(h.in_context("s").is_empty());
     h.sync_turn("s", Some(first.recall_id.to_string()));
-    assert!(h.in_context("s").is_empty());
+    assert_eq!(h.in_context("s"), vec![pottery]);
+}
+
+#[test]
+fn interleaved_syncs_commit_each_acknowledged_injection() {
+    // TIM-99: a turn's sync can arrive after the next prefetch.
+    let h = Harness::new();
+    let pottery = h.insert(fact("Tim takes a pottery class."));
+    let canoe = h.insert(fact("Tim paddles his canoe on Sundays."));
+    let a = h.prefetch("s", "pottery class schedule");
+    let b = h.prefetch("s", "canoe paddles weekend");
+    assert_eq!(a.injected, vec![pottery]);
+    assert_eq!(b.injected, vec![canoe]);
+
+    h.sync_turn("s", Some(a.recall_id.to_string()));
+    assert_eq!(h.in_context("s"), vec![pottery]);
+    h.sync_turn("s", Some(b.recall_id.to_string()));
+    let in_context = h.in_context("s");
+    assert!(
+        in_context.contains(&pottery) && in_context.contains(&canoe),
+        "{in_context:?}"
+    );
+}
+
+#[test]
+fn a_resent_turn_leaves_the_pending_injection_alone() {
+    // Ingest is idempotent (ADR 0002, TIM-90): a turn resent from the spool
+    // or retried is a duplicate and settles nothing.
+    let h = Harness::new();
+    let pottery = h.insert(fact("Tim takes a pottery class."));
+    let mut earlier = turn("s", EARLIER, "An earlier message.", None);
+    earlier.message_at = h.service.now() - SignedDuration::from_mins(10);
+    h.service.ingest_turn(BANK, &earlier).unwrap();
+
+    let pending = h.prefetch("s", "pottery class schedule");
+    let resent = h.service.ingest_turn(BANK, &earlier).unwrap();
+    assert_eq!(resent.outcome, Outcome::Duplicate);
+    h.sync_turn("s", Some(pending.recall_id.to_string()));
+    assert_eq!(h.in_context("s"), vec![pottery]);
 }
 
 #[test]
@@ -1403,6 +1491,13 @@ fn recall_filters_by_phase() {
         ..fact("Tim's garden party was on 10 September 2026.")
     });
     let current = h.insert(fact("Tim's garden has a lemon tree."));
+    // An overdue task is neither upcoming nor past; the `current` filter is
+    // the only one that reaches it short of `any`.
+    let overdue = h.insert(Memory {
+        kind: "task",
+        due_at: Some((local("2026-09-30T00:00"), "day")),
+        ..fact("Tim needs to weed the garden.")
+    });
 
     let only = |filter: PhaseFilter| {
         ids(&h.recall(RecallRequest {
@@ -1414,8 +1509,9 @@ fn recall_filters_by_phase() {
     assert_eq!(only(PhaseFilter::Past), vec![past]);
     let now = only(PhaseFilter::Current);
     assert!(now.contains(&current));
+    assert!(now.contains(&overdue));
     assert!(!now.contains(&upcoming) && !now.contains(&past));
-    assert_eq!(only(PhaseFilter::Any).len(), 3);
+    assert_eq!(only(PhaseFilter::Any).len(), 4);
 }
 
 #[test]
@@ -1522,6 +1618,98 @@ fn a_fact_matches_a_happened_range_only_through_a_stated_start_inside_it() {
     assert!(found.contains(&started));
     assert!(!found.contains(&earlier));
     assert!(!found.contains(&undated));
+}
+
+#[test]
+fn an_open_start_reaches_back_to_any_range_before_the_end() {
+    // Either end of a window can be open (CONTEXT.md), and `happened`
+    // filters the window, not when it was said (decision 4). Said on 15
+    // September with an end of 12 September and no stated start, this state
+    // held on 11 and 12 September.
+    let h = Harness::with_floor(0.0);
+    let berlin = h.insert(Memory {
+        kind: "state",
+        observed_at: at("2026-09-15T00:00:00Z"),
+        valid_until: Some((local("2026-09-12T00:00"), "day")),
+        ..fact("Tim was staying in Berlin.")
+    });
+    let found = ids(&h.recall(RecallRequest {
+        from: Some(local("2026-09-11T00:00")),
+        to: Some(local("2026-09-12T23:00")),
+        ..query("Berlin")
+    }));
+    assert_eq!(found, vec![berlin]);
+}
+
+#[test]
+fn an_ended_fact_matches_a_happened_range_inside_its_window() {
+    // The start-only rule is for a fact with no window (decision 4); once a
+    // fact is ended, its window is bounded and history can find it.
+    let h = Harness::with_floor(0.0);
+    let acme = h.insert(Memory {
+        valid_from: Some((local("2026-03-01T00:00"), "day")),
+        valid_until: Some((local("2026-06-01T00:00"), "day")),
+        ..fact("Tim works at Acme.")
+    });
+    let found = ids(&h.recall(RecallRequest {
+        from: Some(local("2026-05-10T00:00")),
+        to: Some(local("2026-05-20T00:00")),
+        ..query("Tim works at Acme")
+    }));
+    assert_eq!(found, vec![acme]);
+}
+
+#[test]
+fn a_timed_out_reranker_call_leaves_no_queued_inference() {
+    // The production reranker runs one inference at a time behind a mutex.
+    // A caller that can't start before its deadline falls back without
+    // queueing work behind the one running, and once that finishes the
+    // reranker serves again. The gate makes this independent of timing.
+    let (gated, arrived, answered) = GatedReranker::new();
+    let h = Harness::with(1.0, "", gated.clone()).with_deadline(Duration::from_millis(50));
+    let pottery = h.insert(fact("Tim takes a pottery class."));
+
+    let first = h.prefetch("s", "pottery class schedule");
+    assert!(!first.reranked);
+    arrived
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the first call reached the reranker");
+
+    // While it's stuck: more prefetches, at once and one after another, and
+    // an explicit recall.
+    std::thread::scope(|scope| {
+        let calls: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|session| {
+                let h = &h;
+                scope.spawn(move || h.prefetch(session, "pottery class schedule"))
+            })
+            .collect();
+        for call in calls {
+            let prefetch = call.join().unwrap();
+            assert!(!prefetch.reranked && prefetch.injected.is_empty());
+        }
+    });
+    assert!(!h.prefetch("d", "pottery class schedule").reranked);
+    let recall = h.recall(query("pottery class"));
+    assert!(!recall.reranked);
+    assert_eq!(ids(&recall), vec![pottery]);
+    assert_eq!(
+        gated.entered.load(Ordering::SeqCst),
+        1,
+        "timed-out calls queued inference behind the running one"
+    );
+
+    // Once the stuck call answers, the reranker is used again.
+    gated.open();
+    answered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the first call answered");
+    let recovered = (0..100)
+        .map(|_| h.prefetch("e", "pottery class schedule"))
+        .find(|prefetch| prefetch.reranked)
+        .expect("the reranker serves again after the stuck call");
+    assert_eq!(recovered.injected, vec![pottery]);
 }
 
 #[test]
