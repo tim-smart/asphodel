@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 use asphodel_core::config::RankingTuning;
 use asphodel_core::constants::{CANDIDATES_PER_ARM, RERANKED, RRF_K, SHORT_FOLLOW_UP_WORDS, TAU};
 use asphodel_core::ingest::{Outcome, Turn};
-use asphodel_core::models::{Embedder, FakeEmbedder, FakeReranker, ModelError, Models, Reranker};
+use asphodel_core::models::{
+    Embedder, FakeEmbedder, FakeLlm, FakeReranker, ModelError, Models, Reranker,
+};
 use asphodel_core::retrieval::{
     Band, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, band, effective_query,
     estimate_tokens, fuse, phase_term, score,
@@ -1766,4 +1768,147 @@ fn recall_returns_ten_results_unless_asked_for_up_to_thirty() {
     };
     assert_eq!(asked(3), 3);
     assert_eq!(asked(30), 30);
+}
+
+// A queued turn's in-context set (TIM-94, decision 6; ADR 0001)
+//
+// Extraction checks a turn for use against the memories the agent could see
+// when it wrote the reply: the session's in-context set as the turn's sync
+// left it. The bank's worker reaches the turn later, after any chunks ahead
+// of it, so what happens to the session in between (a clear on compaction,
+// a later recall, a restart) must not change which memories the turn is
+// credited with using. Each test queues the turn and extracts it only after
+// the session has moved on.
+
+impl Harness {
+    /// The daemon restarting: the service and its in-memory sessions go,
+    /// the store and its extraction queue stay.
+    fn restart(self) -> Self {
+        let Self {
+            service,
+            clock,
+            chunk,
+            _dir,
+        } = self;
+        let tuning = service.tuning().clone();
+        let models = service.models().unwrap().clone();
+        drop(service);
+        let store = Store::open(&_dir.0, OpenOptions::default(), clock.clone()).unwrap();
+        let service = Service::with_models(clock.clone(), store, tuning, models).unwrap();
+        Self {
+            service,
+            clock,
+            chunk,
+            _dir,
+        }
+    }
+
+    /// Extracts the head of the queue, as the bank's worker does, with a
+    /// call 1 that makes no claims and judges `used` (in-context handles)
+    /// used. The LLM is returned so a test can read what call 1 was shown.
+    fn extract_next(&self, used: &[&str]) -> FakeLlm {
+        let llm = FakeLlm::scripted(
+            "fake-llm",
+            vec![serde_json::json!({"claims": [], "used_injected_ids": used})],
+        );
+        let extracted = self.service.extract_next(BANK, &llm).unwrap();
+        assert!(extracted.is_some(), "nothing was queued");
+        llm
+    }
+
+    /// `used` accesses on `memory`.
+    fn used(&self, memory: Uuid) -> i64 {
+        self.one(
+            "SELECT COUNT(*) FROM accesses WHERE memory_id = ?1 AND kind = 'used'",
+            [self.rowid(memory)],
+        )
+    }
+}
+
+/// A harness with the pottery memory injected in session `s` and the turn
+/// that echoes the injection queued for extraction.
+fn queued_turn_with_pottery_in_context() -> (Harness, Uuid) {
+    let h = Harness::new();
+    let pottery = h.insert(fact("Tim takes a pottery class."));
+    let prefetch = h.prefetch("s", "pottery class schedule");
+    assert_eq!(prefetch.injected, vec![pottery]);
+    h.sync_turn("s", Some(prefetch.recall_id.to_string()));
+    assert_eq!(h.in_context("s"), vec![pottery]);
+    (h, pottery)
+}
+
+#[test]
+fn a_queued_turn_extracted_at_once_is_credited_with_its_injection() {
+    // The control for the three below: nothing happens to the session
+    // between the sync and the extraction.
+    let (h, pottery) = queued_turn_with_pottery_in_context();
+    let llm = h.extract_next(&["m1"]);
+    assert!(llm.requests()[0].user.contains("pottery class"));
+    assert_eq!(h.used(pottery), 1);
+}
+
+#[test]
+#[ignore = "pending fix (TIM-110 review): extract_next reads the session's current in-context set, not the turn's"]
+fn a_session_cleared_before_extraction_keeps_the_turns_in_context_set() {
+    // Hermes compacts the session after the turn and before the worker
+    // reaches it. The reply was still written with the memory in view.
+    let (h, pottery) = queued_turn_with_pottery_in_context();
+    h.service.clear_session(BANK, "s").unwrap();
+
+    let llm = h.extract_next(&["m1"]);
+    assert!(
+        llm.requests()[0].user.contains("pottery class"),
+        "call 1 wasn't shown the turn's in-context memory"
+    );
+    assert_eq!(
+        h.used(pottery),
+        1,
+        "the turn's use of its injection was lost"
+    );
+}
+
+#[test]
+#[ignore = "pending fix (TIM-110 review): extract_next reads the session's current in-context set, not the turn's"]
+fn a_recall_after_the_turn_isnt_in_the_turns_in_context_set() {
+    // A later turn's recall adds to the session; the queued turn's reply
+    // was written before it and can't have used what it returned.
+    let (h, pottery) = queued_turn_with_pottery_in_context();
+    let canoe = h.insert(fact("Tim paddles his canoe on Sundays."));
+    let later = h.recall(RecallRequest {
+        session_id: Some("s".into()),
+        query: "canoe paddles weekend".into(),
+        ..RecallRequest::default()
+    });
+    assert_eq!(later.results[0].id, canoe);
+    assert_eq!(h.in_context("s"), vec![pottery, canoe]);
+
+    // m2 is no handle of the turn's own set, so it can't credit anything.
+    let llm = h.extract_next(&["m2"]);
+    assert!(
+        !llm.requests()[0].user.contains("canoe"),
+        "call 1 was shown a memory recalled after the turn"
+    );
+    assert_eq!(h.used(canoe), 0, "a later recall was credited to the turn");
+    assert_eq!(h.used(pottery), 0);
+}
+
+#[test]
+#[ignore = "pending fix (TIM-110 review): extract_next reads the session's current in-context set, not the turn's"]
+fn a_turn_queued_across_a_restart_keeps_its_in_context_set() {
+    // SIGTERM finishes only the chunk in flight; a turn behind it is
+    // extracted by the next daemon, whose sessions start empty.
+    let (h, pottery) = queued_turn_with_pottery_in_context();
+    let h = h.restart();
+    assert!(h.in_context("s").is_empty());
+
+    let llm = h.extract_next(&["m1"]);
+    assert!(
+        llm.requests()[0].user.contains("pottery class"),
+        "call 1 wasn't shown the turn's in-context memory after the restart"
+    );
+    assert_eq!(
+        h.used(pottery),
+        1,
+        "the turn's use was lost across the restart"
+    );
 }
