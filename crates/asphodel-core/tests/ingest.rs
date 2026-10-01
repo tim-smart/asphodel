@@ -2149,3 +2149,200 @@ fn the_queue_order_survives_a_restart() {
         ]
     );
 }
+
+// Regressions from the TIM-106 review
+
+#[test]
+#[ignore = "TIM-106 review finding (lease identity); activate with its fix"]
+fn a_lease_from_before_a_restart_cannot_complete_the_new_workers_chunk() {
+    // A lease belongs to the service that issued it. After a restart the
+    // chunk is claimed again; the old lease must not take it off the queue
+    // while the new worker still holds it.
+    let h = Harness::new();
+    ingest(&h, "main", &turn("s", "2026-10-01T06:00:00Z", "A.", "Ok."));
+    let stale = claim(&h, "main").unwrap();
+    let h = h.restart();
+    let current = claim(&h, "main").expect("the restart released the lease");
+    assert_eq!(current.chunk, stale.chunk);
+
+    let chunk = stale.chunk;
+    assert!(
+        h.service.complete_chunk(stale).is_err(),
+        "a stale lease is refused"
+    );
+    assert_eq!(h.chunk_column::<Option<i64>>(chunk, "extracted_at"), None);
+    assert_eq!(depth(&h, "main"), 1, "the chunk is still queued");
+    h.service.complete_chunk(current).unwrap();
+    assert_eq!(depth(&h, "main"), 0);
+}
+
+#[test]
+#[ignore = "TIM-106 review finding (lease identity); activate with its fix"]
+fn a_lease_from_before_a_restart_cannot_fail_the_new_workers_chunk() {
+    let h = Harness::new();
+    ingest(&h, "main", &turn("s", "2026-10-01T06:00:00Z", "A.", "Ok."));
+    let stale = claim(&h, "main").unwrap();
+    let h = h.restart();
+    let current = claim(&h, "main").unwrap();
+
+    let chunk = stale.chunk;
+    assert!(
+        h.service.fail_chunk(stale, LLM_502).is_err(),
+        "a stale lease is refused"
+    );
+    assert_eq!(h.chunk_column::<i64>(chunk, "error_count"), 0);
+    assert_eq!(
+        h.chunk_column::<Option<String>>(chunk, "last_error_kind"),
+        None
+    );
+    assert_eq!(
+        h.service.fail_chunk(current, LLM_502).unwrap(),
+        Failure::Retry { error_count: 1 }
+    );
+}
+
+#[test]
+#[ignore = "TIM-106 review finding (lease identity); activate with its fix"]
+fn a_lease_from_another_store_is_refused() {
+    // Two stores whose bank and queue rowids coincide: one store's lease
+    // must not complete or fail the other's chunk.
+    let a = Harness::new();
+    let b = Harness::new();
+    for h in [&a, &b] {
+        ingest(h, "main", &turn("s", "2026-10-01T06:00:00Z", "A.", "Ok."));
+    }
+    let from_a = claim(&a, "main").unwrap();
+    let held_by_b = claim(&b, "main").unwrap();
+    let b_chunk = held_by_b.chunk;
+
+    assert!(b.service.complete_chunk(from_a).is_err());
+    assert_eq!(b.chunk_column::<Option<i64>>(b_chunk, "extracted_at"), None);
+    assert_eq!(depth(&b, "main"), 1);
+
+    let from_a = claim(&a, "main").expect("dropping the lease released a's bank");
+    assert!(b.service.fail_chunk(from_a, LLM_502).is_err());
+    assert_eq!(b.chunk_column::<i64>(b_chunk, "error_count"), 0);
+
+    b.service.complete_chunk(held_by_b).unwrap();
+    assert_eq!(depth(&b, "main"), 0);
+    assert_eq!(depth(&a, "main"), 1, "a's queue is untouched");
+}
+
+#[test]
+#[ignore = "TIM-106 review finding (speaker identity); activate with its fix"]
+fn a_display_name_cannot_capture_another_speakers_platform_id() {
+    // TIM-94, decision 1: speakers are attributed by platform id. A display
+    // name that looks like a platform id is free text, not an identity.
+    let h = Harness::new();
+    let impostor = ingest(
+        &h,
+        "main",
+        &discord_turn(
+            "2026-10-01T06:00:00Z",
+            "Hi.",
+            author("2000", "discord:3000"),
+        ),
+    );
+    let real = ingest(
+        &h,
+        "main",
+        &discord_turn("2026-10-01T06:01:00Z", "Hi.", author("3000", "Sam")),
+    );
+    assert_ne!(
+        real.speaker.unwrap().entity,
+        impostor.speaker.unwrap().entity,
+        "discord:3000 is its own speaker"
+    );
+    assert_eq!(h.entities_in("main"), 4);
+}
+
+#[test]
+#[ignore = "TIM-106 review finding (speaker identity); activate with its fix"]
+fn a_display_name_cannot_capture_the_owners_platform_id() {
+    // The owner's platform id can be added after strangers have spoken
+    // (`PUT /v1/banks/{bank}` merges, TIM-94 decision 7). A stranger who
+    // used it as a display name earlier must not become the owner's
+    // identity, or the owner's turns be attributed to them.
+    let h = Harness::new();
+    let late = BankIdentity {
+        owner_platform_ids: Vec::new(),
+        ..identity()
+    };
+    h.service.ensure_bank("late", &late, &models()).unwrap();
+    let stranger = ingest(
+        &h,
+        "late",
+        &discord_turn(
+            "2026-10-01T06:00:00Z",
+            "Hi.",
+            author("2000", "discord:1234"),
+        ),
+    );
+    assert!(!stranger.speaker.as_ref().unwrap().owner);
+
+    h.service
+        .ensure_bank(
+            "late",
+            &BankIdentity {
+                owner_platform_ids: vec!["discord:1234".into()],
+                ..BankIdentity::default()
+            },
+            &models(),
+        )
+        .unwrap();
+    let owner = ingest(
+        &h,
+        "late",
+        &discord_turn("2026-10-01T06:01:00Z", "It's me.", author("1234", "Tim")),
+    );
+    let speaker = owner.speaker.unwrap();
+    assert!(speaker.owner, "the owner's platform id resolves to user");
+    assert_eq!(speaker.entity, h.seeded("late", "user"));
+    let again = ingest(
+        &h,
+        "late",
+        &discord_turn(
+            "2026-10-01T06:02:00Z",
+            "Still me.",
+            author("2000", "discord:1234"),
+        ),
+    );
+    assert_eq!(
+        again.speaker.unwrap().entity,
+        stranger.speaker.unwrap().entity,
+        "the stranger is still themselves"
+    );
+}
+
+#[test]
+#[ignore = "TIM-106 review finding (same-version dedup); activate with its fix"]
+fn a_repeated_section_in_a_first_version_is_queued_each_time() {
+    // TIM-92 skips chunks seen in earlier versions of a document, not
+    // chunks repeated within the version being ingested.
+    let h = Harness::new();
+    let text = "# A\n\nRepeat.\n\n# A\n\nRepeat.\n";
+    let chunks = split_document(text);
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(
+        chunk_hash(&chunks[0].heading_path, &chunks[0].text),
+        chunk_hash(&chunks[1].heading_path, &chunks[1].text),
+        "the two sections share a hash"
+    );
+
+    let got = ingest_doc(&h, "main", &document("twice.md", text, date(2026, 9, 15)));
+    assert_eq!(got.chunks_queued, 2);
+    assert_eq!(got.chunks_skipped, 0);
+    assert_eq!(h.chunks_of(got.source).len(), 2);
+    assert_eq!(depth(&h, "main"), 2);
+}
+
+#[test]
+#[ignore = "TIM-106 review finding (same-version dedup); activate with its fix"]
+fn a_repeated_section_in_an_edit_is_queued_when_no_earlier_version_had_it() {
+    let h = Harness::new();
+    ingest_doc(&h, "main", &document("life.md", PLANS, date(2026, 9, 1)));
+    let v2 = [PLANS, HOME, "\n\n", HOME].concat();
+    let second = ingest_doc(&h, "main", &document("life.md", &v2, date(2026, 9, 8)));
+    assert_eq!(second.chunks_skipped, 1, "Plans was in v1");
+    assert_eq!(second.chunks_queued, 2, "both Home sections are new");
+}
