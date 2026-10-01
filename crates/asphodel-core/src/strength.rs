@@ -30,7 +30,7 @@ use crate::constants::{
 
 pub use crate::constants::RECENTLY_PAST_DAYS;
 pub use bank_time::BankTime;
-pub use chain::{Link, chain, chain_head, inherits_from};
+pub use chain::{Chains, Link, chain, chain_head, inherits_from};
 pub use confidence::state_confidence;
 pub use purge::{PurgeRule, purge_eligible};
 pub use window::{Kind, Phase, TimePrecision, Window, WorldTime, unit_end};

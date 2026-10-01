@@ -45,7 +45,7 @@ use super::{
 };
 use crate::constants::Significance;
 use crate::store::{SqliteVec, VectorError, VectorIndex, timestamp};
-use crate::strength::{Kind, Link as ChainLink, chain_head};
+use crate::strength::{Chains, Kind, Link as ChainLink};
 
 /// Hits each retriever takes at first. Superseded versions collapse into
 /// their chain's head and retracted memories drop out, so when fewer than
@@ -100,7 +100,7 @@ pub(super) fn search(
     if checked.memories.is_empty() {
         return Ok(None);
     }
-    let links = chain_links(conn, unit.bank_id)?;
+    let mut chains = Chains::new(&chain_links(conn, unit.bank_id)?);
     let mut loaded: BTreeMap<i64, Option<Neighbour>> = BTreeMap::new();
     let mut runs = false;
     let mut per_claim: Vec<Vec<i64>> = Vec::with_capacity(checked.memories.len());
@@ -120,7 +120,7 @@ pub(super) fn search(
                     below_floor = true;
                     break;
                 }
-                let Some(head) = shown(conn, &links, &mut loaded, hit.memory_id)? else {
+                let Some(head) = shown(conn, &mut chains, &mut loaded, hit.memory_id)? else {
                     continue;
                 };
                 if similarity >= floor {
@@ -141,7 +141,7 @@ pub(super) fn search(
             let hits = bm25(conn, unit.bank_id, &memory.content, limit)?;
             bm25_ranked.clear();
             for hit in &hits {
-                if let Some(head) = shown(conn, &links, &mut loaded, *hit)?
+                if let Some(head) = shown(conn, &mut chains, &mut loaded, *hit)?
                     && !bm25_ranked.contains(&head)
                 {
                     bm25_ranked.push(head);
@@ -157,7 +157,7 @@ pub(super) fn search(
         if memory.flagged {
             runs = true;
             for id in linked_open(conn, unit.bank_id, memory)? {
-                if !found.contains(&id) && shown(conn, &links, &mut loaded, id)?.is_some() {
+                if !found.contains(&id) && shown(conn, &mut chains, &mut loaded, id)?.is_some() {
                     found.push(id);
                 }
             }
@@ -358,11 +358,11 @@ fn linked_open(
 /// is retracted. Loads and caches the head.
 fn shown(
     conn: &Connection,
-    links: &[ChainLink],
+    chains: &mut Chains,
     loaded: &mut BTreeMap<i64, Option<Neighbour>>,
     id: i64,
 ) -> Result<Option<i64>, rusqlite::Error> {
-    let head = chain_head(links, id);
+    let head = chains.head(id);
     if let std::collections::btree_map::Entry::Vacant(entry) = loaded.entry(head) {
         entry.insert(load(conn, head)?);
     }

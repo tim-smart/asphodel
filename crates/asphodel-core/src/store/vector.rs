@@ -14,6 +14,10 @@ use rusqlite::Connection;
 /// (TIM-89). Changing models means a re-embed and a migration.
 pub const EMBEDDING_DIMENSIONS: usize = 384;
 
+/// The most neighbours sqlite-vec 0.1.9 returns from one KNN query
+/// (`SQLITE_VEC_VEC0_K_MAX`); it refuses a larger `k`.
+pub const KNN_K_MAX: usize = 4096;
+
 /// One hit from a nearest-neighbour search.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Neighbour {
@@ -52,6 +56,8 @@ pub trait VectorIndex: Send + Sync {
     fn remove(&self, conn: &Connection, memory_id: i64) -> Result<(), VectorError>;
 
     /// The `k` nearest memories to `query` within `bank_id`, nearest first.
+    /// Any `k` is allowed: an index with a limit of its own answers a larger
+    /// one some other way.
     fn nearest(
         &self,
         conn: &Connection,
@@ -125,12 +131,22 @@ impl VectorIndex for SqliteVec {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let k = i64::try_from(k).unwrap_or(i64::MAX);
-        let mut statement = conn.prepare_cached(
+        // Past sqlite-vec's KNN limit, an exact scan of the bank's vectors
+        // in the same metric (the TIM-108 re-review). It's the brute force
+        // the KNN query does anyway, without the cap.
+        let sql = if k <= KNN_K_MAX {
             "SELECT memory_id, distance FROM memory_vectors
              WHERE bank_id = ?1 AND embedding MATCH ?2 AND k = ?3
-             ORDER BY distance",
-        )?;
+             ORDER BY distance"
+        } else {
+            "SELECT memory_id, vec_distance_cosine(embedding, ?2) AS distance
+             FROM memory_vectors
+             WHERE bank_id = ?1
+             ORDER BY distance, memory_id
+             LIMIT ?3"
+        };
+        let k = i64::try_from(k).unwrap_or(i64::MAX);
+        let mut statement = conn.prepare_cached(sql)?;
         let rows = statement.query_map((bank_id, bytes, k), |row| {
             Ok(Neighbour {
                 memory_id: row.get(0)?,

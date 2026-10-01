@@ -35,6 +35,54 @@ pub fn chain_head(links: &[Link], id: i64) -> i64 {
     head
 }
 
+/// A bank's chains, indexed once for many head lookups. Each lookup walks
+/// only as far as a memory whose head is already known, and remembers the
+/// head for every memory it passed, so looking up every version of a long
+/// chain costs about as much as walking it once. Heads are as
+/// [`chain_head`] finds them.
+#[derive(Debug, Clone, Default)]
+pub struct Chains {
+    next: HashMap<i64, i64>,
+    heads: HashMap<i64, i64>,
+}
+
+impl Chains {
+    pub fn new(links: &[Link]) -> Self {
+        Self {
+            next: links
+                .iter()
+                .filter_map(|l| l.superseded_by.map(|by| (l.id, by)))
+                .collect(),
+            heads: HashMap::new(),
+        }
+    }
+
+    /// The head of the chain `id` is in.
+    pub fn head(&mut self, id: i64) -> i64 {
+        if let Some(&head) = self.heads.get(&id) {
+            return head;
+        }
+        let mut path = vec![id];
+        let mut seen = BTreeSet::from([id]);
+        let mut head = id;
+        while let Some(&by) = self.next.get(&head) {
+            if let Some(&known) = self.heads.get(&by) {
+                head = known;
+                break;
+            }
+            if !seen.insert(by) {
+                break;
+            }
+            head = by;
+            path.push(by);
+        }
+        for member in path {
+            self.heads.insert(member, head);
+        }
+        head
+    }
+}
+
 /// Every memory in the chain `id` is in, from any member.
 pub fn chain(links: &[Link], id: i64) -> BTreeSet<i64> {
     inherits_from(links, chain_head(links, id))

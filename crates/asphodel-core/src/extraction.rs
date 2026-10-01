@@ -339,7 +339,8 @@ pub enum DropReason {
 /// The chunk's `last_error_kind` names the cause: `llm_transport`,
 /// `llm_timeout`, `llm_status` (with the status), `llm_no_content`,
 /// `llm_not_json`, `llm_refused`, `llm_backend`, `invalid_reply`,
-/// `embedding` or `commit`.
+/// `embedding`, `search` or `commit`. A call 2 failure records the same
+/// `llm_*` kinds as call 1.
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractError {
     /// The LLM can't be used at all: not configured, conflicting settings,
@@ -374,6 +375,13 @@ pub enum ExtractError {
     #[error("embedding the claims failed: {error}")]
     Model { error: ModelError },
 
+    /// Searching the store for the claims' neighbours failed, and the queue
+    /// counted it, so a fault that recurs reaches the retry cap rather than
+    /// holding the bank's queue. Call 1's reply isn't saved yet, so the retry
+    /// starts at call 1.
+    #[error("searching for the claims' neighbours failed: {error}")]
+    Search { error: StoreError, failure: Failure },
+
     /// Embedding the new memories failed, and the queue counted it.
     #[error("embedding the new memories failed: {error}")]
     Embedding { error: ModelError, failure: Failure },
@@ -403,6 +411,7 @@ impl ExtractError {
         match self {
             ExtractError::Call1 { failure, .. }
             | ExtractError::Call2 { failure, .. }
+            | ExtractError::Search { failure, .. }
             | ExtractError::InvalidReply { failure, .. }
             | ExtractError::Embedding { failure, .. }
             | ExtractError::Commit { failure, .. } => Some(*failure),
@@ -527,7 +536,8 @@ pub(crate) fn extract(
         }
     };
 
-    let search = {
+    // The connection is released before the failure is counted.
+    let searched = {
         let conn = store.connection();
         reconcile::search(
             &conn,
@@ -536,7 +546,17 @@ pub(crate) fn extract(
             &unit,
             &checked,
             &vectors,
-        )?
+        )
+    };
+    let search = match searched {
+        Ok(search) => search,
+        Err(error) => {
+            let failure = queue::fail(store, leases, lease, SEARCH)?;
+            return Err(ExtractError::Search {
+                error: StoreError::Sqlite(error),
+                failure,
+            });
+        }
     };
     let plan = match &search {
         None => reconcile::Plan::all_new(checked.memories.len()),
@@ -688,6 +708,11 @@ fn restore(saved: &str, unit: &mut input::Unit) -> Option<Value> {
 
 const INVALID_REPLY: ChunkError = ChunkError {
     kind: "invalid_reply",
+    status: None,
+};
+
+const SEARCH: ChunkError = ChunkError {
+    kind: "search",
     status: None,
 };
 
