@@ -86,8 +86,8 @@ pub fn fetch_models(
     Ok(report)
 }
 
-/// Writes `bytes` to `path` through a temp file in the same directory and
-/// a rename, creating the directory if needed.
+/// Writes `bytes` to `path` through a new temp file in the same directory
+/// and a rename, creating the directory if needed.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), FetchFailure> {
     let io = |error| FetchFailure::Io {
         path: path.to_path_buf(),
@@ -95,14 +95,7 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), FetchFai
     };
     let parent = path.parent().expect("a model file has a directory");
     std::fs::create_dir_all(parent).map_err(io)?;
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(format!(".part-{}", std::process::id()));
-    let temp = PathBuf::from(temp);
-    let written = std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    written.map_err(io)
+    super::write::replace_file(path, bytes, 0o644).map_err(io)
 }
 
 /// The HTTPS fetcher `asphodel models fetch` uses.

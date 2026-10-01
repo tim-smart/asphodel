@@ -25,6 +25,7 @@ mod fetch;
 mod llm;
 mod manifest;
 mod onnx;
+mod write;
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -34,7 +35,8 @@ use crate::store::bank::ModelIds;
 pub use crate::config::LlmAuth;
 pub use chatgpt::{
     AUTH_ISSUER, CLIENT_ID, CODEX_ENDPOINT, ChatgptTokens, CodexResponses, DeviceCode, LlmStatus,
-    LoginError, ORIGINATOR, REFRESH_WINDOW, TOKEN_FILE, TokenError, TokenStore, device_code_login,
+    LoginError, ORIGINATOR, REFRESH_WINDOW, TOKEN_FILE, TOKEN_LOCK_FILE, TokenError, TokenLock,
+    TokenStore, device_code_login,
 };
 pub use dir::{ModelDir, ModelError};
 pub use fake::{FakeEmbedder, FakeReranker};

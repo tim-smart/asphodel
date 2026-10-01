@@ -103,6 +103,15 @@ flow: it prints a URL and a one-time code, waits for approval, and writes
 `<dir>/llm-tokens.json` with mode 0600. The daemon reads that file before
 every call, so a login while it runs takes effect without a restart.
 
+Every write of the token file goes through an exclusive `flock` on
+`<dir>/llm-tokens.lock`, which holds nothing else. A refresh holds it from
+its re-read of the file to its save, so a login, from the CLI or anywhere
+else, waits for a refresh in flight and then replaces what it wrote rather
+than being overwritten by it. The login takes the lock only for its final
+save, never while it waits for approval. Writes go to a new temp file,
+created exclusively under a fresh name, and a rename; nothing already in
+the data dir is followed or overwritten.
+
 Asphodel never reads `~/.codex/auth.json` and the file must not be copied
 from it. Refresh tokens are single-use: if Asphodel and the Codex CLI
 shared one token chain, whichever refreshed first would log the other out.
@@ -110,7 +119,7 @@ shared one token chain, whichever refreshed first would log the other out.
 **Refresh.** The daemon refreshes the access token when its expiry is
 within five minutes, or after a 401, once. The rotated tokens are written
 before the retried request goes out, and concurrent calls share one
-refresh. An issuer 408, 429 or 5xx is retryable and keeps the token file
+refresh, across clients and processes on the same data dir. An issuer 408, 429 or 5xx is retryable and keeps the token file
 unchanged. A second 401, or a refresh the issuer rejects, surfaces as "run
 `asphodel llm login`"; the old file is kept until the next login replaces
 it.
@@ -120,7 +129,9 @@ time the window resets. The client returns `UsageLimited { resets_at }`,
 which is not a retry: extraction holds the queue until then.
 
 **Secrets.** Tokens never appear in `Debug` output, logs, errors, the
-resolved config or cassettes. The resolved config's `llm` section shows
+resolved config or cassettes. A failed or incomplete response keeps only a
+code from the fixed list codex-rs knows; anything else the backend puts
+there becomes `unknown`, since it could echo what it was sent. The resolved config's `llm` section shows
 the mode, the token file's path and whether a login is present.
 
 **Unverified against the real backend.** Two details could not be

@@ -12,10 +12,10 @@
 //! `~/.codex/auth.json`: refresh tokens are single-use, so sharing a token
 //! chain with the Codex CLI would log one of the two out.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use jiff::{SignedDuration, Timestamp};
@@ -43,6 +43,10 @@ pub const ORIGINATOR: &str = "asphodel";
 
 /// The token file under the data dir.
 pub const TOKEN_FILE: &str = "llm-tokens.json";
+
+/// The token store's lock file, next to [`TOKEN_FILE`]. It holds nothing;
+/// an advisory `flock` on it serialises every write of the token file.
+pub const TOKEN_LOCK_FILE: &str = "llm-tokens.lock";
 
 /// Refresh the access token when its `exp` is this close (codex-rs uses the
 /// same window).
@@ -162,12 +166,20 @@ struct TokenFile {
 }
 
 /// The token file: `<data dir>/llm-tokens.json`, mode 0600, written through
-/// a temp file and a rename. `asphodel llm login` writes it, and the daemon
-/// reads it before every call and every refresh, so a login while the
-/// daemon runs takes effect without a restart. The daemon serialises its
-/// own refreshes with a lock; the CLI never refreshes.
+/// a new temp file and a rename. `asphodel llm login` writes it, and the
+/// daemon reads it before every call and every refresh, so a login while
+/// the daemon runs takes effect without a restart.
+///
+/// Every write goes through [`TokenLock`], an exclusive `flock` on
+/// `<data dir>/llm-tokens.lock`. A refresh holds it from its re-read of the
+/// file through the issuer exchange to its save, so a login or a clear,
+/// from this process or another, waits for the refresh and then replaces
+/// what it wrote instead of being overwritten by it. Two clients on one
+/// store share a refresh the same way: the second finds the rotated tokens
+/// on its re-read. Reads take no lock; the rename makes them atomic.
 pub struct TokenStore {
     path: PathBuf,
+    lock_path: PathBuf,
 }
 
 impl TokenStore {
@@ -175,6 +187,7 @@ impl TokenStore {
     pub fn open(data_dir: &Path) -> Self {
         Self {
             path: data_dir.join(TOKEN_FILE),
+            lock_path: data_dir.join(TOKEN_LOCK_FILE),
         }
     }
 
@@ -206,39 +219,45 @@ impl TokenStore {
         }))
     }
 
-    pub fn save(&self, tokens: &ChatgptTokens) -> Result<(), TokenError> {
+    /// Takes the store's lock, waiting for whoever holds it. Hold it only
+    /// across work that must not interleave with another write; never
+    /// across a wait for the owner, such as a device-code approval.
+    pub fn lock(&self) -> Result<TokenLock<'_>, TokenError> {
+        use std::os::unix::fs::OpenOptionsExt;
         let io = |error| TokenError::Io {
-            path: self.path.clone(),
+            path: self.lock_path.clone(),
             error,
         };
-        let file = TokenFile {
-            access_token: tokens.access_token.expose().to_string(),
-            refresh_token: tokens.refresh_token.expose().to_string(),
-            id_token: tokens.id_token.expose().to_string(),
-            account_id: tokens.account_id.clone(),
-            last_refresh: tokens.last_refresh,
-        };
-        let text = serde_json::to_string_pretty(&file).expect("a token file serialises");
-        let mut temp = self.path.as_os_str().to_owned();
-        temp.push(format!(".part-{}", std::process::id()));
-        let temp = PathBuf::from(temp);
-        let written =
-            write_private(&temp, text.as_bytes()).and_then(|()| std::fs::rename(&temp, &self.path));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&temp);
-        }
-        written.map_err(io)
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&self.lock_path)
+            .map_err(io)?;
+        file.lock().map_err(io)?;
+        Ok(TokenLock {
+            store: self,
+            _file: file,
+        })
     }
 
-    /// Removes the file. Removing a file that isn't there is not an error.
+    /// Replaces the file under the lock, after any refresh in flight.
+    pub fn save(&self, tokens: &ChatgptTokens) -> Result<(), TokenError> {
+        self.lock()?.save(tokens)
+    }
+
+    /// Removes the file under the lock, after any refresh in flight, so the
+    /// refresh can't write the tokens back. Removing a file that isn't
+    /// there, or from a data dir that doesn't exist, is not an error.
     pub fn clear(&self) -> Result<(), TokenError> {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(TokenError::Io {
-                path: self.path.clone(),
-                error,
-            }),
+        match self.lock() {
+            Ok(lock) => lock.clear(),
+            Err(TokenError::Io { error, .. }) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -253,30 +272,45 @@ impl TokenStore {
     }
 }
 
-/// Writes `bytes` to a new file readable by the owner only.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // The mode above is subject to the umask, which can only remove bits;
-    // set it again in case the file already existed with wider permissions.
-    file.set_permissions(std::fs::Permissions::from_mode_private())?;
-    file.write_all(bytes)?;
-    file.sync_all()
+/// The held lock on a [`TokenStore`]. Its writes don't lock again, so a
+/// refresh can read, exchange and save under one hold. Dropping it closes
+/// the file, which releases the lock.
+pub struct TokenLock<'a> {
+    store: &'a TokenStore,
+    _file: std::fs::File,
 }
 
-trait PrivateMode {
-    fn from_mode_private() -> Self;
-}
+impl TokenLock<'_> {
+    pub fn load(&self) -> Result<Option<ChatgptTokens>, TokenError> {
+        self.store.load()
+    }
 
-impl PrivateMode for std::fs::Permissions {
-    fn from_mode_private() -> Self {
-        use std::os::unix::fs::PermissionsExt;
-        Self::from_mode(0o600)
+    pub fn save(&self, tokens: &ChatgptTokens) -> Result<(), TokenError> {
+        let file = TokenFile {
+            access_token: tokens.access_token.expose().to_string(),
+            refresh_token: tokens.refresh_token.expose().to_string(),
+            id_token: tokens.id_token.expose().to_string(),
+            account_id: tokens.account_id.clone(),
+            last_refresh: tokens.last_refresh,
+        };
+        let text = serde_json::to_string_pretty(&file).expect("a token file serialises");
+        super::write::replace_file(&self.store.path, text.as_bytes(), 0o600).map_err(|error| {
+            TokenError::Io {
+                path: self.store.path.clone(),
+                error,
+            }
+        })
+    }
+
+    pub fn clear(&self) -> Result<(), TokenError> {
+        match std::fs::remove_file(&self.store.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(TokenError::Io {
+                path: self.store.path.clone(),
+                error,
+            }),
+        }
     }
 }
 
@@ -521,9 +555,6 @@ pub struct CodexResponses {
     clock: Arc<dyn Clock>,
     issuer: String,
     agent: ureq::Agent,
-    /// Refreshes are serialised: a refresh token is single-use, so two
-    /// threads must not both spend the same one.
-    refresh_lock: Mutex<()>,
     refreshes: AtomicUsize,
 }
 
@@ -553,7 +584,6 @@ impl CodexResponses {
             clock,
             issuer: AUTH_ISSUER.to_string(),
             agent: config.into(),
-            refresh_lock: Mutex::new(()),
             refreshes: AtomicUsize::new(0),
         }
     }
@@ -658,15 +688,15 @@ impl CodexResponses {
     }
 
     /// Refreshes `stale`, unless the file already holds something newer (a
-    /// refresh by another thread, or a new login), which is used instead.
-    /// The rotated tokens are saved before this returns, so a crash after
-    /// the refresh never loses the only valid refresh token.
+    /// refresh by another thread, client or process, or a new login), which
+    /// is used instead. A refresh token is single-use, so the store's lock
+    /// is held from that re-read to the save: no one else spends the same
+    /// token, and no login or clear lands in between to be overwritten. The
+    /// rotated tokens are saved before this returns, so a crash after the
+    /// refresh never loses the only valid refresh token.
     fn refresh(&self, stale: &ChatgptTokens) -> Result<ChatgptTokens, LlmError> {
-        let _guard = self
-            .refresh_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(current) = self.store.load()?
+        let lock = self.store.lock()?;
+        if let Some(current) = lock.load()?
             && current.access_token != stale.access_token
         {
             return Ok(current);
@@ -711,7 +741,7 @@ impl CodexResponses {
             account_id,
             last_refresh: self.clock.now(),
         };
-        self.store.save(&rotated)?;
+        lock.save(&rotated)?;
         Ok(rotated)
     }
 }
@@ -757,6 +787,41 @@ fn usage_limit(body: &str, reset_header: Option<i64>) -> Option<Timestamp> {
         .and_then(Value::as_i64)
         .or(reset_header)?;
     Timestamp::from_second(seconds).ok()
+}
+
+/// The error and incomplete-reason codes the Codex backend sends, from
+/// `codex-rs` at `6b4daaf`. They are the only backend strings an error
+/// carries: the field is the backend's to fill, so a value outside this
+/// list could hold anything it was sent, a token or the prompt included.
+const BACKEND_CODES: &[&str] = &[
+    "server_error",
+    "rate_limit_exceeded",
+    "slow_down",
+    "server_is_overloaded",
+    "context_length_exceeded",
+    "insufficient_quota",
+    "usage_not_included",
+    "invalid_prompt",
+    "cyber_policy",
+    "bio_policy",
+    "misalignment_policy_violation",
+    "max_output_tokens",
+    "content_filter",
+    "interrupted",
+];
+
+/// A known code as itself, any other as `unknown`, and none as `missing`
+/// (the event's own fixed name).
+fn backend_code(code: Option<&str>, missing: &'static str) -> String {
+    let code = match code {
+        None => missing,
+        Some(code) => BACKEND_CODES
+            .iter()
+            .copied()
+            .find(|known| *known == code)
+            .unwrap_or("unknown"),
+    };
+    code.to_string()
 }
 
 /// Reassembles a Responses SSE stream into the reply's JSON and usage.
@@ -850,25 +915,23 @@ fn parse_stream_reader(reader: impl Read) -> Result<(Value, Option<LlmUsage>), L
                 }
             }
             "response.failed" => {
-                let code = event["response"]["error"]["code"]
-                    .as_str()
-                    .unwrap_or("failed")
-                    .to_string();
+                let code = backend_code(event["response"]["error"]["code"].as_str(), "failed");
                 return Err(LlmError::Backend { code });
             }
             "response.incomplete" => {
-                let code = event["response"]["incomplete_details"]["reason"]
-                    .as_str()
-                    .unwrap_or("incomplete")
-                    .to_string();
+                let code = backend_code(
+                    event["response"]["incomplete_details"]["reason"].as_str(),
+                    "incomplete",
+                );
                 return Err(LlmError::Backend { code });
             }
             "error" => {
-                let code = event["error"]["code"]
-                    .as_str()
-                    .or_else(|| event["code"].as_str())
-                    .unwrap_or("error")
-                    .to_string();
+                let code = backend_code(
+                    event["error"]["code"]
+                        .as_str()
+                        .or_else(|| event["code"].as_str()),
+                    "error",
+                );
                 return Err(LlmError::Backend { code });
             }
             _ => {}
