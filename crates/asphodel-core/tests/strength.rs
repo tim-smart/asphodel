@@ -6,16 +6,9 @@
 //! memory record?" (TIM-90), "Retrieval and ranking" (TIM-93), "Deletion
 //! policy" (TIM-97), and ADRs 0001, 0003, 0004 and 0008.
 //!
-//! The functions under test don't exist yet. [`contract`] below holds their
-//! proposed signatures with `todo!()` bodies, so this file compiles and every
-//! test that needs them is ignored. To activate: move the contract into
-//! `asphodel_core::strength`, delete the module, import from the crate
-//! instead, and drop the `ignore` attributes.
-//!
-//! The calibration tests at the top run now. They check the tables in TIM-91,
-//! ADR 0004 and ADR 0008 against the fixed constants in closed form, so the
-//! tables, the constants and the tolerances below are known to agree before
-//! any code is written.
+//! These tests exercise the production API in `asphodel_core::strength`.
+//! The calibration tests also check the tables in TIM-91, ADR 0004 and
+//! ADR 0008 against the fixed constants in closed form.
 //!
 //! Tolerances:
 //!
@@ -49,7 +42,7 @@ use asphodel_core::store::{OpenOptions, Store};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 
-use contract::*;
+use asphodel_core::strength::*;
 
 const EXACT: f64 = 1e-9;
 const TABLE: f64 = 0.05;
@@ -65,258 +58,6 @@ const FAR_DAYS: f64 = 1000.0 * DAYS_PER_YEAR;
 
 /// δ as ADR 0008 starts it.
 const DELTA: f64 = 1.0;
-
-/// The proposed `asphodel_core::strength` API. Everything here is a pure
-/// function of stored facts and `now`; nothing reads a clock or the store.
-#[allow(dead_code, unused_variables)]
-mod contract {
-    use std::collections::BTreeSet;
-
-    use asphodel_core::config::Tuning;
-    use asphodel_core::constants::Volatility;
-    use jiff::Timestamp;
-    use jiff::tz::TimeZone;
-
-    /// The four kinds of access (ADR 0001). Each has its weight in recent use
-    /// from `constants`; the floor ignores the kind.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum AccessKind {
-        Created,
-        Used,
-        MentionedAgain,
-        Confirmed,
-    }
-
-    /// One row of the access log: its kind and when it happened, in world
-    /// time.
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct Access {
-        pub kind: AccessKind,
-        pub at: Timestamp,
-    }
-
-    /// One bank's clock for strength (ADR 0004), built from the times of its
-    /// turns. Documents don't start it. Bank time runs at full speed (1.0)
-    /// inside the union of `[turn, turn + 24 h)` over every turn, and at
-    /// `quiet_rate` everywhere else, so it never runs faster than world time
-    /// however many turns there are.
-    pub struct BankTime {}
-
-    impl BankTime {
-        /// `turns` in any order; duplicates are harmless. `quiet_rate` is
-        /// `Tuning::clock.quiet_rate`, in (0, 1].
-        pub fn new(turns: &[Timestamp], quiet_rate: f64) -> Self {
-            todo!()
-        }
-
-        /// Bank days from `from` to `to`, or 0 when `to <= from`. Additive:
-        /// `elapsed(a, b) + elapsed(b, c) == elapsed(a, c)`.
-        pub fn elapsed_days(&self, from: Timestamp, to: Timestamp) -> f64 {
-            todo!()
-        }
-    }
-
-    /// A validity window's close, for restarting recent use (ADR 0003).
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct WindowClose {
-        /// When the window closed: [`Window::closes_at`], so already the end
-        /// of `valid_until`'s unit in the source's timezone.
-        pub closes_at: Timestamp,
-        /// When the end became known: the `observed_at` of the `ended_by`
-        /// memory for a late-reported end, or the memory's own `observed_at`
-        /// when the end was stated up front.
-        pub known_at: Timestamp,
-    }
-
-    /// A memory's strength and its parts. Never stored.
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct Strength {
-        /// `S·significance + max(recent_use, lasting_floor)`.
-        pub value: f64,
-        pub recent_use: f64,
-        pub lasting_floor: f64,
-        /// n: accesses counted as separate occasions for the floor.
-        pub occasions: u32,
-    }
-
-    /// Strength at `now` (TIM-91, ADR 0003, ADR 0004).
-    ///
-    /// - `significance` is the value, not the level: kept is 1.0.
-    /// - `accesses` is the memory's own log plus everything it inherits
-    ///   along `superseded_by` ([`inherits_from`]), in any order. Accesses
-    ///   after `now` are ignored.
-    /// - Recent use is `ln Σ w_j · age_j^(−d_j)`, ages in bank days from
-    ///   `bank_time`, at least `MIN_ACCESS_AGE_DAYS`. `d_j = min(D_MAX, a +
-    ///   c·e^m)`, where m is recent use over the earlier counted accesses at
-    ///   the time of access j, and −∞ (so d = a) for the first.
-    /// - When `close` is given and `max(closes_at, known_at) <= now`, recent
-    ///   use counts only one synthetic access of weight `WEIGHT_WINDOW_CLOSE`
-    ///   at `max(closes_at, known_at)` plus the accesses strictly after
-    ///   `closes_at`. Otherwise it counts every access.
-    /// - The floor counts occasions over every access, closed window or not:
-    ///   greedily in time order, an access counts when it's at least
-    ///   `FLOOR_SPACING_DAYS` world days after the last one counted. The
-    ///   synthetic access is never an occasion. `lasting_floor = τ − g·ln(n0)
-    ///   + g·ln(n)`.
-    pub fn strength(
-        significance: f64,
-        accesses: &[Access],
-        close: Option<WindowClose>,
-        bank_time: &BankTime,
-        now: Timestamp,
-    ) -> Strength {
-        todo!()
-    }
-
-    /// How exact a stored time is (TIM-90). A time is stored as the UTC
-    /// instant at the start of its unit in the source's timezone.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum TimePrecision {
-        Year,
-        Month,
-        Day,
-        Hour,
-        Minute,
-    }
-
-    /// A stored time with its precision.
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct WorldTime {
-        pub at: Timestamp,
-        pub precision: TimePrecision,
-    }
-
-    /// The end of the unit `time` starts, one unit later in `tz`: calendar
-    /// years, months and days (so a day can be 23 or 25 hours), and absolute
-    /// hours and minutes.
-    pub fn unit_end(time: WorldTime, tz: &TimeZone) -> Timestamp {
-        todo!()
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Kind {
-        Fact,
-        Event,
-        State,
-        Task,
-        Recurring,
-    }
-
-    /// The world-time fields of a memory.
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct Window {
-        pub kind: Kind,
-        pub valid_from: Option<WorldTime>,
-        pub valid_until: Option<WorldTime>,
-        pub due_at: Option<WorldTime>,
-    }
-
-    /// Where a memory sits relative to now, on world time in the source's
-    /// timezone. Computed, never stored.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Phase {
-        /// Before the end of `valid_from`'s unit.
-        Upcoming,
-        /// An open window, an open task that isn't overdue, or no window.
-        Current,
-        /// An open task past the end of `due_at`'s unit.
-        Overdue,
-        /// Less than [`RECENTLY_PAST_DAYS`] world days since the window
-        /// closed.
-        RecentlyPast,
-        /// The window closed at least [`RECENTLY_PAST_DAYS`] world days ago.
-        LongPast,
-    }
-
-    /// Where recently past ends. Proposed: the 30 days over which TIM-93's
-    /// phase penalty ramps to its full value. Belongs in `constants`.
-    pub const RECENTLY_PAST_DAYS: f64 = 30.0;
-
-    impl Window {
-        /// When the window closes: the end of `valid_until`'s unit, or for an
-        /// event with no `valid_until`, the end of `valid_from`'s unit (a
-        /// point event). `None` while the window has no end.
-        pub fn closes_at(&self, tz: &TimeZone) -> Option<Timestamp> {
-            todo!()
-        }
-
-        /// Upcoming before the end of `valid_from`'s unit; past from
-        /// [`Window::closes_at`]; otherwise overdue for a task past the end
-        /// of `due_at`'s unit; otherwise current.
-        pub fn phase(&self, tz: &TimeZone, now: Timestamp) -> Phase {
-            todo!()
-        }
-    }
-
-    /// How likely a state still holds: `1 / (1 + (age / T)²)` with T from
-    /// [`Volatility::rate_days`], age in world days from the later of
-    /// `observed_at` and the last `mentioned_again` or `confirmed` access at
-    /// or before `now`, and never negative. 1.0 when `volatility` is `None`.
-    pub fn state_confidence(
-        volatility: Option<Volatility>,
-        observed_at: Timestamp,
-        accesses: &[Access],
-        now: Timestamp,
-    ) -> f64 {
-        todo!()
-    }
-
-    /// One memory's links, by rowid.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Link {
-        pub id: i64,
-        pub superseded_by: Option<i64>,
-        pub ended_by: Option<i64>,
-    }
-
-    /// The head of the supersession chain `id` is in: follow
-    /// `superseded_by` until it's `None`. `ended_by` is never followed.
-    pub fn chain_head(links: &[Link], id: i64) -> i64 {
-        todo!()
-    }
-
-    /// Every memory connected to `id` along `superseded_by`, in either
-    /// direction. A tree, because two memories can be refined into one.
-    pub fn chain(links: &[Link], id: i64) -> BTreeSet<i64> {
-        todo!()
-    }
-
-    /// `head` and every memory that reaches it along `superseded_by`: the
-    /// memories whose accesses `head`'s strength counts (TIM-91, decision
-    /// 3).
-    pub fn inherits_from(links: &[Link], head: i64) -> BTreeSet<i64> {
-        todo!()
-    }
-
-    /// The purge settings (ADR 0008).
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct PurgeRule {
-        /// δ; `None` never purges.
-        pub delta: Option<f64>,
-        /// The task guard: `agenda.overdue_days`.
-        pub overdue_days: u32,
-    }
-
-    impl PurgeRule {
-        pub fn from_tuning(tuning: &Tuning) -> Self {
-            todo!()
-        }
-    }
-
-    /// Whether a chain may be purged, read on its head: `head_strength <
-    /// τ − δ`, unless δ is `None`, the end of `head.valid_from`'s or
-    /// `head.valid_until`'s unit is after `now`, or `head` is a task and
-    /// `now` is before the end of `due_at`'s unit plus `overdue_days` × 24 h.
-    pub fn purge_eligible(
-        rule: &PurgeRule,
-        head_strength: f64,
-        head: &Window,
-        tz: &TimeZone,
-        now: Timestamp,
-    ) -> bool {
-        todo!()
-    }
-}
 
 // Fixtures.
 
@@ -638,13 +379,11 @@ fn no_column_stores_strength_or_its_parts() {
 // Bank time (ADR 0004).
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_bank_with_no_turns_runs_at_the_quiet_rate() {
     assert_near(quiet_bank(&[]).elapsed_days(at(0.0), at(10.0)), 1.0, EXACT);
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn bank_time_runs_at_full_speed_for_24_hours_after_a_turn() {
     let bank = quiet_bank(&[0.0]);
     assert_near(bank.elapsed_days(at(0.0), at(0.5)), 0.5, EXACT);
@@ -653,7 +392,6 @@ fn bank_time_runs_at_full_speed_for_24_hours_after_a_turn() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn the_full_speed_window_ends_exactly_24_hours_after_the_turn() {
     let bank = quiet_bank(&[0.0]);
     assert_near(bank.elapsed_days(at(1.0), at(2.0)), 0.1, EXACT);
@@ -667,7 +405,6 @@ fn the_full_speed_window_ends_exactly_24_hours_after_the_turn() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn overlapping_windows_merge_and_never_run_faster_than_world_time() {
     // Windows [0, 1) and [0.5, 1.5) cover 1.5 days.
     let bank = quiet_bank(&[0.0, 0.5]);
@@ -690,7 +427,6 @@ fn overlapping_windows_merge_and_never_run_faster_than_world_time() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_turn_before_the_interval_speeds_up_its_start_and_later_turns_dont_count() {
     assert_near(
         quiet_bank(&[0.0]).elapsed_days(at(0.5), at(2.0)),
@@ -705,7 +441,6 @@ fn a_turn_before_the_interval_speeds_up_its_start_and_later_turns_dont_count() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn bank_time_is_additive_and_ignores_turn_order() {
     let bank = quiet_bank(&[0.0, 3.2, 3.7, 9.0]);
     let whole = bank.elapsed_days(at(0.0), at(12.0));
@@ -719,7 +454,6 @@ fn bank_time_is_additive_and_ignores_turn_order() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_quiet_rate_of_one_is_world_time() {
     assert_near(always_on().elapsed_days(at(0.0), at(123.25)), 123.25, EXACT);
 }
@@ -727,7 +461,6 @@ fn a_quiet_rate_of_one_is_world_time() {
 // Recent use and the lasting floor (TIM-91).
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn one_access_fades_as_a_power_of_its_age() {
     // d = a for the first access: recent_use = −0.35·ln 10.
     let s = strength_at(0.1, &[created(0.0)], 10.0);
@@ -739,7 +472,6 @@ fn one_access_fades_as_a_power_of_its_age() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn each_access_kind_counts_with_its_weight() {
     // At an age of 1 day, age^−d = 1 and recent_use = ln w.
     for (kind, weight) in [
@@ -763,7 +495,6 @@ fn each_access_kind_counts_with_its_weight() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_fresh_access_counts_at_the_minimum_age() {
     let expected = -A * MIN_ACCESS_AGE_DAYS.ln();
     assert_near(expected, 1.611_809_565_095_831_7, EXACT);
@@ -782,7 +513,6 @@ fn a_fresh_access_counts_at_the_minimum_age() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn an_access_made_while_fresh_fades_faster() {
     // Pavlik spacing. The second access comes when m = ln(1^−0.35) = 0, so
     // d₂ = 0.35 + 0.2·e⁰ = 0.55. At day 2: ln(1·2^−0.35 + 1.5·1^−0.55).
@@ -792,7 +522,6 @@ fn an_access_made_while_fresh_fades_faster() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn the_decay_rate_is_capped() {
     // Two confirmations 0.01 days apart: m = ln(2·0.01^−0.35) ≈ 2.30, so
     // a + c·e^m ≈ 2.35 is capped at D_MAX = 2. At day 1:
@@ -806,7 +535,6 @@ fn the_decay_rate_is_capped() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn massed_use_spikes_then_falls_below_spaced_use() {
     // TIM-91: 15 uses in one day against 5 uses a week apart.
     let massed: Vec<_> = std::iter::once(created(0.0))
@@ -835,7 +563,6 @@ fn massed_use_spikes_then_falls_below_spaced_use() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn accesses_after_now_are_ignored() {
     let alone = strength_at(0.3, &[created(0.0)], 10.0);
     let with_later = strength_at(0.3, &[created(0.0), confirmed(20.0)], 10.0);
@@ -843,7 +570,6 @@ fn accesses_after_now_are_ignored() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn recent_use_ages_on_bank_time() {
     // Created in a turn, then 10 quiet days: 1 + 10·0.1 = 2 bank days.
     let s = strength(0.0, &[created(0.0)], None, &quiet_bank(&[0.0]), at(11.0));
@@ -851,7 +577,6 @@ fn recent_use_ages_on_bank_time() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn the_floor_counts_occasions_at_least_three_world_days_apart() {
     // ADR 0003: daily for a week is about 3 occasions, every ten days for
     // three months is 10.
@@ -871,7 +596,6 @@ fn the_floor_counts_occasions_at_least_three_world_days_apart() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn floor_spacing_is_world_time_even_in_a_quiet_bank() {
     // Three world days apart is 0.3 bank days in a quiet bank.
     let s = strength(0.0, &occasions(3), None, &quiet_bank(&[]), at(10.0));
@@ -879,7 +603,6 @@ fn floor_spacing_is_world_time_even_in_a_quiet_bank() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn the_floor_follows_the_occasion_count_and_never_goes_down() {
     for n in [1, 2, 3, 4, 8, 18] {
         let s = strength_at(0.0, &occasions(n), FAR_DAYS);
@@ -913,7 +636,6 @@ fn the_floor_follows_the_occasion_count_and_never_goes_down() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn strength_is_significance_plus_the_larger_part() {
     for significance in [0.0, 0.1, 0.5, SIGNIFICANCE_KEPT] {
         for day in [0.0, 2.0, 30.0, FAR_DAYS] {
@@ -931,7 +653,6 @@ fn strength_is_significance_plus_the_larger_part() {
 // Lifetimes on the strength function itself.
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn one_mention_lifetimes_reproduce_tim_91() {
     for (significance, days) in LIFETIMES {
         let fades = crossing(0.0, 200.0 * DAYS_PER_YEAR, TAU, |day| {
@@ -943,7 +664,6 @@ fn one_mention_lifetimes_reproduce_tim_91() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn one_mention_lifetimes_in_an_abandoned_bank_reproduce_adr_0004() {
     let bank = quiet_bank(&[0.0]);
     for (significance, days) in ABANDONED {
@@ -956,7 +676,6 @@ fn one_mention_lifetimes_in_an_abandoned_bank_reproduce_adr_0004() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn enough_separate_occasions_make_a_memory_permanent() {
     for (significance, n) in PERMANENCE {
         let held = strength_at(significance, &occasions(n), FAR_DAYS);
@@ -974,7 +693,6 @@ fn enough_separate_occasions_make_a_memory_permanent() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_kept_memory_never_fades_and_a_critical_one_does() {
     let kept = strength_at(SIGNIFICANCE_KEPT, &[created(0.0)], FAR_DAYS);
     assert!(kept.value >= TAU, "{kept:?}");
@@ -1004,7 +722,6 @@ fn closed_strength(
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn closing_a_window_restarts_recent_use_from_one_synthetic_access() {
     // The end was known from the start, so the synthetic access sits at the
     // close, day 10. At day 12 it's 2 days old and the only one counted.
@@ -1016,7 +733,6 @@ fn closing_a_window_restarts_recent_use_from_one_synthetic_access() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_late_reported_end_places_the_synthetic_access_when_it_became_known() {
     // Valid until day 30, reported on day 40, used on day 35 in between.
     // Counted: used@35 (d = a), then the synthetic access @40, which comes
@@ -1030,7 +746,6 @@ fn a_late_reported_end_places_the_synthetic_access_when_it_became_known() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn accesses_after_the_close_count_and_one_at_the_close_does_not() {
     // Strictly after: an access at the close itself is inside the window.
     let at_close = closed_strength(0.0, &[created(0.0), used(10.0)], close(10.0, 0.0), 12.0);
@@ -1048,7 +763,6 @@ fn accesses_after_the_close_count_and_one_at_the_close_does_not() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_window_that_hasnt_closed_or_isnt_known_to_have_closed_counts_everything() {
     let accesses = [created(0.0), used(4.0), mentioned(8.0)];
     let open = closed_strength(0.3, &accesses, None, 9.0);
@@ -1059,7 +773,6 @@ fn a_window_that_hasnt_closed_or_isnt_known_to_have_closed_counts_everything() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn the_close_never_lowers_the_floor_and_is_not_an_occasion() {
     let accesses: Vec<_> = (0..10).map(|i| used(10.0 * f64::from(i))).collect();
     let open = closed_strength(0.3, &accesses, None, FAR_DAYS);
@@ -1073,7 +786,6 @@ fn the_close_never_lowers_the_floor_and_is_not_an_occasion() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_past_appointment_comes_back_to_recall_when_its_window_closes() {
     // TIM-85: "how did the dentist go?" works the next day. A trivial
     // appointment mentioned once, 90 days ahead.
@@ -1093,7 +805,6 @@ fn a_past_appointment_comes_back_to_recall_when_its_window_closes() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn an_appointment_discussed_daily_for_a_week_fades_and_can_be_purged() {
     // ADR 0003: about 3 occasions, so it fades.
     let trivial = Significance::Trivial.value();
@@ -1104,7 +815,6 @@ fn an_appointment_discussed_daily_for_a_week_fades_and_can_be_purged() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_state_used_for_three_months_stays_in_history_after_it_ends() {
     // ADR 0003: "User lived in Berlin", minor, used every ten days for three
     // months, ended on day 95 and reported on day 100.
@@ -1132,7 +842,6 @@ fn link(id: i64, superseded_by: Option<i64>, ended_by: Option<i64>) -> Link {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn correcting_maya_to_mia_keeps_the_corrected_name_as_strong() {
     // "Maya" is created, used twice and mentioned again; on day 20 the user
     // corrects it, and "Mia" retracts it.
@@ -1164,7 +873,6 @@ fn correcting_maya_to_mia_keeps_the_corrected_name_as_strong() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn inheritance_follows_chains_of_several_and_trees() {
     // 1 → 2 → 3.
     let line = [
@@ -1189,7 +897,6 @@ fn inheritance_follows_chains_of_several_and_trees() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn nothing_is_inherited_along_ended_by() {
     // "Lives in Berlin" (1) is ended by "moved to Lisbon" (2). An old
     // reschedule (3 retracted by 4) sits beside them.
@@ -1210,7 +917,6 @@ fn nothing_is_inherited_along_ended_by() {
 // timezone.
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn each_precision_ends_one_unit_later_in_the_source_timezone() {
     use TimePrecision::*;
     let cases = [
@@ -1272,7 +978,6 @@ fn each_precision_ends_one_unit_later_in_the_source_timezone() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_day_precision_event_is_upcoming_until_the_day_ends_for_the_user() {
     let auckland = tz("Pacific/Auckland");
     let mut event = window(Kind::Event);
@@ -1292,7 +997,6 @@ fn a_day_precision_event_is_upcoming_until_the_day_ends_for_the_user() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_point_event_goes_from_upcoming_to_past_and_a_span_is_current_between() {
     let utc = TimeZone::UTC;
     let mut point = window(Kind::Event);
@@ -1324,7 +1028,6 @@ fn a_point_event_goes_from_upcoming_to_past_and_a_span_is_current_between() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn recently_past_turns_long_past_30_days_after_the_close() {
     let utc = TimeZone::UTC;
     let mut event = window(Kind::Event);
@@ -1341,7 +1044,6 @@ fn recently_past_turns_long_past_30_days_after_the_close() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_task_is_current_until_its_due_day_ends_then_overdue_until_it_ends() {
     let utc = TimeZone::UTC;
     let mut task = window(Kind::Task);
@@ -1367,7 +1069,6 @@ fn a_task_is_current_until_its_due_day_ends_then_overdue_until_it_ends() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn facts_states_and_routines_without_an_end_stay_current() {
     let utc = TimeZone::UTC;
     let now = ts("2026-10-01T12:00:00Z");
@@ -1400,7 +1101,6 @@ fn facts_states_and_routines_without_an_end_stay_current() {
 // State confidence (TIM-91, decision 8).
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn state_confidence_is_a_coin_flip_at_t_on_the_log_logistic_curve() {
     for volatility in Volatility::ALL {
         let t = volatility.rate_days();
@@ -1428,7 +1128,6 @@ fn state_confidence_is_a_coin_flip_at_t_on_the_log_logistic_curve() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn only_a_mention_or_a_confirmation_resets_state_confidence() {
     // Days volatility (T = 3). The anchor is the confirmation on day 20;
     // the use on day 30 doesn't move it, nor does anything after now.
@@ -1454,7 +1153,6 @@ fn only_a_mention_or_a_confirmation_resets_state_confidence() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn no_volatility_means_no_fading() {
     let c = state_confidence(None, at(0.0), &[created(0.0)], at(FAR_DAYS));
     assert_near(c, 1.0, EXACT);
@@ -1463,7 +1161,6 @@ fn no_volatility_means_no_fading() {
 // Purge eligibility (ADR 0008).
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn the_purge_rule_comes_from_tuning() {
     assert_eq!(
         PurgeRule::from_tuning(&Tuning::default()),
@@ -1484,7 +1181,6 @@ fn the_purge_rule_comes_from_tuning() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_memory_is_purged_strictly_below_tau_minus_delta() {
     let fact = window(Kind::Fact);
     let utc = TimeZone::UTC;
@@ -1511,7 +1207,6 @@ fn a_memory_is_purged_strictly_below_tau_minus_delta() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_null_delta_never_purges() {
     let utc = TimeZone::UTC;
     for kind in [
@@ -1532,7 +1227,6 @@ fn a_null_delta_never_purges() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn one_mention_purges_reproduce_adr_0008() {
     let fact = window(Kind::Fact);
     let utc = TimeZone::UTC;
@@ -1555,7 +1249,6 @@ fn one_mention_purges_reproduce_adr_0008() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn separate_occasions_make_a_memory_unpurgeable() {
     let fact = window(Kind::Fact);
     let utc = TimeZone::UTC;
@@ -1581,7 +1274,6 @@ fn separate_occasions_make_a_memory_unpurgeable() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_date_still_ahead_holds_the_head_back() {
     let faded = -5.0;
     let auckland = tz("Pacific/Auckland");
@@ -1633,7 +1325,6 @@ fn a_date_still_ahead_holds_the_head_back() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn a_task_is_held_until_its_overdue_window_ends() {
     let utc = TimeZone::UTC;
     let faded = -5.0;
@@ -1677,7 +1368,6 @@ fn a_task_is_held_until_its_overdue_window_ends() {
 }
 
 #[test]
-#[ignore = "strength model not built yet; activate with the TIM-104 implementation"]
 fn routines_undated_tasks_and_retracted_dates_hold_nothing() {
     let utc = TimeZone::UTC;
     let r = rule(Some(DELTA));
