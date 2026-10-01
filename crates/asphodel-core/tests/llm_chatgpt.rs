@@ -2071,7 +2071,6 @@ fn a_clear_from_another_process_waits_for_a_refresh_and_stays_cleared() {
 }
 
 #[test]
-#[ignore = "security 4: refresh recreates the token file when a clear finished before it took the lock"]
 fn a_clear_before_a_401_is_not_undone_by_the_refresh() {
     let dir = TestDir::new();
     let store = logged_in_store(&dir);
