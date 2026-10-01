@@ -12,20 +12,12 @@
 //! request call 2 is given. Call 2's handles (`c1`, `n1`, …) are read from
 //! the input first, the way call 1's tests read entity and memory handles.
 //!
-//! The code under test doesn't exist yet. [`contract`] below holds the
-//! proposed API with `todo!()` bodies, so this file compiles and every test
-//! that needs it is ignored. To activate: move [`contract::reconcile`] into
-//! the crate (as `asphodel_core::extraction`'s call 2 items), put
-//! [`contract::call2_input`] on `Service`, delete the module, import from the
-//! crate instead, and drop the `ignore` attributes.
-//!
-//! Three tests run now. They check that the schema holds what reconciliation
-//! writes, that the floor is keyed by the exact embedding model, and that the
-//! fixtures below sit on the side of the fake embedder's floor each test
-//! needs.
-//!
-//! Where the tickets leave a detail open, the contract proposes one and its
-//! doc comment says so. Those are the places to argue with.
+//! The API under test is call 2's items in `asphodel_core::extraction` and
+//! the `Service` methods over it, `call2_input` and `extract_chunk`. Three
+//! tests check what the rest rely on: that the schema holds what
+//! reconciliation writes, that the floor is keyed by the exact embedding
+//! model, and that the fixtures below sit on the side of the fake embedder's
+//! floor each test needs.
 //!
 //! Every service here runs on a `SimulatedClock` stopped at one instant
 //! unless a test advances it, so a stored time that equals that instant can
@@ -57,201 +49,11 @@ use rusqlite::types::FromSql;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use contract::call2_input;
-use contract::reconcile::{
+use asphodel_core::extraction::{
     CALL2_TEMPLATE, CALL2_VERSION, Call2Input, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT,
     EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, Label, NEIGHBOUR_CAP,
     NEIGHBOURS_PER_CLAIM, call2_request,
 };
-
-/// The proposed reconciliation API.
-///
-/// Reconciliation is the second step of extracting a chunk: after call 1's
-/// reply passes the checks in code, code finds each claim's nearest stored
-/// memories and, when any clears the floor or a claim is flagged, call 2
-/// labels the claims against them (TIM-92). Everything else is the existing
-/// `Service::extract_chunk`, which grows to run call 2 and commit its
-/// outcome in the same transaction as the chunk's `extracted_at`. Its
-/// signature doesn't change. Its behaviour does:
-///
-/// - The request after call 1, when call 2 runs, is exactly
-///   [`reconcile::call2_request`] of [`call2_input`], on the same
-///   `LlmClient`.
-/// - [`Extracted::memories`](asphodel_core::extraction::Extracted) holds
-///   only the claims that became new memories. A claim whose labels were all
-///   `mentioned_again` or `confirmed` becomes accesses instead, and an older
-///   claim labelled `retracts` or `refines` becomes nothing.
-/// - Call 1's reply is saved on the chunk (`chunks.call1_output`) before
-///   call 2 runs, so a failed call 2 is retried without calling call 1 again,
-///   and the saved reply is dropped when the chunk commits (TIM-92, as
-///   amended by TIM-97).
-/// - A failed call 2 is counted on the chunk like a failed call 1, through a
-///   new `ExtractError` variant (proposal: `Call2 { error, failure }`, with
-///   `InvalidReply` reused for a call 2 reply that doesn't fit its schema),
-///   and an LLM that can't be used at all holds the queue as it does for
-///   call 1. The tests only rely on `ExtractError::failure`.
-#[allow(dead_code, unused_variables)]
-mod contract {
-    use asphodel_core::Service;
-    use asphodel_core::extraction::ExtractError;
-    use asphodel_core::queue::Lease;
-    use serde_json::Value;
-    use uuid::Uuid;
-
-    use self::reconcile::Call2Input;
-
-    /// The proposed `Service::call2_input`: what call 2 will be given for the
-    /// leased chunk when call 1 replied `call1_reply`, or `None` when call 2
-    /// won't run. Reads only; the lease is still held afterwards.
-    ///
-    /// It runs call 1's checks on the reply first, so a dropped claim never
-    /// reaches call 2, then embeds the surviving claims and searches the
-    /// chunk's bank. `in_context` is passed as to `call1_input`, since the
-    /// reply's `used_injected_ids` refer to its handles.
-    ///
-    /// Call 2 runs when a claim has a neighbour whose cosine similarity clears
-    /// the floor for the embedder's exact model id
-    /// (`reconcile.embedding_floors`), or when a claim sets
-    /// `changes_something` or `remember_this` (TIM-92). Proposal: never with
-    /// no neighbours to show, so a flagged claim in a bank that holds nothing
-    /// related still costs one call.
-    pub fn call2_input(
-        service: &Service,
-        lease: &Lease,
-        call1_reply: &Value,
-        in_context: &[Uuid],
-    ) -> Result<Option<Call2Input>, ExtractError> {
-        todo!()
-    }
-
-    /// The proposed call 2 items of `asphodel_core::extraction`.
-    pub mod reconcile {
-        use asphodel_core::models::LlmRequest;
-        use asphodel_core::strength::Kind;
-        use jiff::Timestamp;
-        use uuid::Uuid;
-
-        /// Call 2's template name and version, which replay's cassette keys
-        /// include (TIM-96, decision 4). Proposal.
-        pub const CALL2_TEMPLATE: &str = "reconcile_claims";
-        pub const CALL2_VERSION: u32 = 1;
-
-        /// Neighbours kept per claim after fusing vector search and BM25
-        /// (TIM-92, "top 5 per claim, fused"). A flagged claim's entity-linked
-        /// open tasks and current states come on top.
-        pub const NEIGHBOURS_PER_CLAIM: usize = 5;
-
-        /// Neighbours shown for the whole chunk, at most (TIM-92, "capped at
-        /// about 40 per unit").
-        pub const NEIGHBOUR_CAP: usize = 40;
-
-        /// The edit log kinds reconciliation writes, each on the row of the
-        /// memory it changed (`edits.memory_id`), with ids and times in
-        /// `details` and never content (TIM-90, "every edit logged").
-        /// Proposals, all of them.
-        pub const EDIT_ENDED: &str = "memory_ended";
-        pub const EDIT_RETRACTED: &str = "memory_retracted";
-        pub const EDIT_REFINED: &str = "memory_refined";
-        pub const EDIT_SIGNIFICANCE_RAISED: &str = "significance_raised";
-        /// A remember-this on a neighbour sets the owner's significance to
-        /// kept; it's the same field and edit kind `memory_keep` will write
-        /// (TIM-94).
-        pub const EDIT_KEPT: &str = "memory_kept";
-        /// The memory that ended another was retracted with a successor, so
-        /// the ended memory's `ended_by` and `valid_until` follow the
-        /// successor (TIM-92, "Reopening").
-        pub const EDIT_END_REPOINTED: &str = "end_repointed";
-
-        /// What a claim does to a neighbour (TIM-92, CONTEXT.md
-        /// "Reconciliation").
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum Label {
-            MentionedAgain,
-            Confirmed,
-            Refines,
-            Retracts,
-            Ends,
-        }
-
-        impl Label {
-            pub const ALL: [Label; 5] = [
-                Label::MentionedAgain,
-                Label::Confirmed,
-                Label::Refines,
-                Label::Retracts,
-                Label::Ends,
-            ];
-
-            pub const fn as_str(self) -> &'static str {
-                match self {
-                    Label::MentionedAgain => "mentioned_again",
-                    Label::Confirmed => "confirmed",
-                    Label::Refines => "refines",
-                    Label::Retracts => "retracts",
-                    Label::Ends => "ends",
-                }
-            }
-        }
-
-        /// Everything call 2 is given for one chunk. Handles are short ids
-        /// local to the call, as in call 1: `c1`, `c2`, … for the claims in
-        /// reply order, and `n1`, `n2`, … for the neighbours.
-        ///
-        /// The reply (proposal) is
-        /// `{"claims": [{"claim": "c1", "labels": [{"neighbour": "n1",
-        /// "label": "ends"}]}]}`, every property required. A claim left out,
-        /// or given no labels, is new. A label naming a handle that isn't in
-        /// the input is ignored, as call 1 ignores an unknown entity handle.
-        #[derive(Debug, Clone, PartialEq)]
-        pub struct Call2Input {
-            pub chunk: Uuid,
-            /// The claims that passed call 1's checks, in reply order.
-            pub claims: Vec<ReconcileClaim>,
-            /// Every claim's neighbours, each once, at most
-            /// [`NEIGHBOUR_CAP`].
-            pub neighbours: Vec<NeighbourMemory>,
-        }
-
-        #[derive(Debug, Clone, PartialEq)]
-        pub struct ReconcileClaim {
-            pub handle: String,
-            /// The claim's index in call 1's reply, as `Dropped::claim`
-            /// counts it.
-            pub claim: usize,
-            pub content: String,
-            /// The source's `observed_at`, which decides direction.
-            pub observed_at: Timestamp,
-            /// `changes_something` or `remember_this`: the claim gets the
-            /// wider candidate set.
-            pub flagged: bool,
-            /// The handles of the neighbours found for this claim, best
-            /// first.
-            pub neighbours: Vec<String>,
-        }
-
-        /// A stored memory shown to call 2. Faded and ended memories are
-        /// shown, retracted ones aren't, and a hit on a superseded memory
-        /// shows the head of its chain instead (TIM-92).
-        #[derive(Debug, Clone, PartialEq)]
-        pub struct NeighbourMemory {
-            pub handle: String,
-            pub memory: Uuid,
-            pub content: String,
-            pub kind: Kind,
-            pub observed_at: Timestamp,
-            /// Whether its window is already closed by an ending. Code
-            /// rejects a newer claim's labels on it.
-            pub ended: bool,
-        }
-
-        /// Call 2's request for `input`. The reply schema is strict, every
-        /// property required, and the label is an enum of
-        /// [`Label::ALL`].
-        pub fn call2_request(input: &Call2Input) -> LlmRequest {
-            todo!()
-        }
-    }
-}
 
 // Fixtures
 
@@ -980,7 +782,7 @@ fn call2(h: &Harness, call1: &Value) -> Option<Call2Input> {
 
 fn call2_with(h: &Harness, call1: &Value, in_context: &[Uuid]) -> Option<Call2Input> {
     let lease = lease(h, "main");
-    call2_input(&h.service, &lease, call1, in_context).unwrap()
+    h.service.call2_input(&lease, call1, in_context).unwrap()
 }
 
 /// Extracts the head of `main`'s queue with call 1 answering only `call1`,
@@ -1221,7 +1023,6 @@ fn the_fixtures_sit_on_the_side_of_the_floor_each_test_needs() {
 // When call 2 runs.
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_unit_that_touches_nothing_known_costs_one_call() {
     let h = Harness::new();
     h.fact(CAT);
@@ -1239,7 +1040,6 @@ fn a_unit_that_touches_nothing_known_costs_one_call() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_neighbour_above_the_floor_runs_call_2() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -1267,7 +1067,6 @@ fn a_neighbour_above_the_floor_runs_call_2() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn the_floor_is_the_one_for_the_embedding_model() {
     // The same paraphrase runs call 2 under the fake floor and doesn't under
     // a stricter one, so the floor read is the configured one.
@@ -1281,7 +1080,6 @@ fn the_floor_is_the_one_for_the_embedding_model() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_flagged_claim_sees_open_tasks_and_current_states_of_its_entities() {
     let h = Harness::new();
     let user = h.seeded("main", "user");
@@ -1325,7 +1123,6 @@ fn a_flagged_claim_sees_open_tasks_and_current_states_of_its_entities() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn bm25_hits_fill_out_the_candidates_only_once_call_2_runs() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -1340,11 +1137,12 @@ fn bm25_hits_fill_out_the_candidates_only_once_call_2_runs() {
     let call1 = reply(vec![dog, claim(TEA, "fact", "I like green tea")]);
     let input = call2(&h, &call1).expect("call 2 runs");
     assert!(shown_for(&input, 0).contains(&ana));
-    assert_eq!(shown_for(&input, 1), BTreeSet::from([tea]));
+    // BM25 matches any of the claim's words, so "Tim" can bring Ana's memory
+    // in too; tea only has to be among them.
+    assert!(shown_for(&input, 1).contains(&tea));
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_neighbour_hit_by_several_claims_appears_once() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -1367,7 +1165,6 @@ fn a_neighbour_hit_by_several_claims_appears_once() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn neighbours_are_capped_per_claim_and_per_unit() {
     // Nine topics with six close memories each: 45 candidates once each
     // claim keeps its top five, so the unit cap bites.
@@ -1404,7 +1201,6 @@ fn neighbours_are_capped_per_claim_and_per_unit() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn faded_and_ended_memories_are_neighbours() {
     let h = Harness::new();
     // Trivial and untouched for two years: long faded out, but reconcile
@@ -1441,7 +1237,6 @@ fn faded_and_ended_memories_are_neighbours() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_retracted_memory_isnt_a_neighbour_but_its_chain_head_is() {
     let h = Harness::new();
     let dentist_8 = h.insert_memory("main", DENTIST_8, "event", "minor");
@@ -1468,7 +1263,6 @@ fn a_retracted_memory_isnt_a_neighbour_but_its_chain_head_is() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_hit_on_a_refined_memory_shows_its_chain_head() {
     let h = Harness::new();
     let japan = h.insert_memory("main", JAPAN, "event", "notable");
@@ -1483,7 +1277,6 @@ fn a_hit_on_a_refined_memory_shows_its_chain_head() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn another_banks_memories_are_never_neighbours() {
     let h = Harness::new();
     h.insert_memory("other", TEA, "fact", "minor");
@@ -1493,7 +1286,6 @@ fn another_banks_memories_are_never_neighbours() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn the_request_is_the_input_and_the_call_2_schema() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -1536,7 +1328,6 @@ fn the_request_is_the_input_and_the_call_2_schema() {
 // Labels from a newer claim.
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn mentioned_again_writes_an_access_and_no_memory() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -1570,7 +1361,6 @@ fn mentioned_again_writes_an_access_and_no_memory() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn confirmed_writes_a_confirmed_access() {
     let h = Harness::new();
     let acme = h.fact(ACME);
@@ -1587,7 +1377,6 @@ fn confirmed_writes_a_confirmed_access() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn two_labels_on_one_neighbour_keep_the_strongest_access() {
     // At most one access per memory per turn, keeping the strongest kind
     // (TIM-90): confirmed weighs 2, mentioned again 1.5.
@@ -1614,7 +1403,6 @@ fn two_labels_on_one_neighbour_keep_the_strongest_access() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn mentioned_again_outranks_used_in_the_same_turn() {
     // The reply relied on the memory and the user restated it in the same
     // turn: one access, and it's the heavier mention, whichever is written
@@ -1647,7 +1435,6 @@ fn mentioned_again_outranks_used_in_the_same_turn() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_documents_mention_of_another_documents_memory_writes_an_access() {
     // A document independently restating something is mentioned again
     // (CONTEXT.md). Documents share the turn number of the turn before them,
@@ -1684,7 +1471,6 @@ fn a_documents_mention_of_another_documents_memory_writes_an_access() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn mentioned_again_raises_significance_to_the_larger() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -1719,7 +1505,6 @@ fn mentioned_again_raises_significance_to_the_larger() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn mentioned_again_never_changes_a_significance_the_owner_set() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -1743,7 +1528,6 @@ fn mentioned_again_never_changes_a_significance_the_owner_set() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn remember_this_on_a_mention_keeps_the_neighbour() {
     // TIM-92: remember-this goes on the neighbour when the label is
     // mentioned again or confirmed, and only from the owner's own message.
@@ -1764,7 +1548,6 @@ fn remember_this_on_a_mention_keeps_the_neighbour() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn remember_this_in_a_document_keeps_nothing() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -1790,7 +1573,6 @@ fn remember_this_in_a_document_keeps_nothing() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_reschedule_retracts_the_old_appointment() {
     let h = Harness::new();
     let old = h.insert_memory("main", DENTIST_8, "event", "minor");
@@ -1833,7 +1615,6 @@ fn a_reschedule_retracts_the_old_appointment() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_refinement_supersedes_without_retracting() {
     let h = Harness::new();
     let japan = h.insert_memory("main", JAPAN, "event", "notable");
@@ -1870,7 +1651,6 @@ fn a_refinement_supersedes_without_retracting() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn an_ending_sets_valid_until_and_ended_by() {
     let h = Harness::new();
     let berlin = h.fact(BERLIN);
@@ -1910,7 +1690,6 @@ fn an_ending_sets_valid_until_and_ended_by() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_late_reported_ending_takes_the_ending_memorys_start() {
     // Said on 1 October, about August: the window closes in August, and
     // strength's restart is at the later of that and when the end became
@@ -1947,11 +1726,10 @@ fn a_late_reported_ending_takes_the_ending_memorys_start() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn an_ending_with_no_start_ends_on_the_day_it_was_said_with_low_confidence() {
     // TIM-92: with no start on the ending memory, valid_until is its
-    // observed_at with low window confidence. Proposal: at day precision,
-    // like an event with no stated time, so the instant is the start of
+    // observed_at with low window confidence. It's at day precision, like an
+    // event with no stated time, so the instant is the start of
     // that day in the source's timezone.
     let h = Harness::new();
     let coffee = h.fact(COFFEE);
@@ -1980,7 +1758,6 @@ fn an_ending_with_no_start_ends_on_the_day_it_was_said_with_low_confidence() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn completing_a_task_creates_an_event_that_ends_it() {
     let h = Harness::new();
     let task = h.insert_memory("main", TAX_TASK, "task", "notable");
@@ -2010,7 +1787,6 @@ fn completing_a_task_creates_an_event_that_ends_it() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn maya_corrected_to_mia_keeps_the_strength_maya_had() {
     // TIM-91 decision 3: a successor inherits every access along
     // superseded_by, so correcting the name keeps the corrected one as
@@ -2072,7 +1848,6 @@ fn maya_corrected_to_mia_keeps_the_strength_maya_had() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn labels_on_an_ended_neighbour_are_rejected() {
     // TIM-92: code rejects any label on a neighbour that's already ended. A
     // claim left with no labels is new.
@@ -2105,7 +1880,6 @@ fn labels_on_an_ended_neighbour_are_rejected() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_label_on_an_unknown_neighbour_is_ignored() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -2127,7 +1901,6 @@ fn a_label_on_an_unknown_neighbour_is_ignored() {
 // Direction: an older claim.
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn an_older_claim_arriving_after_a_newer_one_is_created_already_ended() {
     // ADR 0005: code, not the LLM, decides which is newer, so an old
     // document can't overrule a newer memory. An older claim labelled ends
@@ -2162,11 +1935,10 @@ fn an_older_claim_arriving_after_a_newer_one_is_created_already_ended() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn an_older_claim_ending_a_neighbour_with_no_start_ends_at_its_observed_at() {
     // The neighbour has no start, so the older claim ends where the
     // neighbour was said, with low confidence (TIM-92, "this applies in both
-    // directions"). Proposal: at day precision, as for a newer claim.
+    // directions"). It's at day precision, as for a newer claim.
     let h = Harness::new();
     let lisbon = h.fact(LISBON);
     h.set_observed_at(lisbon, local("2026-09-20T09:00"));
@@ -2193,7 +1965,6 @@ fn an_older_claim_ending_a_neighbour_with_no_start_ends_at_its_observed_at() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn an_older_retraction_or_refinement_creates_nothing() {
     let h = Harness::new();
     let dentist = h.insert_memory("main", DENTIST_9, "event", "minor");
@@ -2238,7 +2009,6 @@ fn an_older_retraction_or_refinement_creates_nothing() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn an_older_mention_writes_its_access_even_on_an_ended_neighbour() {
     let h = Harness::new();
     let acme = h.fact(ACME);
@@ -2262,7 +2032,6 @@ fn an_older_mention_writes_its_access_even_on_an_ended_neighbour() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_tie_on_observed_at_goes_to_the_later_ingest() {
     // TIM-92: ties on observed_at are broken by the later ingested_at, then
     // rowid. The fixture's source was ingested an hour before the turn, so
@@ -2284,13 +2053,20 @@ fn a_tie_on_observed_at_goes_to_the_later_ingest() {
     )
     .memories[0];
     assert_eq!(h.change(berlin).ended_by, Some(moved));
-    assert_eq!(h.change(moved), Change::untouched());
+    // TIM-92: an event with no stated time starts on the day it was said,
+    // with low window confidence. Nothing ends or supersedes it.
+    assert_eq!(
+        h.change(moved),
+        Change {
+            window_confidence: "low".into(),
+            ..Change::untouched()
+        }
+    );
 }
 
 // Edited documents.
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_later_version_of_a_document_doesnt_reinforce_itself() {
     // TIM-92: when the neighbour comes from an earlier version of the same
     // document id, mentioned again and confirmed write no access.
@@ -2328,7 +2104,6 @@ fn a_later_version_of_a_document_doesnt_reinforce_itself() {
 // Reopening.
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn retracting_the_memory_that_ended_another_repoints_its_end() {
     // TIM-92, "Reopening": when the memory that ended another is retracted
     // with a successor, ended_by is repointed to the successor and
@@ -2380,7 +2155,6 @@ fn retracting_the_memory_that_ended_another_repoints_its_end() {
 // Mental models.
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_refinement_moves_mental_model_citations_to_the_head() {
     // TIM-95 decision 6: reconcile moves a citation of a refined memory to
     // the head of its chain, where its accesses are inherited.
@@ -2427,7 +2201,6 @@ fn a_refinement_moves_mental_model_citations_to_the_head() {
 // Ordering and failures.
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn call_2_and_the_commit_run_in_observed_at_order() {
     // The newer turn arrives first, but the bank's one worker reconciles the
     // older one first, so the newer one is reconciled against it.
@@ -2453,7 +2226,6 @@ fn call_2_and_the_commit_run_in_observed_at_order() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_failed_call_2_counts_and_keeps_call_1s_reply() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -2483,7 +2255,6 @@ fn a_failed_call_2_counts_and_keeps_call_1s_reply() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn a_retry_resumes_from_call_1s_saved_reply_and_drops_it_on_commit() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -2520,7 +2291,6 @@ fn a_retry_resumes_from_call_1s_saved_reply_and_drops_it_on_commit() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn an_invalid_call_2_reply_writes_nothing() {
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -2548,7 +2318,6 @@ fn an_invalid_call_2_reply_writes_nothing() {
 }
 
 #[test]
-#[ignore = "needs reconciliation (TIM-108)"]
 fn an_llm_that_cant_be_used_at_call_2_holds_the_queue() {
     let h = Harness::new();
     h.fact(TEA);

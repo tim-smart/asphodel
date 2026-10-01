@@ -9,8 +9,10 @@
 //!
 //! These are golden tests against `FakeLlm`: each scripts call 1's reply and
 //! checks what's committed, or checks the input and request call 1 is given.
-//! Reconciliation (call 2, TIM-108) doesn't exist at this stage, so every
-//! claim that survives the checks in code becomes a new memory.
+//! Most of them run where reconciliation (call 2, TIM-108) has nothing to
+//! compare with, so every claim that survives the checks in code becomes a
+//! new memory; where a claim lands near an earlier one, call 2 is scripted
+//! to label nothing. Reconciliation itself is tested in `reconcile.rs`.
 //!
 //! The API under test is `asphodel_core::extraction` and the `Service`
 //! methods over it, `call1_input` and `extract_chunk`. Three tests check the
