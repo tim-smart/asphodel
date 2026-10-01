@@ -59,7 +59,7 @@ How exact each end of a validity window is: year, month, day, hour or minute.
 _Avoid_: Granularity, resolution
 
 **Phase**:
-Where a memory sits relative to now (upcoming, recently past or long past), always computed and never stored.
+Where a memory sits relative to now (upcoming, current, overdue, recently past or long past), always computed and never stored. Recently past lasts 30 days after the validity window closes.
 _Avoid_: Status, lifecycle state
 
 **Observed at**:

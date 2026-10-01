@@ -73,6 +73,13 @@ pub const WEIGHT_WINDOW_CLOSE: f64 = 1.0;
 /// and at the tuned quiet-time rate otherwise (ADR 0004).
 pub const FULL_SPEED_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// World days after its window closes that a memory is recently past rather
+/// than long past. It's the end of the ramp in "Retrieval and ranking"
+/// (TIM-93, decision 6) after which the full phase penalty applies. Only
+/// rendering and the phase label use it; ranking works from the days since
+/// the close.
+pub const RECENTLY_PAST_DAYS: f64 = 30.0;
+
 /// A kept memory's significance. It never fades.
 pub const SIGNIFICANCE_KEPT: f64 = 1.0;
 
@@ -170,6 +177,7 @@ pub struct FixedConstants {
     pub access_weights: AccessWeights,
     pub window_close_weight: f64,
     pub full_speed_window_hours: f64,
+    pub recently_past_days: f64,
     pub significance: SignificanceValues,
     pub volatility_rate_days: VolatilityRates,
     pub reranker_deadline_ms: u128,
@@ -223,6 +231,7 @@ impl FixedConstants {
             },
             window_close_weight: WEIGHT_WINDOW_CLOSE,
             full_speed_window_hours: FULL_SPEED_WINDOW.as_secs_f64() / 3600.0,
+            recently_past_days: RECENTLY_PAST_DAYS,
             significance: SignificanceValues {
                 trivial: Significance::Trivial.value(),
                 minor: Significance::Minor.value(),

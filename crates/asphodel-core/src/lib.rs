@@ -11,6 +11,7 @@ pub mod constants;
 pub mod logging;
 pub mod service;
 pub mod store;
+pub mod strength;
 
 pub use clock::{Clock, SimulatedClock, SystemClock};
 pub use config::{ResolvedConfig, Tuning};
