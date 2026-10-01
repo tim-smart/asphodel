@@ -15,9 +15,9 @@
 //! `serve_store.rs` and `llm_login.rs` set the same variable and a floor for
 //! each fake.
 //!
-//! Two tests stay ignored until `serve` loads the ONNX models when the
-//! variable is unset: today it warns and starts without models, so they
-//! would hang waiting for a refusal instead of failing.
+//! Two refusal tests leave the variable unset and use empty or missing
+//! model dirs. They exercise real-model loading validation without needing
+//! model artifacts or ONNX Runtime.
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -202,7 +202,6 @@ fn onnx_threads_is_a_deployment_flag_with_a_variable() {
 }
 
 #[test]
-#[ignore = "needs serve to load the models from the model dir when ASPHODEL_MODELS is unset"]
 fn an_empty_model_dir_stops_startup_naming_the_missing_file() {
     // Never a download: an empty dir is still empty afterwards, and stderr
     // names the file and the command that fills it.
@@ -223,7 +222,6 @@ fn an_empty_model_dir_stops_startup_naming_the_missing_file() {
 }
 
 #[test]
-#[ignore = "needs serve to load the models from the model dir when ASPHODEL_MODELS is unset"]
 fn a_model_dir_that_does_not_exist_stops_startup_without_creating_it() {
     let dir = TestDir::new();
     let models = dir.0.join("missing-models");
