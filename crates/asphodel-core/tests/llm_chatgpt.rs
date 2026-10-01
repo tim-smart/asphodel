@@ -46,16 +46,6 @@
 //! - `codex-rs/login/src/auth/default_client.rs`: requests carry an
 //!   `originator` header and a `User-Agent` built from it.
 //!
-//! The code under test doesn't exist yet. [`contract`] holds the proposed
-//! additions to `asphodel_core::models` with `todo!()` bodies, so this file
-//! compiles and every test that needs them is ignored. The types that
-//! already exist (`LlmRequest`, `LlmResponse`, `LlmUsage`, `Template`,
-//! `Secret`, `Tuning`, `Deployment`, the clock) are used from the crate.
-//! Where the contract supersedes a crate type (`LlmSettings`, `LlmError`,
-//! `LlmClient`), it is the same type with more variants or fields; on
-//! activation the variants merge into the crate's type and the contract is
-//! deleted.
-//!
 //! Nothing here touches the network. [`StubServer`] plays the Codex backend
 //! and the auth issuer on loopback. The one exception is the ignored
 //! [`real_backend_answers_a_structured_request`], which runs only when a
@@ -72,342 +62,9 @@ use std::time::Duration;
 
 use asphodel_core::clock::{Clock, SimulatedClock};
 use asphodel_core::config::{Deployment, Secret, Tuning};
-use asphodel_core::models::{LlmRequest, LlmUsage, Template};
+use asphodel_core::models::*;
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
-
-use contract::*;
-
-/// The proposed additions to `asphodel_core::models` for the subscription
-/// mode. Everything the API-key mode has stays as it is; this adds a second
-/// auth mode behind the same `LlmClient` trait, so `FakeLlm` and the
-/// cassette wrapper don't change (TIM-96, decision 4).
-#[allow(dead_code, unused_variables)]
-mod contract {
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use asphodel_core::clock::Clock;
-    use asphodel_core::config::{Deployment, Secret, Tuning};
-    use asphodel_core::models::{LlmRequest, LlmResponse};
-    use jiff::Timestamp;
-    use serde::Serialize;
-
-    /// `[llm] auth`. `api_key` is the default and stays fully supported;
-    /// `chatgpt` is the subscription, over the undocumented Codex backend.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum LlmAuth {
-        #[default]
-        ApiKey,
-        Chatgpt,
-    }
-
-    /// The proposed `tuning.llm.auth`, parsed from `auth = "api_key" |
-    /// "chatgpt"` with `api_key` as the default. Any other string is a
-    /// config error.
-    pub fn llm_auth(tuning: &Tuning) -> LlmAuth {
-        todo!()
-    }
-
-    /// The Codex backend. The default endpoint in `chatgpt` mode; `llm.endpoint`
-    /// still overrides it.
-    pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex";
-
-    /// The OAuth issuer for login and refresh.
-    pub const AUTH_ISSUER: &str = "https://auth.openai.com";
-
-    /// Codex's public OAuth client id.
-    pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-
-    /// The `originator` header. Codex sends `codex_cli_rs`; Asphodel sends
-    /// its own name, and the ignored real-backend test is what tells us
-    /// whether the backend accepts it.
-    pub const ORIGINATOR: &str = "asphodel";
-
-    /// The token file under the data dir.
-    pub const TOKEN_FILE: &str = "llm-tokens.json";
-
-    /// Refresh the access token when its `exp` is this close.
-    pub const REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
-
-    /// Where the LLM is and how to talk to it. Supersedes the crate's
-    /// `LlmSettings` by adding `auth`.
-    #[derive(Debug, Clone)]
-    pub struct LlmSettings {
-        pub auth: LlmAuth,
-        /// The base URL. In `chatgpt` mode it defaults to [`CODEX_ENDPOINT`].
-        pub endpoint: String,
-        /// The exact model string, sent as `model` in both modes. Still
-        /// pinned in `chatgpt` mode: calibration runs against one model
-        /// (ADR 0009).
-        pub model: String,
-        /// `api_key` mode only.
-        pub api_key: Option<Secret>,
-        pub timeout: Duration,
-    }
-
-    impl LlmSettings {
-        pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
-
-        /// `api_key` mode behaves as today. In `chatgpt` mode the endpoint
-        /// defaults to [`CODEX_ENDPOINT`], `llm.model` is still required,
-        /// and an `ASPHODEL_LLM_API_KEY` that is also set is
-        /// [`LlmError::Conflicting`] rather than silently ignored.
-        pub fn from_config(
-            tuning: &Tuning,
-            deployment: &Deployment,
-        ) -> Result<Option<Self>, LlmError> {
-            todo!()
-        }
-    }
-
-    /// Why a call failed. Supersedes the crate's `LlmError` by adding the
-    /// last four variants. No variant carries a token, the prompt or the
-    /// reply (TIM-96, decision 8).
-    #[derive(Debug, thiserror::Error)]
-    pub enum LlmError {
-        #[error("the LLM isn't configured: {missing} is not set")]
-        NotConfigured { missing: &'static str },
-
-        #[error("LLM transport: {reason}")]
-        Transport { reason: String },
-
-        #[error("the LLM didn't answer within the timeout")]
-        Timeout,
-
-        #[error("the LLM answered HTTP {status}")]
-        Status { status: u16 },
-
-        #[error("the LLM returned no content")]
-        NoContent,
-
-        #[error("the LLM returned {bytes} bytes that aren't JSON")]
-        NotJson { bytes: usize },
-
-        #[error("the LLM refused the request")]
-        Refused,
-
-        /// Two settings that can't both hold, named by key.
-        #[error("{first} and {second} are both set; unset one")]
-        Conflicting {
-            first: &'static str,
-            second: &'static str,
-        },
-
-        /// No token file, or a refreshed credential the backend still
-        /// rejects. The queue can't proceed until the owner logs in again.
-        #[error("the ChatGPT login is missing or no longer valid: run `asphodel llm login`")]
-        LoginRequired,
-
-        /// The subscription's usage window is spent. Not a failure: the
-        /// extraction queue holds until `resets_at` (world time).
-        #[error("the ChatGPT usage limit is reached until {resets_at}")]
-        UsageLimited { resets_at: Timestamp },
-
-        /// The backend reported a failed or incomplete response. Only the
-        /// code is kept.
-        #[error("the LLM backend failed the request: {code}")]
-        Backend { code: String },
-    }
-
-    impl LlmError {
-        /// Transport errors, timeouts, 408, 429 and 5xx. `UsageLimited` is
-        /// not retryable: it's deferred to `resets_at` instead.
-        pub fn is_retryable(&self) -> bool {
-            todo!()
-        }
-    }
-
-    /// Same as the crate's trait, over the superset error.
-    pub trait LlmClient: Send + Sync {
-        fn model(&self) -> &str;
-        fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
-    }
-
-    // Tokens.
-
-    /// What a login leaves behind. Every token is a [`Secret`]: none of
-    /// them show in `Debug`, logs or serialised config.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ChatgptTokens {
-        pub access_token: Secret,
-        pub refresh_token: Secret,
-        pub id_token: Secret,
-        /// From the id token's `https://api.openai.com/auth.chatgpt_account_id`
-        /// claim; sent as the `chatgpt-account-id` header.
-        pub account_id: String,
-        /// When these tokens were obtained or last refreshed.
-        pub last_refresh: Timestamp,
-    }
-
-    impl ChatgptTokens {
-        /// Builds the record from an exchange or refresh reply, reading the
-        /// account id out of the id token.
-        pub fn from_reply(
-            id_token: &str,
-            access_token: &str,
-            refresh_token: &str,
-            now: Timestamp,
-        ) -> Result<Self, TokenError> {
-            todo!()
-        }
-
-        /// The access token's `exp` claim, if it has one.
-        pub fn access_expires_at(&self) -> Option<Timestamp> {
-            todo!()
-        }
-    }
-
-    #[derive(Debug, thiserror::Error)]
-    pub enum TokenError {
-        #[error("{}: {error}", path.display())]
-        Io {
-            path: PathBuf,
-            #[source]
-            error: std::io::Error,
-        },
-
-        #[error("{} isn't a token file: run `asphodel llm login`", path.display())]
-        Malformed { path: PathBuf },
-
-        #[error("the id token is not a JWT")]
-        InvalidJwt,
-
-        #[error("the id token has no chatgpt_account_id claim")]
-        MissingAccountId,
-    }
-
-    /// The token file: `<data dir>/llm-tokens.json`, mode 0600, written
-    /// through a temp file and a rename. `asphodel llm login` writes it,
-    /// and the daemon reads it before every refresh, so a login while the
-    /// daemon runs takes effect without a restart. The daemon serialises
-    /// its own refreshes with a lock; the CLI never refreshes.
-    pub struct TokenStore {
-        path: PathBuf,
-    }
-
-    impl TokenStore {
-        /// Never creates anything.
-        pub fn open(data_dir: &Path) -> Self {
-            todo!()
-        }
-
-        pub fn path(&self) -> &Path {
-            todo!()
-        }
-
-        /// Re-reads the file every time. `Ok(None)` when it doesn't exist.
-        pub fn load(&self) -> Result<Option<ChatgptTokens>, TokenError> {
-            todo!()
-        }
-
-        pub fn save(&self, tokens: &ChatgptTokens) -> Result<(), TokenError> {
-            todo!()
-        }
-
-        /// Removes the file. Removing a file that isn't there is not an
-        /// error.
-        pub fn clear(&self) -> Result<(), TokenError> {
-            todo!()
-        }
-
-        /// What the resolved config shows: the path and whether a login is
-        /// present. Never a token.
-        pub fn status(&self) -> LlmStatus {
-            todo!()
-        }
-    }
-
-    /// The `llm` section of the resolved config.
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-    pub struct LlmStatus {
-        pub auth: LlmAuth,
-        pub token_file: Option<PathBuf>,
-        pub logged_in: bool,
-    }
-
-    // Login.
-
-    /// What the owner has to do: open the URL and enter the code.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct DeviceCode {
-        pub verification_url: String,
-        pub user_code: String,
-        pub interval: Duration,
-    }
-
-    #[derive(Debug, thiserror::Error)]
-    pub enum LoginError {
-        #[error("login transport: {reason}")]
-        Transport { reason: String },
-
-        #[error("the issuer answered HTTP {status} at {step}")]
-        Status { status: u16, step: &'static str },
-
-        #[error("the login wasn't approved within 15 minutes")]
-        Expired,
-
-        #[error(transparent)]
-        Token(#[from] TokenError),
-    }
-
-    /// `asphodel llm login`: the device-code flow, headless. `show` is
-    /// called once with the URL and code; the function then polls every
-    /// `interval` until the owner approves, exchanges the code for tokens,
-    /// and saves them. It never reads `~/.codex/auth.json`: refresh tokens
-    /// are single-use, so sharing a token chain with the Codex CLI would
-    /// log one of them out.
-    pub fn device_code_login(
-        issuer: &str,
-        store: &TokenStore,
-        clock: &dyn Clock,
-        show: &mut dyn FnMut(&DeviceCode),
-    ) -> Result<ChatgptTokens, LoginError> {
-        todo!()
-    }
-
-    // The client.
-
-    /// The subscription client: the Responses API on the Codex backend,
-    /// streamed, with a bearer access token from the [`TokenStore`].
-    pub struct CodexResponses {}
-
-    impl CodexResponses {
-        /// `clock` decides when the access token is due for refresh
-        /// (ADR 0004: nothing reads the wall clock).
-        pub fn new(settings: LlmSettings, store: TokenStore, clock: Arc<dyn Clock>) -> Self {
-            todo!()
-        }
-
-        /// The issuer for refresh. Defaults to [`AUTH_ISSUER`]; tests point
-        /// it at a stub.
-        pub fn with_issuer(self, issuer: &str) -> Self {
-            todo!()
-        }
-
-        /// Refresh calls so far, for tests.
-        pub fn refreshes(&self) -> usize {
-            todo!()
-        }
-    }
-
-    impl LlmClient for CodexResponses {
-        fn model(&self) -> &str {
-            todo!()
-        }
-
-        /// The sequence: load the token file; refresh first if the access
-        /// token expires within [`REFRESH_WINDOW`]; post; on 401 refresh
-        /// once (serialised, persisted before the retry) and retry once; a
-        /// second 401, or a refresh the issuer rejects, is
-        /// [`LlmError::LoginRequired`].
-        fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-            todo!()
-        }
-    }
-}
 
 // Fixtures.
 
@@ -545,7 +202,7 @@ fn logged_in_store(dir: &TestDir) -> TokenStore {
     let exp = start()
         .checked_add(SignedDuration::from_secs(3600))
         .unwrap();
-    store.save(&tokens("fresh", "one", exp, start())).unwrap();
+    store.save(&tokens("current", "one", exp, start())).unwrap();
     store
 }
 
@@ -954,14 +611,13 @@ fn the_stub_server_streams_events_and_decodes_forms() {
 // Config: defaults and conflicts (ADR 0009).
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn the_auth_mode_defaults_to_api_key() {
     let tuning = Tuning::from_toml(
         "[llm]\nmodel = \"some-model\"\nendpoint = \"http://llm.internal:8080/v1\"\n",
     )
     .unwrap();
-    assert_eq!(llm_auth(&tuning), LlmAuth::ApiKey);
-    assert_eq!(llm_auth(&Tuning::default()), LlmAuth::ApiKey);
+    assert_eq!(tuning.llm.auth, LlmAuth::ApiKey);
+    assert_eq!(Tuning::default().llm.auth, LlmAuth::ApiKey);
 
     let settings = LlmSettings::from_config(&tuning, &deployment(Some("sk-live-41b2e8-secret")))
         .unwrap()
@@ -975,10 +631,9 @@ fn the_auth_mode_defaults_to_api_key() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn chatgpt_mode_defaults_to_the_codex_backend_and_still_pins_the_model() {
     let tuning = Tuning::from_toml("[llm]\nauth = \"chatgpt\"\nmodel = \"gpt-5.1\"\n").unwrap();
-    assert_eq!(llm_auth(&tuning), LlmAuth::Chatgpt);
+    assert_eq!(tuning.llm.auth, LlmAuth::Chatgpt);
     let settings = LlmSettings::from_config(&tuning, &deployment(None))
         .unwrap()
         .expect("configured");
@@ -1003,7 +658,6 @@ fn chatgpt_mode_defaults_to_the_codex_backend_and_still_pins_the_model() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn an_explicit_endpoint_overrides_the_codex_default() {
     let tuning = Tuning::from_toml(
         "[llm]\nauth = \"chatgpt\"\nmodel = \"gpt-5.1\"\nendpoint = \"https://proxy.internal/codex\"\n",
@@ -1016,7 +670,6 @@ fn an_explicit_endpoint_overrides_the_codex_default() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn a_key_set_together_with_chatgpt_mode_is_a_config_error() {
     // Silently ignoring the key would hide a misconfiguration: the operator
     // thinks they're on the key, and the subscription is being billed.
@@ -1038,7 +691,6 @@ fn a_key_set_together_with_chatgpt_mode_is_a_config_error() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn an_unknown_auth_mode_is_rejected() {
     let error = Tuning::from_toml("[llm]\nauth = \"oauth\"\nmodel = \"gpt-5.1\"\n").unwrap_err();
     assert!(error.to_string().contains("auth"), "{error}");
@@ -1047,14 +699,13 @@ fn an_unknown_auth_mode_is_rejected() {
 // The token file.
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn tokens_are_built_from_a_login_reply_with_the_account_id_from_the_id_token() {
     let exp = start()
         .checked_add(SignedDuration::from_secs(3600))
         .unwrap();
     let tokens = ChatgptTokens::from_reply(
         &id_token(ACCOUNT_ID),
-        &access_token("fresh", exp),
+        &access_token("current", exp),
         "rt-one",
         start(),
     )
@@ -1066,7 +717,7 @@ fn tokens_are_built_from_a_login_reply_with_the_account_id_from_the_id_token() {
 
     let no_claim = jwt(json!({"email": "tim@example.test"}));
     let error =
-        ChatgptTokens::from_reply(&no_claim, &access_token("fresh", exp), "rt-one", start())
+        ChatgptTokens::from_reply(&no_claim, &access_token("current", exp), "rt-one", start())
             .unwrap_err();
     assert!(matches!(error, TokenError::MissingAccountId), "{error:?}");
 
@@ -1075,7 +726,6 @@ fn tokens_are_built_from_a_login_reply_with_the_account_id_from_the_id_token() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn the_token_file_lives_under_the_data_dir_with_mode_0600() {
     let dir = TestDir::new();
     let data = dir.data();
@@ -1087,7 +737,7 @@ fn the_token_file_lives_under_the_data_dir_with_mode_0600() {
     let exp = start()
         .checked_add(SignedDuration::from_secs(3600))
         .unwrap();
-    let saved = tokens("fresh", "one", exp, start());
+    let saved = tokens("current", "one", exp, start());
     store.save(&saved).unwrap();
     assert_eq!(
         file_mode(store.path()),
@@ -1114,7 +764,6 @@ fn the_token_file_lives_under_the_data_dir_with_mode_0600() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn a_malformed_token_file_names_the_path_and_the_fix() {
     let dir = TestDir::new();
     let store = TokenStore::open(&dir.data());
@@ -1128,7 +777,6 @@ fn a_malformed_token_file_names_the_path_and_the_fix() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn the_status_shows_the_path_and_whether_a_login_is_present_and_nothing_else() {
     let dir = TestDir::new();
     let store = TokenStore::open(&dir.data());
@@ -1143,20 +791,19 @@ fn the_status_shows_the_path_and_whether_a_login_is_present_and_nothing_else() {
     let text = serde_json::to_string(&status).unwrap();
     assert!(text.contains("\"auth\":\"chatgpt\""), "{text}");
     assert!(text.contains("\"logged_in\":true"), "{text}");
-    for forbidden in ["rt-one", "fresh", "eyJ", ACCOUNT_ID] {
+    for forbidden in ["rt-one", "current", "eyJ", ACCOUNT_ID] {
         assert!(!text.contains(forbidden), "{forbidden} in {text}");
     }
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn debug_output_never_holds_a_token() {
     let dir = TestDir::new();
     let store = logged_in_store(&dir);
     let tokens = store.load().unwrap().unwrap();
     let shown = format!("{tokens:?}");
     assert!(shown.contains(ACCOUNT_ID), "{shown}");
-    for forbidden in ["rt-one", "fresh", "eyJ"] {
+    for forbidden in ["rt-one", "current", "eyJ"] {
         assert!(!shown.contains(forbidden), "{forbidden} in {shown}");
     }
     let settings = chatgpt_settings(CODEX_ENDPOINT);
@@ -1169,7 +816,6 @@ fn debug_output_never_holds_a_token() {
 // Login: the device-code flow against a stub issuer.
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn device_code_login_polls_exchanges_and_saves_tokens() {
     let exp = start()
         .checked_add(SignedDuration::from_secs(3600))
@@ -1270,7 +916,6 @@ fn device_code_login_polls_exchanges_and_saves_tokens() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn a_login_the_issuer_refuses_is_an_error_without_a_token_file() {
     let issuer = StubServer::start(|request| match request.path.as_str() {
         "/api/accounts/deviceauth/usercode" => StubResponse::json(
@@ -1300,7 +945,6 @@ fn a_login_the_issuer_refuses_is_an_error_without_a_token_file() {
 // The Responses wire format.
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn the_client_streams_a_structured_responses_request_with_the_codex_headers() {
     let backend = StubServer::backend(StubResponse::stream(sse_completion(
         "{\"claims\":[\"Tim moved to Wellington in March 2026.\"]}",
@@ -1331,7 +975,7 @@ fn the_client_streams_a_structured_responses_request_with_the_codex_headers() {
         sent.bearer(),
         Some(
             access_token(
-                "fresh",
+                "current",
                 start()
                     .checked_add(SignedDuration::from_secs(3600))
                     .unwrap()
@@ -1389,7 +1033,6 @@ fn the_client_streams_a_structured_responses_request_with_the_codex_headers() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn deltas_are_reassembled_when_no_done_item_carries_the_text() {
     let backend = StubServer::backend(StubResponse::stream(sse(&[
         (
@@ -1414,7 +1057,6 @@ fn deltas_are_reassembled_when_no_done_item_carries_the_text() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn fenced_json_in_the_streamed_text_is_unwrapped() {
     let backend = StubServer::backend(StubResponse::stream(sse_completion(
         "```json\n{\"claims\": []}\n```",
@@ -1427,7 +1069,6 @@ fn fenced_json_in_the_streamed_text_is_unwrapped() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn streamed_text_that_is_not_json_is_an_error_that_carries_only_its_size() {
     let content = "Sure! Here are Tim's claims: he moved to Wellington.";
     let backend = StubServer::backend(StubResponse::stream(sse_completion(content)));
@@ -1443,7 +1084,6 @@ fn streamed_text_that_is_not_json_is_an_error_that_carries_only_its_size() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn a_failed_or_incomplete_response_keeps_only_its_code() {
     let backend = StubServer::backend(StubResponse::stream(sse(&[(
         "response.failed",
@@ -1493,7 +1133,6 @@ fn a_failed_or_incomplete_response_keeps_only_its_code() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn without_a_token_file_the_client_asks_for_a_login_before_any_request() {
     let backend = StubServer::backend(StubResponse::stream(sse_completion("{}")));
     let dir = TestDir::new();
@@ -1513,7 +1152,6 @@ fn without_a_token_file_the_client_asks_for_a_login_before_any_request() {
 // Refresh.
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn an_expired_access_token_is_refreshed_first_and_the_rotation_is_persisted_before_the_request() {
     let dir = TestDir::new();
     let store = expired_store(&dir);
@@ -1573,7 +1211,6 @@ fn an_expired_access_token_is_refreshed_first_and_the_rotation_is_persisted_befo
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn a_token_inside_the_refresh_window_counts_as_expired() {
     // codex-rs refreshes when exp is within 5 minutes.
     let dir = TestDir::new();
@@ -1596,7 +1233,6 @@ fn a_token_inside_the_refresh_window_counts_as_expired() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn a_401_triggers_one_refresh_and_one_retry() {
     let dir = TestDir::new();
     let store = logged_in_store(&dir);
@@ -1621,7 +1257,6 @@ fn a_401_triggers_one_refresh_and_one_retry() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn a_401_after_a_refresh_asks_for_a_login_and_stops() {
     let dir = TestDir::new();
     let store = logged_in_store(&dir);
@@ -1647,7 +1282,6 @@ fn a_401_after_a_refresh_asks_for_a_login_and_stops() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn a_refresh_the_issuer_rejects_asks_for_a_login_and_keeps_the_file() {
     let dir = TestDir::new();
     let store = expired_store(&dir);
@@ -1669,7 +1303,6 @@ fn a_refresh_the_issuer_rejects_asks_for_a_login_and_keeps_the_file() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn a_new_login_written_while_running_is_picked_up_without_a_restart() {
     // Re-login after a failed credential: `asphodel llm login` writes the
     // file; the daemon's next call reads it instead of refreshing.
@@ -1709,7 +1342,6 @@ fn a_new_login_written_while_running_is_picked_up_without_a_restart() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn concurrent_calls_share_one_refresh() {
     // Refresh tokens are single-use. Two threads with the same expired
     // token must not both refresh: the second would present a token the
@@ -1757,7 +1389,6 @@ fn concurrent_calls_share_one_refresh() {
 // Usage limits (reset-aware 429).
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn a_usage_limit_is_deferred_to_its_reset_time_not_retried() {
     let resets_at: Timestamp = "2026-03-02T14:30:00Z".parse().unwrap();
     let backend = StubServer::backend(
@@ -1794,7 +1425,6 @@ fn a_usage_limit_is_deferred_to_its_reset_time_not_retried() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn the_reset_header_fills_in_when_the_body_has_no_reset() {
     let backend = StubServer::backend(
         StubResponse::json(429, json!({"error": {"type": "usage_limit_reached"}}))
@@ -1812,7 +1442,6 @@ fn the_reset_header_fills_in_when_the_body_has_no_reset() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn a_plain_429_stays_a_retryable_status() {
     // A rate limit without a usage window is the old behaviour: retry.
     let backend = StubServer::backend(StubResponse::json(
@@ -1831,7 +1460,6 @@ fn a_plain_429_stays_a_retryable_status() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn other_statuses_map_as_in_api_key_mode() {
     for (status, retryable) in [(400, false), (403, false), (500, true), (503, true)] {
         let backend = StubServer::backend(StubResponse::status(status));
@@ -1851,7 +1479,6 @@ fn other_statuses_map_as_in_api_key_mode() {
 // Secret hygiene across the whole client.
 
 #[test]
-#[ignore = "needs the chatgpt auth mode"]
 fn no_error_or_response_carries_a_token() {
     let dir = TestDir::new();
     let store = expired_store(&dir);

@@ -7,11 +7,9 @@
 //! resolved config line.
 //!
 //! The login talks to the issuer over HTTPS. To test the command without
-//! the network, the proposal is a hidden `ASPHODEL_LLM_ISSUER` variable,
-//! environment only and never in `--help`, that points the flow at a
-//! loopback stub, in the same spirit as `ASPHODEL_MODELS=fake`. Every test
-//! here that runs the command or starts a daemon is ignored until the
-//! subscription implementation lands.
+//! the network, a hidden `ASPHODEL_LLM_ISSUER` variable, environment only
+//! and never in `--help`, points the flow at a loopback stub, in the same
+//! spirit as `ASPHODEL_MODELS=fake`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -285,7 +283,6 @@ fn answer(mut stream: TcpStream, log: &Mutex<Vec<(String, String)>>, polls: &Ato
 }
 
 #[test]
-#[ignore = "needs `asphodel llm login`"]
 fn llm_login_takes_the_data_dir_and_hides_the_issuer_override() {
     let output = run(asphodel().args(["llm", "login", "--help"]));
     assert!(output.status.success(), "{}", stderr(&output));
@@ -301,7 +298,6 @@ fn llm_login_takes_the_data_dir_and_hides_the_issuer_override() {
 }
 
 #[test]
-#[ignore = "needs `asphodel llm login`"]
 fn llm_login_shows_the_code_and_writes_the_token_file() {
     let issuer = Issuer::start();
     let dir = TestDir::new();
@@ -361,7 +357,6 @@ fn llm_login_shows_the_code_and_writes_the_token_file() {
 }
 
 #[test]
-#[ignore = "needs `asphodel llm login`"]
 fn llm_login_never_reads_the_codex_cli_credentials() {
     // Sharing the Codex CLI's token chain would log one of the two out:
     // refresh tokens are single-use. A login with no reachable issuer must
@@ -399,7 +394,6 @@ fn llm_login_never_reads_the_codex_cli_credentials() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode in serve"]
 fn serve_in_chatgpt_mode_starts_logged_out_and_says_so() {
     // The daemon starts without a login; extraction waits for one. The
     // resolved config shows the mode, the token file and the state, and
@@ -430,7 +424,6 @@ fn serve_in_chatgpt_mode_starts_logged_out_and_says_so() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode in serve"]
 fn serve_refuses_a_key_together_with_chatgpt_mode() {
     let dir = TestDir::new();
     let tuning = dir.chatgpt_tuning();
@@ -450,7 +443,6 @@ fn serve_refuses_a_key_together_with_chatgpt_mode() {
 }
 
 #[test]
-#[ignore = "needs the chatgpt auth mode in serve"]
 fn serve_in_chatgpt_mode_shows_logged_in_after_a_login_and_never_the_tokens() {
     let dir = TestDir::new();
     let data = dir.data();

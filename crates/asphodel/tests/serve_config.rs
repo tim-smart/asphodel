@@ -14,11 +14,21 @@ use std::time::Duration;
 const TOKEN: &str = "tok-7f3a9c-secret";
 const LLM_KEY: &str = "sk-live-41b2e8-secret";
 
+/// A floor for each fake model. The daemon loads its models before it
+/// listens and refuses a model without floors (ADR 0009), so every daemon
+/// here that is meant to start runs on the fakes with these.
+const FLOORS_FOR_FAKES: &str = "[injection.reranker_floors]\n\"fake-reranker:v1\" = 0.0\n\
+                                [reconcile.embedding_floors]\n\"fake-embedder:v1\" = 0.5\n";
+
 /// `asphodel serve` with a clean environment, so the caller's `ASPHODEL_*`
-/// variables can't leak in.
+/// variables can't leak in. It runs on the fake models, because the real
+/// ones aren't on a CI machine (TIM-105).
 fn serve() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
-    command.env_clear().arg("serve");
+    command
+        .env_clear()
+        .env("ASPHODEL_MODELS", "fake")
+        .arg("serve");
     command
 }
 
@@ -29,6 +39,16 @@ fn serve() -> Command {
 fn serve_in(dir: &TestDir) -> Command {
     let mut command = serve();
     command.arg("--data-dir").arg(dir.0.join("data"));
+    command
+}
+
+/// [`serve_in`] with a tuning file holding only the floors for the fakes,
+/// for a daemon whose test doesn't need a tuning file of its own.
+fn serve_with_floors(dir: &TestDir) -> Command {
+    let mut command = serve_in(dir);
+    command
+        .arg("--config")
+        .arg(dir.with_floors("floors.toml", ""));
     command
 }
 
@@ -59,6 +79,11 @@ impl TestDir {
         let path = self.0.join(name);
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    /// A tuning file holding `text` and the floors for the fakes.
+    fn with_floors(&self, name: &str, text: &str) -> PathBuf {
+        self.file(name, &format!("{FLOORS_FOR_FAKES}{text}"))
     }
 }
 
@@ -220,7 +245,7 @@ fn the_tuning_file_can_come_from_the_environment() {
 fn the_config_flag_wins_over_its_variable() {
     let dir = TestDir::new();
     let bad = dir.file("bad.toml", "[injection]\ncap = 0\n");
-    let good = dir.file("good.toml", "[clock]\nquiet_rate = 0.3\n");
+    let good = dir.with_floors("good.toml", "[clock]\nquiet_rate = 0.3\n");
     let daemon = start(
         serve_in(&dir)
             .env("ASPHODEL_CONFIG", &bad)
@@ -234,7 +259,7 @@ fn the_config_flag_wins_over_its_variable() {
 #[test]
 fn deployment_values_come_from_the_environment() {
     let dir = TestDir::new();
-    let tuning = dir.file("tuning.toml", "[purge]\nsource_horizon_days = 60\n");
+    let tuning = dir.with_floors("tuning.toml", "[purge]\nsource_horizon_days = 60\n");
     let data = dir.0.join("data");
     let models = dir.0.join("models");
     let daemon = start(
@@ -256,11 +281,11 @@ fn deployment_values_come_from_the_environment() {
 fn listen_comes_from_its_variable_and_the_flag_wins() {
     // An unparseable address in the variable must lose to the flag.
     let dir = TestDir::new();
-    let daemon = start(serve_in(&dir).env("ASPHODEL_LISTEN", "not-an-address"));
+    let daemon = start(serve_with_floors(&dir).env("ASPHODEL_LISTEN", "not-an-address"));
     let config = resolved_config(&daemon.log);
     assert_eq!(config["deployment"]["listen"], "127.0.0.1:0");
 
-    let output = run(serve_in(&dir).env("ASPHODEL_LISTEN", "not-an-address"));
+    let output = run(serve_with_floors(&dir).env("ASPHODEL_LISTEN", "not-an-address"));
     assert!(!output.status.success(), "ASPHODEL_LISTEN was ignored");
 }
 
@@ -268,7 +293,7 @@ fn listen_comes_from_its_variable_and_the_flag_wins() {
 fn secrets_are_read_from_the_environment_and_never_logged() {
     let dir = TestDir::new();
     let daemon = start(
-        serve_in(&dir)
+        serve_with_floors(&dir)
             .env("ASPHODEL_TOKEN", TOKEN)
             .env("ASPHODEL_LLM_API_KEY", LLM_KEY),
     );
@@ -292,7 +317,7 @@ fn secrets_are_read_from_the_environment_and_never_logged() {
 #[test]
 fn absent_secrets_are_recorded_as_absent() {
     let dir = TestDir::new();
-    let daemon = start(&mut serve_in(&dir));
+    let daemon = start(&mut serve_with_floors(&dir));
     let config = resolved_config(&daemon.log);
     assert!(config["deployment"]["token"].is_null());
     assert!(config["deployment"]["llm_api_key"].is_null());
@@ -302,7 +327,7 @@ fn absent_secrets_are_recorded_as_absent() {
 fn off_loopback_needs_a_token_from_the_environment() {
     let dir = TestDir::new();
     for env in [None, Some("")] {
-        let mut command = serve_in(&dir);
+        let mut command = serve_with_floors(&dir);
         command.args(["--listen", "0.0.0.0:0"]);
         if let Some(value) = env {
             command.env("ASPHODEL_TOKEN", value);
@@ -323,7 +348,7 @@ fn off_loopback_needs_a_token_from_the_environment() {
 #[test]
 fn the_startup_log_carries_the_resolved_config() {
     let dir = TestDir::new();
-    let daemon = start(&mut serve_in(&dir));
+    let daemon = start(&mut serve_with_floors(&dir));
     let config = resolved_config(&daemon.log);
     for key in [
         "tuning",
@@ -370,7 +395,7 @@ fn run_bounded(command: &mut Command, log_path: &Path) -> (Option<ExitStatus>, S
 #[test]
 fn a_malformed_llm_endpoint_stops_startup() {
     let dir = TestDir::new();
-    let path = dir.file("tuning.toml", "[llm]\nendpoint = \"http://\"\n");
+    let path = dir.with_floors("tuning.toml", "[llm]\nendpoint = \"http://\"\n");
     let (status, log) = run_bounded(
         serve_in(&dir).arg("--config").arg(&path),
         &dir.0.join("stderr.log"),

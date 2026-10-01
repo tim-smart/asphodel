@@ -5,14 +5,6 @@
 //! transport" (TIM-94, decision 4, as amended by TIM-99), "Replay harness"
 //! (TIM-96, decision 4), "Configuration surface" (TIM-98) and ADR 0009.
 //!
-//! The code under test doesn't exist yet. [`contract`] below holds the
-//! proposed `asphodel_core::models` API with `todo!()` bodies, so this file
-//! compiles and every test that needs it is ignored. To activate: move the
-//! contract into `asphodel_core::models`, delete the module, import from the
-//! crate instead, and drop the `ignore` attributes. The tests that run now
-//! check what already exists: the tuning floors keyed by the exact model
-//! strings, and the LLM settings in the tuning file and the environment.
-//!
 //! Nothing here touches the network. The OpenAI-compatible client is tested
 //! against [`StubServer`], a loopback HTTP/1.1 server in this file, and the
 //! model loader against files written into a temp dir. The one exception is
@@ -36,530 +28,8 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use contract::*;
-
-/// The proposed `asphodel_core::models` API.
-///
-/// Three boundaries, each behind a trait so tests and replay can stand in
-/// for it: [`Embedder`] and [`Reranker`] over the local ONNX models, and
-/// [`LlmClient`] over any OpenAI-compatible endpoint. The production
-/// implementations load from a [`ModelDir`] that `asphodel models fetch`
-/// fills; nothing downloads at runtime, and a missing or corrupt file fails
-/// before ONNX Runtime is touched. The fakes are deterministic and live in
-/// the crate, not in tests, because the replay harness runs its scripted
-/// scenarios against them under `cargo test` (TIM-96, decision 2).
-#[allow(dead_code, unused_variables)]
-mod contract {
-    use std::num::NonZeroUsize;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use asphodel_core::Service;
-    use asphodel_core::clock::Clock;
-    use asphodel_core::config::{ConfigError, Deployment, Secret, Tuning};
-    use asphodel_core::store::Store;
-    use asphodel_core::store::bank::{Bank, BankError, BankIdentity, ModelIds};
-    use serde::{Deserialize, Serialize};
-    use serde_json::Value;
-
-    // Model ids. The exact string, quantisation included, keys the floors in
-    // `Tuning` and is what a bank records (TIM-98: int8 and fp32 score
-    // differently).
-
-    /// bge-small-en-v1.5, int8, 384 dimensions (TIM-89).
-    pub const EMBEDDING_MODEL_ID: &str = "bge-small-en-v1.5:int8";
-
-    /// jina-reranker-v1-turbo-en, int8 (TIM-93, decision 3).
-    pub const RERANKER_MODEL_ID: &str = "jina-reranker-v1-turbo-en:int8";
-
-    /// The files every model needs: the ONNX graph and fastembed's four
-    /// tokenizer files, loaded as a user-defined model.
-    pub const MODEL_FILES: [&str; 5] = [
-        "model.onnx",
-        "tokenizer.json",
-        "config.json",
-        "special_tokens_map.json",
-        "tokenizer_config.json",
-    ];
-
-    /// One file of a model: where it goes under the model's directory, where
-    /// `models fetch` gets it, and the SHA-256 of its bytes.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ModelFile {
-        pub name: String,
-        pub url: String,
-        /// Lowercase hex, 64 characters.
-        pub sha256: String,
-    }
-
-    /// One model: its id, the directory it lives in under the model dir
-    /// (no `:`, so the layout is the same on every filesystem), and its files.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ModelSpec {
-        pub id: String,
-        pub dir: String,
-        pub files: Vec<ModelFile>,
-    }
-
-    /// The two models the daemon runs, in the order embedding then reranker.
-    /// It is the one place file names, URLs and checksums are written down:
-    /// `models fetch` fills the dir from it, and `Models::load` checks the
-    /// dir against it.
-    pub fn manifest() -> Vec<ModelSpec> {
-        todo!()
-    }
-
-    /// Where the models live (TIM-94, decision 4). `ASPHODEL_MODEL_DIR`
-    /// overrides it, and the default is the XDG cache.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ModelDir {
-        path: PathBuf,
-    }
-
-    impl ModelDir {
-        /// Resolves the dir from an explicit override (the flag or
-        /// `ASPHODEL_MODEL_DIR`), else `$XDG_CACHE_HOME/asphodel/models`,
-        /// else `$HOME/.cache/asphodel/models`. A relative `XDG_CACHE_HOME`
-        /// is ignored, as the XDG spec says. The binary reads the
-        /// environment; this takes values so tests never set process-wide
-        /// variables. Fails with [`ModelError::NoModelDir`] when nothing
-        /// resolves.
-        pub fn resolve(
-            override_dir: Option<&Path>,
-            xdg_cache_home: Option<&Path>,
-            home: Option<&Path>,
-        ) -> Result<Self, ModelError> {
-            todo!()
-        }
-
-        /// A dir at a known path, for tests and `models fetch --model-dir`.
-        pub fn at(path: impl Into<PathBuf>) -> Self {
-            todo!()
-        }
-
-        pub fn path(&self) -> &Path {
-            todo!()
-        }
-
-        /// `<dir>/<spec.dir>/<name>`.
-        pub fn file(&self, spec: &ModelSpec, name: &str) -> PathBuf {
-            todo!()
-        }
-    }
-
-    /// Why the models couldn't be found, loaded or run. No variant carries
-    /// text that was embedded or reranked (TIM-96, decision 8).
-    #[derive(Debug, thiserror::Error)]
-    pub enum ModelError {
-        #[error("no model dir: set ASPHODEL_MODEL_DIR, XDG_CACHE_HOME or HOME")]
-        NoModelDir,
-
-        /// A file from the manifest isn't there. The message names the path
-        /// and says to run `asphodel models fetch`.
-        #[error("{model} is missing {}: run `asphodel models fetch`", path.display())]
-        MissingFile { model: String, path: PathBuf },
-
-        /// A file is there but its bytes don't match the manifest.
-        #[error("{model} file {} doesn't match its checksum: run `asphodel models fetch`", path.display())]
-        Checksum { model: String, path: PathBuf },
-
-        /// ONNX Runtime or the tokenizer refused the files.
-        #[error("loading {model}: {reason}")]
-        Load { model: String, reason: String },
-
-        /// A call into a loaded model failed.
-        #[error("running {model}: {reason}")]
-        Inference { model: String, reason: String },
-    }
-
-    /// Fetches one URL. `models fetch` uses an HTTP implementation; tests
-    /// use a map of canned bytes.
-    pub trait Fetcher: Send + Sync {
-        fn fetch(&self, url: &str) -> Result<Vec<u8>, FetchError>;
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-    pub enum FetchError {
-        #[error("transport: {0}")]
-        Transport(String),
-        #[error("HTTP {0}")]
-        Status(u16),
-    }
-
-    /// What one `models fetch` did.
-    #[derive(Debug, Clone, Default, PartialEq, Eq)]
-    pub struct FetchReport {
-        /// Files written, in manifest order.
-        pub fetched: Vec<PathBuf>,
-        /// Files already present with the right checksum, in manifest order.
-        pub skipped: Vec<PathBuf>,
-    }
-
-    #[derive(Debug, thiserror::Error)]
-    pub enum FetchFailure {
-        #[error("fetching {url}: {error}")]
-        Fetch { url: String, error: FetchError },
-
-        /// The bytes came back but don't match the manifest. Nothing is
-        /// written.
-        #[error("{url} doesn't match the checksum in the manifest")]
-        Checksum { url: String },
-
-        #[error("writing {}: {error}", path.display())]
-        Io {
-            path: PathBuf,
-            #[source]
-            error: std::io::Error,
-        },
-    }
-
-    /// Fills `dir` from `specs`, one file at a time in manifest order. A
-    /// file already present with the right checksum is skipped without a
-    /// fetch. A fetched file is checked against its checksum, then written
-    /// to a temp name and renamed into place, so a crash or a bad download
-    /// never leaves a partial file at the final path. The first failure
-    /// stops the run; what was written stays, so the next run resumes.
-    pub fn fetch_models(
-        dir: &ModelDir,
-        specs: &[ModelSpec],
-        fetcher: &dyn Fetcher,
-    ) -> Result<FetchReport, FetchFailure> {
-        todo!()
-    }
-
-    /// How to run the ONNX models.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    pub struct ModelOptions {
-        /// Intra-op threads for ONNX Runtime. `None` leaves it to the
-        /// runtime; replay pins it (TIM-96, decision 3) through
-        /// `--onnx-threads` / `ASPHODEL_ONNX_THREADS`.
-        pub threads: Option<NonZeroUsize>,
-    }
-
-    /// Turns text into vectors.
-    pub trait Embedder: Send + Sync {
-        /// The exact model string, as the floors and the bank row use it.
-        fn model_id(&self) -> &str;
-
-        /// The width of every vector; [`EMBEDDING_DIMENSIONS`] for bge-small.
-        ///
-        /// [`EMBEDDING_DIMENSIONS`]: asphodel_core::store::vector::EMBEDDING_DIMENSIONS
-        fn dimensions(&self) -> usize;
-
-        /// One unit-length vector per text, in the texts' order. An empty
-        /// slice gives an empty vec. Implementations take `&self`, so a model
-        /// that needs `&mut` sits behind a mutex.
-        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ModelError>;
-    }
-
-    /// Scores documents against a query.
-    pub trait Reranker: Send + Sync {
-        /// The exact model string, as the floors and the bank row use it.
-        fn model_id(&self) -> &str;
-
-        /// One relevance logit per document, in the documents' order (not
-        /// sorted: the caller keeps its ids). Higher is more relevant, and
-        /// the injection gate is a floor on this value (TIM-93, decision 9).
-        /// An empty slice gives an empty vec.
-        fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, ModelError>;
-    }
-
-    /// The pair the daemon runs. Shared, so handlers and the extraction
-    /// worker use one loaded copy.
-    #[derive(Clone)]
-    pub struct Models {
-        pub embedder: Arc<dyn Embedder>,
-        pub reranker: Arc<dyn Reranker>,
-    }
-
-    impl std::fmt::Debug for Models {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("Models")
-                .field("embedder", &self.embedder.model_id())
-                .field("reranker", &self.reranker.model_id())
-                .finish()
-        }
-    }
-
-    impl Models {
-        /// Loads both models from `dir` against the manifest. Every file is
-        /// checked for presence and checksum before ONNX Runtime is touched,
-        /// so a missing or corrupt file fails fast and names the path. It
-        /// never downloads.
-        pub fn load(dir: &ModelDir, options: &ModelOptions) -> Result<Self, ModelError> {
-            todo!()
-        }
-
-        /// The deterministic fakes, for tests and the scripted scenarios.
-        pub fn fake() -> Self {
-            todo!()
-        }
-
-        /// What a bank created under these models records.
-        pub fn ids(&self) -> ModelIds {
-            todo!()
-        }
-    }
-
-    /// A deterministic stand-in for the embedding model: a bag of words
-    /// hashed into [`EMBEDDING_DIMENSIONS`] buckets and normalised. Texts
-    /// that share words are closer, word order doesn't matter, and the same
-    /// text always gives the same vector, in any process.
-    ///
-    /// [`EMBEDDING_DIMENSIONS`]: asphodel_core::store::vector::EMBEDDING_DIMENSIONS
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct FakeEmbedder;
-
-    impl FakeEmbedder {
-        /// Distinct from the real id, so floors keyed on the real model
-        /// never apply to the fake by accident.
-        pub const MODEL_ID: &'static str = "fake-embedder:v1";
-    }
-
-    impl Embedder for FakeEmbedder {
-        fn model_id(&self) -> &str {
-            todo!()
-        }
-
-        fn dimensions(&self) -> usize {
-            todo!()
-        }
-
-        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
-            todo!()
-        }
-    }
-
-    /// A deterministic stand-in for the reranker: the logit is the number of
-    /// distinct query words found in the document, minus one half, so a
-    /// document sharing nothing with the query scores below zero and one
-    /// sharing more scores higher.
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct FakeReranker;
-
-    impl FakeReranker {
-        pub const MODEL_ID: &'static str = "fake-reranker:v1";
-    }
-
-    impl Reranker for FakeReranker {
-        fn model_id(&self) -> &str {
-            todo!()
-        }
-
-        fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, ModelError> {
-            todo!()
-        }
-    }
-
-    /// Why a service couldn't be built on a store and models.
-    #[derive(Debug, thiserror::Error)]
-    pub enum OpenError {
-        /// The tuning has no floor for a loaded model (ADR 0009).
-        #[error(transparent)]
-        Config(#[from] ConfigError),
-    }
-
-    /// The proposed `Service::open(clock, store, tuning, models) ->
-    /// Result<Service, OpenError>`. It checks the floors for the loaded
-    /// models' ids with `Tuning::check_floors` here, not in `serve`, so the
-    /// replay harness gets the same refusal (TIM-96, decision 3).
-    pub fn open_service(
-        clock: Arc<dyn Clock>,
-        store: Store,
-        tuning: Tuning,
-        models: Models,
-    ) -> Result<Service, OpenError> {
-        todo!()
-    }
-
-    /// The proposed `Service::models()`.
-    pub fn service_models(service: &Service) -> &Models {
-        todo!()
-    }
-
-    /// The proposed `Service::ensure_bank(name, identity)`: the `models`
-    /// parameter goes, and a new bank records the loaded models' ids.
-    pub fn ensure_bank(
-        service: &Service,
-        name: &str,
-        identity: &BankIdentity,
-    ) -> Result<Bank, BankError> {
-        todo!()
-    }
-
-    // The LLM client.
-
-    /// Where the LLM is and how to talk to it. The endpoint and model come
-    /// from `[llm]` in the tuning file, and the key from
-    /// `ASPHODEL_LLM_API_KEY` (ADR 0009).
-    #[derive(Debug, Clone)]
-    pub struct LlmSettings {
-        /// The base URL, without the `/chat/completions` path.
-        pub endpoint: String,
-        /// The exact model string, sent as `model`.
-        pub model: String,
-        /// Sent as a bearer token when set. Local endpoints have none.
-        pub api_key: Option<Secret>,
-        /// The whole-request timeout.
-        pub timeout: Duration,
-    }
-
-    impl LlmSettings {
-        pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
-
-        /// `Ok(None)` when neither `llm.endpoint` nor `llm.model` is set,
-        /// `Ok(Some)` when both are, and [`LlmError::NotConfigured`] naming
-        /// the missing key when only one is.
-        pub fn from_config(
-            tuning: &Tuning,
-            deployment: &Deployment,
-        ) -> Result<Option<Self>, LlmError> {
-            todo!()
-        }
-    }
-
-    /// Which prompt built a request, and its version. Replay's cache keys
-    /// include it next to the model id, so editing a prompt never hits a
-    /// stale recording (TIM-96, decision 4).
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct Template {
-        pub name: String,
-        pub version: u32,
-    }
-
-    /// One structured-output call: a system and a user message, and the
-    /// JSON schema the reply must satisfy. `Serialize` so a cassette can
-    /// store and key it.
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-    pub struct LlmRequest {
-        pub template: Template,
-        pub system: String,
-        pub user: String,
-        /// The schema's name in `response_format`.
-        pub schema_name: String,
-        pub schema: Value,
-        pub max_tokens: Option<u32>,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct LlmUsage {
-        pub input_tokens: u64,
-        pub output_tokens: u64,
-    }
-
-    /// A reply that parsed as JSON. `latency` is the measured round trip,
-    /// which replay records in `live` mode (TIM-96, decision 3).
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-    pub struct LlmResponse {
-        pub json: Value,
-        /// `None` when the endpoint reports no usage.
-        pub usage: Option<LlmUsage>,
-        pub latency: Duration,
-    }
-
-    /// Why a call failed. No variant carries the prompt or the reply: only
-    /// sizes and statuses (TIM-96, decision 8).
-    #[derive(Debug, thiserror::Error)]
-    pub enum LlmError {
-        #[error("the LLM isn't configured: {missing} is not set")]
-        NotConfigured { missing: &'static str },
-
-        #[error("LLM transport: {reason}")]
-        Transport { reason: String },
-
-        #[error("the LLM didn't answer within the timeout")]
-        Timeout,
-
-        #[error("the LLM answered HTTP {status}")]
-        Status { status: u16 },
-
-        /// The reply had no choices, or a choice with no content.
-        #[error("the LLM returned no content")]
-        NoContent,
-
-        /// The content wasn't JSON, fenced or bare.
-        #[error("the LLM returned {bytes} bytes that aren't JSON")]
-        NotJson { bytes: usize },
-
-        /// The model refused (`message.refusal`).
-        #[error("the LLM refused the request")]
-        Refused,
-    }
-
-    impl LlmError {
-        /// Whether the caller's retry policy may try again: transport
-        /// errors, timeouts, 408, 429 and 5xx. Never for a reply that came
-        /// back and was wrong.
-        pub fn is_retryable(&self) -> bool {
-            todo!()
-        }
-    }
-
-    /// The boundary extraction, reconciliation and refresh call through,
-    /// and that replay's recording and cassette modes wrap (TIM-96,
-    /// decision 4). Synchronous: the extraction worker is a thread per bank,
-    /// and a cassette wrapper needs no runtime.
-    pub trait LlmClient: Send + Sync {
-        /// The model string sent with every request.
-        fn model(&self) -> &str;
-
-        fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
-    }
-
-    /// The real client, for any OpenAI-compatible `chat/completions`.
-    pub struct OpenAiCompatible {
-        settings: LlmSettings,
-    }
-
-    impl OpenAiCompatible {
-        pub fn new(settings: LlmSettings) -> Self {
-            todo!()
-        }
-    }
-
-    impl LlmClient for OpenAiCompatible {
-        fn model(&self) -> &str {
-            todo!()
-        }
-
-        fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-            todo!()
-        }
-    }
-
-    /// A deterministic client for tests: it hands out scripted replies in
-    /// order and records every request it was given.
-    pub struct FakeLlm {}
-
-    impl FakeLlm {
-        /// Replies with each JSON value in turn, then fails with
-        /// [`LlmError::NoContent`] once they run out.
-        pub fn scripted(model: &str, replies: Vec<Value>) -> Self {
-            todo!()
-        }
-
-        /// Fails every call with the error `make` builds.
-        pub fn failing(model: &str, make: fn() -> LlmError) -> Self {
-            todo!()
-        }
-
-        /// Every request so far, in order.
-        pub fn requests(&self) -> Vec<LlmRequest> {
-            todo!()
-        }
-    }
-
-    impl LlmClient for FakeLlm {
-        fn model(&self) -> &str {
-            todo!()
-        }
-
-        fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-            todo!()
-        }
-    }
-}
+use asphodel_core::models::*;
+use asphodel_core::{OpenError, Service};
 
 // Fixtures.
 
@@ -831,6 +301,7 @@ impl StubServer {
 
     fn settings(&self, api_key: Option<&str>) -> LlmSettings {
         LlmSettings {
+            auth: LlmAuth::ApiKey,
             endpoint: format!("{}/v1", self.url),
             model: "some-model:q4_K_M".into(),
             api_key: api_key.map(Secret::new),
@@ -1002,7 +473,6 @@ fn the_stub_server_answers_a_request() {
 // The model dir (TIM-94, decision 4; TIM-98 deployment).
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_override_wins_over_the_xdg_cache() {
     let dir = ModelDir::resolve(
         Some(Path::new("/srv/models")),
@@ -1014,7 +484,6 @@ fn the_override_wins_over_the_xdg_cache() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_default_is_the_xdg_cache() {
     let dir = ModelDir::resolve(
         None,
@@ -1026,7 +495,6 @@ fn the_default_is_the_xdg_cache() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn without_xdg_cache_home_the_default_is_under_home() {
     let dir = ModelDir::resolve(None, None, Some(Path::new("/home/tim"))).unwrap();
     assert_eq!(dir.path(), Path::new("/home/tim/.cache/asphodel/models"));
@@ -1038,7 +506,6 @@ fn without_xdg_cache_home_the_default_is_under_home() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn no_dir_at_all_is_an_error() {
     let error = ModelDir::resolve(None, None, None).unwrap_err();
     assert!(matches!(error, ModelError::NoModelDir), "{error:?}");
@@ -1046,7 +513,6 @@ fn no_dir_at_all_is_an_error() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn files_live_under_the_models_dir_name() {
     let dir = ModelDir::at("/srv/models");
     let spec = &canned().specs[0];
@@ -1059,7 +525,6 @@ fn files_live_under_the_models_dir_name() {
 // The manifest.
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_manifest_names_the_two_models_and_their_five_files() {
     let manifest = manifest();
     let ids: Vec<_> = manifest.iter().map(|spec| spec.id.as_str()).collect();
@@ -1094,7 +559,6 @@ fn the_manifest_names_the_two_models_and_their_five_files() {
 // `asphodel models fetch` (TIM-94, decision 4).
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn fetch_fills_an_empty_dir_and_checks_every_file() {
     let dir = TestDir::new();
     let models = dir.models();
@@ -1125,7 +589,6 @@ fn fetch_fills_an_empty_dir_and_checks_every_file() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn fetch_skips_files_that_are_already_right() {
     let dir = TestDir::new();
     let models = dir.models();
@@ -1141,7 +604,6 @@ fn fetch_skips_files_that_are_already_right() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn fetch_replaces_a_file_whose_bytes_are_wrong() {
     let dir = TestDir::new();
     let models = dir.models();
@@ -1163,7 +625,6 @@ fn fetch_replaces_a_file_whose_bytes_are_wrong() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn fetch_refuses_bytes_that_do_not_match_the_manifest() {
     let dir = TestDir::new();
     let models = dir.models();
@@ -1189,7 +650,6 @@ fn fetch_refuses_bytes_that_do_not_match_the_manifest() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn fetch_stops_at_the_first_failure_and_keeps_what_it_wrote() {
     let dir = TestDir::new();
     let models = dir.models();
@@ -1219,7 +679,6 @@ fn fetch_stops_at_the_first_failure_and_keeps_what_it_wrote() {
 // Loading: never a download, and a missing file fails fast.
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn an_empty_model_dir_fails_fast_naming_the_first_missing_file() {
     let dir = TestDir::new();
     let models = dir.models();
@@ -1242,7 +701,6 @@ fn an_empty_model_dir_fails_fast_naming_the_first_missing_file() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn a_missing_reranker_file_is_named_even_when_the_embedder_is_complete() {
     // A full embedding model dir and a reranker dir short of one tokenizer
     // file. The checksum of the embedding files can't be met here, so the
@@ -1275,7 +733,6 @@ fn a_missing_reranker_file_is_named_even_when_the_embedder_is_complete() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn a_corrupt_file_fails_before_onnx_runtime_is_touched() {
     // Every file present, none with the manifest's bytes. The loader checks
     // checksums before building a session, so the error is ours and names
@@ -1306,7 +763,6 @@ fn a_corrupt_file_fails_before_onnx_runtime_is_touched() {
 // The fakes (TIM-96, decision 2).
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_fakes_have_their_own_ids() {
     let models = Models::fake();
     assert_eq!(models.embedder.model_id(), FakeEmbedder::MODEL_ID);
@@ -1319,7 +775,6 @@ fn the_fakes_have_their_own_ids() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_fake_embedder_is_deterministic_unit_length_and_384_wide() {
     let embedder = FakeEmbedder;
     assert_eq!(embedder.dimensions(), EMBEDDING_DIMENSIONS);
@@ -1345,7 +800,6 @@ fn the_fake_embedder_is_deterministic_unit_length_and_384_wide() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_fake_embedder_puts_texts_that_share_words_closer() {
     let embedder = FakeEmbedder;
     let vectors = embedder
@@ -1371,7 +825,6 @@ fn the_fake_embedder_puts_texts_that_share_words_closer() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_fake_reranker_scores_by_query_words_in_the_document() {
     let reranker = FakeReranker;
     let query = "when is Maya's birthday";
@@ -1393,7 +846,6 @@ fn the_fake_reranker_scores_by_query_words_in_the_document() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_fakes_are_shareable_trait_objects() {
     fn takes(embedder: Arc<dyn Embedder>, reranker: Arc<dyn Reranker>) -> (String, String) {
         (
@@ -1415,12 +867,11 @@ fn the_fakes_are_shareable_trait_objects() {
 // The service: recorded model ids and the floor check at startup.
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn a_missing_floor_for_a_loaded_model_stops_the_service_opening() {
     // ADR 0009: a missing floor for a configured model stops the daemon.
     // The check lives in the service so replay gets it too.
     let dir = TestDir::new();
-    let error = open_service(clock(), open_store(&dir), Tuning::default(), Models::fake())
+    let error = Service::with_models(clock(), open_store(&dir), Tuning::default(), Models::fake())
         .expect_err("opened without floors");
     let OpenError::Config(ConfigError::Invalid(errors)) = error else {
         panic!("{error}");
@@ -1436,10 +887,9 @@ fn a_missing_floor_for_a_loaded_model_stops_the_service_opening() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn floors_for_the_loaded_models_let_the_service_open() {
     let dir = TestDir::new();
-    let service = open_service(
+    let service = Service::with_models(
         clock(),
         open_store(&dir),
         tuning_for_fakes(),
@@ -1447,41 +897,42 @@ fn floors_for_the_loaded_models_let_the_service_open() {
     )
     .unwrap();
     assert_eq!(
-        service_models(&service).ids().embedding,
+        service.models().unwrap().ids().embedding,
         FakeEmbedder::MODEL_ID
     );
     assert!(service.health().ready);
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn a_new_bank_records_the_loaded_models() {
     // TIM-94, decision 4: a bank records its embedding and reranker model
     // ids. They come from what's loaded, not from the caller.
     let dir = TestDir::new();
-    let service = open_service(
+    let service = Service::with_models(
         clock(),
         open_store(&dir),
         tuning_for_fakes(),
         Models::fake(),
     )
     .unwrap();
-    let bank = ensure_bank(&service, "tim", &BankIdentity::default()).unwrap();
+    let bank = service
+        .ensure_bank_with_models("tim", &BankIdentity::default())
+        .unwrap();
     assert!(bank.created);
     assert_eq!(bank.embedding_model, FakeEmbedder::MODEL_ID);
     assert_eq!(bank.reranker_model, FakeReranker::MODEL_ID);
 
     // A merge leaves the recorded ids alone: a change goes through
     // `asphodel reembed` (TIM-99), never through bank config.
-    let again = ensure_bank(
-        &service,
-        "tim",
-        &BankIdentity {
-            owner_name: Some("Tim".into()),
-            ..BankIdentity::default()
-        },
-    )
-    .unwrap();
+    let again = service
+        .ensure_bank_with_models(
+            "tim",
+            &BankIdentity {
+                owner_name: Some("Tim".into()),
+                ..BankIdentity::default()
+            },
+        )
+        .unwrap();
     assert!(!again.created);
     assert_eq!(again.embedding_model, FakeEmbedder::MODEL_ID);
     assert_eq!(again.reranker_model, FakeReranker::MODEL_ID);
@@ -1490,7 +941,6 @@ fn a_new_bank_records_the_loaded_models() {
 // LLM settings (ADR 0009).
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn llm_settings_come_from_the_tuning_file_and_the_environment() {
     let tuning = Tuning::from_toml(
         "[llm]\nmodel = \"some-model:q4_K_M\"\nendpoint = \"http://llm.internal:8080/v1\"\n",
@@ -1517,7 +967,6 @@ fn llm_settings_come_from_the_tuning_file_and_the_environment() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn llm_settings_are_absent_when_nothing_is_set_and_an_error_when_half_set() {
     assert!(
         LlmSettings::from_config(&Tuning::default(), &deployment(None))
@@ -1554,7 +1003,6 @@ fn llm_settings_are_absent_when_nothing_is_set_and_an_error_when_half_set() {
 // The OpenAI-compatible client, against the loopback stub.
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_client_posts_a_structured_chat_completion() {
     let server = StubServer::start(StubResponse::completion(
         "{\"claims\":[\"Tim moved to Wellington in March 2026.\"]}",
@@ -1616,7 +1064,6 @@ fn the_client_posts_a_structured_chat_completion() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn without_a_key_there_is_no_authorization_header_and_no_max_tokens_when_unset() {
     let server = StubServer::start(StubResponse::completion("{}"));
     let client = OpenAiCompatible::new(server.settings(None));
@@ -1630,7 +1077,6 @@ fn without_a_key_there_is_no_authorization_header_and_no_max_tokens_when_unset()
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn a_trailing_slash_on_the_endpoint_does_not_double_the_path() {
     let server = StubServer::start(StubResponse::completion("{}"));
     let mut settings = server.settings(None);
@@ -1642,7 +1088,6 @@ fn a_trailing_slash_on_the_endpoint_does_not_double_the_path() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn fenced_json_in_the_content_is_unwrapped() {
     // Local models often fence their output even under json_schema.
     let server = StubServer::start(StubResponse::completion("```json\n{\"claims\": []}\n```"));
@@ -1653,7 +1098,6 @@ fn fenced_json_in_the_content_is_unwrapped() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn content_that_is_not_json_is_an_error_that_carries_only_its_size() {
     let content = "Sure! Here are Tim's claims: he moved to Wellington.";
     let server = StubServer::start(StubResponse::completion(content));
@@ -1671,7 +1115,6 @@ fn content_that_is_not_json_is_an_error_that_carries_only_its_size() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn no_choices_and_a_refusal_are_errors() {
     let server = StubServer::start(StubResponse::json(json!({
         "choices": [],
@@ -1698,7 +1141,6 @@ fn no_choices_and_a_refusal_are_errors() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn missing_usage_is_none_not_zero() {
     let server = StubServer::start(StubResponse::json(json!({
         "choices": [{
@@ -1714,7 +1156,6 @@ fn missing_usage_is_none_not_zero() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn http_statuses_map_to_retryable_or_not() {
     for (status, retryable) in [
         (400, false),
@@ -1739,7 +1180,6 @@ fn http_statuses_map_to_retryable_or_not() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn a_slow_endpoint_times_out() {
     let mut response = StubResponse::completion("{}");
     response.delay = Duration::from_secs(3);
@@ -1754,7 +1194,6 @@ fn a_slow_endpoint_times_out() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn a_dead_endpoint_is_a_retryable_transport_error() {
     // Bind and drop, so the port is closed.
     let port = TcpListener::bind("127.0.0.1:0")
@@ -1763,6 +1202,7 @@ fn a_dead_endpoint_is_a_retryable_transport_error() {
         .unwrap()
         .port();
     let settings = LlmSettings {
+        auth: LlmAuth::ApiKey,
         endpoint: format!("http://127.0.0.1:{port}/v1"),
         model: "some-model".into(),
         api_key: None,
@@ -1776,7 +1216,6 @@ fn a_dead_endpoint_is_a_retryable_transport_error() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_real_client_is_a_trait_object() {
     let server = StubServer::start(StubResponse::completion("{\"ok\":true}"));
     let client: Arc<dyn LlmClient> = Arc::new(OpenAiCompatible::new(server.settings(None)));
@@ -1790,7 +1229,6 @@ fn the_real_client_is_a_trait_object() {
 // The fake LLM.
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_fake_llm_replies_in_order_and_records_requests() {
     let fake = FakeLlm::scripted(
         "fake-llm",
@@ -1818,7 +1256,6 @@ fn the_fake_llm_replies_in_order_and_records_requests() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_fake_llm_can_fail_every_call() {
     let fake = FakeLlm::failing("fake-llm", || LlmError::Status { status: 503 });
     let error = fake.complete(&request()).unwrap_err();
@@ -1831,7 +1268,6 @@ fn the_fake_llm_can_fail_every_call() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn the_fake_llm_is_a_shareable_trait_object() {
     let client: Arc<dyn LlmClient> = Arc::new(FakeLlm::scripted("fake-llm", vec![json!({})]));
     let handle = {
@@ -1842,7 +1278,6 @@ fn the_fake_llm_is_a_shareable_trait_object() {
 }
 
 #[test]
-#[ignore = "needs asphodel_core::models"]
 fn requests_and_responses_round_trip_through_json_for_the_cassette() {
     // TIM-96, decision 4: replay records calls. The types serialise so the
     // cassette can store them and key on the template and model.

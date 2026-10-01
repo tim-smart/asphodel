@@ -9,12 +9,15 @@
 //! config line.
 //!
 //! The daemon can't load the real models on a CI machine, so these tests
-//! need a way to start it on the fakes: the proposal is `ASPHODEL_MODELS=fake`,
-//! environment only and hidden from `--help`, which `serve` honours with a
-//! warning and shows in the resolved config. The existing process tests in
-//! `serve_config.rs` and `serve_store.rs` start daemons with no model dir at
-//! all, so once loading is wired in they set the same variable. Until then,
-//! every test here that starts a daemon is ignored.
+//! start it on the fakes with `ASPHODEL_MODELS=fake`, environment only and
+//! hidden from `--help`, which `serve` honours with a warning and shows in
+//! the resolved config. The process tests in `serve_config.rs`,
+//! `serve_store.rs` and `llm_login.rs` set the same variable and a floor for
+//! each fake.
+//!
+//! Two tests stay ignored until `serve` loads the ONNX models when the
+//! variable is unset: today it warns and starts without models, so they
+//! would hang waiting for a refusal instead of failing.
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -184,7 +187,6 @@ fn models_fetch_takes_the_model_dir_from_its_variable() {
 }
 
 #[test]
-#[ignore = "needs the models wired into serve"]
 fn onnx_threads_is_a_deployment_flag_with_a_variable() {
     // TIM-98 lists ONNX threads under deployment, and TIM-96 pins it in
     // replay.
@@ -200,7 +202,7 @@ fn onnx_threads_is_a_deployment_flag_with_a_variable() {
 }
 
 #[test]
-#[ignore = "needs the models wired into serve"]
+#[ignore = "needs serve to load the models from the model dir when ASPHODEL_MODELS is unset"]
 fn an_empty_model_dir_stops_startup_naming_the_missing_file() {
     // Never a download: an empty dir is still empty afterwards, and stderr
     // names the file and the command that fills it.
@@ -221,7 +223,7 @@ fn an_empty_model_dir_stops_startup_naming_the_missing_file() {
 }
 
 #[test]
-#[ignore = "needs the models wired into serve"]
+#[ignore = "needs serve to load the models from the model dir when ASPHODEL_MODELS is unset"]
 fn a_model_dir_that_does_not_exist_stops_startup_without_creating_it() {
     let dir = TestDir::new();
     let models = dir.0.join("missing-models");
@@ -239,7 +241,6 @@ fn a_model_dir_that_does_not_exist_stops_startup_without_creating_it() {
 }
 
 #[test]
-#[ignore = "needs the models wired into serve"]
 fn fake_models_still_need_floors() {
     // ADR 0009: a missing floor for a configured model stops the daemon,
     // whichever models are configured.
@@ -260,7 +261,6 @@ fn fake_models_still_need_floors() {
 }
 
 #[test]
-#[ignore = "needs the models wired into serve"]
 fn fake_models_with_floors_start_and_show_in_the_resolved_config() {
     let dir = TestDir::new();
     let tuning = dir.floors_for_fakes();
@@ -278,7 +278,6 @@ fn fake_models_with_floors_start_and_show_in_the_resolved_config() {
 }
 
 #[test]
-#[ignore = "needs the models wired into serve"]
 fn a_floor_for_the_real_models_does_not_cover_the_fakes() {
     // Floors are keyed by the exact model string. A production tuning file
     // doesn't make a fake daemon start, so the switch can't hide a missing
@@ -303,7 +302,6 @@ fn a_floor_for_the_real_models_does_not_cover_the_fakes() {
 }
 
 #[test]
-#[ignore = "needs the models wired into serve"]
 fn the_llm_key_never_reaches_the_resolved_config_or_the_log() {
     let dir = TestDir::new();
     let tuning = dir.floors_for_fakes();

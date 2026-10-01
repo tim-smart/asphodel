@@ -21,10 +21,17 @@ use std::time::{Duration, Instant};
 const STARTUP: Duration = Duration::from_secs(10);
 
 /// `asphodel serve` with a clean environment, so the caller's `ASPHODEL_*`
-/// variables can't leak in.
-fn serve() -> Command {
+/// variables can't leak in. It runs on the fake models with a floor for
+/// each, because the daemon loads its models before it listens and the
+/// real ones aren't on a CI machine (TIM-105).
+fn serve(dir: &TestDir) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
-    command.env_clear().arg("serve");
+    command
+        .env_clear()
+        .env("ASPHODEL_MODELS", "fake")
+        .arg("serve")
+        .arg("--config")
+        .arg(dir.floors_for_fakes());
     command
 }
 
@@ -53,6 +60,19 @@ impl TestDir {
     fn socket(&self, name: &str) -> PathBuf {
         self.0.join(format!("{name}.sock"))
     }
+
+    /// A tuning file with a floor for each fake model, outside the data
+    /// dir so the store's files are all the data dir holds.
+    fn floors_for_fakes(&self) -> PathBuf {
+        let path = self.0.join("tuning.toml");
+        fs::write(
+            &path,
+            "[injection.reranker_floors]\n\"fake-reranker:v1\" = 0.0\n\
+             [reconcile.embedding_floors]\n\"fake-embedder:v1\" = 0.5\n",
+        )
+        .unwrap();
+        path
+    }
 }
 
 impl Drop for TestDir {
@@ -79,8 +99,8 @@ impl Drop for Daemon {
 
 /// Starts a daemon on `socket` and `data_dir` and collects its log up to the
 /// "listening" line. Panics if it exits or stalls first.
-fn start(data_dir: &Path, socket: &Path) -> Daemon {
-    let mut child = serve()
+fn start(dir: &TestDir, data_dir: &Path, socket: &Path) -> Daemon {
+    let mut child = serve(dir)
         .arg("--listen")
         .arg(format!("unix:{}", socket.display()))
         .arg("--data-dir")
@@ -231,7 +251,7 @@ impl Daemon {
 /// at the deadline so a daemon that wrongly starts cannot hang the suite.
 fn run_bounded(dir: &TestDir, name: &str, data_dir: &Path) -> (Option<ExitStatus>, String) {
     let log_path = dir.0.join(format!("{name}.stderr.log"));
-    let mut child = serve()
+    let mut child = serve(dir)
         .arg("--listen")
         .arg(format!("unix:{}", dir.socket(name).display()))
         .arg("--data-dir")
@@ -312,7 +332,7 @@ fn assert_wal(path: &Path, header: &Header) {
 fn the_store_is_one_sqlite_database_in_wal_mode_under_the_data_dir() {
     let dir = TestDir::new();
     let data = dir.data_dir();
-    let daemon = start(&data, &dir.socket("daemon"));
+    let daemon = start(&dir, &data, &dir.socket("daemon"));
     daemon.wait_ready();
 
     let files = sqlite_files(&data);
@@ -341,7 +361,7 @@ fn the_store_is_one_sqlite_database_in_wal_mode_under_the_data_dir() {
 fn a_restart_reopens_the_existing_database() {
     let dir = TestDir::new();
     let data = dir.data_dir();
-    let first = start(&data, &dir.socket("first"));
+    let first = start(&dir, &data, &dir.socket("first"));
     first.wait_ready();
     let created = sqlite_files(&data);
     assert_eq!(created.len(), 1, "{:?}", entries(&data));
@@ -350,7 +370,7 @@ fn a_restart_reopens_the_existing_database() {
 
     // Opening a store that is already at the current schema version is not
     // a migration: no second database and no pre-migration copy appears.
-    let second = start(&data, &dir.socket("second"));
+    let second = start(&dir, &data, &dir.socket("second"));
     second.wait_ready();
     assert_eq!(second.health().0, 200);
     let reopened = sqlite_files(&data);
@@ -367,7 +387,7 @@ fn a_restart_reopens_the_existing_database() {
 fn a_second_daemon_on_the_same_data_dir_is_refused() {
     let dir = TestDir::new();
     let data = dir.data_dir();
-    let first = start(&data, &dir.socket("first"));
+    let first = start(&dir, &data, &dir.socket("first"));
     first.wait_ready();
     let before = entries(&data);
 
@@ -409,11 +429,11 @@ fn the_lock_does_not_outlive_a_crashed_daemon() {
     // crash loop. SIGKILL runs no cleanup.
     let dir = TestDir::new();
     let data = dir.data_dir();
-    let first = start(&data, &dir.socket("first"));
+    let first = start(&dir, &data, &dir.socket("first"));
     first.wait_ready();
     first.crash();
 
-    let second = start(&data, &dir.socket("second"));
+    let second = start(&dir, &data, &dir.socket("second"));
     second.wait_ready();
     assert_eq!(second.health().0, 200);
 }
@@ -422,12 +442,12 @@ fn the_lock_does_not_outlive_a_crashed_daemon() {
 fn a_clean_stop_releases_the_lock() {
     let dir = TestDir::new();
     let data = dir.data_dir();
-    let first = start(&data, &dir.socket("first"));
+    let first = start(&dir, &data, &dir.socket("first"));
     first.wait_ready();
     let (status, log) = first.terminate();
     assert!(status.success(), "clean stop exited with {status}:\n{log}");
 
-    let second = start(&data, &dir.socket("second"));
+    let second = start(&dir, &data, &dir.socket("second"));
     second.wait_ready();
     assert_eq!(second.health().0, 200);
 }
@@ -496,7 +516,7 @@ fn a_pre_migration_copy_is_deleted_at_its_deadline_while_the_daemon_runs() {
     };
     let deadline = Instant::now() + LEAD;
 
-    let daemon = start(&data, &dir.socket("daemon"));
+    let daemon = start(&dir, &data, &dir.socket("daemon"));
     daemon.wait_ready();
     assert!(
         Instant::now() < deadline,
