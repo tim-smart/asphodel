@@ -1,0 +1,17 @@
+[package]
+name = "asphodel-core"
+description = "Asphodel's service layer: the store, the clock and the memory model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jiff.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

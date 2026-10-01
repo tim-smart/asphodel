@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/asphodel-core", "crates/asphodel"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/tim-smart/asphodel"
+
+[workspace.dependencies]
+asphodel-core = { path = "crates/asphodel-core" }
+
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+jiff = { version = "0.2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
