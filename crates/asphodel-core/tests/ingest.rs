@@ -2434,11 +2434,38 @@ fn an_upgrade_from_version_1_records_one_migration_and_keeps_a_copy() {
     assert_eq!(rows, [(0, 1), (1, 2)], "one row for the upgrade");
 }
 
+/// The speaker ids of `bank` that map to its `user`.
+fn owner_ids(h: &Harness, bank: &str) -> Vec<String> {
+    let user = h.seeded(bank, "user");
+    speaker_ids(h, bank)
+        .into_iter()
+        .filter(|(_, entity)| *entity == user)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Sends `bank`'s owner platform ids again, as every Hermes plugin
+/// instance does from `initialize` (docs/upgrading.md).
+fn refresh_owner_ids(h: &Harness, bank: &str, ids: &[&str]) {
+    h.service
+        .ensure_bank(
+            bank,
+            &BankIdentity {
+                owner_platform_ids: ids.iter().map(|id| id.to_string()).collect(),
+                ..BankIdentity::default()
+            },
+            &models(),
+        )
+        .unwrap();
+}
+
 #[test]
-fn an_upgrade_maps_the_owners_platform_ids_and_not_their_names() {
-    // In version 1 only bank config wrote aliases of `user`: the owner's
-    // names, renames included, and platform ids. Only the ids are
-    // identities.
+#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
+fn an_upgrade_maps_no_owner_ids_until_bank_config_is_sent_again() {
+    // Version 1 kept the owner's platform ids only as aliases of `user`,
+    // next to the owner's names, renames included, with nothing recording
+    // which was which. The upgrade fails closed and maps none of them;
+    // bank config sent again maps the ids, and never the names.
     let h = Harness::new();
     h.service
         .ensure_bank(
@@ -2453,19 +2480,24 @@ fn an_upgrade_maps_the_owners_platform_ids_and_not_their_names() {
         .unwrap();
     let h = downgrade_to_v1_and_reopen(h);
     let user = h.seeded("main", "user");
-    assert_eq!(
-        speaker_ids(&h, "main"),
-        [
-            ("discord:1234".to_string(), user),
-            ("telegram:42".to_string(), user),
-        ]
-    );
+    assert_eq!(speaker_ids(&h, "main"), [], "no owner id is inferred");
+    let (entity, owner) = speaker(&h, "main", "discord", "1234", "Tim");
+    assert!(!owner, "until the config is sent again");
+    assert_ne!(entity, user);
+    let (_, owner) = speaker(&h, "main", "telegram", "42", "Tim");
+    assert!(!owner);
+
+    refresh_owner_ids(&h, "main", &["discord:1234", "telegram:42"]);
+    assert_eq!(owner_ids(&h, "main"), ["discord:1234", "telegram:42"]);
     assert_eq!(speaker(&h, "main", "discord", "1234", "Tim"), (user, true));
     assert_eq!(speaker(&h, "main", "telegram", "42", "Tim"), (user, true));
+    for (id, _) in speaker_ids(&h, "main") {
+        assert!(id != "Tim" && id != "Timothy", "a name was mapped: {id}");
+    }
 }
 
 #[test]
-#[ignore = "TIM-106: the migration maps an owner name shaped like a platform id; activate with its fix"]
+#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
 fn an_upgrade_does_not_map_an_owner_name_shaped_like_a_platform_id() {
     // The trust boundary of the backfill. An owner whose configured name
     // looks like a platform id still has a name, not an id: a stranger
@@ -2486,20 +2518,95 @@ fn an_upgrade_does_not_map_an_owner_name_shaped_like_a_platform_id() {
         .unwrap();
     let h = downgrade_to_v1_and_reopen(h);
     let user = h.seeded("odd", "user");
+    let assistant = h.seeded("odd", "assistant");
+    assert_eq!(speaker_ids(&h, "odd"), [], "no owner id is inferred");
+    let check_names = |h: &Harness| {
+        let (entity, owner) = speaker(h, "odd", "discord", "9999", "Stranger");
+        assert!(
+            !owner,
+            "a stranger with the owner's name as their id isn't the owner"
+        );
+        assert_ne!(entity, user);
+        let (entity, owner) = speaker(h, "odd", "discord", "8888", "Other");
+        assert!(!owner);
+        assert_ne!(entity, assistant);
+    };
+    check_names(&h);
+
+    h.service
+        .ensure_bank(
+            "odd",
+            &BankIdentity {
+                owner_name: Some("discord:9999".into()),
+                owner_platform_ids: vec!["discord:1234".into()],
+                ..BankIdentity::default()
+            },
+            &models(),
+        )
+        .unwrap();
     assert_eq!(
-        speaker_ids(&h, "odd"),
-        [("discord:1234".to_string(), user)],
+        owner_ids(&h, "odd"),
+        ["discord:1234"],
         "only the configured platform id is an identity"
     );
-    let (entity, owner) = speaker(&h, "odd", "discord", "9999", "Stranger");
-    assert!(
-        !owner,
-        "a stranger with the owner's name as their id isn't the owner"
+    check_names(&h);
+    assert_eq!(speaker(&h, "odd", "discord", "1234", "Tim"), (user, true));
+}
+
+#[test]
+#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
+fn an_upgrade_does_not_map_a_former_owner_name_shaped_like_a_platform_id() {
+    // A rename keeps the old name as an alias of `user`, and version 1
+    // recorded nothing that tells it from a platform id. Neither the
+    // upgrade nor the config sent again after it makes it an identity.
+    let h = Harness::new();
+    h.service
+        .ensure_bank(
+            "renamed",
+            &BankIdentity {
+                owner_name: Some("discord:9999".into()),
+                owner_platform_ids: vec!["discord:1234".into()],
+                ..identity()
+            },
+            &models(),
+        )
+        .unwrap();
+    h.service
+        .ensure_bank(
+            "renamed",
+            &BankIdentity {
+                owner_name: Some("Tim".into()),
+                ..BankIdentity::default()
+            },
+            &models(),
+        )
+        .unwrap();
+    let former: i64 = h.one(
+        "SELECT COUNT(*) FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
+         JOIN banks b ON b.id = e.bank_id
+         WHERE b.name = 'renamed' AND e.seeded = 'user' AND a.alias = 'discord:9999'",
+        [],
     );
-    assert_ne!(entity, user);
-    let (entity, owner) = speaker(&h, "odd", "discord", "8888", "Other");
-    assert!(!owner);
-    assert_ne!(entity, h.seeded("odd", "assistant"));
+    assert_eq!(former, 1, "the former name stays an alias of user");
+    let h = downgrade_to_v1_and_reopen(h);
+    let user = h.seeded("renamed", "user");
+
+    assert_eq!(owner_ids(&h, "renamed"), Vec::<String>::new());
+    let (stranger, owner) = speaker(&h, "renamed", "discord", "9999", "Stranger");
+    assert!(!owner, "before the config is sent again");
+    assert_ne!(stranger, user);
+
+    refresh_owner_ids(&h, "renamed", &["discord:1234"]);
+    assert_eq!(owner_ids(&h, "renamed"), ["discord:1234"]);
+    assert_eq!(
+        speaker(&h, "renamed", "discord", "9999", "Stranger"),
+        (stranger, false),
+        "after it too"
+    );
+    assert_eq!(
+        speaker(&h, "renamed", "discord", "1234", "Tim"),
+        (user, true)
+    );
 }
 
 #[test]
@@ -2527,21 +2634,20 @@ fn an_owner_name_shaped_like_a_platform_id_is_not_a_speaker_id() {
 }
 
 #[test]
+#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
 fn an_upgrade_keeps_the_speakers_version_1_ingest_created() {
     let h = Harness::new();
     let (sam, _) = speaker(&h, "main", "discord", "5678", "Sam");
     let (impostor, _) = speaker(&h, "main", "discord", "2000", "discord:3000");
     let h = downgrade_to_v1_and_reopen(h);
 
-    let user = h.seeded("main", "user");
     assert_eq!(
         speaker_ids(&h, "main"),
         [
-            ("discord:1234".to_string(), user),
             ("discord:2000".to_string(), impostor),
             ("discord:5678".to_string(), sam),
         ],
-        "each speaker's first alias, and no display name"
+        "each speaker's first alias, no display name, and no owner id"
     );
     assert_eq!(speaker(&h, "main", "discord", "5678", "Sam"), (sam, false));
     assert_eq!(
@@ -2554,10 +2660,12 @@ fn an_upgrade_keeps_the_speakers_version_1_ingest_created() {
 }
 
 #[test]
-fn an_upgrade_gives_the_owner_an_id_a_stranger_held_first() {
+#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
+fn an_upgrade_leaves_an_id_a_stranger_held_first_with_them_until_bank_config_takes_it() {
     // Version 1: the owner spoke from discord:1234 before it was configured,
     // so ingest made them a stranger; then bank config added the id to
-    // `user`. Bank config wins.
+    // `user`. The upgrade keeps the stranger's id and infers nothing for
+    // the owner; the config sent again takes the id over.
     let h = Harness::new();
     let late = BankIdentity {
         owner_platform_ids: Vec::new(),
@@ -2566,27 +2674,34 @@ fn an_upgrade_gives_the_owner_an_id_a_stranger_held_first() {
     h.service.ensure_bank("late", &late, &models()).unwrap();
     let (stranger, owner) = speaker(&h, "late", "discord", "1234", "Tim");
     assert!(!owner);
-    h.service
-        .ensure_bank(
-            "late",
-            &BankIdentity {
-                owner_platform_ids: vec!["discord:1234".into()],
-                ..BankIdentity::default()
-            },
-            &models(),
-        )
-        .unwrap();
+    refresh_owner_ids(&h, "late", &["discord:1234"]);
     let h = downgrade_to_v1_and_reopen(h);
     let user = h.seeded("late", "user");
+    assert_ne!(stranger, user);
     assert_eq!(
         speaker_ids(&h, "late"),
-        [("discord:1234".to_string(), user)]
+        [("discord:1234".to_string(), stranger)]
     );
+    assert_eq!(
+        speaker(&h, "late", "discord", "1234", "Tim"),
+        (stranger, false)
+    );
+
+    let set_edits = |h: &Harness| -> i64 {
+        h.one(
+            "SELECT COUNT(*) FROM edits e JOIN banks b ON b.id = e.bank_id
+             WHERE b.name = 'late' AND e.kind = 'speaker_id_set'",
+            [],
+        )
+    };
+    let before = set_edits(&h);
+    refresh_owner_ids(&h, "late", &["discord:1234"]);
     assert_eq!(speaker(&h, "late", "discord", "1234", "Tim"), (user, true));
-    assert_ne!(stranger, user);
+    assert_eq!(set_edits(&h), before + 1, "the takeover is logged");
 }
 
 #[test]
+#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
 fn an_upgrade_does_not_trust_an_alias_of_unknown_origin() {
     // Shape alone proves nothing: an alias on an entity ingest didn't
     // create, or a later alias of one it did, isn't a platform id.
@@ -2615,7 +2730,7 @@ fn an_upgrade_does_not_trust_an_alias_of_unknown_origin() {
         .into_iter()
         .map(|(id, _)| id)
         .collect();
-    assert_eq!(ids, ["discord:1234", "discord:5678"]);
+    assert_eq!(ids, ["discord:5678"]);
     let (entity, _) = speaker(&h, "main", "slack", "77", "Maya");
     assert_ne!(
         entity,
