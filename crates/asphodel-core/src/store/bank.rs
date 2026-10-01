@@ -418,3 +418,28 @@ pub(crate) fn log_edit(
     )?;
     Ok(())
 }
+
+/// Logs an edit to a memory's metadata (TIM-90, "every edit logged").
+/// `details` holds ids, times and levels, never content.
+pub(crate) fn log_memory_edit(
+    tx: &Transaction<'_>,
+    store: &Store,
+    bank_id: i64,
+    kind: &str,
+    memory_id: i64,
+    details: &str,
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "INSERT INTO edits (uuid, bank_id, kind, memory_id, details, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        (
+            store.new_id().to_string(),
+            bank_id,
+            kind,
+            memory_id,
+            details,
+            micros(store.now()),
+        ),
+    )?;
+    Ok(())
+}

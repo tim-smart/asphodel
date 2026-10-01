@@ -1,6 +1,7 @@
-//! Extraction call 1: turning a chunk into claims and committing them.
+//! Extraction: turning a chunk into claims, reconciling them with what's
+//! stored, and committing the result.
 //!
-//! A leased chunk ([`crate::queue`]) goes through four steps:
+//! A leased chunk ([`crate::queue`]) goes through five steps:
 //!
 //! 1. **Input.** Code assembles what call 1 sees: the chunk's text, its
 //!    context (up to [`CONTEXT_TURNS`] earlier turns of the session, or the
@@ -16,23 +17,33 @@
 //!    weekday that doesn't match the date lowers window confidence, an RRULE
 //!    is kept only when it parses and recurs, and remember-this keeps a
 //!    memory only from the owner's own message (TIM-92, TIM-94 decision 1).
-//! 4. **Commit.** One transaction writes the memories and their vectors,
-//!    entity links, new entities and aliases as logged edits, the `created`
-//!    and `used` accesses, and marks the chunk extracted (TIM-90, ADR 0001).
+//! 4. **Reconciliation.** Code finds each claim's nearest stored memories,
+//!    and when one clears the floor or a claim signals a change, call 2
+//!    ([`call2_request`]) labels the claims against them
+//!    ([`reconcile`](self::reconcile), TIM-92, ADR 0005). Call 1's reply is
+//!    saved on the chunk first, so a failed call 2 is retried from it.
+//! 5. **Commit.** One transaction writes the new memories and their
+//!    vectors, entity links, new entities and aliases as logged edits, the
+//!    neighbours ended, retracted or refined and their logged edits, the
+//!    `created`, `mentioned_again`, `confirmed` and `used` accesses, and
+//!    marks the chunk extracted, dropping call 1's saved reply (TIM-90,
+//!    ADR 0001, ADR 0008).
 //!
-//! Reconciliation (call 2) comes in a later stage, so for now every claim
-//! that survives the checks becomes a new memory. A failure anywhere before
-//! the commit writes nothing but the queue's count of the failed attempt, so
-//! the chunk is retried in place.
+//! A failure anywhere before the commit writes nothing but the queue's
+//! count of the failed attempt and call 1's saved reply, so the chunk is
+//! retried in place.
 
+mod call2;
 mod claims;
 mod commit;
 mod input;
 mod prompt;
+mod reconcile;
 
 use jiff::Timestamp;
 use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::config::Tuning;
@@ -40,12 +51,45 @@ use crate::models::{Embedder, LlmClient, LlmError, ModelError};
 use crate::queue::{self, ChunkError, Failure, Lease, Leases, QueueError, SourceKind};
 use crate::store::{Store, StoreError, VectorIndex};
 
+pub use call2::call2_request;
 pub use prompt::call1_request;
 
 /// Call 1's template name and version, which replay's cassette keys include
 /// (TIM-96, decision 4).
 pub const CALL1_TEMPLATE: &str = "extract_claims";
 pub const CALL1_VERSION: u32 = 1;
+
+/// Call 2's template name and version, which replay's cassette keys include
+/// (TIM-96, decision 4).
+pub const CALL2_TEMPLATE: &str = "reconcile_claims";
+pub const CALL2_VERSION: u32 = 1;
+
+/// Neighbours kept per claim after fusing vector search and BM25 (TIM-92,
+/// "top 5 per claim, fused"). A flagged claim's entity-linked open tasks and
+/// current states come on top.
+pub const NEIGHBOURS_PER_CLAIM: usize = 5;
+
+/// Neighbours shown for the whole chunk, at most (TIM-92, "capped at about
+/// 40 per unit").
+pub const NEIGHBOUR_CAP: usize = 40;
+
+/// The edit log kinds reconciliation writes, each on the row of the memory
+/// it changed (`edits.memory_id`), with ids and times in `details` and never
+/// content (TIM-90, "every edit logged").
+pub const EDIT_ENDED: &str = "memory_ended";
+pub const EDIT_RETRACTED: &str = "memory_retracted";
+pub const EDIT_REFINED: &str = "memory_refined";
+pub const EDIT_SIGNIFICANCE_RAISED: &str = "significance_raised";
+/// A remember-this on a neighbour sets the owner's significance to kept.
+pub const EDIT_KEPT: &str = "memory_kept";
+/// The memory that ended another was retracted by a successor of the same
+/// kind, a reschedule, so the ended memory's `ended_by` and `valid_until`
+/// follow the successor (TIM-92, "Reopening").
+pub const EDIT_END_REPOINTED: &str = "end_repointed";
+/// The memory that ended another was retracted by a claim of another kind,
+/// such as "I haven't filed it after all", so the ended memory is open again
+/// (TIM-92, "Reopening").
+pub const EDIT_END_CLEARED: &str = "end_cleared";
 
 /// Earlier clean turns of the session given as context (TIM-92, "up to 3
 /// previous clean turns").
@@ -181,11 +225,90 @@ pub struct InContextMemory {
     pub content: String,
 }
 
+/// What a claim does to a neighbour (TIM-92, CONTEXT.md "Reconciliation").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Label {
+    MentionedAgain,
+    Confirmed,
+    Refines,
+    Retracts,
+    Ends,
+}
+
+impl Label {
+    pub const ALL: [Label; 5] = [
+        Label::MentionedAgain,
+        Label::Confirmed,
+        Label::Refines,
+        Label::Retracts,
+        Label::Ends,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Label::MentionedAgain => "mentioned_again",
+            Label::Confirmed => "confirmed",
+            Label::Refines => "refines",
+            Label::Retracts => "retracts",
+            Label::Ends => "ends",
+        }
+    }
+}
+
+/// Everything call 2 is given for one chunk. Handles are short ids local to
+/// the call, as in call 1: `c1`, `c2`, … for the claims in reply order, and
+/// `n1`, `n2`, … for the neighbours.
+///
+/// The reply is `{"claims": [{"claim": "c1", "labels": [{"neighbour": "n1",
+/// "label": "ends"}]}]}`. A claim left out, or given no labels, is new. A
+/// label naming a handle that isn't in the input is ignored, as call 1
+/// ignores an unknown entity handle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call2Input {
+    pub chunk: Uuid,
+    /// The claims that passed call 1's checks, in reply order.
+    pub claims: Vec<ReconcileClaim>,
+    /// Every claim's neighbours, each once, at most [`NEIGHBOUR_CAP`].
+    pub neighbours: Vec<NeighbourMemory>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReconcileClaim {
+    pub handle: String,
+    /// The claim's index in call 1's reply, as [`Dropped::claim`] counts it.
+    pub claim: usize,
+    pub content: String,
+    /// The source's `observed_at`, which decides direction.
+    pub observed_at: Timestamp,
+    /// `changes_something` or `remember_this`: the claim gets the wider
+    /// candidate set.
+    pub flagged: bool,
+    /// The handles of the neighbours found for this claim, best first.
+    pub neighbours: Vec<String>,
+}
+
+/// A stored memory shown to call 2. Faded and ended memories are shown,
+/// retracted ones aren't, and a hit on a superseded memory shows the head of
+/// its chain instead (TIM-92).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeighbourMemory {
+    pub handle: String,
+    pub memory: Uuid,
+    pub content: String,
+    pub kind: crate::strength::Kind,
+    pub observed_at: Timestamp,
+    /// Whether another memory has already ended it. Code rejects a newer
+    /// claim's labels on it.
+    pub ended: bool,
+}
+
 /// What one successful extraction committed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Extracted {
     pub chunk: Uuid,
-    /// The new memories, in claim order, without the dropped claims.
+    /// The new memories, in claim order, without the dropped claims and
+    /// without those reconciliation turned into accesses or nothing.
     pub memories: Vec<Uuid>,
     /// The in-context memories call 1 judged used, each once.
     pub used: Vec<Uuid>,
@@ -241,6 +364,20 @@ pub enum ExtractError {
         failure: Failure,
     },
 
+    /// Call 2 failed, and the queue counted it. Call 1's reply stays saved
+    /// on the chunk, so the retry starts at call 2.
+    #[error("call 2 failed: {error}")]
+    Call2 { error: LlmError, failure: Failure },
+
+    /// [`Service::call2_input`](crate::Service::call2_input) was given a
+    /// call 1 reply that doesn't fit its schema. Nothing is counted.
+    #[error("the call 1 reply given is invalid: {reason}")]
+    Rejected { reason: &'static str },
+
+    /// Embedding failed while previewing call 2's input. Nothing is counted.
+    #[error("embedding the claims failed: {error}")]
+    Model { error: ModelError },
+
     /// Embedding the new memories failed, and the queue counted it.
     #[error("embedding the new memories failed: {error}")]
     Embedding { error: ModelError, failure: Failure },
@@ -269,10 +406,13 @@ impl ExtractError {
     pub fn failure(&self) -> Option<Failure> {
         match self {
             ExtractError::Call1 { failure, .. }
+            | ExtractError::Call2 { failure, .. }
             | ExtractError::InvalidReply { failure, .. }
             | ExtractError::Embedding { failure, .. }
             | ExtractError::Commit { failure, .. } => Some(*failure),
             ExtractError::Held { .. }
+            | ExtractError::Rejected { .. }
+            | ExtractError::Model { .. }
             | ExtractError::NoModels
             | ExtractError::Queue(_)
             | ExtractError::Store(_) => None,
@@ -300,7 +440,41 @@ pub(crate) fn call1_input(
     Ok(input)
 }
 
-/// Runs call 1 on the leased chunk and commits what it found.
+/// Call 2's input for the leased chunk when call 1 replied `reply`, or
+/// `None` when call 2 won't run. Reads only.
+pub(crate) fn call2_input(
+    store: &Store,
+    leases: &Leases,
+    tuning: &Tuning,
+    embedder: &dyn Embedder,
+    lease: &Lease,
+    reply: &Value,
+    in_context: &[Uuid],
+) -> Result<Option<Call2Input>, ExtractError> {
+    queue::check_held(leases, lease)?;
+    let (input, unit) = {
+        let conn = store.connection();
+        input::assemble(&conn, tuning, store.now(), lease, in_context)?
+    };
+    let checked =
+        claims::check(reply, &input, &unit).map_err(|reason| ExtractError::Rejected { reason })?;
+    let vectors =
+        embed(store, embedder, &checked).map_err(|error| ExtractError::Model { error })?;
+    let conn = store.connection();
+    let search = reconcile::search(
+        &conn,
+        floor(tuning, embedder),
+        &input,
+        &unit,
+        &checked,
+        &vectors,
+    )?;
+    Ok(search.map(|search| search.input))
+}
+
+/// Runs call 1 on the leased chunk, or takes its saved reply, reconciles
+/// the claims with call 2 when they land near something stored, and commits
+/// the result.
 pub(crate) fn extract(
     store: &Store,
     leases: &Leases,
@@ -311,25 +485,37 @@ pub(crate) fn extract(
     in_context: &[Uuid],
 ) -> Result<Extracted, ExtractError> {
     queue::check_held(leases, &lease)?;
-    let (input, unit) = {
+    let (input, mut unit, saved) = {
         let conn = store.connection();
-        input::assemble(&conn, tuning, store.now(), &lease, in_context)?
+        let (input, unit) = input::assemble(&conn, tuning, store.now(), &lease, in_context)?;
+        let saved: Option<String> = conn.query_row(
+            "SELECT call1_output FROM chunks WHERE id = ?1",
+            [lease.chunk_id()],
+            |row| row.get(0),
+        )?;
+        (input, unit, saved)
     };
 
-    let request = call1_request(&input);
-    let response = match llm.complete(&request) {
-        Ok(response) => response,
-        Err(error) => {
-            let Some(chunk_error) = chunk_error(&error) else {
-                tracing::warn!(chunk = %input.chunk, %error, "the extraction queue holds");
-                return Err(ExtractError::Held { error });
-            };
-            let failure = queue::fail(store, leases, lease, chunk_error)?;
-            return Err(ExtractError::Call1 { error, failure });
-        }
+    // A saved reply means call 2 failed last time: resume from it, with the
+    // handles call 1 was given, rather than pay for call 1 again (TIM-92).
+    let saved = saved.and_then(|saved| restore(&saved, &mut unit));
+    let resumed = saved.is_some();
+    let reply = match saved {
+        Some(reply) => reply,
+        None => match llm.complete(&call1_request(&input)) {
+            Ok(response) => response.json,
+            Err(error) => {
+                let Some(chunk_error) = chunk_error(&error) else {
+                    tracing::warn!(chunk = %input.chunk, %error, "the extraction queue holds");
+                    return Err(ExtractError::Held { error });
+                };
+                let failure = queue::fail(store, leases, lease, chunk_error)?;
+                return Err(ExtractError::Call1 { error, failure });
+            }
+        },
     };
 
-    let checked = match claims::check(&response.json, &input, &unit) {
+    let checked = match claims::check(&reply, &input, &unit) {
         Ok(checked) => checked,
         Err(reason) => {
             let failure = queue::fail(store, leases, lease, INVALID_REPLY)?;
@@ -337,38 +523,63 @@ pub(crate) fn extract(
         }
     };
 
-    let contents: Vec<&str> = checked
-        .memories
-        .iter()
-        .map(|memory| memory.content.as_str())
-        .collect();
-    // Every vector must fit the index before the commit starts, so a bad
-    // embedder is an embedding failure rather than a failed commit.
-    let width = store.vectors().dimensions();
-    let vectors = match embedder.embed(&contents) {
-        Ok(vectors)
-            if vectors.len() == contents.len()
-                && vectors.iter().all(|vector| vector.len() == width) =>
-        {
-            vectors
-        }
-        Ok(_) => {
-            let error = ModelError::Inference {
-                model: embedder.model_id().to_owned(),
-                reason: format!(
-                    "returned vectors that don't fit the index: one {width}-wide vector per text"
-                ),
-            };
-            let failure = queue::fail(store, leases, lease, EMBEDDING)?;
-            return Err(ExtractError::Embedding { error, failure });
-        }
+    let vectors = match embed(store, embedder, &checked) {
+        Ok(vectors) => vectors,
         Err(error) => {
             let failure = queue::fail(store, leases, lease, EMBEDDING)?;
             return Err(ExtractError::Embedding { error, failure });
         }
     };
 
-    match commit::commit(store, &lease, &input, &unit, &checked, &vectors) {
+    let search = {
+        let conn = store.connection();
+        reconcile::search(
+            &conn,
+            floor(tuning, embedder),
+            &input,
+            &unit,
+            &checked,
+            &vectors,
+        )?
+    };
+    let plan = match &search {
+        None => reconcile::Plan::all_new(checked.memories.len()),
+        Some(search) => {
+            if !resumed {
+                save(store, &lease, &reply, &unit)?;
+            }
+            let labels = match llm.complete(&call2_request(&search.input)) {
+                Ok(response) => match call2::parse(&response.json) {
+                    Ok(labels) => labels,
+                    Err(reason) => {
+                        let failure = queue::fail(store, leases, lease, INVALID_REPLY)?;
+                        return Err(ExtractError::InvalidReply { reason, failure });
+                    }
+                },
+                Err(error) => {
+                    let Some(chunk_error) = chunk_error(&error) else {
+                        tracing::warn!(chunk = %input.chunk, %error, "the extraction queue holds");
+                        return Err(ExtractError::Held { error });
+                    };
+                    let failure = queue::fail(store, leases, lease, chunk_error)?;
+                    return Err(ExtractError::Call2 { error, failure });
+                }
+            };
+            reconcile::plan(search, &input, &unit, &checked, &labels)
+        }
+    };
+
+    let neighbours = search.as_ref().map(|search| search.neighbours.as_slice());
+    match commit::commit(
+        store,
+        &lease,
+        &input,
+        &unit,
+        &checked,
+        &vectors,
+        &plan,
+        neighbours.unwrap_or_default(),
+    ) {
         Ok(extracted) => {
             tracing::info!(
                 chunk = %extracted.chunk,
@@ -376,6 +587,9 @@ pub(crate) fn extract(
                 used = extracted.used.len(),
                 dropped = extracted.dropped.len(),
                 entities_created = extracted.entities_created.len(),
+                reconciled = search.is_some(),
+                accesses = plan.accesses.len(),
+                edits = plan.edits.len(),
                 "extracted a chunk"
             );
             Ok(extracted)
@@ -387,6 +601,93 @@ pub(crate) fn extract(
             Err(ExtractError::Commit { error, failure })
         }
     }
+}
+
+/// The reconcile floor for the embedder's exact model. The service refuses
+/// to open without one (ADR 0009), so a missing floor never runs call 2 on
+/// similarity alone.
+fn floor(tuning: &Tuning, embedder: &dyn Embedder) -> f64 {
+    tuning
+        .reconcile
+        .embedding_floors
+        .get(embedder.model_id())
+        .copied()
+        .unwrap_or(f64::INFINITY)
+}
+
+/// One vector per claim. Every vector must fit the index before the commit
+/// starts, so a bad embedder is an embedding failure rather than a failed
+/// commit.
+fn embed(
+    store: &Store,
+    embedder: &dyn Embedder,
+    checked: &claims::Checked,
+) -> Result<Vec<Vec<f32>>, ModelError> {
+    let contents: Vec<&str> = checked
+        .memories
+        .iter()
+        .map(|memory| memory.content.as_str())
+        .collect();
+    let width = store.vectors().dimensions();
+    let vectors = embedder.embed(&contents)?;
+    if vectors.len() == contents.len() && vectors.iter().all(|vector| vector.len() == width) {
+        Ok(vectors)
+    } else {
+        Err(ModelError::Inference {
+            model: embedder.model_id().to_owned(),
+            reason: format!(
+                "returned vectors that don't fit the index: one {width}-wide vector per text"
+            ),
+        })
+    }
+}
+
+/// Saves call 1's reply on the chunk before call 2 runs, with the handles
+/// it was given, so a retry resumes from it. The commit drops it (ADR 0008).
+fn save(store: &Store, lease: &Lease, reply: &Value, unit: &input::Unit) -> Result<(), StoreError> {
+    let saved = json!({
+        "reply": reply,
+        "entity_boundary": unit.entity_boundary,
+        "candidates": unit.candidates,
+        "in_context": unit
+            .in_context
+            .iter()
+            .map(|(handle, (id, uuid))| (handle.clone(), json!([id, uuid.to_string()])))
+            .collect::<serde_json::Map<_, _>>(),
+    });
+    store.connection().execute(
+        "UPDATE chunks SET call1_output = ?1 WHERE id = ?2",
+        (saved.to_string(), lease.chunk_id()),
+    )?;
+    Ok(())
+}
+
+/// Call 1's saved reply, with `unit` given back the handles call 1 saw.
+/// `None` when there's nothing usable saved, so call 1 runs again.
+fn restore(saved: &str, unit: &mut input::Unit) -> Option<Value> {
+    let mut saved: Value = serde_json::from_str(saved).ok()?;
+    let entity_boundary = saved.get("entity_boundary")?.as_i64()?;
+    let candidates = saved
+        .get("candidates")?
+        .as_object()?
+        .iter()
+        .map(|(handle, id)| Some((handle.clone(), id.as_i64()?)))
+        .collect::<Option<_>>()?;
+    let in_context = saved
+        .get("in_context")?
+        .as_object()?
+        .iter()
+        .map(|(handle, pair)| {
+            let id = pair.get(0)?.as_i64()?;
+            let uuid = pair.get(1)?.as_str()?.parse().ok()?;
+            Some((handle.clone(), (id, uuid)))
+        })
+        .collect::<Option<_>>()?;
+    let reply = saved.get_mut("reply")?.take();
+    unit.entity_boundary = entity_boundary;
+    unit.candidates = candidates;
+    unit.in_context = in_context;
+    Some(reply)
 }
 
 const INVALID_REPLY: ChunkError = ChunkError {

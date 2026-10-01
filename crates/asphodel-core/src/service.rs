@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::config::{ConfigError, Tuning};
-use crate::extraction::{Call1Input, ExtractError, Extracted};
+use crate::extraction::{Call1Input, Call2Input, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Turn};
 use crate::models::{LlmClient, Models};
 use crate::queue::{ChunkError, FailedChunk, Failure, Lease, Leases, QueueError};
@@ -182,7 +182,31 @@ impl Service {
         crate::extraction::call1_input(&self.store, &self.leases, &self.tuning, lease, in_context)
     }
 
-    /// Runs call 1 on the leased chunk with `llm` and commits what it found,
+    /// What call 2 would be given for the leased chunk if call 1 replied
+    /// `call1_reply`, or `None` when call 2 wouldn't run
+    /// ([`crate::extraction`]). Reads only; the lease is still held
+    /// afterwards. `in_context` is as for [`Service::call1_input`], since the
+    /// reply's `used_injected_ids` refer to its handles.
+    pub fn call2_input(
+        &self,
+        lease: &Lease,
+        call1_reply: &serde_json::Value,
+        in_context: &[Uuid],
+    ) -> Result<Option<Call2Input>, ExtractError> {
+        let models = self.models.as_ref().ok_or(ExtractError::NoModels)?;
+        crate::extraction::call2_input(
+            &self.store,
+            &self.leases,
+            &self.tuning,
+            models.embedder.as_ref(),
+            lease,
+            call1_reply,
+            in_context,
+        )
+    }
+
+    /// Runs call 1 on the leased chunk with `llm`, reconciles the claims
+    /// with call 2 when they land near something stored, and commits,
     /// marking the chunk extracted. A failure writes nothing but the queue's
     /// count of the attempt, so the chunk is retried in place; an LLM that
     /// can't be used at all holds the queue without counting

@@ -29,6 +29,9 @@ pub(super) struct Unit {
     pub source_id: i64,
     pub tz: TimeZone,
     pub ingested_at: Timestamp,
+    /// The document's id, for a document chunk: a neighbour from an earlier
+    /// version of the same document isn't mentioned again (TIM-92).
+    pub document_id: Option<String>,
     /// The turn number accesses from this chunk carry: for a turn, the
     /// bank's counter just after it was counted; for a document, the
     /// counter when it was ingested.
@@ -60,6 +63,7 @@ struct Source {
     source_id: i64,
     kind: SourceKind,
     session_id: Option<String>,
+    document_id: Option<String>,
     message_at: Option<i64>,
     observed_at: Timestamp,
     reference_date: Option<String>,
@@ -83,7 +87,7 @@ pub(super) fn assemble(
     let source = conn.query_row(
         "SELECT c.uuid, c.text, c.start_offset, s.id, s.kind, s.session_id, s.message_at,
                 s.observed_at, s.reference_date, s.reference_date_exact, s.timezone, s.author_id,
-                s.platform, s.text, s.ingested_at
+                s.platform, s.text, s.ingested_at, s.document_id
          FROM chunks c JOIN sources s ON s.id = c.source_id
          WHERE c.id = ?1",
         [chunk_id],
@@ -108,6 +112,7 @@ pub(super) fn assemble(
                 platform: row.get(12)?,
                 source_text: row.get(13)?,
                 ingested_at: timestamp(row.get(14)?),
+                document_id: row.get(15)?,
             })
         },
     )?;
@@ -220,6 +225,7 @@ pub(super) fn assemble(
         source_id: source.source_id,
         tz,
         ingested_at: source.ingested_at,
+        document_id: source.document_id.clone(),
         turn,
         entity_boundary,
         owner_speaking: speaker_ref.as_ref().is_some_and(|speaker| speaker.owner),
@@ -486,7 +492,7 @@ fn named_entities(
 
 /// `text` as one FTS5 phrase: in double quotes, with any double quote
 /// doubled, so nothing in it is read as query syntax.
-fn phrase(text: &str) -> String {
+pub(super) fn phrase(text: &str) -> String {
     format!("\"{}\"", text.replace('"', "\"\""))
 }
 
