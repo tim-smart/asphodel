@@ -50,9 +50,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use asphodel_core::extraction::{
-    CALL2_TEMPLATE, CALL2_VERSION, Call2Input, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT,
-    EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, ExtractError, Label, NEIGHBOUR_CAP,
-    NEIGHBOURS_PER_CLAIM, call2_request,
+    CALL2_TEMPLATE, CALL2_VERSION, Call2Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED,
+    EDIT_KEPT, EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, ExtractError, Label,
+    NEIGHBOUR_CAP, NEIGHBOURS_PER_CLAIM, call2_request,
 };
 
 // Fixtures
@@ -2344,9 +2344,6 @@ fn a_correction_of_another_kind_still_repoints_the_end() {
 // Denials (the TIM-92 amendment from TIM-108: six labels, and reopening by
 // label).
 
-/// The edit kind the amendment names for an end a denial clears.
-const END_CLEARED: &str = "end_cleared";
-
 /// A task and a state that `Tim filed the tax return.` (1 October) ended, as
 /// an earlier reconciliation would have left them, and a turn on 2 October
 /// queued after them. Returns the task, the state and the ending event.
@@ -2365,7 +2362,6 @@ fn filed_and_ended(h: &Harness, user: &str) -> (Uuid, Uuid, Uuid) {
 }
 
 #[test]
-#[ignore = "pending fix (TIM-108 denies decision): call 2 has no `denies` label yet"]
 fn the_call_2_schema_offers_denies_under_a_new_version() {
     // Six labels, with `denies` defined in the prompt and `retracts` the
     // choice when unsure; the template version moves with the prompt.
@@ -2416,7 +2412,6 @@ fn strings(value: &Value) -> BTreeSet<String> {
 }
 
 #[test]
-#[ignore = "pending fix (TIM-108 denies decision): call 2 has no `denies` label yet"]
 fn a_denial_reopens_everything_its_neighbour_ended() {
     // "I haven't filed it after all" says the filing never happened. The
     // filing is retracted like any other retraction, and everything it had
@@ -2448,7 +2443,7 @@ fn a_denial_reopens_everything_its_neighbour_ended() {
     assert_eq!(h.edits_on(filed, EDIT_RETRACTED), 1);
     for reopened in [task, worry] {
         assert_eq!(h.change(reopened), Change::untouched(), "{reopened}");
-        assert_eq!(h.edits_on(reopened, END_CLEARED), 1);
+        assert_eq!(h.edits_on(reopened, EDIT_END_CLEARED), 1);
         assert_eq!(h.edits_on(reopened, EDIT_END_REPOINTED), 0);
     }
     assert_eq!(h.change(denial), Change::untouched());
@@ -2490,12 +2485,11 @@ fn a_reschedule_still_repoints_everything_its_neighbour_ended() {
             "{ended}"
         );
         assert_eq!(h.edits_on(ended, EDIT_END_REPOINTED), 1);
-        assert_eq!(h.edits_on(ended, END_CLEARED), 0);
+        assert_eq!(h.edits_on(ended, EDIT_END_CLEARED), 0);
     }
 }
 
 #[test]
-#[ignore = "pending fix (TIM-108 denies decision): a refinement doesn't repoint its neighbour's ends yet"]
 fn a_refinement_of_an_ender_repoints_what_it_ended() {
     // The amendment repoints ends for a `refines` successor as for a
     // `retracts` one: the refined filing still completed the task.
@@ -2528,7 +2522,6 @@ fn a_refinement_of_an_ender_repoints_what_it_ended() {
 }
 
 #[test]
-#[ignore = "pending fix (TIM-108 denies decision): call 2 has no `denies` label yet"]
 fn an_older_denial_creates_nothing() {
     // Direction is unchanged: an old note denying the filing can't undo a
     // newer memory of it, and the task stays ended.
@@ -2566,7 +2559,6 @@ fn an_older_denial_creates_nothing() {
 }
 
 #[test]
-#[ignore = "pending fix (TIM-108 denies decision): call 2 has no `denies` label yet"]
 fn denies_on_an_ended_or_retracted_neighbour_is_rejected() {
     // Like every label but `mentioned_again` and `confirmed`, `denies` is
     // rejected on a neighbour already ended, or retracted earlier in the
