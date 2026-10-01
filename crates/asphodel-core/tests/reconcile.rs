@@ -74,6 +74,7 @@ const FLOOR: f64 = 0.5;
 
 const TEA: &str = "Tim likes green tea.";
 const TEA_AGAIN: &str = "Tim really likes green tea.";
+const TEA_A_LOT: &str = "Tim likes green tea a lot.";
 const ACME: &str = "Tim works at Acme.";
 const ACME_STILL: &str = "Tim still works at Acme.";
 const ACME_LEFT: &str = "Tim no longer works at Acme, having left in August 2026.";
@@ -103,8 +104,9 @@ const TRAVEL: &str = "Travel documents are sorted.";
 
 /// Pairs (claim, stored memory) that must clear [`FLOOR`] with the fake
 /// embedder, so call 2 runs on them.
-const ABOVE_FLOOR: [(&str, &str); 14] = [
+const ABOVE_FLOOR: [(&str, &str); 15] = [
     (TEA, TEA),
+    (TEA, TEA_A_LOT),
     (TEA_AGAIN, TEA),
     (ACME_STILL, ACME),
     (ACME, ACME),
@@ -265,6 +267,26 @@ impl Harness {
         service
             .ensure_bank_with_models("other", &identity())
             .unwrap();
+        Self {
+            service,
+            clock,
+            _dir: dir,
+        }
+    }
+
+    /// Drops the service, releasing the data-dir lock, and opens a new one on
+    /// the same data dir and clock: a daemon restart, which runs any pending
+    /// migration.
+    fn restart(self) -> Self {
+        let Harness {
+            service,
+            clock,
+            _dir: dir,
+        } = self;
+        drop(service);
+        let store = Store::open(&dir.data(), OpenOptions::default(), clock.clone()).unwrap();
+        let service =
+            Service::with_models(clock.clone(), store, tuning_for_fakes(), Models::fake()).unwrap();
         Self {
             service,
             clock,
@@ -1277,6 +1299,26 @@ fn a_hit_on_a_refined_memory_shows_its_chain_head() {
 }
 
 #[test]
+#[ignore = "pending fix (TIM-108 review): each retriever takes 20 raw hits before chains collapse"]
+fn a_long_chain_doesnt_crowd_out_another_neighbour() {
+    // The top five are distinct shown memories, not raw hits: 22 versions of
+    // one refined memory collapse to its head, and the next memory that
+    // matches still reaches call 2, or a repeat of it would become a
+    // duplicate rather than an access (ADR 0005).
+    let h = Harness::new();
+    let versions: Vec<Uuid> = (0..22).map(|_| h.fact(TEA)).collect();
+    for pair in versions.windows(2) {
+        h.mark_refined(pair[0], pair[1]);
+    }
+    let head = versions[versions.len() - 1];
+    let lot = h.fact(TEA_A_LOT);
+    owner_says(&h, "I like green tea.");
+    let input =
+        call2(&h, &reply(vec![claim(TEA, "fact", "I like green tea")])).expect("call 2 runs");
+    assert_eq!(shown_for(&input, 0), BTreeSet::from([head, lot]));
+}
+
+#[test]
 fn another_banks_memories_are_never_neighbours() {
     let h = Harness::new();
     h.insert_memory("other", TEA, "fact", "minor");
@@ -2152,6 +2194,59 @@ fn retracting_the_memory_that_ended_another_repoints_its_end() {
     assert_eq!(h.edits_on(task, EDIT_END_REPOINTED), 1);
 }
 
+#[test]
+#[ignore = "pending fix (TIM-108 review): reopening repoints only when the successor's kind matches"]
+fn a_correction_of_another_kind_still_repoints_the_end() {
+    // TIM-92, "Reopening": with a successor, ended_by is repointed. The
+    // correction below is filed as a fact rather than an event, but it still
+    // supersedes the memory that ended the task, so it is a successor and
+    // the task stays ended.
+    let h = Harness::new();
+    let task = h.insert_memory("main", TAX_TASK, "task", "notable");
+    let filed = h.insert_memory("main", TAX_FILED, "event", "minor");
+    h.set_valid_from(filed, local("2026-10-01T00:00"), "day");
+    h.mark_ended(task, filed, local("2026-10-01T00:00"), "day");
+    h.advance(24);
+    h.service
+        .ingest_turn(
+            "main",
+            &turn(
+                "s1",
+                "2026-10-02T06:30:00Z",
+                "Correction: I filed the tax return on 2 October, not the 1st.",
+                "Noted.",
+            ),
+        )
+        .unwrap();
+    let later = one_label(
+        &h,
+        reply(vec![changes(
+            claim(
+                TAX_FILED_LATER,
+                "fact",
+                "I filed the tax return on 2 October",
+            )
+            .with("valid_from", time("2026-10-02", "day")),
+        )]),
+        filed,
+        "retracts",
+    )
+    .memories[0];
+
+    assert_eq!(h.kind(later), "fact");
+    assert_eq!(h.change(filed).superseded_by, Some(later));
+    assert_eq!(
+        h.change(task),
+        Change {
+            valid_until: timed(local("2026-10-02T00:00"), "day"),
+            ended_by: Some(later),
+            ..Change::untouched()
+        }
+    );
+    assert_eq!(h.edits_on(task, EDIT_END_REPOINTED), 1);
+    assert_eq!(h.all_edits_on(task), 1);
+}
+
 // Mental models.
 
 #[test]
@@ -2196,6 +2291,153 @@ fn a_refinement_moves_mental_model_citations_to_the_head() {
         [],
     );
     assert_eq!(cited, vec![tokyo.to_string()]);
+}
+
+// The version 4 migration.
+
+/// One access row, every column.
+type AccessColumns = (i64, i64, i64, String, i64, i64, Option<i64>);
+
+fn access_rows(h: &Harness) -> Vec<AccessColumns> {
+    let store = h.service.store().unwrap();
+    let conn = store.connection();
+    let mut statement = conn
+        .prepare(
+            "SELECT id, bank_id, memory_id, kind, at, turn, source_id FROM accesses ORDER BY id",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// Puts the store back to schema version 3, as the version 3 binary would
+/// have left it: `accesses` with version 1's `UNIQUE (memory_id, turn)` and
+/// every row and id as they are, and one `migrations` row 0 to 3. Reopening
+/// migrates it to version 4.
+fn downgrade_accesses_to_v3(h: &Harness) {
+    h.service
+        .store()
+        .unwrap()
+        .connection()
+        .execute_batch(
+            "CREATE TABLE accesses_v3 (
+               id        INTEGER PRIMARY KEY AUTOINCREMENT,
+               bank_id   INTEGER NOT NULL REFERENCES banks(id),
+               memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+               kind      TEXT NOT NULL
+                           CHECK (kind IN ('created', 'used', 'mentioned_again', 'confirmed')),
+               at        INTEGER NOT NULL,
+               turn      INTEGER NOT NULL,
+               source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL,
+               UNIQUE (memory_id, turn)
+             );
+             INSERT INTO accesses_v3 SELECT id, bank_id, memory_id, kind, at, turn, source_id
+               FROM accesses;
+             DROP TABLE accesses;
+             ALTER TABLE accesses_v3 RENAME TO accesses;
+             CREATE INDEX accesses_memory_at ON accesses(memory_id, at);
+             DELETE FROM migrations;
+             INSERT INTO migrations (from_version, to_version, binary_version, started_at,
+                                     completed_at)
+               VALUES (0, 3, 'v3', 0, 0);
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+}
+
+/// A version 3 store holding a turn's mention, a document's mention and a
+/// used access whose source is gone, each in a turn of its own as version
+/// 3's key required. Returns the harness still at version 3, the two
+/// memories, and the rowids of the turn and the document.
+fn populated_v3() -> (Harness, Uuid, Uuid, i64, i64) {
+    let h = Harness::new();
+    let tea = h.fact(TEA);
+    let acme = h.fact(ACME);
+    let turn_source = owner_says(&h, "I like green tea.");
+    let doc_source =
+        ingest_doc(&h, &document("notes", "I work at Acme.", date(2026, 9, 25))).source;
+    let source_id =
+        |uuid: Uuid| -> i64 { h.one("SELECT id FROM sources WHERE uuid = ?1", [uuid.to_string()]) };
+    let (turn_id, doc_id) = (source_id(turn_source), source_id(doc_source));
+    insert_raw_access(&h, tea, "mentioned_again", 2, Some(turn_id)).unwrap();
+    insert_raw_access(&h, acme, "mentioned_again", 1, Some(doc_id)).unwrap();
+    insert_raw_access(&h, tea, "used", 3, None).unwrap();
+    insert_raw_access(&h, acme, "confirmed", 4, Some(turn_id)).unwrap();
+    downgrade_accesses_to_v3(&h);
+    (h, tea, acme, turn_id, doc_id)
+}
+
+fn insert_raw_access(
+    h: &Harness,
+    memory: Uuid,
+    kind: &str,
+    turn: i64,
+    source: Option<i64>,
+) -> rusqlite::Result<usize> {
+    h.service.store().unwrap().connection().execute(
+        "INSERT INTO accesses (bank_id, memory_id, kind, at, turn, source_id)
+         SELECT bank_id, id, ?2, ?3, ?4, ?5 FROM memories WHERE uuid = ?1",
+        (memory.to_string(), kind, micros(h.now()), turn, source),
+    )
+}
+
+#[test]
+fn a_populated_version_3_store_keeps_its_accesses_through_the_migration() {
+    let (h, tea, _acme, turn_id, doc_id) = populated_v3();
+    let before = access_rows(&h);
+    assert_eq!(before.len(), 6, "two created accesses and four more");
+
+    let h = h.restart();
+    {
+        let store = h.service.store().unwrap();
+        let applied = store.applied().expect("version 3 is migrated");
+        assert_eq!((applied.from, applied.to), (3, 4));
+    }
+    // Every row and id as it was.
+    assert_eq!(access_rows(&h), before);
+    let problems: Vec<String> = h.all("PRAGMA foreign_key_check", []);
+    assert!(problems.is_empty(), "{problems:?}");
+    let integrity: String = h.one("PRAGMA integrity_check", []);
+    assert_eq!(integrity, "ok");
+
+    // A turn keeps one access per memory per turn, with or without a source.
+    assert!(insert_raw_access(&h, tea, "confirmed", 2, Some(turn_id)).is_err());
+    assert!(insert_raw_access(&h, tea, "confirmed", 3, None).is_err());
+    // A document's access in a turn some other source already used lands,
+    // and a second one from the same document doesn't.
+    insert_raw_access(&h, tea, "mentioned_again", 2, Some(doc_id)).unwrap();
+    assert!(insert_raw_access(&h, tea, "confirmed", 2, Some(doc_id)).is_err());
+}
+
+#[test]
+#[ignore = "pending fix (TIM-108 review): the version 4 rebuild loses the AUTOINCREMENT high-water mark"]
+fn the_version_4_migration_never_reuses_an_access_id() {
+    // Rowids are AUTOINCREMENT so they are never reused (the schema's
+    // header). The newest access in the version 3 store is deleted, so only
+    // AUTOINCREMENT remembers its id; the rebuilt table must not hand it out
+    // again.
+    let (h, tea, _acme, _turn_id, _doc_id) = populated_v3();
+    insert_raw_access(&h, tea, "confirmed", 9, None).unwrap();
+    let highest: i64 = h.one("SELECT MAX(id) FROM accesses", []);
+    h.execute("DELETE FROM accesses WHERE id = ?1", [highest]);
+
+    let h = h.restart();
+    insert_raw_access(&h, tea, "confirmed", 10, None).unwrap();
+    let next: i64 = h.one("SELECT MAX(id) FROM accesses", []);
+    assert!(next > highest, "access id {next} reuses {highest} or below");
 }
 
 // Ordering and failures.
