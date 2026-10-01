@@ -123,7 +123,7 @@ An event that counts towards strength: a memory being created, used, mentioned a
 _Avoid_: Hit, retrieval, view, read
 
 **Used**:
-The kind of access where a reply actually relied on a recalled memory, as opposed to just being shown it.
+The kind of access where a reply actually relied on a recalled memory, or on a mental model entry that cites it, as opposed to just being shown it.
 _Avoid_: Retrieved, returned, injected
 
 **Mentioned again**:
@@ -143,7 +143,7 @@ The part of strength built up by accesses on separate occasions. It never goes d
 _Avoid_: Storage strength (outside the formula), permanence
 
 **Recall threshold**:
-The strength below which a memory is no longer injected by relevance. Explicit recall can still find it, and the agenda can still list it.
+The strength below which a memory is no longer injected by relevance, listed among the agenda's routines or undated tasks, or fed to a mental model. Explicit recall can still find it, and the dated agenda can still list it.
 _Avoid_: Cutoff, expiry threshold
 
 **Faded out**:
@@ -165,12 +165,24 @@ Recalled memories placed automatically into the agent's prompt before a turn, ch
 _Avoid_: Prefetch (that's the Hermes hook), context stuffing
 
 **Agenda**:
-The upcoming events, tasks due soon and recently overdue tasks, chosen by world time alone and kept in the agent's prompt for the day. It isn't recall, so the recall threshold doesn't apply to it.
+The upcoming events, tasks due soon and recently overdue tasks, chosen by world time alone, plus a few routines and undated open tasks chosen by strength, kept in the agent's prompt for the day. It isn't recall, and the recall threshold doesn't apply to its dated items.
 _Avoid_: Calendar, schedule, reminders
 
 **Mental model**:
-A document that an LLM writes and keeps up to date from memories, to answer a standing question such as "who is the user?".
+A document that an LLM keeps up to date from memories, to answer a standing question such as "who is the user?". It's made of entries that each cite the memories they rest on, and the memories always win: a cited memory that's forgotten, retracted or ended takes its entry with it.
 _Avoid_: Observation, reflection, summary, profile (a profile is one mental model)
+
+**Entry**:
+One sentence of a mental model, citing the memories it rests on. Only a refresh writes or rewords it, and code drops it when a cited memory goes.
+_Avoid_: Claim (that's an extraction term), line, bullet, block
+
+**Refresh**:
+Bringing a mental model up to date: one retrieval for its question, then one LLM call that returns edits to its entries. It runs once a day, and only when the selected memories have changed.
+_Avoid_: Reflect, consolidation, rebuild, regenerate
+
+**In context**:
+Said of a memory the agent can already see this session: injected earlier, listed in the agenda, returned by the recall tool, or cited by an injected mental model. It isn't injected again, and extraction checks it for use.
+_Avoid_: Loaded, seen, in the context window
 
 ## Sources and organisation
 
