@@ -846,6 +846,20 @@ fn reply(claims: Vec<Value>, used: &[&str]) -> Value {
     json!({"claims": claims, "used_injected_ids": used})
 }
 
+/// Extracts the head of `main`'s queue with call 1 answering `reply` and, if
+/// the claims land near something stored, call 2 labelling nothing, so each
+/// claim stays new. "Tim said One." and "Tim said Two." are close enough under
+/// the fake embedder for reconciliation (TIM-108) to compare them.
+fn extract_unlabelled(h: &Harness, reply: Value) -> Extracted {
+    run(
+        h,
+        "main",
+        &FakeLlm::scripted(MODEL, vec![reply, json!({"claims": []})]),
+        &[],
+    )
+    .unwrap()
+}
+
 // Schema helpers.
 
 fn keys(value: &Value) -> BTreeSet<String> {
@@ -2787,7 +2801,7 @@ fn accesses_carry_the_turn_number_of_their_source() {
     // Turns first in observed_at order, then the document (TIM-92).
     let mut turns = Vec::new();
     for quote in ["One", "Two", "Three", "Doc"] {
-        let memory = extract(
+        let memory = extract_unlabelled(
             &h,
             reply(
                 vec![claim(&format!("Tim said {quote}."), "fact", quote)],
@@ -3330,7 +3344,7 @@ fn a_forget_request_and_a_duplicate_keep_turn_numbers_in_step() {
 
     let mut turns = Vec::new();
     for quote in ["One", "Two"] {
-        let memory = extract(
+        let memory = extract_unlabelled(
             &h,
             reply(
                 vec![claim(&format!("Tim said {quote}."), "fact", quote)],
