@@ -2413,8 +2413,8 @@ fn an_upgrade_from_version_1_records_one_migration_and_keeps_a_copy() {
     let h = downgrade_to_v1_and_reopen(Harness::new());
     let store = h.service.store().unwrap();
     let applied = store.applied().expect("version 1 is migrated");
-    assert_eq!((applied.from, applied.to), (1, 2));
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!((applied.from, applied.to), (1, migrations::SCHEMA_VERSION));
+    assert_eq!(store.schema_version().unwrap(), migrations::SCHEMA_VERSION);
     let copy = migrations::copy_path(&h.dir.data(), 1);
     assert_eq!(applied.copy.as_deref(), Some(copy.as_path()));
     assert!(
@@ -2431,7 +2431,11 @@ fn an_upgrade_from_version_1_records_one_migration_and_keeps_a_copy() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(rows, [(0, 1), (1, 2)], "one row for the upgrade");
+    assert_eq!(
+        rows,
+        [(0, 1), (1, i64::from(migrations::SCHEMA_VERSION))],
+        "one row for the upgrade"
+    );
 }
 
 /// The speaker ids of `bank` that map to its `user`.

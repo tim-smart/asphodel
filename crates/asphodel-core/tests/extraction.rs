@@ -3464,7 +3464,6 @@ fn found_in(h: &Harness, message: &str) -> BTreeSet<Uuid> {
 }
 
 #[test]
-#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
 fn a_decomposed_speaker_name_is_found_by_its_composed_spelling() {
     let h = Harness::new();
     let nikos = speaker_named(&h, "7777", NIKOS_DECOMPOSED);
@@ -3472,7 +3471,6 @@ fn a_decomposed_speaker_name_is_found_by_its_composed_spelling() {
 }
 
 #[test]
-#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
 fn a_decomposed_speaker_name_is_found_by_the_same_spelling() {
     let h = Harness::new();
     let nikos = speaker_named(&h, "7777", NIKOS_DECOMPOSED);
@@ -3493,7 +3491,6 @@ fn a_composed_speaker_name_is_found_by_its_decomposed_spelling() {
 }
 
 #[test]
-#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
 fn speaker_names_and_aliases_are_stored_composed() {
     let h = Harness::new();
     let nikos = speaker_named(&h, "7777", NIKOS_DECOMPOSED);
@@ -3507,7 +3504,6 @@ fn speaker_names_and_aliases_are_stored_composed() {
 }
 
 #[test]
-#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
 fn bank_config_stores_names_and_aliases_composed() {
     let h = Harness::new();
     let zoe_decomposed = "Ζωη\u{301}";
@@ -3541,7 +3537,6 @@ fn bank_config_stores_names_and_aliases_composed() {
 }
 
 #[test]
-#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
 fn a_proposed_entity_is_stored_composed_and_found_again() {
     let h = Harness::new();
     let created = golden(
@@ -3597,7 +3592,6 @@ fn log_alias_added(h: &Harness, entity: Uuid, alias: &str) -> String {
 }
 
 #[test]
-#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
 fn an_upgrade_composes_stored_aliases_and_merges_equivalent_ones() {
     let h = Harness::new();
     // As a version 2 store could hold them: one entity with both spellings
@@ -3636,7 +3630,6 @@ fn an_upgrade_composes_stored_aliases_and_merges_equivalent_ones() {
 }
 
 #[test]
-#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
 fn an_upgraded_decomposed_alias_is_found_by_the_same_spelling() {
     let h = Harness::new();
     let zoe = h.insert_entity("main", "Ζωη\u{301}", "person", &["Ζωη\u{301}"]);

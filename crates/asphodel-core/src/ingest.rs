@@ -38,7 +38,7 @@ use uuid::Uuid;
 use crate::chunking::{chunk_hash, hex, split_document};
 use crate::secrets::{SecretKind, scan};
 use crate::store::bank::{add_alias, log_edit, set_speaker_id};
-use crate::store::{Store, StoreError, micros};
+use crate::store::{Store, StoreError, micros, nfc};
 
 /// Hermes' `turn_author` (TIM-94, decision 1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -555,12 +555,14 @@ fn resolve_speaker(
         });
     }
 
-    let name = author
+    // Composed, as every entity name and alias is stored (schema version 3).
+    let name = nfc(author
         .name
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .unwrap_or(&platform_id);
+        .unwrap_or(&platform_id));
+    let name = name.as_str();
     let uuid = store.new_id();
     let now = micros(store.now());
     tx.execute(

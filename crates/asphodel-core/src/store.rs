@@ -32,8 +32,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Once};
 
 use jiff::Timestamp;
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use tracing::{debug, info, warn};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::clock::Clock;
@@ -411,5 +413,20 @@ fn configure(conn: &Connection) -> Result<(), StoreError> {
          PRAGMA secure_delete = ON;
          PRAGMA temp_store = MEMORY;",
     )?;
+    // Migration 3 composes the aliases and entity names earlier versions
+    // stored, and SQLite has no NFC of its own.
+    conn.create_scalar_function(
+        "asphodel_nfc",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| Ok(ctx.get::<Option<String>>(0)?.map(|text| nfc(&text))),
+    )?;
     Ok(())
+}
+
+/// `text` in Unicode NFC. Aliases and entity names are always stored
+/// composed, because extraction searches its passages composed and the
+/// alias FTS only folds Latin diacritics (schema version 3).
+pub(crate) fn nfc(text: &str) -> String {
+    text.nfc().collect()
 }

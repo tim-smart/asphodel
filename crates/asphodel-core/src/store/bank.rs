@@ -14,7 +14,7 @@ use rusqlite::{OptionalExtension, Transaction};
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::{Store, StoreError, micros};
+use super::{Store, StoreError, micros, nfc};
 
 /// The timezone a bank gets when none was given at creation.
 pub const DEFAULT_TIMEZONE: &str = "UTC";
@@ -275,7 +275,14 @@ fn seed_entity(
     tx.execute(
         "INSERT INTO entities (uuid, bank_id, name, kind, seeded, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-        (store.new_id().to_string(), bank_id, name, kind, seeded, now),
+        (
+            store.new_id().to_string(),
+            bank_id,
+            nfc(name),
+            kind,
+            seeded,
+            now,
+        ),
     )?;
     Ok(tx.last_insert_rowid())
 }
@@ -297,6 +304,8 @@ fn rename_entity(
     entity_id: i64,
     name: &str,
 ) -> Result<(), BankError> {
+    let name = nfc(name);
+    let name = name.as_str();
     let current: String = tx.query_row(
         "SELECT name FROM entities WHERE id = ?1",
         [entity_id],
@@ -321,7 +330,8 @@ pub(crate) fn add_alias(
     entity_id: i64,
     alias: &str,
 ) -> Result<(), rusqlite::Error> {
-    let alias = alias.trim();
+    // Composed, so the alias FTS indexes it as extraction searches it.
+    let alias = nfc(alias.trim());
     if alias.is_empty() {
         return Ok(());
     }

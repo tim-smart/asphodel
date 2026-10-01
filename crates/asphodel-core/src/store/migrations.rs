@@ -21,7 +21,7 @@ use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
 
 /// The schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// How long a pre-migration copy is kept after its migration completes.
 pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
@@ -31,6 +31,10 @@ pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../../migrations/0001_initial.sql")),
     (2, include_str!("../../migrations/0002_speaker_ids.sql")),
+    (
+        3,
+        include_str!("../../migrations/0003_composed_aliases.sql"),
+    ),
 ];
 
 /// What one open applied.

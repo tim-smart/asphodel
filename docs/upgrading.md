@@ -28,3 +28,25 @@ platform ids, before Hermes ingests more turns:
 
 The daemon logs a warning when it migrates a store from version 1, as a
 reminder.
+
+## Schema version 3: aliases and entity names in NFC
+
+Extraction searches the alias index with its passages in Unicode NFC, so
+aliases have to be stored composed too. Outside Latin script the alias
+index doesn't fold a combining accent away, and an alias stored decomposed
+(a letter followed by a combining accent) would never be found
+("Extraction call 1", the TIM-107 review). From version 3, every alias and
+entity name is written in NFC.
+
+The migration composes what earlier versions stored. No action is needed.
+
+- Every alias and entity name is rewritten in NFC. The alias index is
+  updated row by row as they change.
+- Two aliases of one entity that are canonically the same, such as the
+  composed and decomposed spellings of "Νίκος", become one row. The oldest
+  stays.
+- Each `alias_added` edit that named a removed row is repointed to the row
+  that stayed, so every edit still names an alias of its entity. Undoing any
+  of them removes that alias, which is the one each of them added.
+
+As with every migration, the daemon copies the database before it runs.

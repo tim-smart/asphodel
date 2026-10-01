@@ -27,6 +27,7 @@ use super::{Call1Input, DropReason, Dropped, EntityKind};
 use crate::constants::{Significance, Volatility};
 use crate::ingest::TURN_SEPARATOR;
 use crate::queue::SourceKind;
+use crate::store::nfc;
 
 #[derive(Debug, Deserialize)]
 struct Reply {
@@ -540,8 +541,12 @@ fn recurs(rule: &str, start: Timestamp, tz_name: &str, tz: &TimeZone, from: Time
     !set.after(after).before(before).all(1).dates.is_empty()
 }
 
+/// A link as code resolved it. Names and surface forms are composed (NFC)
+/// here, so the entity it may create, the exact alias lookup at commit, the
+/// aliases it adds and the stored surface form all use the form aliases are
+/// stored in (schema version 3).
 fn resolve_link(link: RawLink, unit: &Unit) -> Option<Link> {
-    let surface_form = non_empty(Some(link.surface_form));
+    let surface_form = non_empty(Some(nfc(&link.surface_form)));
     if let Some(handle) = link.entity {
         let entity = *unit.candidates.get(handle.trim())?;
         return Some(Link::Known {
@@ -549,7 +554,7 @@ fn resolve_link(link: RawLink, unit: &Unit) -> Option<Link> {
             surface_form,
         });
     }
-    let name = non_empty(link.new_name)?;
+    let name = non_empty(link.new_name.as_deref().map(nfc))?;
     Some(Link::Proposed {
         name,
         kind: link.new_kind?,
