@@ -1,0 +1,2196 @@
+//! The agenda, mental models and the system prompt block, checked against
+//! "Agenda, mental models and the system prompt block" (TIM-111) and the
+//! decisions it rests on: "Mental models: synthesized documents over
+//! memories" (TIM-95, its resolution and its amendment, "refreshes follow
+//! conversations"), "Retrieval and ranking" (TIM-93, decisions 7 and 12 and
+//! both TIM-95 amendments), "API surface and Hermes transport" (TIM-94,
+//! decision 8, as amended by TIM-95), and ADRs 0001 and 0007. Where a
+//! ticket comment and the ADR disagree, the ADR wins; where two comments
+//! disagree, the later amendment wins.
+//!
+//! These tests drive the service on a `SimulatedClock` and refresh models
+//! with `FakeLlm`. Triggers go through the write paths that exist:
+//! extraction (call 1, and call 2 for retractions, endings and
+//! refinements), `keep`, and the owner's model edits. Memories a test only
+//! needs present are inserted directly, as an earlier extraction would have
+//! left them.
+//!
+//! The API under test is `asphodel_core::mental_models`,
+//! `asphodel_core::agenda`, `asphodel_core::system_prompt` and the
+//! `Service` methods over them. Where the tickets left a detail open, the
+//! tests follow the choice the implementation documents: inclusive agenda
+//! bounds, disabled models outside the budget, and code dropping entries
+//! whose memories left a refresh's input.
+//!
+//! Every service here runs on a `SimulatedClock` stopped at 20:00 on
+//! Thursday 1 October 2026 in Auckland (UTC+13) unless a test advances it.
+//! The next 04:00 there is 15:00 UTC the same day, and the next local
+//! midnight is 11:00 UTC.
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use asphodel_core::ingest::Turn;
+use asphodel_core::models::{Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmError, Models};
+use asphodel_core::retrieval::{PrefetchRequest, estimate_tokens};
+use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME, PROFILE_QUESTION};
+use asphodel_core::store::{OpenOptions, Store, VectorIndex, micros};
+use asphodel_core::strength::Kind;
+use asphodel_core::{Service, SimulatedClock, Tuning};
+use jiff::civil::DateTime;
+use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp};
+use rusqlite::types::FromSql;
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use asphodel_core::agenda::Agenda;
+use asphodel_core::mental_models::{
+    Applied, Entry, FailureKind, Model, ModelEdit, ModelError, ModelSpec, Outcome,
+    REFRESH_TEMPLATE, RefreshInput, Refreshes, RejectReason,
+};
+use asphodel_core::system_prompt::Block;
+
+// Fixtures
+
+const START: &str = "2026-10-01T07:00:00Z";
+const TZ: &str = "Pacific/Auckland";
+const BANK: &str = "main";
+const MODEL: &str = "fake-llm";
+
+/// The next 04:00 in Auckland after [`START`], when the daily sweep runs.
+const SWEEP: &str = "2026-10-01T15:00:00Z";
+
+/// When fixture memories were said, unless a test says otherwise.
+const EARLIER: &str = "2026-09-01T00:00:00Z";
+
+/// Long enough ago that a trivial memory said then is below τ.
+const LONG_AGO: &str = "2021-01-01T00:00:00Z";
+
+const BERLIN: &str = "Tim lives in Berlin.";
+const MOVED: &str = "Tim moved out of Berlin and now lives in Lisbon.";
+const MAYA: &str = "Tim's daughter is called Maya.";
+const MIA: &str = "Tim's daughter is called Mia.";
+const JAPAN: &str = "Tim is going to Japan in 2027.";
+const TOKYO: &str = "Tim is going to Tokyo, Japan in April 2027.";
+const CAT: &str = "Tim's cat is called Miso.";
+const TEA: &str = "Tim likes green tea.";
+
+fn at(text: &str) -> Timestamp {
+    text.parse().unwrap()
+}
+
+/// A local date-time in `TZ` as the instant stored for it.
+fn local(datetime: &str) -> Timestamp {
+    datetime
+        .parse::<DateTime>()
+        .unwrap()
+        .to_zoned(TimeZone::get(TZ).unwrap())
+        .unwrap()
+        .timestamp()
+}
+
+fn minutes(n: i64) -> SignedDuration {
+    SignedDuration::from_mins(n)
+}
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "asphodel-models-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn next_uuid() -> Uuid {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    Uuid::from_u128((0xf4_u128 << 120) | u128::from(NEXT.fetch_add(1, Ordering::Relaxed)))
+}
+
+/// A memory to insert. `Default` is a notable fact said at [`EARLIER`],
+/// with high window confidence and its `created` access then.
+#[derive(Clone)]
+struct Memory {
+    content: &'static str,
+    kind: &'static str,
+    significance: &'static str,
+    observed_at: Timestamp,
+    valid_from: Option<(Timestamp, &'static str)>,
+    valid_until: Option<(Timestamp, &'static str)>,
+    due_at: Option<(Timestamp, &'static str)>,
+    volatility: Option<&'static str>,
+    recurrence_text: Option<&'static str>,
+    recurrence_rrule: Option<&'static str>,
+    recurrence_start: Option<(Timestamp, &'static str)>,
+    retracted: bool,
+    hidden: bool,
+}
+
+impl Default for Memory {
+    fn default() -> Self {
+        Self {
+            content: "",
+            kind: "fact",
+            significance: "notable",
+            observed_at: at(EARLIER),
+            valid_from: None,
+            valid_until: None,
+            due_at: None,
+            volatility: None,
+            recurrence_text: None,
+            recurrence_rrule: None,
+            recurrence_start: None,
+            retracted: false,
+            hidden: false,
+        }
+    }
+}
+
+fn fact(content: &'static str) -> Memory {
+    Memory {
+        content,
+        ..Memory::default()
+    }
+}
+
+/// A trivial memory said long enough ago to be below τ.
+fn faded(memory: Memory) -> Memory {
+    Memory {
+        significance: "trivial",
+        observed_at: at(LONG_AGO),
+        ..memory
+    }
+}
+
+/// An event starting at `when` (local), to the day.
+fn event(content: &'static str, when: &str) -> Memory {
+    Memory {
+        content,
+        kind: "event",
+        valid_from: Some((local(when), "day")),
+        ..Memory::default()
+    }
+}
+
+/// An open task due at `when` (local), to the day.
+fn task_due(content: &'static str, when: &str) -> Memory {
+    Memory {
+        content,
+        kind: "task",
+        due_at: Some((local(when), "day")),
+        ..Memory::default()
+    }
+}
+
+/// An open task with no due date.
+fn task(content: &'static str) -> Memory {
+    Memory {
+        content,
+        kind: "task",
+        ..Memory::default()
+    }
+}
+
+/// A recurring memory with `rrule`, first occurring at `start` (local).
+fn recurring(content: &'static str, rrule: Option<&'static str>, start: &str) -> Memory {
+    Memory {
+        content,
+        kind: "recurring",
+        recurrence_text: Some(content),
+        recurrence_rrule: rrule,
+        recurrence_start: rrule.map(|_| (local(start), "day")),
+        ..Memory::default()
+    }
+}
+
+struct Harness {
+    service: Service,
+    clock: Arc<SimulatedClock>,
+    tuning: Tuning,
+    chunk: i64,
+    _dir: TestDir,
+}
+
+impl Harness {
+    fn new() -> Self {
+        Self::with_tuning("")
+    }
+
+    /// `extra` is more tuning TOML, appended to the floors the fakes need.
+    fn with_tuning(extra: &str) -> Self {
+        let tuning = Tuning::from_toml(&format!(
+            "[injection.reranker_floors]\n\"{}\" = 1.0\n\
+             [reconcile.embedding_floors]\n\"{}\" = 0.5\n{extra}",
+            FakeReranker::MODEL_ID,
+            FakeEmbedder::MODEL_ID,
+        ))
+        .unwrap();
+        let dir = TestDir::new();
+        let clock = Arc::new(SimulatedClock::new(at(START)));
+        let store = Store::open(&dir.0, OpenOptions::default(), clock.clone()).unwrap();
+        let service =
+            Service::with_models(clock.clone(), store, tuning.clone(), Models::fake()).unwrap();
+        service
+            .ensure_bank_with_models(
+                BANK,
+                &BankIdentity {
+                    owner_name: Some("Tim".into()),
+                    assistant_name: Some("Hermes".into()),
+                    timezone: Some(TZ.into()),
+                    ..BankIdentity::default()
+                },
+            )
+            .unwrap();
+        // The chunk fixture memories rest on: a turn said at EARLIER, taken
+        // off the queue as if extracted.
+        service
+            .ingest_turn(BANK, &turn("fixtures", at(EARLIER), "Fixtures."))
+            .unwrap();
+        let mut harness = Self {
+            service,
+            clock,
+            tuning,
+            chunk: 0,
+            _dir: dir,
+        };
+        harness.chunk = harness.one("SELECT id FROM chunks", []);
+        harness.execute("DELETE FROM extraction_queue", []);
+        harness
+    }
+
+    /// The daemon restarting: the service and its in-memory state (sessions,
+    /// the block cache, pending debounces) go; the store stays.
+    fn restart(self) -> Self {
+        let Self {
+            service,
+            clock,
+            tuning,
+            chunk,
+            _dir,
+        } = self;
+        drop(service);
+        let store = Store::open(&_dir.0, OpenOptions::default(), clock.clone()).unwrap();
+        let service =
+            Service::with_models(clock.clone(), store, tuning.clone(), Models::fake()).unwrap();
+        Self {
+            service,
+            clock,
+            tuning,
+            chunk,
+            _dir,
+        }
+    }
+
+    fn now(&self) -> Timestamp {
+        self.service.now()
+    }
+
+    fn advance(&self, by: SignedDuration) {
+        self.clock.advance(by);
+    }
+
+    fn set(&self, to: Timestamp) {
+        self.clock.set(to);
+    }
+
+    fn one<T: FromSql, P: rusqlite::Params>(&self, sql: &str, params: P) -> T {
+        self.service
+            .store()
+            .unwrap()
+            .connection()
+            .query_row(sql, params, |row| row.get(0))
+            .unwrap()
+    }
+
+    fn execute<P: rusqlite::Params>(&self, sql: &str, params: P) -> usize {
+        self.service
+            .store()
+            .unwrap()
+            .connection()
+            .execute(sql, params)
+            .unwrap()
+    }
+
+    fn bank_id(&self) -> i64 {
+        self.one("SELECT id FROM banks WHERE name = ?1", [BANK])
+    }
+
+    fn rowid(&self, memory: Uuid) -> i64 {
+        self.one(
+            "SELECT id FROM memories WHERE uuid = ?1",
+            [memory.to_string()],
+        )
+    }
+
+    fn insert(&self, memory: Memory) -> Uuid {
+        let uuid = next_uuid();
+        let bank_id = self.bank_id();
+        let now = micros(self.now());
+        let stamp = |t: Option<(Timestamp, &'static str)>| {
+            (
+                t.map(|(at, _)| micros(at)),
+                t.map(|(_, precision)| precision),
+            )
+        };
+        let (valid_from, valid_from_precision) = stamp(memory.valid_from);
+        let (valid_until, valid_until_precision) = stamp(memory.valid_until);
+        let (due_at, due_at_precision) = stamp(memory.due_at);
+        let (recurrence_start, recurrence_start_precision) = stamp(memory.recurrence_start);
+        let store = self.service.store().unwrap();
+        let conn = store.connection();
+        conn.execute(
+            "INSERT INTO memories (uuid, bank_id, content, kind, significance, chunk_id,
+                                   source_start, source_end, observed_at, valid_from,
+                                   valid_from_precision, valid_until, valid_until_precision,
+                                   window_confidence, due_at, due_at_precision, volatility,
+                                   recurrence_text, recurrence_rrule, recurrence_start,
+                                   recurrence_start_precision, invalidated_at, hidden_at,
+                                   created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 9, ?7, ?8, ?9, ?10, ?11, 'high', ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)",
+            rusqlite::params![
+                uuid.to_string(),
+                bank_id,
+                memory.content,
+                memory.kind,
+                memory.significance,
+                self.chunk,
+                micros(memory.observed_at),
+                valid_from,
+                valid_from_precision,
+                valid_until,
+                valid_until_precision,
+                due_at,
+                due_at_precision,
+                memory.volatility,
+                memory.recurrence_text,
+                memory.recurrence_rrule,
+                recurrence_start,
+                recurrence_start_precision,
+                memory.retracted.then_some(now),
+                memory.hidden.then_some(now),
+                now,
+            ],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        let vector = FakeEmbedder.embed(&[memory.content]).unwrap().remove(0);
+        store.vectors().upsert(&conn, bank_id, id, &vector).unwrap();
+        conn.execute(
+            "INSERT INTO accesses (bank_id, memory_id, kind, at, turn)
+             VALUES (?1, ?2, 'created', ?3, 0)",
+            (bank_id, id, micros(memory.observed_at)),
+        )
+        .unwrap();
+        uuid
+    }
+
+    /// `memory` ended by `by` at `until`, as reconciliation leaves it.
+    fn mark_ended(&self, memory: Uuid, by: Uuid, until: Timestamp) {
+        self.execute(
+            "UPDATE memories SET valid_until = ?2, valid_until_precision = 'day', ended_by = ?3
+             WHERE id = ?1",
+            (self.rowid(memory), micros(until), self.rowid(by)),
+        );
+    }
+
+    /// The owner says `quote` a minute ago in session `chat`, and the turn is
+    /// extracted with call 1 finding `claim`. Call 2, if the claim lands
+    /// near something stored, labels nothing. Returns the new memory.
+    fn says(&self, claim: Value) -> Uuid {
+        self.ingest_said(&claim);
+        let llm = FakeLlm::scripted(
+            MODEL,
+            vec![
+                json!({"claims": [claim], "used_injected_ids": []}),
+                json!({"claims": []}),
+            ],
+        );
+        let extracted = self.service.extract_next(BANK, &llm).unwrap();
+        extracted.expect("the turn was queued").memories[0]
+    }
+
+    /// As [`Harness::says`], with call 2 labelling the claim `label` on
+    /// `neighbour`: `retracts`, `ends` or `refines`.
+    fn says_changing(&self, claim: Value, neighbour: Uuid, label: &str) -> Uuid {
+        self.ingest_said(&claim);
+        let call1 = json!({"claims": [claim], "used_injected_ids": []});
+        let (claim_handle, neighbour_handle) = {
+            let lease = self.service.claim_chunk(BANK).unwrap().expect("queued");
+            let input = self
+                .service
+                .call2_input(&lease, &call1, &[])
+                .unwrap()
+                .expect("call 2 runs");
+            let neighbour = input
+                .neighbours
+                .iter()
+                .find(|n| n.memory == neighbour)
+                .expect("the memory is a neighbour")
+                .handle
+                .clone();
+            (input.claims[0].handle.clone(), neighbour)
+        };
+        let llm = FakeLlm::scripted(
+            MODEL,
+            vec![
+                call1,
+                json!({"claims": [{
+                    "claim": claim_handle,
+                    "labels": [{"neighbour": neighbour_handle, "label": label}],
+                }]}),
+            ],
+        );
+        let extracted = self.service.extract_next(BANK, &llm).unwrap();
+        extracted.expect("the turn was queued").memories[0]
+    }
+
+    fn ingest_said(&self, claim: &Value) {
+        let quote = claim["quote"].as_str().unwrap();
+        self.service
+            .ingest_turn(BANK, &turn("chat", self.now() - minutes(1), quote))
+            .unwrap();
+    }
+
+    fn keep(&self, memory: Uuid) {
+        self.service.keep(BANK, &[memory.to_string()]).unwrap();
+    }
+
+    fn profile(&self) -> Model {
+        self.model(PROFILE_NAME)
+    }
+
+    fn model(&self, name: &str) -> Model {
+        self.service
+            .list_models(BANK)
+            .unwrap()
+            .into_iter()
+            .find(|model| model.name == name)
+            .unwrap_or_else(|| panic!("no model {name}"))
+    }
+
+    fn input(&self, name: &str) -> RefreshInput {
+        self.service.refresh_input(BANK, name).unwrap()
+    }
+
+    /// Forces a refresh of `name` whose reply adds one entry per
+    /// `(text, cites)`, and returns what it applied.
+    fn refresh_adding(&self, name: &str, entries: &[(&str, &[Uuid])]) -> Applied {
+        let input = self.input(name);
+        let operations = entries
+            .iter()
+            .map(|(text, cites)| add(text, &handles(&input, cites)))
+            .collect();
+        let llm = FakeLlm::scripted(MODEL, vec![reply(operations)]);
+        match self.service.refresh_model(BANK, name, &llm, true).unwrap() {
+            Outcome::Applied(applied) => applied,
+            other => panic!("the refresh didn't apply: {other:?}"),
+        }
+    }
+
+    /// Runs every refresh due now with `llm`.
+    fn tick(&self, llm: &FakeLlm) -> Refreshes {
+        self.service.run_refreshes(llm).unwrap()
+    }
+
+    fn block(&self, session: Option<&str>) -> Block {
+        self.service.system_prompt(BANK, session).unwrap()
+    }
+
+    fn agenda(&self) -> Agenda {
+        self.service.agenda(BANK).unwrap()
+    }
+
+    fn in_context(&self, session: &str) -> Vec<Uuid> {
+        self.service.in_context(BANK, session).unwrap()
+    }
+
+    fn accesses(&self) -> i64 {
+        self.one("SELECT COUNT(*) FROM accesses", [])
+    }
+
+    fn used(&self, memory: Uuid) -> i64 {
+        self.one(
+            "SELECT COUNT(*) FROM accesses WHERE memory_id = ?1 AND kind = 'used'",
+            [self.rowid(memory)],
+        )
+    }
+}
+
+/// The owner's turn on the CLI: no author.
+fn turn(session: &str, message_at: Timestamp, user: &str) -> Turn {
+    Turn {
+        session_id: session.into(),
+        message_at,
+        timezone: Some(TZ.into()),
+        user_text: user.into(),
+        assistant_text: "Noted.".into(),
+        author: None,
+        platform: Some("cli".into()),
+        recall_id: None,
+        forget_requested: false,
+    }
+}
+
+/// Call 1's claim: the sentence is also the quote, as the owner said it.
+fn claim(content: &str, kind: &str, significance: &str) -> Value {
+    json!({
+        "content": content,
+        "kind": kind,
+        "quote": content,
+        "significance": significance,
+        "remember_this": false,
+        "changes_something": false,
+        "valid_from": null,
+        "valid_until": null,
+        "window_confidence": "high",
+        "until_event": null,
+        "due_at": null,
+        "volatility": null,
+        "recurrence_text": null,
+        "recurrence_rrule": null,
+        "recurrence_start": null,
+        "entities": [],
+    })
+}
+
+fn notable(content: &str) -> Value {
+    claim(content, "fact", "notable")
+}
+
+trait With {
+    fn with(self, key: &str, value: Value) -> Value;
+}
+
+impl With for Value {
+    fn with(mut self, key: &str, value: Value) -> Value {
+        self[key] = value;
+        self
+    }
+}
+
+// The refresh reply.
+
+fn reply(operations: Vec<Value>) -> Value {
+    json!({"operations": operations})
+}
+
+fn add(text: &str, cites: &[String]) -> Value {
+    json!({"op": "add", "text": text, "cites": cites})
+}
+
+fn edit(entry: &str, text: &str, cites: &[String]) -> Value {
+    json!({"op": "edit", "entry": entry, "text": text, "cites": cites})
+}
+
+fn remove(entry: &str) -> Value {
+    json!({"op": "remove", "entry": entry})
+}
+
+/// An LLM that answers every refresh with no operations.
+fn quiet_llm(calls: usize) -> FakeLlm {
+    FakeLlm::scripted(MODEL, vec![reply(vec![]); calls])
+}
+
+fn handle(input: &RefreshInput, memory: Uuid) -> String {
+    input
+        .memories
+        .iter()
+        .find(|m| m.memory == memory)
+        .unwrap_or_else(|| panic!("{memory} is in the refresh input"))
+        .handle
+        .clone()
+}
+
+fn handles(input: &RefreshInput, memories: &[Uuid]) -> Vec<String> {
+    memories.iter().map(|m| handle(input, *m)).collect()
+}
+
+fn entry_handle(input: &RefreshInput, entry: Uuid) -> String {
+    input
+        .entries
+        .iter()
+        .find(|e| e.entry == entry)
+        .unwrap_or_else(|| panic!("{entry} is in the refresh input"))
+        .handle
+        .clone()
+}
+
+fn inputs(input: &RefreshInput) -> BTreeSet<Uuid> {
+    input.memories.iter().map(|m| m.memory).collect()
+}
+
+fn texts(model: &Model) -> Vec<&str> {
+    model.entries.iter().map(|e| e.text.as_str()).collect()
+}
+
+fn refresh_calls(llm: &FakeLlm) -> usize {
+    llm.requests()
+        .iter()
+        .filter(|r| r.template.name == REFRESH_TEMPLATE)
+        .count()
+}
+
+fn plans_model() -> ModelSpec {
+    ModelSpec {
+        name: "Plans".into(),
+        question: "Where is Tim going and when?".into(),
+        kinds: vec![Kind::Event],
+        entity: None,
+        min_volatility: None,
+        max_tokens: 100,
+        enabled: true,
+    }
+}
+
+// Refresh triggers and scheduling (TIM-95 amendment, decision 1; ADR 0007)
+
+#[test]
+fn a_notable_memory_triggers_a_refresh_five_minutes_later() {
+    let h = Harness::new();
+    let said = h.now();
+    h.says(notable(TEA));
+
+    h.advance(minutes(4) + SignedDuration::from_secs(59));
+    let llm = quiet_llm(1);
+    let early = h.tick(&llm);
+    assert!(early.ran.is_empty());
+    assert_eq!(refresh_calls(&llm), 0);
+    assert_eq!(early.next_due, Some(said + minutes(5)));
+
+    h.set(said + minutes(5));
+    let ran = h.tick(&llm);
+    assert_eq!(ran.ran.len(), 1);
+    assert_eq!(ran.ran[0].model, PROFILE_NAME);
+    assert_eq!(refresh_calls(&llm), 1);
+    assert_eq!(h.profile().last_refreshed_at, Some(said + minutes(5)));
+}
+
+#[test]
+fn each_trigger_pushes_the_refresh_back_but_never_past_thirty_minutes() {
+    // A long conversation that keeps adding notable facts never goes quiet,
+    // so the debounce is capped 30 minutes after the first trigger.
+    let h = Harness::new();
+    let first = h.now();
+    let llm = quiet_llm(1);
+    for (n, content) in [
+        "Tim plays the cello.",
+        "Tim keeps bees.",
+        "Tim grows chillies.",
+        "Tim restores old radios.",
+        "Tim speaks Portuguese.",
+        "Tim runs on Sundays.",
+        "Tim volunteers at the library.",
+        "Tim collects maps.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        h.set(first + minutes(4 * n as i64));
+        h.says(notable(content));
+        h.advance(minutes(1));
+        assert!(h.tick(&llm).ran.is_empty(), "refreshed after trigger {n}");
+    }
+    // The last trigger was at +28 minutes, so the debounce alone would wait
+    // until +33.
+    h.set(first + minutes(30) - SignedDuration::from_secs(1));
+    assert!(h.tick(&llm).ran.is_empty());
+    h.set(first + minutes(30));
+    assert_eq!(h.tick(&llm).ran.len(), 1);
+    assert_eq!(refresh_calls(&llm), 1);
+}
+
+#[test]
+fn a_memory_below_the_trigger_level_waits_for_the_sweep() {
+    let h = Harness::new();
+    h.says(claim(TEA, "fact", "minor"));
+    h.advance(minutes(5));
+    let llm = quiet_llm(1);
+    let refreshes = h.tick(&llm);
+    assert!(refreshes.ran.is_empty());
+    assert_eq!(refreshes.next_due, Some(at(SWEEP)));
+
+    // The sweep lets minor additions in (TIM-95 amendment, decision 1).
+    h.set(at(SWEEP));
+    assert_eq!(h.tick(&llm).ran.len(), 1);
+    assert_eq!(refresh_calls(&llm), 1);
+    assert!(llm.requests()[0].user.contains(TEA));
+}
+
+#[test]
+fn the_trigger_level_is_tuned() {
+    let h = Harness::with_tuning("[mental_models]\ntrigger_level = \"major\"\n");
+    h.says(notable(TEA));
+    h.advance(minutes(5));
+    assert!(h.tick(&quiet_llm(1)).ran.is_empty());
+
+    h.says(claim("Tim is allergic to penicillin.", "fact", "major"));
+    h.advance(minutes(5));
+    assert_eq!(h.tick(&quiet_llm(1)).ran.len(), 1);
+}
+
+#[test]
+fn a_memory_the_models_filters_leave_out_triggers_nothing() {
+    // The profile takes facts and states of volatility weeks or slower.
+    let h = Harness::new();
+    h.says(claim("Tim went to the cinema.", "event", "major"));
+    h.says(claim("Tim is tired.", "state", "major").with("volatility", json!("days")));
+    h.advance(minutes(5));
+    assert!(h.tick(&quiet_llm(1)).ran.is_empty());
+
+    h.says(
+        claim("Tim is training for a marathon.", "state", "notable")
+            .with("volatility", json!("months")),
+    );
+    h.advance(minutes(5));
+    assert_eq!(h.tick(&quiet_llm(1)).ran.len(), 1);
+}
+
+#[test]
+fn keeping_a_memory_triggers_a_refresh() {
+    let h = Harness::new();
+    let tea = h.insert(Memory {
+        significance: "minor",
+        ..fact(TEA)
+    });
+    let kept = h.now();
+    h.keep(tea);
+    h.advance(minutes(5));
+    let llm = quiet_llm(1);
+    let ran = h.tick(&llm);
+    assert_eq!(ran.ran.len(), 1);
+    assert_eq!(h.profile().last_refreshed_at, Some(kept + minutes(5)));
+}
+
+#[test]
+fn an_owner_edit_triggers_a_refresh_that_isnt_skipped() {
+    // The question is in the fingerprint, so the same memories still get an
+    // LLM call (TIM-95, decision 7).
+    let h = Harness::new();
+    h.insert(fact(TEA));
+    h.refresh_adding(PROFILE_NAME, &[]);
+    let before = h.input(PROFILE_NAME).fingerprint;
+
+    h.service
+        .edit_model(
+            BANK,
+            PROFILE_NAME,
+            &ModelEdit {
+                question: Some("What does Tim like to drink?".into()),
+                ..ModelEdit::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(h.input(PROFILE_NAME).fingerprint, before);
+
+    h.advance(minutes(30));
+    let llm = quiet_llm(1);
+    let ran = h.tick(&llm);
+    assert_eq!(ran.ran.len(), 1);
+    assert!(matches!(ran.ran[0].outcome, Outcome::Applied(_)));
+    assert!(
+        llm.requests()[0]
+            .user
+            .contains("What does Tim like to drink?")
+    );
+}
+
+#[test]
+fn resizing_a_model_changes_its_fingerprint() {
+    let h = Harness::new();
+    let before = h.input(PROFILE_NAME).fingerprint;
+    h.service
+        .edit_model(
+            BANK,
+            PROFILE_NAME,
+            &ModelEdit {
+                max_tokens: Some(400),
+                ..ModelEdit::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(h.input(PROFILE_NAME).fingerprint, before);
+}
+
+#[test]
+fn a_model_is_refreshed_at_most_every_thirty_minutes() {
+    let h = Harness::new();
+    h.says(notable(TEA));
+    h.advance(minutes(5));
+    let llm = quiet_llm(2);
+    assert_eq!(h.tick(&llm).ran.len(), 1);
+    let refreshed = h.now();
+
+    h.advance(minutes(1));
+    h.says(notable("Tim keeps bees."));
+    h.set(refreshed + minutes(6));
+    let waiting = h.tick(&llm);
+    assert!(
+        waiting.ran.is_empty(),
+        "the debounce alone would run it now"
+    );
+    assert_eq!(waiting.next_due, Some(refreshed + minutes(30)));
+
+    h.set(refreshed + minutes(30));
+    assert_eq!(h.tick(&llm).ran.len(), 1);
+    assert_eq!(refresh_calls(&llm), 2);
+}
+
+#[test]
+fn a_failed_refresh_is_retried_after_thirty_minutes_not_at_the_next_trigger() {
+    let h = Harness::new();
+    h.says(notable(TEA));
+    h.advance(minutes(5));
+    let failed_at = h.now();
+    let down = FakeLlm::failing(MODEL, || LlmError::Transport {
+        reason: "connection refused".into(),
+    });
+    let ran = h.service.run_refreshes(&down).unwrap();
+    assert_eq!(ran.ran[0].outcome, Outcome::Failed(FailureKind::Llm));
+    let profile = h.profile();
+    assert_eq!(profile.last_error, Some(FailureKind::Llm));
+    assert_eq!(profile.last_error_at, Some(failed_at));
+    assert_eq!(profile.last_refreshed_at, None);
+
+    h.advance(minutes(1));
+    h.says(notable("Tim keeps bees."));
+    h.set(failed_at + minutes(6));
+    let llm = quiet_llm(1);
+    let waiting = h.tick(&llm);
+    assert!(waiting.ran.is_empty());
+    assert_eq!(waiting.next_due, Some(failed_at + minutes(30)));
+
+    h.set(failed_at + minutes(30));
+    assert_eq!(h.tick(&llm).ran.len(), 1);
+    let profile = h.profile();
+    assert_eq!(profile.last_error, None);
+    assert_eq!(profile.last_refreshed_at, Some(failed_at + minutes(30)));
+}
+
+#[test]
+fn the_daily_sweep_runs_at_four_bank_local() {
+    let h = Harness::new();
+    h.insert(fact(TEA));
+    assert_eq!(h.tick(&quiet_llm(1)).next_due, Some(at(SWEEP)));
+
+    h.set(at(SWEEP) - SignedDuration::from_secs(1));
+    let llm = quiet_llm(2);
+    assert!(h.tick(&llm).ran.is_empty());
+    h.set(at(SWEEP));
+    assert_eq!(h.tick(&llm).ran.len(), 1);
+    assert_eq!(refresh_calls(&llm), 1);
+
+    // The next one is 04:00 the next local day.
+    assert_eq!(
+        h.tick(&llm).next_due,
+        Some(at(SWEEP) + SignedDuration::from_hours(24))
+    );
+}
+
+#[test]
+fn the_sweep_time_is_tuned() {
+    let h = Harness::with_tuning("[mental_models]\nsweep_time = \"05:30\"\n");
+    assert_eq!(
+        h.tick(&quiet_llm(1)).next_due,
+        Some(local("2026-10-02T05:30"))
+    );
+}
+
+#[test]
+fn the_sweep_skips_a_model_whose_inputs_havent_changed() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+
+    h.set(at(SWEEP));
+    let llm = quiet_llm(1);
+    let ran = h.tick(&llm);
+    assert_eq!(ran.ran.len(), 1);
+    assert_eq!(ran.ran[0].outcome, Outcome::Unchanged);
+    assert_eq!(refresh_calls(&llm), 0);
+}
+
+#[test]
+fn a_disabled_model_is_never_refreshed() {
+    let h = Harness::new();
+    h.service
+        .edit_model(
+            BANK,
+            PROFILE_NAME,
+            &ModelEdit {
+                enabled: Some(false),
+                ..ModelEdit::default()
+            },
+        )
+        .unwrap();
+    h.says(notable(TEA));
+    h.advance(minutes(5));
+    let llm = quiet_llm(1);
+    assert!(h.tick(&llm).ran.is_empty());
+    h.set(at(SWEEP));
+    assert!(h.tick(&llm).ran.is_empty());
+    assert_eq!(refresh_calls(&llm), 0);
+}
+
+#[test]
+fn a_refresh_never_runs_inside_a_block_fetch() {
+    // The plugin fetches the block with a 2 s budget (TIM-95, decision 7).
+    let h = Harness::new();
+    h.says(notable(TEA));
+    h.advance(minutes(10));
+    h.block(Some("s1"));
+    assert_eq!(h.profile().last_refreshed_at, None);
+}
+
+// The refresh input and the fingerprint (TIM-95, decisions 3 and 7)
+
+#[test]
+fn a_refresh_selects_current_memories_above_tau_that_pass_the_filters() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let marathon = h.insert(Memory {
+        kind: "state",
+        volatility: Some("months"),
+        ..fact("Tim is training for a marathon.")
+    });
+    let sleepy = h.insert(Memory {
+        kind: "state",
+        volatility: Some("days"),
+        ..fact("Tim is sleepy.")
+    });
+    let no_volatility = h.insert(Memory {
+        kind: "state",
+        ..fact("Tim is between jobs.")
+    });
+    let cinema = h.insert(event("Tim is going to the cinema.", "2026-10-03T00:00"));
+    let gone = h.insert(faded(fact("Tim once tried surfing in Raglan.")));
+    let wrong = h.insert(Memory {
+        retracted: true,
+        ..fact("Tim's sister is called Ana.")
+    });
+    let hidden = h.insert(Memory {
+        hidden: true,
+        ..fact("Tim's bike is a Brompton.")
+    });
+    let berlin = h.insert(fact(BERLIN));
+    let lisbon = h.insert(fact("Tim lives in Lisbon."));
+    h.mark_ended(berlin, lisbon, local("2026-09-12T00:00"));
+
+    let selected = inputs(&h.input(PROFILE_NAME));
+    assert!(selected.contains(&tea));
+    assert!(selected.contains(&marathon));
+    assert!(selected.contains(&no_volatility), "null volatility passes");
+    assert!(selected.contains(&lisbon));
+    for (memory, why) in [
+        (sleepy, "faster than weeks"),
+        (cinema, "an event"),
+        (gone, "below τ"),
+        (wrong, "retracted"),
+        (hidden, "forgotten"),
+        (berlin, "ended"),
+    ] {
+        assert!(
+            !selected.contains(&memory),
+            "selected a memory that's {why}"
+        );
+    }
+}
+
+#[test]
+fn a_cited_memory_stays_in_the_input_past_the_top_sixty() {
+    // Keeping cited memories stops one that slips from 60th to 61st from
+    // being removed and added back on alternate refreshes.
+    let h = Harness::new();
+    // No word in common with the question, like the facts below, so it
+    // ranks below every one of them on strength alone.
+    let weak = h.insert(fact("Tim's cat Miso sleeps."));
+    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[weak])]);
+    const STRONG: [&str; 65] = [
+        "Fact 1.", "Fact 2.", "Fact 3.", "Fact 4.", "Fact 5.", "Fact 6.", "Fact 7.", "Fact 8.",
+        "Fact 9.", "Fact 10.", "Fact 11.", "Fact 12.", "Fact 13.", "Fact 14.", "Fact 15.",
+        "Fact 16.", "Fact 17.", "Fact 18.", "Fact 19.", "Fact 20.", "Fact 21.", "Fact 22.",
+        "Fact 23.", "Fact 24.", "Fact 25.", "Fact 26.", "Fact 27.", "Fact 28.", "Fact 29.",
+        "Fact 30.", "Fact 31.", "Fact 32.", "Fact 33.", "Fact 34.", "Fact 35.", "Fact 36.",
+        "Fact 37.", "Fact 38.", "Fact 39.", "Fact 40.", "Fact 41.", "Fact 42.", "Fact 43.",
+        "Fact 44.", "Fact 45.", "Fact 46.", "Fact 47.", "Fact 48.", "Fact 49.", "Fact 50.",
+        "Fact 51.", "Fact 52.", "Fact 53.", "Fact 54.", "Fact 55.", "Fact 56.", "Fact 57.",
+        "Fact 58.", "Fact 59.", "Fact 60.", "Fact 61.", "Fact 62.", "Fact 63.", "Fact 64.",
+        "Fact 65.",
+    ];
+    for content in STRONG {
+        h.insert(Memory {
+            significance: "critical",
+            ..fact(content)
+        });
+    }
+    let input = h.input(PROFILE_NAME);
+    assert_eq!(input.memories.len(), 61, "the top 60 and the cited one");
+    assert!(inputs(&input).contains(&weak));
+}
+
+#[test]
+fn a_refresh_request_carries_the_question_the_entries_the_memories_and_max_tokens() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let cat = h.insert(fact(CAT));
+    h.refresh_adding(PROFILE_NAME, &[("Tim drinks green tea.", &[tea])]);
+    let llm = quiet_llm(1);
+    h.service
+        .refresh_model(BANK, PROFILE_NAME, &llm, true)
+        .unwrap();
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1, "one synthesis call, never a loop");
+    let request = &requests[0];
+    assert_eq!(request.template.name, REFRESH_TEMPLATE);
+    let input = h.input(PROFILE_NAME);
+    for needle in [
+        PROFILE_QUESTION,
+        "Tim drinks green tea.",
+        TEA,
+        CAT,
+        &handle(&input, tea),
+        &handle(&input, cat),
+        &input.entries[0].handle,
+        &h.tuning.mental_models.profile_max_tokens.to_string(),
+    ] {
+        assert!(
+            request.user.contains(needle),
+            "the request lacks {needle:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unchanged_fingerprint_skips_the_llm_and_force_doesnt() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+
+    let llm = quiet_llm(1);
+    let skipped = h
+        .service
+        .refresh_model(BANK, PROFILE_NAME, &llm, false)
+        .unwrap();
+    assert_eq!(skipped, Outcome::Unchanged);
+    assert_eq!(refresh_calls(&llm), 0);
+
+    let forced = h
+        .service
+        .refresh_model(BANK, PROFILE_NAME, &llm, true)
+        .unwrap();
+    assert!(matches!(forced, Outcome::Applied(_)));
+    assert_eq!(refresh_calls(&llm), 1);
+}
+
+#[test]
+fn a_new_memory_in_the_selection_changes_the_fingerprint() {
+    let h = Harness::new();
+    h.insert(fact(TEA));
+    let before = h.input(PROFILE_NAME).fingerprint;
+    h.insert(fact(CAT));
+    assert_ne!(h.input(PROFILE_NAME).fingerprint, before);
+}
+
+#[test]
+fn a_memory_outside_the_filters_leaves_the_fingerprint_alone() {
+    let h = Harness::new();
+    h.insert(fact(TEA));
+    let before = h.input(PROFILE_NAME).fingerprint;
+    h.insert(event("Tim is going to the cinema.", "2026-10-03T00:00"));
+    h.insert(faded(fact("Tim once tried surfing in Raglan.")));
+    assert_eq!(h.input(PROFILE_NAME).fingerprint, before);
+}
+
+#[test]
+fn a_faded_memory_leaves_the_model_at_the_next_sweep() {
+    // ADR 0007: when a cited memory fades below τ it leaves the input set,
+    // and so leaves the model. A model can't keep a memory alive by itself.
+    // Here the owner keeps a long-faded memory, the model cites it, and the
+    // owner takes the keep back.
+    let h = Harness::new();
+    let cat = h.insert(fact(CAT));
+    let tea = h.insert(faded(fact(TEA)));
+    h.keep(tea);
+    let applied = h.refresh_adding(
+        PROFILE_NAME,
+        &[
+            ("Tim has a cat called Miso.", &[cat]),
+            ("Tim likes green tea.", &[tea]),
+        ],
+    );
+    let tea_entry = applied.added[1];
+    h.service.unkeep(BANK, &[tea.to_string()]).unwrap();
+
+    let input = h.input(PROFILE_NAME);
+    assert!(
+        !inputs(&input).contains(&tea),
+        "the faded memory is still selected"
+    );
+    assert!(inputs(&input).contains(&cat));
+
+    // Even a reply that leaves the entry alone loses it.
+    h.set(at(SWEEP));
+    let llm = quiet_llm(1);
+    let ran = h.tick(&llm);
+    assert_eq!(ran.ran.len(), 1);
+    let Outcome::Applied(applied) = &ran.ran[0].outcome else {
+        panic!("the fingerprint changed, so the LLM is called: {ran:?}");
+    };
+    assert_eq!(applied.dropped, vec![tea_entry]);
+    assert_eq!(texts(&h.profile()), ["Tim has a cat called Miso."]);
+}
+
+#[test]
+fn a_refresh_logs_its_retrieval_and_writes_no_access() {
+    // TIM-95, decision 10: reading or refreshing a model never counts as an
+    // access. The schema's recall log has a `refresh` kind for its
+    // retrieval: one row per refresh, with no session.
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let accesses = h.accesses();
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+    assert_eq!(h.accesses(), accesses);
+    let rows: i64 = h.one("SELECT COUNT(*) FROM recalls WHERE kind = 'refresh'", []);
+    assert_eq!(rows, 1);
+    let session: Option<String> =
+        h.one("SELECT session_id FROM recalls WHERE kind = 'refresh'", []);
+    assert_eq!(session, None);
+}
+
+#[test]
+fn entries_are_never_embedded_extracted_from_or_ingested() {
+    // TIM-95, decision 10: no feedback loops.
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let counts = |h: &Harness| -> (i64, i64, i64, i64) {
+        (
+            h.one("SELECT COUNT(*) FROM memories", []),
+            h.one("SELECT COUNT(*) FROM memory_vectors", []),
+            h.one("SELECT COUNT(*) FROM sources", []),
+            h.one("SELECT COUNT(*) FROM extraction_queue", []),
+        )
+    };
+    let before = counts(&h);
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+    h.block(Some("s1"));
+    assert_eq!(counts(&h), before);
+}
+
+// Entries and edits (TIM-95, decision 5)
+
+#[test]
+fn the_first_refresh_is_all_adds_with_ids_code_assigns() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let cat = h.insert(fact(CAT));
+    let applied = h.refresh_adding(
+        PROFILE_NAME,
+        &[
+            ("Tim likes green tea.", &[tea]),
+            ("Tim has a cat called Miso.", &[cat, tea]),
+        ],
+    );
+    assert_eq!(applied.added.len(), 2);
+    let profile = h.profile();
+    assert_eq!(
+        profile.entries,
+        vec![
+            Entry {
+                id: applied.added[0],
+                text: "Tim likes green tea.".into(),
+                cites: vec![tea],
+            },
+            Entry {
+                id: applied.added[1],
+                text: "Tim has a cat called Miso.".into(),
+                cites: vec![cat, tea],
+            },
+        ]
+    );
+    assert_ne!(applied.added[0], applied.added[1]);
+}
+
+#[test]
+fn untouched_entries_are_copied_byte_for_byte_and_edits_keep_their_id() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let cat = h.insert(fact(CAT));
+    let bees = h.insert(fact("Tim keeps bees."));
+    let applied = h.refresh_adding(
+        PROFILE_NAME,
+        &[
+            ("Tim likes green tea.", &[tea]),
+            ("Tim has a cat  called Miso.\u{00a0}", &[cat]),
+            ("Tim keeps bees.", &[bees]),
+        ],
+    );
+    let [tea_entry, cat_entry, bees_entry] = applied.added[..] else {
+        panic!("three adds");
+    };
+    let before = h.profile();
+
+    let input = h.input(PROFILE_NAME);
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![reply(vec![
+            edit(
+                &entry_handle(&input, tea_entry),
+                "Tim drinks green tea every morning.",
+                &handles(&input, &[tea]),
+            ),
+            remove(&entry_handle(&input, bees_entry)),
+        ])],
+    );
+    let Outcome::Applied(applied) = h
+        .service
+        .refresh_model(BANK, PROFILE_NAME, &llm, true)
+        .unwrap()
+    else {
+        panic!("applied");
+    };
+    assert_eq!(applied.edited, vec![tea_entry]);
+    assert_eq!(applied.removed, vec![bees_entry]);
+
+    let after = h.profile();
+    assert_eq!(after.entries.len(), 2);
+    assert_eq!(after.entries[0].id, tea_entry);
+    assert_eq!(after.entries[0].text, "Tim drinks green tea every morning.");
+    let untouched = after.entries.iter().find(|e| e.id == cat_entry).unwrap();
+    assert_eq!(untouched, &before.entries[1], "the untouched entry changed");
+}
+
+#[test]
+fn an_operation_citing_outside_the_input_is_rejected_and_the_rest_apply() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let gone = h.insert(faded(fact("Tim once tried surfing in Raglan.")));
+    let input = h.input(PROFILE_NAME);
+    assert!(!inputs(&input).contains(&gone));
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![reply(vec![
+            add("Tim surfs.", &["m99".to_string()]),
+            add("Tim surfs in Raglan.", &[gone.to_string()]),
+            add(
+                "Tim likes tea and surfing.",
+                &[handle(&input, tea), "m99".into()],
+            ),
+            add("Tim likes green tea.", &handles(&input, &[tea])),
+        ])],
+    );
+    let Outcome::Applied(applied) = h
+        .service
+        .refresh_model(BANK, PROFILE_NAME, &llm, false)
+        .unwrap()
+    else {
+        panic!("applied");
+    };
+    let rejected: Vec<(usize, RejectReason)> = applied
+        .rejected
+        .iter()
+        .map(|r| (r.index, r.reason))
+        .collect();
+    assert_eq!(
+        rejected,
+        [
+            (0, RejectReason::CitesOutsideInput),
+            (1, RejectReason::CitesOutsideInput),
+            (2, RejectReason::CitesOutsideInput),
+        ]
+    );
+    assert_eq!(texts(&h.profile()), ["Tim likes green tea."]);
+}
+
+#[test]
+fn an_edit_or_add_that_cites_nothing_is_rejected() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let applied = h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+    let input = h.input(PROFILE_NAME);
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![reply(vec![
+            edit(
+                &entry_handle(&input, applied.added[0]),
+                "Tim likes tea.",
+                &[],
+            ),
+            add("Tim is lovely.", &[]),
+        ])],
+    );
+    let Outcome::Applied(applied) = h
+        .service
+        .refresh_model(BANK, PROFILE_NAME, &llm, true)
+        .unwrap()
+    else {
+        panic!("applied");
+    };
+    let rejected: Vec<(usize, RejectReason)> = applied
+        .rejected
+        .iter()
+        .map(|r| (r.index, r.reason))
+        .collect();
+    assert_eq!(
+        rejected,
+        [
+            (0, RejectReason::NoCitations),
+            (1, RejectReason::NoCitations)
+        ]
+    );
+    assert_eq!(texts(&h.profile()), ["Tim likes green tea."]);
+}
+
+#[test]
+fn an_edit_or_remove_of_an_unknown_entry_is_rejected() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let input = h.input(PROFILE_NAME);
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![reply(vec![
+            edit("e7", "Tim likes tea.", &handles(&input, &[tea])),
+            remove("e8"),
+        ])],
+    );
+    let Outcome::Applied(applied) = h
+        .service
+        .refresh_model(BANK, PROFILE_NAME, &llm, true)
+        .unwrap()
+    else {
+        panic!("applied");
+    };
+    let rejected: Vec<(usize, RejectReason)> = applied
+        .rejected
+        .iter()
+        .map(|r| (r.index, r.reason))
+        .collect();
+    assert_eq!(
+        rejected,
+        [
+            (0, RejectReason::UnknownEntry),
+            (1, RejectReason::UnknownEntry)
+        ]
+    );
+    assert!(h.profile().entries.is_empty());
+}
+
+#[test]
+fn a_malformed_reply_leaves_the_entries_untouched_and_records_an_error() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+    let before = h.profile();
+    h.insert(fact(CAT));
+
+    h.advance(minutes(1));
+    for nonsense in [
+        json!({"edits": []}),
+        json!({"operations": [{"op": "rewrite", "text": "Everything."}]}),
+        json!({"operations": "add everything"}),
+    ] {
+        let llm = FakeLlm::scripted(MODEL, vec![nonsense.clone()]);
+        let outcome = h
+            .service
+            .refresh_model(BANK, PROFILE_NAME, &llm, false)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Failed(FailureKind::Malformed),
+            "{nonsense}"
+        );
+        let after = h.profile();
+        assert_eq!(after.entries, before.entries);
+        assert_eq!(after.last_refreshed_at, before.last_refreshed_at);
+        assert_eq!(after.last_error, Some(FailureKind::Malformed));
+        assert_eq!(after.last_error_at, Some(h.now()));
+    }
+    // A failed refresh doesn't record the new fingerprint, so the next one
+    // isn't skipped.
+    let llm = quiet_llm(1);
+    assert!(matches!(
+        h.service
+            .refresh_model(BANK, PROFILE_NAME, &llm, false)
+            .unwrap(),
+        Outcome::Applied(_)
+    ));
+}
+
+// The budget (TIM-95, decision 8)
+
+#[test]
+fn creating_a_model_past_the_budget_is_refused() {
+    // The profile takes 500 of the 800.
+    let h = Harness::new();
+    let refused = h.service.create_model(
+        BANK,
+        &ModelSpec {
+            max_tokens: 301,
+            ..plans_model()
+        },
+    );
+    assert!(matches!(
+        refused,
+        Err(ModelError::OverBudget {
+            requested: 801,
+            budget: 800
+        })
+    ));
+    h.service
+        .create_model(
+            BANK,
+            &ModelSpec {
+                max_tokens: 300,
+                ..plans_model()
+            },
+        )
+        .unwrap();
+    assert_eq!(h.service.list_models(BANK).unwrap().len(), 2);
+}
+
+#[test]
+fn resizing_or_enabling_past_the_budget_is_refused() {
+    let h = Harness::new();
+    h.service
+        .create_model(
+            BANK,
+            &ModelSpec {
+                max_tokens: 300,
+                enabled: false,
+                ..plans_model()
+            },
+        )
+        .unwrap();
+    h.service
+        .edit_model(
+            BANK,
+            PROFILE_NAME,
+            &ModelEdit {
+                max_tokens: Some(800),
+                ..ModelEdit::default()
+            },
+        )
+        .unwrap();
+    // A disabled model isn't rendered, so it doesn't count...
+    let enabling = h.service.edit_model(
+        BANK,
+        "Plans",
+        &ModelEdit {
+            enabled: Some(true),
+            ..ModelEdit::default()
+        },
+    );
+    // ...until it's enabled.
+    assert!(matches!(enabling, Err(ModelError::OverBudget { .. })));
+    let resizing = h.service.edit_model(
+        BANK,
+        PROFILE_NAME,
+        &ModelEdit {
+            max_tokens: Some(801),
+            ..ModelEdit::default()
+        },
+    );
+    assert!(matches!(resizing, Err(ModelError::OverBudget { .. })));
+    assert_eq!(h.profile().max_tokens, 800);
+}
+
+#[test]
+fn the_budget_is_tuned() {
+    let h = Harness::with_tuning("[mental_models]\nbudget = 600\n");
+    let refused = h.service.create_model(
+        BANK,
+        &ModelSpec {
+            max_tokens: 101,
+            ..plans_model()
+        },
+    );
+    assert!(matches!(
+        refused,
+        Err(ModelError::OverBudget { budget: 600, .. })
+    ));
+}
+
+#[test]
+fn a_second_model_with_the_same_name_is_refused() {
+    let h = Harness::new();
+    h.service.create_model(BANK, &plans_model()).unwrap();
+    assert!(matches!(
+        h.service.create_model(BANK, &plans_model()),
+        Err(ModelError::DuplicateName)
+    ));
+}
+
+#[test]
+fn entries_past_max_tokens_are_trimmed_lowest_ranked_first() {
+    // Code trims the lowest-ranked entries, ranked by the best score among
+    // each entry's cited memories. The three memories here share the same
+    // words with the question, so strength decides.
+    let h = Harness::new();
+    h.service
+        .create_model(
+            BANK,
+            &ModelSpec {
+                name: "Mornings".into(),
+                question: "What does Tim drink in the morning?".into(),
+                kinds: vec![Kind::Fact],
+                entity: None,
+                min_volatility: None,
+                max_tokens: 30,
+                enabled: true,
+            },
+        )
+        .unwrap();
+    let tea = h.insert(Memory {
+        significance: "critical",
+        ..fact("Tim drinks tea in the morning.")
+    });
+    let coffee = h.insert(Memory {
+        significance: "minor",
+        ..fact("Tim drinks coffee in the morning.")
+    });
+    let juice = h.insert(Memory {
+        significance: "major",
+        ..fact("Tim drinks juice in the morning.")
+    });
+    // 60 characters each: 15 tokens, so two fit in 30.
+    let applied = h.refresh_adding(
+        "Mornings",
+        &[
+            (
+                "Tim starts every single day with a large pot of green tea..",
+                &[tea],
+            ),
+            (
+                "Tim sometimes has a strong black coffee in the morning too.",
+                &[coffee],
+            ),
+            (
+                "Tim drinks a glass of fresh orange juice with his breakfast.",
+                &[juice],
+            ),
+        ],
+    );
+    assert_eq!(applied.trimmed, vec![applied.added[1]]);
+    let model = h.model("Mornings");
+    assert_eq!(model.entries.len(), 2);
+    let tokens: usize = model.entries.iter().map(|e| estimate_tokens(&e.text)).sum();
+    assert!(tokens <= 30, "{tokens} tokens");
+}
+
+#[test]
+fn the_rendered_models_stay_within_the_budget() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let cites: &[Uuid] = &[tea];
+    let long = "Tim likes green tea, brewed for exactly three minutes at eighty degrees.";
+    let entries: Vec<(&str, &[Uuid])> = (0..40).map(|_| (long, cites)).collect();
+    h.refresh_adding(PROFILE_NAME, &entries);
+    let block = h.block(None);
+    let rendered = block.text.matches(long).count();
+    assert!(rendered > 0);
+    assert!(
+        rendered * estimate_tokens(long) <= h.tuning.mental_models.profile_max_tokens as usize,
+        "{rendered} entries rendered"
+    );
+}
+
+// Memories win (TIM-95, decision 6; ADR 0007)
+
+#[test]
+fn an_entry_citing_a_retracted_memory_is_dropped_from_the_block() {
+    let h = Harness::new();
+    let maya = h.insert(fact(MAYA));
+    let cat = h.insert(fact(CAT));
+    let applied = h.refresh_adding(
+        PROFILE_NAME,
+        &[
+            ("Tim's daughter is Maya.", &[maya]),
+            ("Tim has a cat called Miso.", &[cat]),
+        ],
+    );
+    assert!(h.block(None).text.contains("Tim's daughter is Maya."));
+
+    h.advance(minutes(30));
+    let corrected = h.now();
+    h.says_changing(
+        notable(MIA).with("changes_something", json!(true)),
+        maya,
+        "retracts",
+    );
+    let block = h.block(None);
+    assert!(!block.text.contains("Tim's daughter is Maya."));
+    assert!(block.text.contains("Tim has a cat called Miso."));
+    assert!(!block.cited.contains(&maya));
+    // Dropped at render time, and the model is refreshed: the retraction of
+    // a cited memory is a triggering write.
+    assert_eq!(h.profile().entries[0].id, applied.added[0]);
+    assert_eq!(h.tick(&quiet_llm(1)).next_due, Some(corrected + minutes(5)));
+}
+
+#[test]
+fn an_entry_is_dropped_when_any_one_of_its_memories_ends() {
+    // It isn't enough for one citation to survive: the wording rests on all
+    // of them.
+    let h = Harness::new();
+    let berlin = h.insert(fact(BERLIN));
+    let cat = h.insert(fact(CAT));
+    h.refresh_adding(
+        PROFILE_NAME,
+        &[
+            ("Tim lives in Berlin with his cat Miso.", &[berlin, cat]),
+            ("Tim has a cat called Miso.", &[cat]),
+        ],
+    );
+    h.says_changing(
+        claim(MOVED, "event", "notable")
+            .with("changes_something", json!(true))
+            .with(
+                "valid_from",
+                json!({"at": "2026-09-12", "precision": "day"}),
+            ),
+        berlin,
+        "ends",
+    );
+    let block = h.block(None);
+    assert!(
+        !block
+            .text
+            .contains("Tim lives in Berlin with his cat Miso.")
+    );
+    assert!(block.text.contains("Tim has a cat called Miso."));
+    assert_eq!(block.cited, vec![cat]);
+}
+
+#[test]
+fn a_refinement_moves_the_citation_to_the_head_of_the_chain() {
+    let h = Harness::new();
+    h.service.create_model(BANK, &plans_model()).unwrap();
+    let japan = h.insert(Memory {
+        kind: "event",
+        valid_from: Some((local("2027-01-01T00:00"), "year")),
+        ..fact(JAPAN)
+    });
+    let applied = h.refresh_adding("Plans", &[("Tim is going to Japan next year.", &[japan])]);
+    let before = h.input("Plans").fingerprint;
+
+    h.advance(minutes(30));
+    let refined = h.now();
+    let tokyo = h.says_changing(
+        claim(TOKYO, "event", "notable")
+            .with("valid_from", json!({"at": "2027-04", "precision": "month"})),
+        japan,
+        "refines",
+    );
+    let plans = h.model("Plans");
+    assert_eq!(plans.entries[0].id, applied.added[0]);
+    assert_eq!(plans.entries[0].cites, vec![tokyo]);
+    // The entry still renders, and the next refresh rewords it.
+    assert!(
+        h.block(None)
+            .text
+            .contains("Tim is going to Japan next year.")
+    );
+    assert_ne!(h.input("Plans").fingerprint, before);
+    assert_eq!(h.tick(&quiet_llm(1)).next_due, Some(refined + minutes(5)));
+}
+
+#[test]
+fn an_entry_citing_a_low_confidence_state_shows_its_age() {
+    // TIM-95, decision 5, as injection does (TIM-91, decision 8; TIM-93,
+    // decision 10): "observed 30 days ago, Tue 1 Sep".
+    let h = Harness::new();
+    let job = h.insert(Memory {
+        kind: "state",
+        volatility: Some("weeks"),
+        ..fact("Tim is job hunting.")
+    });
+    h.refresh_adding(PROFILE_NAME, &[("Tim is looking for a new job.", &[job])]);
+    let text = h.block(None).text;
+    let line = text
+        .lines()
+        .find(|line| line.contains("Tim is looking for a new job."))
+        .expect("the entry is rendered");
+    assert!(line.contains("observed"), "{line}");
+    assert!(line.contains("Tue 1 Sep"), "{line}");
+}
+
+// The block (TIM-95, decision 8 and the amendment's decision 2; TIM-94,
+// decision 8)
+
+#[test]
+fn the_block_holds_the_agenda_each_enabled_model_and_the_pointer_line() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let dentist = h.insert(event(
+        "Tim's dentist appointment is on 5 October.",
+        "2026-10-05T00:00",
+    ));
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+    h.service
+        .create_model(
+            BANK,
+            &ModelSpec {
+                enabled: false,
+                ..plans_model()
+            },
+        )
+        .unwrap();
+
+    let block = h.block(None);
+    assert_eq!(block.built_at, h.now());
+    assert_eq!(block.agenda, vec![dentist]);
+    assert_eq!(block.cited, vec![tea]);
+    for needle in [
+        "Tim's dentist appointment is on 5 October.",
+        PROFILE_NAME,
+        "Tim likes green tea.",
+        "memory_recall",
+        "upcoming",
+        "Thu 1 Oct",
+    ] {
+        assert!(block.text.contains(needle), "the block lacks {needle:?}");
+    }
+    assert!(
+        !block.text.contains("Plans"),
+        "a disabled model was rendered"
+    );
+    // The header stays one line: the label goes into the pointer line.
+    assert_eq!(
+        block
+            .text
+            .lines()
+            .filter(|l| l.contains("memory_recall"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn an_empty_model_renders_nothing_not_even_a_header() {
+    let h = Harness::new();
+    assert!(h.profile().entries.is_empty());
+    assert!(!h.block(None).text.contains(PROFILE_NAME));
+}
+
+#[test]
+fn building_the_block_never_calls_the_llm_or_writes_an_access() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    h.insert(event(
+        "Tim's dentist appointment is on 5 October.",
+        "2026-10-05T00:00",
+    ));
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+    let accesses = h.accesses();
+    h.block(Some("s1"));
+    h.block(Some("s2"));
+    assert_eq!(
+        h.accesses(),
+        accesses,
+        "being injected never counts (ADR 0001)"
+    );
+}
+
+#[test]
+fn the_block_is_cached_until_its_content_changes() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    let first = h.block(Some("s1"));
+    h.advance(minutes(10));
+    let again = h.block(Some("s2"));
+    assert_eq!(again.id, first.id);
+    assert_eq!(again.built_at, first.built_at);
+
+    // A memory that isn't on the agenda and doesn't change a model leaves
+    // the block alone.
+    h.says(claim("Tim likes walking.", "fact", "minor"));
+    assert_eq!(h.block(None).id, first.id);
+
+    // A completed refresh clears it.
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+    let refreshed = h.block(None);
+    assert_ne!(refreshed.id, first.id);
+    assert_eq!(refreshed.built_at, h.now());
+    assert!(refreshed.text.contains("Tim likes green tea."));
+}
+
+#[test]
+fn a_new_agenda_memory_clears_the_block() {
+    let h = Harness::new();
+    let first = h.block(None);
+    h.says(
+        claim("Tim has a haircut on 3 October 2026.", "event", "minor").with(
+            "valid_from",
+            json!({"at": "2026-10-03", "precision": "day"}),
+        ),
+    );
+    let block = h.block(None);
+    assert_ne!(block.id, first.id);
+    assert!(block.text.contains("Tim has a haircut on 3 October 2026."));
+}
+
+#[test]
+fn the_clock_alone_changes_the_block_only_at_local_midnight() {
+    let h = Harness::new();
+    h.insert(event(
+        "Tim's dentist appointment is on 9 October.",
+        "2026-10-09T00:00",
+    ));
+    let first = h.block(None);
+    assert!(first.agenda.is_empty(), "9 October is eight days out");
+
+    // 23:59 local is still Thursday.
+    h.set(local("2026-10-01T23:59"));
+    assert_eq!(h.block(None).id, first.id);
+
+    h.set(local("2026-10-02T00:00"));
+    let friday = h.block(None);
+    assert_ne!(friday.id, first.id);
+    assert_eq!(friday.agenda.len(), 1);
+}
+
+#[test]
+fn the_block_cache_lives_in_memory_and_a_restart_rebuilds_it() {
+    let h = Harness::new();
+    let first = h.block(None);
+    let h = h.restart();
+    let rebuilt = h.block(None);
+    assert_ne!(rebuilt.id, first.id);
+    assert_eq!(rebuilt.text, first.text);
+}
+
+// In context (TIM-95, decision 4; TIM-93, decision 7)
+
+#[test]
+fn a_sessions_block_puts_its_agenda_and_cited_memories_in_context() {
+    let h = Harness::new();
+    let cat = h.insert(fact(CAT));
+    let dentist = h.insert(event(
+        "Tim's dentist appointment is on 5 October.",
+        "2026-10-05T00:00",
+    ));
+    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[cat])]);
+    h.block(Some("s1"));
+
+    let in_context: BTreeSet<Uuid> = h.in_context("s1").into_iter().collect();
+    assert_eq!(in_context, BTreeSet::from([cat, dentist]));
+    assert!(h.in_context("s2").is_empty());
+
+    // Relevance injection skips them.
+    let prefetch = h
+        .service
+        .prefetch(
+            BANK,
+            &PrefetchRequest {
+                session_id: "s1".into(),
+                query: "is the cat called Miso".into(),
+                previous_query: None,
+            },
+        )
+        .unwrap();
+    assert!(!prefetch.injected.contains(&cat));
+}
+
+#[test]
+fn the_daemon_persists_which_block_a_session_holds() {
+    let h = Harness::new();
+    let cat = h.insert(fact(CAT));
+    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[cat])]);
+    let block = h.block(Some("s1"));
+    let stored: String = h.one(
+        "SELECT block_id FROM session_blocks WHERE bank_id = ?1 AND session_id = 's1'",
+        [h.bank_id()],
+    );
+    assert_eq!(stored, block.id.to_string());
+
+    // Hermes restores a stored system prompt after a restart without asking
+    // for the block again, so the cited ids come from the store.
+    let h = h.restart();
+    assert_eq!(h.in_context("s1"), vec![cat]);
+}
+
+#[test]
+fn a_reply_relying_on_an_entry_is_credited_as_used() {
+    let h = Harness::new();
+    let cat = h.insert(fact(CAT));
+    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[cat])]);
+    h.block(Some("s1"));
+    h.service
+        .ingest_turn(
+            BANK,
+            &turn("s1", h.now() - minutes(1), "What's my cat called?"),
+        )
+        .unwrap();
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![json!({"claims": [], "used_injected_ids": ["m1"]})],
+    );
+    let extracted = h.service.extract_next(BANK, &llm).unwrap().unwrap();
+    assert!(llm.requests()[0].user.contains(CAT));
+    assert_eq!(extracted.used, vec![cat]);
+    assert_eq!(h.used(cat), 1);
+}
+
+#[test]
+fn clearing_a_session_drops_its_mapping_and_the_next_fetch_writes_one() {
+    let h = Harness::new();
+    let cat = h.insert(fact(CAT));
+    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[cat])]);
+    h.block(Some("s1"));
+    h.service.clear_session(BANK, "s1").unwrap();
+    assert!(h.in_context("s1").is_empty());
+    let mappings: i64 = h.one("SELECT COUNT(*) FROM session_blocks", []);
+    assert_eq!(mappings, 0);
+
+    h.block(Some("s1"));
+    assert_eq!(h.in_context("s1"), vec![cat]);
+}
+
+#[test]
+fn a_mapping_expires_after_thirty_days_without_a_turn() {
+    let h = Harness::new();
+    let cat = h.insert(fact(CAT));
+    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[cat])]);
+    h.block(Some("s1"));
+
+    // Past the in-memory idle timeout, the mapping still holds...
+    h.advance(SignedDuration::from_hours(29 * 24));
+    let h = h.restart();
+    assert_eq!(h.in_context("s1"), vec![cat]);
+
+    // ...until sessions.mapping_expiry_days without a turn.
+    h.advance(SignedDuration::from_hours(2 * 24));
+    let h = h.restart();
+    assert!(h.in_context("s1").is_empty());
+}
+
+// The agenda (TIM-93, decision 7, as amended by TIM-95, decision 1)
+
+#[test]
+fn dated_lines_hold_events_and_tasks_within_seven_local_days() {
+    let h = Harness::new();
+    let today = h.insert(event("Tim has pottery tonight.", "2026-10-01T00:00"));
+    let thursday = h.insert(event(
+        "Tim flies to Sydney on 8 October.",
+        "2026-10-08T00:00",
+    ));
+    let friday = h.insert(event("Tim has a concert on 9 October.", "2026-10-09T00:00"));
+    let due = h.insert(task_due(
+        "Tim needs to pay the rates by 6 October.",
+        "2026-10-06T00:00",
+    ));
+    let later = h.insert(task_due(
+        "Tim needs to renew his passport by 20 October.",
+        "2026-10-20T00:00",
+    ));
+    let past = h.insert(event(
+        "Tim went to the beach on 28 September.",
+        "2026-09-28T00:00",
+    ));
+
+    let agenda = h.agenda();
+    assert_eq!(agenda.dated, vec![today, due, thursday]);
+    for memory in [friday, later, past] {
+        assert!(!agenda.dated.contains(&memory));
+    }
+}
+
+#[test]
+fn overdue_tasks_are_listed_for_overdue_days() {
+    let h = Harness::with_tuning("[agenda]\noverdue_days = 10\n");
+    let recent = h.insert(task_due("Tim needs to call the bank.", "2026-09-21T00:00"));
+    let old = h.insert(task_due("Tim needs to fix the gate.", "2026-09-20T00:00"));
+    let done = h.insert(task_due("Tim needs to book the vet.", "2026-09-25T00:00"));
+    let booked = h.insert(Memory {
+        kind: "event",
+        ..fact("Tim booked the vet.")
+    });
+    h.mark_ended(done, booked, local("2026-09-26T00:00"));
+
+    let agenda = h.agenda();
+    assert_eq!(agenda.dated, vec![recent]);
+    assert!(!agenda.dated.contains(&old));
+    assert!(!agenda.undated_tasks.contains(&done));
+}
+
+#[test]
+fn dated_items_are_listed_even_when_faded() {
+    // A minor appointment mentioned three months ahead mustn't fade out on
+    // the day it matters.
+    let h = Harness::new();
+    let dentist = h.insert(faded(event(
+        "Tim's dentist appointment is on 2 October.",
+        "2026-10-02T00:00",
+    )));
+    assert_eq!(h.agenda().dated, vec![dentist]);
+}
+
+#[test]
+fn retracted_and_forgotten_memories_are_never_on_the_agenda() {
+    let h = Harness::new();
+    h.insert(Memory {
+        retracted: true,
+        ..event(
+            "Tim's dentist appointment is on 2 October.",
+            "2026-10-02T00:00",
+        )
+    });
+    h.insert(Memory {
+        hidden: true,
+        ..task("Tim needs to call Ana.")
+    });
+    h.insert(Memory {
+        hidden: true,
+        ..recurring(
+            "Tim swims on Tuesdays.",
+            Some("FREQ=WEEKLY;BYDAY=TU"),
+            "2026-01-06T00:00",
+        )
+    });
+    let agenda = h.agenda();
+    assert!(agenda.dated.is_empty());
+    assert!(agenda.routines.is_empty());
+    assert!(agenda.undated_tasks.is_empty());
+}
+
+#[test]
+fn over_the_cap_faded_lines_fold_first_then_the_least_significant() {
+    let h = Harness::with_tuning("[agenda]\ndated_lines = 3\n");
+    let a = h.insert(event("Tim has event A.", "2026-10-02T00:00"));
+    let faded_b = h.insert(faded(event("Tim has event B.", "2026-10-03T00:00")));
+    let c = h.insert(Memory {
+        significance: "minor",
+        ..event("Tim has event C.", "2026-10-04T00:00")
+    });
+    let d = h.insert(Memory {
+        significance: "major",
+        ..event("Tim has event D.", "2026-10-05T00:00")
+    });
+    let e = h.insert(event("Tim has event E.", "2026-10-06T00:00"));
+
+    let agenda = h.agenda();
+    assert_eq!(agenda.dated, vec![a, d, e], "in date order");
+    assert_eq!(agenda.folded, 2);
+    assert!(!agenda.dated.contains(&faded_b));
+    assert!(!agenda.dated.contains(&c));
+}
+
+#[test]
+fn routines_are_gated_on_tau_ranked_by_strength_and_capped() {
+    let h = Harness::new();
+    let weekly = |content, significance| Memory {
+        significance,
+        ..recurring(content, Some("FREQ=WEEKLY;BYDAY=TU"), "2026-01-06T00:00")
+    };
+    let swim = h.insert(weekly("Tim swims on Tuesdays.", "critical"));
+    let yoga = h.insert(weekly("Tim does yoga on Tuesdays.", "major"));
+    let call = h.insert(Memory {
+        significance: "notable",
+        ..recurring("Tim calls his mum most weekends.", None, "")
+    });
+    let daily = h.insert(Memory {
+        significance: "minor",
+        ..recurring(
+            "Tim walks the dog every day.",
+            Some("FREQ=DAILY"),
+            "2026-01-01T00:00",
+        )
+    });
+    let bins = h.insert(weekly("Tim puts the bins out on Tuesdays.", "trivial"));
+    let chess = h.insert(faded(recurring("Tim plays chess on Fridays.", None, "")));
+
+    let agenda = h.agenda();
+    assert_eq!(agenda.routines, vec![swim, yoga, call, daily]);
+    assert!(!agenda.routines.contains(&bins), "past the cap of 4");
+    assert!(!agenda.routines.contains(&chess), "below τ");
+    assert!(agenda.dated.is_empty());
+}
+
+#[test]
+fn a_long_period_routine_joins_the_dated_lines_when_it_next_occurs_within_a_week() {
+    let h = Harness::new();
+    let soon = h.insert(recurring(
+        "Tim pays the rent on the 5th of each month.",
+        Some("FREQ=MONTHLY;BYMONTHDAY=5"),
+        "2026-01-05T00:00",
+    ));
+    let later = h.insert(recurring(
+        "Tim's book club meets on the 20th of each month.",
+        Some("FREQ=MONTHLY;BYMONTHDAY=20"),
+        "2026-01-20T00:00",
+    ));
+    let agenda = h.agenda();
+    assert_eq!(agenda.dated, vec![soon]);
+    assert!(agenda.routines.is_empty(), "a month is longer than a week");
+    assert!(!agenda.dated.contains(&later));
+}
+
+#[test]
+fn undated_open_tasks_are_gated_on_tau_and_capped() {
+    let h = Harness::with_tuning("[agenda]\nundated_tasks = 2\n");
+    let passport = h.insert(Memory {
+        significance: "major",
+        ..task("Tim needs to renew his passport.")
+    });
+    let gutters = h.insert(task("Tim needs to clean the gutters."));
+    let shelf = h.insert(Memory {
+        significance: "minor",
+        ..task("Tim needs to put up a shelf.")
+    });
+    let rust = h.insert(faded(task("Tim wants to learn Rust someday.")));
+    let tax = h.insert(task("Tim needs to file the tax return."));
+    let filed = h.insert(Memory {
+        kind: "event",
+        ..fact("Tim filed the tax return.")
+    });
+    h.mark_ended(tax, filed, local("2026-09-30T00:00"));
+
+    let agenda = h.agenda();
+    assert_eq!(agenda.undated_tasks, vec![passport, gutters]);
+    for memory in [shelf, rust, tax] {
+        assert!(!agenda.undated_tasks.contains(&memory));
+    }
+}
+
+#[test]
+fn the_dated_cap_leaves_routines_and_undated_tasks_alone() {
+    let h = Harness::with_tuning("[agenda]\ndated_lines = 1\n");
+    h.insert(event("Tim has event A.", "2026-10-02T00:00"));
+    h.insert(event("Tim has event B.", "2026-10-03T00:00"));
+    h.insert(task("Tim needs to clean the gutters."));
+    h.insert(recurring(
+        "Tim swims on Tuesdays.",
+        Some("FREQ=WEEKLY;BYDAY=TU"),
+        "2026-01-06T00:00",
+    ));
+    let agenda = h.agenda();
+    assert_eq!(agenda.dated.len(), 1);
+    assert_eq!(agenda.folded, 1);
+    assert_eq!(agenda.routines.len(), 1);
+    assert_eq!(agenda.undated_tasks.len(), 1);
+}
+
+#[test]
+fn the_agenda_is_built_without_an_llm_or_an_access() {
+    let h = Harness::new();
+    h.insert(task("Tim needs to clean the gutters."));
+    h.insert(event("Tim has event A.", "2026-10-02T00:00"));
+    let accesses = h.accesses();
+    h.agenda();
+    assert_eq!(h.accesses(), accesses);
+}

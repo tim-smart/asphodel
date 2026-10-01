@@ -5,7 +5,9 @@
 //! routes under `/v1`, the bearer token off loopback, `/v1/health` answering
 //! 503 until the store and models are ready, SIGTERM finishing the chunk in
 //! flight and checkpointing the WAL, and every CLI subcommand reaching the
-//! daemon over `--url`.
+//! daemon over `--url`. "Agenda, mental models and the system prompt block"
+//! (TIM-111) adds the model routes, `/system-prompt`, `/agenda` and
+//! `asphodel model`.
 //!
 //! The daemon runs on the fake models (`ASPHODEL_MODELS=fake`) and a
 //! scripted fake LLM (`ASPHODEL_LLM_SCRIPT`), both environment only. The
@@ -1208,4 +1210,280 @@ fn the_cli_names_a_daemon_it_cannot_reach_or_a_url_it_cannot_use() {
         assert!(!output.status.success(), "{url} was accepted");
         assert!(stderr(&output).contains("--url"), "{}", stderr(&output));
     }
+}
+
+// Mental models and the system prompt block (TIM-111; TIM-95, decisions 2,
+// 4, 7 and 8; TIM-94, decision 8).
+
+/// A refresh reply adding one entry citing the first memory in its input.
+fn adds_entry(text: &str) -> Value {
+    json!({"operations": [{"op": "add", "entry": null, "text": text, "cites": ["m1"]}]})
+}
+
+const ENTRY: &str = "Tim lives in Auckland.";
+
+#[test]
+fn models_are_created_listed_edited_and_refreshed_over_http() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir)
+        .script(&[
+            json!({"reply": auckland_reply()}),
+            json!({"reply": adds_entry(ENTRY)}),
+        ])
+        .ready();
+    daemon.create_bank("main");
+    daemon.ingest_notes("main", "notes.md");
+    let memory = daemon.wait_for_memory("main");
+    daemon.wait_extracted("main");
+
+    // Only "User profile" is seeded, empty and never refreshed.
+    let models = daemon.ok(daemon.get("/v1/banks/main/models"));
+    assert_eq!(models.as_array().unwrap().len(), 1);
+    assert_eq!(models[0]["name"], "User profile");
+    assert_eq!(models[0]["entries"], json!([]));
+    assert_eq!(models[0]["last_refreshed_at"], Value::Null);
+
+    // The profile takes 500 of the 800 tokens.
+    let created = daemon.post(
+        "/v1/banks/main/models",
+        &json!({"name": "Plans", "question": "Where is Tim going?", "kinds": ["event"],
+                "max_tokens": 300}),
+    );
+    assert_eq!(created.status, 201, "{}", created.body);
+    let plans = created.json();
+    assert_eq!(plans["enabled"], true);
+    assert_eq!(plans["kinds"], json!(["event"]));
+    let over = daemon.post(
+        "/v1/banks/main/models",
+        &json!({"name": "Big", "question": "Anything?", "max_tokens": 1}),
+    );
+    assert_eq!(over.status, 422, "{}", over.body);
+    assert!(over.json()["error"].as_str().unwrap().contains("budget"));
+    let duplicate = daemon.post(
+        "/v1/banks/main/models",
+        &json!({"name": "Plans", "question": "Again?", "max_tokens": 1}),
+    );
+    assert_eq!(duplicate.status, 409, "{}", duplicate.body);
+
+    let edited = daemon.ok(daemon.send(
+        "PATCH",
+        "/v1/banks/main/models/Plans",
+        Some(&json!({"enabled": false, "min_volatility": "weeks"})),
+    ));
+    assert_eq!(edited["enabled"], false);
+    assert_eq!(edited["min_volatility"], "weeks");
+    assert_eq!(edited["question"], "Where is Tim going?");
+    let cleared = daemon.ok(daemon.send(
+        "PATCH",
+        "/v1/banks/main/models/Plans",
+        Some(&json!({"min_volatility": null})),
+    ));
+    assert_eq!(cleared["min_volatility"], Value::Null);
+
+    // A forced refresh calls the LLM; the next one finds nothing changed.
+    let refreshed = daemon.ok(daemon.post(
+        "/v1/banks/main/models/User%20profile/refresh?force=true",
+        &Value::Null,
+    ));
+    assert_eq!(refreshed["outcome"], "applied", "{refreshed}");
+    assert_eq!(refreshed["detail"]["added"].as_array().unwrap().len(), 1);
+    let unchanged =
+        daemon.ok(daemon.post("/v1/banks/main/models/User%20profile/refresh", &Value::Null));
+    assert_eq!(unchanged["outcome"], "unchanged", "{unchanged}");
+
+    let profile = &daemon.ok(daemon.get("/v1/banks/main/models"))[0];
+    assert_eq!(profile["entries"][0]["text"], ENTRY);
+    assert_eq!(profile["entries"][0]["cites"], json!([memory]));
+    assert!(profile["last_refreshed_at"].is_string());
+
+    // The block holds the entry and the pointer line, and a session's fetch
+    // puts the cited memory in context, so prefetch doesn't inject it.
+    let block = daemon.ok(daemon.get("/v1/banks/main/system-prompt?session_id=s1"));
+    let text = block["text"].as_str().unwrap();
+    assert!(
+        text.contains("User profile") && text.contains(ENTRY),
+        "{text}"
+    );
+    assert!(text.contains("memory_recall"), "{text}");
+    assert!(!text.contains("Plans"), "a disabled model was rendered");
+    assert_eq!(block["cited"], json!([memory]));
+    assert_eq!(
+        daemon.ok(daemon.get("/v1/banks/main/system-prompt"))["id"],
+        block["id"],
+        "the cached block was rebuilt"
+    );
+    let prefetch = daemon.ok(daemon.post(
+        "/v1/banks/main/prefetch",
+        &json!({"session_id": "s1", "query": "where does Tim live? Auckland"}),
+    ));
+    assert!(
+        !prefetch["injected"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(memory)),
+        "{prefetch}"
+    );
+    let elsewhere = daemon.ok(daemon.post(
+        "/v1/banks/main/prefetch",
+        &json!({"session_id": "s2", "query": "where does Tim live? Auckland"}),
+    ));
+    assert_eq!(elsewhere["injected"], json!([memory]));
+
+    let agenda = daemon.ok(daemon.get("/v1/banks/main/agenda"));
+    assert_eq!(
+        agenda,
+        json!({"dated": [], "folded": 0, "routines": [], "undated_tasks": []})
+    );
+}
+
+#[test]
+fn model_routes_answer_with_the_right_status() {
+    let dir = TestDir::new();
+    let daemon = Serve::new(&dir).ready();
+    daemon.create_bank("main");
+
+    for (method, path, body, status) in [
+        ("GET", "/v1/banks/nope/system-prompt", None, 404),
+        ("GET", "/v1/banks/nope/agenda", None, 404),
+        ("GET", "/v1/banks/nope/models", None, 404),
+        (
+            "PATCH",
+            "/v1/banks/main/models/Nope",
+            Some(json!({"enabled": false})),
+            404,
+        ),
+        (
+            "POST",
+            "/v1/banks/main/models",
+            Some(json!({"name": "", "question": "Who?", "max_tokens": 10})),
+            422,
+        ),
+        (
+            "POST",
+            "/v1/banks/main/models",
+            Some(
+                json!({"name": "Ana", "question": "Who is Ana?", "entity": "Ana",
+                        "max_tokens": 10}),
+            ),
+            422,
+        ),
+        // No LLM is configured, so nothing can be refreshed.
+        (
+            "POST",
+            "/v1/banks/main/models/User%20profile/refresh",
+            Some(Value::Null),
+            503,
+        ),
+    ] {
+        let reply = daemon.send(method, path, body.as_ref());
+        assert_eq!(reply.status, status, "{method} {path}: {}", reply.body);
+        assert!(
+            reply.json()["error"].is_string(),
+            "{method} {path}: {}",
+            reply.body
+        );
+    }
+
+    // An empty bank's block is the pointer line alone.
+    let block = daemon.ok(daemon.get("/v1/banks/main/system-prompt"));
+    let text = block["text"].as_str().unwrap();
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.starts_with("Built "), "{text}");
+    assert_eq!(block["agenda"], json!([]));
+    assert_eq!(block["cited"], json!([]));
+}
+
+#[test]
+fn the_cli_creates_lists_edits_and_refreshes_models() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir)
+        .script(&[
+            json!({"reply": auckland_reply()}),
+            json!({"reply": adds_entry(ENTRY)}),
+        ])
+        .ready();
+    daemon.create_bank("main");
+    daemon.ingest_notes("main", "notes.md");
+    let memory = daemon.wait_for_memory("main");
+    daemon.wait_extracted("main");
+
+    let out = succeeded(run(cli(&daemon).args([
+        "model",
+        "create",
+        "--bank",
+        "main",
+        "Plans",
+        "--question",
+        "Where is Tim going?",
+        "--max-tokens",
+        "300",
+        "--kind",
+        "event",
+    ])));
+    assert!(out.contains("created Plans (300 tokens)"), "{out}");
+    let output = run(cli(&daemon).args([
+        "model",
+        "create",
+        "--bank",
+        "main",
+        "Big",
+        "--question",
+        "Anything?",
+        "--max-tokens",
+        "1",
+    ]));
+    assert!(
+        !output.status.success(),
+        "a model over the budget was created"
+    );
+    assert!(stderr(&output).contains("budget"), "{}", stderr(&output));
+
+    let out = succeeded(run(cli(&daemon).args([
+        "model",
+        "edit",
+        "--bank",
+        "main",
+        "Plans",
+        "--disable",
+    ])));
+    assert!(out.contains("Plans  [300 tokens, disabled]"), "{out}");
+
+    let out = succeeded(run(cli(&daemon).args([
+        "model",
+        "refresh",
+        "--bank",
+        "main",
+        "User profile",
+        "--force",
+    ])));
+    assert!(out.contains("refreshed: 1 added"), "{out}");
+    let out = succeeded(run(cli(&daemon).args([
+        "model",
+        "refresh",
+        "--bank",
+        "main",
+        "User profile",
+    ])));
+    assert!(out.contains("unchanged"), "{out}");
+
+    let out = succeeded(run(cli(&daemon).args(["model", "list", "--bank", "main"])));
+    assert!(out.contains("User profile  [500 tokens]"), "{out}");
+    assert!(
+        out.contains(&format!("- {ENTRY}  (cites {memory})")),
+        "{out}"
+    );
+    assert!(out.contains("Plans  [300 tokens, disabled]"), "{out}");
+    let out = succeeded(run(
+        cli(&daemon).args(["model", "list", "--bank", "main", "--json"])
+    ));
+    let models: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(models.as_array().unwrap().len(), 2);
+
+    let output = run(cli(&daemon).args(["model", "refresh", "--bank", "main", "Nope"]));
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("no such model"),
+        "{}",
+        stderr(&output)
+    );
 }
