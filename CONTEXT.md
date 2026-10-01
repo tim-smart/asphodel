@@ -97,7 +97,7 @@ The link from a memory to the memory that replaced it, whether the old one was r
 _Avoid_: Update, overwrite
 
 **Forget**:
-The owner's explicit request to erase a memory and the passage it came from, as if the store had never been told.
+The owner's explicit request to erase a memory, every earlier and later version of it, and the passages they came from, as if the store had never been told.
 _Avoid_: Delete, purge, expire
 
 **Kept**:
@@ -105,7 +105,7 @@ Said of a memory the owner has asked to remember, which sets its significance as
 _Avoid_: Pinned, starred, saved
 
 **Purge**:
-Asphodel removing a memory that has faded long enough to be worthless on its own.
+Asphodel removing a memory, with every version of it, once its strength has fallen well below the recall threshold. The passage it came from stays until nothing else rests on its source.
 _Avoid_: Forget, garbage collection, expire
 
 ## Strength
@@ -187,7 +187,7 @@ _Avoid_: Loaded, seen, in the context window
 ## Sources and organisation
 
 **Source**:
-The exact input a memory came from, either a conversation turn or a document, kept verbatim.
+The exact input a memory came from, either a conversation turn or a document, kept verbatim. Once no memory rests on it and it's 90 days old, its text is swept and only its key is kept, so it can't be ingested again.
 _Avoid_: Episode, chunk, input, raw message
 
 **Turn**:
