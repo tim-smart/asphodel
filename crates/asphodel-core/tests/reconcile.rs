@@ -2770,7 +2770,10 @@ fn a_populated_version_3_store_keeps_its_accesses_through_the_migration() {
     {
         let store = h.service.store().unwrap();
         let applied = store.applied().expect("version 3 is migrated");
-        assert_eq!((applied.from, applied.to), (3, 4));
+        assert_eq!(
+            (applied.from, applied.to),
+            (3, asphodel_core::store::SCHEMA_VERSION)
+        );
     }
     // Every row and id as it was.
     assert_eq!(access_rows(&h), before);

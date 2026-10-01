@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jiff::Timestamp;
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -175,17 +176,29 @@ impl Service {
     ///
     /// A new turn also settles its prefetch: echoing a pending injection's
     /// `recall_id` commits it to the session's in-context set (TIM-94,
-    /// decision 6). A duplicate, such as a resend from the plugin's spool,
-    /// settles nothing, since the turn it repeats already did.
+    /// decision 6). The set as the turn leaves it is stored with the turn,
+    /// in the same transaction, and extraction reads it from there rather
+    /// than from the session, which may since have been cleared, added to
+    /// or lost to a restart (TIM-110 review). A duplicate, such as a resend
+    /// from the plugin's spool, settles nothing, since the turn it repeats
+    /// already did.
     pub fn ingest_turn(&self, bank: &str, turn: &Turn) -> Result<Ingested, IngestError> {
-        let ingested = crate::ingest::ingest_turn(&self.store, bank, turn)?;
-        if ingested.outcome == Outcome::Duplicate {
-            return Ok(ingested);
-        }
         let bank_id = {
             let conn = self.store.connection();
             crate::ingest::find_bank(&conn, bank)?.map(|(bank_id, _)| bank_id)
         };
+        let in_context = bank_id.map_or_else(Vec::new, |bank_id| {
+            self.sessions.after_turn(
+                bank_id,
+                &turn.session_id,
+                turn.recall_id.as_deref(),
+                self.now(),
+            )
+        });
+        let ingested = crate::ingest::ingest_turn(&self.store, bank, turn, &in_context)?;
+        if ingested.outcome == Outcome::Duplicate {
+            return Ok(ingested);
+        }
         if let Some(bank_id) = bank_id {
             self.sessions.turn(
                 bank_id,
@@ -363,7 +376,8 @@ impl Service {
     }
 
     /// Takes the head of `bank`'s queue and extracts it with `llm`, giving
-    /// call 1 the in-context set of the turn's session. `Ok(None)` when the
+    /// call 1 the in-context set stored with the turn when it was ingested,
+    /// never the session's set now (TIM-110 review). `Ok(None)` when the
     /// queue is empty or the bank's worker already holds a lease. This is
     /// the step the daemon's per-bank worker repeats, and the replay harness
     /// runs it the same way (TIM-96, decision 3).
@@ -378,20 +392,29 @@ impl Service {
         let in_context = match lease.source_kind {
             SourceKind::Document => Vec::new(),
             SourceKind::Turn => {
-                let session: Option<String> = {
+                let stored: Option<String> = {
                     let conn = self.store.connection();
                     conn.query_row(
-                        "SELECT session_id FROM sources WHERE uuid = ?1",
+                        "SELECT t.memories FROM turn_in_context t
+                         JOIN sources s ON s.id = t.source_id
+                         WHERE s.uuid = ?1",
                         [lease.source.to_string()],
                         |row| row.get(0),
                     )
+                    .optional()
                     .map_err(StoreError::Sqlite)?
                 };
-                match session {
-                    Some(session) => {
-                        self.sessions
-                            .in_context(lease.bank_id(), &session, self.now())
-                    }
+                // No row is an empty set, including for a turn ingested
+                // before version 5: the session can't stand in for it.
+                match stored {
+                    Some(stored) => serde_json::from_str(&stored).unwrap_or_else(|error| {
+                        tracing::warn!(
+                            source = %lease.source,
+                            %error,
+                            "a turn's stored in-context set doesn't parse; extracting without it"
+                        );
+                        Vec::new()
+                    }),
                     None => Vec::new(),
                 }
             }

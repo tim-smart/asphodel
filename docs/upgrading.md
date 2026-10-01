@@ -64,3 +64,16 @@ memory per turn, the strongest.
 
 The migration rebuilds the `accesses` table with every row and id as they
 were. No action is needed.
+
+## Schema version 5: a queued turn keeps its in-context set
+
+Extraction credits a turn with `used` accesses on the memories the agent
+could see when it wrote the reply. Before version 5 the worker read the
+session's in-context set when it reached the turn, so a session cleared
+on compaction, a later recall, or a restart in between changed the credit
+(the TIM-110 review). From version 5, ingest stores the set with the turn
+in `turn_in_context`, and the row goes once the turn is extracted.
+
+The migration only adds the table. Turns already queued when you upgrade
+have no stored set and are extracted as if nothing was in context, which
+is what a restart did to them before. No action is needed.

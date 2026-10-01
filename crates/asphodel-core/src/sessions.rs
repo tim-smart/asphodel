@@ -13,8 +13,10 @@
 //!   [`PENDING_PER_SESSION`] newer ones push it out, or the session idles.
 //! - **The in-context set** is what the agent can already see this session:
 //!   committed injections and recall-tool results (and, once it exists, the
-//!   agenda). Injection skips it, and extraction gets it to judge `used`
-//!   (ADR 0001). It's cleared on compaction.
+//!   agenda). Injection skips it, and it's cleared on compaction. Extraction
+//!   judges `used` (ADR 0001) against the set as each turn's sync left it,
+//!   which ingest stores with the turn ([`Sessions::after_turn`]), never
+//!   against the session as it is when the worker gets there.
 //! - **Idle timeout.** A session untouched for
 //!   `sessions.in_context_idle_days` on the service's clock is dropped. It's
 //!   garbage collection only.
@@ -98,6 +100,33 @@ impl Sessions {
                 "no turn acknowledged a pending injection, so it's dropped"
             );
         }
+    }
+
+    /// The in-context set [`Sessions::turn`] would leave for a turn
+    /// echoing `recall_id`, without changing anything: the set now, plus the
+    /// pending injection held under that id. Ingest stores it with the turn,
+    /// so extraction sees what the agent saw when it wrote the reply.
+    pub(crate) fn after_turn(
+        &self,
+        bank_id: i64,
+        session_id: &str,
+        recall_id: Option<&str>,
+        now: Timestamp,
+    ) -> Vec<Uuid> {
+        let sessions = self.live(now);
+        let Some(session) = sessions.get(&(bank_id, session_id.to_owned())) else {
+            return Vec::new();
+        };
+        let mut set = session.in_context.clone();
+        let recall_id = recall_id.and_then(|id| id.trim().parse::<Uuid>().ok());
+        if let Some(pending) = session
+            .pending
+            .iter()
+            .find(|pending| Some(pending.recall_id) == recall_id)
+        {
+            add(&mut set, &pending.memories);
+        }
+        set
     }
 
     /// A turn arrived echoing `recall_id`: commits the pending injection

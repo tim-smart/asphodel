@@ -171,7 +171,18 @@ pub(crate) const PRIORITY_DOCUMENT: i64 = 1;
 pub const TURN_SEPARATOR: &str = "\n\n";
 
 /// Ingests a turn into `bank`.
-pub fn ingest_turn(store: &Store, bank: &str, turn: &Turn) -> Result<Ingested, IngestError> {
+///
+/// `in_context` is the session's in-context set as this turn's sync leaves
+/// it, the memories the agent could see when it wrote the reply. It's
+/// stored with the turn in the same transaction, and extraction judges the
+/// turn's `used` verdicts against it alone (ADR 0001, TIM-110 review). A
+/// duplicate or a tombstone stores none.
+pub fn ingest_turn(
+    store: &Store,
+    bank: &str,
+    turn: &Turn,
+    in_context: &[Uuid],
+) -> Result<Ingested, IngestError> {
     let mut conn = store.connection();
     let tx = conn.transaction()?;
     let (bank_id, bank_timezone) = find_bank(&tx, bank)?.ok_or(IngestError::UnknownBank)?;
@@ -254,6 +265,15 @@ pub fn ingest_turn(store: &Store, bank: &str, turn: &Turn) -> Result<Ingested, I
         ],
     )?;
     let source_id = tx.last_insert_rowid();
+    if !in_context.is_empty() {
+        tx.execute(
+            "INSERT INTO turn_in_context (source_id, memories) VALUES (?1, ?2)",
+            (
+                source_id,
+                serde_json::to_string(in_context).expect("a list of ids serialises"),
+            ),
+        )?;
+    }
 
     let text = [user.text.as_str(), TURN_SEPARATOR, reply.text.as_str()].concat();
     let chunk = NewChunk {

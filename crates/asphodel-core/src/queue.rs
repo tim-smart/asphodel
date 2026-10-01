@@ -238,8 +238,9 @@ pub(crate) fn complete(store: &Store, leases: &Leases, lease: Lease) -> Result<(
 }
 
 /// [`complete`]'s writes, inside the caller's transaction, so extraction
-/// commits its memories together with `extracted_at` (TIM-92). The caller
-/// has checked the lease is held.
+/// commits its memories together with `extracted_at` (TIM-92). A turn's
+/// stored in-context set goes too: it was only kept for this extraction.
+/// The caller has checked the lease is held.
 pub(crate) fn finish(
     tx: &rusqlite::Transaction<'_>,
     now: Timestamp,
@@ -249,6 +250,13 @@ pub(crate) fn finish(
         "UPDATE chunks SET extracted_at = ?1, call1_output = NULL WHERE id = ?2",
         (micros(now), lease.chunk_id),
     )?;
+    if lease.source_kind == SourceKind::Turn {
+        tx.execute(
+            "DELETE FROM turn_in_context
+             WHERE source_id = (SELECT source_id FROM chunks WHERE id = ?1)",
+            [lease.chunk_id],
+        )?;
+    }
     tx.execute(
         "DELETE FROM extraction_queue WHERE id = ?1",
         [lease.queue_id],
