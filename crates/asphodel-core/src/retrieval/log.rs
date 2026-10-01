@@ -15,6 +15,8 @@ use crate::store::micros;
 pub(super) enum RecallKind {
     Prefetch,
     Tool,
+    /// A mental model's refresh retrieval (TIM-95, decision 3).
+    Refresh,
 }
 
 impl RecallKind {
@@ -22,6 +24,7 @@ impl RecallKind {
         match self {
             RecallKind::Prefetch => "prefetch",
             RecallKind::Tool => "tool",
+            RecallKind::Refresh => "refresh",
         }
     }
 }

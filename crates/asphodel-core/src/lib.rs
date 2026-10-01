@@ -5,6 +5,7 @@
 //! every operation takes its notion of "now" from the [`clock::Clock`] it was
 //! given, so a replay can run years of bank time in minutes (ADR 0004).
 
+pub mod agenda;
 pub mod chunking;
 pub mod clock;
 pub mod config;
@@ -13,6 +14,7 @@ pub mod extraction;
 pub mod ingest;
 pub mod keep;
 pub mod logging;
+pub mod mental_models;
 pub mod models;
 pub mod queue;
 pub mod retrieval;
@@ -21,6 +23,7 @@ pub mod service;
 mod sessions;
 pub mod store;
 pub mod strength;
+pub mod system_prompt;
 
 pub use clock::{Clock, SimulatedClock, SystemClock};
 pub use config::{ResolvedConfig, Tuning};

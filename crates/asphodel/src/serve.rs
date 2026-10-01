@@ -44,6 +44,11 @@ mod worker;
 /// doesn't count, and is the retry delay after a failed pass.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// The longest the refresh timer sleeps. A trigger written meanwhile moves
+/// the next refresh earlier than the timer knew, so it looks again at
+/// least this often; the debounce is minutes, so a minute late is fine.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The shortest wait between passes. The timer is monotonic and the
 /// deadline is on the service's clock, so a wake can land just short of it;
 /// this keeps that from becoming a run of near-zero waits.
@@ -74,6 +79,8 @@ pub(crate) struct Ready {
     config: ResolvedConfig,
     /// `None` when no LLM is configured: chunks wait on the queue.
     workers: Option<Arc<Workers>>,
+    /// The LLM extraction and refresh share, when one is configured.
+    llm: Option<Arc<dyn LlmClient>>,
 }
 
 impl App {
@@ -189,10 +196,17 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 
     let service = Arc::new(started.service);
     tokio::spawn(housekeeping(Arc::downgrade(&service)));
-    let workers = match started.llm {
+    if let Some(llm) = &started.llm {
+        tokio::spawn(refreshes(
+            Arc::downgrade(&service),
+            Arc::clone(llm),
+            stop.clone(),
+        ));
+    }
+    let workers = match &started.llm {
         Some(llm) => Some(Workers::start(
             Arc::clone(&service),
-            llm,
+            Arc::clone(llm),
             &started.banks,
             stop.clone(),
         )),
@@ -202,6 +216,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         service: Arc::clone(&service),
         config: started.config,
         workers: workers.clone(),
+        llm: started.llm,
     });
     info!(version = asphodel_core::VERSION, listen = %address, "asphodel listening");
 
@@ -577,6 +592,53 @@ async fn housekeeping(service: Weak<Service>) {
             }
         };
         tokio::time::sleep(wait).await;
+    }
+}
+
+/// Runs [`Service::run_refreshes`] at each pass's `next_due`, or after
+/// [`REFRESH_INTERVAL`] if that comes first, until the daemon stops or the
+/// service is dropped (TIM-95 amendment, decision 1). Refreshes run here,
+/// never inside a request. Like [`housekeeping`], it holds the service
+/// weakly and never across a wait.
+async fn refreshes(service: Weak<Service>, llm: Arc<dyn LlmClient>, stop: watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let Some(service) = service.upgrade() else {
+            return;
+        };
+        let llm = Arc::clone(&llm);
+        let pass = tokio::task::spawn_blocking(move || {
+            let result = service.run_refreshes(llm.as_ref());
+            (result, service.now())
+        })
+        .await;
+        let wait = match pass {
+            Ok((Ok(done), now)) => {
+                for run in &done.ran {
+                    info!(bank = %run.bank, model = %run.model, outcome = ?run.outcome,
+                        "refreshed a mental model");
+                }
+                done.next_due.map_or(REFRESH_INTERVAL, |due| {
+                    Duration::try_from(now.duration_until(due))
+                        .unwrap_or(Duration::ZERO)
+                        .clamp(HOUSEKEEPING_MIN_WAIT, REFRESH_INTERVAL)
+                })
+            }
+            Ok((Err(error), _)) => {
+                warn!(%error, "refreshing mental models failed");
+                REFRESH_INTERVAL
+            }
+            Err(error) => {
+                warn!(%error, "refreshing mental models panicked");
+                REFRESH_INTERVAL
+            }
+        };
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = stopped(stop.clone()) => return,
+        }
     }
 }
 

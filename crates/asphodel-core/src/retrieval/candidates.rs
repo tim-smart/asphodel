@@ -24,7 +24,7 @@ use crate::strength::{AccessKind, Chains, Kind, Phase, Window, state_confidence}
 
 /// A memory that survived clean-up, with what ranking and rendering need.
 #[derive(Debug, Clone)]
-pub(super) struct Candidate {
+pub(crate) struct Candidate {
     pub id: i64,
     pub uuid: Uuid,
     pub content: String,
@@ -43,11 +43,13 @@ pub(super) struct Candidate {
     /// When the state was last said to hold: `observed_at`, or a later
     /// `mentioned_again` or `confirmed`, as state confidence ages it.
     pub last_observed: Timestamp,
+    /// A state's volatility; `None` for anything else, or a state with none.
+    pub volatility: Option<Volatility>,
     pub kept: bool,
 }
 
 /// Turns hits into candidates for one recall, caching each head.
-pub(super) struct Cleanup<'a> {
+pub(crate) struct Cleanup<'a> {
     conn: &'a Connection,
     chains: Chains,
     strength: StrengthLoader,
@@ -60,7 +62,7 @@ pub(super) struct Cleanup<'a> {
 }
 
 impl<'a> Cleanup<'a> {
-    pub(super) fn new(
+    pub(crate) fn new(
         conn: &'a Connection,
         bank_id: i64,
         quiet_rate: f64,
@@ -81,7 +83,7 @@ impl<'a> Cleanup<'a> {
 
     /// Cleans up one retriever's hits, best first: each hit becomes its
     /// chain's head, or nothing, and each head is listed once.
-    pub(super) fn list(&mut self, hits: &[i64]) -> Result<Vec<i64>, rusqlite::Error> {
+    pub(crate) fn list(&mut self, hits: &[i64]) -> Result<Vec<i64>, rusqlite::Error> {
         let mut ranked = Vec::new();
         for &hit in hits {
             if let Some(head) = self.shown(hit)?
@@ -95,7 +97,7 @@ impl<'a> Cleanup<'a> {
 
     /// The candidates for `ids`, in that order. Every id must have come out
     /// of [`Cleanup::list`].
-    pub(super) fn take(&mut self, ids: &[i64]) -> Vec<Candidate> {
+    pub(crate) fn take(&mut self, ids: &[i64]) -> Vec<Candidate> {
         ids.iter()
             .filter_map(|id| self.heads.get(id).cloned().flatten())
             .collect()
@@ -208,6 +210,7 @@ fn load(
         strength,
         state_confidence,
         last_observed,
+        volatility,
         kept: row.owner_significance.as_deref() == Some("kept"),
     }))
 }

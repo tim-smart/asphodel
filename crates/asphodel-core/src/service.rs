@@ -4,20 +4,26 @@
 //! in a handler belongs here instead (TIM-96, decision 3).
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use jiff::Timestamp;
+use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::agenda::Agenda;
 use crate::clock::Clock;
 use crate::config::{ConfigError, Tuning};
 use crate::constants::RERANKER_DEADLINE;
 use crate::extraction::{Call1Input, Call2Input, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use crate::keep::{KeepError, Kept, Unkept};
+use crate::mental_models::{
+    Model, ModelEdit, ModelError, ModelSpec, Outcome as RefreshOutcome, RefreshInput, RefreshRun,
+    Refreshes, Schedule,
+};
 use crate::models::{LlmClient, Models};
 use crate::queue::{
     ChunkError, ChunkList, FailedChunk, Failure, Lease, Leases, QueueError, Retried, SourceKind,
@@ -26,6 +32,7 @@ use crate::retrieval::{Permit, Prefetch, PrefetchRequest, Recall, RecallError, R
 use crate::sessions::Sessions;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
+use crate::system_prompt::{Block, Blocks};
 
 /// One running store: the daemon's banks, models, extraction queue and jobs,
 /// driven by a clock.
@@ -49,6 +56,15 @@ pub struct Service {
     /// The reranker deadline: [`RERANKER_DEADLINE`], fixed in code
     /// (ADR 0009), unless [`Service::with_reranker_deadline`] set another.
     reranker_deadline: Duration,
+    /// Each bank's last refresh trigger and last daily sweep (TIM-95
+    /// amendment, decision 1). In memory; the requests themselves are in
+    /// the store.
+    schedule: Schedule,
+    /// Each bank's system prompt block, rebuilt lazily once cleared.
+    blocks: Blocks,
+    /// Held while a refresh runs, so the timer and `model refresh` never
+    /// refresh at once.
+    refreshing: Mutex<()>,
 }
 
 /// Why a service couldn't be built on a store and models.
@@ -65,6 +81,7 @@ impl Service {
     /// use [`Service::with_models`].
     pub fn open(clock: Arc<dyn Clock>, store: Store, tuning: Tuning) -> Self {
         let sessions = Sessions::new(tuning.sessions.in_context_idle_days);
+        let schedule = Schedule::new(clock.now());
         Self {
             clock,
             store,
@@ -74,6 +91,9 @@ impl Service {
             sessions,
             reranker_permit: Arc::default(),
             reranker_deadline: RERANKER_DEADLINE,
+            schedule,
+            blocks: Blocks::default(),
+            refreshing: Mutex::new(()),
         }
     }
 
@@ -92,6 +112,7 @@ impl Service {
         let ids = models.ids();
         tuning.check_floors(&ids.embedding, &ids.reranker)?;
         let sessions = Sessions::new(tuning.sessions.in_context_idle_days);
+        let schedule = Schedule::new(clock.now());
         Ok(Self {
             clock,
             store,
@@ -101,6 +122,9 @@ impl Service {
             sessions,
             reranker_permit: Arc::default(),
             reranker_deadline: RERANKER_DEADLINE,
+            schedule,
+            blocks: Blocks::default(),
+            refreshing: Mutex::new(()),
         })
     }
 
@@ -187,6 +211,9 @@ impl Service {
             let conn = self.store.connection();
             crate::ingest::find_bank(&conn, bank)?.map(|(bank_id, _)| bank_id)
         };
+        if let Some(bank_id) = bank_id {
+            self.restore_block(bank_id, &turn.session_id)?;
+        }
         let in_context = bank_id.map_or_else(Vec::new, |bank_id| {
             self.sessions.after_turn(
                 bank_id,
@@ -206,6 +233,9 @@ impl Service {
                 turn.recall_id.as_deref(),
                 self.now(),
             );
+            let conn = self.store.connection();
+            crate::system_prompt::touch_session(&conn, bank_id, &turn.session_id, self.now())
+                .map_err(StoreError::Sqlite)?;
         }
         Ok(ingested)
     }
@@ -286,7 +316,12 @@ impl Service {
         in_context: &[Uuid],
     ) -> Result<Extracted, ExtractError> {
         let models = self.models.as_ref().ok_or(ExtractError::NoModels)?;
-        crate::extraction::extract(
+        let bank_id = lease.bank_id();
+        let watermark = {
+            let conn = self.store.connection();
+            crate::mental_models::watermark(&conn, bank_id).map_err(StoreError::Sqlite)?
+        };
+        let extracted = crate::extraction::extract(
             &self.store,
             &self.leases,
             &self.tuning,
@@ -294,13 +329,18 @@ impl Service {
             lease,
             llm,
             in_context,
-        )
+        )?;
+        self.after_writes(bank_id, watermark, &extracted.memories)?;
+        Ok(extracted)
     }
 
     /// Prefetch: recalls for the user's message in `bank` and returns the
     /// injection, holding it as the session's pending set until the turn
     /// that echoes its `recall_id` ([`crate::retrieval`]).
     pub fn prefetch(&self, bank: &str, request: &PrefetchRequest) -> Result<Prefetch, RecallError> {
+        if let Ok(bank_id) = self.bank_id(bank) {
+            self.restore_block(bank_id, &request.session_id)?;
+        }
         crate::retrieval::prefetch(&self.retrieval()?, bank, request)
     }
 
@@ -316,6 +356,7 @@ impl Service {
     /// [`Service::call1_input`] and [`Service::extract_chunk`] take.
     pub fn in_context(&self, bank: &str, session_id: &str) -> Result<Vec<Uuid>, RecallError> {
         let bank_id = self.bank_id(bank)?;
+        self.restore_block(bank_id, session_id)?;
         Ok(self.sessions.in_context(bank_id, session_id, self.now()))
     }
 
@@ -324,6 +365,9 @@ impl Service {
     pub fn clear_session(&self, bank: &str, session_id: &str) -> Result<(), RecallError> {
         let bank_id = self.bank_id(bank)?;
         self.sessions.clear(bank_id, session_id, self.now());
+        let conn = self.store.connection();
+        crate::system_prompt::unmap_session(&conn, bank_id, session_id)
+            .map_err(StoreError::Sqlite)?;
         Ok(())
     }
 
@@ -436,13 +480,23 @@ impl Service {
     /// Keeps the memories `ids` names in `bank`, so they never fade
     /// (`memory_keep`, TIM-94, decision 9).
     pub fn keep(&self, bank: &str, ids: &[String]) -> Result<Kept, KeepError> {
-        crate::keep::keep(&self.store, bank, ids)
+        let watermark = self.watermark_for(bank)?;
+        let kept = crate::keep::keep(&self.store, bank, ids)?;
+        if let Some((bank_id, watermark)) = watermark {
+            self.after_writes(bank_id, watermark, &[])?;
+        }
+        Ok(kept)
     }
 
     /// Hands the memories `ids` names in `bank` back to the significance
     /// extraction gave them (`memory_unkeep`).
     pub fn unkeep(&self, bank: &str, ids: &[String]) -> Result<Unkept, KeepError> {
-        crate::keep::unkeep(&self.store, bank, ids)
+        let watermark = self.watermark_for(bank)?;
+        let unkept = crate::keep::unkeep(&self.store, bank, ids)?;
+        if let Some((bank_id, watermark)) = watermark {
+            self.after_writes(bank_id, watermark, &[])?;
+        }
+        Ok(unkept)
     }
 
     /// Checkpoints the WAL into the database file, as the daemon does on
@@ -461,6 +515,10 @@ impl Service {
     /// copy's deadline instead of finding it on a later poll.
     pub fn housekeeping(&self) -> Result<Housekeeping, StoreError> {
         let copies_removed = self.store.expire_copies()?;
+        {
+            let conn = self.store.connection();
+            crate::system_prompt::expire_mappings(&conn, self.now(), self.mapping_expiry())?;
+        }
         let next_due = self.store.next_copy_expiry()?;
         Ok(Housekeeping {
             copies_removed,
@@ -478,6 +536,319 @@ impl Service {
             ready: true,
             now: self.now(),
         }
+    }
+}
+
+/// Mental models, the agenda and the system prompt block ("Agenda, mental
+/// models and the system prompt block", TIM-111; ADR 0007).
+impl Service {
+    /// The model surface, `model create` (TIM-95, decision 2). The enabled
+    /// models' `max_tokens` must fit `mental_models.budget`. A new enabled
+    /// model is refreshed after the debounce, like any owner edit.
+    pub fn create_model(&self, bank: &str, spec: &ModelSpec) -> Result<Model, ModelError> {
+        let (bank_id, _) = self.model_bank(bank)?;
+        let row = crate::mental_models::create(
+            &self.store,
+            bank_id,
+            spec,
+            self.tuning.mental_models.budget,
+        )?;
+        if row.enabled {
+            self.trigger(bank_id, row.id)?;
+        }
+        self.blocks.invalidate(bank_id);
+        let conn = self.store.connection();
+        Ok(crate::mental_models::model(&conn, &row)?)
+    }
+
+    /// An owner edit to a model (`model edit`). Changing the question, the
+    /// filters or `max_tokens`, or enabling it, triggers a refresh;
+    /// resizing and enabling are checked against the budget.
+    pub fn edit_model(
+        &self,
+        bank: &str,
+        name: &str,
+        edit: &ModelEdit,
+    ) -> Result<Model, ModelError> {
+        let (bank_id, _) = self.model_bank(bank)?;
+        let edited = crate::mental_models::edit(
+            &self.store,
+            bank_id,
+            name,
+            edit,
+            self.tuning.mental_models.budget,
+        )?;
+        if edited.triggers {
+            self.trigger(bank_id, edited.row.id)?;
+        }
+        self.blocks.invalidate(bank_id);
+        let conn = self.store.connection();
+        Ok(crate::mental_models::model(&conn, &edited.row)?)
+    }
+
+    /// Every model of the bank with its entries (`model list`).
+    pub fn list_models(&self, bank: &str) -> Result<Vec<Model>, ModelError> {
+        let (bank_id, _) = self.model_bank(bank)?;
+        let conn = self.store.connection();
+        crate::mental_models::load_models(&conn, bank_id)?
+            .iter()
+            .map(|row| crate::mental_models::model(&conn, row).map_err(ModelError::from))
+            .collect()
+    }
+
+    /// What the next refresh of the model would send the LLM, and its
+    /// fingerprint. Reads only, and writes no recall row.
+    pub fn refresh_input(&self, bank: &str, name: &str) -> Result<RefreshInput, ModelError> {
+        let row = self.model_row(bank, name)?;
+        crate::mental_models::refresh_input(&self.retrieval()?, &row)
+    }
+
+    /// One refresh now, outside the schedule (`model refresh [--force]`).
+    /// Without `force` it's skipped when the fingerprint matches the last
+    /// completed refresh's (TIM-95, decision 7).
+    pub fn refresh_model(
+        &self,
+        bank: &str,
+        name: &str,
+        llm: &dyn LlmClient,
+        force: bool,
+    ) -> Result<RefreshOutcome, ModelError> {
+        let _refreshing = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+        let row = self.model_row(bank, name)?;
+        let outcome = crate::mental_models::refresh(&self.retrieval()?, &row, llm, force)?;
+        if matches!(outcome, RefreshOutcome::Applied(_)) {
+            self.blocks.invalidate(row.bank_id);
+        }
+        Ok(outcome)
+    }
+
+    /// Runs every refresh due now, across banks, and says when the next is
+    /// due: a model whose debounce or retry has come round, and every
+    /// enabled model of a bank whose daily sweep has. `serve` calls it from
+    /// a timer and the replay harness after advancing its clock (TIM-96,
+    /// decision 3). A model that fails to refresh doesn't stop the rest.
+    pub fn run_refreshes(&self, llm: &dyn LlmClient) -> Result<Refreshes, ModelError> {
+        let _refreshing = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+        let now = self.now();
+        let tuning = &self.tuning.mental_models;
+        let cx = self.retrieval()?;
+        let mut ran = Vec::new();
+        for (bank_id, bank, tz) in self.bank_zones()? {
+            let sweep = self.schedule.next_sweep(bank_id, &tz, tuning.sweep_time) <= now;
+            let models = {
+                let conn = self.store.connection();
+                crate::mental_models::load_models(&conn, bank_id)?
+            };
+            for model in models.into_iter().filter(|model| model.enabled) {
+                let last_trigger = self.schedule.last_trigger(bank_id);
+                let requested = crate::mental_models::schedule::due(&model, last_trigger, tuning)
+                    .is_some_and(|due| due <= now);
+                let run = requested
+                    || (sweep && {
+                        let held = crate::mental_models::schedule::not_before(&model)
+                            .is_some_and(|floor| floor > now);
+                        if held {
+                            // Refreshed too recently: the sweep's check
+                            // waits for the interval instead.
+                            let conn = self.store.connection();
+                            crate::mental_models::request(&conn, &[model.id].into(), now)?;
+                        }
+                        !held
+                    });
+                if !run {
+                    continue;
+                }
+                match crate::mental_models::refresh(&cx, &model, llm, false) {
+                    Ok(outcome) => {
+                        if matches!(outcome, RefreshOutcome::Applied(_)) {
+                            self.blocks.invalidate(bank_id);
+                        }
+                        ran.push(RefreshRun {
+                            bank: bank.clone(),
+                            model: model.name.clone(),
+                            outcome,
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(bank = %bank, model = %model.uuid, %error,
+                            "a mental model refresh failed before its LLM call");
+                    }
+                }
+            }
+            if sweep {
+                self.schedule.swept(bank_id, now);
+            }
+        }
+        Ok(Refreshes {
+            ran,
+            next_due: self.next_refresh_due()?,
+        })
+    }
+
+    /// The earliest requested refresh or daily sweep still ahead.
+    fn next_refresh_due(&self) -> Result<Option<Timestamp>, ModelError> {
+        let tuning = &self.tuning.mental_models;
+        let mut next: Option<Timestamp> = None;
+        let mut earliest = |at: Timestamp| next = Some(next.map_or(at, |next| next.min(at)));
+        for (bank_id, _, tz) in self.bank_zones()? {
+            let models = {
+                let conn = self.store.connection();
+                crate::mental_models::load_models(&conn, bank_id)?
+            };
+            let mut any = false;
+            for model in models.iter().filter(|model| model.enabled) {
+                any = true;
+                let last_trigger = self.schedule.last_trigger(bank_id);
+                if let Some(due) = crate::mental_models::schedule::due(model, last_trigger, tuning)
+                {
+                    earliest(due);
+                }
+            }
+            if any {
+                earliest(self.schedule.next_sweep(bank_id, &tz, tuning.sweep_time));
+            }
+        }
+        Ok(next)
+    }
+
+    /// The bank's agenda now (TIM-93, decision 7, as amended by TIM-95).
+    pub fn agenda(&self, bank: &str) -> Result<Agenda, ModelError> {
+        let (bank_id, tz) = self.model_bank(bank)?;
+        let conn = self.store.connection();
+        Ok(crate::agenda::build(&conn, &self.tuning, bank_id, &tz, self.now())?.agenda)
+    }
+
+    /// The bank's system prompt block, `GET /v1/banks/{bank}/system-prompt`:
+    /// the cached one, or a new one built from the agenda and each enabled
+    /// model's entries as of its last completed refresh. It never calls the
+    /// LLM. With a session id, the daemon records which block the session
+    /// holds, and what the block lists or cites joins the session's
+    /// in-context set (TIM-95, decision 4).
+    pub fn system_prompt(&self, bank: &str, session: Option<&str>) -> Result<Block, ModelError> {
+        let (bank_id, tz) = self.model_bank(bank)?;
+        let now = self.now();
+        let today = now.to_zoned(tz.clone()).date();
+        let block = match self.blocks.get(bank_id, today) {
+            Ok(block) => block,
+            Err(generation) => {
+                let block = crate::system_prompt::build(&self.store, &self.tuning, bank_id, &tz)?;
+                self.blocks.put(bank_id, today, block.clone(), generation);
+                block
+            }
+        };
+        if let Some(session) = session.map(str::trim).filter(|session| !session.is_empty()) {
+            {
+                let conn = self.store.connection();
+                crate::system_prompt::map_session(&conn, bank_id, session, &block, now)?;
+            }
+            self.sessions
+                .add(bank_id, session, &block.in_context(), now);
+        }
+        Ok(block)
+    }
+
+    fn mapping_expiry(&self) -> SignedDuration {
+        SignedDuration::from_hours(24 * i64::from(self.tuning.sessions.mapping_expiry_days))
+    }
+
+    /// Puts what the session's block listed and cited back into its
+    /// in-context set, from the stored mapping, which outlives a restart.
+    fn restore_block(&self, bank_id: i64, session_id: &str) -> Result<(), StoreError> {
+        let now = self.now();
+        let ids = {
+            let conn = self.store.connection();
+            crate::system_prompt::mapped(&conn, bank_id, session_id, now, self.mapping_expiry())?
+        };
+        if !ids.is_empty() {
+            self.sessions.add(bank_id, session_id, &ids, now);
+        }
+        Ok(())
+    }
+
+    /// The bank's rowid and edit-log high-water mark, when it exists.
+    fn watermark_for(&self, bank: &str) -> Result<Option<(i64, i64)>, StoreError> {
+        let conn = self.store.connection();
+        let Some((bank_id, _)) = crate::ingest::find_bank(&conn, bank)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            bank_id,
+            crate::mental_models::watermark(&conn, bank_id)?,
+        )))
+    }
+
+    /// Triggers refreshes and clears the block for what was written to the
+    /// bank since `watermark` ([`crate::mental_models::effects`]).
+    fn after_writes(
+        &self,
+        bank_id: i64,
+        watermark: i64,
+        created: &[Uuid],
+    ) -> Result<(), StoreError> {
+        let now = self.now();
+        let effects = {
+            let conn = self.store.connection();
+            let effects = crate::mental_models::effects(
+                &conn,
+                bank_id,
+                watermark,
+                created,
+                self.tuning.mental_models.trigger_level,
+            )?;
+            crate::mental_models::request(&conn, &effects.triggered, now)?;
+            effects
+        };
+        if !effects.triggered.is_empty() {
+            self.schedule.triggered(bank_id, now);
+        }
+        if effects.invalidates {
+            self.blocks.invalidate(bank_id);
+        }
+        Ok(())
+    }
+
+    fn trigger(&self, bank_id: i64, model_id: i64) -> Result<(), StoreError> {
+        let now = self.now();
+        {
+            let conn = self.store.connection();
+            crate::mental_models::request(&conn, &[model_id].into(), now)?;
+        }
+        self.schedule.triggered(bank_id, now);
+        Ok(())
+    }
+
+    fn model_bank(&self, bank: &str) -> Result<(i64, TimeZone), ModelError> {
+        let conn = self.store.connection();
+        let (bank_id, timezone) =
+            crate::ingest::find_bank(&conn, bank)?.ok_or(ModelError::UnknownBank)?;
+        Ok((bank_id, TimeZone::get(&timezone).unwrap_or(TimeZone::UTC)))
+    }
+
+    fn model_row(
+        &self,
+        bank: &str,
+        name: &str,
+    ) -> Result<crate::mental_models::ModelRow, ModelError> {
+        let (bank_id, _) = self.model_bank(bank)?;
+        let conn = self.store.connection();
+        crate::mental_models::find_model(&conn, bank_id, name)?.ok_or(ModelError::UnknownModel)
+    }
+
+    /// Every bank's rowid, name and timezone.
+    fn bank_zones(&self) -> Result<Vec<(i64, String, TimeZone)>, StoreError> {
+        let conn = self.store.connection();
+        let mut statement = conn.prepare("SELECT id, name, timezone FROM banks ORDER BY id")?;
+        let banks = statement
+            .query_map([], |row| {
+                let timezone: String = row.get(2)?;
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    TimeZone::get(&timezone).unwrap_or(TimeZone::UTC),
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(banks)
     }
 }
 

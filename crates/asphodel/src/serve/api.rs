@@ -10,20 +10,23 @@
 
 use std::sync::Arc;
 
+use asphodel_core::agenda::Agenda;
 use asphodel_core::config::Secret;
 use asphodel_core::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use asphodel_core::keep::{KeepError, Kept, MemoryIds, Unkept};
+use asphodel_core::mental_models::{Model, ModelEdit, ModelError, ModelSpec, Outcome as Refreshed};
 use asphodel_core::queue::{ChunkList, QueueError, Retried, RetryRequest};
 use asphodel_core::retrieval::{Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
 use asphodel_core::store::StoreError;
 use asphodel_core::store::bank::{Bank, BankError, BankIdentity};
+use asphodel_core::system_prompt::Block;
 use asphodel_core::{Health, ResolvedConfig, Service};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -50,6 +53,17 @@ pub(crate) fn router(app: Shared) -> Router {
         )
         .route("/v1/banks/{bank}/chunks", get(chunks))
         .route("/v1/banks/{bank}/chunks/retry", post(retry_chunks))
+        .route("/v1/banks/{bank}/system-prompt", get(system_prompt))
+        .route("/v1/banks/{bank}/agenda", get(agenda))
+        .route(
+            "/v1/banks/{bank}/models",
+            get(list_models).post(create_model),
+        )
+        .route("/v1/banks/{bank}/models/{model}", patch(edit_model))
+        .route(
+            "/v1/banks/{bank}/models/{model}/refresh",
+            post(refresh_model),
+        )
         .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize));
     Router::new()
         .route("/v1/health", get(health))
@@ -187,6 +201,24 @@ impl From<QueueError> for ApiError {
             QueueError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
             QueueError::NotHeld { .. } => Self::new(StatusCode::CONFLICT, error.to_string()),
             QueueError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<ModelError> for ApiError {
+    fn from(error: ModelError) -> Self {
+        match error {
+            ModelError::UnknownBank | ModelError::UnknownModel => {
+                Self::new(StatusCode::NOT_FOUND, error.to_string())
+            }
+            ModelError::DuplicateName => Self::new(StatusCode::CONFLICT, error.to_string()),
+            ModelError::OverBudget { .. }
+            | ModelError::UnknownEntity
+            | ModelError::Invalid { .. } => {
+                Self::new(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+            }
+            ModelError::Retrieval(error) => error.into(),
+            ModelError::Store(error) => error.into(),
         }
     }
 }
@@ -434,4 +466,104 @@ async fn retry_chunks(
         app.wake(&bank);
     }
     Ok(Json(retried))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SystemPromptQuery {
+    /// The Hermes session the block is for. The daemon records which block
+    /// the session holds, and what it lists or cites joins the session's
+    /// in-context set (TIM-95, decision 4).
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// `GET /v1/banks/{bank}/system-prompt[?session_id=...]`:
+/// `system_prompt_block()`. Built from the agenda and the models' entries
+/// with queries only, never an LLM call.
+async fn system_prompt(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    query: Result<Query<SystemPromptQuery>, QueryRejection>,
+) -> Result<Json<Block>, ApiError> {
+    let Query(query) = query?;
+    let block = app
+        .call(move |service| service.system_prompt(&bank, query.session_id.as_deref()))
+        .await?;
+    Ok(Json(block))
+}
+
+/// `GET /v1/banks/{bank}/agenda`: the agenda as the block would list it.
+async fn agenda(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+) -> Result<Json<Agenda>, ApiError> {
+    let agenda = app.call(move |service| service.agenda(&bank)).await?;
+    Ok(Json(agenda))
+}
+
+/// `GET /v1/banks/{bank}/models`: `asphodel model list`.
+async fn list_models(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+) -> Result<Json<Vec<Model>>, ApiError> {
+    let models = app.call(move |service| service.list_models(&bank)).await?;
+    Ok(Json(models))
+}
+
+/// `POST /v1/banks/{bank}/models`: `asphodel model create`. 201.
+async fn create_model(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<ModelSpec>, JsonRejection>,
+) -> Result<(StatusCode, Json<Model>), ApiError> {
+    let Json(spec) = body?;
+    let model = app
+        .call(move |service| service.create_model(&bank, &spec))
+        .await?;
+    Ok((StatusCode::CREATED, Json(model)))
+}
+
+/// `PATCH /v1/banks/{bank}/models/{model}`: `asphodel model edit`.
+async fn edit_model(
+    State(app): State<Shared>,
+    Path((bank, name)): Path<(String, String)>,
+    body: Result<Json<ModelEdit>, JsonRejection>,
+) -> Result<Json<Model>, ApiError> {
+    let Json(edit) = body?;
+    let model = app
+        .call(move |service| service.edit_model(&bank, &name, &edit))
+        .await?;
+    Ok(Json(model))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RefreshQuery {
+    /// Skip the fingerprint check.
+    #[serde(default)]
+    force: bool,
+}
+
+/// `POST /v1/banks/{bank}/models/{model}/refresh[?force=true]`:
+/// `asphodel model refresh`. 503 when no LLM is configured.
+async fn refresh_model(
+    State(app): State<Shared>,
+    Path((bank, name)): Path<(String, String)>,
+    query: Result<Query<RefreshQuery>, QueryRejection>,
+) -> Result<Json<Refreshed>, ApiError> {
+    let Query(query) = query?;
+    let llm = app
+        .ready()
+        .ok_or_else(ApiError::not_ready)?
+        .llm
+        .clone()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no LLM is configured, so models can't be refreshed",
+            )
+        })?;
+    let outcome = app
+        .call(move |service| service.refresh_model(&bank, &name, llm.as_ref(), query.force))
+        .await?;
+    Ok(Json(outcome))
 }

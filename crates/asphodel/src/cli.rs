@@ -1,8 +1,8 @@
 //! The subcommand tree from "API surface and Hermes transport" (TIM-94,
 //! decision 10), plus `replay` and `bench` from the replay harness decision
 //! (TIM-96). `serve` runs the daemon; `ingest`, `bank`, `chunks`, `recall`,
-//! `keep` and `unkeep` are HTTP clients of it ([`crate::client`]); `models
-//! fetch` and `llm login` work on files. `forget`, `replay` and `bench` are
+//! `keep`, `unkeep` and `model` are HTTP clients of it ([`crate::client`]);
+//! `models fetch` and `llm login` work on files. `forget`, `replay` and `bench` are
 //! stubs that later stages fill in.
 
 use std::num::NonZeroUsize;
@@ -11,8 +11,10 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 use asphodel_core::SystemClock;
 use asphodel_core::config::{Secret, TOKEN_ENV};
+use asphodel_core::constants::Volatility;
 use asphodel_core::ingest::Document;
 use asphodel_core::keep::MemoryIds;
+use asphodel_core::mental_models::{ModelEdit, ModelSpec};
 use asphodel_core::models::{
     AUTH_ISSUER, DeviceCode, HttpFetcher, ModelDir, TokenStore, device_code_login, fetch_models,
     manifest,
@@ -64,6 +66,10 @@ enum Command {
 
     /// Hand kept memories back to the significance extraction gave them.
     Unkeep(IdsArgs),
+
+    /// Define, list and refresh a bank's mental models.
+    #[command(subcommand)]
+    Model(ModelCommand),
 
     /// Fetch and manage the local models.
     #[command(subcommand)]
@@ -293,6 +299,123 @@ pub struct IdsArgs {
     pub ids: Vec<String>,
 }
 
+/// `asphodel model`: only the owner defines models, through here or the
+/// API (TIM-95, decision 2).
+#[derive(Debug, Subcommand)]
+pub enum ModelCommand {
+    /// Define a model: a standing question its entries answer.
+    Create(ModelCreateArgs),
+
+    /// List the bank's models with their entries and citations.
+    List(ModelListArgs),
+
+    /// Change a model's question, filters, size, or whether it's enabled.
+    Edit(ModelEditArgs),
+
+    /// Refresh a model now. It's skipped when its inputs haven't changed,
+    /// unless `--force`.
+    Refresh(ModelRefreshArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ModelCreateArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+
+    #[arg(long)]
+    pub bank: String,
+
+    /// The model's name.
+    pub name: String,
+
+    /// The standing question its entries answer.
+    #[arg(long)]
+    pub question: String,
+
+    /// The model's share of the prompt block, in tokens.
+    #[arg(long)]
+    pub max_tokens: u32,
+
+    /// Only this kind: fact, event, state, task or recurring. Repeat for
+    /// several; none means every kind.
+    #[arg(long = "kind", value_parser = serde_value::<Kind>)]
+    pub kinds: Vec<Kind>,
+
+    /// Only memories about this entity, by name or alias.
+    #[arg(long)]
+    pub entity: Option<String>,
+
+    /// Leave out states less durable than this: hours, days, weeks, months
+    /// or years.
+    #[arg(long, value_parser = serde_value::<Volatility>)]
+    pub min_volatility: Option<Volatility>,
+
+    /// Create it disabled: not refreshed and not rendered.
+    #[arg(long)]
+    pub disabled: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ModelListArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+
+    #[arg(long)]
+    pub bank: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ModelEditArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+
+    #[arg(long)]
+    pub bank: String,
+
+    /// The model's name.
+    pub name: String,
+
+    #[arg(long)]
+    pub question: Option<String>,
+
+    #[arg(long)]
+    pub max_tokens: Option<u32>,
+
+    /// Only this kind. Repeat for several; replaces the model's kinds.
+    #[arg(long = "kind", value_parser = serde_value::<Kind>, conflicts_with = "all_kinds")]
+    pub kinds: Vec<Kind>,
+
+    /// Take every kind.
+    #[arg(long)]
+    pub all_kinds: bool,
+
+    /// hours, days, weeks, months or years, or `none` to clear it.
+    #[arg(long)]
+    pub min_volatility: Option<String>,
+
+    #[arg(long, conflicts_with = "disable")]
+    pub enable: bool,
+
+    #[arg(long)]
+    pub disable: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ModelRefreshArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+
+    #[arg(long)]
+    pub bank: String,
+
+    /// The model's name.
+    pub name: String,
+
+    /// Refresh even when the model's inputs haven't changed.
+    #[arg(long)]
+    pub force: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ModelsCommand {
     /// Download the embedding and reranker models into the model dir.
@@ -350,6 +473,7 @@ impl Cli {
             Command::Forget(_) => stub("forget"),
             Command::Keep(args) => keep(args, Keep::Keep),
             Command::Unkeep(args) => keep(args, Keep::Unkeep),
+            Command::Model(command) => model(command),
             Command::Models(ModelsCommand::Fetch { model_dir }) => models_fetch(model_dir),
             Command::Llm(LlmCommand::Login { data_dir }) => llm_login(&data_dir),
             Command::Replay(_) => stub("replay"),
@@ -690,6 +814,162 @@ fn keep(args: IdsArgs, action: Keep) -> anyhow::Result<()> {
         bail!("no such memory in {}: {}", args.bank, unknown.join(", "));
     }
     Ok(())
+}
+
+/// `asphodel model create|list|edit|refresh` over
+/// `/v1/banks/{bank}/models`.
+fn model(command: ModelCommand) -> anyhow::Result<()> {
+    match command {
+        ModelCommand::Create(args) => {
+            let client = Client::new(&args.client)?;
+            let spec = ModelSpec {
+                name: args.name,
+                question: args.question,
+                kinds: args.kinds,
+                entity: args.entity,
+                min_volatility: args.min_volatility,
+                max_tokens: args.max_tokens,
+                enabled: !args.disabled,
+            };
+            let model: Value =
+                client.post(&format!("/v1/banks/{}/models", segment(&args.bank)), &spec)?;
+            if args.client.json {
+                return print_json(&model);
+            }
+            println!(
+                "created {} ({} tokens); it's refreshed in a few minutes, or now with `asphodel model refresh`",
+                text(&model, "name"),
+                model.get("max_tokens").and_then(Value::as_u64).unwrap_or(0)
+            );
+            Ok(())
+        }
+        ModelCommand::List(args) => {
+            let client = Client::new(&args.client)?;
+            let models: Value = client.get(&format!("/v1/banks/{}/models", segment(&args.bank)))?;
+            if args.client.json {
+                return print_json(&models);
+            }
+            let models = models.as_array().cloned().unwrap_or_default();
+            if models.is_empty() {
+                println!("no models");
+            }
+            for model in &models {
+                print_model(model);
+            }
+            Ok(())
+        }
+        ModelCommand::Edit(args) => {
+            let client = Client::new(&args.client)?;
+            let min_volatility = match args.min_volatility.as_deref() {
+                None => None,
+                Some("none") => Some(None),
+                Some(level) => Some(Some(
+                    serde_value::<Volatility>(level).map_err(anyhow::Error::msg)?,
+                )),
+            };
+            let edit = ModelEdit {
+                question: args.question,
+                kinds: if args.all_kinds {
+                    Some(Vec::new())
+                } else if args.kinds.is_empty() {
+                    None
+                } else {
+                    Some(args.kinds)
+                },
+                min_volatility,
+                max_tokens: args.max_tokens,
+                enabled: if args.enable {
+                    Some(true)
+                } else if args.disable {
+                    Some(false)
+                } else {
+                    None
+                },
+            };
+            let model: Value = client.patch(
+                &format!(
+                    "/v1/banks/{}/models/{}",
+                    segment(&args.bank),
+                    segment(&args.name)
+                ),
+                &edit,
+            )?;
+            if args.client.json {
+                return print_json(&model);
+            }
+            print_model(&model);
+            Ok(())
+        }
+        ModelCommand::Refresh(args) => {
+            let client = Client::new(&args.client)?;
+            let outcome: Value = client.post(
+                &format!(
+                    "/v1/banks/{}/models/{}/refresh?force={}",
+                    segment(&args.bank),
+                    segment(&args.name),
+                    args.force
+                ),
+                &Value::Null,
+            )?;
+            if args.client.json {
+                return print_json(&outcome);
+            }
+            let detail = &outcome["detail"];
+            match outcome.get("outcome").and_then(Value::as_str) {
+                Some("unchanged") => {
+                    println!("unchanged: its inputs are the same as at the last refresh")
+                }
+                Some("applied") => {
+                    let count = |key: &str| list(detail, key).len();
+                    println!(
+                        "refreshed: {} added, {} edited, {} removed, {} rejected, {} dropped, {} trimmed",
+                        count("added"),
+                        count("edited"),
+                        count("removed"),
+                        count("rejected"),
+                        count("dropped"),
+                        count("trimmed"),
+                    );
+                }
+                _ => bail!(
+                    "the refresh failed ({}); it's tried again in 30 minutes",
+                    detail.as_str().unwrap_or("unknown")
+                ),
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_model(model: &Value) {
+    let enabled = if model.get("enabled").and_then(Value::as_bool) == Some(false) {
+        ", disabled"
+    } else {
+        ""
+    };
+    println!(
+        "{}  [{} tokens{enabled}]  {}",
+        text(model, "name"),
+        model.get("max_tokens").and_then(Value::as_u64).unwrap_or(0),
+        text(model, "question"),
+    );
+    match model.get("last_refreshed_at").and_then(Value::as_str) {
+        Some(at) => println!("  last refreshed {at}"),
+        None => println!("  never refreshed"),
+    }
+    if let Some(error) = model.get("last_error").and_then(Value::as_str) {
+        println!(
+            "  the last refresh failed ({error}) at {}",
+            text(model, "last_error_at")
+        );
+    }
+    for entry in list(model, "entries") {
+        let cites: Vec<&str> = list(entry, "cites")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        println!("  - {}  (cites {})", text(entry, "text"), cites.join(", "));
+    }
 }
 
 fn stub(name: &str) -> anyhow::Result<()> {

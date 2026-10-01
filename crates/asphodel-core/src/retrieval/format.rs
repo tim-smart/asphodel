@@ -22,7 +22,7 @@ use crate::strength::{Kind, Phase, TimePrecision, WorldTime};
 const MICROS_PER_DAY: i64 = 24 * 60 * 60 * 1_000_000;
 
 /// The header: when the recall ran, in the bank's timezone.
-pub(super) fn header(now: Timestamp, tz: &TimeZone) -> String {
+pub(crate) fn header(now: Timestamp, tz: &TimeZone) -> String {
     format!(
         "Recalled {}",
         now.to_zoned(tz.clone()).strftime("%a %-d %b %H:%M")
@@ -30,7 +30,7 @@ pub(super) fn header(now: Timestamp, tz: &TimeZone) -> String {
 }
 
 /// One memory's line: `- <sentence>`, then its annotations in brackets.
-pub(super) fn line(candidate: &Candidate, now: Timestamp) -> String {
+pub(crate) fn line(candidate: &Candidate, now: Timestamp) -> String {
     let annotations = annotations(candidate, now);
     if annotations.is_empty() {
         format!("- {}", candidate.content)
@@ -40,7 +40,7 @@ pub(super) fn line(candidate: &Candidate, now: Timestamp) -> String {
 }
 
 /// The block: the header, then one line per memory, in score order.
-pub(super) fn block(header: &str, lines: &[String]) -> String {
+pub(crate) fn block(header: &str, lines: &[String]) -> String {
     let mut text = header.to_owned();
     for line in lines {
         text.push('\n');
@@ -78,20 +78,8 @@ fn annotations(candidate: &Candidate, now: Timestamp) -> Vec<String> {
     {
         annotations.push(format!("recurring: {text}"));
     }
-    if window.kind == Kind::State && candidate.state_confidence < STATE_AGE_SHOWN_BELOW {
-        let days = (now.as_microsecond() - candidate.last_observed.as_microsecond())
-            .max(0)
-            .div_euclid(MICROS_PER_DAY);
-        let ago = match days {
-            0 => "today".to_owned(),
-            1 => "1 day ago".to_owned(),
-            n => format!("{n} days ago"),
-        };
-        let on = candidate
-            .last_observed
-            .to_zoned(tz.clone())
-            .strftime("%a %-d %b");
-        annotations.push(format!("observed {ago}, {on}"));
+    if let Some(age) = state_age(candidate, now) {
+        annotations.push(age);
     }
     let dated =
         window.valid_from.is_some() || window.valid_until.is_some() || window.due_at.is_some();
@@ -99,6 +87,28 @@ fn annotations(candidate: &Candidate, now: Timestamp) -> Vec<String> {
         annotations.push("date uncertain".to_owned());
     }
     annotations
+}
+
+/// `observed 4 days ago, Sat 27 Sep` for a state whose confidence is below
+/// [`STATE_AGE_SHOWN_BELOW`] (TIM-91, decision 8), and `None` otherwise. A
+/// mental model entry citing such a state shows it too (TIM-95, decision 5).
+pub(crate) fn state_age(candidate: &Candidate, now: Timestamp) -> Option<String> {
+    if candidate.window.kind != Kind::State || candidate.state_confidence >= STATE_AGE_SHOWN_BELOW {
+        return None;
+    }
+    let days = (now.as_microsecond() - candidate.last_observed.as_microsecond())
+        .max(0)
+        .div_euclid(MICROS_PER_DAY);
+    let ago = match days {
+        0 => "today".to_owned(),
+        1 => "1 day ago".to_owned(),
+        n => format!("{n} days ago"),
+    };
+    let on = candidate
+        .last_observed
+        .to_zoned(candidate.tz.clone())
+        .strftime("%a %-d %b");
+    Some(format!("observed {ago}, {on}"))
 }
 
 /// A stored time as its precision allows: `Thu 3 Oct 15:00`, `Sat 12 Sep`,

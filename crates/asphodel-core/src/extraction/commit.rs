@@ -147,14 +147,8 @@ pub(super) fn commit(
             }
         }
         // A model citing it refreshes (TIM-95, "refreshes follow
-        // conversations").
-        tx.execute(
-            "UPDATE mental_models SET refresh_requested_at = ?2
-             WHERE id IN (SELECT e.model_id FROM mental_model_citations c
-                          JOIN mental_model_entries e ON e.id = c.entry_id
-                          WHERE c.memory_id IN (?1, ?3))",
-            (neighbour, micros(now), by.id),
-        )?;
+        // conversations"): the service reads this edit back and triggers
+        // it, with the bank's debounce ([`crate::mental_models::effects`]).
     }
 
     for (&neighbour, &label) in &plan.accesses {

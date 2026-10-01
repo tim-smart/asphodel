@@ -32,8 +32,8 @@
 //! writes an access (ADR 0001). "Now" is always the service's clock.
 
 mod arms;
-mod candidates;
-mod format;
+pub(crate) mod candidates;
+pub(crate) mod format;
 mod log;
 mod rerank;
 
@@ -643,6 +643,205 @@ pub(crate) fn recall(
         results,
         reranked,
     })
+}
+
+/// How long a refresh waits for the reranker. A refresh is a daemon job
+/// and never runs inside a request (TIM-95, decision 7), so it can wait its
+/// turn behind prefetch; past this it scores on strength alone.
+const REFRESH_RERANK_DEADLINE: Duration = Duration::from_secs(60);
+
+/// A memory a mental model's refresh selected, with its score.
+pub(crate) struct Selected {
+    pub candidate: Candidate,
+    pub score: f64,
+}
+
+/// A refresh's selection (TIM-95, decision 3): the model's question runs
+/// through the pipeline with injection's weighting, over the memories
+/// `keep` admits. Every fused candidate is reranked and scored, the best
+/// `budget` are taken, and then the memories in `cited` that `keep` still
+/// admits, best first, until there are `with_cited`. Keeping cited
+/// memories stops one that slips from 60th to 61st from leaving and coming
+/// back on alternate refreshes.
+///
+/// The result is in score order, and the recall log gets one `refresh` row
+/// when `log` is set. A missed reranker scores every candidate as if its
+/// relevance were 0, so strength decides.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select(
+    cx: &Context<'_>,
+    bank_id: i64,
+    question: &str,
+    keep: &dyn Fn(&Candidate) -> bool,
+    cited: &[i64],
+    budget: usize,
+    with_cited: usize,
+    log: bool,
+) -> Result<Vec<Selected>, RecallError> {
+    let started = Instant::now();
+    let now = cx.store.now();
+    let query = question.trim();
+    let vector = if query.is_empty() {
+        None
+    } else {
+        Some(
+            cx.models
+                .embedder
+                .embed(&[query])
+                .map_err(|error| RecallError::Model { error })?
+                .pop()
+                .unwrap_or_default(),
+        )
+    };
+    let (found, cited) = {
+        let conn = cx.store.connection();
+        let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning.clock.quiet_rate, now, keep)?;
+        let mut ids = match &vector {
+            Some(vector) => {
+                let lists = [
+                    cleanup.list(&arms::vector(&conn, bank_id, vector, CANDIDATES_PER_ARM)?)?,
+                    cleanup.list(&arms::bm25(&conn, bank_id, query, CANDIDATES_PER_ARM)?)?,
+                    cleanup.list(&arms::entity(
+                        &conn,
+                        bank_id,
+                        query,
+                        vector,
+                        CANDIDATES_PER_ARM,
+                    )?)?,
+                ];
+                fuse(&[
+                    lists[0].as_slice(),
+                    lists[1].as_slice(),
+                    lists[2].as_slice(),
+                ])
+            }
+            None => Vec::new(),
+        };
+        let cited: BTreeSet<i64> = cleanup.list(cited)?.into_iter().collect();
+        for id in &cited {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        (cleanup.take(&ids), cited)
+    };
+
+    let logits = if query.is_empty() {
+        None
+    } else {
+        let documents = found.iter().map(|c| c.content.clone()).collect();
+        rerank::logits(
+            &cx.models.reranker,
+            cx.permit,
+            query,
+            documents,
+            Instant::now() + REFRESH_RERANK_DEADLINE,
+        )
+    };
+    let ranking = &cx.tuning.ranking;
+    let mut scored: Vec<(usize, Selected)> = found
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let logit = logits
+                .as_ref()
+                .and_then(|logits| logits.get(index))
+                .map_or(0.0, |logit| f64::from(*logit));
+            let phase = phase_term(
+                &candidate.window,
+                candidate.low_confidence,
+                &candidate.tz,
+                now,
+                ranking,
+            );
+            let score = score(
+                logit,
+                ranking.w_s_inject,
+                candidate.strength,
+                candidate.state_confidence,
+                phase,
+            );
+            (index, Selected { candidate, score })
+        })
+        .collect();
+    scored.sort_by(|(left_index, left), (right_index, right)| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then(left_index.cmp(right_index))
+    });
+    let mut selected = Vec::new();
+    let mut extras = Vec::new();
+    for (_, item) in scored {
+        if selected.len() < budget {
+            selected.push(item);
+        } else if cited.contains(&item.candidate.id) {
+            extras.push(item);
+        }
+    }
+    let room = with_cited.saturating_sub(selected.len());
+    selected.extend(extras.into_iter().take(room));
+
+    if log {
+        let logged: Vec<Logged> = selected
+            .iter()
+            .map(|item| Logged {
+                memory_id: item.candidate.id,
+                score: Some(item.score),
+                injected: false,
+            })
+            .collect();
+        log::write(
+            &mut cx.store.connection(),
+            &Entry {
+                uuid: cx.store.new_id(),
+                bank_id,
+                kind: RecallKind::Refresh,
+                session_id: None,
+                query,
+                latency_ms: elapsed_ms(started),
+                at: now,
+                results: &logged,
+            },
+        )?;
+    }
+    Ok(selected)
+}
+
+/// The memories linked to `entity` or to an entity merged into it, with the
+/// head of each one's supersession chain, as a model's entity filter
+/// admits them.
+pub(crate) fn linked_memories(
+    conn: &Connection,
+    bank_id: i64,
+    entity: i64,
+) -> Result<BTreeSet<i64>, rusqlite::Error> {
+    let mut statement = conn.prepare_cached(
+        "SELECT DISTINCT me.memory_id FROM memory_entities me
+         JOIN memories m ON m.id = me.memory_id
+         JOIN entities e ON e.id = me.entity_id
+         WHERE m.bank_id = ?1 AND (e.id = ?2 OR e.merged_into = ?2)",
+    )?;
+    let direct: Vec<i64> = statement
+        .query_map((bank_id, entity), |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut links = conn.prepare_cached(
+        "SELECT id, superseded_by, ended_by FROM memories
+         WHERE bank_id = ?1 AND superseded_by IS NOT NULL",
+    )?;
+    let links: Vec<crate::strength::Link> = links
+        .query_map([bank_id], |row| {
+            Ok(crate::strength::Link {
+                id: row.get(0)?,
+                superseded_by: row.get(1)?,
+                ended_by: row.get(2)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut chains = crate::strength::Chains::new(&links);
+    let mut ids: BTreeSet<i64> = direct.iter().copied().collect();
+    ids.extend(direct.iter().map(|id| chains.head(*id)));
+    Ok(ids)
 }
 
 /// A candidate in its final place.

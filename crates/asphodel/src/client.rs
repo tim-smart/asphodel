@@ -69,6 +69,14 @@ impl Client {
         self.request(Method::POST, path, Some(serde_json::to_vec(body)?))
     }
 
+    pub(crate) fn patch<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> anyhow::Result<T> {
+        self.request(Method::PATCH, path, Some(serde_json::to_vec(body)?))
+    }
+
     pub(crate) fn put<B: Serialize, T: DeserializeOwned>(
         &self,
         path: &str,
