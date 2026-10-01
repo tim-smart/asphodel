@@ -344,10 +344,16 @@ fn resolved_json_shows_a_null_delta_as_null() {
     t.purge.delta = None;
     let json = serde_json::to_value(&t).unwrap();
     assert!(json["purge"]["delta"].is_null());
-    assert_eq!(
-        serde_json::to_value(Tuning::default()).unwrap()["purge"]["delta"],
-        1.0
-    );
+    let json: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+    assert!(json["purge"]["delta"].is_null());
+    for delta in [0.0, 0.5, 1.0] {
+        t.purge.delta = Some(delta);
+        assert_eq!(serde_json::to_value(&t).unwrap()["purge"]["delta"], delta);
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(json["purge"]["delta"], delta);
+    }
 }
 
 #[test]
@@ -415,7 +421,6 @@ fn a_tuning_written_as_toml_loads_back_unchanged() {
 }
 
 #[test]
-#[ignore = "known failure: a null δ is dropped when written as TOML, so it loads back as the 1.0 default"]
 fn a_never_delta_written_as_toml_loads_back_as_never() {
     let mut tuning = Tuning::default();
     tuning.purge.delta = None;
@@ -425,6 +430,18 @@ fn a_never_delta_written_as_toml_loads_back_as_never() {
         None,
         "a null δ came back as a number from:\n{text}"
     );
+}
+
+#[test]
+fn numeric_deltas_written_as_toml_load_back_as_numbers() {
+    let mut tuning = Tuning::default();
+    for delta in [0.0, 0.5, 1.0] {
+        tuning.purge.delta = Some(delta);
+        let text = toml::to_string(&tuning).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(value["purge"]["delta"].as_float(), Some(delta));
+        assert_eq!(load(&text).unwrap(), tuning, "round trip of:\n{text}");
+    }
 }
 
 // Tuning: rejection
