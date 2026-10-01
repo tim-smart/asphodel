@@ -7,16 +7,9 @@
 //! amendment), "Operations" (TIM-99, decision 2), "Configuration surface"
 //! (TIM-98, the extraction constants), and ADRs 0002 and 0010.
 //!
-//! The code under test doesn't exist yet. [`contract`] below holds the
-//! proposed API with `todo!()` bodies, so this file compiles and every test
-//! that needs it is ignored. To activate: move the contract into the crate
-//! (`asphodel_core::{ingest, chunking, secrets, queue}`, the two constants
-//! into `asphodel_core::constants`, and the free functions onto `Service`),
-//! delete the module, import from the crate instead, and drop the `ignore`
-//! attributes.
-//!
-//! Two tests run now. They check that the schema TIM-103 landed has what
-//! ingest needs, so the implementation shouldn't need a migration.
+//! The API under test is `asphodel_core::{ingest, chunking, secrets,
+//! queue}`, the extraction constants and the `Service` methods over them.
+//! Two tests check that the schema TIM-103 landed has what ingest needs.
 //!
 //! The credentials in the secret-scanning tests are built at runtime from
 //! pieces, so no literal in this file looks like a real credential to a
@@ -41,386 +34,11 @@ use jiff::{SignedDuration, Timestamp};
 use rusqlite::types::FromSql;
 use uuid::Uuid;
 
-use contract::chunking::{DocumentChunk, chunk_hash, split_document};
-use contract::ingest::{Document, IngestError, Ingested, Outcome, Turn, TurnAuthor};
-use contract::queue::{ChunkError, Failure, Lease, SourceKind};
-use contract::secrets::{SecretKind, scan};
-use contract::*;
-
-/// The proposed ingest API.
-///
-/// Ingest receives a turn or a document, scans it for secrets, stores it as a
-/// source, splits it into chunks and queues the chunks for extraction. It
-/// never calls a model: extraction (TIM-107, TIM-108) takes chunks off the
-/// queue. Everything is synchronous and runs on the service's clock, so
-/// `serve` and replay share it (TIM-96, decision 3).
-#[allow(dead_code, unused_variables)]
-mod contract {
-    use asphodel_core::Service;
-
-    use self::ingest::{Document, IngestError, Ingested, Turn};
-    use self::queue::{ChunkError, FailedChunk, Failure, Lease, QueueError};
-
-    /// The proposed `asphodel_core::constants::CHUNK_CHARS`: the size a
-    /// document section is split down to when it's too long, in characters
-    /// (TIM-92: "at about 3,000 characters"). Fixed in code (TIM-98).
-    pub const CHUNK_CHARS: usize = 3_000;
-
-    /// The proposed `asphodel_core::constants::CHUNK_RETRY_CAP`: how many
-    /// failed attempts mark a chunk `failed` (TIM-92). Fixed in code
-    /// (TIM-98). No ticket gives the number; 5 is a proposal.
-    pub const CHUNK_RETRY_CAP: u32 = 5;
-
-    /// The proposed `asphodel_core::secrets`: the regex scan that runs
-    /// before anything is stored (ADR 0002, TIM-92 other decision 1).
-    pub mod secrets {
-        use std::collections::BTreeSet;
-
-        /// The kinds of secret the scan recognises. The name of each kind is
-        /// what's recorded on the source and shown by `memory show` (ADR
-        /// 0010), and what its marker names.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub enum SecretKind {
-            /// A PEM or OpenSSH private key block, BEGIN to END.
-            PrivateKey,
-            /// `AKIA` or `ASIA` and 16 upper-case alphanumerics.
-            AwsAccessKey,
-            /// `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` or `github_pat_` tokens.
-            GithubToken,
-            /// `sk-` and `sk-proj-` keys, but not `sk-ant-`.
-            OpenAiKey,
-            /// `sk-ant-` keys.
-            AnthropicKey,
-            /// `xoxb-`, `xoxp-`, `xoxa-`, `xoxr-` and `xoxs-` tokens.
-            SlackToken,
-            /// `sk_live_`, `sk_test_`, `rk_live_` and `rk_test_` keys.
-            StripeKey,
-            /// `AIza` and 35 URL-safe characters.
-            GoogleApiKey,
-            /// Three dot-separated base64url segments, the first two `eyJ`.
-            Jwt,
-            /// The password in a URL's userinfo (`scheme://user:password@host`).
-            /// Only the password is redacted; the user and host stay.
-            UrlPassword,
-        }
-
-        impl SecretKind {
-            pub const ALL: [SecretKind; 10] = [
-                SecretKind::PrivateKey,
-                SecretKind::AwsAccessKey,
-                SecretKind::GithubToken,
-                SecretKind::OpenAiKey,
-                SecretKind::AnthropicKey,
-                SecretKind::SlackToken,
-                SecretKind::StripeKey,
-                SecretKind::GoogleApiKey,
-                SecretKind::Jwt,
-                SecretKind::UrlPassword,
-            ];
-
-            /// The snake_case name: `private_key`, `aws_access_key`,
-            /// `github_token`, `openai_key`, `anthropic_key`, `slack_token`,
-            /// `stripe_key`, `google_api_key`, `jwt`, `url_password`.
-            pub fn as_str(self) -> &'static str {
-                todo!()
-            }
-
-            /// The text a match is replaced with. It names the kind, and the
-            /// scan never flags a marker itself.
-            pub fn marker(self) -> String {
-                todo!()
-            }
-        }
-
-        /// What one scan found.
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct Scan {
-            /// The input with every match replaced in place by its kind's
-            /// marker. Equal to the input when nothing matched.
-            pub text: String,
-            /// The kinds that fired, each once however often it matched.
-            pub kinds: BTreeSet<SecretKind>,
-        }
-
-        /// Scans `text` and redacts every match. Pure: no clock, no store.
-        pub fn scan(text: &str) -> Scan {
-            todo!()
-        }
-    }
-
-    /// The proposed `asphodel_core::chunking` (TIM-92, documents and chunks).
-    pub mod chunking {
-        /// One chunk of a document, before it's stored.
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct DocumentChunk {
-            /// The headings above this chunk, outermost first, without their
-            /// `#` marks. Empty for text before the first heading and for a
-            /// document with no headings.
-            pub heading_path: Vec<String>,
-            /// The chunk's range in the document, in characters (TIM-90:
-            /// "character offsets"), end exclusive.
-            pub start: usize,
-            pub end: usize,
-            /// The document's characters `start..end`.
-            pub text: String,
-        }
-
-        /// Splits a plain-text or markdown document: one chunk per section
-        /// (a section runs from an ATX heading to the next heading of any
-        /// level), split further at paragraph breaks only when a section is
-        /// longer than [`CHUNK_CHARS`](super::CHUNK_CHARS). A paragraph
-        /// longer than that on its own is cut at line or sentence breaks,
-        /// or anywhere as a last resort. Small sections are never merged.
-        /// Lines inside fenced code blocks are never headings.
-        pub fn split_document(text: &str) -> Vec<DocumentChunk> {
-            todo!()
-        }
-
-        /// A chunk's identity: a hash of its text and its heading path, fixed
-        /// at ingest and never recomputed. It's the forget tombstone, not an
-        /// integrity check (TIM-92). Different paths never collide however
-        /// their headings are spelled.
-        pub fn chunk_hash(heading_path: &[String], text: &str) -> String {
-            todo!()
-        }
-    }
-
-    /// The proposed `asphodel_core::ingest`.
-    pub mod ingest {
-        use std::collections::BTreeSet;
-
-        use asphodel_core::store::StoreError;
-        use jiff::Timestamp;
-        use jiff::civil::Date;
-        use uuid::Uuid;
-
-        use super::secrets::SecretKind;
-
-        /// Hermes' `turn_author` (TIM-94, decision 1).
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct TurnAuthor {
-            /// The platform's id for the speaker, such as a Discord user id.
-            /// Ingest resolves the speaker by the alias `<platform>:<id>`,
-            /// the form the owner's platform ids take in bank config.
-            pub id: String,
-            pub name: Option<String>,
-            pub is_bot: bool,
-        }
-
-        /// What `sync_turn` sends (TIM-94, decision 5 as amended by TIM-96
-        /// and TIM-99). The plugin has already stripped any backfilled
-        /// channel history before `[New message]`; the `[Name] ` prefix in
-        /// shared threads stays and is stored as sent.
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct Turn {
-            pub session_id: String,
-            /// The user message's epoch timestamp. It's the turn's
-            /// `observed_at` and part of its key.
-            pub message_at: Timestamp,
-            /// `hermes_time.get_timezone_name()`. The bank's default when
-            /// absent.
-            pub timezone: Option<String>,
-            /// The clean user message, never `api_content`.
-            pub user_text: String,
-            pub assistant_text: String,
-            /// `None` on the CLI, TUI and Hermes UI, where the turn is the
-            /// owner's.
-            pub author: Option<TurnAuthor>,
-            pub platform: Option<String>,
-            /// The `recall_id` the plugin echoes from `prefetch`.
-            pub recall_id: Option<String>,
-            /// The turn called `memory_forget` (ADR 0010). It's stored only
-            /// as a tombstone, never queued, and its recall row is deleted.
-            pub forget_requested: bool,
-        }
-
-        /// A document sent through the API or `asphodel ingest`.
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct Document {
-            /// `--id`; re-ingesting the same id with new text is an edit.
-            pub document_id: String,
-            /// Plain text or markdown.
-            pub text: String,
-            /// `--date`. The document's `observed_at` is the start of this
-            /// day in its timezone.
-            pub reference_date: Date,
-            /// `false` with `--inexact` (TIM-92).
-            pub reference_date_exact: bool,
-            /// The bank's default when absent.
-            pub timezone: Option<String>,
-        }
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum Outcome {
-            /// A new source, stored and its chunks queued.
-            Stored,
-            /// The key was already there: nothing changed (TIM-90).
-            Duplicate,
-            /// A `forget_requested` turn, stored as a tombstone only.
-            Tombstone,
-        }
-
-        /// Whose words a turn holds (TIM-94, decision 1).
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct Speaker {
-            /// The speaker's entity: the seeded `user` for the owner,
-            /// otherwise an entity of their own.
-            pub entity: Uuid,
-            pub owner: bool,
-        }
-
-        /// What one ingest did.
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct Ingested {
-            /// The source's public id; the existing one on a duplicate.
-            pub source: Uuid,
-            pub outcome: Outcome,
-            /// Chunks queued for extraction by this call.
-            pub chunks_queued: usize,
-            /// Chunks of an edited document already seen in an earlier
-            /// version of it, and so not queued (TIM-92).
-            pub chunks_skipped: usize,
-            /// The secret kinds that fired on what this call stored.
-            pub secret_kinds: BTreeSet<SecretKind>,
-            /// The resolved speaker of a stored turn; `None` for documents,
-            /// duplicates and tombstones.
-            pub speaker: Option<Speaker>,
-        }
-
-        /// Why an ingest was refused. Nothing is stored when it is, and no
-        /// variant carries content (ADR 0010).
-        #[derive(Debug, thiserror::Error)]
-        pub enum IngestError {
-            #[error("unknown bank")]
-            UnknownBank,
-            #[error("unknown timezone")]
-            InvalidTimezone,
-            #[error(transparent)]
-            Store(#[from] StoreError),
-        }
-    }
-
-    /// The proposed `asphodel_core::queue`: the durable extraction queue in
-    /// the `extraction_queue` table (TIM-92, TIM-94 decision 3).
-    pub mod queue {
-        use asphodel_core::store::StoreError;
-        use jiff::Timestamp;
-        use uuid::Uuid;
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum SourceKind {
-            Turn,
-            Document,
-        }
-
-        /// A chunk handed to a bank's one worker. While a bank has a lease
-        /// out, it hands out no other: one worker per bank. Leases live in
-        /// the service, not the store, so a restart releases them and the
-        /// chunk is claimed again without counting an error.
-        #[derive(Debug, PartialEq, Eq)]
-        pub struct Lease {
-            pub chunk: Uuid,
-            pub source: Uuid,
-            pub source_kind: SourceKind,
-            pub position: u32,
-            pub observed_at: Timestamp,
-            /// Failed attempts so far, across restarts.
-            pub error_count: u32,
-        }
-
-        /// Why an attempt failed: the error kind and HTTP status, never the
-        /// response (ADR 0010). `kind` is static so it can't carry content.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub struct ChunkError {
-            pub kind: &'static str,
-            pub status: Option<u16>,
-        }
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum Failure {
-            /// The chunk stays at its place in the queue and is retried.
-            Retry { error_count: u32 },
-            /// The cap was reached: the chunk is marked failed, leaves the
-            /// queue and is surfaced instead of retried.
-            Failed,
-        }
-
-        /// A chunk that reached the retry cap, as `chunks --failed` lists it.
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct FailedChunk {
-            pub chunk: Uuid,
-            pub source: Uuid,
-            pub error_count: u32,
-            pub error_kind: String,
-            pub status: Option<u16>,
-            pub failed_at: Timestamp,
-        }
-
-        #[derive(Debug, thiserror::Error)]
-        pub enum QueueError {
-            #[error("unknown bank")]
-            UnknownBank,
-            #[error(transparent)]
-            Store(#[from] StoreError),
-        }
-    }
-
-    /// The proposed `Service::ingest_turn(bank, turn)`.
-    pub fn ingest_turn(
-        service: &Service,
-        bank: &str,
-        turn: &Turn,
-    ) -> Result<Ingested, IngestError> {
-        todo!()
-    }
-
-    /// The proposed `Service::ingest_document(bank, document)`.
-    pub fn ingest_document(
-        service: &Service,
-        bank: &str,
-        document: &Document,
-    ) -> Result<Ingested, IngestError> {
-        todo!()
-    }
-
-    /// The proposed `Service::claim_chunk(bank)`: the head of the bank's
-    /// queue, or `None` when the queue is empty or the bank's worker already
-    /// holds a lease. Order: turns ahead of document chunks, then
-    /// `observed_at`, then `ingested_at`, then rowid (TIM-92).
-    pub fn claim_chunk(service: &Service, bank: &str) -> Result<Option<Lease>, QueueError> {
-        todo!()
-    }
-
-    /// The proposed `Service::complete_chunk(lease)`: sets `extracted_at`,
-    /// drops call 1's saved output (ADR 0008) and takes the chunk off the
-    /// queue. Extraction will want this inside its own commit transaction
-    /// (TIM-92); that variant belongs to TIM-107.
-    pub fn complete_chunk(service: &Service, lease: Lease) -> Result<(), QueueError> {
-        todo!()
-    }
-
-    /// The proposed `Service::fail_chunk(lease, error)`: counts the error
-    /// on the chunk and either leaves it at the head for a retry or, at
-    /// [`CHUNK_RETRY_CAP`], marks it failed.
-    pub fn fail_chunk(
-        service: &Service,
-        lease: Lease,
-        error: ChunkError,
-    ) -> Result<Failure, QueueError> {
-        todo!()
-    }
-
-    /// The proposed `Service::queue_depth(bank)`: chunks waiting or in
-    /// flight, not counting failed ones. `asphodel status` shows it.
-    pub fn queue_depth(service: &Service, bank: &str) -> Result<usize, QueueError> {
-        todo!()
-    }
-
-    /// The proposed `Service::failed_chunks(bank)`, oldest failure first.
-    pub fn failed_chunks(service: &Service, bank: &str) -> Result<Vec<FailedChunk>, QueueError> {
-        todo!()
-    }
-}
+use asphodel_core::chunking::{DocumentChunk, chunk_hash, split_document};
+use asphodel_core::constants::{CHUNK_CHARS, CHUNK_RETRY_CAP};
+use asphodel_core::ingest::{Document, IngestError, Ingested, Outcome, Turn, TurnAuthor};
+use asphodel_core::queue::{ChunkError, Failure, Lease, SourceKind};
+use asphodel_core::secrets::{SecretKind, scan};
 
 // Fixtures
 
@@ -675,19 +293,19 @@ fn document(id: &str, text: &str, reference_date: Date) -> Document {
 }
 
 fn ingest(h: &Harness, bank: &str, turn: &Turn) -> Ingested {
-    ingest_turn(&h.service, bank, turn).unwrap()
+    h.service.ingest_turn(bank, turn).unwrap()
 }
 
 fn ingest_doc(h: &Harness, bank: &str, document: &Document) -> Ingested {
-    ingest_document(&h.service, bank, document).unwrap()
+    h.service.ingest_document(bank, document).unwrap()
 }
 
 fn claim(h: &Harness, bank: &str) -> Option<Lease> {
-    claim_chunk(&h.service, bank).unwrap()
+    h.service.claim_chunk(bank).unwrap()
 }
 
 fn depth(h: &Harness, bank: &str) -> usize {
-    queue_depth(&h.service, bank).unwrap()
+    h.service.queue_depth(bank).unwrap()
 }
 
 const LLM_502: ChunkError = ChunkError {
@@ -774,7 +392,7 @@ fn sentence_with(kind: SecretKind, seed: usize) -> (String, String) {
     (text, secret)
 }
 
-// What runs now: the schema TIM-103 landed has what ingest needs.
+// The schema TIM-103 landed has what ingest needs.
 
 #[test]
 fn the_schema_has_the_columns_ingest_needs() {
@@ -879,7 +497,6 @@ fn a_forget_request_tombstone_fits_the_schema_and_keeps_its_key() {
 // Constants (TIM-92, TIM-98)
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 #[allow(clippy::assertions_on_constants)]
 fn the_chunk_size_and_retry_cap_are_fixed_in_code() {
     assert_eq!(CHUNK_CHARS, 3_000, "TIM-92: about 3,000 characters");
@@ -892,7 +509,6 @@ fn the_chunk_size_and_retry_cap_are_fixed_in_code() {
 // Secret scanning (ADR 0002; TIM-92, other decision 1)
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn secret_kinds_have_stable_names() {
     // These names are recorded on sources and shown by `memory show`, so
     // renaming one is a migration.
@@ -915,7 +531,6 @@ fn secret_kinds_have_stable_names() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn each_marker_names_its_kind() {
     // TIM-92: "redacted in place with a marker that names the pattern kind".
     let markers: BTreeSet<String> = SecretKind::ALL.iter().map(|kind| kind.marker()).collect();
@@ -930,7 +545,6 @@ fn each_marker_names_its_kind() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn every_kind_is_found_and_redacted_in_place() {
     for kind in SecretKind::ALL {
         let (text, secret) = sentence_with(kind, 1);
@@ -951,7 +565,6 @@ fn every_kind_is_found_and_redacted_in_place() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_private_key_block_goes_whole() {
     let key = fake(SecretKind::PrivateKey, 2);
     let text = format!("Here it is:\n{key}\nKeep it safe.");
@@ -970,7 +583,6 @@ fn a_private_key_block_goes_whole() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn an_anthropic_key_is_not_also_an_openai_key() {
     // Both start `sk-`; the more specific kind wins and fires alone.
     let (text, _) = sentence_with(SecretKind::AnthropicKey, 3);
@@ -981,7 +593,6 @@ fn an_anthropic_key_is_not_also_an_openai_key() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn every_match_is_redacted_and_each_kind_is_recorded_once() {
     let first = fake(SecretKind::GithubToken, 4);
     let second = fake(SecretKind::GithubToken, 5);
@@ -1000,7 +611,6 @@ fn every_match_is_redacted_and_each_kind_is_recorded_once() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn ordinary_text_is_left_alone() {
     // Over-redaction loses memories, so the patterns are specific.
     let text = "Commit 9f1c2d3e4b5a69788796a5b4c3d2e1f0a9b8c7d6 fixed task-list sorting.\n\
@@ -1014,7 +624,6 @@ fn ordinary_text_is_left_alone() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_scan_of_redacted_text_finds_nothing_more() {
     // A marker is never itself a match, so re-scanning stored text (as a
     // re-extraction might) changes nothing.
@@ -1058,7 +667,6 @@ fn assert_tiles(document: &str, chunks: &[DocumentChunk]) {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_short_plain_document_is_one_chunk() {
     let text = "Buy milk.\n\nCall the dentist about the 3 October appointment.\n";
     let chunks = split_document(text);
@@ -1068,7 +676,6 @@ fn a_short_plain_document_is_one_chunk() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_markdown_document_is_one_chunk_per_section_with_its_heading_path() {
     let text = "Notes from the week.\n\n\
                 # Work\n\nShipping Asphodel v1.\n\n\
@@ -1099,7 +706,6 @@ fn a_markdown_document_is_one_chunk_per_section_with_its_heading_path() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn hashes_in_code_blocks_and_hashtags_are_not_headings() {
     let text = "# Setup\n\nRun this:\n\n```sh\n# install the daemon\nnix profile install\n```\n\n\
                 #asphodel is the tag we use.\n";
@@ -1110,7 +716,6 @@ fn hashes_in_code_blocks_and_hashtags_are_not_headings() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_section_under_the_budget_is_not_split() {
     let paragraph = "word ".repeat(140); // 700 characters
     let section = format!("# Long\n\n{}", [paragraph.as_str(); 4].join("\n\n"));
@@ -1120,7 +725,6 @@ fn a_section_under_the_budget_is_not_split() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_long_section_is_split_at_paragraphs_under_the_budget() {
     let paragraphs: Vec<String> = (0..12)
         .map(|n| format!("Paragraph {n}. {}", "lorem ipsum ".repeat(75)))
@@ -1158,7 +762,6 @@ fn a_long_section_is_split_at_paragraphs_under_the_budget() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn one_paragraph_over_the_budget_is_still_split() {
     let text = "This sentence repeats. ".repeat(400); // 9,200 characters
     let chunks = split_document(&text);
@@ -1170,7 +773,6 @@ fn one_paragraph_over_the_budget_is_still_split() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn offsets_count_characters_not_bytes() {
     // TIM-90: memories point into their source by character offsets.
     let text = "# Café ☕\n\nNaïve résumé.\n\n# Über\n\nGrüße aus Köln. 🌧️\n";
@@ -1188,7 +790,6 @@ fn offsets_count_characters_not_bytes() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_chunk_hash_covers_its_text_and_heading_path() {
     let text = "Plant the tomatoes.\n";
     let garden = chunk_hash(&path(&["Home", "Garden"]), text);
@@ -1225,7 +826,6 @@ fn a_chunk_hash_covers_its_text_and_heading_path() {
 // Turns (TIM-90 sources; TIM-94 decision 5)
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_turn_is_stored_verbatim_with_its_provenance() {
     let h = Harness::new();
     let mut sent = discord_turn(
@@ -1277,7 +877,6 @@ fn a_turn_is_stored_verbatim_with_its_provenance() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_turn_without_a_timezone_takes_the_banks() {
     let h = Harness::new();
     h.service
@@ -1305,7 +904,6 @@ fn a_turn_without_a_timezone_takes_the_banks() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn an_unknown_timezone_or_bank_is_refused_and_nothing_is_stored() {
     let h = Harness::new();
     let bad = Turn {
@@ -1313,7 +911,7 @@ fn an_unknown_timezone_or_bank_is_refused_and_nothing_is_stored() {
         ..turn("s", "2026-10-01T06:00:00Z", "Hello.", "Hi.")
     };
     assert!(matches!(
-        ingest_turn(&h.service, "main", &bad),
+        h.service.ingest_turn("main", &bad),
         Err(IngestError::InvalidTimezone)
     ));
     let bad_doc = Document {
@@ -1321,12 +919,11 @@ fn an_unknown_timezone_or_bank_is_refused_and_nothing_is_stored() {
         ..document("notes.md", "Hello.", date(2026, 9, 15))
     };
     assert!(matches!(
-        ingest_document(&h.service, "main", &bad_doc),
+        h.service.ingest_document("main", &bad_doc),
         Err(IngestError::InvalidTimezone)
     ));
     assert!(matches!(
-        ingest_turn(
-            &h.service,
+        h.service.ingest_turn(
             "nowhere",
             &turn("s", "2026-10-01T06:00:00Z", "Hello.", "Hi.")
         ),
@@ -1338,7 +935,6 @@ fn an_unknown_timezone_or_bank_is_refused_and_nothing_is_stored() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_turn_is_one_queued_chunk() {
     let h = Harness::new();
     let got = ingest(
@@ -1369,7 +965,6 @@ fn a_turn_is_one_queued_chunk() {
 // Idempotency (TIM-90, ADR 0002)
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn the_same_turn_twice_does_nothing_the_second_time() {
     // Hermes retries, and the plugin's spool replays (TIM-94, decision 6).
     let h = Harness::new();
@@ -1398,7 +993,6 @@ fn the_same_turn_twice_does_nothing_the_second_time() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_duplicate_is_caught_after_a_restart() {
     let h = Harness::new();
     let sent = turn(
@@ -1416,7 +1010,6 @@ fn a_duplicate_is_caught_after_a_restart() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_duplicate_does_not_requeue_an_extracted_chunk() {
     let h = Harness::new();
     let sent = turn(
@@ -1427,7 +1020,7 @@ fn a_duplicate_does_not_requeue_an_extracted_chunk() {
     );
     ingest(&h, "main", &sent);
     let lease = claim(&h, "main").unwrap();
-    complete_chunk(&h.service, lease).unwrap();
+    h.service.complete_chunk(lease).unwrap();
     let again = ingest(&h, "main", &sent);
     assert_eq!(again.outcome, Outcome::Duplicate);
     assert_eq!(depth(&h, "main"), 0);
@@ -1435,7 +1028,6 @@ fn a_duplicate_does_not_requeue_an_extracted_chunk() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_swept_source_stays_a_tombstone_when_it_is_sent_again() {
     // ADR 0008: the sweep deletes the text and keeps the key, so re-ingest
     // can't bring the passage back.
@@ -1467,7 +1059,6 @@ fn a_swept_source_stays_a_tombstone_when_it_is_sent_again() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn the_same_words_in_another_session_at_another_time_or_in_another_bank_are_new() {
     let h = Harness::new();
     let words = ("Good morning.", "Morning!");
@@ -1503,7 +1094,6 @@ fn the_same_words_in_another_session_at_another_time_or_in_another_bank_are_new(
 // Documents (TIM-92; TIM-94 decision 10)
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_document_is_stored_with_its_reference_date() {
     let h = Harness::new();
     let text = "# Trip\n\nFlying to Berlin tomorrow.\n";
@@ -1540,7 +1130,6 @@ fn a_document_is_stored_with_its_reference_date() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn an_inexact_reference_date_is_recorded() {
     let h = Harness::new();
     let got = ingest_doc(
@@ -1558,7 +1147,6 @@ fn an_inexact_reference_date_is_recorded() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_document_is_stored_as_its_chunks_and_every_chunk_is_queued() {
     let h = Harness::new();
     let text = "Preamble.\n\n# Work\n\nShip v1.\n\n## Ingest\n\nChunk documents.\n\n# Home\n\nFix the fence.\n";
@@ -1580,7 +1168,6 @@ fn a_document_is_stored_as_its_chunks_and_every_chunk_is_queued() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn the_same_document_twice_does_nothing_the_second_time() {
     let h = Harness::new();
     let text = "# Plans\n\nFly to Berlin on 3 October.\n";
@@ -1631,7 +1218,6 @@ fn hashes_of(text: &str, sections: &[&str]) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn an_edited_document_queues_only_chunks_no_earlier_version_had() {
     // TIM-92, edited documents: chunks are matched by hash, and a chunk seen
     // in any earlier version is skipped.
@@ -1675,7 +1261,6 @@ fn an_edited_document_queues_only_chunks_no_earlier_version_had() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_section_moved_under_another_heading_is_new() {
     let h = Harness::new();
     let v1 = "# Work\n\n## Errands\n\nFix the fence.\n";
@@ -1694,7 +1279,6 @@ fn a_section_moved_under_another_heading_is_new() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn an_earlier_reference_date_is_accepted() {
     // TIM-92: reconciliation's direction rule makes older claims harmless,
     // and a rejection would be a failure nobody sees.
@@ -1710,7 +1294,6 @@ fn an_earlier_reference_date_is_accepted() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn memories_from_a_removed_section_are_left_alone() {
     // TIM-92: deleting a line from a note doesn't make it false.
     let h = Harness::new();
@@ -1747,7 +1330,6 @@ fn memories_from_a_removed_section_are_left_alone() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_tombstoned_chunk_is_not_extracted_again_from_a_new_version() {
     // ADR 0002 and TIM-92: the chunk hash is the forget tombstone. Once the
     // erase or the sweep has removed a chunk's text, a new version that
@@ -1786,7 +1368,6 @@ fn recorded_kinds(h: &Harness, source: Uuid) -> BTreeSet<String> {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn secrets_in_a_turn_are_redacted_before_anything_is_stored() {
     let h = Harness::new();
     let (user, github) = sentence_with(SecretKind::GithubToken, 7);
@@ -1817,7 +1398,6 @@ fn secrets_in_a_turn_are_redacted_before_anything_is_stored() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn secrets_in_a_document_are_redacted_and_the_chunks_hash_the_redacted_text() {
     let h = Harness::new();
     let (line, password) = sentence_with(SecretKind::UrlPassword, 9);
@@ -1842,7 +1422,6 @@ fn secrets_in_a_document_are_redacted_and_the_chunks_hash_the_redacted_text() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_clean_turn_records_no_secret_kinds() {
     let h = Harness::new();
     let got = ingest(
@@ -1855,7 +1434,6 @@ fn a_clean_turn_records_no_secret_kinds() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn the_key_is_computed_from_the_redacted_text() {
     // Nothing stored is derived from a secret, the content hash included,
     // so a resend whose only difference is the secret itself is the same
@@ -1881,7 +1459,6 @@ fn the_key_is_computed_from_the_redacted_text() {
 // The turn that asks to forget (TIM-99 decision 2, ADR 0010)
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_forget_request_is_stored_only_as_a_tombstone_and_never_queued() {
     let h = Harness::new();
     let sent = Turn {
@@ -1918,7 +1495,6 @@ fn a_forget_request_is_stored_only_as_a_tombstone_and_never_queued() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_forget_request_deletes_its_recall_row() {
     // ADR 0010: the recall row for the turn's `recall_id` holds the
     // request as its query, so it goes too. Other recalls stay.
@@ -1957,7 +1533,6 @@ fn a_forget_request_deletes_its_recall_row() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_forget_request_sent_again_stays_a_tombstone() {
     // The spool may replay the turn, and a resend could lose the flag.
     let h = Harness::new();
@@ -1983,7 +1558,6 @@ fn a_forget_request_sent_again_stays_a_tombstone() {
 // Speakers (TIM-94, decision 1)
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn the_owners_platform_id_resolves_to_user() {
     let h = Harness::new();
     let got = ingest(
@@ -2002,7 +1576,6 @@ fn the_owners_platform_id_resolves_to_user() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_turn_with_no_author_is_the_owners() {
     // The CLI, TUI and Hermes UI send no author.
     let h = Harness::new();
@@ -2035,7 +1608,6 @@ fn aliases(h: &Harness, entity: Uuid) -> BTreeSet<String> {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn anyone_else_becomes_a_person_of_their_own() {
     let h = Harness::new();
     let got = ingest(
@@ -2073,7 +1645,6 @@ fn anyone_else_becomes_a_person_of_their_own() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_speaker_is_found_again_by_platform_id_even_after_a_rename() {
     let h = Harness::new();
     let first = ingest(
@@ -2098,7 +1669,6 @@ fn a_speaker_is_found_again_by_platform_id_even_after_a_rename() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn sharing_the_owners_name_does_not_make_someone_the_owner() {
     // Only the owner can forget, keep or unkeep, so ownership comes from
     // platform ids alone, never from a display name.
@@ -2118,7 +1688,6 @@ fn sharing_the_owners_name_does_not_make_someone_the_owner() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn the_owners_id_on_another_platform_is_someone_else() {
     // The owner's platform id is `discord:1234`; `1234` on Telegram is a
     // different account.
@@ -2137,7 +1706,6 @@ fn the_owners_id_on_another_platform_is_someone_else() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn two_people_with_one_name_are_two_entities() {
     // TIM-92: no string-similarity matching and no automatic merges.
     let h = Harness::new();
@@ -2156,7 +1724,6 @@ fn two_people_with_one_name_are_two_entities() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_bot_is_a_speaker_of_its_own() {
     let h = Harness::new();
     let got = ingest(
@@ -2180,7 +1747,6 @@ fn a_bot_is_a_speaker_of_its_own() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn speakers_never_cross_banks() {
     let h = Harness::new();
     let a = ingest(
@@ -2201,17 +1767,15 @@ fn speakers_never_cross_banks() {
 // The extraction queue (TIM-92; TIM-94 decision 3)
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn an_empty_queue_hands_out_nothing() {
     let h = Harness::new();
     assert!(claim(&h, "main").is_none());
     assert_eq!(depth(&h, "main"), 0);
-    assert!(failed_chunks(&h.service, "main").unwrap().is_empty());
-    assert!(claim_chunk(&h.service, "nowhere").is_err());
+    assert!(h.service.failed_chunks("main").unwrap().is_empty());
+    assert!(h.service.claim_chunk("nowhere").is_err());
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn each_bank_has_one_worker() {
     let h = Harness::new();
     ingest(
@@ -2238,17 +1802,16 @@ fn each_bank_has_one_worker() {
     let other = claim(&h, "other").expect("another bank isn't held up");
     assert_eq!(depth(&h, "main"), 2, "a leased chunk is still in the queue");
 
-    complete_chunk(&h.service, main).unwrap();
+    h.service.complete_chunk(main).unwrap();
     let next = claim(&h, "main").expect("the lease is released on completion");
     assert!(
         h.chunk_column::<String>(next.chunk, "text")
             .contains("Two.")
     );
-    complete_chunk(&h.service, other).unwrap();
+    h.service.complete_chunk(other).unwrap();
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn turns_go_ahead_of_documents_then_observed_at_order() {
     // TIM-92: serialised in observed_at order, with turns ahead of document
     // chunks.
@@ -2277,7 +1840,7 @@ fn turns_go_ahead_of_documents_then_observed_at_order() {
     let mut order = Vec::new();
     while let Some(lease) = claim(&h, "main") {
         order.push((lease.source, lease.source_kind, lease.position));
-        complete_chunk(&h.service, lease).unwrap();
+        h.service.complete_chunk(lease).unwrap();
     }
     assert_eq!(
         order,
@@ -2291,7 +1854,6 @@ fn turns_go_ahead_of_documents_then_observed_at_order() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_lease_describes_its_chunk() {
     let h = Harness::new();
     let got = ingest(
@@ -2309,7 +1871,6 @@ fn a_lease_describes_its_chunk() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn completing_a_chunk_marks_it_extracted_and_takes_it_off_the_queue() {
     let h = Harness::new();
     ingest(
@@ -2326,7 +1887,7 @@ fn completing_a_chunk_marks_it_extracted_and_takes_it_off_the_queue() {
         [chunk.to_string()],
     );
     h.clock.advance(SignedDuration::from_secs(3));
-    complete_chunk(&h.service, lease).unwrap();
+    h.service.complete_chunk(lease).unwrap();
 
     assert_eq!(
         h.chunk_column::<Option<i64>>(chunk, "extracted_at"),
@@ -2341,7 +1902,6 @@ fn completing_a_chunk_marks_it_extracted_and_takes_it_off_the_queue() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_failed_attempt_is_counted_and_retried_in_place() {
     let h = Harness::new();
     ingest(
@@ -2358,7 +1918,7 @@ fn a_failed_attempt_is_counted_and_retried_in_place() {
     let head = lease.chunk;
 
     assert_eq!(
-        fail_chunk(&h.service, lease, LLM_502).unwrap(),
+        h.service.fail_chunk(lease, LLM_502).unwrap(),
         Failure::Retry { error_count: 1 }
     );
     assert_eq!(h.chunk_column::<i64>(head, "error_count"), 1);
@@ -2395,7 +1955,7 @@ fn fail_until_failed(h: &Harness, bank: &str) -> Uuid {
     let mut lease = first;
     for attempt in 1..=CHUNK_RETRY_CAP {
         assert_eq!(lease.chunk, chunk);
-        let result = fail_chunk(&h.service, lease, LLM_502).unwrap();
+        let result = h.service.fail_chunk(lease, LLM_502).unwrap();
         if attempt < CHUNK_RETRY_CAP {
             assert_eq!(
                 result,
@@ -2414,7 +1974,6 @@ fn fail_until_failed(h: &Harness, bank: &str) -> Uuid {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn reaching_the_retry_cap_marks_the_chunk_failed_and_the_queue_moves_on() {
     let h = Harness::new();
     let first = ingest(
@@ -2441,7 +2000,7 @@ fn reaching_the_retry_cap_marks_the_chunk_failed_and_the_queue_moves_on() {
     assert_eq!(h.chunk_column::<Option<i64>>(failed, "extracted_at"), None);
     assert_eq!(depth(&h, "main"), 1, "a failed chunk isn't waiting");
 
-    let listed = failed_chunks(&h.service, "main").unwrap();
+    let listed = h.service.failed_chunks("main").unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].chunk, failed);
     assert_eq!(listed[0].source, first.source);
@@ -2459,7 +2018,6 @@ fn reaching_the_retry_cap_marks_the_chunk_failed_and_the_queue_moves_on() {
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_failure_in_one_bank_does_not_hold_up_another() {
     let h = Harness::new();
     ingest(
@@ -2473,7 +2031,7 @@ fn a_failure_in_one_bank_does_not_hold_up_another() {
         &turn("s", "2026-10-01T06:00:00Z", "Other.", "Ok."),
     );
     let main = claim(&h, "main").unwrap();
-    fail_chunk(&h.service, main, LLM_502).unwrap();
+    h.service.fail_chunk(main, LLM_502).unwrap();
     let other = claim(&h, "other").expect("other's queue is its own");
     assert_eq!(other.error_count, 0);
 }
@@ -2481,7 +2039,6 @@ fn a_failure_in_one_bank_does_not_hold_up_another() {
 // Recovery after a restart (TIM-94 decision 3: nothing queued is lost)
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn the_queue_survives_a_restart_with_the_chunk_in_flight_first() {
     let h = Harness::new();
     let a = ingest(&h, "main", &turn("s", "2026-10-01T06:00:00Z", "A.", "Ok."));
@@ -2503,25 +2060,24 @@ fn the_queue_survives_a_restart_with_the_chunk_in_flight_first() {
         "the interrupted chunk goes first"
     );
     assert_eq!(again.error_count, 0, "a restart isn't a failure");
-    complete_chunk(&h.service, again).unwrap();
+    h.service.complete_chunk(again).unwrap();
 
     let mut rest = Vec::new();
     while let Some(lease) = claim(&h, "main") {
         rest.push(lease.source);
-        complete_chunk(&h.service, lease).unwrap();
+        h.service.complete_chunk(lease).unwrap();
     }
     assert_eq!(rest, [b.source, c.source]);
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn the_error_count_survives_a_restart() {
     // The cap counts attempts, not attempts since the last restart, or a
     // crash-looping daemon would retry a poisoned chunk for ever.
     let h = Harness::new();
     ingest(&h, "main", &turn("s", "2026-10-01T06:00:00Z", "A.", "Ok."));
     let lease = claim(&h, "main").unwrap();
-    fail_chunk(&h.service, lease, LLM_502).unwrap();
+    h.service.fail_chunk(lease, LLM_502).unwrap();
 
     let h = h.restart();
     h.clock.advance(SignedDuration::from_hours(24));
@@ -2529,7 +2085,7 @@ fn the_error_count_survives_a_restart() {
     assert_eq!(lease.error_count, 1);
     let mut lease = lease;
     for attempt in 2..=CHUNK_RETRY_CAP {
-        let result = fail_chunk(&h.service, lease, LLM_502).unwrap();
+        let result = h.service.fail_chunk(lease, LLM_502).unwrap();
         if attempt == CHUNK_RETRY_CAP {
             assert_eq!(result, Failure::Failed);
             break;
@@ -2537,11 +2093,10 @@ fn the_error_count_survives_a_restart() {
         h.clock.advance(SignedDuration::from_hours(24));
         lease = claim(&h, "main").unwrap();
     }
-    assert_eq!(failed_chunks(&h.service, "main").unwrap().len(), 1);
+    assert_eq!(h.service.failed_chunks("main").unwrap().len(), 1);
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn a_failed_chunk_stays_failed_after_a_restart() {
     let h = Harness::new();
     ingest(&h, "main", &turn("s", "2026-10-01T06:00:00Z", "A.", "Ok."));
@@ -2550,13 +2105,12 @@ fn a_failed_chunk_stays_failed_after_a_restart() {
     let h = h.restart();
     assert_eq!(depth(&h, "main"), 0);
     assert!(claim(&h, "main").is_none(), "surfaced, not retried");
-    let listed = failed_chunks(&h.service, "main").unwrap();
+    let listed = h.service.failed_chunks("main").unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].chunk, failed);
 }
 
 #[test]
-#[ignore = "ingest not built yet; activate with the TIM-106 implementation"]
 fn the_queue_order_survives_a_restart() {
     let h = Harness::new();
     let doc = ingest_doc(
@@ -2583,7 +2137,7 @@ fn the_queue_order_survives_a_restart() {
     let mut order = Vec::new();
     while let Some(lease) = claim(&h, "main") {
         order.push((lease.source, lease.position));
-        complete_chunk(&h.service, lease).unwrap();
+        h.service.complete_chunk(lease).unwrap();
     }
     assert_eq!(
         order,
