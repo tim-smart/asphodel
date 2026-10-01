@@ -12,19 +12,12 @@
 //! Reconciliation (call 2, TIM-108) doesn't exist at this stage, so every
 //! claim that survives the checks in code becomes a new memory.
 //!
-//! The code under test doesn't exist yet. [`contract`] below holds the
-//! proposed API with `todo!()` bodies, so this file compiles and every test
-//! that needs it is ignored. To activate: move [`contract::extraction`] into
-//! the crate as `asphodel_core::extraction`, put [`contract::call1_input`]
-//! and [`contract::extract_chunk`] on `Service`, delete the module, import
-//! from the crate instead, and drop the `ignore` attributes.
-//!
-//! Three tests run now. They check that the schema TIM-103 landed holds what
-//! call 1 commits, that it allows one access per memory per turn, and that no
-//! significance level extraction can give is permanent from creation.
-//!
-//! Where the tickets leave a detail open, the contract proposes one and its
-//! doc comment says so. Those are the places to argue with.
+//! The API under test is `asphodel_core::extraction` and the `Service`
+//! methods over it, `call1_input` and `extract_chunk`. Three tests check the
+//! schema and constants call 1 relies on: that the schema TIM-103 landed
+//! holds what call 1 commits, that it allows one access per memory per turn,
+//! and that no significance level extraction can give is permanent from
+//! creation.
 //!
 //! Every service here runs on a `SimulatedClock` stopped at one instant
 //! unless a test advances it, so a stored time that equals that instant can
@@ -53,321 +46,11 @@ use rusqlite::types::FromSql;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use contract::extraction::{
+use asphodel_core::extraction::{
     CALENDAR_DAYS, CALL1_TEMPLATE, CALL1_VERSION, CANDIDATE_MEMORIES, CONTEXT_CHARS, CONTEXT_TURNS,
     Call1Input, DropReason, Dropped, ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, Extracted,
     PREVIOUS_CHUNK_CHARS, call1_request,
 };
-use contract::{call1_input, extract_chunk};
-
-/// The proposed extraction API.
-///
-/// Extraction takes a leased chunk off the queue ([`asphodel_core::queue`]),
-/// assembles call 1's input, makes the call, checks the reply in code and
-/// commits the result in one transaction with the chunk's `extracted_at`.
-/// Everything runs on the service's clock, so `serve` and replay share it
-/// (TIM-96, decision 3).
-#[allow(dead_code, unused_variables)]
-mod contract {
-    use asphodel_core::Service;
-    use asphodel_core::models::LlmClient;
-    use asphodel_core::queue::Lease;
-    use uuid::Uuid;
-
-    use self::extraction::{Call1Input, ExtractError, Extracted};
-
-    /// The proposed `Service::call1_input`: what call 1 will be given for the
-    /// leased chunk. Reads only; the lease is still held afterwards.
-    ///
-    /// `in_context` is the session's in-context set: the public ids of the
-    /// memories the agent can already see (CONTEXT.md, "In context"). Who
-    /// keeps that set belongs to prefetch and the HTTP API (TIM-109,
-    /// TIM-110), so here the caller passes it. Ids that aren't memories of
-    /// the chunk's bank, and memories hidden by a pending forget (ADR 0010),
-    /// are left out. A document chunk has no reply to have used anything, so
-    /// it gets no in-context memories whatever is passed (proposal).
-    pub fn call1_input(
-        service: &Service,
-        lease: &Lease,
-        in_context: &[Uuid],
-    ) -> Result<Call1Input, ExtractError> {
-        todo!()
-    }
-
-    /// The proposed `Service::extract_chunk`: runs call 1 on the leased
-    /// chunk and commits what it found. The request sent is exactly
-    /// [`extraction::call1_request`] of [`call1_input`].
-    ///
-    /// On success, in one transaction: the memories with their vectors, the
-    /// entity links, new entities and aliases with their logged edits, the
-    /// `created` and `used` accesses, and the chunk marked extracted and
-    /// taken off the queue with call 1's saved output dropped (ADR 0008).
-    ///
-    /// On failure nothing is written but the queue's count of the failed
-    /// attempt ([`asphodel_core::queue`]), so the chunk is retried in place
-    /// and fails at `CHUNK_RETRY_CAP`. An LLM error that isn't the chunk's
-    /// fault holds the queue instead and counts nothing
-    /// ([`ExtractError::Held`]).
-    pub fn extract_chunk(
-        service: &Service,
-        lease: Lease,
-        llm: &dyn LlmClient,
-        in_context: &[Uuid],
-    ) -> Result<Extracted, ExtractError> {
-        todo!()
-    }
-
-    /// The proposed `asphodel_core::extraction`.
-    pub mod extraction {
-        use asphodel_core::models::{LlmError, LlmRequest, ModelError};
-        use asphodel_core::queue::{Failure, QueueError, SourceKind};
-        use asphodel_core::store::StoreError;
-        use jiff::Timestamp;
-        use jiff::civil::Date;
-        use uuid::Uuid;
-
-        /// Call 1's template name and version, which replay's cassette keys
-        /// include (TIM-96, decision 4).
-        pub const CALL1_TEMPLATE: &str = "extract_claims";
-        pub const CALL1_VERSION: u32 = 1;
-
-        /// Earlier clean turns of the session given as context (TIM-92,
-        /// "up to 3 previous clean turns").
-        pub const CONTEXT_TURNS: usize = 3;
-
-        /// The context turns' total size in characters. Over it, they're
-        /// clipped oldest first: characters come off the start of the oldest
-        /// turn, and a turn clipped to nothing is left out (TIM-92, "clipped
-        /// oldest first to about 6,000 characters").
-        pub const CONTEXT_CHARS: usize = 6_000;
-
-        /// How much of the document before a chunk it gets as context, in
-        /// characters (TIM-92, "the last few hundred characters of the
-        /// previous chunk"). Proposal: 400, taken from the source text
-        /// before the chunk's start, so a chunk skipped as seen in an
-        /// earlier version still provides it.
-        pub const PREVIOUS_CHUNK_CHARS: usize = 400;
-
-        /// Entity candidates found by alias search, at most (TIM-92, "capped
-        /// at about 30 per unit, ranked by how many memories link to
-        /// them"). `user`, `assistant` and the speaker come on top
-        /// (proposal), since search never has to find them.
-        pub const ENTITY_CANDIDATE_CAP: usize = 30;
-
-        /// Linked memory sentences shown with a candidate, strongest first.
-        pub const CANDIDATE_MEMORIES: usize = 3;
-
-        /// The calendar strip: the reference date and this many days either
-        /// side (TIM-92, "three weeks either side").
-        pub const CALENDAR_DAYS: i64 = 21;
-
-        /// Everything call 1 is given for one chunk. Handles are short ids
-        /// local to the call (`e1`, `e2`, … for candidates and `m1`, `m2`, …
-        /// for in-context memories), which the reply refers back to; they're
-        /// cheaper and harder to garble than UUIDs (proposal).
-        #[derive(Debug, Clone, PartialEq)]
-        pub struct Call1Input {
-            pub chunk: Uuid,
-            pub source_kind: SourceKind,
-            /// The chunk's text: the unit claims are extracted from and
-            /// quotes are checked against. For a turn, the user message,
-            /// `TURN_SEPARATOR` and the reply.
-            pub text: String,
-            /// The source's `observed_at`.
-            pub observed_at: Timestamp,
-            /// The source's timezone.
-            pub timezone: String,
-            /// The local date relative times resolve against: the message
-            /// time's date in the source's timezone, or a document's
-            /// reference date. `None` for a document whose reference date
-            /// isn't exact, whose relative dates aren't resolved (TIM-92).
-            pub reference_date: Option<Date>,
-            /// The reference date and [`CALENDAR_DAYS`] either side, in
-            /// order. The prompt renders each as `YYYY-MM-DD Weekday`
-            /// (`2026-10-01 Thursday`). Empty when `reference_date` is
-            /// `None`.
-            pub calendar: Vec<Date>,
-            /// Whose words the user message is; `None` for a document. "I"
-            /// and "me" resolve to them (TIM-94, decision 1).
-            pub speaker: Option<SpeakerRef>,
-            /// Context only, oldest first: never quoted from, never
-            /// extracted from on its own. For a turn, up to
-            /// [`CONTEXT_TURNS`] earlier turns of the same session that
-            /// still have their text, each as its chunk text would be. For a
-            /// document chunk, the [`PREVIOUS_CHUNK_CHARS`] before it, if
-            /// any.
-            pub context: Vec<String>,
-            /// `user`, `assistant` and the speaker first, then the entities
-            /// whose aliases appear in the text or its context, found
-            /// through the alias FTS within the chunk's bank. A merged
-            /// entity is shown as the entity it survives as, once.
-            pub candidates: Vec<Candidate>,
-            /// The in-context memories call 1 judges `used` against.
-            pub in_context: Vec<InContextMemory>,
-        }
-
-        #[derive(Debug, Clone, PartialEq)]
-        pub struct SpeakerRef {
-            /// The speaker's handle among the candidates.
-            pub handle: String,
-            pub entity: Uuid,
-            pub name: String,
-            /// Whether the speaker is the owner, the seeded `user`.
-            pub owner: bool,
-        }
-
-        #[derive(Debug, Clone, PartialEq)]
-        pub struct Candidate {
-            pub handle: String,
-            pub entity: Uuid,
-            pub name: String,
-            pub kind: EntityKind,
-            pub aliases: Vec<String>,
-            /// Up to [`CANDIDATE_MEMORIES`] sentences of memories linked to
-            /// the entity, strongest first, leaving out hidden ones.
-            pub memories: Vec<String>,
-        }
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum EntityKind {
-            Person,
-            Place,
-            Organisation,
-            Project,
-            Thing,
-        }
-
-        #[derive(Debug, Clone, PartialEq)]
-        pub struct InContextMemory {
-            pub handle: String,
-            pub memory: Uuid,
-            pub content: String,
-        }
-
-        /// Call 1's request for `input`.
-        ///
-        /// The system prompt holds the rules and is the same for every chunk,
-        /// so a provider can cache it. The user prompt holds `input`. The
-        /// reply schema is strict, every property required:
-        ///
-        /// ```json
-        /// {
-        ///   "claims": [{
-        ///     "content": "Tim has a dentist appointment on 2 October 2026 at 3pm.",
-        ///     "kind": "fact | event | state | task | recurring",
-        ///     "quote": "Dentist tomorrow at 3pm",
-        ///     "significance": "trivial | minor | notable | major | critical",
-        ///     "remember_this": false,
-        ///     "changes_something": false,
-        ///     "valid_from": {"at": "2026-10-02T15:00", "precision": "hour"},
-        ///     "valid_until": null,
-        ///     "window_confidence": "high | low",
-        ///     "until_event": null,
-        ///     "due_at": null,
-        ///     "volatility": "hours | days | weeks | months | years | null",
-        ///     "recurrence_text": null,
-        ///     "recurrence_rrule": null,
-        ///     "recurrence_start": null,
-        ///     "entities": [
-        ///       {"entity": "e1", "new_name": null, "new_kind": null, "surface_form": "I"},
-        ///       {"entity": null, "new_name": "Lisbon", "new_kind": "place", "surface_form": "Lisbon"}
-        ///     ]
-        ///   }],
-        ///   "used_injected_ids": ["m2"]
-        /// }
-        /// ```
-        ///
-        /// A time's `at` is a local date or date-time in the source's
-        /// timezone, as `YYYY`, `YYYY-MM`, `YYYY-MM-DD` or
-        /// `YYYY-MM-DDTHH:MM`, and `precision` is `year`, `month`, `day`,
-        /// `hour` or `minute` (proposal). The significance enum stops at
-        /// `critical`, so extraction can't score above 0.9 (TIM-91,
-        /// decision 7).
-        pub fn call1_request(input: &Call1Input) -> LlmRequest {
-            todo!()
-        }
-
-        /// What one successful extraction committed.
-        #[derive(Debug, Clone, PartialEq)]
-        pub struct Extracted {
-            pub chunk: Uuid,
-            /// The new memories, in claim order, without the dropped claims.
-            pub memories: Vec<Uuid>,
-            /// The in-context memories credited `used`, each once.
-            pub used: Vec<Uuid>,
-            /// Entities created for proposed new entities.
-            pub entities_created: Vec<Uuid>,
-            /// Claims code dropped, by their index in the reply.
-            pub dropped: Vec<Dropped>,
-        }
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub struct Dropped {
-            pub claim: usize,
-            pub reason: DropReason,
-        }
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum DropReason {
-            /// The quote is empty or isn't in the chunk's text. A passage
-            /// that's only in the context doesn't count (TIM-92).
-            QuoteNotFound,
-            /// The content is empty after trimming.
-            EmptyContent,
-            /// A task quoted from the assistant's reply with neither a due
-            /// date nor an until-event (TIM-92: the assistant's task has "a
-            /// due date or an until-event beyond the current turn").
-            AssistantTaskUndated,
-        }
-
-        /// Why an extraction didn't commit. No variant carries the prompt,
-        /// the reply or a claim (ADR 0010).
-        ///
-        /// The chunk's `last_error_kind` names the cause: `llm_transport`,
-        /// `llm_timeout`, `llm_status` (with the status), `llm_no_content`,
-        /// `llm_not_json`, `llm_refused`, `llm_backend`, `invalid_reply` or
-        /// `embedding`.
-        #[derive(Debug)]
-        pub enum ExtractError {
-            /// The LLM can't be used at all: not configured, conflicting
-            /// settings, no valid login, or a usage limit until
-            /// `resets_at`. Not the chunk's fault, so nothing is counted and
-            /// the chunk stays at the head of the queue (proposal, following
-            /// `LlmError`'s docs: "the extraction queue holds").
-            Held {
-                error: LlmError,
-            },
-            /// Call 1 failed, and the queue counted it.
-            Call1 {
-                error: LlmError,
-                failure: Failure,
-            },
-            /// The reply came back but doesn't fit the schema: a missing
-            /// field, or a value outside an enum such as a significance
-            /// above `critical`. Counted like a failed call.
-            InvalidReply {
-                reason: &'static str,
-                failure: Failure,
-            },
-            /// Embedding the new memories failed. Counted like a failed
-            /// call.
-            Embedding {
-                error: ModelError,
-                failure: Failure,
-            },
-            Queue(QueueError),
-            Store(StoreError),
-        }
-
-        impl ExtractError {
-            /// What the queue did with the chunk, or `None` when the attempt
-            /// wasn't counted.
-            pub fn failure(&self) -> Option<Failure> {
-                todo!()
-            }
-        }
-    }
-}
 
 // Fixtures
 
@@ -978,7 +661,7 @@ fn lease(h: &Harness, bank: &str) -> Lease {
 /// when it drops.
 fn input(h: &Harness, bank: &str, in_context: &[Uuid]) -> Call1Input {
     let lease = lease(h, bank);
-    call1_input(&h.service, &lease, in_context).unwrap()
+    h.service.call1_input(&lease, in_context).unwrap()
 }
 
 /// Extracts the head of the bank's queue with `llm`.
@@ -988,7 +671,7 @@ fn run(
     llm: &FakeLlm,
     in_context: &[Uuid],
 ) -> Result<Extracted, ExtractError> {
-    extract_chunk(&h.service, lease(h, bank), llm, in_context)
+    h.service.extract_chunk(lease(h, bank), llm, in_context)
 }
 
 /// Extracts the head of `main`'s queue with call 1 answering `reply`.
@@ -1266,7 +949,6 @@ fn no_level_extraction_can_give_is_permanent_from_creation() {
 // Context assembly.
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_turns_input_is_its_text_speaker_and_reference_date() {
     let h = Harness::new();
     let ingested = ingest(&h, &turn("s1", T1, "Dentist tomorrow at 3pm.", "Noted."));
@@ -1289,7 +971,6 @@ fn a_turns_input_is_its_text_speaker_and_reference_date() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn the_calendar_is_three_weeks_either_side_of_the_local_date() {
     let h = Harness::new();
     // 01:00 on Friday 2 October in Auckland, still the 1st in UTC.
@@ -1307,7 +988,6 @@ fn the_calendar_is_three_weeks_either_side_of_the_local_date() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn up_to_three_earlier_turns_of_the_session_are_context() {
     let h = Harness::new();
     let earlier: Vec<(String, String)> = (1..=5)
@@ -1350,7 +1030,6 @@ fn up_to_three_earlier_turns_of_the_session_are_context() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn context_is_clipped_oldest_first() {
     let h = Harness::new();
     // Three earlier turns of 2,500 characters each: 7,500 in all.
@@ -1384,7 +1063,6 @@ fn context_is_clipped_oldest_first() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_document_chunk_gets_the_text_before_it_as_context() {
     let h = Harness::new();
     let trip = format!("TRIPSTART {}", "We fly out early. ".repeat(40));
@@ -1416,7 +1094,6 @@ fn a_document_chunk_gets_the_text_before_it_as_context() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn an_inexact_reference_date_gets_no_calendar() {
     let h = Harness::new();
     ingest_doc(
@@ -1432,7 +1109,6 @@ fn an_inexact_reference_date_gets_no_calendar() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn user_and_assistant_are_always_candidates() {
     let h = Harness::new();
     ingest(&h, &turn("s1", T1, "Hello there.", "Hi."));
@@ -1460,7 +1136,6 @@ fn user_and_assistant_are_always_candidates() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn another_speaker_is_the_speaker_and_a_candidate() {
     let h = Harness::new();
     let ingested = ingest(&h, &sams_turn(T1, "I'm moving to Lisbon.", "Exciting!"));
@@ -1478,7 +1153,6 @@ fn another_speaker_is_the_speaker_and_a_candidate() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn entities_named_in_the_chunk_or_its_context_are_candidates() {
     let h = Harness::new();
     let ana = h.insert_entity("main", "Ana", "person", &["Ana"]);
@@ -1518,7 +1192,6 @@ fn entities_named_in_the_chunk_or_its_context_are_candidates() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_candidate_shows_its_three_strongest_memories() {
     let h = Harness::new();
     let ana = h.insert_entity("main", "Ana", "person", &["Ana"]);
@@ -1569,7 +1242,6 @@ fn crowded(h: &Harness) -> (Vec<Uuid>, String) {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn candidates_are_capped_by_how_many_memories_link_to_them() {
     let h = Harness::new();
     let (entities, message) = crowded(&h);
@@ -1585,7 +1257,6 @@ fn candidates_are_capped_by_how_many_memories_link_to_them() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn only_the_banks_visible_in_context_memories_are_given() {
     let h = Harness::new();
     let tea = h.insert_memory("main", "Tim likes tea.", "minor");
@@ -1602,7 +1273,6 @@ fn only_the_banks_visible_in_context_memories_are_given() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn the_request_is_the_input_and_the_call_1_schema() {
     let h = Harness::new();
     let ana = h.insert_entity("main", "Ana", "person", &["Ana"]);
@@ -1692,7 +1362,6 @@ fn the_request_is_the_input_and_the_call_1_schema() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn the_system_prompt_is_the_same_for_every_chunk() {
     let h = Harness::new();
     ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
@@ -1712,7 +1381,6 @@ fn the_system_prompt_is_the_same_for_every_chunk() {
 // Kinds.
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_fact_keeps_a_stated_start_but_never_an_end() {
     let h = Harness::new();
     let user = "I started at Acme in March 2024.";
@@ -1745,7 +1413,6 @@ fn a_fact_keeps_a_stated_start_but_never_an_end() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn an_event_keeps_its_window_and_precisions() {
     let h = Harness::new();
     let user = "I'm on holiday from Monday until 12 October. Dentist tomorrow at 3pm.";
@@ -1792,7 +1459,6 @@ fn an_event_keeps_its_window_and_precisions() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn an_event_with_no_stated_time_starts_on_the_day_it_was_said() {
     let h = Harness::new();
     let user = "I finally filed the tax return.";
@@ -1820,7 +1486,6 @@ fn an_event_with_no_stated_time_starts_on_the_day_it_was_said() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_state_keeps_its_volatility_and_until_event() {
     let h = Harness::new();
     let user = "I'm chasing a flaky build until the release ships. Feeling tired today.";
@@ -1863,7 +1528,6 @@ fn a_state_keeps_its_volatility_and_until_event() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_task_has_a_due_date_and_no_end() {
     let h = Harness::new();
     let user = "Remind me to renew my passport by 20 October.";
@@ -1895,7 +1559,6 @@ fn a_task_has_a_due_date_and_no_end() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_recurring_memory_keeps_a_rule_that_parses_and_recurs() {
     let h = Harness::new();
     let user = "I play football every Tuesday at 6pm.";
@@ -1929,7 +1592,6 @@ fn a_recurring_memory_keeps_a_rule_that_parses_and_recurs() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_recurring_memory_without_a_usable_rule_keeps_only_its_text() {
     let h = Harness::new();
     let user = "Bins go out every week. I swim on Fridays. We had a reunion every year until 2019.";
@@ -1986,7 +1648,6 @@ fn a_recurring_memory_without_a_usable_rule_keeps_only_its_text() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn fields_that_belong_to_another_kind_are_dropped() {
     let h = Harness::new();
     let user =
@@ -2062,7 +1723,6 @@ fn fields_that_belong_to_another_kind_are_dropped() {
 // what it gives into instants in the source's timezone and checks weekdays.
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_time_is_the_start_of_its_unit_in_the_sources_timezone() {
     let h = Harness::new();
     let event = |content: &str, at: &str, precision: &str| {
@@ -2108,7 +1768,6 @@ fn a_time_is_the_start_of_its_unit_in_the_sources_timezone() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_source_in_another_timezone_resolves_in_its_own() {
     let h = Harness::new();
     let london = "Europe/London";
@@ -2154,7 +1813,6 @@ fn a_source_in_another_timezone_resolves_in_its_own() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_weekday_in_the_quote_that_doesnt_match_the_date_lowers_confidence() {
     let h = Harness::new();
     // 2 October 2026 is a Friday.
@@ -2204,7 +1862,6 @@ fn a_weekday_in_the_quote_that_doesnt_match_the_date_lowers_confidence() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_time_that_doesnt_parse_is_dropped_with_low_confidence() {
     let h = Harness::new();
     let memories = golden(
@@ -2234,7 +1891,6 @@ fn a_time_that_doesnt_parse_is_dropped_with_low_confidence() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_documents_memory_is_observed_at_its_reference_date_and_created_at_ingest() {
     let h = Harness::new();
     let text = "Yesterday I met Ana at the market.";
@@ -2285,7 +1941,6 @@ fn a_documents_memory_is_observed_at_its_reference_date_and_created_at_ingest() 
 // Speakers.
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn the_owners_claims_link_to_user() {
     let h = Harness::new();
     ingest(
@@ -2328,7 +1983,6 @@ fn the_owners_claims_link_to_user() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn another_speakers_claims_link_to_their_own_entity() {
     let h = Harness::new();
     let user_text = "I'm moving to Lisbon in November.";
@@ -2376,7 +2030,6 @@ fn another_speakers_claims_link_to_their_own_entity() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn an_answer_to_the_assistants_question_quotes_the_answer() {
     let h = Harness::new();
     ingest(
@@ -2425,7 +2078,6 @@ fn an_answer_to_the_assistants_question_quotes_the_answer() {
 // Significance.
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn each_level_is_stored_as_given() {
     let h = Harness::new();
     let claims = LEVELS
@@ -2451,7 +2103,6 @@ fn each_level_is_stored_as_given() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_significance_above_critical_is_an_invalid_reply() {
     let h = Harness::new();
     ingest(&h, &turn("s1", T1, "This matters.", "Noted."));
@@ -2484,7 +2135,6 @@ fn a_significance_above_critical_is_an_invalid_reply() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn remember_this_from_the_owner_keeps_the_memory() {
     let h = Harness::new();
     let memories = golden(
@@ -2509,7 +2159,6 @@ fn remember_this_from_the_owner_keeps_the_memory() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn remember_this_from_another_speaker_is_capped_at_critical() {
     let h = Harness::new();
     ingest(
@@ -2538,7 +2187,6 @@ fn remember_this_from_another_speaker_is_capped_at_critical() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn remember_this_in_a_document_is_ignored() {
     let h = Harness::new();
     ingest_doc(
@@ -2571,7 +2219,6 @@ fn remember_this_in_a_document_is_ignored() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn remember_this_quoted_from_the_reply_is_ignored() {
     let h = Harness::new();
     // Only the owner's own message can keep a memory (TIM-92, other
@@ -2595,7 +2242,6 @@ fn remember_this_quoted_from_the_reply_is_ignored() {
 // Quotes.
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn offsets_locate_the_quote_in_the_chunk_in_characters() {
     let h = Harness::new();
     let user = "Café ☕ with Ana on Friday.";
@@ -2621,7 +2267,6 @@ fn offsets_locate_the_quote_in_the_chunk_in_characters() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_claim_without_a_quote_from_the_chunk_is_dropped() {
     let h = Harness::new();
     ingest(
@@ -2675,7 +2320,6 @@ fn a_claim_without_a_quote_from_the_chunk_is_dropped() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn an_assistant_task_needs_a_due_date_or_an_until_event() {
     let h = Harness::new();
     ingest(
@@ -2731,7 +2375,6 @@ fn an_assistant_task_needs_a_due_date_or_an_until_event() {
 // Entities.
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_link_to_a_candidate_records_its_surface_form() {
     let h = Harness::new();
     let ana = h.insert_entity("main", "Ana", "person", &["Ana"]);
@@ -2759,7 +2402,6 @@ fn a_link_to_a_candidate_records_its_surface_form() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_new_surface_form_becomes_a_logged_alias() {
     let h = Harness::new();
     let ana = h.insert_entity("main", "Ana", "person", &["Ana"]);
@@ -2807,7 +2449,6 @@ fn a_new_surface_form_becomes_a_logged_alias() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_proposed_entity_is_created_once_per_reply() {
     let h = Harness::new();
     let created_before = h.edits("main", "entity_created");
@@ -2836,7 +2477,6 @@ fn a_proposed_entity_is_created_once_per_reply() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_new_entity_beside_one_call_1_saw_is_a_second_entity() {
     let h = Harness::new();
     let sam = h.insert_entity("main", "Sam", "person", &["Sam"]);
@@ -2870,7 +2510,6 @@ fn a_new_entity_beside_one_call_1_saw_is_a_second_entity() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_new_entity_named_like_one_call_1_didnt_see_links_to_it() {
     let h = Harness::new();
     let (entities, message) = crowded(&h);
@@ -2899,7 +2538,6 @@ fn a_new_entity_named_like_one_call_1_didnt_see_links_to_it() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_link_that_names_no_entity_is_dropped() {
     let h = Harness::new();
     let entities_before = h.count("SELECT COUNT(*) FROM entities");
@@ -2927,7 +2565,6 @@ fn a_link_that_names_no_entity_is_dropped() {
 // Accesses.
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn each_new_memory_gets_a_created_access_at_ingest_time() {
     let h = Harness::new();
     let ingested = ingest(&h, &turn("s1", T1, "I like tea.", "Noted."));
@@ -2950,7 +2587,6 @@ fn each_new_memory_gets_a_created_access_at_ingest_time() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn used_verdicts_write_one_used_access_each() {
     let h = Harness::new();
     let tea = h.insert_memory("main", "Tim likes tea.", "minor");
@@ -2987,7 +2623,6 @@ fn used_verdicts_write_one_used_access_each() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_used_verdict_keeps_a_stronger_access_in_the_same_turn() {
     let h = Harness::new();
     let tea = h.insert_memory("main", "Tim likes tea.", "minor");
@@ -3013,7 +2648,6 @@ fn a_used_verdict_keeps_a_stronger_access_in_the_same_turn() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn accesses_carry_the_turn_number_of_their_source() {
     let h = Harness::new();
     // Everything is ingested before anything is extracted, so the bank's
@@ -3044,7 +2678,6 @@ fn accesses_carry_the_turn_number_of_their_source() {
 // Commit.
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_commit_writes_vectors_and_marks_the_chunk_extracted() {
     let h = Harness::new();
     let ingested = ingest(&h, &turn("s1", T1, "I like tea.", "Noted."));
@@ -3102,7 +2735,6 @@ fn a_commit_writes_vectors_and_marks_the_chunk_extracted() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_reply_with_no_claims_completes_the_chunk() {
     let h = Harness::new();
     let ingested = ingest(&h, &turn("s1", T1, "Thanks!", "You're welcome."));
@@ -3146,7 +2778,6 @@ fn busy_reply(input: &Call1Input, used: Uuid) -> Value {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn a_failed_call_1_leaves_the_chunk_retryable() {
     let h = Harness::new();
     let tea = h.insert_memory("main", "Tim likes tea.", "minor");
@@ -3187,7 +2818,7 @@ fn a_failed_call_1_leaves_the_chunk_retryable() {
     let lease = lease(&h, "main");
     assert_eq!(lease.chunk, chunk);
     assert_eq!(lease.error_count, 1);
-    let input = call1_input(&h.service, &lease, &[tea]).unwrap();
+    let input = h.service.call1_input(&lease, &[tea]).unwrap();
     drop(lease);
     let extracted = extract_with(&h, busy_reply(&input, tea), &[tea]);
     assert_eq!(extracted.memories.len(), 1);
@@ -3196,7 +2827,6 @@ fn a_failed_call_1_leaves_the_chunk_retryable() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn each_llm_failure_is_recorded_by_kind() {
     let h = Harness::new();
     let ingested = ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
@@ -3227,7 +2857,6 @@ fn each_llm_failure_is_recorded_by_kind() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn an_invalid_reply_leaves_the_chunk_retryable() {
     let h = Harness::new();
     let ingested = ingest(&h, &turn("s1", T1, "I like tea.", "Noted."));
@@ -3273,7 +2902,6 @@ fn an_invalid_reply_leaves_the_chunk_retryable() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn the_retry_cap_marks_a_chunk_failed() {
     let h = Harness::new();
     let ingested = ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
@@ -3301,7 +2929,6 @@ fn the_retry_cap_marks_a_chunk_failed() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn an_unusable_llm_holds_the_queue_without_counting() {
     let h = Harness::new();
     let ingested = ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
@@ -3328,7 +2955,6 @@ fn an_unusable_llm_holds_the_queue_without_counting() {
 }
 
 #[test]
-#[ignore = "needs extraction call 1 (TIM-107)"]
 fn an_embedding_failure_writes_nothing() {
     let h = Harness::with_models(Models {
         embedder: Arc::new(FailingEmbedder),
