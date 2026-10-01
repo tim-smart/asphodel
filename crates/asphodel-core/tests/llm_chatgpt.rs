@@ -2070,6 +2070,44 @@ fn a_clear_from_another_process_waits_for_a_refresh_and_stays_cleared() {
     );
 }
 
+#[test]
+#[ignore = "security 4: refresh recreates the token file when a clear finished before it took the lock"]
+fn a_clear_before_a_401_is_not_undone_by_the_refresh() {
+    let dir = TestDir::new();
+    let store = logged_in_store(&dir);
+    let token_path = store.path().to_path_buf();
+    let gate = Gate::new();
+    let server = {
+        let gate = Arc::clone(&gate);
+        Scripted::server(move |request, _| match request.path.as_str() {
+            "/responses" => {
+                gate.pass();
+                StubResponse::status(401)
+            }
+            "/oauth/token" => refresh_reply("rotated", "two", an_hour_from_start()),
+            other => panic!("unexpected path {other}"),
+        })
+    };
+    let client = client(&server, store, clock());
+    let worker = std::thread::spawn(move || (client.complete(&request()), client.refreshes()));
+    assert!(
+        gate.arrived(1, Duration::from_secs(5)),
+        "the Responses request never reached the backend"
+    );
+    let mut child = ChildProcess::token_store("clear", &dir.data());
+    let status = child.exited_within(Duration::from_secs(5));
+    let cleared = !token_path.exists();
+    gate.open();
+    let (result, refreshes) = worker.join().unwrap();
+
+    assert!(status.expect("the child clear never finished").success());
+    assert!(cleared, "the child clear left the token file behind");
+    assert!(matches!(result, Err(LlmError::LoginRequired)), "{result:?}");
+    assert_eq!(refreshes, 0, "a cleared login must not be refreshed");
+    assert_eq!(server.paths(), ["/responses"]);
+    assert!(!token_path.exists(), "the refresh recreated the token file");
+}
+
 /// Where `TokenStore::save` puts its temp file today: the token file's
 /// name, `.part-`, and this process's id. The fix moves to fresh names, so
 /// a file planted here must then simply be left alone.
