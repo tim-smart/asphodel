@@ -652,7 +652,8 @@ impl Service {
     ) -> Result<RefreshOutcome, ModelError> {
         let _refreshing = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
         let row = self.model_row(bank, name)?;
-        let outcome = crate::mental_models::refresh(&self.retrieval()?, &row, llm, force)?;
+        let outcome =
+            crate::mental_models::refresh(&self.retrieval()?, &self.schedule, &row, llm, force)?;
         if matches!(outcome, RefreshOutcome::Applied(_)) {
             self.blocks.invalidate(row.bank_id);
         }
@@ -688,14 +689,19 @@ impl Service {
                             // Refreshed too recently: the sweep's check
                             // waits for the interval instead.
                             let conn = self.store.connection();
-                            crate::mental_models::request(&conn, &[model.id].into(), now)?;
+                            crate::mental_models::request(
+                                &conn,
+                                &self.schedule,
+                                &[model.id].into(),
+                                now,
+                            )?;
                         }
                         !held
                     });
                 if !run {
                     continue;
                 }
-                match crate::mental_models::refresh(&cx, &model, llm, false) {
+                match crate::mental_models::refresh(&cx, &self.schedule, &model, llm, false) {
                     Ok(outcome) => {
                         if matches!(outcome, RefreshOutcome::Applied(_)) {
                             self.blocks.invalidate(bank_id);
@@ -852,7 +858,7 @@ impl Service {
                 created,
                 self.tuning.mental_models.trigger_level,
             )?;
-            crate::mental_models::request(&conn, &effects.triggered, now)?;
+            crate::mental_models::request(&conn, &self.schedule, &effects.triggered, now)?;
             effects
         };
         if !effects.triggered.is_empty() {
@@ -868,7 +874,7 @@ impl Service {
         let now = self.now();
         {
             let conn = self.store.connection();
-            crate::mental_models::request(&conn, &[model_id].into(), now)?;
+            crate::mental_models::request(&conn, &self.schedule, &[model_id].into(), now)?;
         }
         self.schedule.triggered(bank_id, now);
         Ok(())

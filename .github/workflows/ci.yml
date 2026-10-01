@@ -13,6 +13,12 @@ env:
   # Nothing in CI may reach a model host. fastembed and the ONNX models come
   # from the nix store or the repo, never from a download at build or test time.
   HF_HUB_OFFLINE: "1"
+  # The runner ran out of disk linking the test binaries: each statically
+  # links fastembed, ort and tokenizers, and full debug info made them
+  # 150-230 MB apiece. Without it one is about 27 MB. Incremental state is
+  # never reused in CI, so it isn't written.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   check:
@@ -25,14 +31,16 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - name: Cache cargo registry and build output
+      # Only Cargo's downloads are cached. `target` is rebuilt each run: a
+      # restored one brought back every earlier head's artifacts and filled
+      # the disk.
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-

@@ -858,9 +858,13 @@ pub(crate) fn watermark(conn: &Connection, bank_id: i64) -> Result<i64, rusqlite
 }
 
 /// Marks `models` for a refresh. The first trigger since the last refresh
-/// is kept: the debounce caps the wait from it.
+/// is kept: the debounce caps the wait from it. Each request also moves the
+/// model's generation in `schedule`, while the caller holds the store's
+/// connection, so a refresh that started before it can't clear it
+/// ([`Schedule::generation`]).
 pub(crate) fn request(
     conn: &Connection,
+    schedule: &Schedule,
     models: &BTreeSet<i64>,
     now: Timestamp,
 ) -> Result<(), rusqlite::Error> {
@@ -869,6 +873,7 @@ pub(crate) fn request(
          WHERE id = ?1 AND enabled = 1",
     )?;
     for model in models {
+        schedule.requested(*model);
         statement.execute((model, micros(now)))?;
     }
     Ok(())

@@ -14,6 +14,15 @@
 //! the first trigger stands in for the last, and the next sweep is the next
 //! `sweep_time` after the daemon started. Everything runs on the service's
 //! clock.
+//!
+//! A refresh clears the request it ran for, but not one made while it ran:
+//! that write may not be in the inputs it selected. Every request moves the
+//! model's generation, under the store's connection lock, and a refresh
+//! clears the request, under the same lock, only if the generation is the
+//! one it started with. Otherwise the request stays, and the minimum
+//! interval schedules the next refresh. Nothing is cleared and asked for
+//! again, so a restart in between can't lose it, and a refresh in flight
+//! at a restart never cleared anything.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -25,11 +34,12 @@ use jiff::{SignedDuration, Timestamp};
 use super::{MIN_REFRESH_INTERVAL, ModelRow};
 use crate::config::MentalModelsTuning;
 
-/// Each bank's last trigger and last sweep.
+/// Each bank's last trigger and last sweep, and each model's generation.
 #[derive(Debug)]
 pub(crate) struct Schedule {
     started: Timestamp,
     banks: Mutex<HashMap<i64, Bank>>,
+    generations: Mutex<HashMap<i64, u64>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -44,7 +54,21 @@ impl Schedule {
         Self {
             started,
             banks: Mutex::default(),
+            generations: Mutex::default(),
         }
+    }
+
+    /// A refresh of `model` was requested: its generation moves on.
+    pub(crate) fn requested(&self, model: i64) {
+        let mut generations = self.generations.lock().unwrap_or_else(|e| e.into_inner());
+        *generations.entry(model).or_default() += 1;
+    }
+
+    /// The model's generation: how many requests it has had since the
+    /// daemon started. A refresh takes it before it selects its inputs.
+    pub(crate) fn generation(&self, model: i64) -> u64 {
+        let generations = self.generations.lock().unwrap_or_else(|e| e.into_inner());
+        generations.get(&model).copied().unwrap_or_default()
     }
 
     fn with<T>(&self, bank_id: i64, f: impl FnOnce(&mut Bank) -> T) -> T {

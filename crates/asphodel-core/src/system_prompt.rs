@@ -6,6 +6,15 @@
 //! with the build time. Building it costs queries only, never an LLM call,
 //! so the plugin's 2 s fetch never waits on a refresh.
 //!
+//! - **The budget.** The whole text stays within `mental_models.budget`
+//!   tokens, which the agenda and every model share (ADR 0007). The pointer
+//!   line is always there. The agenda is laid out first and whole, and folds
+//!   only when it and the pointer alone are over: undated tasks, then
+//!   routines, least-ranked first, then dated lines in the agenda's fold
+//!   order. The models fill what's left, oldest first, each with its
+//!   entries in stored order until the next doesn't fit. What the block
+//!   lists, cites and keeps by id is only what it rendered.
+//!
 //! - **The cache.** One block per bank, in memory, rebuilt lazily on the
 //!   next fetch once it's cleared. It's cleared when a model completes a
 //!   refresh or is edited, when a memory the agenda would list is written,
@@ -39,10 +48,13 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::agenda::{Agenda, Built};
 use crate::config::Tuning;
 use crate::mental_models::{load_entries, load_models};
 use crate::retrieval::candidates::Cleanup;
+use crate::retrieval::estimate_tokens;
 use crate::retrieval::format;
+use crate::store::strength::world_time;
 use crate::store::{Store, micros, timestamp};
 
 /// One built block. `id` changes exactly when the content is rebuilt.
@@ -144,47 +156,73 @@ pub(crate) fn build(
     let now = store.now();
     let conn = store.connection();
     let agenda = crate::agenda::build(&conn, tuning, bank_id, tz, now)?;
-    let mut sections: Vec<String> = Vec::new();
-
-    let mut lines = Vec::new();
-    if !agenda.dated.is_empty() || agenda.agenda.folded > 0 {
-        lines.push(format!(
-            "Agenda for {}",
-            now.to_zoned(tz.clone()).strftime("%a %-d %b")
-        ));
-        lines.extend(agenda.dated.iter().cloned());
-        if agenda.agenda.folded > 0 {
-            lines.push(format!(
-                "- and {} more dated item{}",
-                agenda.agenda.folded,
-                if agenda.agenda.folded == 1 { "" } else { "s" }
-            ));
+    let budget = tuning.mental_models.budget as usize;
+    let pointer = pointer(now, tz);
+    // The agenda and every enabled model share the budget (ADR 0007), with
+    // the pointer line always kept. Each try lays the sections out as they'd
+    // be rendered and measures the whole text.
+    let fits = |sections: &[String]| -> bool {
+        let mut text = sections.join("\n\n");
+        if !text.is_empty() {
+            text.push_str("\n\n");
         }
-    }
-    if !agenda.routines.is_empty() {
-        lines.push("Routines".to_owned());
-        lines.extend(agenda.routines.iter().cloned());
-    }
-    if !agenda.undated_tasks.is_empty() {
-        lines.push("Open tasks".to_owned());
-        lines.extend(agenda.undated_tasks.iter().cloned());
-    }
-    if !lines.is_empty() {
-        sections.push(lines.join("\n"));
-    }
+        text.push_str(&pointer);
+        estimate_tokens(&text) <= budget
+    };
 
+    // The agenda first, whole when it fits: its dated lines are chosen by
+    // time so an item can't drop out on the day it matters. Only when the
+    // agenda and the pointer alone are over the budget does it fold, the
+    // least-ranked undated task first, then the least-ranked routine, then
+    // dated lines in the agenda's own fold order.
+    let mut shown = Shown {
+        dated: vec![true; agenda.dated.len()],
+        folded: agenda.agenda.folded,
+        routines: agenda.routines.len(),
+        undated_tasks: agenda.undated_tasks.len(),
+    };
+    let mut fold = agenda.dated_fold.iter();
+    let mut agenda_section = shown.section(&agenda, now, tz);
+    while !agenda_section
+        .as_ref()
+        .is_none_or(|section| fits(std::slice::from_ref(section)))
+    {
+        if shown.undated_tasks > 0 {
+            shown.undated_tasks -= 1;
+        } else if shown.routines > 0 {
+            shown.routines -= 1;
+        } else if let Some(position) = fold.next() {
+            shown.dated[*position] = false;
+            shown.folded += 1;
+        } else {
+            break;
+        }
+        agenda_section = shown.section(&agenda, now, tz);
+    }
+    let mut sections: Vec<String> = agenda_section.into_iter().collect();
+
+    // Then each enabled model, oldest first, in what's left: its entries in
+    // stored order until the next one doesn't fit. Only what's rendered is
+    // recorded as cited, and so put in a session's context.
     let mut cited: Vec<Uuid> = Vec::new();
     let mut entries: Vec<BlockEntry> = Vec::new();
     for model in load_models(&conn, bank_id)?
         .into_iter()
         .filter(|model| model.enabled)
     {
-        let mut lines = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
         for entry in load_entries(&conn, model.id)? {
             let Some(line) = entry_line(&conn, tuning, bank_id, now, &entry)? else {
                 continue;
             };
-            lines.push(line);
+            let mut with = lines.clone();
+            with.push(line);
+            let mut tried = sections.clone();
+            tried.push(format!("{}\n{}", model.name, with.join("\n")));
+            if !fits(&tried) {
+                break;
+            }
+            lines = with;
             for (_, uuid) in &entry.cites {
                 if !cited.contains(uuid) {
                     cited.push(*uuid);
@@ -201,13 +239,13 @@ pub(crate) fn build(
             sections.push(format!("{}\n{}", model.name, lines.join("\n")));
         }
     }
-    sections.push(pointer(now, tz));
+    sections.push(pointer);
 
     let block = Block {
         id: store.new_id(),
         built_at: now,
         text: sections.join("\n\n"),
-        agenda: agenda.agenda.listed(),
+        agenda: shown.listed(&agenda.agenda),
         cited,
     };
     // Kept by id, for the plugin that sends it with its first prefetch and
@@ -226,6 +264,70 @@ pub(crate) fn build(
     Ok(block)
 }
 
+/// How much of the agenda the block shows: which dated lines, how many
+/// fold into a count, and how many of the routines and undated tasks, best
+/// first.
+struct Shown {
+    dated: Vec<bool>,
+    folded: usize,
+    routines: usize,
+    undated_tasks: usize,
+}
+
+impl Shown {
+    /// The agenda's section, or `None` when it lists nothing.
+    fn section(&self, agenda: &Built, now: Timestamp, tz: &TimeZone) -> Option<String> {
+        let mut lines = Vec::new();
+        let dated: Vec<&String> = agenda
+            .dated
+            .iter()
+            .zip(&self.dated)
+            .filter_map(|(line, shown)| shown.then_some(line))
+            .collect();
+        if !dated.is_empty() || self.folded > 0 {
+            lines.push(format!(
+                "Agenda for {}",
+                now.to_zoned(tz.clone()).strftime("%a %-d %b")
+            ));
+            lines.extend(dated.into_iter().cloned());
+            if self.folded > 0 {
+                lines.push(format!(
+                    "- and {} more dated item{}",
+                    self.folded,
+                    if self.folded == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        if self.routines > 0 {
+            lines.push("Routines".to_owned());
+            lines.extend(agenda.routines[..self.routines].iter().cloned());
+        }
+        if self.undated_tasks > 0 {
+            lines.push("Open tasks".to_owned());
+            lines.extend(agenda.undated_tasks[..self.undated_tasks].iter().cloned());
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// The memories the section lists, in the order it lists them.
+    fn listed(&self, agenda: &Agenda) -> Vec<Uuid> {
+        agenda
+            .dated
+            .iter()
+            .zip(&self.dated)
+            .filter_map(|(id, shown)| shown.then_some(*id))
+            .chain(agenda.routines.iter().take(self.routines).copied())
+            .chain(
+                agenda
+                    .undated_tasks
+                    .iter()
+                    .take(self.undated_tasks)
+                    .copied(),
+            )
+            .collect()
+    }
+}
+
 /// An entry's line, or `None` when any memory it cites is retracted,
 /// forgotten, ended or gone (decision 6).
 fn entry_line(
@@ -239,15 +341,22 @@ fn entry_line(
         return Ok(None);
     }
     let mut statement = conn.prepare_cached(
-        "SELECT invalidated_at IS NULL AND hidden_at IS NULL AND ended_by IS NULL
-                AND (valid_until IS NULL OR valid_until > ?2)
-         FROM memories WHERE id = ?1",
+        "SELECT m.invalidated_at IS NULL AND m.hidden_at IS NULL, m.valid_until,
+                m.valid_until_precision, s.timezone
+         FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
+         WHERE m.id = ?1",
     )?;
     for (memory, _) in &entry.cites {
-        let current: Option<bool> = statement
-            .query_row((memory, micros(now)), |row| row.get(0))
+        let found: Option<(bool, Option<i64>, Option<String>, String)> = statement
+            .query_row([memory], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .optional()?;
-        if current != Some(true) {
+        let Some((shown, until, precision, timezone)) = found else {
+            return Ok(None);
+        };
+        let tz = TimeZone::get(&timezone).unwrap_or(TimeZone::UTC);
+        if !shown || crate::agenda::has_ended(world_time(until, precision), &tz, now) {
             return Ok(None);
         }
     }

@@ -29,12 +29,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::schedule::Schedule;
 use super::{
     Applied, FailureKind, InputEntry, InputMemory, ModelError, ModelRow, Outcome, REFRESH_TEMPLATE,
     REFRESH_VERSION, RefreshInput, RejectReason, Rejected, StoredEntry, load_entries,
@@ -195,11 +195,18 @@ pub(crate) fn refresh_input(
 /// on the model so the schedule waits before trying again.
 pub(crate) fn refresh(
     cx: &Context<'_>,
+    schedule: &Schedule,
     model: &ModelRow,
     llm: &dyn LlmClient,
     force: bool,
 ) -> Result<Outcome, ModelError> {
-    let started = cx.store.now();
+    // Taken before the inputs are selected: a request made after this may
+    // have written something the selection doesn't hold.
+    let started = Started {
+        schedule,
+        model: model.id,
+        generation: schedule.generation(model.id),
+    };
     // A failed retrieval is a failed refresh like any other: recorded, and
     // tried again once the interval has passed, never on every timer pass.
     let selection = match select(cx, model, true) {
@@ -214,10 +221,9 @@ pub(crate) fn refresh(
         let conn = cx.store.connection();
         conn.execute(
             "UPDATE mental_models SET last_error_kind = NULL, last_error_at = NULL,
-                    refresh_requested_at = CASE WHEN refresh_requested_at > ?2
-                                                THEN refresh_requested_at END
+                    refresh_requested_at = CASE WHEN ?2 THEN NULL ELSE refresh_requested_at END
              WHERE id = ?1",
-            (model.id, micros(started)),
+            (model.id, started.unchanged()),
         )?;
         return Ok(Outcome::Unchanged);
     }
@@ -258,6 +264,23 @@ pub(crate) fn refresh(
     );
     write(cx, model, &selection, &drafts, started)?;
     Ok(Outcome::Applied(applied))
+}
+
+/// The model's generation when a refresh started.
+#[derive(Clone, Copy)]
+struct Started<'a> {
+    schedule: &'a Schedule,
+    model: i64,
+    generation: u64,
+}
+
+impl Started<'_> {
+    /// Whether no request has been made since the refresh started, so it
+    /// may clear the one it ran for. Called while holding the store's
+    /// connection, as every request is made.
+    fn unchanged(&self) -> bool {
+        self.schedule.generation(self.model) == self.generation
+    }
 }
 
 fn failed(cx: &Context<'_>, model: &ModelRow, kind: FailureKind) -> Result<Outcome, ModelError> {
@@ -527,7 +550,7 @@ fn write(
     model: &ModelRow,
     selection: &Selection,
     drafts: &[Draft],
-    started: Timestamp,
+    started: Started<'_>,
 ) -> Result<(), ModelError> {
     let now = micros(cx.store.now());
     let mut conn = cx.store.connection();
@@ -584,11 +607,15 @@ fn write(
     tx.execute(
         "UPDATE mental_models SET last_fingerprint = ?2, last_refreshed_at = ?3,
                 last_error_kind = NULL, last_error_at = NULL,
-                refresh_requested_at = CASE WHEN refresh_requested_at > ?4
-                                            THEN refresh_requested_at END,
+                refresh_requested_at = CASE WHEN ?4 THEN NULL ELSE refresh_requested_at END,
                 updated_at = ?3
          WHERE id = ?1",
-        (model.id, &selection.input.fingerprint, now, micros(started)),
+        (
+            model.id,
+            &selection.input.fingerprint,
+            now,
+            started.unchanged(),
+        ),
     )?;
     tx.commit()?;
     Ok(())

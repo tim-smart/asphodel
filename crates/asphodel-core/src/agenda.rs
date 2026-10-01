@@ -19,7 +19,8 @@
 //!   same way, at most `agenda.undated_tasks`.
 //!
 //! Only current heads count: nothing retracted, forgotten, refined into a
-//! newer version, or ended. Building it never writes an access, and its
+//! newer version, or ended ([`has_ended`]: a stated end holds through its
+//! unit, and an ending still ahead hasn't ended anything). Building it never writes an access, and its
 //! items count as in context once a session's block lists them.
 
 use chrono::TimeZone as _;
@@ -34,9 +35,9 @@ use crate::config::Tuning;
 use crate::constants::TAU;
 use crate::retrieval::candidates::Cleanup;
 use crate::retrieval::format;
-use crate::store::strength::{StrengthLoader, memory_kind, significance_value};
+use crate::store::strength::{StrengthLoader, memory_kind, significance_value, world_time};
 use crate::store::timestamp;
-use crate::strength::Kind;
+use crate::strength::{Kind, WorldTime, unit_end};
 
 /// The bank's agenda now.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -61,12 +62,27 @@ impl Agenda {
     }
 }
 
-/// The agenda with each group's rendered lines, for the block.
+/// The agenda with each group's rendered lines, for the block. The lines
+/// are in the same order as the agenda's ids.
 pub(crate) struct Built {
     pub agenda: Agenda,
     pub dated: Vec<String>,
     pub routines: Vec<String>,
     pub undated_tasks: Vec<String>,
+    /// Indexes into `dated`, in the order they'd fold next: faded first,
+    /// then the least significant, then the furthest from today. The block
+    /// folds in this order when the agenda alone is over its budget.
+    pub dated_fold: Vec<usize>,
+}
+
+/// Whether a memory's stated end has passed: the end of `valid_until`'s
+/// unit, in its source's timezone, as `Window::closes_at` has it. A stored
+/// time is the start of its unit, so an end of 1 October holds through 1
+/// October. A memory with no stated end hasn't ended, whatever else it has
+/// (a point event in the past is past, not ended), and neither has one
+/// whose recorded ending is still ahead.
+pub(crate) fn has_ended(valid_until: Option<WorldTime>, tz: &TimeZone, now: Timestamp) -> bool {
+    valid_until.is_some_and(|until| unit_end(until, tz) <= now)
 }
 
 struct Row {
@@ -75,7 +91,7 @@ struct Row {
     kind: Kind,
     level: f64,
     valid_from: Option<Timestamp>,
-    valid_until: Option<Timestamp>,
+    valid_until: Option<WorldTime>,
     due_at: Option<Timestamp>,
     rrule: Option<String>,
     recurrence_start: Option<Timestamp>,
@@ -116,6 +132,10 @@ pub(crate) fn build(
     let mut routines: Vec<usize> = Vec::new();
     let mut undated: Vec<usize> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
+        let source_tz = TimeZone::get(&row.timezone).unwrap_or(TimeZone::UTC);
+        if has_ended(row.valid_until, &source_tz, now) {
+            continue;
+        }
         match row.kind {
             Kind::Event => {
                 if let Some(from) = row.valid_from {
@@ -129,28 +149,20 @@ pub(crate) fn build(
                     }
                 }
             }
-            Kind::Task => {
-                if row.valid_until.is_some_and(|until| until <= now) {
-                    continue;
-                }
-                match row.due_at {
-                    Some(due) => {
-                        let date = local(due);
-                        if overdue_from <= date && date <= horizon {
-                            dated.push(Dated {
-                                row: index,
-                                at: due,
-                                date,
-                            });
-                        }
+            Kind::Task => match row.due_at {
+                Some(due) => {
+                    let date = local(due);
+                    if overdue_from <= date && date <= horizon {
+                        dated.push(Dated {
+                            row: index,
+                            at: due,
+                            date,
+                        });
                     }
-                    None => undated.push(index),
                 }
-            }
+                None => undated.push(index),
+            },
             Kind::Recurring => {
-                if row.valid_until.is_some_and(|until| until <= now) {
-                    continue;
-                }
                 let long = row
                     .rrule
                     .as_deref()
@@ -180,31 +192,33 @@ pub(crate) fn build(
         |row: &Row| -> Result<f64, rusqlite::Error> { Ok(loader.strength(conn, row.id)?.value) };
 
     dated.sort_by(|a, b| a.at.cmp(&b.at).then(rows[a.row].id.cmp(&rows[b.row].id)));
-    let cap = settings.dated_lines as usize;
-    let mut folded = 0;
-    if dated.len() > cap {
-        // Fold faded items first, then the least significant, then the
-        // furthest from today.
-        let mut order: Vec<(bool, f64, i64, usize)> = Vec::with_capacity(dated.len());
-        for (position, item) in dated.iter().enumerate() {
-            let row = &rows[item.row];
-            let distance = i64::from((item.date - today).get_days().abs());
-            order.push((strength(row)? >= TAU, row.level, -distance, position));
-        }
-        order.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then(a.1.total_cmp(&b.1))
-                .then(a.2.cmp(&b.2))
-                .then(b.3.cmp(&a.3))
-        });
-        let excess = dated.len() - cap;
-        let mut fold: Vec<usize> = order.iter().take(excess).map(|item| item.3).collect();
-        fold.sort_unstable();
-        for position in fold.into_iter().rev() {
-            dated.remove(position);
-        }
-        folded = excess;
+    // Fold faded items first, then the least significant, then the furthest
+    // from today.
+    let mut order: Vec<(bool, f64, i64, usize)> = Vec::with_capacity(dated.len());
+    for (position, item) in dated.iter().enumerate() {
+        let row = &rows[item.row];
+        let distance = i64::from((item.date - today).get_days().abs());
+        order.push((strength(row)? >= TAU, row.level, -distance, position));
     }
+    order.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.total_cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+            .then(b.3.cmp(&a.3))
+    });
+    let order: Vec<usize> = order.into_iter().map(|item| item.3).collect();
+    let excess = dated.len().saturating_sub(settings.dated_lines as usize);
+    let folded = excess;
+    let mut fold: Vec<usize> = order[..excess].to_vec();
+    fold.sort_unstable();
+    for position in fold.iter().rev() {
+        dated.remove(*position);
+    }
+    // Where each remaining item now sits, in the order it would fold next.
+    let dated_fold: Vec<usize> = order[excess..]
+        .iter()
+        .map(|position| position - fold.iter().filter(|folded| *folded < position).count())
+        .collect();
 
     let ranked = |indices: Vec<usize>, cap: u32| -> Result<Vec<usize>, rusqlite::Error> {
         let mut gated = Vec::new();
@@ -245,6 +259,7 @@ pub(crate) fn build(
             .collect()
     };
     let built = Built {
+        dated_fold,
         dated: lines(&dated),
         routines: lines(&routines),
         undated_tasks: lines(&undated),
@@ -262,11 +277,11 @@ fn rows(conn: &Connection, bank_id: i64) -> Result<Vec<Row>, rusqlite::Error> {
     let mut statement = conn.prepare_cached(
         "SELECT m.id, m.uuid, m.kind, COALESCE(m.owner_significance, m.significance),
                 m.valid_from, m.valid_until, m.due_at, m.recurrence_rrule, m.recurrence_start,
-                s.timezone
+                s.timezone, m.valid_until_precision
          FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
          WHERE m.bank_id = ?1 AND m.kind IN ('event', 'task', 'recurring')
            AND m.invalidated_at IS NULL AND m.hidden_at IS NULL
-           AND m.superseded_by IS NULL AND m.ended_by IS NULL
+           AND m.superseded_by IS NULL
          ORDER BY m.id",
     )?;
     statement
@@ -280,7 +295,7 @@ fn rows(conn: &Connection, bank_id: i64) -> Result<Vec<Row>, rusqlite::Error> {
                 kind: memory_kind(&kind).unwrap_or(Kind::Fact),
                 level: significance_value(&level),
                 valid_from: row.get::<_, Option<i64>>(4)?.map(timestamp),
-                valid_until: row.get::<_, Option<i64>>(5)?.map(timestamp),
+                valid_until: world_time(row.get(5)?, row.get(10)?),
                 due_at: row.get::<_, Option<i64>>(6)?.map(timestamp),
                 rrule: row.get(7)?,
                 recurrence_start: row.get::<_, Option<i64>>(8)?.map(timestamp),
