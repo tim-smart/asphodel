@@ -453,7 +453,6 @@ fn a_data_dir_that_is_a_regular_file_is_refused_and_preserved() {
 }
 
 #[test]
-#[ignore = "housekeeping only polls hourly; activate with the TIM-103 deadline wake"]
 fn a_pre_migration_copy_is_deleted_at_its_deadline_while_the_daemon_runs() {
     // ADR 0010: the copy is deleted 7 days after its migration completes,
     // and forget reaches it within 7 days. A daemon started just before

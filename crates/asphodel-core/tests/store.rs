@@ -926,15 +926,22 @@ fn check_housekeeping_expiry(paused: bool) {
         (copy, incomplete)
     };
     let service = Service::open(clock.clone(), store, tuning);
-    assert!(service.housekeeping().unwrap().copies_removed.is_empty());
+    let deadline = clock
+        .now()
+        .checked_add(migrations::PRE_MIGRATION_COPY_TTL)
+        .unwrap();
+    let upkeep = service.housekeeping().unwrap();
+    assert!(upkeep.copies_removed.is_empty());
+    assert_eq!(upkeep.next_due, Some(deadline));
     clock.advance(SignedDuration::from_hours(7 * 24) - SignedDuration::from_micros(1));
-    assert!(service.housekeeping().unwrap().copies_removed.is_empty());
+    let upkeep = service.housekeeping().unwrap();
+    assert!(upkeep.copies_removed.is_empty());
+    assert_eq!(upkeep.next_due, Some(deadline));
     assert!(copy.exists(), "expired before completion plus seven days");
     clock.advance(SignedDuration::from_micros(1));
-    assert_eq!(
-        service.housekeeping().unwrap().copies_removed,
-        std::slice::from_ref(&copy)
-    );
+    let upkeep = service.housekeeping().unwrap();
+    assert_eq!(upkeep.copies_removed, std::slice::from_ref(&copy));
+    assert_eq!(upkeep.next_due, None);
     assert!(
         !copy.exists(),
         "housekeeping needed a restart to expire the copy"
@@ -943,7 +950,12 @@ fn check_housekeeping_expiry(paused: bool) {
         incomplete.exists(),
         "removed a copy without a completed migration"
     );
-    assert!(service.housekeeping().unwrap().copies_removed.is_empty());
+    let upkeep = service.housekeeping().unwrap();
+    assert!(upkeep.copies_removed.is_empty());
+    assert_eq!(
+        upkeep.next_due, None,
+        "an incomplete migration has no deadline"
+    );
     assert_eq!(
         service
             .store()
@@ -963,6 +975,96 @@ fn housekeeping_expires_copies_on_the_simulated_clock_without_restarting() {
 #[test]
 fn housekeeping_expires_copies_even_while_purge_is_paused() {
     check_housekeeping_expiry(true);
+}
+
+#[test]
+fn housekeeping_has_no_deadline_without_a_copy() {
+    let dir = TestDir::new();
+    let service = service(&dir);
+    let upkeep = service.housekeeping().unwrap();
+    assert!(upkeep.copies_removed.is_empty());
+    assert_eq!(upkeep.next_due, None);
+    assert_eq!(service.store().unwrap().next_copy_expiry().unwrap(), None);
+}
+
+// Only the initial migration exists today. These rows model later completed
+// migrations without changing the live schema, just as the expiry tests do.
+fn completed_copy(store: &Store, from: u32, completed: Timestamp) -> PathBuf {
+    let conn = store.connection();
+    let copy = migrations::take_copy(&conn, store.dir(), from).unwrap();
+    conn.execute(
+        "INSERT INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
+         VALUES (?1, ?2, 'test', ?3, ?3)",
+        (from, from + 1, micros(completed)),
+    )
+    .unwrap();
+    copy
+}
+
+#[test]
+fn housekeeping_ignores_a_missing_copy_even_after_its_deadline() {
+    let dir = TestDir::new();
+    let clock = clock();
+    let store = open(&dir.data(), clock.clone());
+    let copy = completed_copy(&store, 1, clock.now());
+    let deadline = clock
+        .now()
+        .checked_add(migrations::PRE_MIGRATION_COPY_TTL)
+        .unwrap();
+    let service = Service::open(clock.clone(), store, Tuning::default());
+    assert_eq!(service.housekeeping().unwrap().next_due, Some(deadline));
+    std::fs::remove_file(copy).unwrap();
+    for advance in [SignedDuration::ZERO, migrations::PRE_MIGRATION_COPY_TTL] {
+        clock.advance(advance);
+        let upkeep = service.housekeeping().unwrap();
+        assert!(upkeep.copies_removed.is_empty());
+        assert_eq!(upkeep.next_due, None);
+        assert_eq!(service.store().unwrap().next_copy_expiry().unwrap(), None);
+    }
+}
+
+#[test]
+fn housekeeping_selects_the_earliest_existing_copy_deadline() {
+    let dir = TestDir::new();
+    let clock = clock();
+    let store = open(&dir.data(), clock.clone());
+    // Reverse completion order relative to version order to catch selecting
+    // the first row rather than the minimum deadline.
+    let later_completion = start().checked_add(SignedDuration::from_hours(2)).unwrap();
+    let later = completed_copy(&store, 1, later_completion);
+    let earlier = completed_copy(&store, 2, start());
+    let missing = completed_copy(
+        &store,
+        3,
+        start().checked_sub(SignedDuration::from_hours(1)).unwrap(),
+    );
+    std::fs::remove_file(missing).unwrap();
+    let earlier_deadline = start()
+        .checked_add(migrations::PRE_MIGRATION_COPY_TTL)
+        .unwrap();
+    let later_deadline = later_completion
+        .checked_add(migrations::PRE_MIGRATION_COPY_TTL)
+        .unwrap();
+    let service = Service::open(clock.clone(), store, Tuning::default());
+
+    let upkeep = service.housekeeping().unwrap();
+    assert!(upkeep.copies_removed.is_empty());
+    assert_eq!(upkeep.next_due, Some(earlier_deadline));
+    assert_eq!(
+        service.store().unwrap().next_copy_expiry().unwrap(),
+        Some(earlier_deadline)
+    );
+    clock.advance(migrations::PRE_MIGRATION_COPY_TTL);
+    let upkeep = service.housekeeping().unwrap();
+    assert_eq!(upkeep.copies_removed, std::slice::from_ref(&earlier));
+    assert!(!earlier.exists());
+    assert!(later.exists());
+    assert_eq!(upkeep.next_due, Some(later_deadline));
+    clock.advance(SignedDuration::from_hours(2));
+    let upkeep = service.housekeeping().unwrap();
+    assert_eq!(upkeep.copies_removed, std::slice::from_ref(&later));
+    assert!(!later.exists());
+    assert_eq!(upkeep.next_due, None);
 }
 
 #[test]
