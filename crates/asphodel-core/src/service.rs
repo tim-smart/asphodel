@@ -17,29 +17,18 @@ use crate::store::{Store, StoreError};
 /// One running store: the daemon's banks, models and jobs, driven by a clock.
 ///
 /// Later stages add the models and the extraction queue behind this type.
-/// `serve` always builds it on a store; [`Service::new`] still builds one
-/// without, where nothing is persisted and bank calls fail.
 pub struct Service {
     clock: Arc<dyn Clock>,
-    store: Option<Store>,
+    store: Store,
     tuning: Tuning,
 }
 
 impl Service {
-    /// Builds a service on the given clock and no store.
-    pub fn new(clock: Arc<dyn Clock>) -> Self {
-        Self {
-            clock,
-            store: None,
-            tuning: Tuning::default(),
-        }
-    }
-
     /// Builds a service on an open store and the tuning it runs under.
     pub fn open(clock: Arc<dyn Clock>, store: Store, tuning: Tuning) -> Self {
         Self {
             clock,
-            store: Some(store),
+            store,
             tuning,
         }
     }
@@ -54,9 +43,10 @@ impl Service {
         self.clock.now()
     }
 
-    /// The store, when the service has one.
+    /// The store this service runs on. Always returns `Some`; the optional
+    /// return type is retained for compatibility with existing callers.
     pub fn store(&self) -> Option<&Store> {
-        self.store.as_ref()
+        Some(&self.store)
     }
 
     /// The tuning the service runs under.
@@ -71,9 +61,8 @@ impl Service {
         identity: &BankIdentity,
         models: &ModelIds,
     ) -> Result<Bank, BankError> {
-        let store = self.store.as_ref().ok_or(BankError::NoStore)?;
         crate::store::bank::ensure(
-            store,
+            &self.store,
             name,
             identity,
             models,
@@ -87,10 +76,7 @@ impl Service {
     /// paused: deleting an expired pre-migration copy is ADR 0010's bound on
     /// how long forgotten content survives, not a purge.
     pub fn housekeeping(&self) -> Result<Housekeeping, StoreError> {
-        let copies_removed = match &self.store {
-            Some(store) => store.expire_copies()?,
-            None => Vec::new(),
-        };
+        let copies_removed = self.store.expire_copies()?;
         Ok(Housekeeping { copies_removed })
     }
 

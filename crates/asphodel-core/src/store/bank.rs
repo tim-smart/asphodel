@@ -73,9 +73,6 @@ pub enum BankError {
     #[error("unknown timezone")]
     InvalidTimezone,
 
-    #[error("the service has no store")]
-    NoStore,
-
     #[error(transparent)]
     Store(#[from] StoreError),
 }
