@@ -3357,6 +3357,59 @@ fn aliases_match_with_or_without_diacritics() {
     );
 }
 
+/// The entities found as candidates when `main` has an entity per alias and
+/// the owner says `message`. Each alias is its entity's name and only alias.
+fn candidates_for(aliases: &[&str], message: &str) -> (Vec<Uuid>, BTreeSet<Uuid>) {
+    let h = Harness::new();
+    let entities: Vec<Uuid> = aliases
+        .iter()
+        .map(|alias| h.insert_entity("main", alias, "person", &[alias]))
+        .collect();
+    ingest(&h, &turn("s1", T1, message, "Lovely."));
+    let found = found(&h, &input(&h, "main", &[]));
+    (entities, found)
+}
+
+#[test]
+#[ignore = "TIM-107 re-review finding (normalization); activate with its fix"]
+fn a_decomposed_name_matches_a_precomposed_alias() {
+    // "Luci\u{301}a" is "Lucía" with a combining acute: the same name, which
+    // the alias FTS indexes as "lucia" either way.
+    let (entities, found) = candidates_for(&["Lucía"], "Luci\u{301}a called.");
+    assert_eq!(found, BTreeSet::from([entities[0]]));
+}
+
+#[test]
+#[ignore = "TIM-107 re-review finding (normalization); activate with its fix"]
+fn a_precomposed_name_matches_a_decomposed_alias() {
+    let (entities, found) = candidates_for(&["Luci\u{301}a"], "Lucía called.");
+    assert_eq!(found, BTreeSet::from([entities[0]]));
+}
+
+#[test]
+#[ignore = "TIM-107 re-review finding (normalization); activate with its fix"]
+fn an_accented_greek_name_matches_itself() {
+    // The FTS keeps Greek accents, so an identical name must still match.
+    let (entities, found) = candidates_for(&["Νίκος"], "Ο Νίκος ήρθε.");
+    assert_eq!(found, BTreeSet::from([entities[0]]));
+}
+
+#[test]
+#[ignore = "TIM-107 re-review finding (normalization); activate with its fix"]
+fn a_devanagari_name_matches_itself() {
+    // A vowel sign is a combining mark, and part of the name.
+    let (entities, found) = candidates_for(&["किरण"], "किरण आया।");
+    assert_eq!(found, BTreeSet::from([entities[0]]));
+}
+
+#[test]
+fn accents_outside_latin_and_letters_like_o_slash_stay_distinct() {
+    // The FTS folds Latin diacritics only. A Greek accent and "ø" are part of
+    // the letter, so these are different names, as the FTS has them.
+    let (_, found) = candidates_for(&["Νίκος", "Søren"], "Νικος and Soren came.");
+    assert!(found.is_empty(), "{found:?}");
+}
+
 #[test]
 fn times_in_a_daylight_saving_gap_or_fold_resolve_compatibly() {
     let h = Harness::new();
