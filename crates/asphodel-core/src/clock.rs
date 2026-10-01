@@ -86,3 +86,93 @@ impl fmt::Debug for SimulatedClock {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::panic::catch_unwind;
+
+    use super::*;
+
+    fn start() -> Timestamp {
+        "2026-01-01T00:00:00.123456789Z".parse().unwrap()
+    }
+
+    #[test]
+    fn reads_stay_at_the_supplied_time() {
+        let first = SimulatedClock::new(start());
+        let second = SimulatedClock::new(start());
+        let clocks: [&dyn Clock; 2] = [&first, &second];
+
+        for _ in 0..100 {
+            for clock in clocks {
+                assert_eq!(clock.now(), start());
+            }
+        }
+    }
+
+    #[test]
+    fn advance_accumulates_exact_durations() {
+        let clock = SimulatedClock::new(start());
+        clock.advance(SignedDuration::from_secs(60));
+        assert_eq!(
+            clock.now(),
+            "2026-01-01T00:01:00.123456789Z".parse().unwrap()
+        );
+
+        clock.advance(SignedDuration::from_nanos(1));
+        assert_eq!(
+            clock.now(),
+            "2026-01-01T00:01:00.123456790Z".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn set_moves_forward_and_advance_uses_the_new_time() {
+        let clock = SimulatedClock::new(start());
+        let later = "2026-02-01T12:00:00Z".parse().unwrap();
+        clock.set(later);
+        assert_eq!(clock.now(), later);
+
+        clock.advance(SignedDuration::from_secs(1));
+        assert_eq!(clock.now(), "2026-02-01T12:00:01Z".parse().unwrap());
+    }
+
+    #[test]
+    fn zero_advance_and_equal_set_leave_time_unchanged() {
+        let clock = SimulatedClock::new(start());
+        clock.advance(SignedDuration::ZERO);
+        assert_eq!(clock.now(), start());
+        clock.set(start());
+        assert_eq!(clock.now(), start());
+    }
+
+    #[test]
+    fn negative_advance_panics_without_changing_time() {
+        let clock = SimulatedClock::new(start());
+        assert!(catch_unwind(|| clock.advance(SignedDuration::from_nanos(-1))).is_err());
+        assert_eq!(clock.now(), start());
+
+        clock.advance(SignedDuration::from_secs(1));
+        assert_eq!(
+            clock.now(),
+            "2026-01-01T00:00:01.123456789Z".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn backward_set_panics_without_changing_time() {
+        let clock = SimulatedClock::new(start());
+        let earlier = "2026-01-01T00:00:00.123456788Z".parse().unwrap();
+        assert!(catch_unwind(|| clock.set(earlier)).is_err());
+        assert_eq!(clock.now(), start());
+
+        let later = "2026-01-01T00:00:00.123456790Z".parse().unwrap();
+        clock.set(later);
+        assert_eq!(clock.now(), later);
+        clock.advance(SignedDuration::from_nanos(1));
+        assert_eq!(
+            clock.now(),
+            "2026-01-01T00:00:00.123456791Z".parse().unwrap()
+        );
+    }
+}
