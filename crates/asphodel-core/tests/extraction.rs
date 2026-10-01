@@ -27,6 +27,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use asphodel_core::Service;
 use asphodel_core::clock::{Clock, SimulatedClock};
@@ -34,7 +35,8 @@ use asphodel_core::config::Tuning;
 use asphodel_core::constants::{CHUNK_RETRY_CAP, SIGNIFICANCE_KEPT, Significance};
 use asphodel_core::ingest::{Document, Ingested, Turn, TurnAuthor};
 use asphodel_core::models::{
-    Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmError, ModelError, Models, Template,
+    Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest, LlmResponse,
+    ModelError, Models, Template,
 };
 use asphodel_core::queue::{Failure, Lease, SourceKind};
 use asphodel_core::store::{OpenOptions, Store, micros, timestamp};
@@ -179,6 +181,21 @@ impl Harness {
         service
             .ensure_bank_with_models("other", &identity())
             .unwrap();
+        Self {
+            service,
+            clock,
+            _dir: dir,
+        }
+    }
+
+    /// A service built without models, as `Service::open` gives.
+    fn without_models() -> Self {
+        let dir = TestDir::new();
+        let clock = Arc::new(SimulatedClock::new(at(START)));
+        let store = Store::open(&dir.data(), OpenOptions::default(), clock.clone()).unwrap();
+        let service = Service::open(clock.clone(), store, tuning_for_fakes());
+        let ids = Models::fake().ids();
+        service.ensure_bank("main", &identity(), &ids).unwrap();
         Self {
             service,
             clock,
@@ -445,6 +462,18 @@ impl Harness {
     /// A fact in `bank` with one `created` access at turn 0, inserted
     /// directly, as an earlier extraction would have left it.
     fn insert_memory(&self, bank: &str, content: &str, significance: &str) -> Uuid {
+        self.insert_memory_of_kind(bank, content, "fact", significance)
+    }
+
+    /// [`Harness::insert_memory`] of any kind. A kind never changes once
+    /// stored, so it's chosen here.
+    fn insert_memory_of_kind(
+        &self,
+        bank: &str,
+        content: &str,
+        kind: &str,
+        significance: &str,
+    ) -> Uuid {
         let chunk = self.fixture_chunk(bank);
         let uuid = next_uuid();
         let now = micros(self.now());
@@ -452,11 +481,12 @@ impl Harness {
             "INSERT INTO memories (uuid, bank_id, content, kind, significance, chunk_id,
                                    source_start, source_end, observed_at, window_confidence,
                                    created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'fact', ?4, ?5, 0, 9, ?6, 'high', ?6, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 9, ?7, 'high', ?7, ?7)",
             (
                 uuid.to_string(),
                 self.bank_id(bank),
                 content,
+                kind,
                 significance,
                 chunk,
                 now,
@@ -476,6 +506,16 @@ impl Harness {
             "INSERT INTO accesses (bank_id, memory_id, kind, at, turn)
              SELECT bank_id, id, ?2, ?3, ?4 FROM memories WHERE uuid = ?1",
             (memory.to_string(), kind, micros(self.now()), turn),
+        );
+    }
+
+    /// An access on `memory` at `turn` and world time `at`, inserted
+    /// directly.
+    fn insert_access_at(&self, memory: Uuid, kind: &str, turn: i64, at: Timestamp) {
+        self.execute(
+            "INSERT INTO accesses (bank_id, memory_id, kind, at, turn)
+             SELECT bank_id, id, ?2, ?3, ?4 FROM memories WHERE uuid = ?1",
+            (memory.to_string(), kind, micros(at), turn),
         );
     }
 
@@ -2510,15 +2550,17 @@ fn a_new_entity_beside_one_call_1_saw_is_a_second_entity() {
 }
 
 #[test]
-fn a_new_entity_named_like_one_call_1_didnt_see_links_to_it() {
+#[ignore = "TIM-107 review finding (proposed entities); activate with its fix"]
+fn a_proposed_entity_never_reuses_one_that_existed_before_call_1() {
     let h = Harness::new();
     let (entities, message) = crowded(&h);
     ingest(&h, &turn("s1", T1, &message, "Quite a list."));
     let input = input(&h, "main", &[]);
     assert!(!found(&h, &input).contains(&entities[0]));
 
-    // Name00 missed the cap, so call 1 proposed it as new. Code repeats the
-    // exact alias lookup at commit and links the existing entity.
+    // Name00 missed the cap, so call 1 never compared it and proposed a new
+    // entity. TIM-92 reuses only an entity created after call 1 ran, so this
+    // is a second Name00, not the one call 1 never saw.
     let extracted = extract(
         &h,
         reply(
@@ -2529,11 +2571,69 @@ fn a_new_entity_named_like_one_call_1_didnt_see_links_to_it() {
             &[],
         ),
     );
-    assert!(extracted.entities_created.is_empty());
-    assert_eq!(h.entities_named("main", "Name00"), vec![entities[0]]);
+    let named = h.entities_named("main", "Name00");
+    assert_eq!(named.len(), 2);
+    assert_eq!(named[0], entities[0]);
+    assert_eq!(extracted.entities_created, vec![named[1]]);
     assert_eq!(
         h.links(extracted.memories[0]),
-        BTreeSet::from([(entities[0], Some("Name00".into()))])
+        BTreeSet::from([(named[1], Some("Name00".into()))])
+    );
+}
+
+/// Call 1 answering `reply`, running `during` while the call is in flight,
+/// as another writer to the bank would.
+struct Meanwhile<'a> {
+    h: &'a Harness,
+    during: fn(&Harness),
+    reply: Value,
+}
+
+impl LlmClient for Meanwhile<'_> {
+    fn model(&self) -> &str {
+        MODEL
+    }
+
+    fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        (self.during)(self.h);
+        Ok(LlmResponse {
+            json: self.reply.clone(),
+            usage: None,
+            latency: Duration::ZERO,
+        })
+    }
+}
+
+#[test]
+fn a_proposed_entity_reuses_one_created_while_call_1_ran() {
+    let h = Harness::new();
+    ingest(&h, &turn("s1", T1, "Lisbon was hot.", "Sounds warm."));
+    let llm = Meanwhile {
+        h: &h,
+        during: |h| {
+            h.insert_entity("main", "Lisbon", "place", &["Lisbon"]);
+        },
+        reply: reply(
+            vec![
+                claim("Lisbon was hot.", "event", "Lisbon was hot")
+                    .with("entities", json!([new_entity("Lisbon", "place", "Lisbon")])),
+            ],
+            &[],
+        ),
+    };
+    let extracted = h
+        .service
+        .extract_chunk(lease(&h, "main"), &llm, &[])
+        .unwrap();
+
+    // TIM-92: code repeats the exact alias lookup at commit and links the
+    // entity created after call 1 ran, rather than a duplicate.
+    let lisbon = h.entities_named("main", "Lisbon");
+    assert_eq!(lisbon.len(), 1);
+    assert!(extracted.entities_created.is_empty());
+    assert_eq!(
+        h.links(extracted.memories[0]),
+        BTreeSet::from([(lisbon[0], Some("Lisbon".into()))])
     );
 }
 
@@ -2986,4 +3086,511 @@ fn an_embedding_failure_writes_nothing() {
     );
     assert_eq!(h.chunk_column::<Option<i64>>(chunk, "extracted_at"), None);
     assert_eq!(h.service.queue_depth("main").unwrap(), 1);
+}
+
+// The TIM-107 review. Findings that fail against the current implementation
+// are ignored until their fixes land; the rest pin guarantees the review
+// found untested.
+
+/// Ana with three fresh memories linked, at major, notable and minor.
+fn ana_with_memories(h: &Harness) -> Uuid {
+    let ana = h.insert_entity("main", "Ana", "person", &["Ana"]);
+    for (content, level) in [
+        ("Ana is a nurse.", "major"),
+        ("Ana lives in Wellington.", "notable"),
+        ("Ana likes jazz.", "minor"),
+    ] {
+        let memory = h.insert_memory("main", content, level);
+        h.link(memory, ana);
+    }
+    ana
+}
+
+fn candidate_memories(h: &Harness, entity: Uuid) -> Vec<String> {
+    let input = input(h, "main", &[]);
+    input
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.entity == entity)
+        .expect("a candidate")
+        .memories
+}
+
+#[test]
+#[ignore = "TIM-107 review finding (candidate strength); activate with its fix"]
+fn inherited_accesses_rank_a_candidates_memories() {
+    let h = Harness::new();
+    let ana = ana_with_memories(&h);
+    // A trivial correction that inherits a well-used predecessor's accesses
+    // along superseded_by (TIM-91, decision 3). On its own accesses it would
+    // rank last.
+    let surname = h.insert_memory("main", "Ana's surname is Ngata.", "trivial");
+    h.link(surname, ana);
+    let predecessor = h.insert_memory("main", "Ana's surname is Ngati.", "minor");
+    for (turn, days) in [(1, 30), (2, 20), (3, 10), (4, 5)] {
+        let at = h
+            .now()
+            .checked_sub(SignedDuration::from_hours(24 * days))
+            .unwrap();
+        h.insert_access_at(predecessor, "confirmed", turn, at);
+    }
+    h.execute(
+        "UPDATE memories SET superseded_by = (SELECT id FROM memories WHERE uuid = ?2)
+         WHERE uuid = ?1",
+        (predecessor.to_string(), surname.to_string()),
+    );
+    ingest(&h, &turn("s1", T1, "Ana called.", "How is she?"));
+
+    let memories = candidate_memories(&h, ana);
+    assert_eq!(memories.len(), CANDIDATE_MEMORIES);
+    assert_eq!(memories[0], "Ana's surname is Ngata.");
+    assert!(!memories.contains(&"Ana likes jazz.".to_string()));
+}
+
+#[test]
+#[ignore = "TIM-107 review finding (candidate strength); activate with its fix"]
+fn a_closed_window_ranks_a_candidates_memories() {
+    let h = Harness::new();
+    let ana = h.insert_entity("main", "Ana", "person", &["Ana"]);
+    for (content, level) in [
+        ("Ana likes jazz.", "minor"),
+        ("Ana drinks tea.", "trivial"),
+        ("Ana has a cat.", "trivial"),
+    ] {
+        let memory = h.insert_memory("main", content, level);
+        h.link(memory, ana);
+    }
+    // An event said 400 days ago that ended three days ago. Its window's
+    // close restarts recent use (ADR 0003), which lifts it above the fresh
+    // minor and trivial memories; on its old created access alone it would
+    // rank last.
+    let exhibition = h.insert_memory_of_kind(
+        "main",
+        "Ana's exhibition ran until 28 September 2026.",
+        "event",
+        "critical",
+    );
+    h.link(exhibition, ana);
+    let said = h
+        .now()
+        .checked_sub(SignedDuration::from_hours(24 * 400))
+        .unwrap();
+    h.execute(
+        "UPDATE memories SET observed_at = ?2, valid_until = ?3, valid_until_precision = 'day'
+         WHERE uuid = ?1",
+        (
+            exhibition.to_string(),
+            micros(said),
+            micros(local("2026-09-28T00:00")),
+        ),
+    );
+    h.execute(
+        "UPDATE accesses SET at = ?2
+         WHERE memory_id = (SELECT id FROM memories WHERE uuid = ?1)",
+        (exhibition.to_string(), micros(said)),
+    );
+    ingest(&h, &turn("s1", T1, "Ana called.", "How is she?"));
+
+    let memories = candidate_memories(&h, ana);
+    assert_eq!(memories.len(), CANDIDATE_MEMORIES);
+    assert_eq!(memories[0], "Ana's exhibition ran until 28 September 2026.");
+}
+
+#[test]
+fn retracted_memories_are_not_candidate_examples() {
+    let h = Harness::new();
+    let ana = h.insert_entity("main", "Ana", "person", &["Ana"]);
+    let nurse = h.insert_memory("main", "Ana is a nurse.", "major");
+    let doctor = h.insert_memory("main", "Ana is a doctor.", "minor");
+    h.link(nurse, ana);
+    h.link(doctor, ana);
+    h.execute(
+        "UPDATE memories SET invalidated_at = ?2,
+                             superseded_by = (SELECT id FROM memories WHERE uuid = ?3)
+         WHERE uuid = ?1",
+        (nurse.to_string(), micros(h.now()), doctor.to_string()),
+    );
+    ingest(&h, &turn("s1", T1, "Ana called.", "How is she?"));
+    assert_eq!(
+        candidate_memories(&h, ana),
+        vec!["Ana is a doctor.".to_string()]
+    );
+}
+
+#[test]
+#[ignore = "TIM-107 review finding (repeated quotes); activate with its fix"]
+fn remember_this_on_a_quote_the_reply_repeats_is_not_kept() {
+    let h = Harness::new();
+    // The owner asks about the sentence and the reply repeats it with
+    // "remember this". The quote's first occurrence is in the owner's
+    // message, but the claim can't be shown to come from it, so it isn't
+    // kept (TIM-92 other decision 3).
+    let memories = golden(
+        &h,
+        "Is \"Ana's birthday is 4 May\" correct?",
+        "Remember this: Ana's birthday is 4 May.",
+        vec![
+            claim(
+                "Ana's birthday is 4 May.",
+                "fact",
+                "Ana's birthday is 4 May",
+            )
+            .with("significance", json!("notable"))
+            .with("remember_this", json!(true)),
+        ],
+    );
+    let row = h.row(memories[0]);
+    assert_eq!(row.owner_significance, None);
+    assert_eq!(row.significance, "notable");
+}
+
+#[test]
+#[ignore = "TIM-107 review finding (weekday check); activate with its fix"]
+fn every_named_weekday_must_fall_on_one_of_the_dates() {
+    let h = Harness::new();
+    // 5 October 2026 is a Monday and the 8th a Thursday. The Monday start
+    // matches, but nothing falls on the Friday the quote names.
+    let memories = golden(
+        &h,
+        "I'm away Monday through Friday.",
+        "Enjoy.",
+        vec![
+            claim(
+                "Tim is away from 5 to 8 October 2026.",
+                "event",
+                "away Monday through Friday",
+            )
+            .with("valid_from", time("2026-10-05", "day"))
+            .with("valid_until", time("2026-10-08", "day")),
+        ],
+    );
+    let row = h.row(memories[0]);
+    assert_eq!(row.window_confidence, "low");
+    assert_eq!(row.valid_from, timed(local("2026-10-05T00:00"), "day"));
+    assert_eq!(row.valid_until, timed(local("2026-10-08T00:00"), "day"));
+}
+
+#[test]
+fn weekdays_that_each_match_a_date_keep_high_confidence() {
+    let h = Harness::new();
+    let memories = golden(
+        &h,
+        "I'm away Monday through Friday.",
+        "Enjoy.",
+        vec![
+            claim(
+                "Tim is away from 5 to 9 October 2026.",
+                "event",
+                "away Monday through Friday",
+            )
+            .with("valid_from", time("2026-10-05", "day"))
+            .with("valid_until", time("2026-10-09", "day")),
+        ],
+    );
+    assert_eq!(h.row(memories[0]).window_confidence, "high");
+}
+
+#[test]
+fn a_forget_request_and_a_duplicate_keep_turn_numbers_in_step() {
+    let h = Harness::new();
+    let first = turn("s1", "2026-10-01T06:00:00Z", "One.", "Ok.");
+    ingest(&h, &first);
+    ingest(
+        &h,
+        &Turn {
+            forget_requested: true,
+            ..turn("s1", "2026-10-01T06:05:00Z", "Forget my address.", "Done.")
+        },
+    );
+    // A duplicate stores nothing and doesn't count.
+    ingest(&h, &first);
+    ingest(&h, &turn("s1", "2026-10-01T06:10:00Z", "Two.", "Ok."));
+    assert_eq!(h.turns("main"), 3);
+
+    let mut turns = Vec::new();
+    for quote in ["One", "Two"] {
+        let memory = extract(
+            &h,
+            reply(
+                vec![claim(&format!("Tim said {quote}."), "fact", quote)],
+                &[],
+            ),
+        )
+        .memories[0];
+        turns.push(h.accesses(memory)[0].turn);
+    }
+    // The forget request is turn 2, so the next turn is 3.
+    assert_eq!(turns, vec![1, 3]);
+}
+
+#[test]
+fn aliases_match_whole_words_in_order() {
+    let h = Harness::new();
+    let acme = h.insert_entity("main", "Acme Corp", "organisation", &["Acme Corp"]);
+    h.insert_entity("main", "Ana", "person", &["Ana"]);
+    h.insert_entity("main", "Bob Smith", "person", &["Bob Smith"]);
+    h.insert_entity(
+        "main",
+        "Acme Corporation",
+        "organisation",
+        &["Acme Corporation Ltd"],
+    );
+    ingest(
+        &h,
+        &turn(
+            "s1",
+            T1,
+            "Acme Corp. called about a banana for Smith Bob, and Acme Corporation too.",
+            "Busy.",
+        ),
+    );
+    // "Ana" isn't a word here, the words of "Bob Smith" are out of order,
+    // and "Acme Corporation Ltd" isn't all there.
+    assert_eq!(found(&h, &input(&h, "main", &[])), BTreeSet::from([acme]));
+}
+
+#[test]
+#[ignore = "TIM-107 review finding (diacritics); activate with its fix"]
+fn aliases_match_with_or_without_diacritics() {
+    let h = Harness::new();
+    // The alias FTS removes diacritics (`remove_diacritics 2`), so matching
+    // agrees with it both ways round.
+    let lucia = h.insert_entity("main", "Lucía", "person", &["Lucía"]);
+    let zoe = h.insert_entity("main", "Zoe", "person", &["Zoe"]);
+    ingest(&h, &turn("s1", T1, "Lucia and Zoë came over.", "Lovely."));
+    assert_eq!(
+        found(&h, &input(&h, "main", &[])),
+        BTreeSet::from([lucia, zoe])
+    );
+}
+
+#[test]
+fn times_in_a_daylight_saving_gap_or_fold_resolve_compatibly() {
+    let h = Harness::new();
+    // Auckland skips 02:00 to 03:00 on 27 September 2026 and repeats 02:00
+    // to 03:00 on 5 April 2026. A time in the gap moves forward by the gap,
+    // a time in the fold takes the earlier offset, and neither lowers window
+    // confidence.
+    let event = |content: &str, at: &str, precision: &str| {
+        claim(content, "event", "Plans").with("valid_from", time(at, precision))
+    };
+    let memories = golden(
+        &h,
+        "Plans.",
+        "Ok.",
+        vec![
+            event("Tim had an early start.", "2026-09-27T02:30", "minute"),
+            event("Tim had an early hour.", "2026-09-27T02:00", "hour"),
+            event("Tim had a late night.", "2026-04-05T02:30", "minute"),
+        ],
+    );
+    let rows: Vec<Row> = memories.iter().map(|m| h.row(*m)).collect();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.valid_from.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            timed(at("2026-09-26T14:30:00Z"), "minute"),
+            timed(at("2026-09-26T14:00:00Z"), "hour"),
+            timed(at("2026-04-04T13:30:00Z"), "minute"),
+        ]
+    );
+    assert!(rows.iter().all(|r| r.window_confidence == "high"));
+}
+
+#[test]
+fn a_swept_earlier_turn_is_not_context() {
+    let h = Harness::new();
+    let swept = ingest(&h, &turn("s1", "2026-10-01T06:00:00Z", "Old news.", "Ok."));
+    ingest(&h, &turn("s1", "2026-10-01T06:10:00Z", "Kept news.", "Ok."));
+    h.execute(
+        "UPDATE sources SET text = NULL, reply = NULL, tombstoned_at = ?2,
+                            tombstone_reason = 'swept'
+         WHERE uuid = ?1",
+        (swept.source.to_string(), micros(h.now())),
+    );
+    let current = ingest(&h, &turn("s1", T1, "Now.", "Yes."));
+    h.focus(h.chunk_of(current.source, 0));
+    assert_eq!(
+        input(&h, "main", &[]).context,
+        vec![turn_text("Kept news.", "Ok.")]
+    );
+}
+
+#[test]
+fn without_models_a_chunk_stays_queued_and_uncounted() {
+    let h = Harness::without_models();
+    let ingested = ingest(&h, &turn("s1", T1, "I like tea.", "Noted."));
+    let chunk = h.chunk_of(ingested.source, 0);
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![reply(
+            vec![claim("Tim likes tea.", "fact", "I like tea")],
+            &[],
+        )],
+    );
+    let error = run(&h, "main", &llm, &[]).unwrap_err();
+    assert!(matches!(error, ExtractError::NoModels), "{error:?}");
+    assert_eq!(error.failure(), None);
+    assert!(llm.requests().is_empty());
+    assert_eq!(h.chunk_column::<i64>(chunk, "error_count"), 0);
+    assert_eq!(h.service.queue_depth("main").unwrap(), 1);
+    assert_eq!(lease(&h, "main").chunk, chunk);
+    assert_eq!(h.memories_in("main"), 0);
+}
+
+/// An embedder that claims bge-small's width but returns short vectors.
+struct ShortEmbedder;
+
+impl Embedder for ShortEmbedder {
+    fn model_id(&self) -> &str {
+        FakeEmbedder::MODEL_ID
+    }
+
+    fn dimensions(&self) -> usize {
+        FakeEmbedder.dimensions()
+    }
+
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
+        Ok(texts.iter().map(|_| vec![1.0; 8]).collect())
+    }
+}
+
+fn vectors(h: &Harness) -> i64 {
+    h.count("SELECT COUNT(*) FROM memory_vectors")
+}
+
+#[test]
+#[ignore = "TIM-107 review finding (vector width); activate with its fix"]
+fn a_vector_of_the_wrong_width_is_an_embedding_failure() {
+    let h = Harness::with_models(Models {
+        embedder: Arc::new(ShortEmbedder),
+        reranker: Arc::new(FakeReranker),
+    });
+    let tea = h.insert_memory("main", "Tim likes tea.", "minor");
+    let ingested = ingest(&h, &turn("s1", T1, "I'm moving to Lisbon.", "Exciting!"));
+    let chunk = h.chunk_of(ingested.source, 0);
+    let input = input(&h, "main", &[tea]);
+    let before = (untouched(&h), vectors(&h));
+
+    let llm = FakeLlm::scripted(MODEL, vec![busy_reply(&input, tea)]);
+    let error = run(&h, "main", &llm, &[tea]).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ExtractError::Embedding {
+                failure: Failure::Retry { error_count: 1 },
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!((untouched(&h), vectors(&h)), before);
+    assert_eq!(
+        h.chunk_column::<Option<String>>(chunk, "last_error_kind"),
+        Some("embedding".into())
+    );
+    assert_eq!(h.service.queue_depth("main").unwrap(), 1);
+}
+
+/// Makes every access insert fail, so a commit fails after its memories,
+/// vectors, entities and links are written.
+fn break_accesses(h: &Harness) {
+    h.execute(
+        "CREATE TRIGGER break_accesses BEFORE INSERT ON accesses
+         BEGIN SELECT RAISE(ABORT, 'scripted commit failure'); END",
+        [],
+    );
+}
+
+#[test]
+fn a_failed_commit_rolls_back_everything_and_is_counted() {
+    let h = Harness::new();
+    let tea = h.insert_memory("main", "Tim likes tea.", "minor");
+    let ingested = ingest(&h, &turn("s1", T1, "I'm moving to Lisbon.", "Exciting!"));
+    let chunk = h.chunk_of(ingested.source, 0);
+    let input = input(&h, "main", &[tea]);
+    break_accesses(&h);
+    let before = (untouched(&h), vectors(&h));
+
+    let llm = FakeLlm::scripted(MODEL, vec![busy_reply(&input, tea)]);
+    run(&h, "main", &llm, &[tea]).unwrap_err();
+    assert_eq!((untouched(&h), vectors(&h)), before);
+    assert!(h.entities_named("main", "Lisbon").is_empty());
+    assert_eq!(h.chunk_column::<Option<i64>>(chunk, "extracted_at"), None);
+    assert_eq!(h.chunk_column::<i64>(chunk, "error_count"), 1);
+    assert_eq!(
+        h.chunk_column::<Option<String>>(chunk, "last_error_kind"),
+        Some("commit".into())
+    );
+    assert_eq!(h.service.queue_depth("main").unwrap(), 1);
+
+    // Once the fault is gone, the retry commits everything once.
+    h.execute("DROP TRIGGER break_accesses", []);
+    let extracted = extract_with(&h, busy_reply(&input, tea), &[tea]);
+    assert_eq!(extracted.memories.len(), 1);
+    assert_eq!(vectors(&h), before.1 + 1);
+    assert_eq!(h.entities_named("main", "Lisbon").len(), 1);
+    assert_eq!(h.accesses(tea).len(), 2);
+}
+
+#[test]
+#[ignore = "TIM-107 review finding (commit failure reporting); activate with its fix"]
+fn a_failed_commit_reports_the_queues_count() {
+    let h = Harness::new();
+    ingest(&h, &turn("s1", T1, "I like tea.", "Noted."));
+    break_accesses(&h);
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![reply(
+            vec![claim("Tim likes tea.", "fact", "I like tea")],
+            &[],
+        )],
+    );
+    let error = run(&h, "main", &llm, &[]).unwrap_err();
+    // The queue counted the attempt, so the error says so, as every other
+    // counted failure does.
+    assert_eq!(error.failure(), Some(Failure::Retry { error_count: 1 }));
+}
+
+#[test]
+fn the_prompts_state_the_extraction_rules() {
+    let h = Harness::new();
+    ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
+    let system = call1_request(&input(&h, "main", &[])).system;
+    // Scripted replies can't show these instructions were given, so check
+    // the prompt carries them (TIM-92, "Inputs", "Significance", "Time" and
+    // "Language").
+    for rule in [
+        // Only what the assistant did, and its tasks only when asked and dated.
+        "From the assistant's reply, only what the assistant says it has done or will do.",
+        "An assistant task is extracted only when the speaker asked for it and it has a due date or an until-event beyond this turn.",
+        "Never extract the assistant's suggestions, general knowledge, or findings from tools.",
+        // Answers resolved from the context, quoted from the text.
+        "A short answer to a question the assistant asked in the context is the speaker's claim, written out in full.",
+        "Quote only from the text, never from the context",
+        // No claim from a request to forget.
+        "Nothing from a request to forget something, and no task to forget it.",
+        // The expected distribution.
+        "Most claims are trivial or minor. Major is rare and critical is a few per hundred claims.",
+        // Language.
+        "Write the claim in the language of the passage it quotes and never translate.",
+        // The hard rule on ends, and an unknown reference date.
+        "Never set `valid_until` unless the text states an end.",
+        "If the reference date is unknown, don't resolve relative times",
+    ] {
+        assert!(system.contains(rule), "{rule}");
+    }
+
+    ingest_doc(
+        &h,
+        &Document {
+            reference_date_exact: false,
+            ..document("diary", "Met Ana yesterday.", date(2026, 9, 28))
+        },
+    );
+    extract(&h, reply(vec![], &[]));
+    let user = call1_request(&input(&h, "main", &[])).user;
+    assert!(user.contains("Reference date: unknown"), "{user}");
+    assert!(user.contains("Don't resolve relative times."), "{user}");
 }
