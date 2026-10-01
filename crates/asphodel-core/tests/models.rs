@@ -677,7 +677,6 @@ fn fetch_stops_at_the_first_failure_and_keeps_what_it_wrote() {
 }
 
 #[test]
-#[ignore = "security 2: fetch writes its predictable temp name through whatever is there, so a planted symlink redirects the model bytes"]
 fn fetch_never_writes_through_a_planted_temp_symlink() {
     // Today the temp file is `<file>.part-<pid>`. The fix moves to fresh
     // names created exclusively, so a symlink planted here must simply be

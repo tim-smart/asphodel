@@ -1545,11 +1545,10 @@ fn no_error_or_response_carries_a_token() {
     }
 }
 
-// Review regressions (PR #3 review of edd84ad). Each is ignored until its
-// fix lands; run them by name with `--ignored` to see the defect.
+// Review regressions (PR #3 review of edd84ad). These run in the ordinary
+// offline suite now that the protocol fixes have landed.
 
 #[test]
-#[ignore = "defect 1: the client reads the whole body before parsing, so a completed stream left open times out"]
 fn a_completed_stream_that_stays_open_is_not_a_timeout() {
     // The backend sends the whole response and `response.completed`, then
     // holds the connection open. codex-rs returns at completion
@@ -1587,7 +1586,6 @@ fn a_completed_stream_that_stays_open_is_not_a_timeout() {
 }
 
 #[test]
-#[ignore = "defect 1: the client reads the whole body before parsing, so a completed stream left open times out"]
 fn a_failed_stream_that_stays_open_reports_the_failure_not_a_timeout() {
     let backend = StubServer::backend(
         StubResponse::stream(sse(&[(
@@ -1612,7 +1610,6 @@ fn a_failed_stream_that_stays_open_reports_the_failure_not_a_timeout() {
 }
 
 #[test]
-#[ignore = "defect 2: every non-2xx refresh reply is treated as a rejected credential"]
 fn a_transient_issuer_error_during_refresh_is_retryable_not_a_login() {
     // An issuer that is down (503), overloaded (502) or rate limiting
     // (429) has not rejected the credential. Telling the owner to log in
@@ -1669,7 +1666,6 @@ fn a_rejected_refresh_credential_asks_for_a_login() {
 }
 
 #[test]
-#[ignore = "defect 3: the login parses the poll reply as JSON before checking for a pending 403/404"]
 fn a_pending_device_authorization_with_a_plain_text_body_keeps_polling() {
     // codex-rs checks the status first and parses JSON only on success. A
     // 403 "Forbidden" or 404 "Not Found" with a text body is "pending",
@@ -1725,7 +1721,6 @@ fn a_pending_device_authorization_with_a_plain_text_body_keeps_polling() {
 }
 
 #[test]
-#[ignore = "defect 3: the login parses the poll reply as JSON before checking for a pending 403/404"]
 fn a_non_json_refusal_at_any_login_step_reports_its_status() {
     // A proxy's text error at any step is a status error naming the step,
     // not "the reply couldn't be read".
@@ -1771,9 +1766,8 @@ fn a_non_json_refusal_at_any_login_step_reports_its_status() {
     }
 }
 
-// Security regressions (security review of edd84ad). Each failing one is
-// ignored until its fix lands; run them by name with `--ignored` to see the
-// defect.
+// Security regressions (security review of edd84ad). These run in the
+// ordinary offline suite now that the security fixes have landed.
 
 /// Holds the issuer's refresh reply until the test opens it, and tells the
 /// test when a refresh has arrived. The tests synchronise on the issuer
@@ -1859,7 +1853,6 @@ fn relogin_tokens() -> ChatgptTokens {
 }
 
 #[test]
-#[ignore = "security 1: refresh saves without a lock the login's save shares, so a login during a refresh is overwritten"]
 fn a_login_saved_during_a_refresh_waits_for_it_and_wins() {
     let dir = TestDir::new();
     let store = expired_store(&dir);
@@ -1915,7 +1908,6 @@ fn a_login_saved_during_a_refresh_waits_for_it_and_wins() {
 }
 
 #[test]
-#[ignore = "security 1: each client has its own refresh mutex, so two clients on one store both spend the refresh token"]
 fn two_clients_on_one_store_share_one_refresh() {
     // Refresh tokens are single-use, so the lock has to belong to the token
     // store, not to one `CodexResponses`.
@@ -2048,7 +2040,6 @@ fn token_store_op_during_a_refresh(dir: &TestDir, op: &str) -> (bool, StubServer
 }
 
 #[test]
-#[ignore = "security 1: the token store has no cross-process lock, so another process's save lands mid-refresh and is overwritten"]
 fn a_save_from_another_process_waits_for_a_refresh_and_wins() {
     let dir = TestDir::new();
     let (saved_during_refresh, _server) = token_store_op_during_a_refresh(&dir, "save");
@@ -2065,7 +2056,6 @@ fn a_save_from_another_process_waits_for_a_refresh_and_wins() {
 }
 
 #[test]
-#[ignore = "security 1: clear takes no lock, so a refresh in flight writes the tokens back after another process clears them"]
 fn a_clear_from_another_process_waits_for_a_refresh_and_stays_cleared() {
     let dir = TestDir::new();
     let (cleared_during_refresh, _server) = token_store_op_during_a_refresh(&dir, "clear");
@@ -2090,7 +2080,6 @@ fn predictable_temp(store: &TokenStore) -> PathBuf {
 }
 
 #[test]
-#[ignore = "security 2: save opens its predictable temp name with create+truncate, so it writes through a planted symlink"]
 fn save_never_writes_through_a_planted_temp_symlink() {
     let dir = TestDir::new();
     let data = dir.data();
@@ -2128,7 +2117,6 @@ fn save_never_writes_through_a_planted_temp_symlink() {
 }
 
 #[test]
-#[ignore = "security 2: save truncates and renames whatever already sits at its predictable temp name"]
 fn save_leaves_a_pre_existing_temp_file_alone() {
     let dir = TestDir::new();
     let data = dir.data();
@@ -2211,7 +2199,6 @@ fn a_known_backend_code_passes_through_every_terminal_event() {
 }
 
 #[test]
-#[ignore = "security 3: backend error codes are copied verbatim into LlmError::Backend"]
 fn a_backend_code_reflecting_a_secret_or_the_prompt_never_reaches_the_error() {
     // The backend echoes what it was sent into the field the client keeps.
     // Whatever arrives there, only a fixed code may come out.
