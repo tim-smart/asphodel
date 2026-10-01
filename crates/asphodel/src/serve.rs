@@ -5,12 +5,18 @@
 //! same service functions the replay harness does (TIM-96, decision 3). Only
 //! `health` exists so far.
 
-use std::sync::Arc;
+use std::{
+    fs::{self, Metadata},
+    io::ErrorKind,
+    os::unix::fs::{FileTypeExt, MetadataExt},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, bail};
 use asphodel_core::{Health, Service, SystemClock};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::signal;
 use tracing::{info, warn};
 
@@ -47,19 +53,106 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 .await?;
         }
         Listen::Unix(path) => {
-            if path.exists() {
-                std::fs::remove_file(path)
-                    .with_context(|| format!("removing stale socket {}", path.display()))?;
-            }
-            let listener =
-                UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
-            axum::serve(listener, app)
+            let (listener, cleanup) = bind_unix(path).await?;
+            let result = axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown_signal())
-                .await?;
+                .await;
+            cleanup.remove()?;
+            result?;
         }
     }
     info!("asphodel stopped");
     Ok(())
+}
+
+/// Binds a Unix socket, recovering only a stale socket (never a file,
+/// symlink or live listener). The caller removes its socket after serving.
+pub(crate) async fn bind_unix(path: &Path) -> anyhow::Result<(UnixListener, UnixSocketCleanup)> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if !file_type.is_socket() {
+                let kind = if file_type.is_symlink() {
+                    "a symlink"
+                } else if file_type.is_file() {
+                    "a regular file"
+                } else if file_type.is_dir() {
+                    "a directory"
+                } else {
+                    "a non-socket file"
+                };
+                bail!("refusing to bind {}: found {kind}", path.display());
+            }
+            match UnixStream::connect(path).await {
+                Ok(_) => bail!("socket {} is already in use", path.display()),
+                Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
+                    // Check identity again after the probe: a replacement must
+                    // not be mistaken for the stale socket we inspected.
+                    UnixSocketCleanup::new(path, &metadata).remove()?;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("checking socket {}", path.display()));
+                }
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", path.display()));
+        }
+    }
+
+    let listener = std::os::unix::net::UnixListener::bind(path)
+        .with_context(|| format!("binding {}", path.display()))?;
+    listener.set_nonblocking(true)?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting bound socket {}", path.display()))?;
+    let mut cleanup = UnixSocketCleanup::new(path, &metadata);
+    // Keep the bound socket alive through cleanup, even after axum drops its
+    // listener, so its filesystem inode cannot be reused by a replacement.
+    cleanup._listener = Some(listener.try_clone()?);
+    Ok((UnixListener::from_std(listener)?, cleanup))
+}
+
+/// The filesystem identity of the socket we created, not just its name.
+pub(crate) struct UnixSocketCleanup {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    _listener: Option<std::os::unix::net::UnixListener>,
+}
+
+impl UnixSocketCleanup {
+    fn new(path: &Path, metadata: &Metadata) -> Self {
+        Self {
+            path: path.to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            _listener: None,
+        }
+    }
+
+    pub(crate) fn remove(self) -> anyhow::Result<()> {
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting socket {}", self.path.display()));
+            }
+        };
+        if metadata.file_type().is_socket()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            // POSIX has no conditional unlink by inode. As with stale-socket
+            // recovery, this assumes an operator-controlled socket directory;
+            // the identity check protects replacements already at the path.
+            fs::remove_file(&self.path)
+                .with_context(|| format!("removing socket {}", self.path.display()))?;
+        }
+        Ok(())
+    }
 }
 
 /// `GET /v1/health`: 503 until the daemon is ready, then 200 with the version.
