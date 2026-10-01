@@ -210,6 +210,7 @@ fn defaults_match_the_decisions() {
     assert_eq!(t.mental_models.input_budget, 60); // TIM-95 decision 3
     assert_eq!(t.mental_models.input_budget_with_cited, 70);
     assert_eq!(t.sessions.mapping_expiry_days, 30); // TIM-95 decision 4
+    assert_eq!(t.sessions.in_context_idle_days, 7); // TIM-93, amended by TIM-109
 }
 
 #[test]
@@ -465,6 +466,7 @@ fn unknown_keys_are_rejected_in_every_section() {
         "agenda",
         "mental_models",
         "sessions",
+        "ranking",
         "llm",
     ] {
         assert_rejected(&format!("[{section}]\nnot_a_setting = 1\n"));
@@ -566,6 +568,31 @@ fn injection_cap_must_be_positive() {
     // TIM-98: cap > 0.
     assert_eq!(invalid_keys("[injection]\ncap = 0\n"), ["injection.cap"]);
     load("[injection]\ncap = 1\n").unwrap();
+}
+
+#[test]
+fn in_context_idle_days_must_be_positive() {
+    // TIM-93, amended by TIM-109: at least 1, like mapping_expiry_days.
+    assert_eq!(
+        invalid_keys("[sessions]\nin_context_idle_days = 0\n"),
+        ["sessions.in_context_idle_days"]
+    );
+    let t = load("[sessions]\nin_context_idle_days = 1\n").unwrap();
+    assert_eq!(t.sessions.in_context_idle_days, 1);
+}
+
+#[test]
+fn ranking_constants_are_tuning_keys() {
+    // TIM-98 places w_s for each mode and the phase bonus and penalty in
+    // [ranking].
+    let t = load(
+        "[ranking]\nw_s_inject = 0.8\nw_s_recall = 0.3\nphase_bonus = 1.5\nphase_penalty = 0.5\n",
+    )
+    .unwrap();
+    assert_eq!(t.ranking.w_s_inject, 0.8);
+    assert_eq!(t.ranking.w_s_recall, 0.3);
+    assert_eq!(t.ranking.phase_bonus, 1.5);
+    assert_eq!(t.ranking.phase_penalty, 0.5);
 }
 
 #[test]
