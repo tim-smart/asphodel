@@ -5,8 +5,8 @@
 //! out-of-range value in the tuning file stops the daemon starting.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
-use std::process::{Child, Command, Output, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -336,20 +336,17 @@ fn the_startup_log_carries_the_resolved_config() {
     }
 }
 
-#[test]
-fn a_malformed_llm_endpoint_stops_startup() {
-    let dir = TestDir::new();
-    let path = dir.file("tuning.toml", "[llm]\nendpoint = \"http://\"\n");
-    // A file avoids a pipe filling while waiting. The guard kills and reaps
-    // the child on every exit path, including a timeout or assertion panic.
-    let log_path = dir.0.join("stderr.log");
-    let child = serve_in(&dir)
+/// Runs a daemon that is expected to refuse and exit on its own. Its
+/// stderr goes to `log_path` so a pipe can't fill while waiting, and the
+/// guard kills and reaps the child on every exit path, including a timeout
+/// or an assertion panic, so a daemon that wrongly starts can't hang the
+/// suite. Returns `None` when it was still running at the deadline.
+fn run_bounded(command: &mut Command, log_path: &Path) -> (Option<ExitStatus>, String) {
+    let child = command
         .args(["--listen", "127.0.0.1:0"])
-        .arg("--config")
-        .arg(&path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(std::fs::File::create(&log_path).unwrap())
+        .stderr(std::fs::File::create(log_path).unwrap())
         .spawn()
         .unwrap();
     let mut daemon = Daemon {
@@ -367,7 +364,17 @@ fn a_malformed_llm_endpoint_stops_startup() {
         std::thread::sleep(Duration::from_millis(10));
     };
     drop(daemon);
-    let log = std::fs::read_to_string(log_path).unwrap();
+    (status, std::fs::read_to_string(log_path).unwrap())
+}
+
+#[test]
+fn a_malformed_llm_endpoint_stops_startup() {
+    let dir = TestDir::new();
+    let path = dir.file("tuning.toml", "[llm]\nendpoint = \"http://\"\n");
+    let (status, log) = run_bounded(
+        serve_in(&dir).arg("--config").arg(&path),
+        &dir.0.join("stderr.log"),
+    );
     let status = status.unwrap_or_else(|| {
         panic!("invalid endpoint did not stop startup within 5 seconds:\n{log}")
     });
@@ -376,4 +383,28 @@ fn a_malformed_llm_endpoint_stops_startup() {
         "invalid endpoint exited successfully:\n{log}"
     );
     assert!(log.contains("llm.endpoint"), "{log}");
+}
+
+#[test]
+#[ignore = "serve still starts without a data dir; activate with the TIM-103 fix"]
+fn serve_needs_a_data_dir_from_the_flag_or_the_environment() {
+    // TIM-94, decision 4: the store lives under `--data-dir`. A daemon with
+    // neither the flag nor `ASPHODEL_DATA_DIR` has nowhere to persist, so it
+    // must refuse to start rather than answer ready with no store.
+    let dir = TestDir::new();
+    let (status, log) = run_bounded(&mut serve(), &dir.0.join("stderr.log"));
+    let status = status
+        .unwrap_or_else(|| panic!("a daemon with no data dir kept running for 5 seconds:\n{log}"));
+    assert!(
+        !status.success(),
+        "a daemon with no data dir started:\n{log}"
+    );
+    assert!(
+        log.contains("--data-dir") || log.contains("ASPHODEL_DATA_DIR"),
+        "the refusal doesn't name the missing setting:\n{log}"
+    );
+    assert!(
+        !log.contains("asphodel listening"),
+        "the daemon listened before refusing:\n{log}"
+    );
 }

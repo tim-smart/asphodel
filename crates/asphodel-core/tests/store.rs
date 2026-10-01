@@ -1427,3 +1427,118 @@ fn the_stored_fingerprint_is_printable() {
     let fingerprint: Fingerprint = Tuning::default().deletion_fingerprint();
     assert_eq!(fingerprint.to_string(), fingerprint.as_str());
 }
+
+// Review regressions (TIM-103 review through c157b84)
+
+#[test]
+#[ignore = "the seeded profile has no filters yet; activate with the TIM-103 fix"]
+fn the_seeded_profile_takes_facts_and_slow_states() {
+    // TIM-95, decision 3: the profile takes facts, plus states with
+    // volatility of weeks or slower, and null volatility passes. Decision 2
+    // makes those the model's own filters, not words in its question.
+    let dir = TestDir::new();
+    let service = service(&dir);
+    service.ensure_bank("main", &identity(), &models()).unwrap();
+    let conn = service.store().unwrap().connection();
+    let (kinds, min_volatility, entity): (Option<String>, Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT filter_kinds, filter_min_volatility, filter_entity_id FROM mental_models
+             WHERE name = ?1",
+            [PROFILE_NAME],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let kinds: Vec<String> =
+        serde_json::from_str(kinds.as_deref().expect("the profile filters its kinds")).unwrap();
+    let mut kinds = kinds;
+    kinds.sort();
+    assert_eq!(kinds, ["fact", "state"]);
+    assert_eq!(min_volatility.as_deref(), Some("weeks"));
+    assert_eq!(entity, None, "the profile is about the whole bank");
+}
+
+#[test]
+fn merge_leaves_the_profiles_filters_alone() {
+    // An owner edit to a model's filters survives every later
+    // `PUT /v1/banks/{bank}` (TIM-94, decision 7; TIM-95, decision 2).
+    let dir = TestDir::new();
+    let service = service(&dir);
+    service.ensure_bank("main", &identity(), &models()).unwrap();
+    service
+        .store()
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE mental_models SET filter_kinds = '[\"fact\"]', filter_min_volatility = 'months',
+                                      max_tokens = 123, question = 'edited'
+             WHERE name = ?1",
+            [PROFILE_NAME],
+        )
+        .unwrap();
+    service.ensure_bank("main", &identity(), &models()).unwrap();
+    let conn = service.store().unwrap().connection();
+    let (kinds, min_volatility, max_tokens, question): (String, String, i64, String) = conn
+        .query_row(
+            "SELECT filter_kinds, filter_min_volatility, max_tokens, question FROM mental_models
+             WHERE name = ?1",
+            [PROFILE_NAME],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(kinds, "[\"fact\"]");
+    assert_eq!(min_volatility, "months");
+    assert_eq!(max_tokens, 123);
+    assert_eq!(question, "edited");
+}
+
+#[test]
+#[ignore = "the pre-migration copy is not integrity-checked yet; activate with the TIM-103 fix"]
+fn a_corrupt_existing_copy_refuses_the_migration_and_is_kept() {
+    // ADR 0010: the pre-migration copy is the same integrity-checked copy
+    // backup makes, and a copy for the same from-version is never
+    // overwritten. A damaged file under the copy's name can't be trusted and
+    // can't be replaced, so the migration must stop and name it.
+    let dir = TestDir::new();
+    let clock = clock();
+    let store = open(&dir.data(), clock.clone());
+    let conn = store.connection();
+    let path = migrations::copy_path(&dir.data(), 1);
+    std::fs::write(&path, b"not a database").unwrap();
+
+    let error = match migrations::take_copy(&conn, &dir.data(), 1) {
+        Err(error) => error,
+        Ok(path) => panic!("a corrupt copy was accepted: {}", path.display()),
+    };
+    assert!(
+        error.to_string().contains(path.to_str().unwrap()),
+        "the refusal doesn't name the copy: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"not a database",
+        "the corrupt copy was replaced"
+    );
+}
+
+#[test]
+fn a_fresh_copy_passes_the_integrity_check_it_will_be_held_to() {
+    // The healthy case of the regression above: what `take_copy` publishes
+    // is a database `PRAGMA integrity_check` accepts, with nothing left
+    // under a partial name.
+    let dir = TestDir::new();
+    let store = open(&dir.data(), clock());
+    let conn = store.connection();
+    let path = migrations::take_copy(&conn, &dir.data(), 1).unwrap();
+    let copy =
+        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let integrity: String = copy
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    let partials: Vec<_> = std::fs::read_dir(dir.data())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("partial"))
+        .collect();
+    assert!(partials.is_empty(), "{partials:?}");
+}
