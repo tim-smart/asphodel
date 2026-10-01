@@ -530,6 +530,13 @@ mod delta {
     pub fn serialize<S: Serializer>(delta: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error> {
         match delta {
             Some(delta) => serializer.serialize_f64(*delta),
+            // Serde has no null-support query, and both TOML and JSON are
+            // human-readable. Identify TOML serializers, including the
+            // document serializer's strategy probe, to use the explicit sentinel
+            // rather than silently omitting the key and restoring the default.
+            None if std::any::type_name::<S>().starts_with("toml::") => {
+                serializer.serialize_str(NEVER)
+            }
             None => serializer.serialize_none(),
         }
     }
