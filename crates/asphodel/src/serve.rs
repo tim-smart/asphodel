@@ -18,7 +18,7 @@ use anyhow::{Context, bail};
 use asphodel_core::config::{
     Deployment, LLM_API_KEY_ENV, LlmAuth, ModelsConfig, Secret, TOKEN_ENV,
 };
-use asphodel_core::models::{LlmSettings, LlmStatus, Models, TokenStore};
+use asphodel_core::models::{LlmSettings, LlmStatus, ModelOptions, Models, TokenStore};
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::{Clock, Health, ResolvedConfig, Service, SystemClock, Tuning};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
@@ -80,10 +80,20 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             Service::with_models(clock, store, config.tuning.clone(), models)?
         }
         ModelsSwitch::None => {
-            warn!(
-                "the ONNX models aren't loaded by serve yet, so recall and extraction have no embedder or reranker"
-            );
-            Service::open(clock, store, config.tuning.clone())
+            let dir = crate::cli::resolve_model_dir(args.model_dir.as_deref())?;
+            let models = Models::load(
+                &dir,
+                &ModelOptions {
+                    threads: args.onnx_threads,
+                },
+            )
+            .with_context(|| format!("loading the models in {}", dir.path().display()))?;
+            config.models = Some(ModelsConfig::new(
+                &models,
+                false,
+                args.onnx_threads.map(std::num::NonZeroUsize::get),
+            ));
+            Service::with_models(clock, store, config.tuning.clone(), models)?
         }
     };
     info!(
