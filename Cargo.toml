@@ -14,11 +14,13 @@ asphodel-core = { path = "crates/asphodel-core" }
 
 anyhow = "1"
 axum = "0.8"
+chrono = { version = "0.4", default-features = false }
 fastembed = { version = "7.1.0", default-features = false, features = ["ort-load-dynamic"] }
 clap = { version = "4", features = ["derive", "env"] }
 jiff = { version = "0.2", features = ["serde"] }
 libc = "0.2"
 regex = "1"
+rrule = "0.14"
 rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

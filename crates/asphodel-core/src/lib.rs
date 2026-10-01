@@ -9,6 +9,7 @@ pub mod chunking;
 pub mod clock;
 pub mod config;
 pub mod constants;
+pub mod extraction;
 pub mod ingest;
 pub mod logging;
 pub mod models;

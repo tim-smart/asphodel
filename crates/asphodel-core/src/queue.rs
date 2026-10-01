@@ -75,6 +75,18 @@ pub struct Lease {
     leases: Leases,
 }
 
+impl Lease {
+    /// The bank's rowid.
+    pub(crate) fn bank_id(&self) -> i64 {
+        self.bank_id
+    }
+
+    /// The chunk's rowid.
+    pub(crate) fn chunk_id(&self) -> i64 {
+        self.chunk_id
+    }
+}
+
 impl PartialEq for Lease {
     fn eq(&self, other: &Self) -> bool {
         self.queue_id == other.queue_id && self.chunk == other.chunk
@@ -204,7 +216,7 @@ pub(crate) fn claim(
 /// Rowids alone don't identify a lease: after a restart the same chunk is
 /// claimed again under the same rowids, and another store's rowids can
 /// coincide. So the lease must also come from this service's registry.
-fn check_held(leases: &Leases, lease: &Lease) -> Result<(), QueueError> {
+pub(crate) fn check_held(leases: &Leases, lease: &Lease) -> Result<(), QueueError> {
     if Arc::ptr_eq(&leases.0, &lease.leases.0)
         && leases.lock().get(&lease.bank_id) == Some(&lease.queue_id)
     {
@@ -220,15 +232,27 @@ pub(crate) fn complete(store: &Store, leases: &Leases, lease: Lease) -> Result<(
     check_held(leases, &lease)?;
     let mut conn = store.connection();
     let tx = conn.transaction()?;
+    finish(&tx, store.now(), &lease)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// [`complete`]'s writes, inside the caller's transaction, so extraction
+/// commits its memories together with `extracted_at` (TIM-92). The caller
+/// has checked the lease is held.
+pub(crate) fn finish(
+    tx: &rusqlite::Transaction<'_>,
+    now: Timestamp,
+    lease: &Lease,
+) -> Result<(), rusqlite::Error> {
     tx.execute(
         "UPDATE chunks SET extracted_at = ?1, call1_output = NULL WHERE id = ?2",
-        (micros(store.now()), lease.chunk_id),
+        (micros(now), lease.chunk_id),
     )?;
     tx.execute(
         "DELETE FROM extraction_queue WHERE id = ?1",
         [lease.queue_id],
     )?;
-    tx.commit()?;
     Ok(())
 }
 

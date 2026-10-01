@@ -8,11 +8,13 @@ use std::sync::Arc;
 
 use jiff::Timestamp;
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::config::{ConfigError, Tuning};
+use crate::extraction::{Call1Input, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Turn};
-use crate::models::Models;
+use crate::models::{LlmClient, Models};
 use crate::queue::{ChunkError, FailedChunk, Failure, Lease, Leases, QueueError};
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
@@ -166,6 +168,41 @@ impl Service {
     /// marked failed.
     pub fn fail_chunk(&self, lease: Lease, error: ChunkError) -> Result<Failure, QueueError> {
         crate::queue::fail(&self.store, &self.leases, lease, error)
+    }
+
+    /// What call 1 would be given for the leased chunk ([`crate::extraction`]).
+    /// `in_context` is the session's in-context set, the public ids of the
+    /// memories the agent can already see; ids that aren't visible memories
+    /// of the chunk's bank are left out, and a document gets none.
+    pub fn call1_input(
+        &self,
+        lease: &Lease,
+        in_context: &[Uuid],
+    ) -> Result<Call1Input, ExtractError> {
+        crate::extraction::call1_input(&self.store, &self.leases, &self.tuning, lease, in_context)
+    }
+
+    /// Runs call 1 on the leased chunk with `llm` and commits what it found,
+    /// marking the chunk extracted. A failure writes nothing but the queue's
+    /// count of the attempt, so the chunk is retried in place; an LLM that
+    /// can't be used at all holds the queue without counting
+    /// ([`ExtractError::Held`]).
+    pub fn extract_chunk(
+        &self,
+        lease: Lease,
+        llm: &dyn LlmClient,
+        in_context: &[Uuid],
+    ) -> Result<Extracted, ExtractError> {
+        let models = self.models.as_ref().ok_or(ExtractError::NoModels)?;
+        crate::extraction::extract(
+            &self.store,
+            &self.leases,
+            &self.tuning,
+            models.embedder.as_ref(),
+            lease,
+            llm,
+            in_context,
+        )
     }
 
     /// Chunks waiting or in flight in `bank`, not counting failed ones.
