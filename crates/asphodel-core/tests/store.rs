@@ -211,6 +211,39 @@ fn the_network_refusal_names_the_dir_the_kind_and_the_flag() {
     assert!(message.contains("--allow-network-fs"), "{message}");
 }
 
+#[test]
+fn filesystem_policy_refuses_each_network_kind_unless_overridden() {
+    let dir = Path::new("/var/lib/asphodel");
+    for kind in [
+        FilesystemKind::Nfs,
+        FilesystemKind::Smb,
+        FilesystemKind::Ceph,
+        FilesystemKind::Fuse,
+    ] {
+        match fs::apply_policy(dir, kind, false) {
+            Err(StoreError::NetworkFilesystem {
+                dir: refused,
+                kind: found,
+            }) => {
+                assert_eq!(refused, dir);
+                assert_eq!(found, kind);
+            }
+            other => panic!("wrong policy result for {kind:?}: {other:?}"),
+        }
+        let message = fs::apply_policy(dir, kind, false).unwrap_err().to_string();
+        assert!(message.contains(dir.to_str().unwrap()), "{message}");
+        assert!(message.contains(&kind.to_string()), "{message}");
+        assert!(message.contains("--allow-network-fs"), "{message}");
+        assert_eq!(fs::apply_policy(dir, kind, true).unwrap(), kind);
+    }
+    for allow in [false, true] {
+        assert_eq!(
+            fs::apply_policy(dir, FilesystemKind::Local, allow).unwrap(),
+            FilesystemKind::Local
+        );
+    }
+}
+
 // The data-dir lock (TIM-94, decision 4)
 
 #[test]
@@ -854,6 +887,84 @@ fn a_copy_without_a_completed_migration_is_kept() {
 
 // The deletion fingerprint (ADR 0009)
 
+fn check_housekeeping_expiry(paused: bool) {
+    let dir = TestDir::new();
+    let clock = clock();
+    let store = open(&dir.data(), clock.clone());
+    let original = Tuning::default().deletion_fingerprint();
+    assert_eq!(
+        store.check_fingerprint(&original).unwrap(),
+        PurgePause::Running
+    );
+    let mut tuning = Tuning::default();
+    if paused {
+        tuning.clock.quiet_rate = 0.2;
+    }
+    let expected_pause = if paused {
+        PurgePause::Paused { stored: original }
+    } else {
+        PurgePause::Running
+    };
+    assert_eq!(
+        store
+            .check_fingerprint(&tuning.deletion_fingerprint())
+            .unwrap(),
+        expected_pause
+    );
+
+    // A later completion, not the start of the migration, sets the deadline.
+    clock.advance(SignedDuration::from_hours(1));
+    let (copy, incomplete) = {
+        let conn = store.connection();
+        let copy = migrations::take_copy(&conn, &dir.data(), 1).unwrap();
+        let incomplete = migrations::take_copy(&conn, &dir.data(), 3).unwrap();
+        conn.execute(
+            "INSERT INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
+             VALUES (1, 2, 'test', ?1, ?2)",
+            (micros(start()), micros(clock.now())),
+        ).unwrap();
+        (copy, incomplete)
+    };
+    let service = Service::open(clock.clone(), store, tuning);
+    assert!(service.housekeeping().unwrap().copies_removed.is_empty());
+    clock.advance(SignedDuration::from_hours(7 * 24) - SignedDuration::from_micros(1));
+    assert!(service.housekeeping().unwrap().copies_removed.is_empty());
+    assert!(copy.exists(), "expired before completion plus seven days");
+    clock.advance(SignedDuration::from_micros(1));
+    assert_eq!(
+        service.housekeeping().unwrap().copies_removed,
+        std::slice::from_ref(&copy)
+    );
+    assert!(
+        !copy.exists(),
+        "housekeeping needed a restart to expire the copy"
+    );
+    assert!(
+        incomplete.exists(),
+        "removed a copy without a completed migration"
+    );
+    assert!(service.housekeeping().unwrap().copies_removed.is_empty());
+    assert_eq!(
+        service
+            .store()
+            .unwrap()
+            .check_fingerprint(&service.tuning().deletion_fingerprint())
+            .unwrap(),
+        expected_pause
+    );
+    assert!(service.health().ready);
+}
+
+#[test]
+fn housekeeping_expires_copies_on_the_simulated_clock_without_restarting() {
+    check_housekeeping_expiry(false);
+}
+
+#[test]
+fn housekeeping_expires_copies_even_while_purge_is_paused() {
+    check_housekeeping_expiry(true);
+}
+
 #[test]
 fn the_fingerprint_is_recorded_on_first_start() {
     let dir = TestDir::new();
@@ -1384,17 +1495,6 @@ fn an_unknown_timezone_or_empty_name_creates_nothing() {
 }
 
 #[test]
-fn a_service_without_a_store_cannot_ensure_a_bank() {
-    let service = Service::new(clock());
-    assert!(service.store().is_none());
-    assert!(matches!(
-        service.ensure_bank("main", &identity(), &models()),
-        Err(BankError::NoStore)
-    ));
-    assert!(service.health().ready);
-}
-
-#[test]
 fn a_bank_survives_a_reopen() {
     let dir = TestDir::new();
     let created = {
@@ -1431,7 +1531,6 @@ fn the_stored_fingerprint_is_printable() {
 // Review regressions (TIM-103 review through c157b84)
 
 #[test]
-#[ignore = "the seeded profile has no filters yet; activate with the TIM-103 fix"]
 fn the_seeded_profile_takes_facts_and_slow_states() {
     // TIM-95, decision 3: the profile takes facts, plus states with
     // volatility of weeks or slower, and null volatility passes. Decision 2
@@ -1492,7 +1591,6 @@ fn merge_leaves_the_profiles_filters_alone() {
 }
 
 #[test]
-#[ignore = "the pre-migration copy is not integrity-checked yet; activate with the TIM-103 fix"]
 fn a_corrupt_existing_copy_refuses_the_migration_and_is_kept() {
     // ADR 0010: the pre-migration copy is the same integrity-checked copy
     // backup makes, and a copy for the same from-version is never
@@ -1541,4 +1639,44 @@ fn a_fresh_copy_passes_the_integrity_check_it_will_be_held_to() {
         .filter(|name| name.contains("partial"))
         .collect();
     assert!(partials.is_empty(), "{partials:?}");
+}
+
+#[test]
+fn a_copy_stays_a_single_file_after_read_only_checks_and_reuse() {
+    let dir = TestDir::new();
+    let store = open(&dir.data(), clock());
+    let conn = store.connection();
+    let listing = || {
+        let mut names: Vec<_> = std::fs::read_dir(dir.data())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let mut expected = listing();
+    let path = migrations::take_copy(&conn, &dir.data(), 1).unwrap();
+    expected.push(path.file_name().unwrap().to_owned());
+    expected.sort();
+    assert_eq!(
+        listing(),
+        expected,
+        "copy creation left sidecars or partials"
+    );
+    for _ in 0..2 {
+        let copy =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let journal: String = copy
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "delete");
+        let integrity: String = copy
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(listing(), expected, "a read-only check created sidecars");
+        drop(copy);
+        assert_eq!(migrations::take_copy(&conn, &dir.data(), 1).unwrap(), path);
+        assert_eq!(listing(), expected, "reusing the copy created sidecars");
+    }
 }

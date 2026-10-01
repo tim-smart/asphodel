@@ -386,7 +386,6 @@ fn a_malformed_llm_endpoint_stops_startup() {
 }
 
 #[test]
-#[ignore = "serve still starts without a data dir; activate with the TIM-103 fix"]
 fn serve_needs_a_data_dir_from_the_flag_or_the_environment() {
     // TIM-94, decision 4: the store lives under `--data-dir`. A daemon with
     // neither the flag nor `ASPHODEL_DATA_DIR` has nowhere to persist, so it
