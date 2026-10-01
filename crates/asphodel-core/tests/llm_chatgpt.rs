@@ -344,6 +344,10 @@ struct StubResponse {
     body: String,
     /// Held before answering.
     delay: Duration,
+    /// When nonzero, the body is sent chunked and the connection is held
+    /// open this long after it before the terminating chunk, as a backend
+    /// that has finished a response but not closed the stream would.
+    linger: Duration,
 }
 
 impl StubResponse {
@@ -354,6 +358,19 @@ impl StubResponse {
             headers: Vec::new(),
             body: value.to_string(),
             delay: Duration::ZERO,
+            linger: Duration::ZERO,
+        }
+    }
+
+    /// A non-JSON reply, as a proxy or a load balancer sends one.
+    fn text(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            content_type: "text/plain",
+            headers: Vec::new(),
+            body: body.to_string(),
+            delay: Duration::ZERO,
+            linger: Duration::ZERO,
         }
     }
 
@@ -364,7 +381,13 @@ impl StubResponse {
             headers: Vec::new(),
             body,
             delay: Duration::ZERO,
+            linger: Duration::ZERO,
         }
+    }
+
+    fn lingering(mut self, linger: Duration) -> Self {
+        self.linger = linger;
+        self
     }
 
     fn status(status: u16) -> Self {
@@ -467,6 +490,21 @@ fn serve_one(mut stream: TcpStream, handler: &Handler, log: &Mutex<Vec<StubReque
     let mut extra = String::new();
     for (name, value) in &response.headers {
         extra.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if response.linger > Duration::ZERO {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {} Status\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n{extra}\r\n{:x}\r\n{}\r\n",
+            response.status,
+            response.content_type,
+            response.body.len(),
+            response.body
+        );
+        let _ = stream.flush();
+        std::thread::sleep(response.linger);
+        let _ = write!(stream, "0\r\n\r\n");
+        let _ = stream.flush();
+        return;
     }
     let _ = write!(
         stream,
@@ -1501,6 +1539,232 @@ fn no_error_or_response_carries_a_token() {
     );
     for forbidden in ["rt-one", "rt-two", "rotated", "stale", "eyJ", "Bearer"] {
         assert!(!shown.contains(forbidden), "{forbidden} in {shown}");
+    }
+}
+
+// Review regressions (PR #3 review of edd84ad). Each is ignored until its
+// fix lands; run them by name with `--ignored` to see the defect.
+
+#[test]
+#[ignore = "defect 1: the client reads the whole body before parsing, so a completed stream left open times out"]
+fn a_completed_stream_that_stays_open_is_not_a_timeout() {
+    // The backend sends the whole response and `response.completed`, then
+    // holds the connection open. codex-rs returns at completion
+    // (`codex-rs/codex-api/src/sse/responses.rs`, the "stream does not end"
+    // case); so should we, or a good answer becomes a timeout and a
+    // duplicate request.
+    let backend = StubServer::backend(
+        StubResponse::stream(sse_completion("{\"claims\":[\"kept\"]}"))
+            .lingering(Duration::from_secs(3)),
+    );
+    let dir = TestDir::new();
+    let mut settings = chatgpt_settings(&backend.url);
+    settings.timeout = Duration::from_secs(1);
+    let client =
+        CodexResponses::new(settings, logged_in_store(&dir), clock()).with_issuer(&backend.url);
+
+    let response = client
+        .complete(&request())
+        .unwrap_or_else(|error| panic!("a completed stream failed: {error:?}"));
+    assert_eq!(response.json, json!({"claims": ["kept"]}));
+    assert_eq!(
+        response.usage,
+        Some(LlmUsage {
+            input_tokens: 41,
+            output_tokens: 7
+        })
+    );
+    // Returned on completion, not when the connection finally closed.
+    assert!(
+        response.latency < Duration::from_secs(2),
+        "waited for the close: {:?}",
+        response.latency
+    );
+    assert_eq!(backend.requests().len(), 1, "a duplicate request went out");
+}
+
+#[test]
+#[ignore = "defect 1: the client reads the whole body before parsing, so a completed stream left open times out"]
+fn a_failed_stream_that_stays_open_reports_the_failure_not_a_timeout() {
+    let backend = StubServer::backend(
+        StubResponse::stream(sse(&[(
+            "response.failed",
+            json!({
+                "type": "response.failed",
+                "response": {"id": "resp_9", "status": "failed", "error": {"code": "server_error"}}
+            }),
+        )]))
+        .lingering(Duration::from_secs(3)),
+    );
+    let dir = TestDir::new();
+    let mut settings = chatgpt_settings(&backend.url);
+    settings.timeout = Duration::from_secs(1);
+    let client =
+        CodexResponses::new(settings, logged_in_store(&dir), clock()).with_issuer(&backend.url);
+    let error = client.complete(&request()).unwrap_err();
+    assert!(
+        matches!(&error, LlmError::Backend { code } if code == "server_error"),
+        "{error:?}"
+    );
+}
+
+#[test]
+#[ignore = "defect 2: every non-2xx refresh reply is treated as a rejected credential"]
+fn a_transient_issuer_error_during_refresh_is_retryable_not_a_login() {
+    // An issuer that is down (503), overloaded (502) or rate limiting
+    // (429) has not rejected the credential. Telling the owner to log in
+    // again would be wrong, and would make them spend a login on nothing.
+    for status in [503u16, 502, 429] {
+        let dir = TestDir::new();
+        let store = expired_store(&dir);
+        let server = Scripted::server(move |request, _| match request.path.as_str() {
+            "/oauth/token" => StubResponse::text(status, "Service Unavailable"),
+            other => panic!("unexpected path {other}"),
+        });
+        let client = client(&server, store, clock());
+        let error = client.complete(&request()).unwrap_err();
+        assert!(
+            matches!(error, LlmError::Status { status: got } if got == status),
+            "{status}: {error:?}"
+        );
+        assert!(error.is_retryable(), "{status}: {error:?}");
+        assert_eq!(client.refreshes(), 1, "{status}");
+        assert_eq!(
+            server.paths(),
+            ["/oauth/token"],
+            "{status}: the request went out anyway"
+        );
+        // The credential is untouched: the next attempt can still refresh.
+        let saved = TokenStore::open(&dir.data()).load().unwrap().unwrap();
+        assert_eq!(saved.refresh_token.expose(), "rt-one", "{status}");
+    }
+}
+
+#[test]
+fn a_rejected_refresh_credential_asks_for_a_login() {
+    // The counterpart of the transient case: 400 (`invalid_grant`) and 401
+    // mean the issuer has rejected the credential, and only a login helps.
+    for (status, body) in [
+        (400u16, json!({"error": "invalid_grant"})),
+        (401, json!({"error": "invalid_client"})),
+    ] {
+        let dir = TestDir::new();
+        let store = expired_store(&dir);
+        let server = Scripted::server(move |request, _| match request.path.as_str() {
+            "/oauth/token" => StubResponse::json(status, body.clone()),
+            other => panic!("unexpected path {other}"),
+        });
+        let client = client(&server, store, clock());
+        let error = client.complete(&request()).unwrap_err();
+        assert!(
+            matches!(error, LlmError::LoginRequired),
+            "{status}: {error:?}"
+        );
+        assert!(!error.is_retryable());
+        assert_eq!(server.paths(), ["/oauth/token"], "{status}");
+    }
+}
+
+#[test]
+#[ignore = "defect 3: the login parses the poll reply as JSON before checking for a pending 403/404"]
+fn a_pending_device_authorization_with_a_plain_text_body_keeps_polling() {
+    // codex-rs checks the status first and parses JSON only on success. A
+    // 403 "Forbidden" or 404 "Not Found" with a text body is "pending",
+    // not a broken reply.
+    let exp = start()
+        .checked_add(SignedDuration::from_secs(3600))
+        .unwrap();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let issuer = {
+        let polls = Arc::clone(&polls);
+        StubServer::start(move |request| match request.path.as_str() {
+            "/api/accounts/deviceauth/usercode" => StubResponse::json(
+                200,
+                json!({"device_auth_id": "dev_123", "user_code": "ABCD-EFGH", "interval": "0"}),
+            ),
+            "/api/accounts/deviceauth/token" => match polls.fetch_add(1, Ordering::SeqCst) {
+                0 => StubResponse::text(403, "Forbidden"),
+                1 => StubResponse::text(404, "Not Found"),
+                _ => StubResponse::json(
+                    200,
+                    json!({
+                        "authorization_code": "code_9",
+                        "code_challenge": "chal",
+                        "code_verifier": "verif"
+                    }),
+                ),
+            },
+            "/oauth/token" => StubResponse::json(
+                200,
+                json!({
+                    "id_token": id_token(ACCOUNT_ID),
+                    "access_token": access_token("first", exp),
+                    "refresh_token": "rt-first"
+                }),
+            ),
+            other => panic!("unexpected path {other}"),
+        })
+    };
+    let dir = TestDir::new();
+    let store = TokenStore::open(&dir.data());
+    let tokens = device_code_login(&issuer.url, &store, clock().as_ref(), &mut |_| {})
+        .unwrap_or_else(|error| panic!("a pending poll was treated as a failure: {error:?}"));
+    assert_eq!(tokens.refresh_token.expose(), "rt-first");
+    assert_eq!(
+        issuer
+            .paths()
+            .iter()
+            .filter(|path| *path == "/api/accounts/deviceauth/token")
+            .count(),
+        3
+    );
+    assert!(store.path().exists());
+}
+
+#[test]
+#[ignore = "defect 3: the login parses the poll reply as JSON before checking for a pending 403/404"]
+fn a_non_json_refusal_at_any_login_step_reports_its_status() {
+    // A proxy's text error at any step is a status error naming the step,
+    // not "the reply couldn't be read".
+    let cases: [(&str, u16, &'static str); 3] = [
+        (
+            "/api/accounts/deviceauth/usercode",
+            503,
+            "deviceauth/usercode",
+        ),
+        ("/api/accounts/deviceauth/token", 400, "deviceauth/token"),
+        ("/oauth/token", 500, "oauth/token"),
+    ];
+    for (failing_path, status, step) in cases {
+        let issuer = StubServer::start(move |request| {
+            if request.path == failing_path {
+                return StubResponse::text(status, "upstream error");
+            }
+            match request.path.as_str() {
+                "/api/accounts/deviceauth/usercode" => StubResponse::json(
+                    200,
+                    json!({"device_auth_id": "dev_123", "user_code": "ABCD-EFGH", "interval": "0"}),
+                ),
+                "/api/accounts/deviceauth/token" => StubResponse::json(
+                    200,
+                    json!({
+                        "authorization_code": "code_9",
+                        "code_challenge": "chal",
+                        "code_verifier": "verif"
+                    }),
+                ),
+                other => panic!("unexpected path {other}"),
+            }
+        });
+        let dir = TestDir::new();
+        let store = TokenStore::open(&dir.data());
+        let error =
+            device_code_login(&issuer.url, &store, clock().as_ref(), &mut |_| {}).unwrap_err();
+        assert!(
+            matches!(&error, LoginError::Status { status: got, step: got_step } if *got == status && *got_step == step),
+            "{failing_path}: {error:?}"
+        );
+        assert!(!store.path().exists(), "{failing_path}");
     }
 }
 
