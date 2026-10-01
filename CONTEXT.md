@@ -5,7 +5,7 @@ Asphodel is a memory store for the Hermes agent. It works like human memory: it 
 ## Memories
 
 **Memory**:
-A single claim written as one sentence that makes sense on its own, with names in place of pronouns and dates made absolute.
+A single statement written as one sentence that makes sense on its own, with names in place of pronouns and dates made absolute.
 _Avoid_: Fact (a fact is one kind of memory), memory unit, record, note
 
 **Kind**:
@@ -13,19 +13,19 @@ The category of a memory, which decides how its validity behaves: fact, event, s
 _Avoid_: Type, fact type, category
 
 **Fact**:
-A memory that isn't expected to change, including preferences. It has no validity window when extracted.
+A memory that isn't expected to change, or whose change would be announced, including preferences, a job or a home. It's never given an end when extracted, though a stated start is kept.
 _Avoid_: Preference (as a separate kind), world fact
 
 **Event**:
-A memory of something that happens at a particular time or over a particular span.
+A memory of something that happens at a particular time or over a particular span, including anything with a stated end date.
 _Avoid_: Appointment, occurrence
 
 **State**:
-A memory of an ongoing condition that's expected to change eventually, like where the user is or what they're working on.
+A memory of an ongoing condition that's expected to change without anyone announcing it, like where the user is or what they're working on.
 _Avoid_: Status, situation
 
 **Task**:
-A memory of something to be done. It stays open until it's completed or cancelled, and it's overdue once its due date passes.
+A memory of something to be done. It stays open until an event recording its completion or cancellation ends it, and it's overdue once its due date passes.
 _Avoid_: Todo, reminder
 
 **Recurring**:
@@ -33,7 +33,7 @@ A memory of something that repeats on a schedule, held as one memory rather than
 _Avoid_: Rule, routine, repeating event
 
 **Significance**:
-How much a memory matters on its own terms, judged when it's extracted and adjustable by the user. It's the fixed baseline beneath strength.
+How much a memory matters on its own terms, judged at extraction as one of five levels (trivial, minor, notable, major, critical) and adjustable by the user. It's the fixed baseline beneath strength.
 _Avoid_: Importance, poignancy, priority
 
 **Volatility**:
@@ -63,7 +63,7 @@ Where a memory sits relative to now (upcoming, recently past or long past), alwa
 _Avoid_: Status, lifecycle state
 
 **Observed at**:
-When a memory's claim was made, taken from the source's message time rather than from when it was processed.
+When the statement behind a memory was made, taken from the source's message time rather than from when it was processed.
 _Avoid_: Created at, extracted at
 
 **Due date**:
@@ -89,7 +89,7 @@ A memory that turned out to be wrong, such as a correction or a rescheduled appo
 _Avoid_: Deleted, invalidated, cancelled
 
 **Refined**:
-A memory replaced by a more precise version of the same claim, without having been wrong.
+A memory replaced by a more precise version of the same statement, without having been wrong.
 _Avoid_: Updated, merged
 
 **Supersession**:
@@ -123,7 +123,7 @@ The kind of access where a reply actually relied on a recalled memory, as oppose
 _Avoid_: Retrieved, returned, injected
 
 **Mentioned again**:
-The kind of access where the user or a document independently states something already remembered.
+The kind of access where the user or a document independently states something already remembered. A later version of the same document repeating itself doesn't count.
 _Avoid_: Duplicate, repeat, re-extraction
 
 **Confirmed**:
@@ -183,8 +183,20 @@ The date that relative times in a source ("tomorrow", "last week") are resolved 
 _Avoid_: Event date, context date
 
 **Extraction**:
-Turning a source into memories and access events using the LLM.
+Turning a source into memories and access events using the LLM, one chunk at a time.
 _Avoid_: Retain, ingestion (ingestion is receiving the source, before extraction)
+
+**Chunk**:
+The unit a source is extracted in: a whole turn, or a section of a document, split further only when it's too long.
+_Avoid_: Segment, passage, piece
+
+**Claim**:
+A statement extraction has found in a chunk but not yet reconciled. It becomes a new memory, an access on an existing memory, or nothing.
+_Avoid_: Fact (that's a kind), candidate, extracted fact
+
+**Reconciliation**:
+The step of extraction that compares claims with the closest existing memories and decides whether each is new, mentioned again, confirmed, or ends, retracts or refines an existing memory.
+_Avoid_: Deduplication, merging, consolidation
 
 **Entity**:
 A person, place, organisation or thing that memories are about, recognised under several aliases. Every bank starts with the user and the assistant as entities.
