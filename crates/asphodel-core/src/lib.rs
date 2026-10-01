@@ -9,13 +9,15 @@ pub mod clock;
 pub mod config;
 pub mod constants;
 pub mod logging;
+pub mod models;
 pub mod service;
 pub mod store;
 pub mod strength;
 
 pub use clock::{Clock, SimulatedClock, SystemClock};
 pub use config::{ResolvedConfig, Tuning};
-pub use service::{Health, Housekeeping, Service};
+pub use models::Models;
+pub use service::{Health, Housekeeping, OpenError, Service};
 pub use store::Store;
 
 /// The version of this build, as reported by `/v1/health`.

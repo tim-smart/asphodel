@@ -15,7 +15,8 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use asphodel_core::config::{Deployment, LLM_API_KEY_ENV, Secret, TOKEN_ENV};
+use asphodel_core::config::{Deployment, LLM_API_KEY_ENV, ModelsConfig, Secret, TOKEN_ENV};
+use asphodel_core::models::Models;
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::{Clock, Health, ResolvedConfig, Service, SystemClock, Tuning};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
@@ -62,7 +63,26 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let store = Store::open(&args.data_dir, options, Arc::clone(&clock))
         .with_context(|| format!("opening the store in {}", args.data_dir.display()))?;
     config.purge = store.check_fingerprint(&config.deletion_fingerprint)?;
-    let service = Service::open(clock, store, config.tuning.clone());
+    let service = match models_switch()? {
+        ModelsSwitch::Fake => {
+            warn!(
+                "{MODELS_ENV}=fake: serving with the deterministic fake models, not the ONNX ones"
+            );
+            let models = Models::fake();
+            config.models = Some(ModelsConfig::new(
+                &models,
+                true,
+                args.onnx_threads.map(std::num::NonZeroUsize::get),
+            ));
+            Service::with_models(clock, store, config.tuning.clone(), models)?
+        }
+        ModelsSwitch::None => {
+            warn!(
+                "the ONNX models aren't loaded by serve yet, so recall and extraction have no embedder or reranker"
+            );
+            Service::open(clock, store, config.tuning.clone())
+        }
+    };
     info!(
         config = %serde_json::to_string(&config)?,
         "resolved config"
@@ -94,6 +114,27 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     }
     info!("asphodel stopped");
     Ok(())
+}
+
+/// `ASPHODEL_MODELS=fake` runs the daemon on the deterministic fake models.
+/// It is for tests, environment only, never in `--help`, and the resolved
+/// config says so.
+const MODELS_ENV: &str = "ASPHODEL_MODELS";
+
+enum ModelsSwitch {
+    None,
+    Fake,
+}
+
+fn models_switch() -> anyhow::Result<ModelsSwitch> {
+    match std::env::var_os(MODELS_ENV) {
+        None => Ok(ModelsSwitch::None),
+        Some(value) if value == "fake" => Ok(ModelsSwitch::Fake),
+        Some(value) => bail!(
+            "{MODELS_ENV} is {:?}; the only value is `fake`, for tests. Unset it to run the ONNX models",
+            value
+        ),
+    }
 }
 
 /// Loads the tuning file and records the deployment. An unreadable file,

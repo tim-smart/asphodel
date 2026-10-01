@@ -10,27 +10,64 @@ use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::clock::Clock;
-use crate::config::Tuning;
+use crate::config::{ConfigError, Tuning};
+use crate::models::Models;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
 
 /// One running store: the daemon's banks, models and jobs, driven by a clock.
 ///
-/// Later stages add the models and the extraction queue behind this type.
+/// Later stages add the extraction queue behind this type.
 pub struct Service {
     clock: Arc<dyn Clock>,
     store: Store,
     tuning: Tuning,
+    /// `None` only for a service built with [`Service::open`], which the
+    /// existing callers use; [`Service::with_models`] always sets it.
+    models: Option<Models>,
+}
+
+/// Why a service couldn't be built on a store and models.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    /// The tuning has no floor for a loaded model (ADR 0009).
+    #[error(transparent)]
+    Config(#[from] ConfigError),
 }
 
 impl Service {
-    /// Builds a service on an open store and the tuning it runs under.
+    /// Builds a service on an open store and the tuning it runs under,
+    /// without models. Retained for existing callers; `serve` and replay
+    /// use [`Service::with_models`].
     pub fn open(clock: Arc<dyn Clock>, store: Store, tuning: Tuning) -> Self {
         Self {
             clock,
             store,
             tuning,
+            models: None,
         }
+    }
+
+    /// Builds a service on an open store, the tuning it runs under and the
+    /// models it serves with. The tuning must have a floor for each model's
+    /// exact id, or the service doesn't open: a missing gate floor would
+    /// flood injection, and a missing reconcile floor would skip
+    /// reconciliation (ADR 0009). The check lives here, not in `serve`, so
+    /// the replay harness gets the same refusal (TIM-96, decision 3).
+    pub fn with_models(
+        clock: Arc<dyn Clock>,
+        store: Store,
+        tuning: Tuning,
+        models: Models,
+    ) -> Result<Self, OpenError> {
+        let ids = models.ids();
+        tuning.check_floors(&ids.embedding, &ids.reranker)?;
+        Ok(Self {
+            clock,
+            store,
+            tuning,
+            models: Some(models),
+        })
     }
 
     /// The clock this service runs on.
@@ -54,7 +91,14 @@ impl Service {
         &self.tuning
     }
 
-    /// Creates a bank or merges `identity` into it (TIM-94, decision 7).
+    /// The models the service serves with, when it was built with them.
+    pub fn models(&self) -> Option<&Models> {
+        self.models.as_ref()
+    }
+
+    /// Creates a bank or merges `identity` into it (TIM-94, decision 7),
+    /// recording `models` on creation. Retained for existing callers;
+    /// [`Service::ensure_bank_with_models`] records the loaded models.
     pub fn ensure_bank(
         &self,
         name: &str,
@@ -68,6 +112,19 @@ impl Service {
             models,
             self.tuning.mental_models.profile_max_tokens,
         )
+    }
+
+    /// Creates a bank or merges `identity` into it. A new bank records the
+    /// ids of the models this service was built with (TIM-94, decision 4);
+    /// a merge leaves the recorded ids alone, since a change goes through
+    /// `asphodel reembed` (TIM-99).
+    pub fn ensure_bank_with_models(
+        &self,
+        name: &str,
+        identity: &BankIdentity,
+    ) -> Result<Bank, BankError> {
+        let models = self.models.as_ref().ok_or(BankError::NoModels)?;
+        self.ensure_bank(name, identity, &models.ids())
     }
 
     /// The periodic store upkeep. `serve` calls it on a timer and the replay
@@ -104,6 +161,7 @@ impl std::fmt::Debug for Service {
         f.debug_struct("Service")
             .field("now", &self.now())
             .field("store", &self.store)
+            .field("models", &self.models)
             .finish_non_exhaustive()
     }
 }

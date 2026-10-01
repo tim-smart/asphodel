@@ -1,11 +1,13 @@
 //! The subcommand tree from "API surface and Hermes transport" (TIM-94,
 //! decision 10), plus `replay` and `bench` from the replay harness decision
-//! (TIM-96). Only `serve` does anything yet; the rest are stubs that later
-//! stages fill in.
+//! (TIM-96). `serve` and `models fetch` do something; the rest are stubs
+//! that later stages fill in.
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
+use asphodel_core::models::{HttpFetcher, ModelDir, fetch_models, manifest};
 use clap::{Args, Parser, Subcommand};
 
 use crate::listen::Listen;
@@ -94,6 +96,10 @@ pub struct ServeArgs {
     /// Directory holding the embedding and reranker models.
     #[arg(long, env = "ASPHODEL_MODEL_DIR")]
     pub model_dir: Option<PathBuf>,
+
+    /// Intra-op threads for ONNX Runtime. Unset leaves it to the runtime.
+    #[arg(long, env = "ASPHODEL_ONNX_THREADS")]
+    pub onnx_threads: Option<NonZeroUsize>,
 }
 
 #[derive(Debug, Args)]
@@ -219,7 +225,7 @@ impl Cli {
             Command::Forget(_) => stub("forget"),
             Command::Keep(_) => stub("keep"),
             Command::Unkeep(_) => stub("unkeep"),
-            Command::Models(ModelsCommand::Fetch { .. }) => stub("models fetch"),
+            Command::Models(ModelsCommand::Fetch { model_dir }) => models_fetch(model_dir),
             Command::Replay(_) => stub("replay"),
             Command::Bench(_) => stub("bench"),
         }
@@ -231,6 +237,41 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(crate::serve::run(args))
+}
+
+/// Resolves the model dir as the daemon does: the flag or
+/// `ASPHODEL_MODEL_DIR`, else the XDG cache, else under `HOME`.
+pub(crate) fn resolve_model_dir(
+    override_dir: Option<&std::path::Path>,
+) -> anyhow::Result<ModelDir> {
+    let env = |name: &str| std::env::var_os(name).map(PathBuf::from);
+    Ok(ModelDir::resolve(
+        override_dir,
+        env("XDG_CACHE_HOME").as_deref(),
+        env("HOME").as_deref(),
+    )?)
+}
+
+/// `asphodel models fetch`: fills the model dir from the manifest, skipping
+/// files already present with the right checksum (TIM-94, decision 4).
+fn models_fetch(model_dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let dir = resolve_model_dir(model_dir.as_deref())?;
+    let report = fetch_models(&dir, &manifest(), &HttpFetcher::new())
+        .with_context(|| format!("filling {}", dir.path().display()))?;
+    for path in &report.fetched {
+        println!("fetched {}", path.display());
+    }
+    for path in &report.skipped {
+        println!("kept    {}", path.display());
+    }
+    println!(
+        "{} files in {}: {} fetched, {} already there",
+        report.fetched.len() + report.skipped.len(),
+        dir.path().display(),
+        report.fetched.len(),
+        report.skipped.len()
+    );
+    Ok(())
 }
 
 fn stub(name: &str) -> anyhow::Result<()> {

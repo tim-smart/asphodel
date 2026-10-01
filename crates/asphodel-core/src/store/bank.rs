@@ -45,7 +45,7 @@ pub struct BankIdentity {
 
 /// The models a bank is served with, recorded at creation (TIM-94,
 /// decision 4). A later change goes through `asphodel reembed`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelIds {
     pub embedding: String,
     pub reranker: String,
@@ -72,6 +72,10 @@ pub enum BankError {
 
     #[error("unknown timezone")]
     InvalidTimezone,
+
+    /// The service was built without models, so there are no ids to record.
+    #[error("no models are loaded, so a bank can't record them")]
+    NoModels,
 
     #[error(transparent)]
     Store(#[from] StoreError),

@@ -20,7 +20,7 @@ mod tuning;
 
 pub use deployment::{Deployment, LLM_API_KEY_ENV, Secret, TOKEN_ENV};
 pub use fingerprint::{DeletionInputs, Fingerprint, deletion_fingerprint};
-pub use resolved::{PurgePause, ResolvedConfig};
+pub use resolved::{ModelsConfig, PurgePause, ResolvedConfig};
 pub use tuning::{
     AgendaTuning, ClockTuning, ConfigError, InjectionTuning, InvalidValue, Layer, LlmTuning,
     MentalModelsTuning, PurgeTuning, RecallTuning, ReconcileTuning, SessionsTuning, Tuning,
