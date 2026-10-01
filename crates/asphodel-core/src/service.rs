@@ -75,9 +75,16 @@ impl Service {
     /// either way (TIM-96, decision 3). It runs whether or not purge is
     /// paused: deleting an expired pre-migration copy is ADR 0010's bound on
     /// how long forgotten content survives, not a purge.
+    ///
+    /// The result says when the next pass is due, so a caller can wake at a
+    /// copy's deadline instead of finding it on a later poll.
     pub fn housekeeping(&self) -> Result<Housekeeping, StoreError> {
         let copies_removed = self.store.expire_copies()?;
-        Ok(Housekeeping { copies_removed })
+        let next_due = self.store.next_copy_expiry()?;
+        Ok(Housekeeping {
+            copies_removed,
+            next_due,
+        })
     }
 
     /// What `/v1/health` reports. The daemon is not ready while models load
@@ -106,6 +113,9 @@ impl std::fmt::Debug for Service {
 pub struct Housekeeping {
     /// The pre-migration copies it deleted.
     pub copies_removed: Vec<PathBuf>,
+    /// When the next pass has work, on the service's clock: the earliest
+    /// deadline of a copy still on disk. `None` when nothing is pending.
+    pub next_due: Option<Timestamp>,
 }
 
 /// The health response. The plugin compares `version`'s major against the

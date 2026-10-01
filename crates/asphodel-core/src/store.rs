@@ -13,7 +13,8 @@
 //! 5. take the pre-migration copy and run any pending migrations (ADR 0010);
 //! 6. delete pre-migration copies older than seven days.
 //!
-//! The service repeats step 6 on a timer through [`Store::expire_copies`].
+//! The service repeats step 6 through [`Store::expire_copies`], waking at
+//! the deadline [`Store::next_copy_expiry`] gives.
 //!
 //! Every timestamp written here comes from the [`Clock`] the store was
 //! opened with; no SQL reads SQLite's clock (TIM-90).
@@ -294,6 +295,12 @@ impl Store {
     /// it while the daemon runs, so the bound holds without a restart.
     pub fn expire_copies(&self) -> Result<Vec<PathBuf>, StoreError> {
         expire_copies(&self.connection(), &self.dir, self.clock.now())
+    }
+
+    /// When the next pre-migration copy on disk is due for deletion, so the
+    /// daemon can wake for it rather than wait for its next poll.
+    pub fn next_copy_expiry(&self) -> Result<Option<Timestamp>, StoreError> {
+        migrations::next_copy_expiry(&self.connection(), &self.dir)
     }
 
     /// Checkpoints the WAL into the database file, as the daemon does on

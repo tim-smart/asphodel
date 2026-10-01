@@ -155,21 +155,11 @@ pub fn expire_copies(
     dir: &Path,
     now: Timestamp,
 ) -> Result<Vec<PathBuf>, StoreError> {
-    let mut statement = conn.prepare(
-        "SELECT from_version, completed_at FROM migrations WHERE from_version > 0 ORDER BY to_version",
-    )?;
-    let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
     let mut removed = Vec::new();
-    for row in rows {
-        let (from, completed_at) = row?;
-        let from = u32::try_from(from).unwrap_or(0);
-        let expires_at = timestamp(completed_at)
-            .checked_add(PRE_MIGRATION_COPY_TTL)
-            .unwrap_or(Timestamp::MAX);
+    for (path, expires_at) in copy_deadlines(conn, dir)? {
         if now < expires_at {
             continue;
         }
-        let path = copy_path(dir, from);
         match std::fs::remove_file(&path) {
             Ok(()) => removed.push(path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -182,4 +172,33 @@ pub fn expire_copies(
         }
     }
     Ok(removed)
+}
+
+/// When the next pre-migration copy still on disk is due for deletion, if
+/// any is. A copy that is already gone has no deadline, so a deleted copy
+/// can't keep the daemon waking for it.
+pub fn next_copy_expiry(conn: &Connection, dir: &Path) -> Result<Option<Timestamp>, StoreError> {
+    Ok(copy_deadlines(conn, dir)?
+        .into_iter()
+        .filter(|(path, _)| path.exists())
+        .map(|(_, expires_at)| expires_at)
+        .min())
+}
+
+/// Every copy a completed migration has a row for, with when it expires.
+fn copy_deadlines(conn: &Connection, dir: &Path) -> Result<Vec<(PathBuf, Timestamp)>, StoreError> {
+    let mut statement = conn.prepare(
+        "SELECT from_version, completed_at FROM migrations WHERE from_version > 0 ORDER BY to_version",
+    )?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+    let mut deadlines = Vec::new();
+    for row in rows {
+        let (from, completed_at) = row?;
+        let from = u32::try_from(from).unwrap_or(0);
+        let expires_at = timestamp(completed_at)
+            .checked_add(PRE_MIGRATION_COPY_TTL)
+            .unwrap_or(Timestamp::MAX);
+        deadlines.push((copy_path(dir, from), expires_at));
+    }
+    Ok(deadlines)
 }

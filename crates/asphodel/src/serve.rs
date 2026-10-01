@@ -21,7 +21,6 @@ use asphodel_core::{Clock, Health, ResolvedConfig, Service, SystemClock, Tuning}
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::signal;
-use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::cli::ServeArgs;
@@ -29,9 +28,16 @@ use crate::listen::Listen;
 
 type Shared = Arc<Service>;
 
-/// How often the daemon runs its housekeeping. Hourly keeps a pre-migration
-/// copy within an hour of its seven days (ADR 0010).
+/// The longest the daemon waits between housekeeping passes. It normally
+/// wakes at the next copy's deadline (ADR 0010); this cap bounds how late
+/// that wake can be after a host suspend, which tokio's monotonic timer
+/// doesn't count, and is the retry delay after a failed pass.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// The shortest wait between passes. The timer is monotonic and the
+/// deadline is on the service's clock, so a wake can land just short of it;
+/// this keeps that from becoming a run of near-zero waits.
+const HOUSEKEEPING_MIN_WAIT: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 mod tests;
@@ -196,24 +202,40 @@ impl UnixSocketCleanup {
     }
 }
 
-/// Runs [`Service::housekeeping`] every [`HOUSEKEEPING_INTERVAL`] until the
-/// service is dropped. It holds the service weakly so the store still closes,
-/// and checkpoints, when `run` returns.
+/// Runs [`Service::housekeeping`] at each pass's `next_due`, or after
+/// [`HOUSEKEEPING_INTERVAL`] if that comes first, until the service is
+/// dropped. It holds the service weakly, and never across a wait, so the
+/// store still closes, and checkpoints, when `run` returns.
 async fn housekeeping(service: Weak<Service>) {
-    let mut interval = tokio::time::interval(HOUSEKEEPING_INTERVAL);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // The first tick is immediate, and opening the store just did the work.
-    interval.tick().await;
     loop {
-        interval.tick().await;
         let Some(service) = service.upgrade() else {
             return;
         };
-        match tokio::task::spawn_blocking(move || service.housekeeping()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => warn!(%error, "housekeeping failed"),
-            Err(error) => warn!(%error, "housekeeping panicked"),
-        }
+        // The first pass runs at once: open deletes what has expired but
+        // doesn't say when the next copy is due.
+        let pass = tokio::task::spawn_blocking(move || {
+            let result = service.housekeeping();
+            (result, service.now())
+        })
+        .await;
+        let wait = match pass {
+            Ok((Ok(done), now)) => done.next_due.map_or(HOUSEKEEPING_INTERVAL, |due| {
+                // A deadline already past converts to nothing: wait the
+                // minimum and run again.
+                Duration::try_from(now.duration_until(due))
+                    .unwrap_or(Duration::ZERO)
+                    .clamp(HOUSEKEEPING_MIN_WAIT, HOUSEKEEPING_INTERVAL)
+            }),
+            Ok((Err(error), _)) => {
+                warn!(%error, "housekeeping failed");
+                HOUSEKEEPING_INTERVAL
+            }
+            Err(error) => {
+                warn!(%error, "housekeeping panicked");
+                HOUSEKEEPING_INTERVAL
+            }
+        };
+        tokio::time::sleep(wait).await;
     }
 }
 
