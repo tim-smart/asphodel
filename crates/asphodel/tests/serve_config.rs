@@ -318,3 +318,46 @@ fn the_startup_log_carries_the_resolved_config() {
         assert!(!config[key].is_null(), "missing {key} in {config}");
     }
 }
+
+#[test]
+#[ignore = "known endpoint-validation bug; activate with production fix"]
+fn a_malformed_llm_endpoint_stops_startup() {
+    let dir = TestDir::new();
+    let path = dir.file("tuning.toml", "[llm]\nendpoint = \"http://\"\n");
+    // A file avoids a pipe filling while waiting. The guard kills and reaps
+    // the child on every exit path, including a timeout or assertion panic.
+    let log_path = dir.0.join("stderr.log");
+    let child = serve()
+        .args(["--listen", "127.0.0.1:0"])
+        .arg("--config")
+        .arg(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log_path).unwrap())
+        .spawn()
+        .unwrap();
+    let mut daemon = Daemon {
+        child,
+        log: String::new(),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = daemon.child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(daemon);
+    let log = std::fs::read_to_string(log_path).unwrap();
+    let status = status.unwrap_or_else(|| {
+        panic!("invalid endpoint did not stop startup within 5 seconds:\n{log}")
+    });
+    assert!(
+        !status.success(),
+        "invalid endpoint exited successfully:\n{log}"
+    );
+    assert!(log.contains("llm.endpoint"), "{log}");
+}
