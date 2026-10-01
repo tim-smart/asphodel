@@ -724,7 +724,6 @@ fn access_permutations(accesses: &[Access]) -> Vec<Vec<Access>> {
 }
 
 #[test]
-#[ignore = "TIM-104: pending heaviest-first equal-time access ordering in production"]
 fn tie_order_mixed_weights_are_heaviest_first() {
     let expected = strength_at(0.1, &[confirmed(0.0), created(0.0)], 100.0);
     // confirmed has d = a; the massed created access has d capped at 2.
@@ -737,7 +736,6 @@ fn tie_order_mixed_weights_are_heaviest_first() {
 }
 
 #[test]
-#[ignore = "TIM-104: pending heaviest-first equal-time access ordering in production"]
 fn tie_order_inherited_logs_are_independent_of_concatenation_order() {
     let maya = [created(0.0), mentioned(20.0)];
     let mia = [created(20.0)];
@@ -792,7 +790,6 @@ fn tie_order_mentioned_precedes_synthetic_restart() {
 }
 
 #[test]
-#[ignore = "TIM-104: pending heaviest-first equal-time access ordering in production"]
 fn tie_order_mixed_real_accesses_at_synthetic_restart_are_heaviest_first() {
     let accesses = [created(0.0), confirmed(12.0), mentioned(12.0)];
     let expected = closed_strength(0.1, &accesses, close(10.0, 12.0), 100.0);
@@ -810,7 +807,6 @@ fn tie_order_mixed_real_accesses_at_synthetic_restart_are_heaviest_first() {
 }
 
 #[test]
-#[ignore = "TIM-104: pending heaviest-first equal-time access ordering in production"]
 fn tie_order_adding_tied_accesses_never_weakens_the_heaviest_alone() {
     let sets = [
         vec![created(0.0), confirmed(0.0)],
