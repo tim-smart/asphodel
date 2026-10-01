@@ -56,9 +56,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use asphodel_core::clock::{Clock, SimulatedClock};
 use asphodel_core::config::{Deployment, Secret, Tuning};
@@ -786,10 +787,12 @@ fn the_token_file_lives_under_the_data_dir_with_mode_0600() {
     assert_eq!(store.load().unwrap(), Some(saved.clone()));
 
     // No temp file is left behind, and the file holds the raw tokens (it
-    // is the one place they may be written).
+    // is the one place they may be written). The token store's lock file,
+    // `llm-tokens.lock`, may sit next to it; it holds nothing.
     let entries: Vec<_> = std::fs::read_dir(&data)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != "llm-tokens.lock")
         .collect();
     assert_eq!(entries, [TOKEN_FILE]);
     let text = std::fs::read_to_string(store.path()).unwrap();
@@ -1765,6 +1768,497 @@ fn a_non_json_refusal_at_any_login_step_reports_its_status() {
             "{failing_path}: {error:?}"
         );
         assert!(!store.path().exists(), "{failing_path}");
+    }
+}
+
+// Security regressions (security review of edd84ad). Each failing one is
+// ignored until its fix lands; run them by name with `--ignored` to see the
+// defect.
+
+/// Holds the issuer's refresh reply until the test opens it, and tells the
+/// test when a refresh has arrived. The tests synchronise on the issuer
+/// receiving the refresh, not on a sleep, so "a refresh is in flight" is a
+/// fact when they act on it.
+struct Gate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    arrived: usize,
+    open: bool,
+}
+
+impl Gate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(GateState::default()),
+            changed: Condvar::new(),
+        })
+    }
+
+    /// Called by the stub: counts the arrival, then waits until the gate
+    /// opens. The wait is bounded so a failing test can't hang the suite.
+    fn pass(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.arrived += 1;
+        self.changed.notify_all();
+        let _ = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(10), |state| !state.open)
+            .unwrap();
+    }
+
+    /// Whether `count` requests have arrived within `timeout`.
+    fn arrived(&self, count: usize, timeout: Duration) -> bool {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.arrived < count)
+            .unwrap();
+        state.arrived >= count
+    }
+
+    fn open(&self) {
+        self.state.lock().unwrap().open = true;
+        self.changed.notify_all();
+    }
+}
+
+/// How long a token-file write gets to finish while a refresh is held at
+/// the issuer. Returning inside it means the write didn't wait for the
+/// refresh. A process needs longer than a thread just to start.
+const THREAD_GRACE: Duration = Duration::from_millis(300);
+const PROCESS_GRACE: Duration = Duration::from_secs(1);
+
+/// A server whose `/oauth/token` refresh waits at `gate` before rotating
+/// to `rotated` / `rt-two`, and whose `/responses` always completes.
+fn gated_server(gate: &Arc<Gate>, exp: Timestamp) -> StubServer {
+    let gate = Arc::clone(gate);
+    Scripted::server(move |request, _| match request.path.as_str() {
+        "/oauth/token" => {
+            gate.pass();
+            refresh_reply("rotated", "two", exp)
+        }
+        "/responses" => StubResponse::stream(sse_completion("{}")),
+        other => panic!("unexpected path {other}"),
+    })
+}
+
+fn an_hour_from_start() -> Timestamp {
+    start()
+        .checked_add(SignedDuration::from_secs(3600))
+        .unwrap()
+}
+
+/// What `asphodel llm login` saves: a different session from the one the
+/// daemon is refreshing.
+fn relogin_tokens() -> ChatgptTokens {
+    tokens("relogin", "three", an_hour_from_start(), start())
+}
+
+#[test]
+#[ignore = "security 1: refresh saves without a lock the login's save shares, so a login during a refresh is overwritten"]
+fn a_login_saved_during_a_refresh_waits_for_it_and_wins() {
+    let dir = TestDir::new();
+    let store = expired_store(&dir);
+    let data = dir.data();
+    let gate = Gate::new();
+    let server = gated_server(&gate, an_hour_from_start());
+    let client = Arc::new(client(&server, store, clock()));
+
+    let worker = {
+        let client = Arc::clone(&client);
+        std::thread::spawn(move || client.complete(&request()))
+    };
+    assert!(
+        gate.arrived(1, Duration::from_secs(5)),
+        "the refresh never reached the issuer"
+    );
+
+    // `asphodel llm login` saves while the refresh is in flight. With the
+    // lock this save waits for the refresh's own save, then replaces it.
+    let (saved, saved_rx) = std::sync::mpsc::channel();
+    let login = std::thread::spawn(move || {
+        TokenStore::open(&data).save(&relogin_tokens()).unwrap();
+        let _ = saved.send(());
+    });
+    let saved_during_refresh = saved_rx.recv_timeout(THREAD_GRACE).is_ok();
+    gate.open();
+    login.join().unwrap();
+    worker.join().unwrap().unwrap();
+
+    let file = TokenStore::open(&dir.data()).load().unwrap().unwrap();
+    assert_eq!(
+        file.refresh_token.expose(),
+        "rt-three",
+        "the refresh overwrote the new login"
+    );
+    assert!(
+        !saved_during_refresh,
+        "the login's save didn't wait for the refresh in flight"
+    );
+    // The worker's own retry used what its refresh rotated to.
+    assert_eq!(
+        server.requests().last().unwrap().bearer(),
+        Some(access_token("rotated", an_hour_from_start()).as_str())
+    );
+
+    // The next call runs on the login, with no refresh.
+    client.complete(&request()).unwrap();
+    assert_eq!(client.refreshes(), 1);
+    assert_eq!(
+        server.requests().last().unwrap().bearer(),
+        Some(access_token("relogin", an_hour_from_start()).as_str())
+    );
+}
+
+#[test]
+#[ignore = "security 1: each client has its own refresh mutex, so two clients on one store both spend the refresh token"]
+fn two_clients_on_one_store_share_one_refresh() {
+    // Refresh tokens are single-use, so the lock has to belong to the token
+    // store, not to one `CodexResponses`.
+    let dir = TestDir::new();
+    expired_store(&dir);
+    let gate = Gate::new();
+    let server = gated_server(&gate, an_hour_from_start());
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let client = client(&server, TokenStore::open(&dir.data()), clock());
+            std::thread::spawn(move || client.complete(&request()).map(|r| r.json))
+        })
+        .collect();
+    assert!(
+        gate.arrived(1, Duration::from_secs(5)),
+        "no refresh reached the issuer"
+    );
+    let second_refresh = gate.arrived(2, THREAD_GRACE);
+    gate.open();
+    let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+
+    assert!(!second_refresh, "a second refresh reached the issuer");
+    for result in results {
+        assert_eq!(result.unwrap(), json!({}));
+    }
+    let paths = server.paths();
+    assert_eq!(
+        paths.iter().filter(|p| *p == "/oauth/token").count(),
+        1,
+        "{paths:?}"
+    );
+    for request in server.requests().iter().filter(|r| r.path == "/responses") {
+        assert_eq!(
+            request.bearer(),
+            Some(access_token("rotated", an_hour_from_start()).as_str())
+        );
+    }
+}
+
+/// Selects [`token_store_in_a_child_process`] and what it does.
+const CHILD_OP_ENV: &str = "ASPHODEL_TEST_TOKEN_STORE_OP";
+const CHILD_DATA_ENV: &str = "ASPHODEL_TEST_TOKEN_STORE_DATA";
+
+/// Not a test on its own: the cross-process tests re-run this binary with
+/// only this selected, so a `TokenStore` in another process writes the
+/// file, as `asphodel llm login` does. Without the variables it does
+/// nothing.
+#[test]
+fn token_store_in_a_child_process() {
+    let Ok(op) = std::env::var(CHILD_OP_ENV) else {
+        return;
+    };
+    let data = PathBuf::from(std::env::var_os(CHILD_DATA_ENV).unwrap());
+    let store = TokenStore::open(&data);
+    match op.as_str() {
+        "save" => store.save(&relogin_tokens()).unwrap(),
+        "clear" => store.clear().unwrap(),
+        other => panic!("unknown op {other}"),
+    }
+}
+
+/// A child process, killed on drop.
+struct ChildProcess(Child);
+
+impl ChildProcess {
+    /// Runs `op` (`save` or `clear`) on the token store in `data` from a
+    /// separate process.
+    fn token_store(op: &str, data: &Path) -> Self {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "token_store_in_a_child_process",
+                "--test-threads=1",
+            ])
+            .env(CHILD_OP_ENV, op)
+            .env(CHILD_DATA_ENV, data)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Self(child)
+    }
+
+    /// Its exit status, if it exits within `timeout`.
+    fn exited_within(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for ChildProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Holds a refresh at the issuer, runs `op` on the token file from another
+/// process, then lets the refresh finish. Returns whether `op` finished
+/// while the refresh was still in flight, and the server.
+fn token_store_op_during_a_refresh(dir: &TestDir, op: &str) -> (bool, StubServer) {
+    let store = expired_store(dir);
+    let gate = Gate::new();
+    let server = gated_server(&gate, an_hour_from_start());
+    let client = client(&server, store, clock());
+    let worker = std::thread::spawn(move || client.complete(&request()));
+    assert!(
+        gate.arrived(1, Duration::from_secs(5)),
+        "the refresh never reached the issuer"
+    );
+
+    let mut child = ChildProcess::token_store(op, &dir.data());
+    let during_refresh = child.exited_within(PROCESS_GRACE);
+    gate.open();
+    let status = during_refresh
+        .or_else(|| child.exited_within(Duration::from_secs(10)))
+        .unwrap_or_else(|| panic!("the child's {op} never finished"));
+    assert!(status.success(), "the child's {op} failed: {status}");
+    worker.join().unwrap().unwrap();
+    (during_refresh.is_some(), server)
+}
+
+#[test]
+#[ignore = "security 1: the token store has no cross-process lock, so another process's save lands mid-refresh and is overwritten"]
+fn a_save_from_another_process_waits_for_a_refresh_and_wins() {
+    let dir = TestDir::new();
+    let (saved_during_refresh, _server) = token_store_op_during_a_refresh(&dir, "save");
+    let file = TokenStore::open(&dir.data()).load().unwrap().unwrap();
+    assert_eq!(
+        file.refresh_token.expose(),
+        "rt-three",
+        "the refresh overwrote the other process's login"
+    );
+    assert!(
+        !saved_during_refresh,
+        "the other process's save didn't wait for the refresh in flight"
+    );
+}
+
+#[test]
+#[ignore = "security 1: clear takes no lock, so a refresh in flight writes the tokens back after another process clears them"]
+fn a_clear_from_another_process_waits_for_a_refresh_and_stays_cleared() {
+    let dir = TestDir::new();
+    let (cleared_during_refresh, _server) = token_store_op_during_a_refresh(&dir, "clear");
+    let store = TokenStore::open(&dir.data());
+    assert!(
+        store.load().unwrap().is_none(),
+        "the refresh wrote the tokens back after they were cleared"
+    );
+    assert!(
+        !cleared_during_refresh,
+        "the other process's clear didn't wait for the refresh in flight"
+    );
+}
+
+/// Where `TokenStore::save` puts its temp file today: the token file's
+/// name, `.part-`, and this process's id. The fix moves to fresh names, so
+/// a file planted here must then simply be left alone.
+fn predictable_temp(store: &TokenStore) -> PathBuf {
+    let mut temp = store.path().as_os_str().to_owned();
+    temp.push(format!(".part-{}", std::process::id()));
+    PathBuf::from(temp)
+}
+
+#[test]
+#[ignore = "security 2: save opens its predictable temp name with create+truncate, so it writes through a planted symlink"]
+fn save_never_writes_through_a_planted_temp_symlink() {
+    let dir = TestDir::new();
+    let data = dir.data();
+    let store = TokenStore::open(&data);
+    let victim = data.join("other.txt");
+    std::fs::write(&victim, "irreplaceable contents").unwrap();
+    let planted = predictable_temp(&store);
+    std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+    store.save(&relogin_tokens()).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "irreplaceable contents",
+        "the tokens were written through the symlink"
+    );
+    let installed = std::fs::symlink_metadata(store.path()).unwrap();
+    assert!(
+        installed.file_type().is_file(),
+        "the token file is not a regular file: {:?}",
+        installed.file_type()
+    );
+    assert_eq!(mode(file_mode(store.path())), mode(0o600));
+    assert_eq!(
+        store.load().unwrap().unwrap().refresh_token.expose(),
+        "rt-three"
+    );
+    assert!(
+        std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted symlink was removed or replaced"
+    );
+}
+
+#[test]
+#[ignore = "security 2: save truncates and renames whatever already sits at its predictable temp name"]
+fn save_leaves_a_pre_existing_temp_file_alone() {
+    let dir = TestDir::new();
+    let data = dir.data();
+    let store = TokenStore::open(&data);
+    let planted = predictable_temp(&store);
+    std::fs::write(&planted, "someone else's file").unwrap();
+
+    store.save(&relogin_tokens()).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&planted).ok().as_deref(),
+        Some("someone else's file"),
+        "the pre-existing file was overwritten or moved"
+    );
+    assert_eq!(
+        store.load().unwrap().unwrap().refresh_token.expose(),
+        "rt-three"
+    );
+    assert_eq!(mode(file_mode(store.path())), mode(0o600));
+}
+
+/// The three ways a stream ends in a backend error, each carrying `code`
+/// where the client reads it.
+fn terminal_events(code: &str) -> [(&'static str, String); 3] {
+    [
+        (
+            "response.failed",
+            sse(&[(
+                "response.failed",
+                json!({
+                    "type": "response.failed",
+                    "response": {"id": "resp_f", "status": "failed", "error": {"code": code, "message": "failed"}}
+                }),
+            )]),
+        ),
+        (
+            "response.incomplete",
+            sse(&[(
+                "response.incomplete",
+                json!({
+                    "type": "response.incomplete",
+                    "response": {"id": "resp_i", "status": "incomplete", "incomplete_details": {"reason": code}}
+                }),
+            )]),
+        ),
+        (
+            "error",
+            sse(&[(
+                "error",
+                json!({"type": "error", "code": code, "message": "error", "param": null}),
+            )]),
+        ),
+    ]
+}
+
+/// What a reflecting backend copies from the request into its error code.
+type Reflect = fn(&StubRequest) -> String;
+
+fn backend_code(error: &LlmError) -> Option<String> {
+    match error {
+        LlmError::Backend { code } => Some(code.to_string()),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_known_backend_code_passes_through_every_terminal_event() {
+    for (shape, body) in terminal_events("context_length_exceeded") {
+        let backend = StubServer::backend(StubResponse::stream(body));
+        let dir = TestDir::new();
+        let error = client(&backend, logged_in_store(&dir), clock())
+            .complete(&request())
+            .unwrap_err();
+        assert_eq!(
+            backend_code(&error).as_deref(),
+            Some("context_length_exceeded"),
+            "{shape}: {error:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "security 3: backend error codes are copied verbatim into LlmError::Backend"]
+fn a_backend_code_reflecting_a_secret_or_the_prompt_never_reaches_the_error() {
+    // The backend echoes what it was sent into the field the client keeps.
+    // Whatever arrives there, only a fixed code may come out.
+    let user = request().user;
+    let reflections: [(&str, Reflect); 3] = [
+        ("the bearer token", |sent| {
+            sent.bearer().unwrap_or_default().to_string()
+        }),
+        ("the prompt", |sent| {
+            sent.json()["input"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }),
+        ("a forged log line", |_| {
+            "server_error\nForged: logged in as admin".to_string()
+        }),
+    ];
+    let bearer = access_token("current", an_hour_from_start());
+    for (shape, (label, _)) in terminal_events("").iter().enumerate() {
+        for (name, reflect) in reflections {
+            let backend = StubServer::start(move |sent| {
+                StubResponse::stream(terminal_events(&reflect(sent))[shape].1.clone())
+            });
+            let dir = TestDir::new();
+            let error = client(&backend, logged_in_store(&dir), clock())
+                .complete(&request())
+                .unwrap_err();
+            let shown = format!("{error} {error:?}");
+            for forbidden in [
+                bearer.as_str(),
+                "eyJ",
+                user.as_str(),
+                "Wellington",
+                "Forged",
+            ] {
+                assert!(
+                    !shown.contains(forbidden),
+                    "{label} reflecting {name}: {forbidden:?} in {shown}"
+                );
+            }
+            assert_eq!(
+                backend_code(&error).as_deref(),
+                Some("unknown"),
+                "{label} reflecting {name}: {error:?}"
+            );
+        }
     }
 }
 

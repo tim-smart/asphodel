@@ -676,6 +676,57 @@ fn fetch_stops_at_the_first_failure_and_keeps_what_it_wrote() {
     assert_eq!(report.fetched.len(), 8);
 }
 
+#[test]
+#[ignore = "security 2: fetch writes its predictable temp name through whatever is there, so a planted symlink redirects the model bytes"]
+fn fetch_never_writes_through_a_planted_temp_symlink() {
+    // Today the temp file is `<file>.part-<pid>`. The fix moves to fresh
+    // names created exclusively, so a symlink planted here must simply be
+    // left alone.
+    let dir = TestDir::new();
+    let models = dir.models();
+    let canned = canned();
+    let spec = &canned.specs[0];
+    let target = models.file(spec, &spec.files[0].name);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let victim = dir.join("victim.txt");
+    std::fs::write(&victim, "irreplaceable contents").unwrap();
+    let mut planted = target.as_os_str().to_owned();
+    planted.push(format!(".part-{}", std::process::id()));
+    let planted = PathBuf::from(planted);
+    std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+    fetch_models(
+        &models,
+        &canned.specs,
+        &MapFetcher::new(canned.bytes.clone()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "irreplaceable contents",
+        "the model bytes were written through the symlink"
+    );
+    let installed = std::fs::symlink_metadata(&target).unwrap();
+    assert!(
+        installed.file_type().is_file(),
+        "{} is not a regular file: {:?}",
+        target.display(),
+        installed.file_type()
+    );
+    assert_eq!(
+        sha256_hex(&std::fs::read(&target).unwrap()),
+        spec.files[0].sha256
+    );
+    assert!(
+        std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted symlink was removed or replaced"
+    );
+}
+
 // Loading: never a download, and a missing file fails fast.
 
 #[test]
