@@ -460,10 +460,29 @@ impl Tuning {
         {
             fail("llm.model", "must not be empty".into());
         }
-        if let Some(endpoint) = &self.llm.endpoint
-            && !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
-        {
-            fail("llm.endpoint", "must be an http:// or https:// URL".into());
+        if let Some(endpoint) = &self.llm.endpoint {
+            // Keep the raw spelling: URL parsing silently repairs missing
+            // slashes and surrounding whitespace. Validation must not do so.
+            let explicit_scheme =
+                endpoint.starts_with("http://") || endpoint.starts_with("https://");
+            let valid = explicit_scheme
+                && endpoint.trim() == endpoint
+                && url::Url::parse(endpoint).is_ok_and(|url| {
+                    url.has_host()
+                        && url.port() != Some(0)
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                });
+            if !valid {
+                // Neither the raw URL nor parser errors belong in startup
+                // diagnostics: userinfo and queries can contain secrets.
+                fail(
+                    "llm.endpoint",
+                    "must be an http:// or https:// URL with a host and a nonzero port, without credentials, query, fragment or surrounding whitespace".into(),
+                );
+            }
         }
 
         if errors.is_empty() {
