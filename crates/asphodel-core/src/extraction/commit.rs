@@ -8,12 +8,25 @@ use uuid::Uuid;
 
 use super::claims::{Checked, Link, NewMemory, Stamp, is_pronoun};
 use super::input::{Unit, survivor};
-use super::{Call1Input, EntityKind, Extracted};
-use crate::constants::{Significance, Volatility};
+use super::reconcile::{Edit, Fate, Neighbour, Plan, end_at};
+use super::{
+    Call1Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT, EDIT_REFINED,
+    EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted,
+};
+use crate::constants::{
+    Significance, Volatility, WEIGHT_CONFIRMED, WEIGHT_CREATED, WEIGHT_MENTIONED_AGAIN, WEIGHT_USED,
+};
 use crate::queue::{self, Lease};
-use crate::store::bank::{add_alias, log_edit};
+use crate::store::bank::{add_alias, log_edit, log_memory_edit};
 use crate::store::{Store, StoreError, VectorError, VectorIndex, micros};
 
+/// A new memory's row, as the edits on its neighbours need it.
+struct Written {
+    id: i64,
+    end: (Stamp, bool),
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn commit(
     store: &Store,
     lease: &Lease,
@@ -21,17 +34,47 @@ pub(super) fn commit(
     unit: &Unit,
     checked: &Checked,
     vectors: &[Vec<f32>],
+    plan: &Plan,
+    neighbours: &[Neighbour],
 ) -> Result<Extracted, StoreError> {
     let now = store.now();
     let mut conn = store.connection();
     let tx = conn.transaction()?;
 
-    let (proposed, entities_created) = resolve_proposals(&tx, store, unit, checked)?;
+    let (proposed, entities_created) = resolve_proposals(&tx, store, unit, checked, plan)?;
 
     let mut memories = Vec::with_capacity(checked.memories.len());
-    for (memory, vector) in checked.memories.iter().zip(vectors) {
+    let mut written: BTreeMap<usize, Written> = BTreeMap::new();
+    for (index, ((memory, vector), fate)) in checked
+        .memories
+        .iter()
+        .zip(vectors)
+        .zip(&plan.fates)
+        .enumerate()
+    {
+        let ended = match fate {
+            Fate::Absorbed => continue,
+            Fate::New => None,
+            Fate::NewEnded {
+                by,
+                until,
+                low_confidence,
+            } => Some((*by, *until, *low_confidence)),
+        };
         let uuid = store.new_id();
-        let memory_id = insert_memory(&tx, store, unit, input, memory, uuid)?;
+        let memory_id = insert_memory(&tx, store, unit, input, memory, uuid, ended)?;
+        written.insert(
+            index,
+            Written {
+                id: memory_id,
+                // Where a neighbour this claim ends, or a memory whose ender
+                // it replaces, ends (TIM-92).
+                end: match memory.valid_from {
+                    Some(stamp) => (stamp, memory.low_confidence),
+                    None => end_at(None, input.observed_at, &unit.tz),
+                },
+            },
+        );
         // The caller checked every vector's width, so only SQLite can fail
         // here.
         store
@@ -50,9 +93,109 @@ pub(super) fn commit(
         memories.push(uuid);
     }
 
-    // At most one access per memory per turn, keeping the strongest
-    // (TIM-90). `used` weighs least, so an access already in this turn
-    // always stays.
+    let by_id: BTreeMap<i64, &Neighbour> = neighbours.iter().map(|n| (n.id, n)).collect();
+    for &(index, neighbour, edit) in &plan.edits {
+        let by = &written[&index];
+        match edit {
+            Edit::Ends => end(&tx, store, unit, neighbour, by.id, by.end, EDIT_ENDED)?,
+            Edit::Retracts => {
+                tx.execute(
+                    "UPDATE memories SET invalidated_at = ?2, superseded_by = ?3, updated_at = ?4
+                     WHERE id = ?1",
+                    (neighbour, micros(input.observed_at), by.id, micros(now)),
+                )?;
+                log_memory_edit(
+                    &tx,
+                    store,
+                    unit.bank_id,
+                    EDIT_RETRACTED,
+                    neighbour,
+                    &format!(
+                        "{{\"superseded_by\":{},\"invalidated_at\":{}}}",
+                        by.id,
+                        micros(input.observed_at)
+                    ),
+                )?;
+                let same_kind = by_id
+                    .get(&neighbour)
+                    .is_some_and(|n| n.kind == checked.memories[index].kind.window_kind());
+                reopen(&tx, store, unit, neighbour, by, same_kind)?;
+            }
+            Edit::Refines => {
+                tx.execute(
+                    "UPDATE memories SET superseded_by = ?2, updated_at = ?3 WHERE id = ?1",
+                    (neighbour, by.id, micros(now)),
+                )?;
+                log_memory_edit(
+                    &tx,
+                    store,
+                    unit.bank_id,
+                    EDIT_REFINED,
+                    neighbour,
+                    &format!("{{\"superseded_by\":{}}}", by.id),
+                )?;
+                // TIM-95 decision 6: a citation of a refined memory moves to
+                // the head of its chain, where its accesses are inherited.
+                tx.execute(
+                    "UPDATE OR IGNORE mental_model_citations SET memory_id = ?2
+                     WHERE memory_id = ?1",
+                    (neighbour, by.id),
+                )?;
+                tx.execute(
+                    "DELETE FROM mental_model_citations WHERE memory_id = ?1",
+                    [neighbour],
+                )?;
+            }
+        }
+        // A model citing it refreshes (TIM-95, "refreshes follow
+        // conversations").
+        tx.execute(
+            "UPDATE mental_models SET refresh_requested_at = ?2
+             WHERE id IN (SELECT e.model_id FROM mental_model_citations c
+                          JOIN mental_model_entries e ON e.id = c.entry_id
+                          WHERE c.memory_id IN (?1, ?3))",
+            (neighbour, micros(now), by.id),
+        )?;
+    }
+
+    for (&neighbour, &label) in &plan.accesses {
+        insert_access(&tx, unit, neighbour, label.as_str())?;
+    }
+    for (&neighbour, &significance) in &plan.raises {
+        let raised = tx.execute(
+            "UPDATE memories SET significance = ?2, updated_at = ?3
+             WHERE id = ?1 AND owner_significance IS NULL",
+            (neighbour, level(significance), micros(now)),
+        )?;
+        if raised > 0 {
+            log_memory_edit(
+                &tx,
+                store,
+                unit.bank_id,
+                EDIT_SIGNIFICANCE_RAISED,
+                neighbour,
+                &format!(
+                    "{{\"from\":\"{}\",\"to\":\"{}\"}}",
+                    by_id.get(&neighbour).map_or("", |n| level(n.significance)),
+                    level(significance)
+                ),
+            )?;
+        }
+    }
+    for &neighbour in &plan.keeps {
+        let kept = tx.execute(
+            "UPDATE memories SET owner_significance = 'kept', updated_at = ?2
+             WHERE id = ?1 AND owner_significance IS NOT 'kept'",
+            (neighbour, micros(now)),
+        )?;
+        if kept > 0 {
+            log_memory_edit(&tx, store, unit.bank_id, EDIT_KEPT, neighbour, "{}")?;
+        }
+    }
+
+    // At most one access per memory per turn and source, keeping the
+    // strongest (TIM-90). `used` weighs least, so an access already in this
+    // turn always stays.
     for (memory_id, _) in &checked.used {
         insert_access(&tx, unit, *memory_id, "used")?;
     }
@@ -80,11 +223,19 @@ fn resolve_proposals(
     store: &Store,
     unit: &Unit,
     checked: &Checked,
+    plan: &Plan,
 ) -> Result<(BTreeMap<String, i64>, Vec<Uuid>), rusqlite::Error> {
     let seen = unit.seen();
     let mut resolved = BTreeMap::new();
     let mut created = Vec::new();
-    for memory in &checked.memories {
+    // A claim that became accesses or nothing links nothing, so it proposes
+    // no entity either.
+    for (memory, _) in checked
+        .memories
+        .iter()
+        .zip(&plan.fates)
+        .filter(|(_, fate)| **fate != Fate::Absorbed)
+    {
         for link in &memory.links {
             let Link::Proposed { name, kind, .. } = link else {
                 continue;
@@ -152,6 +303,9 @@ fn create_entity(
     Ok((entity_id, uuid))
 }
 
+/// Inserts a new memory. `ended` is the newer neighbour that already ends
+/// it, with where it ends and whether that's a guess: an older claim
+/// arriving after a newer one (TIM-92).
 fn insert_memory(
     tx: &Transaction<'_>,
     store: &Store,
@@ -159,19 +313,24 @@ fn insert_memory(
     input: &Call1Input,
     memory: &NewMemory,
     uuid: Uuid,
+    ended: Option<(i64, Stamp, bool)>,
 ) -> Result<i64, rusqlite::Error> {
     let now = micros(store.now());
     let at = |stamp: Option<Stamp>| stamp.map(|stamp| micros(stamp.at));
     let precision = |stamp: Option<Stamp>| stamp.map(|stamp| stamp.precision.as_str());
+    let (valid_until, ended_by, low) = match ended {
+        Some((by, until, low)) => (Some(until), Some(by), memory.low_confidence || low),
+        None => (memory.valid_until, None, memory.low_confidence),
+    };
     tx.execute(
         "INSERT INTO memories (uuid, bank_id, content, kind, significance, owner_significance,
                                chunk_id, source_start, source_end, observed_at, valid_from,
                                valid_from_precision, valid_until, valid_until_precision,
                                until_event, window_confidence, due_at, due_at_precision,
                                volatility, recurrence_text, recurrence_rrule, recurrence_start,
-                               recurrence_start_precision, created_at, updated_at)
+                               recurrence_start_precision, ended_by, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                 ?19, ?20, ?21, ?22, ?23, ?24, ?24)",
+                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?25)",
         rusqlite::params![
             uuid.to_string(),
             unit.bank_id,
@@ -185,10 +344,10 @@ fn insert_memory(
             micros(input.observed_at),
             at(memory.valid_from),
             precision(memory.valid_from),
-            at(memory.valid_until),
-            precision(memory.valid_until),
+            at(valid_until),
+            precision(valid_until),
             memory.until_event,
-            if memory.low_confidence { "low" } else { "high" },
+            if low { "low" } else { "high" },
             at(memory.due_at),
             precision(memory.due_at),
             memory.volatility.map(volatility),
@@ -196,6 +355,7 @@ fn insert_memory(
             memory.recurrence_rrule,
             at(memory.recurrence_start),
             precision(memory.recurrence_start),
+            ended_by,
             now,
         ],
     )?;
@@ -249,26 +409,151 @@ fn has_alias(tx: &Transaction<'_>, entity_id: i64, alias: &str) -> Result<bool, 
         .is_some())
 }
 
-/// An access at the source's ingested_at and turn number. An access the
-/// memory already has in that turn stays (`UNIQUE (memory_id, turn)`).
+/// An access at the source's ingested_at and turn number, keeping the
+/// strongest kind: an access already there stays unless this one weighs
+/// more. A memory has at most one access per turn (TIM-90), and one per
+/// document: a document carries the number of the turn before it, and its
+/// mention is a separate, independent one (CONTEXT.md, "Mentioned again").
 fn insert_access(
     tx: &Transaction<'_>,
     unit: &Unit,
     memory_id: i64,
     kind: &str,
 ) -> Result<(), rusqlite::Error> {
+    // ?3 is the document's source, or NULL for a turn.
+    let existing: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT a.id, a.kind FROM accesses a LEFT JOIN sources s ON s.id = a.source_id
+             WHERE a.memory_id = ?1 AND a.turn = ?2
+               AND (CASE WHEN ?3 IS NULL THEN s.kind IS NOT 'document'
+                         ELSE a.source_id = ?3 END)",
+            (
+                memory_id,
+                unit.turn,
+                unit.document_id.is_some().then_some(unit.source_id),
+            ),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match existing {
+        None => {
+            tx.execute(
+                "INSERT INTO accesses (bank_id, memory_id, kind, at, turn, source_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    unit.bank_id,
+                    memory_id,
+                    kind,
+                    micros(unit.ingested_at),
+                    unit.turn,
+                    unit.source_id,
+                ),
+            )?;
+        }
+        Some((id, old)) if weight(kind) > weight(&old) => {
+            tx.execute(
+                "UPDATE accesses SET kind = ?2, at = ?3 WHERE id = ?1",
+                (id, kind, micros(unit.ingested_at)),
+            )?;
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+fn weight(kind: &str) -> f64 {
+    match kind {
+        "confirmed" => WEIGHT_CONFIRMED,
+        "mentioned_again" => WEIGHT_MENTIONED_AGAIN,
+        "created" => WEIGHT_CREATED,
+        _ => WEIGHT_USED,
+    }
+}
+
+/// Ends `neighbour` by `by`: `valid_until` where `by` starts, or the day it
+/// was said with low confidence (TIM-92). A guessed end lowers the ended
+/// memory's window confidence. The edit is logged as `kind`.
+fn end(
+    tx: &Transaction<'_>,
+    store: &Store,
+    unit: &Unit,
+    neighbour: i64,
+    by: i64,
+    (until, low): (Stamp, bool),
+    kind: &str,
+) -> Result<(), rusqlite::Error> {
     tx.execute(
-        "INSERT OR IGNORE INTO accesses (bank_id, memory_id, kind, at, turn, source_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "UPDATE memories SET valid_until = ?2, valid_until_precision = ?3, ended_by = ?4,
+                window_confidence = CASE WHEN ?5 THEN 'low' ELSE window_confidence END,
+                updated_at = ?6
+         WHERE id = ?1",
         (
-            unit.bank_id,
-            memory_id,
-            kind,
-            micros(unit.ingested_at),
-            unit.turn,
-            unit.source_id,
+            neighbour,
+            micros(until.at),
+            until.precision.as_str(),
+            by,
+            low,
+            micros(store.now()),
         ),
     )?;
+    log_memory_edit(
+        tx,
+        store,
+        unit.bank_id,
+        kind,
+        neighbour,
+        &format!(
+            "{{\"ended_by\":{by},\"valid_until\":{},\"precision\":\"{}\"}}",
+            micros(until.at),
+            until.precision.as_str()
+        ),
+    )
+}
+
+/// The memories `retracted` had ended (TIM-92, "Reopening"). Retracted by a
+/// successor of the same kind, a reschedule, their end follows the
+/// successor. Retracted by anything else, such as "I haven't filed it after
+/// all", they're open again. Either way the edit is logged.
+fn reopen(
+    tx: &Transaction<'_>,
+    store: &Store,
+    unit: &Unit,
+    retracted: i64,
+    successor: &Written,
+    reschedule: bool,
+) -> Result<(), rusqlite::Error> {
+    let mut statement = tx.prepare_cached("SELECT id FROM memories WHERE ended_by = ?1")?;
+    let ended: Vec<i64> = statement
+        .query_map([retracted], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for memory in ended {
+        if reschedule {
+            end(
+                tx,
+                store,
+                unit,
+                memory,
+                successor.id,
+                successor.end,
+                EDIT_END_REPOINTED,
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE memories SET valid_until = NULL, valid_until_precision = NULL,
+                        ended_by = NULL, updated_at = ?2
+                 WHERE id = ?1",
+                (memory, micros(store.now())),
+            )?;
+            log_memory_edit(
+                tx,
+                store,
+                unit.bank_id,
+                EDIT_END_CLEARED,
+                memory,
+                &format!("{{\"ended_by\":{retracted}}}"),
+            )?;
+        }
+    }
     Ok(())
 }
 

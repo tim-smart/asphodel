@@ -50,3 +50,17 @@ The migration composes what earlier versions stored. No action is needed.
   of them removes that alias, which is the one each of them added.
 
 As with every migration, the daemon copies the database before it runs.
+
+## Schema version 4: a document's access has its own key
+
+Reconciliation writes an access when a document restates something
+already remembered ("Reconciliation", TIM-108). A document carries the
+turn number of the turn before it, and version 1 allowed one access per
+memory per turn, so a second document ingested with no turn in between
+couldn't record its mention of a memory the first one created. From
+version 4 the key includes the source. Turns are unaffected: each turn is
+one source with its own number, and extraction still keeps one access per
+memory per turn, the strongest.
+
+The migration rebuilds the `accesses` table with every row and id as they
+were. No action is needed.

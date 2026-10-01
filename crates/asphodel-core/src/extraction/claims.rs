@@ -42,8 +42,6 @@ struct RawClaim {
     quote: String,
     significance: Significance,
     remember_this: bool,
-    // Read by reconciliation (call 2), which comes in a later stage.
-    #[allow(dead_code)]
     changes_something: bool,
     valid_from: Option<RawTime>,
     valid_until: Option<RawTime>,
@@ -82,6 +80,17 @@ pub(super) enum Kind {
 }
 
 impl Kind {
+    /// The same kind as the strength model names it.
+    pub fn window_kind(self) -> crate::strength::Kind {
+        match self {
+            Kind::Fact => crate::strength::Kind::Fact,
+            Kind::Event => crate::strength::Kind::Event,
+            Kind::State => crate::strength::Kind::State,
+            Kind::Task => crate::strength::Kind::Task,
+            Kind::Recurring => crate::strength::Kind::Recurring,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Fact => "fact",
@@ -112,6 +121,17 @@ pub(super) enum Precision {
 }
 
 impl Precision {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "year" => Some(Precision::Year),
+            "month" => Some(Precision::Month),
+            "day" => Some(Precision::Day),
+            "hour" => Some(Precision::Hour),
+            "minute" => Some(Precision::Minute),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Precision::Year => "year",
@@ -150,6 +170,11 @@ pub(super) enum Link {
 /// A claim that passed the checks: a new memory to write.
 #[derive(Debug, Clone)]
 pub(super) struct NewMemory {
+    /// The claim's index in call 1's reply.
+    pub claim: usize,
+    /// `changes_something` or `remember_this`, from anyone: the claim gets
+    /// reconciliation's wider candidate set and always runs call 2 (TIM-92).
+    pub flagged: bool,
     pub content: String,
     pub kind: Kind,
     pub significance: Significance,
@@ -191,7 +216,7 @@ pub(super) fn check(
     let mut memories = Vec::new();
     let mut dropped = Vec::new();
     for (index, claim) in reply.claims.into_iter().enumerate() {
-        match check_claim(claim, input, unit) {
+        match check_claim(index, claim, input, unit) {
             Ok(memory) => memories.push(memory),
             Err(reason) => dropped.push(Dropped {
                 claim: index,
@@ -216,7 +241,12 @@ pub(super) fn check(
     })
 }
 
-fn check_claim(claim: RawClaim, input: &Call1Input, unit: &Unit) -> Result<NewMemory, DropReason> {
+fn check_claim(
+    index: usize,
+    claim: RawClaim,
+    input: &Call1Input,
+    unit: &Unit,
+) -> Result<NewMemory, DropReason> {
     let content = claim.content.trim();
     if content.is_empty() {
         return Err(DropReason::EmptyContent);
@@ -329,6 +359,8 @@ fn check_claim(claim: RawClaim, input: &Call1Input, unit: &Unit) -> Result<NewMe
         .collect();
 
     Ok(NewMemory {
+        claim: index,
+        flagged: claim.remember_this || claim.changes_something,
         content: content.to_owned(),
         kind: claim.kind,
         significance: claim.significance,
@@ -466,7 +498,7 @@ fn parse_local(text: &str) -> Option<(DateTime, Precision)> {
     }
 }
 
-fn start_of_day(at: Timestamp, tz: &TimeZone) -> Option<Timestamp> {
+pub(super) fn start_of_day(at: Timestamp, tz: &TimeZone) -> Option<Timestamp> {
     let date = at.to_zoned(tz.clone()).date();
     Some(date.to_zoned(tz.clone()).ok()?.timestamp())
 }
