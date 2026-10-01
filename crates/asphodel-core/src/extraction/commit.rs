@@ -10,8 +10,8 @@ use super::claims::{Checked, Link, NewMemory, Stamp, is_pronoun};
 use super::input::{Unit, survivor};
 use super::reconcile::{Edit, Fate, Neighbour, Plan, end_at};
 use super::{
-    Call1Input, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT, EDIT_REFINED, EDIT_RETRACTED,
-    EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted,
+    Call1Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT, EDIT_REFINED,
+    EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted,
 };
 use crate::constants::{
     Significance, Volatility, WEIGHT_CONFIRMED, WEIGHT_CREATED, WEIGHT_MENTIONED_AGAIN, WEIGHT_USED,
@@ -98,7 +98,7 @@ pub(super) fn commit(
         let by = &written[&index];
         match edit {
             Edit::Ends => end(&tx, store, unit, neighbour, by.id, by.end, EDIT_ENDED)?,
-            Edit::Retracts => {
+            Edit::Retracts | Edit::Denies => {
                 tx.execute(
                     "UPDATE memories SET invalidated_at = ?2, superseded_by = ?3, updated_at = ?4
                      WHERE id = ?1",
@@ -111,12 +111,13 @@ pub(super) fn commit(
                     EDIT_RETRACTED,
                     neighbour,
                     &format!(
-                        "{{\"superseded_by\":{},\"invalidated_at\":{}}}",
+                        "{{\"superseded_by\":{},\"invalidated_at\":{},\"denied\":{}}}",
                         by.id,
-                        micros(input.observed_at)
+                        micros(input.observed_at),
+                        edit == Edit::Denies
                     ),
                 )?;
-                reopen(&tx, store, unit, neighbour, by)?;
+                reopen(&tx, store, unit, neighbour, by, edit == Edit::Denies)?;
             }
             Edit::Refines => {
                 tx.execute(
@@ -131,6 +132,7 @@ pub(super) fn commit(
                     neighbour,
                     &format!("{{\"superseded_by\":{}}}", by.id),
                 )?;
+                reopen(&tx, store, unit, neighbour, by, false)?;
                 // TIM-95 decision 6: a citation of a refined memory moves to
                 // the head of its chain, where its accesses are inherited.
                 tx.execute(
@@ -507,30 +509,53 @@ fn end(
     )
 }
 
-/// The memories `retracted` had ended (TIM-92, "Reopening"). A retraction
-/// here always has a successor, the claim that retracted it, so their end
-/// follows the successor, whatever its kind, and the edit is logged.
+/// The memories `superseded` had ended, now that a claim supersedes it
+/// (TIM-92, "Reopening", as amended by TIM-108). After a `retracts` or
+/// `refines` their end follows the successor, which still ended them. After
+/// a `denies` (`denied`) the ending never happened, so they're open again.
+/// The label decides, never the kinds. Either way the edit is logged.
 fn reopen(
     tx: &Transaction<'_>,
     store: &Store,
     unit: &Unit,
-    retracted: i64,
+    superseded: i64,
     successor: &Written,
+    denied: bool,
 ) -> Result<(), rusqlite::Error> {
     let mut statement = tx.prepare_cached("SELECT id FROM memories WHERE ended_by = ?1")?;
     let ended: Vec<i64> = statement
-        .query_map([retracted], |row| row.get(0))?
+        .query_map([superseded], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
     for memory in ended {
-        end(
-            tx,
-            store,
-            unit,
-            memory,
-            successor.id,
-            successor.end,
-            EDIT_END_REPOINTED,
-        )?;
+        if denied {
+            tx.execute(
+                "UPDATE memories SET valid_until = NULL, valid_until_precision = NULL,
+                        ended_by = NULL, updated_at = ?2
+                 WHERE id = ?1",
+                (memory, micros(store.now())),
+            )?;
+            log_memory_edit(
+                tx,
+                store,
+                unit.bank_id,
+                EDIT_END_CLEARED,
+                memory,
+                &format!(
+                    "{{\"ended_by\":{superseded},\"denied_by\":{}}}",
+                    successor.id
+                ),
+            )?;
+        } else {
+            end(
+                tx,
+                store,
+                unit,
+                memory,
+                successor.id,
+                successor.end,
+                EDIT_END_REPOINTED,
+            )?;
+        }
     }
     Ok(())
 }

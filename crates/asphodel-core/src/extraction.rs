@@ -62,7 +62,7 @@ pub const CALL1_VERSION: u32 = 1;
 /// Call 2's template name and version, which replay's cassette keys include
 /// (TIM-96, decision 4).
 pub const CALL2_TEMPLATE: &str = "reconcile_claims";
-pub const CALL2_VERSION: u32 = 1;
+pub const CALL2_VERSION: u32 = 2;
 
 /// Neighbours kept per claim after fusing vector search and BM25 (TIM-92,
 /// "top 5 per claim, fused"). A flagged claim's entity-linked open tasks and
@@ -82,10 +82,14 @@ pub const EDIT_REFINED: &str = "memory_refined";
 pub const EDIT_SIGNIFICANCE_RAISED: &str = "significance_raised";
 /// A remember-this on a neighbour sets the owner's significance to kept.
 pub const EDIT_KEPT: &str = "memory_kept";
-/// The memory that ended another was retracted with a successor, so the
-/// ended memory's `ended_by` and `valid_until` follow the successor (TIM-92,
-/// "Reopening").
+/// The memory that ended another was retracted or refined, so the ended
+/// memory's `ended_by` and `valid_until` follow the successor (TIM-92,
+/// "Reopening", as amended by TIM-108).
 pub const EDIT_END_REPOINTED: &str = "end_repointed";
+/// The memory that ended another was denied, so the ended memory is open
+/// again: its `valid_until` and `ended_by` are cleared (TIM-92, "Reopening",
+/// as amended by TIM-108).
+pub const EDIT_END_CLEARED: &str = "end_cleared";
 
 /// Earlier clean turns of the session given as context (TIM-92, "up to 3
 /// previous clean turns").
@@ -222,6 +226,10 @@ pub struct InContextMemory {
 }
 
 /// What a claim does to a neighbour (TIM-92, CONTEXT.md "Reconciliation").
+/// `Retracts` is a corrected version of the neighbour, such as a reschedule;
+/// `Denies` says the neighbour didn't happen or isn't true. Both retract it,
+/// and differ only in what happens to anything it had ended (the TIM-92
+/// amendment from TIM-108).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Label {
@@ -229,15 +237,17 @@ pub enum Label {
     Confirmed,
     Refines,
     Retracts,
+    Denies,
     Ends,
 }
 
 impl Label {
-    pub const ALL: [Label; 5] = [
+    pub const ALL: [Label; 6] = [
         Label::MentionedAgain,
         Label::Confirmed,
         Label::Refines,
         Label::Retracts,
+        Label::Denies,
         Label::Ends,
     ];
 
@@ -247,6 +257,7 @@ impl Label {
             Label::Confirmed => "confirmed",
             Label::Refines => "refines",
             Label::Retracts => "retracts",
+            Label::Denies => "denies",
             Label::Ends => "ends",
         }
     }

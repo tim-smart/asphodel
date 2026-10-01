@@ -26,8 +26,8 @@
 //! neighbour already ended or retracted is rejected. An older claim's
 //! `mentioned_again` and `confirmed` still write the access, even on an
 //! ended neighbour; its `ends` creates it already ended by the neighbour;
-//! its `retracts` and `refines` create nothing. A claim left with no
-//! labels is new.
+//! its `retracts`, `denies` and `refines` create nothing. A claim left with
+//! no labels is new.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -461,6 +461,8 @@ pub(super) enum Fate {
 pub(super) enum Edit {
     Ends,
     Retracts,
+    /// A retraction that also reopens whatever the neighbour had ended.
+    Denies,
     Refines,
 }
 
@@ -550,7 +552,7 @@ pub(super) fn plan(
                     }
                     mentions.push((n, label));
                 }
-                Label::Ends | Label::Retracts | Label::Refines if ended[n] => {}
+                Label::Ends | Label::Retracts | Label::Denies | Label::Refines if ended[n] => {}
                 Label::Ends if newer => {
                     plan.edits.push((index, neighbour.id, Edit::Ends));
                     ended[n] = true;
@@ -558,6 +560,11 @@ pub(super) fn plan(
                 }
                 Label::Retracts if newer => {
                     plan.edits.push((index, neighbour.id, Edit::Retracts));
+                    retracted[n] = true;
+                    changed = true;
+                }
+                Label::Denies if newer => {
+                    plan.edits.push((index, neighbour.id, Edit::Denies));
                     retracted[n] = true;
                     changed = true;
                 }
@@ -569,7 +576,7 @@ pub(super) fn plan(
                 Label::Ends => {
                     older_end.get_or_insert(n);
                 }
-                Label::Retracts | Label::Refines => older_nothing = true,
+                Label::Retracts | Label::Denies | Label::Refines => older_nothing = true,
             }
         }
 

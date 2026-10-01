@@ -25,7 +25,8 @@ Give a claim a label on a memory only when the two are about the same thing:
 - `mentioned_again`: the claim states what the memory already says, independently. Rewording, or the same fact with less detail, is still mentioned again.
 - `confirmed`: the claim says the memory is still right, such as "yes" to a question about it, or "still" true.
 - `refines`: the claim is a more precise version of the same statement, and the memory wasn't wrong ("going to Japan in 2027" refined by "going to Tokyo in April 2027").
-- `retracts`: the claim says the memory was wrong: a correction, or a rescheduled appointment or plan ("the dentist is on Friday, not Thursday", "her name is Mia, not Maya").
+- `retracts`: the claim is a corrected version of the memory, which was wrong: a correction, or a rescheduled appointment or plan ("the dentist is on Friday, not Thursday", "her name is Mia, not Maya", "I filed the tax return on the 2nd, not the 1st").
+- `denies`: the claim says the memory didn't happen or isn't true at all, with nothing to replace it ("I haven't filed the tax return after all", "the trip to Japan isn't happening"). When unsure between `denies` and `retracts`, use `retracts`.
 - `ends`: the memory was true and the claim says it stopped being true: a move, a job left, a habit stopped, or a task completed or cancelled ("moved out of Berlin" ends "lives in Berlin"; "filed the tax return" ends "needs to file the tax return").
 
 A claim can have labels on several memories, and several claims can label the same memory. A claim about something new gets no labels. Don't label a memory just because it's on the same topic: "likes tea" and "likes coffee" are two memories.

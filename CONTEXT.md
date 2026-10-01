@@ -86,6 +86,7 @@ _Avoid_: Expired, closed, completed
 
 **Retracted**:
 A memory that turned out to be wrong, such as a correction or a rescheduled appointment. It's hidden from current and history answers, but kept for audit.
+A denied memory, one the user says never happened or isn't true, is retracted too. The only difference is what happens to anything it had ended: a correction still ends it, and a denial opens it again.
 _Avoid_: Deleted, invalidated, cancelled
 
 **Refined**:
@@ -223,7 +224,7 @@ A statement extraction has found in a chunk but not yet reconciled. It becomes a
 _Avoid_: Fact (that's a kind), candidate, extracted fact
 
 **Reconciliation**:
-The step of extraction that compares claims with the closest existing memories and decides whether each is new, mentioned again, confirmed, or ends, retracts or refines an existing memory.
+The step of extraction that compares claims with the closest existing memories and decides whether each is new, mentioned again, confirmed, or ends, retracts, denies or refines an existing memory.
 _Avoid_: Deduplication, merging, consolidation
 
 **Entity**:
