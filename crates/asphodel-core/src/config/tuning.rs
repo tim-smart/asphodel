@@ -22,6 +22,7 @@ use crate::constants::{Significance, TAU};
 pub struct Tuning {
     pub clock: ClockTuning,
     pub purge: PurgeTuning,
+    pub ranking: RankingTuning,
     pub recall: RecallTuning,
     pub injection: InjectionTuning,
     pub reconcile: ReconcileTuning,
@@ -65,6 +66,43 @@ impl Default for PurgeTuning {
         Self {
             delta: Some(1.0),
             source_horizon_days: 90,
+        }
+    }
+}
+
+/// `[ranking]`: the weights in the retrieval score (TIM-93, decisions 5 and
+/// 6; placed in tuning by TIM-98):
+///
+/// ```text
+/// score = relevance + w_s·strength + max(−3, ln(state_confidence)) + phase_term
+/// ```
+///
+/// The defaults are opening values, to be tuned on the replay harness.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RankingTuning {
+    /// w_s in injection.
+    pub w_s_inject: f64,
+
+    /// w_s in explicit recall, at most `w_s_inject`: recall answers the
+    /// question asked, so strength counts for less.
+    pub w_s_recall: f64,
+
+    /// The full phase bonus, for something starting now or overdue.
+    pub phase_bonus: f64,
+
+    /// The full phase penalty, for something ended a month or more ago. It's
+    /// subtracted, so it's given as a positive number.
+    pub phase_penalty: f64,
+}
+
+impl Default for RankingTuning {
+    fn default() -> Self {
+        Self {
+            w_s_inject: 0.5,
+            w_s_recall: 0.2,
+            phase_bonus: 1.0,
+            phase_penalty: 1.0,
         }
     }
 }
@@ -370,6 +408,27 @@ impl Tuning {
         }
         if self.purge.source_horizon_days == 0 {
             fail("purge.source_horizon_days", "must be at least 1".into());
+        }
+
+        let ranking = &self.ranking;
+        for (key, value) in [
+            ("ranking.w_s_inject", ranking.w_s_inject),
+            ("ranking.w_s_recall", ranking.w_s_recall),
+            ("ranking.phase_bonus", ranking.phase_bonus),
+            ("ranking.phase_penalty", ranking.phase_penalty),
+        ] {
+            if !(value.is_finite() && value >= 0.0) {
+                fail(key, format!("must be a number of at least 0, got {value}"));
+            }
+        }
+        if ranking.w_s_recall > ranking.w_s_inject {
+            fail(
+                "ranking.w_s_recall",
+                format!(
+                    "must be at most ranking.w_s_inject ({}), got {}",
+                    ranking.w_s_inject, ranking.w_s_recall
+                ),
+            );
         }
 
         let strong_cutoff = self.recall.strong_cutoff;

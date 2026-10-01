@@ -161,6 +161,61 @@ impl Volatility {
 /// the daemon, 3 s in the plugin and 8 s in Hermes.
 pub const RERANKER_DEADLINE: Duration = Duration::from_millis(1500);
 
+// Retrieval (TIM-93, placed in code by TIM-98):
+
+/// Reciprocal rank fusion's constant: a hit at rank r scores 1 / (k + r).
+/// Recall and reconciliation fuse with the same step.
+pub const RRF_K: f64 = 60.0;
+
+/// Hits each retriever (vector, BM25, entity) takes, "about 100 candidates
+/// each".
+pub const CANDIDATES_PER_ARM: usize = 100;
+
+/// The fused candidates the reranker scores.
+pub const RERANKED: usize = 40;
+
+/// A message with fewer words than this, split on whitespace, is a short
+/// follow-up ("yes, book it"): its query borrows the previous prefetch query
+/// of the session.
+pub const SHORT_FOLLOW_UP_WORDS: usize = 8;
+
+/// The confidence term's floor, `max(−3, ln(state_confidence))`, so a stale
+/// state is demoted and never gated (TIM-93, decision 5).
+pub const CONFIDENCE_TERM_MIN: f64 = -3.0;
+
+/// An upcoming memory's bonus grows over the last this many world days
+/// before it starts, from 0 to the full bonus.
+pub const UPCOMING_BONUS_DAYS: f64 = 7.0;
+
+/// An overdue task keeps the full bonus for this many world days past due...
+pub const OVERDUE_FULL_DAYS: f64 = 14.0;
+
+/// ...and the bonus falls linearly to 0 at this many.
+pub const OVERDUE_ZERO_DAYS: f64 = 60.0;
+
+/// An ended memory has no phase term for this many world days after its
+/// window closes; the penalty then rises linearly to its full value at
+/// [`RECENTLY_PAST_DAYS`].
+pub const ENDED_GRACE_DAYS: f64 = 7.0;
+
+/// A state is annotated with its age in an injection when its confidence is
+/// below this.
+pub const STATE_AGE_SHOWN_BELOW: f64 = 0.9;
+
+/// The `limit` of an explicit recall when the caller gives none, and the
+/// most it can ask for (TIM-94, decision 9).
+pub const RECALL_LIMIT_DEFAULT: usize = 10;
+pub const RECALL_LIMIT_MAX: usize = 30;
+
+/// A session's in-context set and pending injection are dropped after this
+/// long without a prefetch, recall or turn, on the service's clock. If it
+/// lapses while Hermes still holds the session, the worst case is one
+/// repeated injection (TIM-94, decision 6).
+///
+/// Provisional: TIM-98 fixes the timeout in code, but its value is waiting
+/// on Tim (TIM-109).
+pub const IN_CONTEXT_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 // Extraction (TIM-92, TIM-98):
 
 /// The size a document section is split down to when it's too long, in
@@ -191,6 +246,24 @@ pub struct FixedConstants {
     pub significance: SignificanceValues,
     pub volatility_rate_days: VolatilityRates,
     pub reranker_deadline_ms: u128,
+    pub retrieval: RetrievalConstants,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RetrievalConstants {
+    pub rrf_k: f64,
+    pub candidates_per_arm: usize,
+    pub reranked: usize,
+    pub short_follow_up_words: usize,
+    pub confidence_term_min: f64,
+    pub upcoming_bonus_days: f64,
+    pub overdue_full_days: f64,
+    pub overdue_zero_days: f64,
+    pub ended_grace_days: f64,
+    pub state_age_shown_below: f64,
+    pub recall_limit_default: usize,
+    pub recall_limit_max: usize,
+    pub in_context_idle_timeout_hours: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -258,6 +331,21 @@ impl FixedConstants {
                 years: Volatility::Years.rate_days(),
             },
             reranker_deadline_ms: RERANKER_DEADLINE.as_millis(),
+            retrieval: RetrievalConstants {
+                rrf_k: RRF_K,
+                candidates_per_arm: CANDIDATES_PER_ARM,
+                reranked: RERANKED,
+                short_follow_up_words: SHORT_FOLLOW_UP_WORDS,
+                confidence_term_min: CONFIDENCE_TERM_MIN,
+                upcoming_bonus_days: UPCOMING_BONUS_DAYS,
+                overdue_full_days: OVERDUE_FULL_DAYS,
+                overdue_zero_days: OVERDUE_ZERO_DAYS,
+                ended_grace_days: ENDED_GRACE_DAYS,
+                state_age_shown_below: STATE_AGE_SHOWN_BELOW,
+                recall_limit_default: RECALL_LIMIT_DEFAULT,
+                recall_limit_max: RECALL_LIMIT_MAX,
+                in_context_idle_timeout_hours: IN_CONTEXT_IDLE_TIMEOUT.as_secs_f64() / 3600.0,
+            },
         }
     }
 }

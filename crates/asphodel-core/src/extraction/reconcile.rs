@@ -38,12 +38,13 @@ use rusqlite::Connection;
 use uuid::Uuid;
 
 use super::claims::{Checked, Link, NewMemory, Precision, Stamp, start_of_day};
-use super::input::{Unit, phrase};
+use super::input::Unit;
 use super::{
     Call1Input, Call2Input, Label, NEIGHBOUR_CAP, NEIGHBOURS_PER_CLAIM, NeighbourMemory,
     ReconcileClaim,
 };
 use crate::constants::Significance;
+use crate::retrieval::{bm25, fuse};
 use crate::store::{SqliteVec, VectorError, VectorIndex, timestamp};
 use crate::strength::{Chains, Kind, Link as ChainLink};
 
@@ -52,12 +53,6 @@ use crate::strength::{Chains, Kind, Link as ChainLink};
 /// [`NEIGHBOURS_PER_CLAIM`] distinct memories are left, the retriever asks
 /// for twice as many, until it has them or runs out (the TIM-108 review).
 const HITS_PER_RETRIEVER: usize = NEIGHBOURS_PER_CLAIM * 4;
-
-/// Reciprocal rank fusion's constant: a hit at rank r scores 1 / (k + r).
-/// "Retrieval and ranking" (TIM-93) fuses with the same step, without its
-/// strength, phase and confidence weighting, which reconciliation doesn't
-/// use (TIM-92).
-const RRF_K: f64 = 60.0;
 
 /// A neighbour as the plan needs it.
 #[derive(Debug, Clone)]
@@ -152,7 +147,7 @@ pub(super) fn search(
             }
             limit *= 2;
         }
-        let mut found = fuse(&[&vector_ranked, &bm25_ranked]);
+        let mut found = fuse(&[vector_ranked.as_slice(), bm25_ranked.as_slice()]);
         found.truncate(NEIGHBOURS_PER_CLAIM);
         if memory.flagged {
             runs = true;
@@ -261,63 +256,6 @@ fn nearest(
             VectorError::Sqlite(error) => error,
             other => rusqlite::Error::ToSqlConversionFailure(Box::new(other)),
         })
-}
-
-/// BM25 over memory content within the bank, best first: any of the
-/// claim's words, each as a quoted phrase so nothing is read as syntax.
-fn bm25(
-    conn: &Connection,
-    bank_id: i64,
-    content: &str,
-    limit: usize,
-) -> Result<Vec<i64>, rusqlite::Error> {
-    let words: BTreeSet<String> = content
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
-        .collect();
-    if words.is_empty() {
-        return Ok(Vec::new());
-    }
-    let query = words
-        .iter()
-        .map(|word| phrase(word))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let mut statement = conn.prepare_cached(
-        "SELECT m.id FROM memories_fts f JOIN memories m ON m.id = f.rowid
-         WHERE memories_fts MATCH ?1 AND m.bank_id = ?2
-         ORDER BY f.rank, m.id
-         LIMIT ?3",
-    )?;
-    statement
-        .query_map(
-            (query, bank_id, i64::try_from(limit).unwrap_or(i64::MAX)),
-            |row| row.get(0),
-        )?
-        .collect()
-}
-
-/// Reciprocal rank fusion of ranked lists, best first, each id once. Ties
-/// go to the lower rowid, so the order is stable.
-fn fuse(lists: &[&Vec<i64>]) -> Vec<i64> {
-    let mut scores: BTreeMap<i64, f64> = BTreeMap::new();
-    for list in lists {
-        let mut seen = BTreeSet::new();
-        let mut rank = 0usize;
-        for id in list.iter() {
-            if !seen.insert(*id) {
-                continue;
-            }
-            rank += 1;
-            *scores.entry(*id).or_default() += 1.0 / (RRF_K + rank as f64);
-        }
-    }
-    let mut fused: Vec<(i64, f64)> = scores.into_iter().collect();
-    fused.sort_by(|(left_id, left), (right_id, right)| {
-        right.total_cmp(left).then(left_id.cmp(right_id))
-    });
-    fused.into_iter().map(|(id, _)| id).collect()
 }
 
 /// The open tasks and current states linked to the claim's known

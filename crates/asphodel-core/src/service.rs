@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use jiff::Timestamp;
 use serde::Serialize;
@@ -12,10 +13,13 @@ use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::config::{ConfigError, Tuning};
+use crate::constants::RERANKER_DEADLINE;
 use crate::extraction::{Call1Input, Call2Input, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Turn};
 use crate::models::{LlmClient, Models};
 use crate::queue::{ChunkError, FailedChunk, Failure, Lease, Leases, QueueError};
+use crate::retrieval::{Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
+use crate::sessions::Sessions;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
 
@@ -31,6 +35,12 @@ pub struct Service {
     /// The extraction queue's leases, one per bank at most. They live here
     /// rather than in the store so a restart releases them.
     leases: Leases,
+    /// Pending injections and in-context sets, per Hermes session. In
+    /// memory, so a restart costs at most one repeated injection.
+    sessions: Sessions,
+    /// Prefetch's reranker deadline: [`RERANKER_DEADLINE`], fixed in code
+    /// (ADR 0009), unless [`Service::with_reranker_deadline`] set another.
+    reranker_deadline: Duration,
 }
 
 /// Why a service couldn't be built on a store and models.
@@ -52,6 +62,8 @@ impl Service {
             tuning,
             models: None,
             leases: Leases::default(),
+            sessions: Sessions::default(),
+            reranker_deadline: RERANKER_DEADLINE,
         }
     }
 
@@ -75,7 +87,18 @@ impl Service {
             tuning,
             models: Some(models),
             leases: Leases::default(),
+            sessions: Sessions::default(),
+            reranker_deadline: RERANKER_DEADLINE,
         })
+    }
+
+    /// The same service with prefetch's reranker deadline set to
+    /// `deadline`. The deadline is fixed in code (ADR 0009); this is for
+    /// tests of the fallback and for the bench, which shouldn't wait 1.5 s
+    /// per slow call.
+    pub fn with_reranker_deadline(mut self, deadline: Duration) -> Self {
+        self.reranker_deadline = deadline;
+        self
     }
 
     /// The clock this service runs on.
@@ -138,8 +161,25 @@ impl Service {
     /// Ingests a turn into `bank`: scans it for secrets, stores it as a
     /// source and queues it as one chunk, or stores only a tombstone when it
     /// asked to forget ([`crate::ingest`]).
+    ///
+    /// The turn also settles the session's pending injection: echoing the
+    /// `recall_id` of the session's last prefetch commits it to the
+    /// in-context set, and anything else discards it (TIM-94, decision 6).
     pub fn ingest_turn(&self, bank: &str, turn: &Turn) -> Result<Ingested, IngestError> {
-        crate::ingest::ingest_turn(&self.store, bank, turn)
+        let ingested = crate::ingest::ingest_turn(&self.store, bank, turn)?;
+        let bank_id = {
+            let conn = self.store.connection();
+            crate::ingest::find_bank(&conn, bank)?.map(|(bank_id, _)| bank_id)
+        };
+        if let Some(bank_id) = bank_id {
+            self.sessions.turn(
+                bank_id,
+                &turn.session_id,
+                turn.recall_id.as_deref(),
+                self.now(),
+            );
+        }
+        Ok(ingested)
     }
 
     /// Ingests a document into `bank`: scans it for secrets, stores it as a
@@ -227,6 +267,53 @@ impl Service {
             llm,
             in_context,
         )
+    }
+
+    /// Prefetch: recalls for the user's message in `bank` and returns the
+    /// injection, holding it as the session's pending set until the turn
+    /// that echoes its `recall_id` ([`crate::retrieval`]).
+    pub fn prefetch(&self, bank: &str, request: &PrefetchRequest) -> Result<Prefetch, RecallError> {
+        crate::retrieval::prefetch(&self.retrieval()?, bank, request)
+    }
+
+    /// Explicit recall, as the `memory_recall` tool asks for it
+    /// ([`crate::retrieval`]). The results join the session's in-context
+    /// set when the request names a session.
+    pub fn recall(&self, bank: &str, request: &RecallRequest) -> Result<Recall, RecallError> {
+        crate::retrieval::recall(&self.retrieval()?, bank, request)
+    }
+
+    /// The session's in-context set: the public ids of the memories the
+    /// agent can already see, oldest first. It's what
+    /// [`Service::call1_input`] and [`Service::extract_chunk`] take.
+    pub fn in_context(&self, bank: &str, session_id: &str) -> Result<Vec<Uuid>, RecallError> {
+        let bank_id = self.bank_id(bank)?;
+        Ok(self.sessions.in_context(bank_id, session_id, self.now()))
+    }
+
+    /// Clears the session's in-context set and pending injection, as Hermes
+    /// asks on compaction, reset or rewind (`sessions/{id}/clear`).
+    pub fn clear_session(&self, bank: &str, session_id: &str) -> Result<(), RecallError> {
+        let bank_id = self.bank_id(bank)?;
+        self.sessions.clear(bank_id, session_id, self.now());
+        Ok(())
+    }
+
+    fn retrieval(&self) -> Result<crate::retrieval::Context<'_>, RecallError> {
+        Ok(crate::retrieval::Context {
+            store: &self.store,
+            tuning: &self.tuning,
+            models: self.models.as_ref().ok_or(RecallError::NoModels)?,
+            sessions: &self.sessions,
+            deadline: self.reranker_deadline,
+        })
+    }
+
+    fn bank_id(&self, bank: &str) -> Result<i64, RecallError> {
+        let conn = self.store.connection();
+        let (bank_id, _) =
+            crate::ingest::find_bank(&conn, bank)?.ok_or(RecallError::UnknownBank)?;
+        Ok(bank_id)
     }
 
     /// Chunks waiting or in flight in `bank`, not counting failed ones.

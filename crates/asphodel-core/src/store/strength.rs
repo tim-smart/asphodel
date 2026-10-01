@@ -104,23 +104,7 @@ impl StrengthLoader {
                 .unwrap_or(&memory.significance),
         );
 
-        let mut accesses = Vec::new();
-        let mut statement =
-            conn.prepare_cached("SELECT kind, at FROM accesses WHERE memory_id = ?1")?;
-        for id in inherits_from(&self.links, memory_id) {
-            let rows = statement.query_map([id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            for row in rows {
-                let (kind, at) = row?;
-                if let Some(kind) = access_kind(&kind) {
-                    accesses.push(Access {
-                        kind,
-                        at: timestamp(at),
-                    });
-                }
-            }
-        }
+        let accesses = self.accesses(conn, memory_id)?;
 
         let close = match memory_kind(&memory.kind) {
             Some(kind) => {
@@ -166,6 +150,40 @@ impl StrengthLoader {
     }
 }
 
+impl StrengthLoader {
+    /// The accesses the memory with rowid `memory_id` counts: its own and
+    /// those it inherits along `superseded_by`, in no particular order.
+    pub(crate) fn accesses(
+        &self,
+        conn: &Connection,
+        memory_id: i64,
+    ) -> Result<Vec<Access>, rusqlite::Error> {
+        let mut accesses = Vec::new();
+        let mut statement =
+            conn.prepare_cached("SELECT kind, at FROM accesses WHERE memory_id = ?1")?;
+        for id in inherits_from(&self.links, memory_id) {
+            let rows = statement.query_map([id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (kind, at) = row?;
+                if let Some(kind) = access_kind(&kind) {
+                    accesses.push(Access {
+                        kind,
+                        at: timestamp(at),
+                    });
+                }
+            }
+        }
+        Ok(accesses)
+    }
+
+    /// The bank's supersession links, as loaded.
+    pub(crate) fn links(&self) -> &[Link] {
+        &self.links
+    }
+}
+
 struct Memory {
     significance: String,
     owner_significance: Option<String>,
@@ -178,7 +196,7 @@ struct Memory {
     timezone: String,
 }
 
-fn world_time(at: Option<i64>, precision: Option<String>) -> Option<WorldTime> {
+pub(crate) fn world_time(at: Option<i64>, precision: Option<String>) -> Option<WorldTime> {
     Some(WorldTime {
         at: timestamp(at?),
         precision: time_precision(precision.as_deref()?)?,
@@ -196,7 +214,7 @@ fn time_precision(text: &str) -> Option<TimePrecision> {
     }
 }
 
-fn memory_kind(text: &str) -> Option<Kind> {
+pub(crate) fn memory_kind(text: &str) -> Option<Kind> {
     match text {
         "fact" => Some(Kind::Fact),
         "event" => Some(Kind::Event),
@@ -218,7 +236,7 @@ fn access_kind(text: &str) -> Option<AccessKind> {
 }
 
 /// A stored significance level, or `kept`, as its value.
-fn significance_value(level: &str) -> f64 {
+pub(crate) fn significance_value(level: &str) -> f64 {
     match level {
         "kept" => SIGNIFICANCE_KEPT,
         "trivial" => Significance::Trivial.value(),

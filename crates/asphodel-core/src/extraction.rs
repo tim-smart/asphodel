@@ -52,6 +52,7 @@ use crate::queue::{self, ChunkError, Failure, Lease, Leases, QueueError, SourceK
 use crate::store::{Store, StoreError, VectorIndex};
 
 pub use call2::call2_request;
+pub(crate) use input::{entities_named, phrase};
 pub use prompt::call1_request;
 
 /// Call 1's template name and version, which replay's cassette keys include

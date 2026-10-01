@@ -3,6 +3,7 @@
 
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Span, Timestamp, ToSpan};
+use serde::{Deserialize, Serialize};
 
 use super::world_days;
 use crate::constants::RECENTLY_PAST_DAYS;
@@ -10,7 +11,8 @@ use crate::constants::RECENTLY_PAST_DAYS;
 /// How exact a stored time is. A time is stored as the UTC instant at the
 /// start of its unit in the source's timezone, and it means the whole unit:
 /// a day-precision date lasts until that day ends for the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TimePrecision {
     Year,
     Month,
@@ -20,7 +22,7 @@ pub enum TimePrecision {
 }
 
 /// A stored time with its precision.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct WorldTime {
     pub at: Timestamp,
     pub precision: TimePrecision,
@@ -47,7 +49,8 @@ pub fn unit_end(time: WorldTime, tz: &TimeZone) -> Timestamp {
 }
 
 /// The kind of a memory, which decides how its window behaves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     Fact,
     Event,
@@ -66,7 +69,8 @@ pub struct Window {
 }
 
 /// Where a memory sits relative to now. Computed, never stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// Before the end of `valid_from`'s unit.
     Upcoming,

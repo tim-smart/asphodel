@@ -14,8 +14,10 @@ pub mod ingest;
 pub mod logging;
 pub mod models;
 pub mod queue;
+pub mod retrieval;
 pub mod secrets;
 pub mod service;
+mod sessions;
 pub mod store;
 pub mod strength;
 

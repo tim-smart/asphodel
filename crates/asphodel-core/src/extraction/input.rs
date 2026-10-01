@@ -405,18 +405,7 @@ fn found_entities(
     passages: &[&str],
     always: &[i64],
 ) -> Result<Vec<i64>, rusqlite::Error> {
-    conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.extraction_passages
-           USING fts5(text, tokenize = '{ALIAS_TOKENIZER}');
-         CREATE VIRTUAL TABLE IF NOT EXISTS temp.extraction_passage_terms
-           USING fts5vocab('temp', 'extraction_passages', 'row');
-         DELETE FROM temp.extraction_passages;"
-    ))?;
-    let found = named_entities(conn, bank_id, passages, always);
-    // The passages are memory content: don't leave them behind, even after
-    // an error. The temp store is in memory (`temp_store = MEMORY`).
-    conn.execute("DELETE FROM temp.extraction_passages", [])?;
-    let found = found?;
+    let found = entities_named(conn, bank_id, passages, always)?;
 
     let mut ranked = Vec::with_capacity(found.len());
     for entity_id in found {
@@ -435,6 +424,31 @@ fn found_entities(
         .take(ENTITY_CANDIDATE_CAP)
         .map(|(_, entity_id)| entity_id)
         .collect())
+}
+
+/// The entities of `bank_id` with an alias that appears whole in any of
+/// `passages`, matched with the alias FTS's own tokenizer, each resolved to
+/// the entity it was merged into and leaving out `exclude`. Retrieval's
+/// entity arm and the recall tool's `entity` parameter use this too
+/// ("Retrieval and ranking", TIM-93, decision 1).
+pub(crate) fn entities_named(
+    conn: &Connection,
+    bank_id: i64,
+    passages: &[&str],
+    exclude: &[i64],
+) -> Result<BTreeSet<i64>, rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.extraction_passages
+           USING fts5(text, tokenize = '{ALIAS_TOKENIZER}');
+         CREATE VIRTUAL TABLE IF NOT EXISTS temp.extraction_passage_terms
+           USING fts5vocab('temp', 'extraction_passages', 'row');
+         DELETE FROM temp.extraction_passages;"
+    ))?;
+    let found = named_entities(conn, bank_id, passages, exclude);
+    // The passages are memory content: don't leave them behind, even after
+    // an error. The temp store is in memory (`temp_store = MEMORY`).
+    conn.execute("DELETE FROM temp.extraction_passages", [])?;
+    found
 }
 
 fn named_entities(
@@ -492,7 +506,7 @@ fn named_entities(
 
 /// `text` as one FTS5 phrase: in double quotes, with any double quote
 /// doubled, so nothing in it is read as query syntax.
-pub(super) fn phrase(text: &str) -> String {
+pub(crate) fn phrase(text: &str) -> String {
     format!("\"{}\"", text.replace('"', "\"\""))
 }
 
