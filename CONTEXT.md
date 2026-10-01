@@ -165,7 +165,7 @@ Recalled memories placed automatically into the agent's prompt before a turn, ch
 _Avoid_: Prefetch (that's the Hermes hook), context stuffing
 
 **Agenda**:
-The upcoming events, tasks due soon and recently overdue tasks, chosen by world time alone, plus a few routines and undated open tasks chosen by strength, kept in the agent's prompt for the day. It isn't recall, and the recall threshold doesn't apply to its dated items.
+The upcoming events, tasks due soon and recently overdue tasks, chosen by world time alone, plus a few routines and undated open tasks chosen by strength, kept in the agent's prompt. It isn't recall, and the recall threshold doesn't apply to its dated items.
 _Avoid_: Calendar, schedule, reminders
 
 **Mental model**:
@@ -177,7 +177,7 @@ One sentence of a mental model, citing the memories it rests on. Only a refresh 
 _Avoid_: Claim (that's an extraction term), line, bullet, block
 
 **Refresh**:
-Bringing a mental model up to date: one retrieval for its question, then one LLM call that returns edits to its entries. It runs once a day, and only when the selected memories have changed.
+Bringing a mental model up to date: one retrieval for its question, then one LLM call that returns edits to its entries. It runs shortly after a conversation adds or changes something the model would care about, and once a day besides, and only when the selected memories have changed.
 _Avoid_: Reflect, consolidation, rebuild, regenerate
 
 **In context**:
