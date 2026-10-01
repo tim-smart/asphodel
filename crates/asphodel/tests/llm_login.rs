@@ -141,7 +141,7 @@ fn start(command: &mut Command) -> Daemon {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("the daemon never started listening:\n{log}");
+                panic!("the daemon never became ready:\n{log}");
             }
         }
     }

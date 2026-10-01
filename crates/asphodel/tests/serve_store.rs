@@ -22,7 +22,7 @@ const STARTUP: Duration = Duration::from_secs(10);
 
 /// `asphodel serve` with a clean environment, so the caller's `ASPHODEL_*`
 /// variables can't leak in. It runs on the fake models with a floor for
-/// each, because the daemon loads its models before it listens and the
+/// each, because the daemon loads its models before it is ready and the
 /// real ones aren't on a CI machine (TIM-105).
 fn serve(dir: &TestDir) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
@@ -142,7 +142,7 @@ fn start(dir: &TestDir, data_dir: &Path, socket: &Path) -> Daemon {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("the daemon never started listening:\n{log}");
+                panic!("the daemon never became ready:\n{log}");
             }
         }
     }
@@ -177,9 +177,10 @@ impl Daemon {
             .unwrap_or_else(|error| panic!("connecting to {}: {error}", self.socket.display()))
     }
 
-    /// Waits for `/v1/health` to answer 200. The socket appears shortly
-    /// after the "listening" line, and health answers 503 while migrations
-    /// run (TIM-94, decision 3).
+    /// Waits for `/v1/health` to answer 200. The socket is bound before the
+    /// store opens, and health answers 503 while migrations run and the
+    /// models load (TIM-94, decision 3); "asphodel listening" is logged
+    /// once it answers 200.
     fn wait_ready(&self) {
         let deadline = Instant::now() + STARTUP;
         loop {

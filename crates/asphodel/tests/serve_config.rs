@@ -14,8 +14,8 @@ use std::time::Duration;
 const TOKEN: &str = "tok-7f3a9c-secret";
 const LLM_KEY: &str = "sk-live-41b2e8-secret";
 
-/// A floor for each fake model. The daemon loads its models before it
-/// listens and refuses a model without floors (ADR 0009), so every daemon
+/// A floor for each fake model. The daemon loads its models before it is
+/// ready and refuses a model without floors (ADR 0009), so every daemon
 /// here that is meant to start runs on the fakes with these.
 const FLOORS_FOR_FAKES: &str = "[injection.reranker_floors]\n\"fake-reranker:v1\" = 0.0\n\
                                 [reconcile.embedding_floors]\n\"fake-embedder:v1\" = 0.5\n";
@@ -141,7 +141,7 @@ fn start(command: &mut Command) -> Daemon {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("the daemon never started listening:\n{log}");
+                panic!("the daemon never became ready:\n{log}");
             }
         }
     }
@@ -342,6 +342,12 @@ fn off_loopback_needs_a_token_from_the_environment() {
             "{}",
             stderr(&output)
         );
+        // Refused before binding, so nothing off this machine ever reached it.
+        assert!(
+            !stderr(&output).contains("asphodel starting"),
+            "the daemon bound before refusing:\n{}",
+            stderr(&output)
+        );
     }
 }
 
@@ -427,8 +433,13 @@ fn serve_needs_a_data_dir_from_the_flag_or_the_environment() {
         log.contains("--data-dir") || log.contains("ASPHODEL_DATA_DIR"),
         "the refusal doesn't name the missing setting:\n{log}"
     );
+    // Refused before binding, let alone becoming ready.
+    assert!(
+        !log.contains("asphodel starting"),
+        "the daemon bound before refusing:\n{log}"
+    );
     assert!(
         !log.contains("asphodel listening"),
-        "the daemon listened before refusing:\n{log}"
+        "the daemon became ready before refusing:\n{log}"
     );
 }

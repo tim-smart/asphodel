@@ -3,7 +3,7 @@
 //! "Models: local embeddings, reranker and the OpenAI-compatible LLM
 //! client" (TIM-105), from "API surface and Hermes transport" (TIM-94,
 //! decision 4) and ADR 0009: the daemon loads the models from the model dir
-//! before it listens, never downloads, fails fast on a missing file, and
+//! before it is ready, never downloads, fails fast on a missing file, and
 //! refuses to start without a floor for each loaded model. These tests see
 //! only what an operator sees: flags, exit codes, stderr and the resolved
 //! config line.
@@ -150,7 +150,7 @@ fn start(command: &mut Command) -> Daemon {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("the daemon never started listening:\n{log}");
+                panic!("the daemon never became ready:\n{log}");
             }
         }
     }
@@ -217,7 +217,8 @@ fn an_empty_model_dir_stops_startup_naming_the_missing_file() {
     assert!(stderr.contains("asphodel models fetch"), "{stderr}");
     assert!(stderr.contains(models.to_str().unwrap()), "{stderr}");
     assert_eq!(std::fs::read_dir(&models).unwrap().count(), 0);
-    // And the daemon never listened.
+    // And the daemon never became ready: its listener answers 503 while the
+    // models load, and "asphodel listening" is logged only once they have.
     assert!(!stderr.contains("asphodel listening"), "{stderr}");
 }
 
