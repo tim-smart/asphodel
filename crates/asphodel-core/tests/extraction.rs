@@ -188,6 +188,26 @@ impl Harness {
         }
     }
 
+    /// Drops the service, releasing the data-dir lock, and opens a new one on
+    /// the same data dir and clock: a daemon restart, which runs any pending
+    /// migration.
+    fn restart(self) -> Self {
+        let Harness {
+            service,
+            clock,
+            _dir: dir,
+        } = self;
+        drop(service);
+        let store = Store::open(&dir.data(), OpenOptions::default(), clock.clone()).unwrap();
+        let service =
+            Service::with_models(clock.clone(), store, tuning_for_fakes(), Models::fake()).unwrap();
+        Self {
+            service,
+            clock,
+            _dir: dir,
+        }
+    }
+
     /// A service built without models, as `Service::open` gives.
     fn without_models() -> Self {
         let dir = TestDir::new();
@@ -282,6 +302,13 @@ impl Harness {
         .iter()
         .map(|uuid| uuid.parse().unwrap())
         .collect()
+    }
+
+    fn entity_name(&self, entity: Uuid) -> String {
+        self.one(
+            "SELECT name FROM entities WHERE uuid = ?1",
+            [entity.to_string()],
+        )
     }
 
     fn entity_kind(&self, entity: Uuid) -> String {
@@ -3396,6 +3423,225 @@ fn a_devanagari_name_matches_itself() {
     // A vowel sign is a combining mark, and part of the name.
     let (entities, found) = candidates_for(&["किरण"], "किरण आया।");
     assert_eq!(found, BTreeSet::from([entities[0]]));
+}
+
+// Composed aliases (the TIM-107 re-review of `d4825ab`). Passages are
+// searched in NFC, so every alias has to be stored in NFC too: on every
+// write, and for the aliases a store already holds.
+
+/// Greek "Νίκος" decomposed: iota, then a combining acute.
+const NIKOS_DECOMPOSED: &str = "Νι\u{301}κος";
+const NIKOS: &str = "Νίκος";
+
+/// A Discord speaker called `name` says hello, which creates their entity
+/// and aliases through ingest. The chunk is taken off the queue.
+fn speaker_named(h: &Harness, id: &str, name: &str) -> Uuid {
+    let ingested = ingest(
+        h,
+        &Turn {
+            author: Some(TurnAuthor {
+                id: id.into(),
+                name: Some(name.into()),
+                is_bot: false,
+            }),
+            platform: Some("discord".into()),
+            ..turn("thread-9", "2026-10-01T05:00:00Z", "Hello.", "Hi.")
+        },
+    );
+    h.execute(
+        "DELETE FROM extraction_queue
+         WHERE chunk_id = (SELECT c.id FROM chunks c JOIN sources s ON s.id = c.source_id
+                           WHERE s.uuid = ?1)",
+        [ingested.source.to_string()],
+    );
+    ingested.speaker.unwrap().entity
+}
+
+/// The candidates found when the owner says `message`.
+fn found_in(h: &Harness, message: &str) -> BTreeSet<Uuid> {
+    ingest(h, &turn("s1", T1, message, "Lovely."));
+    found(h, &input(h, "main", &[]))
+}
+
+#[test]
+#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
+fn a_decomposed_speaker_name_is_found_by_its_composed_spelling() {
+    let h = Harness::new();
+    let nikos = speaker_named(&h, "7777", NIKOS_DECOMPOSED);
+    assert_eq!(found_in(&h, "Ο Νίκος ήρθε."), BTreeSet::from([nikos]));
+}
+
+#[test]
+#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
+fn a_decomposed_speaker_name_is_found_by_the_same_spelling() {
+    let h = Harness::new();
+    let nikos = speaker_named(&h, "7777", NIKOS_DECOMPOSED);
+    assert_eq!(
+        found_in(&h, &format!("Ο {NIKOS_DECOMPOSED} ήρθε.")),
+        BTreeSet::from([nikos])
+    );
+}
+
+#[test]
+fn a_composed_speaker_name_is_found_by_its_decomposed_spelling() {
+    let h = Harness::new();
+    let nikos = speaker_named(&h, "7777", NIKOS);
+    assert_eq!(
+        found_in(&h, &format!("Ο {NIKOS_DECOMPOSED} ήρθε.")),
+        BTreeSet::from([nikos])
+    );
+}
+
+#[test]
+#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
+fn speaker_names_and_aliases_are_stored_composed() {
+    let h = Harness::new();
+    let nikos = speaker_named(&h, "7777", NIKOS_DECOMPOSED);
+    assert_eq!(h.entity_name(nikos), NIKOS);
+    let aliases = h.aliases(nikos);
+    assert!(aliases.contains(&NIKOS.to_string()), "{aliases:?}");
+    assert!(
+        !aliases.contains(&NIKOS_DECOMPOSED.to_string()),
+        "{aliases:?}"
+    );
+}
+
+#[test]
+#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
+fn bank_config_stores_names_and_aliases_composed() {
+    let h = Harness::new();
+    let zoe_decomposed = "Ζωη\u{301}";
+    h.service
+        .ensure_bank_with_models(
+            "greek",
+            &asphodel_core::store::bank::BankIdentity {
+                owner_name: Some(NIKOS_DECOMPOSED.into()),
+                owner_platform_ids: Vec::new(),
+                assistant_name: Some(zoe_decomposed.into()),
+                timezone: Some(TZ.into()),
+            },
+        )
+        .unwrap();
+    for (which, composed, decomposed) in [
+        ("user", NIKOS, NIKOS_DECOMPOSED),
+        ("assistant", "Ζωή", zoe_decomposed),
+    ] {
+        let entity = h.seeded("greek", which);
+        assert_eq!(h.entity_name(entity), composed, "{which}");
+        let aliases = h.aliases(entity);
+        assert!(
+            aliases.contains(&composed.to_string()),
+            "{which}: {aliases:?}"
+        );
+        assert!(
+            !aliases.contains(&decomposed.to_string()),
+            "{which}: {aliases:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
+fn a_proposed_entity_is_stored_composed_and_found_again() {
+    let h = Harness::new();
+    let created = golden(
+        &h,
+        &format!("{NIKOS_DECOMPOSED} called."),
+        "Who's that?",
+        vec![claim("Nikos called Tim.", "event", NIKOS_DECOMPOSED).with(
+            "entities",
+            json!([new_entity(NIKOS_DECOMPOSED, "person", NIKOS_DECOMPOSED)]),
+        )],
+    );
+    let nikos = h.entities_named("main", NIKOS);
+    assert_eq!(nikos.len(), 1);
+    assert_eq!(h.aliases(nikos[0]), vec![NIKOS.to_string()]);
+    assert_eq!(
+        h.links(created[0]),
+        BTreeSet::from([(nikos[0], Some(NIKOS.into()))])
+    );
+    assert_eq!(found_in(&h, "Ο Νίκος ήρθε."), BTreeSet::from([nikos[0]]));
+}
+
+/// Puts the store back to schema version 2, the last that stored aliases as
+/// written, and leaves one `migrations` row 0 to 2. Everything written
+/// stays, so reopening runs only the migrations after version 2.
+fn downgrade_to_v2_and_reopen(h: Harness) -> Harness {
+    h.service
+        .store()
+        .unwrap()
+        .connection()
+        .execute_batch(
+            "DELETE FROM migrations;
+             INSERT INTO migrations (from_version, to_version, binary_version, started_at,
+                                     completed_at)
+               VALUES (0, 2, 'v2', 0, 0);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    h.restart()
+}
+
+/// Logs an `alias_added` edit for the alias row `alias` of `entity`, as
+/// `add_alias` does.
+fn log_alias_added(h: &Harness, entity: Uuid, alias: &str) -> String {
+    let edit = next_uuid().to_string();
+    h.execute(
+        "INSERT INTO edits (uuid, bank_id, kind, entity_id, details, at)
+         SELECT ?1, e.bank_id, 'alias_added', e.id, json_object('alias_id', a.id), ?4
+         FROM entities e JOIN entity_aliases a ON a.entity_id = e.id
+         WHERE e.uuid = ?2 AND a.alias = ?3",
+        (edit.clone(), entity.to_string(), alias, micros(h.now())),
+    );
+    edit
+}
+
+#[test]
+#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
+fn an_upgrade_composes_stored_aliases_and_merges_equivalent_ones() {
+    let h = Harness::new();
+    // As a version 2 store could hold them: one entity with both spellings
+    // of its name as aliases, each with its `alias_added` edit, and one
+    // known only by a decomposed alias.
+    let nikos = h.insert_entity("main", NIKOS, "person", &[NIKOS, NIKOS_DECOMPOSED]);
+    let edits = [
+        log_alias_added(&h, nikos, NIKOS),
+        log_alias_added(&h, nikos, NIKOS_DECOMPOSED),
+    ];
+    let zoe = h.insert_entity("main", "Ζωη\u{301}", "person", &["Ζωη\u{301}"]);
+    let h = downgrade_to_v2_and_reopen(h);
+
+    // One composed alias each; the canonical duplicate is merged away.
+    assert_eq!(h.aliases(nikos), vec![NIKOS.to_string()]);
+    assert_eq!(h.aliases(zoe), vec!["Ζωή".to_string()]);
+    assert_eq!(h.entity_name(zoe), "Ζωή");
+    // Both edits still name an alias of the entity: the one that survived.
+    let survivor: i64 = h.one(
+        "SELECT a.id FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
+         WHERE e.uuid = ?1",
+        [nikos.to_string()],
+    );
+    for edit in &edits {
+        let alias_id: i64 = h.one(
+            "SELECT json_extract(details, '$.alias_id') FROM edits WHERE uuid = ?1",
+            [edit],
+        );
+        assert_eq!(alias_id, survivor, "{edit}");
+    }
+    // Both are found again, in either spelling.
+    assert_eq!(
+        found_in(&h, "Ο Νίκος και η Ζωή ήρθαν."),
+        BTreeSet::from([nikos, zoe])
+    );
+}
+
+#[test]
+#[ignore = "TIM-107 re-review finding (composed aliases); activate with its fix"]
+fn an_upgraded_decomposed_alias_is_found_by_the_same_spelling() {
+    let h = Harness::new();
+    let zoe = h.insert_entity("main", "Ζωη\u{301}", "person", &["Ζωη\u{301}"]);
+    let h = downgrade_to_v2_and_reopen(h);
+    assert_eq!(found_in(&h, "Η Ζωη\u{301} ήρθε."), BTreeSet::from([zoe]));
 }
 
 #[test]
