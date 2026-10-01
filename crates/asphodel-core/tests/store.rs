@@ -2,7 +2,7 @@
 //! data-dir lock" (TIM-103) and the decisions it rests on: "What is a memory
 //! record?" (TIM-90), "Rust storage and search stack" (TIM-89), "API surface
 //! and Hermes transport" (TIM-94, decisions 4 and 7), "Mental models"
-//! (TIM-95, decision 2), ADR 0002, ADR 0008, ADR 0009 and ADR 0010.
+//! (TIM-95, decisions 2 and 6), ADR 0002, ADR 0008, ADR 0009 and ADR 0010.
 //!
 //! Every store here runs on a `SimulatedClock` stopped at one instant, so a
 //! stored time that equals that instant can only have come from the Clock.
@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use asphodel_core::clock::{Clock, SimulatedClock};
 use asphodel_core::config::{PurgePause, Tuning};
-use asphodel_core::store::bank::{BankError, BankIdentity, ModelIds, PROFILE_NAME};
+use asphodel_core::store::bank::{
+    BankError, BankIdentity, ModelIds, PROFILE_NAME, PROFILE_QUESTION,
+};
 use asphodel_core::store::fs::{self, FilesystemKind, classify, classify_name};
 use asphodel_core::store::{
     DB_FILE, DataDirLock, EMBEDDING_DIMENSIONS, LOCK_FILE, OpenOptions, SCHEMA_VERSION, Store,
@@ -1742,6 +1744,100 @@ fn merge_leaves_the_profiles_filters_alone() {
     assert_eq!(min_volatility, "months");
     assert_eq!(max_tokens, 123);
     assert_eq!(question, "edited");
+}
+
+#[test]
+fn the_seeded_question_is_the_one_tim95_decided() {
+    // TIM-95, decision 2: it leaves out what the agenda already carries,
+    // and the check-in preference moved into it from the routines question
+    // (decision 1).
+    assert_eq!(
+        PROFILE_QUESTION,
+        "Who is the user: their preferences, important people, work and home, the platforms \
+         they use, and how they like to be helped. Not upcoming events, tasks or routines."
+    );
+}
+
+#[test]
+fn a_deleted_memory_takes_its_citations_and_leaves_the_entry() {
+    // TIM-95, decision 6: forget and purge delete the memory row, the
+    // cascade removes its citations, and code drops the entry. The entry
+    // has to survive the cascade for code to see what it cited.
+    let dir = TestDir::new();
+    let service = service(&dir);
+    service.ensure_bank("main", &identity(), &models()).unwrap();
+    let conn = service.store().unwrap().connection();
+    let bank = bank_rowid(&conn, "main");
+    let chunk = seed_chunk(&conn, bank, "a", 0);
+    let tea = insert_memory(&conn, bank, chunk, "Tim likes green tea.", 0);
+    let cat = insert_memory(&conn, bank, chunk, "Tim's cat is called Miso.", 0);
+    let model: i64 = conn
+        .query_row(
+            "SELECT id FROM mental_models WHERE bank_id = ?1 AND name = ?2",
+            (bank, PROFILE_NAME),
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO mental_model_entries (uuid, model_id, position, text, created_at, updated_at)
+         VALUES ('entry-1', ?1, 0, 'Tim drinks green tea with his cat Miso.', 0, 0)",
+        [model],
+    )
+    .unwrap();
+    let entry = conn.last_insert_rowid();
+    for memory in [tea, cat] {
+        conn.execute(
+            "INSERT INTO mental_model_citations (entry_id, memory_id) VALUES (?1, ?2)",
+            (entry, memory),
+        )
+        .unwrap();
+    }
+
+    conn.execute("DELETE FROM memories WHERE id = ?1", [tea])
+        .unwrap();
+    assert_eq!(count(&conn, "SELECT count(*) FROM mental_model_entries"), 1);
+    let cited: Vec<i64> = conn
+        .prepare("SELECT memory_id FROM mental_model_citations WHERE entry_id = ?1")
+        .unwrap()
+        .query_map([entry], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(cited, [cat]);
+}
+
+#[test]
+fn a_deleted_model_takes_its_entries_and_their_citations() {
+    let dir = TestDir::new();
+    let service = service(&dir);
+    service.ensure_bank("main", &identity(), &models()).unwrap();
+    let conn = service.store().unwrap().connection();
+    let bank = bank_rowid(&conn, "main");
+    let chunk = seed_chunk(&conn, bank, "a", 0);
+    let tea = insert_memory(&conn, bank, chunk, "Tim likes green tea.", 0);
+    conn.execute(
+        "INSERT INTO mental_model_entries (uuid, model_id, position, text, created_at, updated_at)
+         SELECT 'entry-1', id, 0, 'Tim likes green tea.', 0, 0 FROM mental_models",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO mental_model_citations (entry_id, memory_id) VALUES (?1, ?2)",
+        (conn.last_insert_rowid(), tea),
+    )
+    .unwrap();
+
+    conn.execute("DELETE FROM mental_models", []).unwrap();
+    assert_eq!(count(&conn, "SELECT count(*) FROM mental_model_entries"), 0);
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM mental_model_citations"),
+        0
+    );
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM memories"),
+        1,
+        "the memory stays"
+    );
 }
 
 #[test]
