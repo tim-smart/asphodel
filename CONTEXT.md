@@ -139,7 +139,7 @@ The part of strength built up by accesses on separate occasions. It never goes d
 _Avoid_: Storage strength (outside the formula), permanence
 
 **Recall threshold**:
-The strength below which a memory is no longer injected automatically. Explicit recall can still find it.
+The strength below which a memory is no longer injected by relevance. Explicit recall can still find it, and the agenda can still list it.
 _Avoid_: Cutoff, expiry threshold
 
 **Faded out**:
@@ -157,8 +157,12 @@ One retrieval of memories for a query, together with a record of what came back.
 _Avoid_: Search (for the whole operation), lookup, access
 
 **Injection**:
-Recalled memories placed automatically into the agent's prompt before a turn.
+Recalled memories placed automatically into the agent's prompt before a turn, chosen by relevance to what the user just said.
 _Avoid_: Prefetch (that's the Hermes hook), context stuffing
+
+**Agenda**:
+The upcoming events, tasks due soon and recently overdue tasks, chosen by world time alone and kept in the agent's prompt for the day. It isn't recall, so the recall threshold doesn't apply to it.
+_Avoid_: Calendar, schedule, reminders
 
 **Mental model**:
 A document that an LLM writes and keeps up to date from memories, to answer a standing question such as "who is the user?".
