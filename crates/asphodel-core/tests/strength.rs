@@ -1037,6 +1037,47 @@ fn inheritance_follows_chains_of_several_and_trees() {
 }
 
 #[test]
+fn chains_finds_the_heads_chain_head_does_in_any_order() {
+    // `Chains` indexes a bank's links once for reconcile's many lookups and
+    // remembers the heads it finds; whatever order they're asked in, each
+    // head is the one `chain_head` gives.
+    let links = [
+        // 1 → 2 → 3, and 4 and 5 refined into 6 → 7.
+        link(1, Some(2), None),
+        link(2, Some(3), None),
+        link(4, Some(6), None),
+        link(5, Some(6), None),
+        link(6, Some(7), None),
+        // 8 is ended by 3 but supersedes nothing; 9 has no links at all.
+        link(8, None, Some(3)),
+    ];
+    let ids = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let orders: [Vec<i64>; 3] = [
+        ids.to_vec(),
+        ids.iter().rev().copied().collect(),
+        vec![2, 6, 9, 1, 5, 3, 8, 4, 7],
+    ];
+    for order in orders {
+        let mut chains = Chains::new(&links);
+        for id in &order {
+            assert_eq!(
+                chains.head(*id),
+                chain_head(&links, *id),
+                "{id} in {order:?}"
+            );
+            // Asking again gives the remembered head.
+            assert_eq!(chains.head(*id), chain_head(&links, *id), "{id} again");
+        }
+    }
+    let mut chains = Chains::new(&links);
+    assert_eq!(chains.head(1), 3);
+    assert_eq!(chains.head(4), 7);
+    assert_eq!(chains.head(8), 8, "ended_by isn't a chain link");
+    assert_eq!(chains.head(9), 9);
+    assert_eq!(Chains::new(&[]).head(1), 1);
+}
+
+#[test]
 fn nothing_is_inherited_along_ended_by() {
     // "Lives in Berlin" (1) is ended by "moved to Lisbon" (2). An old
     // reschedule (3 retracted by 4) sits beside them.

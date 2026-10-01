@@ -1255,6 +1255,58 @@ fn nearest_returns_the_closest_memory_first_with_cosine_distance() {
 }
 
 #[test]
+fn nearest_past_the_knn_limit_scans_exactly() {
+    // sqlite-vec refuses a KNN query for more than KNN_K_MAX neighbours, so a
+    // larger k is an exact scan (the TIM-108 re-review). It must give the
+    // same neighbours in the same order and metric, within the bank.
+    use asphodel_core::store::Neighbour;
+    use asphodel_core::store::vector::KNN_K_MAX;
+    let dir = TestDir::new();
+    let store = open(&dir.data(), clock());
+    let vectors = store.vectors();
+    let conn = store.connection();
+    for (step, id) in (0..6).zip(10..) {
+        let mut leaning = unit(0);
+        leaning[1] = step as f32 * 0.4;
+        vectors.upsert(&conn, 1, id, &leaning).unwrap();
+    }
+    vectors.upsert(&conn, 1, 20, &unit(1)).unwrap();
+    vectors.upsert(&conn, 2, 30, &unit(0)).unwrap();
+
+    let knn = vectors.nearest(&conn, 1, &unit(0), 7).unwrap();
+    let exact = vectors.nearest(&conn, 1, &unit(0), KNN_K_MAX + 1).unwrap();
+    let ids = |found: &[Neighbour]| -> Vec<i64> { found.iter().map(|n| n.memory_id).collect() };
+    assert_eq!(ids(&knn), [10, 11, 12, 13, 14, 15, 20]);
+    assert_eq!(ids(&exact), ids(&knn), "another bank's vector stays out");
+    for (k, e) in knn.iter().zip(&exact) {
+        assert!(
+            (k.distance - e.distance).abs() < 1e-5,
+            "{k:?} against {e:?}"
+        );
+    }
+    assert!(
+        vectors
+            .nearest(&conn, 2, &unit(0), KNN_K_MAX + 1)
+            .unwrap()
+            .len()
+            == 1
+    );
+    assert!(
+        vectors
+            .nearest(&conn, 3, &unit(0), KNN_K_MAX + 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        vectors.nearest(&conn, 1, &[0.5; 3], KNN_K_MAX + 1),
+        Err(VectorError::Dimensions {
+            expected: 384,
+            got: 3
+        })
+    ));
+}
+
+#[test]
 fn a_bank_never_sees_another_banks_vectors() {
     let dir = TestDir::new();
     let store = open(&dir.data(), clock());

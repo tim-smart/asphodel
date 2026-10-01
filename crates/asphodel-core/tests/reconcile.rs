@@ -32,7 +32,7 @@ use std::time::Duration;
 use asphodel_core::Service;
 use asphodel_core::clock::{Clock, SimulatedClock};
 use asphodel_core::config::Tuning;
-use asphodel_core::constants::{SIGNIFICANCE_KEPT, Significance};
+use asphodel_core::constants::{CHUNK_RETRY_CAP, SIGNIFICANCE_KEPT, Significance};
 use asphodel_core::ingest::{Document, Ingested, Turn};
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest, LlmResponse,
@@ -51,7 +51,7 @@ use uuid::Uuid;
 
 use asphodel_core::extraction::{
     CALL2_TEMPLATE, CALL2_VERSION, Call2Input, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT,
-    EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, Label, NEIGHBOUR_CAP,
+    EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, ExtractError, Label, NEIGHBOUR_CAP,
     NEIGHBOURS_PER_CLAIM, call2_request,
 };
 
@@ -1349,7 +1349,6 @@ fn a_hit_on_a_refined_memory_shows_its_chain_head() {
 const KNN_K_MAX: usize = 4096;
 
 #[test]
-#[ignore = "pending fix (TIM-108 re-review): vector search asks sqlite-vec for more than 4,096 neighbours"]
 fn a_chain_past_the_knn_limit_doesnt_abort_extraction() {
     // 2,600 versions of one fact all clear the floor and collapse to one
     // head, so the search keeps asking for more: 2,560 hits still leave it
@@ -1373,7 +1372,6 @@ fn a_chain_past_the_knn_limit_doesnt_abort_extraction() {
 }
 
 #[test]
-#[ignore = "pending fix (TIM-108 re-review): vector search can't see past sqlite-vec's 4,096-neighbour limit"]
 fn a_memory_past_the_knn_limit_is_still_a_neighbour() {
     // More versions of one fact than sqlite-vec returns from one KNN query
     // all sit nearer the claim than another matching memory. Stopping at the
@@ -2552,6 +2550,143 @@ fn call_2_and_the_commit_run_in_observed_at_order() {
     let input =
         call2(&h, &reply(vec![claim(BERLIN, "fact", "I live in Berlin")])).expect("call 2 runs");
     assert_eq!(shown(&input), BTreeSet::from([berlin]));
+}
+
+/// Breaks BM25 for the whole store, so every neighbour search fails. Only a
+/// test does this; in production it stands for any fault the search hits.
+fn break_search(h: &Harness) {
+    h.service
+        .store()
+        .unwrap()
+        .connection()
+        .execute_batch("DROP TABLE memories_fts")
+        .unwrap();
+}
+
+#[test]
+fn a_failed_search_is_counted_and_writes_nothing() {
+    let h = Harness::new();
+    let tea = h.fact(TEA);
+    owner_says(&h, "I like green tea.");
+    break_search(&h);
+
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![reply(vec![claim(TEA, "fact", "I like green tea")])],
+    );
+    let error = h
+        .service
+        .extract_chunk(lease(&h, "main"), &llm, &[])
+        .unwrap_err();
+    assert!(matches!(error, ExtractError::Search { .. }), "{error:?}");
+    assert_eq!(error.failure(), Some(Failure::Retry { error_count: 1 }));
+    // The search runs between the calls, so call 2 never did.
+    assert_eq!(llm.requests().len(), 1);
+
+    // Counted like any failed attempt, and nothing else written: no memory,
+    // no access, and no saved reply, so the retry starts at call 1.
+    let chunk = lease(&h, "main").chunk;
+    let kind: Option<String> = h.chunk_column(chunk, "last_error_kind");
+    assert_eq!(kind.as_deref(), Some("search"));
+    let saved: Option<String> = h.chunk_column(chunk, "call1_output");
+    assert_eq!(saved, None);
+    let extracted_at: Option<i64> = h.chunk_column(chunk, "extracted_at");
+    assert_eq!(extracted_at, None);
+    assert_eq!(h.memories_in("main"), 1);
+    assert_eq!(h.accesses(tea), vec![Harness::fixture_access()]);
+    assert_eq!(h.service.queue_depth("main").unwrap(), 1);
+}
+
+#[test]
+fn a_search_that_keeps_failing_fails_the_chunk_and_the_queue_moves_on() {
+    // A fault that recurs reaches the retry cap rather than holding the
+    // bank's queue (TIM-92: "after a capped number of failures, the chunk is
+    // marked failed and surfaced instead of retried").
+    let h = Harness::new();
+    h.fact(TEA);
+    let stuck = owner_says(&h, "I like green tea.");
+    let next = h
+        .service
+        .ingest_turn(
+            "main",
+            &turn("s2", "2026-10-01T06:40:00Z", "I like coffee.", "Noted."),
+        )
+        .unwrap()
+        .source;
+    break_search(&h);
+
+    for attempt in 1..=CHUNK_RETRY_CAP {
+        let lease = lease(&h, "main");
+        assert_eq!(lease.source, stuck, "attempt {attempt} retries in place");
+        let llm = FakeLlm::scripted(
+            MODEL,
+            vec![reply(vec![claim(TEA, "fact", "I like green tea")])],
+        );
+        let error = h.service.extract_chunk(lease, &llm, &[]).unwrap_err();
+        let expected = if attempt == CHUNK_RETRY_CAP {
+            Failure::Failed
+        } else {
+            Failure::Retry {
+                error_count: attempt,
+            }
+        };
+        assert_eq!(error.failure(), Some(expected), "attempt {attempt}");
+    }
+
+    let failed = h.service.failed_chunks("main").unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].source, stuck);
+    assert_eq!(failed[0].error_kind, "search");
+    assert_eq!(failed[0].error_count, CHUNK_RETRY_CAP);
+    assert_eq!(h.service.queue_depth("main").unwrap(), 1);
+    assert_eq!(lease(&h, "main").source, next);
+}
+
+#[test]
+fn call2_input_counts_nothing_when_it_fails() {
+    // `call2_input` only previews call 2's input, so neither a reply that
+    // doesn't fit call 1's schema nor a failed search counts against the
+    // chunk, saves anything or moves the queue.
+    let h = Harness::new();
+    h.fact(TEA);
+    owner_says(&h, "I like green tea.");
+    let unchanged = |h: &Harness| {
+        let lease = lease(h, "main");
+        assert_eq!(lease.error_count, 0);
+        let kind: Option<String> = h.chunk_column(lease.chunk, "last_error_kind");
+        assert_eq!(kind, None);
+        let saved: Option<String> = h.chunk_column(lease.chunk, "call1_output");
+        assert_eq!(saved, None);
+        assert_eq!(h.service.queue_depth("main").unwrap(), 1);
+    };
+
+    let rejected = {
+        let lease = lease(&h, "main");
+        h.service
+            .call2_input(&lease, &json!({"claims": "not a list"}), &[])
+            .unwrap_err()
+    };
+    assert!(
+        matches!(rejected, ExtractError::Rejected { .. }),
+        "{rejected:?}"
+    );
+    assert_eq!(rejected.failure(), None);
+    unchanged(&h);
+
+    break_search(&h);
+    let failed = {
+        let lease = lease(&h, "main");
+        h.service
+            .call2_input(
+                &lease,
+                &reply(vec![claim(TEA, "fact", "I like green tea")]),
+                &[],
+            )
+            .unwrap_err()
+    };
+    assert!(matches!(failed, ExtractError::Store(_)), "{failed:?}");
+    assert_eq!(failed.failure(), None);
+    unchanged(&h);
 }
 
 #[test]
