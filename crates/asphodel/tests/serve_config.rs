@@ -22,6 +22,16 @@ fn serve() -> Command {
     command
 }
 
+/// `asphodel serve` with its own data dir under `dir`. Every daemon that
+/// is meant to start gets one, so `--data-dir` can become required without
+/// touching these tests. Precedence tests that set `ASPHODEL_DATA_DIR`
+/// use `serve()` instead, because the flag would win over the variable.
+fn serve_in(dir: &TestDir) -> Command {
+    let mut command = serve();
+    command.arg("--data-dir").arg(dir.0.join("data"));
+    command
+}
+
 fn run(command: &mut Command) -> Output {
     command.stdin(Stdio::null()).output().unwrap()
 }
@@ -166,7 +176,7 @@ fn secrets_have_no_flag() {
 fn an_unknown_tuning_key_stops_startup() {
     let dir = TestDir::new();
     let path = dir.file("tuning.toml", "[clock]\nquiet_rat = 0.2\n");
-    let output = run(serve().arg("--config").arg(&path));
+    let output = run(serve_in(&dir).arg("--config").arg(&path));
     assert!(!output.status.success());
     assert!(stderr(&output).contains("quiet_rat"), "{}", stderr(&output));
 }
@@ -175,7 +185,7 @@ fn an_unknown_tuning_key_stops_startup() {
 fn an_out_of_range_tuning_value_stops_startup() {
     let dir = TestDir::new();
     let path = dir.file("tuning.toml", "[purge]\ndelta = -1.0\n");
-    let output = run(serve().arg("--config").arg(&path));
+    let output = run(serve_in(&dir).arg("--config").arg(&path));
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("purge.delta"),
@@ -187,7 +197,9 @@ fn an_out_of_range_tuning_value_stops_startup() {
 #[test]
 fn a_missing_tuning_file_stops_startup() {
     let dir = TestDir::new();
-    let output = run(serve().arg("--config").arg(dir.0.join("missing.toml")));
+    let output = run(serve_in(&dir)
+        .arg("--config")
+        .arg(dir.0.join("missing.toml")));
     assert!(!output.status.success());
 }
 
@@ -195,7 +207,7 @@ fn a_missing_tuning_file_stops_startup() {
 fn the_tuning_file_can_come_from_the_environment() {
     let dir = TestDir::new();
     let path = dir.file("tuning.toml", "[injection]\ncap = 0\n");
-    let output = run(serve().env("ASPHODEL_CONFIG", &path));
+    let output = run(serve_in(&dir).env("ASPHODEL_CONFIG", &path));
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("injection.cap"),
@@ -210,7 +222,7 @@ fn the_config_flag_wins_over_its_variable() {
     let bad = dir.file("bad.toml", "[injection]\ncap = 0\n");
     let good = dir.file("good.toml", "[clock]\nquiet_rate = 0.3\n");
     let daemon = start(
-        serve()
+        serve_in(&dir)
             .env("ASPHODEL_CONFIG", &bad)
             .arg("--config")
             .arg(&good),
@@ -243,18 +255,20 @@ fn deployment_values_come_from_the_environment() {
 #[test]
 fn listen_comes_from_its_variable_and_the_flag_wins() {
     // An unparseable address in the variable must lose to the flag.
-    let daemon = start(serve().env("ASPHODEL_LISTEN", "not-an-address"));
+    let dir = TestDir::new();
+    let daemon = start(serve_in(&dir).env("ASPHODEL_LISTEN", "not-an-address"));
     let config = resolved_config(&daemon.log);
     assert_eq!(config["deployment"]["listen"], "127.0.0.1:0");
 
-    let output = run(serve().env("ASPHODEL_LISTEN", "not-an-address"));
+    let output = run(serve_in(&dir).env("ASPHODEL_LISTEN", "not-an-address"));
     assert!(!output.status.success(), "ASPHODEL_LISTEN was ignored");
 }
 
 #[test]
 fn secrets_are_read_from_the_environment_and_never_logged() {
+    let dir = TestDir::new();
     let daemon = start(
-        serve()
+        serve_in(&dir)
             .env("ASPHODEL_TOKEN", TOKEN)
             .env("ASPHODEL_LLM_API_KEY", LLM_KEY),
     );
@@ -277,7 +291,8 @@ fn secrets_are_read_from_the_environment_and_never_logged() {
 
 #[test]
 fn absent_secrets_are_recorded_as_absent() {
-    let daemon = start(&mut serve());
+    let dir = TestDir::new();
+    let daemon = start(&mut serve_in(&dir));
     let config = resolved_config(&daemon.log);
     assert!(config["deployment"]["token"].is_null());
     assert!(config["deployment"]["llm_api_key"].is_null());
@@ -285,8 +300,9 @@ fn absent_secrets_are_recorded_as_absent() {
 
 #[test]
 fn off_loopback_needs_a_token_from_the_environment() {
+    let dir = TestDir::new();
     for env in [None, Some("")] {
-        let mut command = serve();
+        let mut command = serve_in(&dir);
         command.args(["--listen", "0.0.0.0:0"]);
         if let Some(value) = env {
             command.env("ASPHODEL_TOKEN", value);
@@ -306,7 +322,8 @@ fn off_loopback_needs_a_token_from_the_environment() {
 
 #[test]
 fn the_startup_log_carries_the_resolved_config() {
-    let daemon = start(&mut serve());
+    let dir = TestDir::new();
+    let daemon = start(&mut serve_in(&dir));
     let config = resolved_config(&daemon.log);
     for key in [
         "tuning",
@@ -326,7 +343,7 @@ fn a_malformed_llm_endpoint_stops_startup() {
     // A file avoids a pipe filling while waiting. The guard kills and reaps
     // the child on every exit path, including a timeout or assertion panic.
     let log_path = dir.0.join("stderr.log");
-    let child = serve()
+    let child = serve_in(&dir)
         .args(["--listen", "127.0.0.1:0"])
         .arg("--config")
         .arg(&path)

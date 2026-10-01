@@ -309,7 +309,6 @@ fn assert_wal(path: &Path, header: &Header) {
 }
 
 #[test]
-#[ignore = "store not built yet; activate with the TIM-103 implementation"]
 fn the_store_is_one_sqlite_database_in_wal_mode_under_the_data_dir() {
     let dir = TestDir::new();
     let data = dir.data_dir();
@@ -339,7 +338,6 @@ fn the_store_is_one_sqlite_database_in_wal_mode_under_the_data_dir() {
 }
 
 #[test]
-#[ignore = "store not built yet; activate with the TIM-103 implementation"]
 fn a_restart_reopens_the_existing_database() {
     let dir = TestDir::new();
     let data = dir.data_dir();
@@ -366,7 +364,6 @@ fn a_restart_reopens_the_existing_database() {
 }
 
 #[test]
-#[ignore = "store not built yet; activate with the TIM-103 implementation"]
 fn a_second_daemon_on_the_same_data_dir_is_refused() {
     let dir = TestDir::new();
     let data = dir.data_dir();
@@ -436,7 +433,6 @@ fn a_clean_stop_releases_the_lock() {
 }
 
 #[test]
-#[ignore = "store not built yet; activate with the TIM-103 implementation"]
 fn a_data_dir_that_is_a_regular_file_is_refused_and_preserved() {
     let dir = TestDir::new();
     let file = dir.0.join("not-a-dir");
