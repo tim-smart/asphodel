@@ -90,6 +90,11 @@ const NO_COFFEE: &str = "Tim no longer drinks coffee.";
 const TAX_TASK: &str = "Tim needs to file the tax return.";
 const TAX_FILED: &str = "Tim filed the tax return.";
 const TAX_FILED_LATER: &str = "Tim filed the tax return on 2 October 2026.";
+const TAX_FILED_ONLINE: &str = "Tim filed the tax return online.";
+const TAX_NOT_FILED: &str = "Tim has not filed the tax return.";
+const TAX_WORRY: &str = "Tim is worried about the tax return.";
+const NEVER_ACME: &str = "Tim has never worked at Acme.";
+const NO_DENTIST: &str = "Tim has no dentist appointment.";
 const MAYA: &str = "Tim's daughter is called Maya.";
 const MIA: &str = "Tim's daughter is called Mia.";
 const BIKE: &str = "Tim's bike is a Brompton.";
@@ -104,7 +109,10 @@ const TRAVEL: &str = "Travel documents are sorted.";
 
 /// Pairs (claim, stored memory) that must clear [`FLOOR`] with the fake
 /// embedder, so call 2 runs on them.
-const ABOVE_FLOOR: [(&str, &str); 15] = [
+const ABOVE_FLOOR: [(&str, &str); 18] = [
+    (TAX_NOT_FILED, TAX_FILED),
+    (TAX_FILED_ONLINE, TAX_FILED),
+    (NEVER_ACME, ACME),
     (TEA, TEA),
     (TEA, TEA_A_LOT),
     (TEA_AGAIN, TEA),
@@ -2331,6 +2339,286 @@ fn a_correction_of_another_kind_still_repoints_the_end() {
     );
     assert_eq!(h.edits_on(task, EDIT_END_REPOINTED), 1);
     assert_eq!(h.all_edits_on(task), 1);
+}
+
+// Denials (the TIM-92 amendment from TIM-108: six labels, and reopening by
+// label).
+
+/// The edit kind the amendment names for an end a denial clears.
+const END_CLEARED: &str = "end_cleared";
+
+/// A task and a state that `Tim filed the tax return.` (1 October) ended, as
+/// an earlier reconciliation would have left them, and a turn on 2 October
+/// queued after them. Returns the task, the state and the ending event.
+fn filed_and_ended(h: &Harness, user: &str) -> (Uuid, Uuid, Uuid) {
+    let task = h.insert_memory("main", TAX_TASK, "task", "notable");
+    let worry = h.insert_memory("main", TAX_WORRY, "state", "minor");
+    let filed = h.insert_memory("main", TAX_FILED, "event", "minor");
+    h.set_valid_from(filed, local("2026-10-01T00:00"), "day");
+    h.mark_ended(task, filed, local("2026-10-01T00:00"), "day");
+    h.mark_ended(worry, filed, local("2026-10-01T00:00"), "day");
+    h.advance(24);
+    h.service
+        .ingest_turn("main", &turn("s1", "2026-10-02T06:30:00Z", user, "Noted."))
+        .unwrap();
+    (task, worry, filed)
+}
+
+#[test]
+#[ignore = "pending fix (TIM-108 denies decision): call 2 has no `denies` label yet"]
+fn the_call_2_schema_offers_denies_under_a_new_version() {
+    // Six labels, with `denies` defined in the prompt and `retracts` the
+    // choice when unsure; the template version moves with the prompt.
+    let h = Harness::new();
+    let tea = h.fact(TEA);
+    owner_says(&h, "I really like green tea.");
+    let input = call2(
+        &h,
+        &reply(vec![claim(TEA_AGAIN, "fact", "I really like green tea")]),
+    )
+    .expect("call 2 runs");
+    assert!(input.neighbours.iter().any(|n| n.memory == tea));
+    let request = call2_request(&input);
+    let labels = strings(
+        &request.schema["properties"]["claims"]["items"]["properties"]["labels"]["items"]["properties"]
+            ["label"]["enum"],
+    );
+    assert_eq!(
+        labels,
+        [
+            "mentioned_again",
+            "confirmed",
+            "refines",
+            "retracts",
+            "denies",
+            "ends"
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(CALL2_VERSION, 2, "the prompt changed, so its version does");
+    assert!(request.system.contains("`denies`"));
+    assert!(
+        request.system.contains("unsure"),
+        "the prompt says to use `retracts` when unsure"
+    );
+}
+
+/// The strings in a JSON array.
+fn strings(value: &Value) -> BTreeSet<String> {
+    value
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|item| item.as_str().expect("a string").to_owned())
+        .collect()
+}
+
+#[test]
+#[ignore = "pending fix (TIM-108 denies decision): call 2 has no `denies` label yet"]
+fn a_denial_reopens_everything_its_neighbour_ended() {
+    // "I haven't filed it after all" says the filing never happened. The
+    // filing is retracted like any other retraction, and everything it had
+    // ended is open again, each clearing logged as `end_cleared`.
+    let h = Harness::new();
+    let (task, worry, filed) = filed_and_ended(&h, "Actually I haven't filed the tax return yet.");
+    let denial = one_label(
+        &h,
+        reply(vec![changes(claim(
+            TAX_NOT_FILED,
+            "fact",
+            "I haven't filed the tax return yet",
+        ))]),
+        filed,
+        "denies",
+    )
+    .memories[0];
+
+    assert_eq!(h.content(denial), TAX_NOT_FILED);
+    assert_eq!(
+        h.change(filed),
+        Change {
+            valid_until: None,
+            invalidated_at: Some(at("2026-10-02T06:30:00Z")),
+            superseded_by: Some(denial),
+            ..Change::untouched()
+        }
+    );
+    assert_eq!(h.edits_on(filed, EDIT_RETRACTED), 1);
+    for reopened in [task, worry] {
+        assert_eq!(h.change(reopened), Change::untouched(), "{reopened}");
+        assert_eq!(h.edits_on(reopened, END_CLEARED), 1);
+        assert_eq!(h.edits_on(reopened, EDIT_END_REPOINTED), 0);
+    }
+    assert_eq!(h.change(denial), Change::untouched());
+}
+
+#[test]
+fn a_reschedule_still_repoints_everything_its_neighbour_ended() {
+    // A `retracts` is a corrected version of the ender, so everything it
+    // ended stays ended, now by the correction.
+    let h = Harness::new();
+    let (task, worry, filed) = filed_and_ended(
+        &h,
+        "Correction: I filed the tax return on 2 October, not the 1st.",
+    );
+    let later = one_label(
+        &h,
+        reply(vec![changes(
+            claim(
+                TAX_FILED_LATER,
+                "event",
+                "I filed the tax return on 2 October",
+            )
+            .with("valid_from", time("2026-10-02", "day")),
+        )]),
+        filed,
+        "retracts",
+    )
+    .memories[0];
+
+    assert_eq!(h.change(filed).superseded_by, Some(later));
+    for ended in [task, worry] {
+        assert_eq!(
+            h.change(ended),
+            Change {
+                valid_until: timed(local("2026-10-02T00:00"), "day"),
+                ended_by: Some(later),
+                ..Change::untouched()
+            },
+            "{ended}"
+        );
+        assert_eq!(h.edits_on(ended, EDIT_END_REPOINTED), 1);
+        assert_eq!(h.edits_on(ended, END_CLEARED), 0);
+    }
+}
+
+#[test]
+#[ignore = "pending fix (TIM-108 denies decision): a refinement doesn't repoint its neighbour's ends yet"]
+fn a_refinement_of_an_ender_repoints_what_it_ended() {
+    // The amendment repoints ends for a `refines` successor as for a
+    // `retracts` one: the refined filing still completed the task.
+    let h = Harness::new();
+    let (task, worry, filed) = filed_and_ended(&h, "I filed the tax return online.");
+    let online = one_label(
+        &h,
+        reply(vec![
+            claim(TAX_FILED_ONLINE, "event", "I filed the tax return online")
+                .with("valid_from", time("2026-10-01", "day")),
+        ]),
+        filed,
+        "refines",
+    )
+    .memories[0];
+
+    assert_eq!(h.change(filed).superseded_by, Some(online));
+    for ended in [task, worry] {
+        assert_eq!(
+            h.change(ended),
+            Change {
+                valid_until: timed(local("2026-10-01T00:00"), "day"),
+                ended_by: Some(online),
+                ..Change::untouched()
+            },
+            "{ended}"
+        );
+        assert_eq!(h.edits_on(ended, EDIT_END_REPOINTED), 1);
+    }
+}
+
+#[test]
+#[ignore = "pending fix (TIM-108 denies decision): call 2 has no `denies` label yet"]
+fn an_older_denial_creates_nothing() {
+    // Direction is unchanged: an old note denying the filing can't undo a
+    // newer memory of it, and the task stays ended.
+    let h = Harness::new();
+    let task = h.insert_memory("main", TAX_TASK, "task", "notable");
+    let filed = h.insert_memory("main", TAX_FILED, "event", "minor");
+    h.set_observed_at(filed, at("2026-09-25T00:00:00Z"));
+    h.set_valid_from(filed, local("2026-09-25T00:00"), "day");
+    h.mark_ended(task, filed, local("2026-09-25T00:00"), "day");
+    let task_before = h.change(task);
+    ingest_doc(
+        &h,
+        &document(
+            "old-notes",
+            "I haven't filed the tax return.",
+            date(2026, 9, 10),
+        ),
+    );
+    let extracted = one_label(
+        &h,
+        reply(vec![claim(
+            TAX_NOT_FILED,
+            "fact",
+            "I haven't filed the tax return",
+        )]),
+        filed,
+        "denies",
+    );
+
+    assert!(extracted.memories.is_empty());
+    assert_eq!(h.change(filed), Change::untouched());
+    assert_eq!(h.all_edits_on(filed), 0);
+    assert_eq!(h.change(task), task_before);
+    assert_eq!(h.all_edits_on(task), 0);
+}
+
+#[test]
+#[ignore = "pending fix (TIM-108 denies decision): call 2 has no `denies` label yet"]
+fn denies_on_an_ended_or_retracted_neighbour_is_rejected() {
+    // Like every label but `mentioned_again` and `confirmed`, `denies` is
+    // rejected on a neighbour already ended, or retracted earlier in the
+    // same unit. A claim left with no labels is new.
+    let h = Harness::new();
+    let acme = h.fact(ACME);
+    let left = h.insert_memory("main", ACME_LEFT, "event", "minor");
+    h.mark_ended(acme, left, local("2026-08-01T00:00"), "month");
+    let acme_before = h.change(acme);
+    let dentist = h.insert_memory("main", DENTIST_8, "event", "minor");
+
+    owner_says(
+        &h,
+        "I've never worked at Acme. The dentist moved my appointment to 9 October. \
+         Actually I have no dentist appointment.",
+    );
+    let call1 = reply(vec![
+        changes(claim(NEVER_ACME, "fact", "I've never worked at Acme")),
+        changes(claim(
+            DENTIST_9,
+            "event",
+            "The dentist moved my appointment to 9 October",
+        )),
+        changes(claim(NO_DENTIST, "fact", "I have no dentist appointment")),
+    ]);
+    let input = call2(&h, &call1).expect("call 2 runs");
+    let n_acme = neighbour_handle(&input, acme);
+    let n_dentist = neighbour_handle(&input, dentist);
+    let extracted = reconcile(
+        &h,
+        call1,
+        call2_reply(vec![
+            labelled(&input.claims[0].handle, &[(n_acme, "denies")]),
+            labelled(&input.claims[1].handle, &[(n_dentist.clone(), "retracts")]),
+            labelled(&input.claims[2].handle, &[(n_dentist, "denies")]),
+        ]),
+    );
+
+    // All three claims are new memories, and only the reschedule edited
+    // anything.
+    assert_eq!(extracted.memories.len(), 3);
+    let [never, rescheduled, none] = [
+        extracted.memories[0],
+        extracted.memories[1],
+        extracted.memories[2],
+    ];
+    assert_eq!(h.content(never), NEVER_ACME);
+    assert_eq!(h.content(none), NO_DENTIST);
+    assert_eq!(h.change(acme), acme_before);
+    assert_eq!(h.all_edits_on(acme), 0);
+    assert_eq!(h.change(dentist).superseded_by, Some(rescheduled));
+    assert_eq!(h.edits_on(dentist, EDIT_RETRACTED), 1);
 }
 
 // Mental models.
