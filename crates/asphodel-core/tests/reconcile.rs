@@ -1299,7 +1299,6 @@ fn a_hit_on_a_refined_memory_shows_its_chain_head() {
 }
 
 #[test]
-#[ignore = "pending fix (TIM-108 review): each retriever takes 20 raw hits before chains collapse"]
 fn a_long_chain_doesnt_crowd_out_another_neighbour() {
     // The top five are distinct shown memories, not raw hits: 22 versions of
     // one refined memory collapse to its head, and the next memory that
@@ -2195,7 +2194,6 @@ fn retracting_the_memory_that_ended_another_repoints_its_end() {
 }
 
 #[test]
-#[ignore = "pending fix (TIM-108 review): reopening repoints only when the successor's kind matches"]
 fn a_correction_of_another_kind_still_repoints_the_end() {
     // TIM-92, "Reopening": with a successor, ended_by is repointed. The
     // correction below is filed as a fact rather than an event, but it still
@@ -2423,7 +2421,6 @@ fn a_populated_version_3_store_keeps_its_accesses_through_the_migration() {
 }
 
 #[test]
-#[ignore = "pending fix (TIM-108 review): the version 4 rebuild loses the AUTOINCREMENT high-water mark"]
 fn the_version_4_migration_never_reuses_an_access_id() {
     // Rowids are AUTOINCREMENT so they are never reused (the schema's
     // header). The newest access in the version 3 store is deleted, so only
