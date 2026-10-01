@@ -2460,7 +2460,6 @@ fn refresh_owner_ids(h: &Harness, bank: &str, ids: &[&str]) {
 }
 
 #[test]
-#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
 fn an_upgrade_maps_no_owner_ids_until_bank_config_is_sent_again() {
     // Version 1 kept the owner's platform ids only as aliases of `user`,
     // next to the owner's names, renames included, with nothing recording
@@ -2497,7 +2496,6 @@ fn an_upgrade_maps_no_owner_ids_until_bank_config_is_sent_again() {
 }
 
 #[test]
-#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
 fn an_upgrade_does_not_map_an_owner_name_shaped_like_a_platform_id() {
     // The trust boundary of the backfill. An owner whose configured name
     // looks like a platform id still has a name, not an id: a stranger
@@ -2554,7 +2552,6 @@ fn an_upgrade_does_not_map_an_owner_name_shaped_like_a_platform_id() {
 }
 
 #[test]
-#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
 fn an_upgrade_does_not_map_a_former_owner_name_shaped_like_a_platform_id() {
     // A rename keeps the old name as an alias of `user`, and version 1
     // recorded nothing that tells it from a platform id. Neither the
@@ -2634,7 +2631,6 @@ fn an_owner_name_shaped_like_a_platform_id_is_not_a_speaker_id() {
 }
 
 #[test]
-#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
 fn an_upgrade_keeps_the_speakers_version_1_ingest_created() {
     let h = Harness::new();
     let (sam, _) = speaker(&h, "main", "discord", "5678", "Sam");
@@ -2660,7 +2656,6 @@ fn an_upgrade_keeps_the_speakers_version_1_ingest_created() {
 }
 
 #[test]
-#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
 fn an_upgrade_leaves_an_id_a_stranger_held_first_with_them_until_bank_config_takes_it() {
     // Version 1: the owner spoke from discord:1234 before it was configured,
     // so ingest made them a stranger; then bank config added the id to
@@ -2701,7 +2696,6 @@ fn an_upgrade_leaves_an_id_a_stranger_held_first_with_them_until_bank_config_tak
 }
 
 #[test]
-#[ignore = "TIM-106: needs the fail-closed owner backfill; activate with the migration patch"]
 fn an_upgrade_does_not_trust_an_alias_of_unknown_origin() {
     // Shape alone proves nothing: an alias on an entity ingest didn't
     // create, or a later alias of one it did, isn't a platform id.
