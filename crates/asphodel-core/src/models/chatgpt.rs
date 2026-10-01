@@ -12,7 +12,7 @@
 //! `~/.codex/auth.json`: refresh tokens are single-use, so sharing a token
 //! chain with the Codex CLI would log one of the two out.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -383,10 +383,9 @@ fn login_transport(error: ureq::Error) -> LoginError {
     }
 }
 
-fn read_json(
+fn read_login_body(
     mut response: ureq::http::Response<ureq::Body>,
-    step: &'static str,
-) -> Result<(u16, Value), LoginError> {
+) -> Result<(u16, String), LoginError> {
     let status = response.status().as_u16();
     let text = response
         .body_mut()
@@ -394,12 +393,16 @@ fn read_json(
         .limit(REPLY_LIMIT)
         .read_to_string()
         .map_err(login_transport)?;
+    Ok((status, text))
+}
+
+fn parse_login_reply(text: &str, step: &'static str) -> Result<Value, LoginError> {
     let value = if text.trim().is_empty() {
         Value::Null
     } else {
-        serde_json::from_str(&text).map_err(|_| LoginError::InvalidReply { step })?
+        serde_json::from_str(text).map_err(|_| LoginError::InvalidReply { step })?
     };
-    Ok((status, value))
+    Ok(value)
 }
 
 fn string_field(value: &Value, key: &str, step: &'static str) -> Result<String, LoginError> {
@@ -429,10 +432,11 @@ pub fn device_code_login(
         .post(format!("{api}/deviceauth/usercode"))
         .send_json(json!({ "client_id": CLIENT_ID }))
         .map_err(login_transport)?;
-    let (status, reply) = read_json(response, step)?;
+    let (status, text) = read_login_body(response)?;
     if !(200..300).contains(&status) {
         return Err(LoginError::Status { status, step });
     }
+    let reply = parse_login_reply(&text, step)?;
     let device_auth_id = string_field(&reply, "device_auth_id", step)?;
     let user_code = reply
         .get("user_code")
@@ -463,9 +467,9 @@ pub fn device_code_login(
                 "user_code": code.user_code,
             }))
             .map_err(login_transport)?;
-        let (status, reply) = read_json(response, step)?;
+        let (status, text) = read_login_body(response)?;
         if (200..300).contains(&status) {
-            break reply;
+            break parse_login_reply(&text, step)?;
         }
         if status == 403 || status == 404 {
             if started.elapsed() >= LOGIN_WAIT {
@@ -492,10 +496,11 @@ pub fn device_code_login(
             ("code_verifier", code_verifier.as_str()),
         ])
         .map_err(login_transport)?;
-    let (status, reply) = read_json(response, step)?;
+    let (status, text) = read_login_body(response)?;
     if !(200..300).contains(&status) {
         return Err(LoginError::Status { status, step });
     }
+    let reply = parse_login_reply(&text, step)?;
     let tokens = ChatgptTokens::from_reply(
         &string_field(&reply, "id_token", step)?,
         &string_field(&reply, "access_token", step)?,
@@ -621,16 +626,16 @@ impl CodexResponses {
             .get("x-codex-primary-reset-at")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<i64>().ok());
-        let text = response
-            .body_mut()
-            .with_config()
-            .limit(REPLY_LIMIT)
-            .read_to_string()
-            .map_err(super::llm::transport)?;
         match status {
             200..=299 => {}
             401 => return Err(Post::Unauthorized),
             429 => {
+                let text = response
+                    .body_mut()
+                    .with_config()
+                    .limit(REPLY_LIMIT)
+                    .read_to_string()
+                    .map_err(super::llm::transport)?;
                 if let Some(resets_at) = usage_limit(&text, reset_header) {
                     return Err(LlmError::UsageLimited { resets_at }.into());
                 }
@@ -638,8 +643,13 @@ impl CodexResponses {
             }
             _ => return Err(LlmError::Status { status }.into()),
         }
+        let reader = response
+            .body_mut()
+            .with_config()
+            .limit(REPLY_LIMIT)
+            .reader();
+        let (json, usage) = parse_stream_reader(reader)?;
         let latency = started.elapsed();
-        let (json, usage) = parse_stream(&text)?;
         Ok(LlmResponse {
             json,
             usage,
@@ -679,8 +689,11 @@ impl CodexResponses {
             .read_to_string()
             .map_err(super::llm::transport)?;
         if !(200..300).contains(&status) {
-            // A rejected refresh token can't be recovered from here.
-            return Err(LlmError::LoginRequired);
+            // Transient issuer failures don't invalidate the credential.
+            return Err(match status {
+                408 | 429 | 500..=599 => LlmError::Status { status },
+                _ => LlmError::LoginRequired,
+            });
         }
         let reply: Value = serde_json::from_str(&text).map_err(|_| LlmError::LoginRequired)?;
         let field = |key: &str| reply.get(key).and_then(Value::as_str).map(str::to_string);
@@ -747,21 +760,55 @@ fn usage_limit(body: &str, reset_header: Option<i64>) -> Option<Timestamp> {
 }
 
 /// Reassembles a Responses SSE stream into the reply's JSON and usage.
+#[cfg(test)]
 fn parse_stream(text: &str) -> Result<(Value, Option<LlmUsage>), LlmError> {
+    parse_stream_reader(text.as_bytes())
+}
+
+fn parse_stream_reader(reader: impl Read) -> Result<(Value, Option<LlmUsage>), LlmError> {
+    // Bound even a single unterminated line, not just well-formed SSE blocks.
+    let mut reader = BufReader::new(reader.take(REPLY_LIMIT + 1));
+    let mut bytes = 0u64;
     let mut done_text: Option<String> = None;
     let mut deltas = String::new();
     let mut completed = false;
     let mut usage = None;
-    for block in text.replace("\r\n", "\n").split("\n\n") {
-        let data: Vec<&str> = block
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(str::trim_start)
-            .collect();
+    loop {
+        let mut data = Vec::new();
+        let mut eof = false;
+        loop {
+            let mut line = String::new();
+            let count = reader
+                .read_line(&mut line)
+                .map_err(|error| super::llm::transport(error.into()))?;
+            bytes += count as u64;
+            if bytes > REPLY_LIMIT {
+                return Err(LlmError::Transport {
+                    reason: "SSE reply exceeds size limit".into(),
+                });
+            }
+            if count == 0 {
+                eof = true;
+                break;
+            }
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("data:") {
+                data.push(value.trim_start().to_string());
+            }
+        }
         if data.is_empty() {
+            if eof {
+                break;
+            }
             continue;
         }
         let Ok(event) = serde_json::from_str::<Value>(&data.join("\n")) else {
+            if eof {
+                break;
+            }
             continue;
         };
         match event
@@ -825,6 +872,9 @@ fn parse_stream(text: &str) -> Result<(Value, Option<LlmUsage>), LlmError> {
                 return Err(LlmError::Backend { code });
             }
             _ => {}
+        }
+        if completed || eof {
+            break;
         }
     }
     if !completed {

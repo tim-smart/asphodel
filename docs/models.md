@@ -93,6 +93,11 @@ and no temperature (the GPT-5 family rejects it). The protocol was read
 from `openai/codex` at `6b4daaf`; it is undocumented and OpenAI can change
 it, which is why `api_key` stays the default.
 
+Subscription usage windows will throttle the real-history import in TIM-117.
+A large backfill could take days. Keep `llm.model` pinned and calibrate
+against that exact model; subscription mode does not change ADR 0009's
+single-model calibration requirement.
+
 **Logging in.** `asphodel llm login --data-dir <dir>` runs the device-code
 flow: it prints a URL and a one-time code, waits for approval, and writes
 `<dir>/llm-tokens.json` with mode 0600. The daemon reads that file before
@@ -105,7 +110,8 @@ shared one token chain, whichever refreshed first would log the other out.
 **Refresh.** The daemon refreshes the access token when its expiry is
 within five minutes, or after a 401, once. The rotated tokens are written
 before the retried request goes out, and concurrent calls share one
-refresh. A second 401, or a refresh the issuer rejects, surfaces as "run
+refresh. An issuer 408, 429 or 5xx is retryable and keeps the token file
+unchanged. A second 401, or a refresh the issuer rejects, surfaces as "run
 `asphodel llm login`"; the old file is kept until the next login replaces
 it.
 
