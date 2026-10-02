@@ -1047,3 +1047,134 @@ fn delete_orphans(conn: &Connection, entities: &BTreeSet<i64>) -> Result<(), rus
     }
     Ok(())
 }
+
+/// The daemon-wide edit kind a bank deletion writes.
+pub const EDIT_BANK_DELETED: &str = "bank_deleted";
+
+/// What `bank delete` did: counts only, as its `bank_deleted` row holds
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BankDeleted {
+    pub bank: Uuid,
+    pub name: String,
+    pub memories: usize,
+    pub entities: usize,
+    pub sources: usize,
+    pub chunks: usize,
+    pub edits: usize,
+    pub models: usize,
+    pub recalls: usize,
+    pub sessions: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BankDeleteError {
+    #[error("unknown bank")]
+    UnknownBank,
+
+    #[error("--confirm must repeat the bank's name")]
+    NotConfirmed,
+
+    #[error("the bank's extraction didn't finish its chunk in time; try again")]
+    Busy,
+
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl From<rusqlite::Error> for BankDeleteError {
+    fn from(error: rusqlite::Error) -> Self {
+        BankDeleteError::Store(StoreError::Sqlite(error))
+    }
+}
+
+/// Deletes a bank (TIM-99, decision 10; ADR 0010). Every memory goes
+/// through the erase path as one purge, which drops the model entries
+/// citing them and their vectors; then everything else the bank holds goes
+/// too, its tombstones, edit rows and session mappings included, and one
+/// daemon-wide `bank_deleted` row records the counts. The caller holds the
+/// bank's lease, so no chunk is in flight.
+pub(crate) fn delete_bank(
+    store: &Store,
+    bank: &str,
+) -> Result<(i64, BankDeleted), BankDeleteError> {
+    let mut conn = store.connection();
+    let tx = conn.transaction()?;
+    let (bank_id, _) = find_bank(&tx, bank)?.ok_or(BankDeleteError::UnknownBank)?;
+    let (uuid, name): (String, String) = tx.query_row(
+        "SELECT uuid, name FROM banks WHERE id = ?1",
+        [bank_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let count = |sql: &str| -> Result<usize, rusqlite::Error> {
+        tx.query_row(sql, [bank_id], |row| row.get::<_, i64>(0))
+            .map(|count| usize::try_from(count).unwrap_or(0))
+    };
+    let entities = count("SELECT COUNT(*) FROM entities WHERE bank_id = ?1")?;
+    let sources = count("SELECT COUNT(*) FROM sources WHERE bank_id = ?1")?;
+    let chunks = count("SELECT COUNT(*) FROM chunks WHERE bank_id = ?1")?;
+    let models = count("SELECT COUNT(*) FROM mental_models WHERE bank_id = ?1")?;
+    let recalls = count("SELECT COUNT(*) FROM recalls WHERE bank_id = ?1")?;
+    let sessions = count("SELECT COUNT(*) FROM session_blocks WHERE bank_id = ?1")?;
+
+    let members: BTreeSet<i64> = {
+        let mut statement = tx.prepare("SELECT id FROM memories WHERE bank_id = ?1")?;
+        statement
+            .query_map([bank_id], |row| row.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    let (memories, _) = erase_chain(&tx, store, bank_id, &members, EraseReason::Purge)?;
+    let edits = count("SELECT COUNT(*) FROM edits WHERE bank_id = ?1")?;
+
+    for sql in [
+        "DELETE FROM reembed_vectors WHERE bank_id = ?1",
+        "DELETE FROM reembeds WHERE bank_id = ?1",
+        "DELETE FROM mental_models WHERE bank_id = ?1",
+        "DELETE FROM recalls WHERE bank_id = ?1",
+        "DELETE FROM session_blocks WHERE bank_id = ?1",
+        "DELETE FROM prompt_blocks WHERE bank_id = ?1",
+        "DELETE FROM sweep_runs WHERE bank_id = ?1",
+        "DELETE FROM sweep_progress WHERE bank_id = ?1",
+        "DELETE FROM extraction_queue WHERE bank_id = ?1",
+        "DELETE FROM accesses WHERE bank_id = ?1",
+        "DELETE FROM mention_passages
+         WHERE chunk_id IN (SELECT id FROM chunks WHERE bank_id = ?1)",
+        "DELETE FROM chunks WHERE bank_id = ?1",
+        "DELETE FROM sources WHERE bank_id = ?1",
+        "DELETE FROM speaker_ids WHERE bank_id = ?1",
+        "DELETE FROM edits WHERE bank_id = ?1",
+        "DELETE FROM memory_entities
+         WHERE entity_id IN (SELECT id FROM entities WHERE bank_id = ?1)",
+        "DELETE FROM entity_aliases WHERE bank_id = ?1",
+        "UPDATE entities SET merged_into = NULL WHERE bank_id = ?1",
+        "DELETE FROM entities WHERE bank_id = ?1",
+        "DELETE FROM banks WHERE id = ?1",
+    ] {
+        tx.execute(sql, [bank_id])?;
+    }
+
+    let deleted = BankDeleted {
+        bank: uuid.parse().expect("a stored uuid parses"),
+        name,
+        memories: memories.len(),
+        entities,
+        sources,
+        chunks,
+        edits,
+        models,
+        recalls,
+        sessions,
+    };
+    tx.execute(
+        "INSERT INTO edits (uuid, bank_id, kind, details, at) VALUES (?1, NULL, ?2, ?3, ?4)",
+        (
+            store.new_id().to_string(),
+            EDIT_BANK_DELETED,
+            serde_json::to_string(&deleted).expect("counts serialise"),
+            micros(store.now()),
+        ),
+    )?;
+    tx.commit()?;
+    tracing::info!(bank = %deleted.bank, memories = deleted.memories, "deleted a bank");
+    Ok((bank_id, deleted))
+}

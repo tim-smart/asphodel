@@ -3,6 +3,7 @@
 //! Handlers stay thin: anything that would be skipped by replay if it lived
 //! in a handler belongs here instead (TIM-96, decision 3).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,19 +18,27 @@ use crate::agenda::Agenda;
 use crate::clock::Clock;
 use crate::config::{ConfigError, DeletionInputs, PurgePause, Tuning};
 use crate::constants::RERANKER_DEADLINE;
-use crate::erase::{Aftermath, Erased, ForgetError, ForgetRequest, Forgotten};
+use crate::entities::{
+    AliasRemoval, AliasRemoved, EntityError, LinkEdited, LinkRequest, MergeRequest, Merged,
+    Unmerged,
+};
+use crate::erase::{
+    Aftermath, BankDeleteError, BankDeleted, Erased, ForgetError, ForgetRequest, Forgotten,
+};
 use crate::extraction::{Call1Input, Call2Input, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Outcome, Turn};
-use crate::keep::{KeepError, Kept, Unkept};
+use crate::inspect::{EntityView, InspectError, MemoryView, ModelView};
+use crate::keep::{KeepError, Kept, SignificanceSet, Unkept};
 use crate::mental_models::{
     Model, ModelEdit, ModelError, ModelSpec, Outcome as RefreshOutcome, RefreshInput, RefreshRun,
     Refreshes, Schedule,
 };
-use crate::models::{LlmClient, Models};
+use crate::models::{Embedder, LlmClient, Models};
 use crate::operations::{Audit, AuditError, AuditList, Backup, BackupError, Status};
 use crate::queue::{
     ChunkError, ChunkList, FailedChunk, Failure, Lease, Leases, QueueError, Retried, SourceKind,
 };
+use crate::reembed::{ReembedError, ReembedStatus};
 use crate::retrieval::{Permit, Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
 use crate::sessions::Sessions;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
@@ -75,6 +84,19 @@ pub struct Service {
     sweeps: SweepSchedule,
     /// Held while the sweep runs, so two callers never sweep at once.
     sweeping: Mutex<()>,
+    /// Embedding models carried besides the models' own, for banks a
+    /// re-embed hasn't moved yet (ADR 0010).
+    previous_embedders: Vec<Arc<dyn Embedder>>,
+    /// The banks whose re-embed is running, and why each one's last run
+    /// failed.
+    reembeds: Mutex<ReembedRuns>,
+}
+
+/// What [`Service`] keeps in memory about re-embeds.
+#[derive(Debug, Default)]
+struct ReembedRuns {
+    running: BTreeSet<i64>,
+    failed: BTreeMap<i64, String>,
 }
 
 /// Why a service couldn't be built on a store and models.
@@ -108,6 +130,8 @@ impl Service {
             purge: Mutex::new(PurgePause::Running),
             sweeps: SweepSchedule::new(started),
             sweeping: Mutex::new(()),
+            previous_embedders: Vec::new(),
+            reembeds: Mutex::default(),
         }
     }
 
@@ -143,7 +167,70 @@ impl Service {
             purge: Mutex::new(PurgePause::Running),
             sweeps: SweepSchedule::new(started),
             sweeping: Mutex::new(()),
+            previous_embedders: Vec::new(),
+            reembeds: Mutex::default(),
         })
+    }
+
+    /// The same service, also carrying `embedder`, a model banks may have
+    /// recorded before the daemon's model changed. Each such bank is served
+    /// with it until `asphodel reembed` swaps the bank to the daemon's
+    /// model (ADR 0010). It needs a reconcile floor like the daemon's own.
+    pub fn with_previous_embedder(
+        mut self,
+        embedder: Arc<dyn Embedder>,
+    ) -> Result<Self, OpenError> {
+        let reranker = self
+            .models
+            .as_ref()
+            .map(|models| models.reranker.model_id().to_string());
+        if let Some(reranker) = reranker {
+            self.tuning.check_floors(embedder.model_id(), &reranker)?;
+        }
+        self.previous_embedders.push(embedder);
+        Ok(self)
+    }
+
+    /// The banks recorded under an embedding model this service doesn't
+    /// carry, with that model. They're served with the daemon's model, so
+    /// `serve` warns about each at startup.
+    pub fn banks_without_their_model(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let Some(models) = &self.models else {
+            return Ok(Vec::new());
+        };
+        let conn = self.store.connection();
+        let mut statement = conn.prepare("SELECT name, embedding_model FROM banks ORDER BY id")?;
+        let banks: Vec<(String, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(banks
+            .into_iter()
+            .filter(|(_, recorded)| {
+                models.embedder.model_id() != recorded
+                    && !self
+                        .previous_embedders
+                        .iter()
+                        .any(|embedder| embedder.model_id() == recorded)
+            })
+            .collect())
+    }
+
+    /// The embedder `bank_id` is served with: the model it recorded, until
+    /// a re-embed swaps it (ADR 0010).
+    fn bank_embedder<'a>(
+        &'a self,
+        models: &'a Models,
+        bank_id: i64,
+    ) -> Result<&'a dyn Embedder, StoreError> {
+        let recorded = {
+            let conn = self.store.connection();
+            crate::reembed::recorded_model(&conn, bank_id)?
+        };
+        Ok(crate::models::serving(
+            models,
+            &self.previous_embedders,
+            &recorded,
+        ))
     }
 
     /// The same service with the reranker deadline set to
@@ -348,7 +435,7 @@ impl Service {
             &self.store,
             &self.leases,
             &self.tuning,
-            models.embedder.as_ref(),
+            self.bank_embedder(models, lease.bank_id())?,
             lease,
             call1_reply,
             in_context,
@@ -390,7 +477,7 @@ impl Service {
             &self.store,
             &self.leases,
             &self.tuning,
-            models.embedder.as_ref(),
+            self.bank_embedder(models, bank_id)?,
             lease,
             llm,
             in_context,
@@ -445,6 +532,7 @@ impl Service {
             store: &self.store,
             tuning: &self.tuning,
             models: self.models.as_ref().ok_or(RecallError::NoModels)?,
+            previous: &self.previous_embedders,
             sessions: &self.sessions,
             permit: &self.reranker_permit,
             deadline: self.reranker_deadline,
@@ -649,6 +737,245 @@ impl Service {
         limit: Option<usize>,
     ) -> Result<Audit, AuditError> {
         crate::operations::audit(&self.store, bank, list, limit)
+    }
+}
+
+/// Inspection and correction ("Operations: inspection, entity correction,
+/// re-embedding and bank deletion", TIM-115; ADR 0010). The views read
+/// only; each correction is one logged edit, and refreshes the models it
+/// changes what they see.
+impl Service {
+    /// `memory show`: the memory, both significance fields, its passage or
+    /// why it's gone, its accesses, edits and chain, its strength in parts,
+    /// what holds back a purge, and projected fade and purge dates.
+    pub fn show_memory(&self, bank: &str, id: &str) -> Result<MemoryView, InspectError> {
+        crate::inspect::memory(&self.store, &self.tuning, &self.purge_pause(), bank, id)
+    }
+
+    /// `entity show`: an entity by id, `user`, `assistant`, name or alias.
+    pub fn show_entity(&self, bank: &str, entity: &str) -> Result<EntityView, InspectError> {
+        crate::inspect::entity(&self.store, bank, entity)
+    }
+
+    /// `model show [--entry]`: a model with each entry's citations.
+    pub fn show_model(
+        &self,
+        bank: &str,
+        name: &str,
+        entry: Option<&str>,
+    ) -> Result<ModelView, InspectError> {
+        crate::inspect::model_view(&self.store, bank, name, entry)
+    }
+
+    /// `memory significance <id> <level|clear>`: the owner's significance,
+    /// the field keep and unkeep write.
+    pub fn set_significance(
+        &self,
+        bank: &str,
+        id: &str,
+        level: Option<&str>,
+    ) -> Result<SignificanceSet, KeepError> {
+        let watermark = self.watermark_for(bank)?;
+        let set = crate::keep::set_significance(&self.store, bank, id, level)?;
+        if let Some((bank_id, watermark)) = watermark {
+            self.after_writes(bank_id, watermark, &[])?;
+        }
+        Ok(set)
+    }
+
+    /// `entity merge <from> <into>`.
+    pub fn merge_entities(
+        &self,
+        bank: &str,
+        request: &MergeRequest,
+    ) -> Result<Merged, EntityError> {
+        let (bank_id, merged, models) = crate::entities::merge(&self.store, bank, request)?;
+        self.corrected(bank_id, &models)?;
+        Ok(merged)
+    }
+
+    /// `entity unmerge <edit-id>`.
+    pub fn unmerge_entity(&self, bank: &str, edit: &str) -> Result<Unmerged, EntityError> {
+        let (bank_id, unmerged, models) = crate::entities::unmerge(&self.store, bank, edit)?;
+        self.corrected(bank_id, &models)?;
+        Ok(unmerged)
+    }
+
+    /// `entity alias rm [--relink-to]`.
+    pub fn remove_alias(
+        &self,
+        bank: &str,
+        request: &AliasRemoval,
+    ) -> Result<AliasRemoved, EntityError> {
+        let (bank_id, removed, models) = crate::entities::remove_alias(&self.store, bank, request)?;
+        self.corrected(bank_id, &models)?;
+        Ok(removed)
+    }
+
+    /// `entity link <memory> <entity>`.
+    pub fn link_entity(
+        &self,
+        bank: &str,
+        request: &LinkRequest,
+    ) -> Result<LinkEdited, EntityError> {
+        let (bank_id, linked, models) =
+            crate::entities::edit_link(&self.store, bank, request, true)?;
+        self.corrected(bank_id, &models)?;
+        Ok(linked)
+    }
+
+    /// `entity unlink <memory> <entity>`.
+    pub fn unlink_entity(
+        &self,
+        bank: &str,
+        request: &LinkRequest,
+    ) -> Result<LinkEdited, EntityError> {
+        let (bank_id, unlinked, models) =
+            crate::entities::edit_link(&self.store, bank, request, false)?;
+        self.corrected(bank_id, &models)?;
+        Ok(unlinked)
+    }
+
+    /// Requests a refresh of the models a correction changed, and clears
+    /// the bank's block.
+    fn corrected(&self, bank_id: i64, models: &BTreeSet<i64>) -> Result<(), StoreError> {
+        if !models.is_empty() {
+            let now = self.now();
+            {
+                let conn = self.store.connection();
+                crate::mental_models::request(&conn, &self.schedule, models, now)?;
+            }
+            self.schedule.triggered(bank_id, now);
+        }
+        self.blocks.invalidate(bank_id);
+        Ok(())
+    }
+}
+
+/// Re-embedding and bank deletion, the daemon jobs that change a bank at
+/// scale (TIM-99, decision 10; ADR 0010).
+impl Service {
+    /// How long a re-embed's swap or a bank deletion waits for the bank's
+    /// chunk in flight: longer than any one extraction takes.
+    const HOLD_WAIT: Duration = Duration::from_secs(600);
+
+    /// `POST /v1/banks/{bank}/reembed`: records a job moving the bank to the
+    /// daemon's embedding model, unless it's already on it, and says where
+    /// it stands. [`Service::run_reembed`] runs it.
+    pub fn start_reembed(&self, bank: &str) -> Result<ReembedStatus, ReembedError> {
+        let models = self.models.as_ref().ok_or(ReembedError::NoModels)?;
+        if crate::reembed::start(&self.store, bank, models.embedder.model_id())? {
+            let bank_id = crate::reembed::bank(&self.store.connection(), bank)?.0;
+            self.reembed_runs().failed.remove(&bank_id);
+        }
+        self.reembed_status(bank)
+    }
+
+    /// `GET /v1/banks/{bank}/reembed`.
+    pub fn reembed_status(&self, bank: &str) -> Result<ReembedStatus, ReembedError> {
+        let models = self.models.as_ref().ok_or(ReembedError::NoModels)?;
+        let bank_id = crate::reembed::bank(&self.store.connection(), bank)?.0;
+        let (running, failed) = {
+            let runs = self.reembed_runs();
+            (
+                runs.running.contains(&bank_id),
+                runs.failed.get(&bank_id).cloned(),
+            )
+        };
+        crate::reembed::status(
+            &self.store,
+            bank,
+            models.embedder.model_id(),
+            running,
+            failed,
+        )
+    }
+
+    /// Runs the bank's recorded re-embed to the end, from where it last
+    /// stopped, and swaps it in. A run already going for the bank is left
+    /// to it. Blocks for as long as it takes: the daemon calls it on a
+    /// blocking thread, and at startup for every job a restart stopped.
+    pub fn run_reembed(&self, bank: &str) -> Result<ReembedStatus, ReembedError> {
+        let models = self.models.as_ref().ok_or(ReembedError::NoModels)?;
+        let bank_id = crate::reembed::bank(&self.store.connection(), bank)?.0;
+        if !self.reembed_runs().running.insert(bank_id) {
+            return self.reembed_status(bank);
+        }
+        let result = self.reembed_until_swapped(models, bank_id);
+        {
+            let mut runs = self.reembed_runs();
+            runs.running.remove(&bank_id);
+            match &result {
+                Ok(_) => {
+                    runs.failed.remove(&bank_id);
+                }
+                Err(error) => {
+                    runs.failed.insert(bank_id, error.to_string());
+                }
+            }
+        }
+        if let Err(error) = &result {
+            tracing::warn!(bank_id, %error, "a re-embed stopped; it resumes from where it got to");
+        }
+        result?;
+        self.reembed_status(bank)
+    }
+
+    fn reembed_until_swapped(&self, models: &Models, bank_id: i64) -> Result<(), ReembedError> {
+        let embedder = models.embedder.as_ref();
+        while crate::reembed::step(&self.store, bank_id, embedder)? > 0 {}
+        let hold = self
+            .leases
+            .hold(bank_id, Self::HOLD_WAIT)
+            .ok_or(ReembedError::Busy)?;
+        if let Some(memories) = crate::reembed::swap(&self.store, &hold, bank_id, embedder)? {
+            tracing::info!(
+                bank_id,
+                memories,
+                model = embedder.model_id(),
+                "re-embedded a bank"
+            );
+        }
+        Ok(())
+    }
+
+    /// The banks with a re-embed recorded, which the daemon resumes at
+    /// startup.
+    pub fn pending_reembeds(&self) -> Result<Vec<String>, StoreError> {
+        crate::reembed::pending(&self.store)
+    }
+
+    fn reembed_runs(&self) -> std::sync::MutexGuard<'_, ReembedRuns> {
+        self.reembeds.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `bank delete <bank> --confirm <bank>`: erases the bank through the
+    /// erase path and removes everything it holds, writing a daemon-wide
+    /// `bank_deleted` row with counts. `confirm` must repeat the name. A
+    /// live plugin recreates the bank empty on `initialize`, so disable it
+    /// first.
+    pub fn delete_bank(&self, bank: &str, confirm: &str) -> Result<BankDeleted, BankDeleteError> {
+        if bank.trim() != confirm.trim() {
+            return Err(BankDeleteError::NotConfirmed);
+        }
+        let bank_id = {
+            let conn = self.store.connection();
+            crate::ingest::find_bank(&conn, bank)?
+                .ok_or(BankDeleteError::UnknownBank)?
+                .0
+        };
+        let _hold = self
+            .leases
+            .hold(bank_id, Self::HOLD_WAIT)
+            .ok_or(BankDeleteError::Busy)?;
+        let (bank_id, deleted) = crate::erase::delete_bank(&self.store, bank)?;
+        self.sessions.forget_bank(bank_id);
+        self.blocks.invalidate(bank_id);
+        {
+            let mut runs = self.reembed_runs();
+            runs.failed.remove(&bank_id);
+        }
+        Ok(deleted)
     }
 }
 

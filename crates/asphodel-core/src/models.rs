@@ -39,7 +39,7 @@ pub use chatgpt::{
     TokenStore, device_code_login,
 };
 pub use dir::{ModelDir, ModelError};
-pub use fake::{FakeEmbedder, FakeReranker};
+pub use fake::{FakeEmbedder, FakeEmbedderV2, FakeReranker};
 pub use fetch::{FetchError, FetchFailure, FetchReport, Fetcher, HttpFetcher, fetch_models};
 pub use llm::{
     FakeLlm, LlmClient, LlmError, LlmRequest, LlmResponse, LlmSettings, LlmUsage, OpenAiCompatible,
@@ -147,6 +147,25 @@ impl std::fmt::Debug for Models {
             .field("reranker", &self.reranker.model_id())
             .finish()
     }
+}
+
+/// The embedder a bank whose recorded model is `recorded` is served with
+/// (ADR 0010): that model when it's the daemon's own or one of the
+/// `previous` models it carries during a change. A bank recorded under a
+/// model the daemon doesn't carry falls back to the daemon's own, as every
+/// bank was served before re-embedding existed.
+pub(crate) fn serving<'a>(
+    models: &'a Models,
+    previous: &'a [Arc<dyn Embedder>],
+    recorded: &str,
+) -> &'a dyn Embedder {
+    if models.embedder.model_id() == recorded {
+        return models.embedder.as_ref();
+    }
+    previous
+        .iter()
+        .find(|embedder| embedder.model_id() == recorded)
+        .map_or(models.embedder.as_ref(), |embedder| embedder.as_ref())
 }
 
 /// Scales `vector` to unit length. A zero vector is left alone.

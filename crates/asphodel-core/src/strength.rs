@@ -29,7 +29,7 @@ use crate::constants::{
 };
 
 pub use crate::constants::RECENTLY_PAST_DAYS;
-pub use bank_time::BankTime;
+pub use bank_time::{BankTime, FULL_SPEED_HORIZON_DAYS};
 pub use chain::{Chains, Link, chain, chain_head, inherits_from};
 pub use confidence::state_confidence;
 pub use purge::{PurgeRule, purge_eligible};
@@ -207,4 +207,82 @@ fn recent_use(sorted: &[(f64, Timestamp)], bank_time: &BankTime, now: Timestamp)
         .map(|(&(weight, at), &d)| weight * age(at, now).powf(-d))
         .sum::<f64>()
         .ln()
+}
+
+/// When strength first falls below `threshold` if nothing uses the memory
+/// again and bank time runs at full speed from `now`: the bank days from
+/// `now`, which at full speed are also world days, so `now` plus them is
+/// the earliest world time it can happen. `Some(0.0)` when it's already
+/// below, `None` when it never falls below, as for a kept memory or one
+/// whose lasting floor holds it up.
+///
+/// Recent use only falls without accesses, so strength falls too, except
+/// at a window's close still ahead, where recent use starts over: the
+/// stretch before it is searched first.
+pub fn projected_below(
+    significance: f64,
+    accesses: &[Access],
+    close: Option<WindowClose>,
+    bank_time: &BankTime,
+    now: Timestamp,
+    threshold: f64,
+) -> Option<f64> {
+    let clock = bank_time.at_full_speed_from(now);
+    let at = |days: f64| {
+        now.checked_add(jiff::SignedDuration::from_secs_f64(days * 86_400.0))
+            .unwrap_or(Timestamp::MAX)
+    };
+    let value = |days: f64| strength(significance, accesses, close, &clock, at(days)).value;
+    let below = |days: f64| value(days) < threshold;
+    if below(0.0) {
+        return Some(0.0);
+    }
+    // Precise to about a minute.
+    const PRECISION: f64 = 1.0 / 1440.0;
+    let search = |mut low: f64, mut high: f64| {
+        while high - low > PRECISION {
+            let middle = (low + high) / 2.0;
+            if below(middle) {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        high
+    };
+    let mut from = 0.0;
+    if let Some(close) = close {
+        let restart = close.closes_at.max(close.known_at);
+        if restart > now {
+            let until = world_days(now, restart);
+            let before = (until - PRECISION).max(0.0);
+            if below(before) {
+                return Some(search(0.0, before));
+            }
+            from = until;
+        }
+    }
+    if S * significance + lasting_floor_of(accesses) >= threshold {
+        return None;
+    }
+    let mut high = from.max(1.0);
+    while !below(high) {
+        if high >= FULL_SPEED_HORIZON_DAYS {
+            return None;
+        }
+        high = (high * 2.0).min(FULL_SPEED_HORIZON_DAYS);
+    }
+    Some(search(from, high))
+}
+
+/// The lasting floor of `accesses`, which never falls.
+fn lasting_floor_of(accesses: &[Access]) -> f64 {
+    let mut sorted = accesses.to_vec();
+    sorted.sort_by_key(|a| a.at);
+    let occasions = occasions(&sorted);
+    if occasions == 0 {
+        f64::NEG_INFINITY
+    } else {
+        TAU - G * N0.ln() + G * f64::from(occasions).ln()
+    }
 }

@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use rusqlite::OptionalExtension;
@@ -53,6 +54,49 @@ impl Leases {
         if held.get(&bank_id) == Some(&queue_id) {
             held.remove(&bank_id);
         }
+    }
+
+    /// Takes the bank's lease without a chunk, waiting up to `wait` for its
+    /// worker to finish the chunk in flight, so no extraction runs on the
+    /// bank until the hold drops. A re-embed's swap and a bank deletion
+    /// hold it (ADR 0010). `None` when the wait ran out.
+    pub(crate) fn hold(&self, bank_id: i64, wait: Duration) -> Option<BankHold> {
+        let started = Instant::now();
+        loop {
+            {
+                let mut held = self.lock();
+                if let std::collections::btree_map::Entry::Vacant(entry) = held.entry(bank_id) {
+                    entry.insert(HOLD);
+                    return Some(BankHold {
+                        leases: self.clone(),
+                        bank_id,
+                    });
+                }
+            }
+            if started.elapsed() >= wait {
+                return None;
+            }
+            std::thread::sleep(HOLD_POLL);
+        }
+    }
+}
+
+/// The queue row a [`BankHold`] stands in for. Queue rowids start at 1.
+const HOLD: i64 = 0;
+
+/// How often [`Leases::hold`] looks again while a chunk is in flight.
+const HOLD_POLL: Duration = Duration::from_millis(50);
+
+/// A bank's lease held without a chunk; dropping it releases the bank.
+#[derive(Debug)]
+pub(crate) struct BankHold {
+    leases: Leases,
+    bank_id: i64,
+}
+
+impl Drop for BankHold {
+    fn drop(&mut self) {
+        self.leases.release(self.bank_id, HOLD);
     }
 }
 

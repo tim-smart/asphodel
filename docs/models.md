@@ -64,6 +64,35 @@ under `cargo test`.
 `ASPHODEL_MODELS=fake` runs `asphodel serve` on them. It is for tests,
 environment only, and the resolved config shows `models.fake = true`.
 
+### Changing the embedding model
+
+A bank records the embedding model it was created under and is served with
+that model, not the daemon's, until `asphodel reembed --bank <bank>` moves
+it (ADR 0010). During a change the image carries both models: the daemon
+runs the new one and keeps the old one for banks still recorded under it
+(`Service::with_previous_embedder`). The manifest lists one embedding
+model today, so a change adds the new model to it and keeps the old one as
+the previous embedder until every bank has moved. A bank recorded under a
+model the daemon doesn't carry is served with the daemon's model, and the
+daemon warns about it at startup.
+
+The re-embed is a daemon job. It embeds the bank's memories with the new
+model into a side table, in rowid order, recording how far it got, so a
+restart resumes it rather than starting over. Extraction carries on with
+the recorded model meanwhile. The swap waits for the chunk in flight, embeds
+whatever arrived since, and in one transaction replaces the bank's vectors,
+records the new model and drops the side table's rows. `asphodel reembed`
+follows the job to the swap, or returns at once with `--no-wait`; running
+it again shows where the job stands.
+
+The new model's reconcile floor (`reconcile.embedding_floors`) is
+calibrated in replay before the deploy, and the daemon won't start without
+it. A reranker-only change needs only its gate floor.
+
+`ASPHODEL_MODELS=fake-v2` serves with a second fake embedder,
+`fake-embedder:v2`, and carries `fake-embedder:v1` for banks recorded under
+it, so a re-embed can be driven on the fakes in tests.
+
 ## The LLM
 
 One LLM serves extraction, reconciliation and refresh. `llm.model` comes

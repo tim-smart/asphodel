@@ -390,12 +390,34 @@ pub(crate) struct Context<'a> {
     pub store: &'a Store,
     pub tuning: &'a Tuning,
     pub models: &'a Models,
+    /// Embedding models the daemon carries besides its own, for banks a
+    /// re-embed hasn't moved yet (ADR 0010).
+    pub previous: &'a [Arc<dyn crate::models::Embedder>],
     pub sessions: &'a Sessions,
     /// The service's permit to run its reranker.
     pub permit: &'a Arc<Permit>,
     /// [`RERANKER_DEADLINE`](crate::constants::RERANKER_DEADLINE) unless a
     /// test or bench set another.
     pub deadline: Duration,
+}
+
+impl Context<'_> {
+    /// The embedder `bank_id` is served with: the model it recorded, until
+    /// a re-embed swaps it (ADR 0010).
+    pub(crate) fn embedder(
+        &self,
+        bank_id: i64,
+    ) -> Result<&dyn crate::models::Embedder, rusqlite::Error> {
+        let recorded = {
+            let conn = self.store.connection();
+            crate::reembed::recorded_model(&conn, bank_id)?
+        };
+        Ok(crate::models::serving(
+            self.models,
+            self.previous,
+            &recorded,
+        ))
+    }
 }
 
 /// Prefetch: recalls for the current message and injects what passes the
@@ -691,8 +713,7 @@ pub(crate) fn select(
         None
     } else {
         Some(
-            cx.models
-                .embedder
+            cx.embedder(bank_id)?
                 .embed(&[query])
                 .map_err(|error| RecallError::Model { error })?
                 .pop()
@@ -917,8 +938,7 @@ fn gather(
         return Ok(Vec::new());
     }
     let vector = cx
-        .models
-        .embedder
+        .embedder(bank_id)?
         .embed(&[query])
         .map_err(|error| RecallError::Model { error })?
         .pop()

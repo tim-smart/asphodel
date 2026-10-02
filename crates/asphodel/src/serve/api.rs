@@ -13,15 +13,23 @@ use std::sync::Arc;
 
 use asphodel_core::agenda::Agenda;
 use asphodel_core::config::Secret;
-use asphodel_core::erase::{ForgetError, ForgetRequest, Forgotten};
+use asphodel_core::entities::{
+    AliasRemoval, AliasRemoved, EntityError, LinkEdited, LinkRequest, MergeRequest, Merged,
+    Unmerged,
+};
+use asphodel_core::erase::{BankDeleteError, BankDeleted, ForgetError, ForgetRequest, Forgotten};
 use asphodel_core::ingest::{Document, IngestError, Ingested, Outcome, Turn};
-use asphodel_core::keep::{KeepError, Kept, MemoryIds, Unkept};
+use asphodel_core::inspect::{EntityView, InspectError, MemoryView, ModelView};
+use asphodel_core::keep::{
+    KeepError, Kept, MemoryIds, SignificanceRequest, SignificanceSet, Unkept,
+};
 use asphodel_core::mental_models::{Model, ModelEdit, ModelError, ModelSpec, Outcome as Refreshed};
 use asphodel_core::operations::{
     Audit, AuditError, AuditList, BACKED_UP_AT_HEADER, Backup, BackupError, LENGTH_HEADER,
     SHA256_HEADER, Status,
 };
 use asphodel_core::queue::{ChunkList, QueueError, Retried, RetryRequest};
+use asphodel_core::reembed::{ReembedError, ReembedState, ReembedStatus};
 use asphodel_core::retrieval::{Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
 use asphodel_core::store::StoreError;
 use asphodel_core::store::bank::{Bank, BankError, BankIdentity};
@@ -34,7 +42,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use http_body_util::channel::Channel;
 use serde::{Deserialize, Serialize};
@@ -49,7 +57,7 @@ const BODY_LIMIT: usize = 16 * 1024 * 1024;
 pub(crate) fn router(app: Shared) -> Router {
     let authorized = Router::new()
         .route("/v1/config", get(config))
-        .route("/v1/banks/{bank}", put(put_bank))
+        .route("/v1/banks/{bank}", put(put_bank).delete(delete_bank))
         .route("/v1/banks/{bank}/turns", post(turns))
         .route("/v1/banks/{bank}/documents", post(documents))
         .route("/v1/banks/{bank}/prefetch", post(prefetch))
@@ -69,7 +77,10 @@ pub(crate) fn router(app: Shared) -> Router {
             "/v1/banks/{bank}/models",
             get(list_models).post(create_model),
         )
-        .route("/v1/banks/{bank}/models/{model}", patch(edit_model))
+        .route(
+            "/v1/banks/{bank}/models/{model}",
+            get(show_model).patch(edit_model),
+        )
         .route(
             "/v1/banks/{bank}/models/{model}/refresh",
             post(refresh_model),
@@ -78,6 +89,21 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/v1/banks/{bank}/forgets", get(forgets))
         .route("/v1/banks/{bank}/sweeps", get(sweeps))
         .route("/v1/banks/{bank}/recalls", get(recalls))
+        .route("/v1/banks/{bank}/memories/{memory}", get(show_memory))
+        .route(
+            "/v1/banks/{bank}/memories/{memory}/significance",
+            put(set_significance),
+        )
+        .route("/v1/banks/{bank}/entities/{entity}", get(show_entity))
+        .route("/v1/banks/{bank}/merges", post(merge))
+        .route("/v1/banks/{bank}/merges/{edit}/undo", post(unmerge))
+        .route("/v1/banks/{bank}/aliases/remove", post(remove_alias))
+        .route("/v1/banks/{bank}/links", post(link))
+        .route("/v1/banks/{bank}/links/remove", post(unlink))
+        .route(
+            "/v1/banks/{bank}/reembed",
+            get(reembed_status).post(reembed),
+        )
         .route("/v1/backup", post(backup))
         .route("/v1/status", get(status))
         .route("/v1/purge/plan", get(purge_plan))
@@ -206,9 +232,70 @@ impl From<RecallError> for ApiError {
 impl From<KeepError> for ApiError {
     fn from(error: KeepError) -> Self {
         match error {
-            KeepError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
-            KeepError::TooMany { .. } => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
+            KeepError::UnknownBank | KeepError::UnknownMemory => {
+                Self::new(StatusCode::NOT_FOUND, error.to_string())
+            }
+            KeepError::TooMany { .. } | KeepError::InvalidLevel => {
+                Self::new(StatusCode::BAD_REQUEST, error.to_string())
+            }
             KeepError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<EntityError> for ApiError {
+    fn from(error: EntityError) -> Self {
+        match error {
+            EntityError::UnknownBank
+            | EntityError::UnknownEntity
+            | EntityError::UnknownMemory
+            | EntityError::UnknownAlias
+            | EntityError::UnknownMerge => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            EntityError::Ambiguous { .. } | EntityError::SeededFrom | EntityError::SameEntity => {
+                Self::new(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+            }
+            EntityError::AlreadyMerged { .. }
+            | EntityError::TargetMerged { .. }
+            | EntityError::AlreadyUnmerged
+            | EntityError::MergedSince { .. } => Self::new(StatusCode::CONFLICT, error.to_string()),
+            EntityError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<InspectError> for ApiError {
+    fn from(error: InspectError) -> Self {
+        match error {
+            InspectError::UnknownBank
+            | InspectError::UnknownMemory
+            | InspectError::UnknownModel
+            | InspectError::UnknownEntry => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            InspectError::Entity(error) => error.into(),
+            InspectError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<ReembedError> for ApiError {
+    fn from(error: ReembedError) -> Self {
+        match error {
+            ReembedError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            ReembedError::NoModels | ReembedError::Busy => {
+                Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+            }
+            ReembedError::Model { .. } => Self::internal(error),
+            ReembedError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<BankDeleteError> for ApiError {
+    fn from(error: BankDeleteError) -> Self {
+        match error {
+            BankDeleteError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            BankDeleteError::NotConfirmed => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
+            BankDeleteError::Busy => Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+            BankDeleteError::Store(error) => error.into(),
         }
     }
 }
@@ -789,4 +876,178 @@ async fn refresh_model(
         .call(move |service| service.refresh_model(&bank, &name, llm.as_ref(), query.force))
         .await?;
     Ok(Json(outcome))
+}
+
+/// `GET /v1/banks/{bank}/memories/{id}`: `asphodel memory show`.
+async fn show_memory(
+    State(app): State<Shared>,
+    Path((bank, memory)): Path<(String, String)>,
+) -> Result<Json<MemoryView>, ApiError> {
+    let view = app
+        .call(move |service| service.show_memory(&bank, &memory))
+        .await?;
+    Ok(Json(view))
+}
+
+/// `PUT /v1/banks/{bank}/memories/{id}/significance`: `asphodel memory
+/// significance`, with `{"level": null}` to clear the owner's setting.
+async fn set_significance(
+    State(app): State<Shared>,
+    Path((bank, memory)): Path<(String, String)>,
+    body: Result<Json<SignificanceRequest>, JsonRejection>,
+) -> Result<Json<SignificanceSet>, ApiError> {
+    let Json(SignificanceRequest { level }) = body?;
+    let set = app
+        .call(move |service| service.set_significance(&bank, &memory, level.as_deref()))
+        .await?;
+    Ok(Json(set))
+}
+
+/// `GET /v1/banks/{bank}/entities/{entity}`: `asphodel entity show`, by
+/// id, `user`, `assistant`, name or alias.
+async fn show_entity(
+    State(app): State<Shared>,
+    Path((bank, entity)): Path<(String, String)>,
+) -> Result<Json<EntityView>, ApiError> {
+    let view = app
+        .call(move |service| service.show_entity(&bank, &entity))
+        .await?;
+    Ok(Json(view))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ShowModelQuery {
+    /// Only this entry.
+    #[serde(default)]
+    entry: Option<String>,
+}
+
+/// `GET /v1/banks/{bank}/models/{model}[?entry=<id>]`: `asphodel model
+/// show`.
+async fn show_model(
+    State(app): State<Shared>,
+    Path((bank, name)): Path<(String, String)>,
+    query: Result<Query<ShowModelQuery>, QueryRejection>,
+) -> Result<Json<ModelView>, ApiError> {
+    let Query(query) = query?;
+    let view = app
+        .call(move |service| service.show_model(&bank, &name, query.entry.as_deref()))
+        .await?;
+    Ok(Json(view))
+}
+
+/// `POST /v1/banks/{bank}/merges`: `asphodel entity merge`.
+async fn merge(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<MergeRequest>, JsonRejection>,
+) -> Result<Json<Merged>, ApiError> {
+    let Json(request) = body?;
+    let merged = app
+        .call(move |service| service.merge_entities(&bank, &request))
+        .await?;
+    Ok(Json(merged))
+}
+
+/// `POST /v1/banks/{bank}/merges/{edit}/undo`: `asphodel entity unmerge`.
+async fn unmerge(
+    State(app): State<Shared>,
+    Path((bank, edit)): Path<(String, String)>,
+) -> Result<Json<Unmerged>, ApiError> {
+    let unmerged = app
+        .call(move |service| service.unmerge_entity(&bank, &edit))
+        .await?;
+    Ok(Json(unmerged))
+}
+
+/// `POST /v1/banks/{bank}/aliases/remove`: `asphodel entity alias rm`.
+async fn remove_alias(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<AliasRemoval>, JsonRejection>,
+) -> Result<Json<AliasRemoved>, ApiError> {
+    let Json(request) = body?;
+    let removed = app
+        .call(move |service| service.remove_alias(&bank, &request))
+        .await?;
+    Ok(Json(removed))
+}
+
+/// `POST /v1/banks/{bank}/links`: `asphodel entity link`.
+async fn link(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<LinkRequest>, JsonRejection>,
+) -> Result<Json<LinkEdited>, ApiError> {
+    let Json(request) = body?;
+    let linked = app
+        .call(move |service| service.link_entity(&bank, &request))
+        .await?;
+    Ok(Json(linked))
+}
+
+/// `POST /v1/banks/{bank}/links/remove`: `asphodel entity unlink`.
+async fn unlink(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<LinkRequest>, JsonRejection>,
+) -> Result<Json<LinkEdited>, ApiError> {
+    let Json(request) = body?;
+    let unlinked = app
+        .call(move |service| service.unlink_entity(&bank, &request))
+        .await?;
+    Ok(Json(unlinked))
+}
+
+/// `POST /v1/banks/{bank}/reembed`: records a re-embed to the daemon's
+/// embedding model and starts it as a daemon job, or resumes one. 202 with
+/// where it stands; `GET` follows it. A bank already on the model answers
+/// 200 with `state: current`.
+async fn reembed(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+) -> Result<(StatusCode, Json<ReembedStatus>), ApiError> {
+    let name = bank.clone();
+    let status = app
+        .call(move |service| service.start_reembed(&name))
+        .await?;
+    if status.state == ReembedState::Current {
+        return Ok((StatusCode::OK, Json(status)));
+    }
+    let ready = app.ready().ok_or_else(ApiError::not_ready)?;
+    super::run_reembed(Arc::clone(&ready.service), ready.workers.clone(), bank);
+    Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+/// `GET /v1/banks/{bank}/reembed`: where the bank's re-embed stands.
+async fn reembed_status(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+) -> Result<Json<ReembedStatus>, ApiError> {
+    let status = app
+        .call(move |service| service.reembed_status(&bank))
+        .await?;
+    Ok(Json(status))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DeleteQuery {
+    /// The bank's name again.
+    #[serde(default)]
+    confirm: String,
+}
+
+/// `DELETE /v1/banks/{bank}?confirm=<bank>`: `asphodel bank delete`. A
+/// live plugin recreates the bank empty on `initialize`, so disable it
+/// first.
+async fn delete_bank(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    query: Result<Query<DeleteQuery>, QueryRejection>,
+) -> Result<Json<BankDeleted>, ApiError> {
+    let Query(query) = query?;
+    let deleted = app
+        .call(move |service| service.delete_bank(&bank, &query.confirm))
+        .await?;
+    Ok(Json(deleted))
 }

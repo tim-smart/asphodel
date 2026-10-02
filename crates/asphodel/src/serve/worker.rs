@@ -45,9 +45,14 @@ pub(crate) struct Workers {
     service: Arc<Service>,
     llm: Arc<dyn LlmClient>,
     stop: watch::Receiver<bool>,
-    banks: Mutex<BTreeMap<String, Arc<Notify>>>,
+    banks: Registry,
     tasks: Mutex<JoinSet<()>>,
 }
+
+/// Each running worker's wake-up, by bank name. A worker whose bank is
+/// gone takes itself out, so a bank created again under the name gets a
+/// new one.
+type Registry = Arc<Mutex<BTreeMap<String, Arc<Notify>>>>;
 
 impl Workers {
     /// Starts a worker for each of `banks`, the banks in the store, since
@@ -62,7 +67,7 @@ impl Workers {
             service,
             llm,
             stop,
-            banks: Mutex::default(),
+            banks: Registry::default(),
             tasks: Mutex::new(JoinSet::new()),
         });
         for bank in banks {
@@ -95,6 +100,7 @@ impl Workers {
             bank,
             notify,
             stop: self.stop.clone(),
+            registry: Arc::clone(&self.banks),
         };
         self.tasks
             .lock()
@@ -125,6 +131,7 @@ struct Worker {
     bank: String,
     notify: Arc<Notify>,
     stop: watch::Receiver<bool>,
+    registry: Registry,
 }
 
 /// What one blocking step did.
@@ -184,7 +191,19 @@ impl Worker {
             };
             match next {
                 Next::Continue => {}
-                Next::Exit => break,
+                Next::Exit => {
+                    let mut banks = self
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if banks
+                        .get(&self.bank)
+                        .is_some_and(|notify| Arc::ptr_eq(notify, &self.notify))
+                    {
+                        banks.remove(&self.bank);
+                    }
+                    break;
+                }
                 Next::Idle => {
                     tokio::select! {
                         _ = self.notify.notified() => {}

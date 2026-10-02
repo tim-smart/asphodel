@@ -21,8 +21,8 @@ use asphodel_core::config::{
     Deployment, LLM_API_KEY_ENV, LlmAuth, ModelsConfig, Secret, TOKEN_ENV,
 };
 use asphodel_core::models::{
-    CodexResponses, FakeLlm, LlmClient, LlmSettings, LlmStatus, ModelOptions, Models,
-    OpenAiCompatible, TokenStore,
+    CodexResponses, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, LlmSettings,
+    LlmStatus, ModelOptions, Models, OpenAiCompatible, TokenStore,
 };
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::{Clock, ResolvedConfig, Service, SystemClock, Tuning};
@@ -219,6 +219,15 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         llm: started.llm,
     });
     info!(version = asphodel_core::VERSION, listen = %address, "asphodel listening");
+    // A re-embed a restart stopped resumes from where it got to (ADR 0010).
+    match service.pending_reembeds() {
+        Ok(banks) => {
+            for bank in banks {
+                run_reembed(Arc::clone(&service), workers.clone(), bank);
+            }
+        }
+        Err(error) => warn!(%error, "listing the re-embeds to resume failed"),
+    }
 
     // SIGTERM: ingest is refused and the listener stops; each worker
     // finishes its chunk in flight; then the WAL is checkpointed (TIM-94,
@@ -244,6 +253,21 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     served??;
     info!("asphodel stopped");
     Ok(())
+}
+
+/// Runs a bank's re-embed to its swap on a blocking thread, then wakes the
+/// bank's worker, which waited while the swap held its lease. A failure is
+/// kept for `GET /v1/banks/{bank}/reembed`, and the job resumes on the next
+/// `asphodel reembed` or restart.
+pub(crate) fn run_reembed(service: Arc<Service>, workers: Option<Arc<Workers>>, bank: String) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = service.run_reembed(&bank) {
+            warn!(%error, "a re-embed stopped");
+        }
+        if let Some(workers) = workers {
+            workers.wake(&bank);
+        }
+    });
 }
 
 /// Resolves once a stop has been signalled.
@@ -314,6 +338,22 @@ fn start(
             ));
             Service::with_models(Arc::clone(&clock), store, config.tuning.clone(), models)?
         }
+        ModelsSwitch::FakeV2 => {
+            warn!(
+                "{MODELS_ENV}=fake-v2: serving with the second fake embedder, carrying the first for banks recorded under it"
+            );
+            let models = Models {
+                embedder: Arc::new(FakeEmbedderV2),
+                reranker: Arc::new(FakeReranker),
+            };
+            config.models = Some(ModelsConfig::new(
+                &models,
+                true,
+                args.onnx_threads.map(std::num::NonZeroUsize::get),
+            ));
+            Service::with_models(Arc::clone(&clock), store, config.tuning.clone(), models)?
+                .with_previous_embedder(Arc::new(FakeEmbedder))?
+        }
         ModelsSwitch::None => {
             let dir = crate::cli::resolve_model_dir(args.model_dir.as_deref())?;
             let models = Models::load(
@@ -340,6 +380,9 @@ fn start(
         config = %serde_json::to_string(&config)?,
         "resolved config"
     );
+    for (bank, model) in service.banks_without_their_model()? {
+        warn!(%bank, %model, "the bank records an embedding model this daemon doesn't carry, so it's served with the daemon's own; run `asphodel reembed --bank` to move it");
+    }
     let banks = service.bank_names()?;
     Ok(Some(Started {
         service,
@@ -420,14 +463,18 @@ const MODELS_ENV: &str = "ASPHODEL_MODELS";
 enum ModelsSwitch {
     None,
     Fake,
+    /// The second fake embedder, carrying the first: a model change on
+    /// fakes, for re-embed tests.
+    FakeV2,
 }
 
 fn models_switch() -> anyhow::Result<ModelsSwitch> {
     match std::env::var_os(MODELS_ENV) {
         None => Ok(ModelsSwitch::None),
         Some(value) if value == "fake" => Ok(ModelsSwitch::Fake),
+        Some(value) if value == "fake-v2" => Ok(ModelsSwitch::FakeV2),
         Some(value) => bail!(
-            "{MODELS_ENV} is {:?}; the only value is `fake`, for tests. Unset it to run the ONNX models",
+            "{MODELS_ENV} is {:?}; the values are `fake` and `fake-v2`, for tests. Unset it to run the ONNX models",
             value
         ),
     }

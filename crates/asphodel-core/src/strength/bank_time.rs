@@ -3,6 +3,10 @@
 use jiff::Timestamp;
 
 use super::MICROS_PER_DAY;
+
+/// How far ahead [`BankTime::at_full_speed_from`] runs at full speed: two
+/// centuries, past anything a projection reports.
+pub const FULL_SPEED_HORIZON_DAYS: f64 = 200.0 * 365.25;
 use crate::constants::FULL_SPEED_WINDOW;
 
 /// One bank's clock for strength, built from when its turns happened.
@@ -65,6 +69,35 @@ impl BankTime {
         let full = (self.full_before(to) - self.full_before(from)) as f64;
         let quiet = (to - from) as f64 - full;
         (full + self.quiet_rate * quiet) / MICROS_PER_DAY
+    }
+
+    /// This clock with bank time running at full speed from `from` for
+    /// [`FULL_SPEED_HORIZON_DAYS`]: what it would be if a turn came at
+    /// least once a day. `memory show` projects fade and purge dates on it,
+    /// so a bank day after `from` is a world day, the earliest one.
+    pub fn at_full_speed_from(&self, from: Timestamp) -> Self {
+        let start = from.as_microsecond();
+        let span = (FULL_SPEED_HORIZON_DAYS * MICROS_PER_DAY) as i64;
+        let mut windows = self.windows.clone();
+        windows.push((start, start.saturating_add(span)));
+        windows.sort_unstable();
+        let mut merged: Vec<(i64, i64)> = Vec::with_capacity(windows.len());
+        for (start, end) in windows {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        let mut full = Vec::with_capacity(merged.len() + 1);
+        full.push(0);
+        for (start, end) in &merged {
+            full.push(full.last().unwrap() + (end - start));
+        }
+        Self {
+            windows: merged,
+            full,
+            quiet_rate: self.quiet_rate,
+        }
     }
 
     /// Full-speed microseconds before `at`.

@@ -373,7 +373,8 @@ fn insert_memory(
 
 /// Links a memory to its entities, keeping each link's surface form. A new
 /// surface form becomes an alias in a logged edit, so a mislink can be undone
-/// (TIM-92); a pronoun never does.
+/// (TIM-92); a pronoun never does. A known entity merged into another since
+/// call 1 read its input is linked as the entity that survived (ADR 0010).
 fn link_entities(
     tx: &Transaction<'_>,
     store: &Store,
@@ -387,7 +388,7 @@ fn link_entities(
             Link::Known {
                 entity,
                 surface_form,
-            } => (*entity, surface_form),
+            } => (survivor(tx, *entity)?, surface_form),
             Link::Proposed {
                 name, surface_form, ..
             } => (proposed[&name.to_lowercase()], surface_form),

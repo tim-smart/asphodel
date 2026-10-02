@@ -788,6 +788,7 @@ pub(crate) fn effects(
         match kind.as_str() {
             crate::extraction::EDIT_SIGNIFICANCE_RAISED => checked.push((*memory, false)),
             crate::extraction::EDIT_KEPT => checked.push((*memory, true)),
+            crate::keep::EDIT_SIGNIFICANCE_SET => checked.push((*memory, false)),
             crate::keep::EDIT_UNKEPT => {
                 if let Some(memory) = written(conn, *memory)? {
                     effects.invalidates |= agenda_kind(memory.kind);

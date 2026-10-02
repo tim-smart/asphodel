@@ -185,6 +185,12 @@ impl Sessions {
         }
     }
 
+    /// Drops every session of a deleted bank.
+    pub(crate) fn forget_bank(&self, bank_id: i64) {
+        let mut sessions = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.retain(|(bank, _), _| *bank != bank_id);
+    }
+
     /// The map, with every session idle past the timeout dropped.
     fn live(&self, now: Timestamp) -> MutexGuard<'_, HashMap<Key, Session>> {
         let mut sessions = self.inner.lock().unwrap_or_else(|e| e.into_inner());

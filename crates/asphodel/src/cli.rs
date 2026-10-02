@@ -1,8 +1,9 @@
 //! The subcommand tree from "API surface and Hermes transport" (TIM-94,
 //! decision 10), plus `replay` and `bench` from the replay harness decision
 //! (TIM-96). `serve` runs the daemon; `ingest`, `bank`, `chunks`, `recall`,
-//! `forget`, `keep`, `unkeep`, `model`, `purge`, `backup`, `status` and the
-//! audit lists are HTTP clients of it ([`crate::client`]); `models fetch`
+//! `forget`, `keep`, `unkeep`, `memory`, `entity`, `model`, `reembed`,
+//! `purge`, `backup`, `status` and the audit lists are HTTP clients of it
+//! ([`crate::client`]); `models fetch`
 //! and `llm login` work on files, and `restore` works on the data dir
 //! offline (ADR 0010).
 //! `replay` and `bench` are stubs that later stages fill in.
@@ -15,8 +16,9 @@ use anyhow::{Context, bail};
 use asphodel_core::SystemClock;
 use asphodel_core::config::{Secret, TOKEN_ENV};
 use asphodel_core::constants::Volatility;
+use asphodel_core::entities::{AliasRemoval, LinkRequest, MergeRequest};
 use asphodel_core::ingest::Document;
-use asphodel_core::keep::MemoryIds;
+use asphodel_core::keep::{MemoryIds, SignificanceRequest};
 use asphodel_core::mental_models::{ModelEdit, ModelSpec};
 use asphodel_core::models::{
     AUTH_ISSUER, DeviceCode, HttpFetcher, ModelDir, TokenStore, device_code_login, fetch_models,
@@ -77,9 +79,21 @@ enum Command {
     /// Hand kept memories back to the significance extraction gave them.
     Unkeep(IdsArgs),
 
-    /// Define, list and refresh a bank's mental models.
+    /// Show a memory, or set the owner's significance on it.
+    #[command(subcommand)]
+    Memory(MemoryCommand),
+
+    /// Show and correct entities: merge, unmerge, aliases and links.
+    #[command(subcommand)]
+    Entity(EntityCommand),
+
+    /// Define, list, show and refresh a bank's mental models.
     #[command(subcommand)]
     Model(ModelCommand),
+
+    /// Re-embed a bank with the daemon's embedding model, then swap it in.
+    /// The bank is served with its recorded model until the swap.
+    Reembed(ReembedArgs),
 
     /// See and acknowledge a purge pause.
     #[command(subcommand)]
@@ -220,6 +234,17 @@ pub enum BankCommand {
         name: String,
         #[command(flatten)]
         identity: IdentityArgs,
+    },
+    /// Delete a bank and everything in it, through the erase path. Disable
+    /// the plugin first: its `initialize` creates the bank again, empty.
+    Delete {
+        #[command(flatten)]
+        client: ClientArgs,
+        /// The bank's name.
+        name: String,
+        /// The bank's name again.
+        #[arg(long)]
+        confirm: String,
     },
 }
 
@@ -427,6 +452,145 @@ pub enum ModelCommand {
     /// Refresh a model now. It's skipped when its inputs haven't changed,
     /// unless `--force`.
     Refresh(ModelRefreshArgs),
+
+    /// Show a model's entries with the memories each cites and whether the
+    /// block shows it.
+    Show(ModelShowArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ModelShowArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+
+    #[arg(long)]
+    pub bank: String,
+
+    /// The model's name.
+    pub name: String,
+
+    /// Only this entry, by id.
+    #[arg(long)]
+    pub entry: Option<String>,
+}
+
+/// `asphodel memory` (ADR 0010): a memory's metadata can be edited, never
+/// its sentence, kind or window.
+#[derive(Debug, Subcommand)]
+pub enum MemoryCommand {
+    /// Show a memory: both significance fields, its passage or why it's
+    /// gone, its accesses, edits and chain, the secret-scan kinds, its
+    /// strength in parts, what holds back a purge, and projected fade and
+    /// purge dates.
+    Show {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        /// The memory's id.
+        id: String,
+    },
+
+    /// Set the owner's significance on a memory: trivial, minor, notable,
+    /// major, critical or kept, or `clear` to hand it back to the level
+    /// extraction gave.
+    Significance {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        /// The memory's id.
+        id: String,
+        level: String,
+    },
+}
+
+/// `asphodel entity` (ADR 0010). An entity is named by its id, `user`,
+/// `assistant`, or a name or alias only one entity of the bank has.
+#[derive(Debug, Subcommand)]
+pub enum EntityCommand {
+    /// Show an entity: its aliases, merges, linked memories and edits.
+    Show {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        entity: String,
+    },
+
+    /// Merge one entity into another. `user` and `assistant` can only be
+    /// merged into.
+    Merge {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        from: String,
+        into: String,
+    },
+
+    /// Undo a merge, by the edit id `entity merge` printed.
+    Unmerge {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        edit: String,
+    },
+
+    /// Remove a wrong alias.
+    #[command(subcommand)]
+    Alias(AliasCommand),
+
+    /// Link a memory to an entity.
+    Link {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        memory: String,
+        entity: String,
+    },
+
+    /// Unlink a memory from an entity.
+    Unlink {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        memory: String,
+        entity: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AliasCommand {
+    /// Remove an alias from an entity. With `--relink-to`, the links that
+    /// named the entity by it move to that entity, which gets the alias.
+    Rm {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        entity: String,
+        alias: String,
+        #[arg(long)]
+        relink_to: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct ReembedArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+
+    /// The bank to re-embed.
+    #[arg(long)]
+    pub bank: String,
+
+    /// Start the job and return, rather than follow it to the swap.
+    #[arg(long)]
+    pub no_wait: bool,
 }
 
 #[derive(Debug, Args)]
@@ -580,6 +744,14 @@ impl Cli {
                 name,
                 identity,
             }) => bank(&client, &name, identity),
+            Command::Bank(BankCommand::Delete {
+                client,
+                name,
+                confirm,
+            }) => bank_delete(&client, &name, &confirm),
+            Command::Memory(command) => memory(command),
+            Command::Entity(command) => entity(command),
+            Command::Reembed(args) => reembed(args),
             Command::Chunks(args) => chunks(args),
             Command::Recall(args) => recall(args),
             Command::Forget(args) => by_ids(args, IdsAction::Forget),
@@ -1061,6 +1233,84 @@ fn model(command: ModelCommand) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        ModelCommand::Show(args) => {
+            let client = Client::new(&args.client)?;
+            let mut path = format!(
+                "/v1/banks/{}/models/{}",
+                segment(&args.bank),
+                segment(&args.name)
+            );
+            if let Some(entry) = &args.entry {
+                path.push_str(&format!("?entry={}", segment(entry)));
+            }
+            let view: Value = client.get(&path)?;
+            if args.client.json {
+                return print_json(&view);
+            }
+            print_model_view(&view);
+            Ok(())
+        }
+    }
+}
+
+fn print_model_view(view: &Value) {
+    let enabled = if view.get("enabled").and_then(Value::as_bool) == Some(false) {
+        ", disabled"
+    } else {
+        ""
+    };
+    println!(
+        "{}  {}  [{} tokens{enabled}]",
+        text(view, "name"),
+        text(view, "id"),
+        count(view, "max_tokens"),
+    );
+    println!("  question: {}", text(view, "question"));
+    let kinds: Vec<&str> = list(view, "kinds")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if !kinds.is_empty() {
+        println!("  kinds: {}", kinds.join(", "));
+    }
+    if let Some(entity) = view.get("entity").and_then(Value::as_str) {
+        println!("  entity: {entity} ({})", text(view, "entity_id"));
+    }
+    if let Some(level) = view.get("min_volatility").and_then(Value::as_str) {
+        println!("  min volatility: {level}");
+    }
+    match view.get("last_refreshed_at").and_then(Value::as_str) {
+        Some(at) => println!("  last refreshed {at}"),
+        None => println!("  never refreshed"),
+    }
+    if let Some(at) = view.get("refresh_requested_at").and_then(Value::as_str) {
+        println!("  refresh requested {at}");
+    }
+    if let Some(error) = view.get("last_error").and_then(Value::as_str) {
+        println!(
+            "  the last refresh failed ({error}) at {}",
+            text(view, "last_error_at")
+        );
+    }
+    for entry in list(view, "entry_views") {
+        let renders = if entry.get("renders").and_then(Value::as_bool) == Some(true) {
+            ""
+        } else {
+            "  (not shown: a memory it cites isn't current)"
+        };
+        println!(
+            "  - {}  {}{renders}",
+            text(entry, "id"),
+            text(entry, "text")
+        );
+        for cite in list(entry, "cites") {
+            println!(
+                "      cites {} [{}]  {}",
+                text(cite, "id"),
+                text(cite, "status"),
+                text(cite, "sentence")
+            );
+        }
     }
 }
 
@@ -1444,6 +1694,628 @@ fn audit(args: ListArgs, kind: AuditList) -> anyhow::Result<()> {
             ),
         }
     }
+    Ok(())
+}
+
+/// A number from a view, or −∞ for the `null` JSON makes of it.
+fn number(value: &Value, key: &str) -> String {
+    match value.get(key).and_then(Value::as_f64) {
+        Some(number) => format!("{number:.3}"),
+        None => "−∞".to_string(),
+    }
+}
+
+/// `asphodel bank delete <bank> --confirm <bank>`: `DELETE /v1/banks/{bank}`.
+fn bank_delete(client_args: &ClientArgs, name: &str, confirm: &str) -> anyhow::Result<()> {
+    if name.trim() != confirm.trim() {
+        bail!("--confirm must repeat the bank's name");
+    }
+    let client = Client::new(client_args)?;
+    let deleted: Value = client.delete(&format!(
+        "/v1/banks/{}?confirm={}",
+        segment(name),
+        segment(confirm)
+    ))?;
+    if client_args.json {
+        return print_json(&deleted);
+    }
+    println!(
+        "deleted bank {} ({}): {} memories, {} entities, {} sources, {} chunks, {} edits, {} models, {} recalls, {} sessions",
+        text(&deleted, "name"),
+        text(&deleted, "bank"),
+        count(&deleted, "memories"),
+        count(&deleted, "entities"),
+        count(&deleted, "sources"),
+        count(&deleted, "chunks"),
+        count(&deleted, "edits"),
+        count(&deleted, "models"),
+        count(&deleted, "recalls"),
+        count(&deleted, "sessions"),
+    );
+    println!("a running plugin creates it again, empty, on its next `initialize`");
+    Ok(())
+}
+
+/// `asphodel memory show|significance`.
+fn memory(command: MemoryCommand) -> anyhow::Result<()> {
+    match command {
+        MemoryCommand::Show { client, bank, id } => {
+            let json = client.json;
+            let client = Client::new(&client)?;
+            let view: Value = client.get(&format!(
+                "/v1/banks/{}/memories/{}",
+                segment(&bank),
+                segment(&id)
+            ))?;
+            if json {
+                return print_json(&view);
+            }
+            print_memory(&view);
+            Ok(())
+        }
+        MemoryCommand::Significance {
+            client,
+            bank,
+            id,
+            level,
+        } => {
+            let json = client.json;
+            let client = Client::new(&client)?;
+            let level = (level.trim() != "clear").then(|| level.trim().to_string());
+            let set: Value = client.put(
+                &format!(
+                    "/v1/banks/{}/memories/{}/significance",
+                    segment(&bank),
+                    segment(&id)
+                ),
+                &SignificanceRequest { level },
+            )?;
+            if json {
+                return print_json(&set);
+            }
+            let shown = |key: &str| {
+                set.get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("none")
+                    .to_string()
+            };
+            println!(
+                "{}: owner's significance {} -> {} (extracted {})",
+                text(&set, "memory"),
+                shown("from"),
+                shown("to"),
+                text(&set, "extracted"),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn print_memory(view: &Value) {
+    let phase = view.get("phase").and_then(Value::as_str).unwrap_or("-");
+    println!(
+        "{}  [{}, {}]  {}",
+        text(view, "id"),
+        text(view, "kind"),
+        phase,
+        text(view, "sentence")
+    );
+    let significance = &view["significance"];
+    println!(
+        "  significance: extracted {}, owner {} (strength uses {}, {})",
+        text(significance, "extracted"),
+        significance
+            .get("owner")
+            .and_then(Value::as_str)
+            .unwrap_or("none"),
+        text(significance, "effective"),
+        number(significance, "value"),
+    );
+    let window = &view["window"];
+    let time = |key: &str| {
+        window
+            .get(key)
+            .filter(|value| !value.is_null())
+            .map(|value| format!("{} ({})", text(value, "at"), text(value, "precision")))
+    };
+    let mut parts = Vec::new();
+    if let Some(from) = time("valid_from") {
+        parts.push(format!("from {from}"));
+    }
+    if let Some(until) = time("valid_until") {
+        parts.push(format!("until {until}"));
+    }
+    if let Some(event) = window.get("until_event").and_then(Value::as_str) {
+        parts.push(format!("until \"{event}\""));
+    }
+    if let Some(due) = time("due_at") {
+        parts.push(format!("due {due}"));
+    }
+    if let Some(volatility) = window.get("volatility").and_then(Value::as_str) {
+        parts.push(format!("volatility {volatility}"));
+    }
+    if let Some(recurrence) = window.get("recurrence").and_then(Value::as_str) {
+        parts.push(format!("recurs \"{recurrence}\""));
+    }
+    parts.push(format!(
+        "{} confidence, {}",
+        text(window, "window_confidence"),
+        text(window, "timezone")
+    ));
+    println!("  window: {}", parts.join("; "));
+    let mut times = vec![
+        format!("observed {}", text(view, "observed_at")),
+        format!("created {}", text(view, "created_at")),
+    ];
+    if let Some(at) = view.get("hidden_at").and_then(Value::as_str) {
+        times.push(format!("forgotten {at}, erase pending"));
+    }
+    if let Some(at) = view.get("retracted_at").and_then(Value::as_str) {
+        times.push(format!("retracted {at}"));
+    }
+    println!("  {}", times.join(", "));
+
+    let source = &view["source"];
+    println!(
+        "  source: {} {}, chunk {} [{}..{}]",
+        text(source, "kind"),
+        text(source, "source"),
+        text(source, "chunk"),
+        count(source, "start"),
+        count(source, "end"),
+    );
+    match source.get("passage").and_then(Value::as_str) {
+        Some(passage) => println!("    \"{passage}\""),
+        None => {
+            let gone = &source["gone"];
+            match text(gone, "reason") {
+                "swept" => println!(
+                    "    passage gone: swept at its 90-day horizon{}",
+                    gone.get("at")
+                        .and_then(Value::as_str)
+                        .map(|at| format!(" ({at})"))
+                        .unwrap_or_default()
+                ),
+                "redacted" => println!("    passage gone: redacted by a forget"),
+                "forget_requested" => {
+                    println!("    passage gone: the turn asked to forget and was never stored")
+                }
+                other => println!("    passage gone: {other}"),
+            }
+        }
+    }
+    let secrets: Vec<&str> = list(source, "secret_kinds")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if !secrets.is_empty() {
+        println!("    secret scan redacted: {}", secrets.join(", "));
+    }
+
+    let strength = &view["strength"];
+    let recallable = if strength.get("recallable").and_then(Value::as_bool) == Some(true) {
+        "recallable"
+    } else {
+        "below τ, so recall leaves it out"
+    };
+    println!(
+        "  strength {} = significance {} + max(recent use {}, lasting floor {} over {} occasions); τ {}: {recallable}",
+        number(strength, "value"),
+        number(strength, "significance_boost"),
+        number(strength, "recent_use"),
+        number(strength, "lasting_floor"),
+        count(strength, "occasions"),
+        number(strength, "threshold"),
+    );
+    let purge = &view["purge"];
+    let line = match purge.get("line").and_then(Value::as_f64) {
+        Some(_) => format!("purge line τ−δ {}", number(purge, "line")),
+        None => "purge is off (δ unset)".to_string(),
+    };
+    println!(
+        "  purge: read on head {} at {}; {line}",
+        text(purge, "head"),
+        number(purge, "head_strength"),
+    );
+    let guards = list(purge, "guards");
+    if guards.is_empty() {
+        println!("    nothing holds it back: the next sweep purges the chain");
+    }
+    for guard in guards {
+        match text(guard, "guard") {
+            "purge_disabled" => println!("    held: δ is unset, so nothing is purged"),
+            "purge_paused" => {
+                println!("    held: purge is paused until `asphodel purge ack`")
+            }
+            "forgotten" => println!("    held: forgotten; its erase removes it"),
+            "date_ahead" => println!("    held: a date ahead, until {}", text(guard, "until")),
+            "overdue_task" => println!("    held: an overdue task, until {}", text(guard, "until")),
+            "strength" => println!("    held: the head is above the purge line"),
+            other => println!("    held: {other}"),
+        }
+    }
+    let projection = &view["projection"];
+    println!("  projected, {}:", text(projection, "basis"));
+    let projected = |label: &str, key: &str, never: &str| match projection.get(key) {
+        Some(when) if !when.is_null() => println!(
+            "    {label} in {} bank days; earliest {} (at full speed)",
+            number(when, "bank_days"),
+            text(when, "earliest_at"),
+        ),
+        _ => println!("    {never}"),
+    };
+    projected("fades below τ", "fade", "never fades below τ");
+    projected("purgeable", "purge", "never purged");
+
+    let chain = &view["chain"];
+    let members = list(chain, "members");
+    if members.len() > 1 {
+        println!("  chain, head {}:", text(chain, "head"));
+        for member in members {
+            let mut notes = Vec::new();
+            if let Some(by) = member.get("superseded_by").and_then(Value::as_str) {
+                notes.push(format!("superseded by {by}"));
+            }
+            if member.get("retracted").and_then(Value::as_bool) == Some(true) {
+                notes.push("retracted".to_string());
+            }
+            if member.get("hidden").and_then(Value::as_bool) == Some(true) {
+                notes.push("forgotten".to_string());
+            }
+            println!("    {}  {}", text(member, "id"), notes.join(", "));
+        }
+    }
+    if let Some(by) = chain.get("ended_by").and_then(Value::as_str) {
+        println!("  ended by {by}");
+    }
+    let ends: Vec<&str> = list(chain, "ends")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if !ends.is_empty() {
+        println!("  ends {}", ends.join(", "));
+    }
+    for entity in list(view, "entities") {
+        let surface = entity
+            .get("surface_form")
+            .and_then(Value::as_str)
+            .map(|form| format!(" as \"{form}\""))
+            .unwrap_or_default();
+        println!(
+            "  about {} ({}){surface}",
+            text(entity, "name"),
+            text(entity, "id")
+        );
+    }
+    let accesses = list(view, "accesses");
+    println!("  accesses ({}):", accesses.len());
+    for access in accesses {
+        let inherited = access
+            .get("inherited_from")
+            .and_then(Value::as_str)
+            .map(|from| format!(", inherited from {from}"))
+            .unwrap_or_default();
+        println!(
+            "    {} {} turn {}{inherited}",
+            text(access, "at"),
+            text(access, "kind"),
+            count(access, "turn"),
+        );
+    }
+    print_edits(list(view, "edits"));
+}
+
+fn print_edits(edits: &[Value]) {
+    println!("  edits ({}):", edits.len());
+    for edit in edits {
+        println!(
+            "    {} {} {}  {}",
+            text(edit, "at"),
+            text(edit, "kind"),
+            text(edit, "id"),
+            edit.get("details")
+                .map(Value::to_string)
+                .unwrap_or_default(),
+        );
+    }
+}
+
+/// `asphodel entity show|merge|unmerge|alias rm|link|unlink`.
+fn entity(command: EntityCommand) -> anyhow::Result<()> {
+    match command {
+        EntityCommand::Show {
+            client,
+            bank,
+            entity,
+        } => {
+            let json = client.json;
+            let client = Client::new(&client)?;
+            let view: Value = client.get(&format!(
+                "/v1/banks/{}/entities/{}",
+                segment(&bank),
+                segment(&entity)
+            ))?;
+            if json {
+                return print_json(&view);
+            }
+            print_entity(&view);
+            Ok(())
+        }
+        EntityCommand::Merge {
+            client,
+            bank,
+            from,
+            into,
+        } => {
+            let json = client.json;
+            let client = Client::new(&client)?;
+            let merged: Value = client.post(
+                &format!("/v1/banks/{}/merges", segment(&bank)),
+                &MergeRequest { from, into },
+            )?;
+            if json {
+                return print_json(&merged);
+            }
+            println!(
+                "merged {} into {}: {} aliases and {} links moved, {} models repointed",
+                text(&merged, "from"),
+                text(&merged, "into"),
+                count(&merged, "aliases_moved"),
+                count(&merged, "links_moved"),
+                count(&merged, "models_repointed"),
+            );
+            println!(
+                "undo with `asphodel entity unmerge --bank {bank} {}`",
+                text(&merged, "edit")
+            );
+            Ok(())
+        }
+        EntityCommand::Unmerge { client, bank, edit } => {
+            let json = client.json;
+            let client = Client::new(&client)?;
+            let unmerged: Value = client.post(
+                &format!(
+                    "/v1/banks/{}/merges/{}/undo",
+                    segment(&bank),
+                    segment(&edit)
+                ),
+                &Value::Null,
+            )?;
+            if json {
+                return print_json(&unmerged);
+            }
+            println!(
+                "unmerged {} from {}: {} aliases and {} links moved back, {} models repointed",
+                text(&unmerged, "from"),
+                text(&unmerged, "into"),
+                count(&unmerged, "aliases_moved"),
+                count(&unmerged, "links_moved"),
+                count(&unmerged, "models_repointed"),
+            );
+            Ok(())
+        }
+        EntityCommand::Alias(AliasCommand::Rm {
+            client,
+            bank,
+            entity,
+            alias,
+            relink_to,
+        }) => {
+            let json = client.json;
+            let client = Client::new(&client)?;
+            let removed: Value = client.post(
+                &format!("/v1/banks/{}/aliases/remove", segment(&bank)),
+                &AliasRemoval {
+                    entity,
+                    alias,
+                    relink_to,
+                },
+            )?;
+            if json {
+                return print_json(&removed);
+            }
+            match removed.get("relinked_to").and_then(Value::as_str) {
+                Some(target) => println!(
+                    "removed the alias from {}; {} links moved to {target}, which has it now",
+                    text(&removed, "entity"),
+                    count(&removed, "links_moved"),
+                ),
+                None => println!("removed the alias from {}", text(&removed, "entity")),
+            }
+            Ok(())
+        }
+        EntityCommand::Link {
+            client,
+            bank,
+            memory,
+            entity,
+        } => edit_link(client, &bank, memory, entity, true),
+        EntityCommand::Unlink {
+            client,
+            bank,
+            memory,
+            entity,
+        } => edit_link(client, &bank, memory, entity, false),
+    }
+}
+
+fn edit_link(
+    client_args: ClientArgs,
+    bank: &str,
+    memory: String,
+    entity: String,
+    link: bool,
+) -> anyhow::Result<()> {
+    let client = Client::new(&client_args)?;
+    let route = if link { "links" } else { "links/remove" };
+    let edited: Value = client.post(
+        &format!("/v1/banks/{}/{route}", segment(bank)),
+        &LinkRequest { memory, entity },
+    )?;
+    if client_args.json {
+        return print_json(&edited);
+    }
+    let changed = edited.get("changed").and_then(Value::as_bool) == Some(true);
+    let (done, already) = if link {
+        ("linked", "already linked")
+    } else {
+        ("unlinked", "wasn't linked")
+    };
+    println!(
+        "{} {} {}",
+        text(&edited, "memory"),
+        if changed { done } else { already },
+        text(&edited, "entity"),
+    );
+    Ok(())
+}
+
+fn print_entity(view: &Value) {
+    let seeded = view
+        .get("seeded")
+        .and_then(Value::as_str)
+        .map(|seeded| format!(", the bank's {seeded}"))
+        .unwrap_or_default();
+    println!(
+        "{}  {}  [{}{seeded}]",
+        text(view, "id"),
+        text(view, "name"),
+        text(view, "kind")
+    );
+    if let Some(into) = view.get("merged_into").and_then(Value::as_str) {
+        let survivor = view
+            .get("survivor")
+            .and_then(Value::as_str)
+            .map(|survivor| format!(", which ends at {survivor}"))
+            .unwrap_or_default();
+        println!("  merged into {into}{survivor}");
+    }
+    let merged_from: Vec<&str> = list(view, "merged_from")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if !merged_from.is_empty() {
+        println!("  merged into it: {}", merged_from.join(", "));
+    }
+    let aliases: Vec<&str> = list(view, "aliases")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    println!("  aliases: {}", aliases.join(", "));
+    let speakers: Vec<&str> = list(view, "speaker_ids")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if !speakers.is_empty() {
+        println!("  speaker ids: {}", speakers.join(", "));
+    }
+    let models: Vec<&str> = list(view, "models")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if !models.is_empty() {
+        println!("  models filtering on it: {}", models.join(", "));
+    }
+    let memories = list(view, "memories");
+    println!(
+        "  memories: {} linked{}",
+        count(view, "memory_count"),
+        if (memories.len() as u64) < count(view, "memory_count") {
+            format!(", the newest {} shown", memories.len())
+        } else {
+            String::new()
+        }
+    );
+    for memory in memories {
+        let surface = memory
+            .get("surface_form")
+            .and_then(Value::as_str)
+            .map(|form| format!(" as \"{form}\""))
+            .unwrap_or_default();
+        let via = memory
+            .get("via")
+            .and_then(Value::as_str)
+            .map(|via| format!(" via {via}"))
+            .unwrap_or_default();
+        println!(
+            "    {}  [{}]  {}{surface}{via}",
+            text(memory, "id"),
+            text(memory, "kind"),
+            text(memory, "sentence"),
+        );
+    }
+    print_edits(list(view, "edits"));
+}
+
+/// How often `asphodel reembed` looks at the job while it follows it.
+const REEMBED_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `asphodel reembed --bank`: starts or resumes the daemon's job, and
+/// follows it to the swap unless `--no-wait`.
+fn reembed(args: ReembedArgs) -> anyhow::Result<()> {
+    let client = Client::new(&args.client)?;
+    let path = format!("/v1/banks/{}/reembed", segment(&args.bank));
+    let mut status: Value = client.post(&path, &Value::Null)?;
+    if text(&status, "state") == "current" {
+        if args.client.json {
+            return print_json(&status);
+        }
+        println!(
+            "{} is already on {}; nothing to re-embed",
+            args.bank,
+            text(&status, "model")
+        );
+        return Ok(());
+    }
+    let from = text(&status, "recorded_model").to_string();
+    if args.no_wait {
+        if args.client.json {
+            return print_json(&status);
+        }
+        println!(
+            "re-embedding {} from {from} to {}; follow it with `asphodel reembed --bank {}`",
+            args.bank,
+            text(&status, "model"),
+            args.bank
+        );
+        return Ok(());
+    }
+    if !args.client.json {
+        println!(
+            "re-embedding {} from {from} to {}: served with {from} until the swap",
+            args.bank,
+            text(&status, "model")
+        );
+    }
+    let mut shown = u64::MAX;
+    loop {
+        match text(&status, "state") {
+            "current" => break,
+            "failed" => bail!(
+                "the re-embed stopped ({}); run it again to resume from where it got to",
+                text(&status, "error")
+            ),
+            _ => {}
+        }
+        let embedded = count(&status, "embedded");
+        if embedded != shown && !args.client.json {
+            println!(
+                "  {embedded} of {} memories embedded",
+                count(&status, "memories")
+            );
+            shown = embedded;
+        }
+        std::thread::sleep(REEMBED_POLL);
+        status = client.get(&path)?;
+    }
+    if args.client.json {
+        return print_json(&status);
+    }
+    println!(
+        "swapped: {} is served with {} now",
+        args.bank,
+        text(&status, "recorded_model")
+    );
     Ok(())
 }
 

@@ -53,7 +53,7 @@ use crate::store::{Store, StoreError, VectorIndex};
 use crate::system_prompt::BlockEntry;
 
 pub use call2::call2_request;
-pub(crate) use input::{entities_named, phrase};
+pub(crate) use input::{entities_named, phrase, survivor};
 pub use prompt::call1_request;
 
 /// Call 1's template name and version, which replay's cassette keys include

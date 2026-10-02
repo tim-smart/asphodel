@@ -77,6 +77,10 @@ impl Client {
         self.request(Method::PATCH, path, Some(serde_json::to_vec(body)?))
     }
 
+    pub(crate) fn delete<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        self.request(Method::DELETE, path, None)
+    }
+
     pub(crate) fn put<B: Serialize, T: DeserializeOwned>(
         &self,
         path: &str,

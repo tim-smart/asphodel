@@ -34,11 +34,44 @@ impl Embedder for FakeEmbedder {
     }
 }
 
+/// A second deterministic embedder with its own id, which hashes words
+/// into other buckets: a stand-in for a changed embedding model, so a
+/// re-embed can be driven on fakes (ADR 0010). `ASPHODEL_MODELS=fake-v2`
+/// serves with it and carries [`FakeEmbedder`] for banks recorded under it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FakeEmbedderV2;
+
+impl FakeEmbedderV2 {
+    pub const MODEL_ID: &'static str = "fake-embedder:v2";
+}
+
+impl Embedder for FakeEmbedderV2 {
+    fn model_id(&self) -> &str {
+        Self::MODEL_ID
+    }
+
+    fn dimensions(&self) -> usize {
+        EMBEDDING_DIMENSIONS
+    }
+
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
+        Ok(texts
+            .iter()
+            .map(|text| embed_seeded(text, b"v2:"))
+            .collect())
+    }
+}
+
 fn embed_one(text: &str) -> Vec<f32> {
+    embed_seeded(text, b"")
+}
+
+/// The bag of words, each word hashed after `seed`.
+fn embed_seeded(text: &str, seed: &[u8]) -> Vec<f32> {
     let mut vector = vec![0.0f32; EMBEDDING_DIMENSIONS];
     let mut any = false;
     for word in words(text) {
-        let hash = fnv1a(word.as_bytes());
+        let hash = fnv1a(&[seed, word.as_bytes()].concat());
         let bucket = (hash % EMBEDDING_DIMENSIONS as u64) as usize;
         let sign = if (hash >> 32) & 1 == 0 { 1.0 } else { -1.0 };
         vector[bucket] += sign;

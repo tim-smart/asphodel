@@ -25,6 +25,12 @@ pub const MAX_IDS: usize = 50;
 /// The edit kind unkeep writes.
 pub const EDIT_UNKEPT: &str = "memory_unkept";
 
+/// The edit kind `memory significance` writes (ADR 0010).
+pub const EDIT_SIGNIFICANCE_SET: &str = "owner_significance_set";
+
+/// The levels `memory significance` takes: extraction's five and `kept`.
+pub const OWNER_LEVELS: [&str; 6] = ["trivial", "minor", "notable", "major", "critical", "kept"];
+
 /// What `keep` and `unkeep` take.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MemoryIds {
@@ -46,10 +52,35 @@ pub struct Unkept {
     pub unknown: Vec<String>,
 }
 
+/// What `PUT /v1/banks/{bank}/memories/{id}/significance` takes: a level,
+/// or `null` to clear the owner's setting.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SignificanceRequest {
+    pub level: Option<String>,
+}
+
+/// What `memory significance` did. `from` and `to` are the owner's
+/// setting before and after; `extracted` is the level beneath it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SignificanceSet {
+    pub memory: Uuid,
+    pub extracted: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum KeepError {
     #[error("unknown bank")]
     UnknownBank,
+
+    #[error("no such memory in the bank")]
+    UnknownMemory,
+
+    #[error(
+        "unknown significance level; give trivial, minor, notable, major, critical, kept or clear"
+    )]
+    InvalidLevel,
 
     #[error("at most {MAX_IDS} ids per call, got {given}")]
     TooMany { given: usize },
@@ -76,6 +107,66 @@ pub(crate) fn keep(store: &Store, bank: &str, ids: &[String]) -> Result<Kept, Ke
 pub(crate) fn unkeep(store: &Store, bank: &str, ids: &[String]) -> Result<Unkept, KeepError> {
     let (unkept, unknown) = apply(store, bank, ids, Change::Unkeep)?;
     Ok(Unkept { unkept, unknown })
+}
+
+/// Sets the owner's significance on one memory, or clears it with `None`,
+/// handing the memory back to the level extraction gave (TIM-99, decision
+/// 5). The same field keep and unkeep write; a change is a logged edit of
+/// levels only.
+pub(crate) fn set_significance(
+    store: &Store,
+    bank: &str,
+    id: &str,
+    level: Option<&str>,
+) -> Result<SignificanceSet, KeepError> {
+    let to = match level.map(str::trim) {
+        None | Some("clear") => None,
+        Some(level) => Some(
+            OWNER_LEVELS
+                .into_iter()
+                .find(|known| *known == level)
+                .ok_or(KeepError::InvalidLevel)?,
+        ),
+    };
+    let now = micros(store.now());
+    let mut conn = store.connection();
+    let tx = conn.transaction()?;
+    let (bank_id, _) = find_bank(&tx, bank)?.ok_or(KeepError::UnknownBank)?;
+    let uuid = id
+        .trim()
+        .parse::<Uuid>()
+        .map_err(|_| KeepError::UnknownMemory)?;
+    let (memory_id, extracted, from): (i64, String, Option<String>) = tx
+        .query_row(
+            "SELECT id, significance, owner_significance FROM memories
+             WHERE uuid = ?1 AND bank_id = ?2 AND hidden_at IS NULL",
+            (uuid.to_string(), bank_id),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .ok_or(KeepError::UnknownMemory)?;
+    if from.as_deref() != to {
+        tx.execute(
+            "UPDATE memories SET owner_significance = ?2, updated_at = ?3 WHERE id = ?1",
+            (memory_id, to, now),
+        )?;
+        let details = serde_json::json!({ "from": from, "to": to }).to_string();
+        log_memory_edit(
+            &tx,
+            store,
+            bank_id,
+            EDIT_SIGNIFICANCE_SET,
+            memory_id,
+            &details,
+        )?;
+    }
+    tx.commit()?;
+    Ok(SignificanceSet {
+        memory: uuid,
+        extracted,
+        from,
+        to: to.map(str::to_string),
+    })
 }
 
 #[derive(Clone, Copy)]

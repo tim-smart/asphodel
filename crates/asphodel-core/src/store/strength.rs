@@ -75,6 +75,28 @@ impl StrengthLoader {
         conn: &Connection,
         memory_id: i64,
     ) -> Result<Strength, rusqlite::Error> {
+        let inputs = self.inputs(conn, memory_id)?;
+        Ok(strength(
+            inputs.significance,
+            &inputs.accesses,
+            inputs.close,
+            &self.bank_time,
+            self.now,
+        ))
+    }
+
+    /// The bank's clock, as loaded.
+    pub(crate) fn bank_time(&self) -> &BankTime {
+        &self.bank_time
+    }
+
+    /// What the strength of the memory with rowid `memory_id` is computed
+    /// from, so `memory show` can project it forward.
+    pub(crate) fn inputs(
+        &self,
+        conn: &Connection,
+        memory_id: i64,
+    ) -> Result<Inputs, rusqlite::Error> {
         let memory = conn.query_row(
             "SELECT m.significance, m.owner_significance, m.kind, m.observed_at,
                     m.valid_from, m.valid_from_precision, m.valid_until, m.valid_until_precision,
@@ -140,14 +162,20 @@ impl StrengthLoader {
             None => None,
         };
 
-        Ok(strength(
+        Ok(Inputs {
             significance,
-            &accesses,
+            accesses,
             close,
-            &self.bank_time,
-            self.now,
-        ))
+        })
     }
+}
+
+/// A memory's strength inputs: its significance value, the accesses it
+/// counts and its window's close.
+pub(crate) struct Inputs {
+    pub significance: f64,
+    pub accesses: Vec<Access>,
+    pub close: Option<WindowClose>,
 }
 
 impl StrengthLoader {

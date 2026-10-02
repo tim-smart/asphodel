@@ -412,7 +412,7 @@ fn speaker_entity(
 
 /// Follows `merged_into` to the entity that survived any merges. Bounded, so
 /// a corrupt cycle can't hang extraction.
-pub(super) fn survivor(conn: &Connection, mut entity_id: i64) -> Result<i64, rusqlite::Error> {
+pub(crate) fn survivor(conn: &Connection, mut entity_id: i64) -> Result<i64, rusqlite::Error> {
     for _ in 0..64 {
         let merged_into: Option<i64> = conn.query_row(
             "SELECT merged_into FROM entities WHERE id = ?1",
