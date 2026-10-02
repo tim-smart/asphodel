@@ -8,6 +8,7 @@
 //! the rest as it goes, since whether a target is a neighbour or a `used`
 //! memory is in context is only known then.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -18,6 +19,11 @@ use asphodel_core::strength::{Kind, Phase};
 use jiff::civil::Date;
 use jiff::{SignedDuration, Span, SpanRelativeTo, Timestamp};
 use serde::Deserialize;
+
+/// The prefix of the sessions the prefetch probes run on, `probe:<id>`.
+/// No scenario session may start with it, so a probe never touches a
+/// scenario session's pending injections or idle timeout.
+pub const PROBE_SESSION_PREFIX: &str = "probe:";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -445,6 +451,45 @@ pub fn load(path: &Path) -> anyhow::Result<Scenario> {
 /// the label at fault. Empty when the scenario is well formed.
 pub fn check(scenario: &Scenario) -> Vec<String> {
     let mut errors = Vec::new();
+    // The default report path is `reports/<name>.json` under the private
+    // dir, so the name is one filename component.
+    let mut components = Path::new(&scenario.name).components();
+    let one_component = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !one_component || scenario.name.contains(['/', '\\', '\0']) {
+        errors.push(format!(
+            "the scenario's name {:?} isn't a single filename component",
+            scenario.name
+        ));
+    }
+    let sessions = scenario
+        .turns
+        .iter()
+        .map(|turn| turn.session.as_str())
+        .chain(
+            scenario
+                .chatter
+                .iter()
+                .map(|chatter| chatter.session.as_deref().unwrap_or("chatter")),
+        )
+        .chain(scenario.clears.iter().map(|clear| clear.session.as_str()));
+    let reserved: BTreeSet<&str> = sessions
+        .filter(|session| session.starts_with(PROBE_SESSION_PREFIX))
+        .collect();
+    for session in reserved {
+        errors.push(format!(
+            "the session {session:?} starts with {PROBE_SESSION_PREFIX:?}, which is reserved for probes"
+        ));
+    }
+    let mut probe_ids = BTreeSet::new();
+    for (index, probe) in scenario.probes.iter().enumerate() {
+        let id = probe.id(index);
+        if !probe_ids.insert(id.clone()) {
+            errors.push(format!("the probe id {id:?} is used twice"));
+        }
+    }
     // Every labelled claim, with when its event happens.
     let mut labels: Vec<(String, Timestamp)> = Vec::new();
     let mut claims: Vec<(Timestamp, &Claim)> = Vec::new();

@@ -10,6 +10,13 @@
 //! goes to `--report` or `<replay dir>/reports/<name>.json`, and the shadow
 //! table of purged rows to `<replay dir>/shadow.db`.
 //!
+//! A run holds a lock on the private dir from before it touches the store
+//! until the report is written, so two replays never share one. The store
+//! carries a marker naming it replay's own; a `store` dir without one is
+//! refused, never reset. Both outputs are checked before the run: neither
+//! may already be a symlink, and a `--report` inside a git working tree is
+//! refused.
+//!
 //! Exit 0 when every probe passed; 1 when one failed, with the report
 //! written; 2 when the arguments or the scenario were refused, or the run
 //! itself failed, with no report.
@@ -29,7 +36,7 @@ use anyhow::{Context as _, anyhow, bail};
 use asphodel_core::config::Layer;
 use asphodel_core::models::{FakeEmbedder, FakeReranker, ModelOptions};
 use asphodel_core::store::bank::BankIdentity;
-use asphodel_core::store::{DB_FILE, DataDirLock, OpenOptions};
+use asphodel_core::store::{DB_FILE, DataDirLock, LOCK_FILE, OpenOptions, StoreError};
 use asphodel_core::{Clock, Models, Service, SimulatedClock, Store, Tuning, VERSION};
 use jiff::tz::TimeZone;
 use tracing::info;
@@ -49,6 +56,13 @@ fn fake_floors() -> String {
         FakeEmbedder::MODEL_ID
     )
 }
+
+/// The marker in `<replay dir>/store` that says replay created it, so a
+/// run may reset it.
+const STORE_MARKER: &str = "replay-store";
+
+/// The shadow table under the replay dir.
+const SHADOW_FILE: &str = "shadow.db";
 
 /// Replay never skips the reranker (TIM-96, decision 3).
 const NO_DEADLINE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
@@ -82,6 +96,10 @@ struct Finished {
 fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
     let scenario = scenario::load(&args.scenario)?;
     let dir = private_dir(args.replay_dir.as_deref())?;
+    let _lock = lock_private_dir(&dir)?;
+    let report_path = report_path(args.report.as_deref(), &dir, &scenario.name)?;
+    let shadow_path = dir.join(SHADOW_FILE);
+    refuse_symlink(&shadow_path)?;
 
     let (models, fake) = match scenario.group {
         Group::Ci => (Models::fake(), true),
@@ -174,7 +192,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         .get(&embedder)
         .copied()
         .unwrap_or(1.0);
-    shadow::write(&dir.join("shadow.db"), &outcome.shadow).context("writing the shadow table")?;
+    shadow::write(&shadow_path, &outcome.shadow).context("writing the shadow table")?;
     let purged_then_re_mentioned = shadow::re_mentioned(&outcome.created, &outcome.shadow, floor);
 
     let failed = outcome.probes.iter().filter(|probe| !probe.passed).count();
@@ -204,18 +222,9 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             live: 0,
         },
     };
-    let report_path = match &args.report {
-        Some(path) => path.clone(),
-        None => {
-            let reports = dir.join("reports");
-            fs::create_dir_all(&reports)
-                .with_context(|| format!("creating {}", reports.display()))?;
-            reports.join(format!("{}.json", scenario.name))
-        }
-    };
     let mut json = serde_json::to_vec_pretty(&report)?;
     json.push(b'\n');
-    fs::write(&report_path, json)
+    write_report(&report_path, &json)
         .with_context(|| format!("writing the report to {}", report_path.display()))?;
     Ok(Finished {
         failed,
@@ -238,7 +247,19 @@ fn private_dir(given: Option<&Path>) -> anyhow::Result<PathBuf> {
     };
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let dir = fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
-    let mut ancestor = Some(dir.as_path());
+    refuse_git_tree(&dir)?;
+    if dir.join(DB_FILE).exists() {
+        bail!(
+            "{} holds {DB_FILE} at its top level, which makes it a `serve` data dir; replay opens only its own store under <replay dir>/store",
+            dir.display()
+        );
+    }
+    Ok(dir)
+}
+
+/// Refuses `dir` when it or an ancestor holds `.git`.
+fn refuse_git_tree(dir: &Path) -> anyhow::Result<()> {
+    let mut ancestor = Some(dir);
     while let Some(path) = ancestor {
         if path.join(".git").exists() {
             bail!(
@@ -249,28 +270,107 @@ fn private_dir(given: Option<&Path>) -> anyhow::Result<PathBuf> {
         }
         ancestor = path.parent();
     }
-    if dir.join(DB_FILE).exists() {
-        bail!(
-            "{} holds {DB_FILE} at its top level, which makes it a `serve` data dir; replay opens only its own store under <replay dir>/store",
-            dir.display()
-        );
-    }
-    Ok(dir)
+    Ok(())
 }
 
-/// A fresh store under `<replay dir>/store`, with deterministic ids. A run
-/// starts from nothing, so an earlier run's store is removed first, unless
-/// another replay holds it.
+/// Refuses an output path that is already a symlink, which would write
+/// through to wherever it points.
+fn refuse_symlink(path: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+            "{} is a symlink; replay never writes through one",
+            path.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("checking {}", path.display())),
+    }
+}
+
+/// The lock on the private dir, held for the whole run: from before the
+/// store is reset until the report is written.
+fn lock_private_dir(dir: &Path) -> anyhow::Result<DataDirLock> {
+    refuse_symlink(&dir.join(LOCK_FILE))?;
+    DataDirLock::acquire(dir).map_err(|error| match error {
+        StoreError::Locked { holder, .. } => anyhow!(
+            "another replay (pid {holder}) is running in {}; one replay owns a private dir at a time",
+            dir.display()
+        ),
+        error => anyhow::Error::new(error).context(format!("locking {}", dir.display())),
+    })
+}
+
+/// Where the report goes, checked before the run (TIM-96, decision 8):
+/// `--report`, or `<replay dir>/reports/<name>.json`. A scripted report
+/// may go outside the private dir, since it derives from a checked-in
+/// fixture, but never inside a git working tree or through a symlink.
+fn report_path(given: Option<&Path>, dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let path = match given {
+        Some(path) => path.to_owned(),
+        None => {
+            let reports = dir.join("reports");
+            refuse_symlink(&reports)?;
+            fs::create_dir_all(&reports)
+                .with_context(|| format!("creating {}", reports.display()))?;
+            reports.join(format!("{name}.json"))
+        }
+    };
+    refuse_symlink(&path)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("--report {} doesn't name a file", path.display()))?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let parent = fs::canonicalize(parent)
+        .with_context(|| format!("resolving the report's directory {}", parent.display()))?;
+    refuse_git_tree(&parent)?;
+    Ok(parent.join(file_name))
+}
+
+/// Writes the report through a fresh file in the same directory and
+/// renames it into place, so a symlink planted at the destination since
+/// the check is replaced rather than followed.
+fn write_report(path: &Path, json: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .and_then(|mut file| file.write_all(json).and_then(|()| file.sync_all()))
+        .and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    Ok(result?)
+}
+
+/// A fresh store under `<replay dir>/store`, with deterministic ids. The
+/// caller holds the private dir's lock. A run starts from nothing, so an
+/// earlier run's store is reset first: only one carrying replay's marker,
+/// and under the store's own lock, whose file is kept so its inode still
+/// excludes anyone who opened it.
 fn open_store(dir: &Path, clock: Arc<dyn Clock>) -> anyhow::Result<Store> {
     let store_dir = dir.join("store");
-    if store_dir.exists() {
-        let lock = DataDirLock::acquire(&store_dir)
-            .context("another replay holds the store under the replay dir")?;
-        drop(lock);
-        fs::remove_dir_all(&store_dir)
-            .with_context(|| format!("clearing {}", store_dir.display()))?;
+    refuse_symlink(&store_dir)?;
+    let marked = if store_dir.exists() {
+        reset_store(&store_dir)?
+    } else {
+        fs::create_dir(&store_dir).with_context(|| format!("creating {}", store_dir.display()))?;
+        false
+    };
+    if !marked {
+        // `create_new` never follows a symlink at the marker's path.
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(store_dir.join(STORE_MARKER))
+            .with_context(|| format!("marking {}", store_dir.display()))?;
     }
-    fs::create_dir_all(&store_dir)?;
     Ok(Store::open(
         &store_dir,
         OpenOptions {
@@ -279,6 +379,51 @@ fn open_store(dir: &Path, clock: Arc<dyn Clock>) -> anyhow::Result<Store> {
         },
         clock,
     )?)
+}
+
+/// Empties an earlier run's store, keeping its lock file and marker, and
+/// says whether it was marked. A `store` dir without the marker isn't
+/// replay's and is left as it is, unless it's empty.
+fn reset_store(store_dir: &Path) -> anyhow::Result<bool> {
+    let marked =
+        fs::symlink_metadata(store_dir.join(STORE_MARKER)).is_ok_and(|metadata| metadata.is_file());
+    if !marked {
+        let empty = fs::read_dir(store_dir)
+            .with_context(|| format!("reading {}", store_dir.display()))?
+            .next()
+            .is_none();
+        if !empty {
+            bail!(
+                "{} wasn't created by replay (no {STORE_MARKER} marker); replay never resets a store it didn't create",
+                store_dir.display()
+            );
+        }
+        return Ok(false);
+    }
+    let _lock = DataDirLock::acquire(store_dir).map_err(|error| match error {
+        StoreError::Locked { holder, .. } => anyhow!(
+            "the store {} is held by another process (pid {holder})",
+            store_dir.display()
+        ),
+        error => anyhow::Error::new(error).context(format!("locking {}", store_dir.display())),
+    })?;
+    for entry in
+        fs::read_dir(store_dir).with_context(|| format!("reading {}", store_dir.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == LOCK_FILE || name == STORE_MARKER {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        removed.with_context(|| format!("clearing {}", path.display()))?;
+    }
+    Ok(true)
 }
 
 /// Code defaults, the fake floors (group `ci`), `--config`, the scenario's

@@ -8,9 +8,15 @@
 //! scheduled. The clock is set to each event's time before it runs, so
 //! every store write carries the simulated time.
 //!
-//! A turn's extraction is queued at its sync and committed at its
-//! completion, scheduled at the later of the sync and the bank's previous
-//! completion plus the latency, since each bank has one extraction worker.
+//! A source's extraction is queued at its sync. The bank's one simulated
+//! worker claims the head of the production queue whenever it's free, at
+//! a sync or at its previous completion, and commits what it claimed a
+//! latency later, so the queue's order (turns before documents, then
+//! observed time) decides what is extracted when. The latency is per
+//! source: the source's later chunks commit with the first while they are
+//! the queue's head. The run ends at the
+//! latest of the last event, `--until` and the last completion, so
+//! accepted work is always extracted.
 //! The LLM is answered from the scenario's claims: call 1's reply is built
 //! from them, and call 2's from their outcomes against the neighbours the
 //! real reconciliation found, so nothing in reconciliation is replay-only.
@@ -40,7 +46,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::report::{DayCount, Lag, ProbeResult, WeekBands, WeekCount};
-use super::scenario::{Author, Check, Claim, Scenario};
+use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX, Scenario};
 use super::shadow::{Created, ShadowRow};
 
 /// The scripted LLM's model name.
@@ -109,11 +115,12 @@ struct PlannedTurn {
     recall_id: Option<String>,
 }
 
-/// An extraction scheduled for its completion time.
+/// A synced source whose chunks aren't all extracted yet.
 struct Pending {
-    source: Uuid,
     synced_at: Timestamp,
+    /// Its chunks still to extract.
     chunks: usize,
+    /// Its claims not yet matched to an extracted chunk.
     claims: Vec<Claim>,
     used: Vec<String>,
     /// How errors name the event.
@@ -122,7 +129,7 @@ struct Pending {
 
 enum EventKind {
     Timer,
-    Completion(Pending),
+    Completion(Claimed),
     Prefetch(usize),
     Sync(usize),
     Document(usize),
@@ -181,12 +188,18 @@ pub struct Engine<'a> {
     events: BTreeMap<u64, EventKind>,
     seq: u64,
     timers: BTreeSet<Timestamp>,
+    /// Timers due after the end as it stood, scheduled if a completion
+    /// moves the end past them.
+    deferred: BTreeSet<Timestamp>,
     end: Timestamp,
     /// Claim labels to the memories they created.
     labels: BTreeMap<String, Uuid>,
     created: Vec<Created>,
     shadow: Vec<ShadowRow>,
-    last_completion: Timestamp,
+    /// Synced sources by id, until their last chunk is extracted.
+    pending: BTreeMap<Uuid, Pending>,
+    /// Whether the worker holds a lease, with its completion on the queue.
+    working: bool,
     refresh_llm: NoEdits,
     probes: Vec<ProbeResult>,
     purges: BTreeMap<String, u64>,
@@ -223,11 +236,13 @@ impl<'a> Engine<'a> {
             events: BTreeMap::new(),
             seq: 0,
             timers: BTreeSet::new(),
+            deferred: BTreeSet::new(),
             end,
             labels: BTreeMap::new(),
             created: Vec::new(),
             shadow: Vec::new(),
-            last_completion: start,
+            pending: BTreeMap::new(),
+            working: false,
             refresh_llm: NoEdits {
                 calls: Mutex::new(Vec::new()),
                 clock,
@@ -313,15 +328,33 @@ impl<'a> Engine<'a> {
     }
 
     /// Schedules the housekeeping timer at `at`, once per instant, within
-    /// the run.
+    /// the run. One past the end waits in case a completion extends it.
     fn schedule_timer(&mut self, at: Option<Timestamp>) {
         let Some(at) = at else {
             return;
         };
-        if at > self.end || at < self.clock.now() || !self.timers.insert(at) {
+        if at < self.clock.now() || self.timers.contains(&at) {
             return;
         }
+        if at > self.end {
+            self.deferred.insert(at);
+            return;
+        }
+        self.timers.insert(at);
         self.push(at, 0, EventKind::Timer);
+    }
+
+    /// Moves the end to `at` if it's later, with the timers due by then.
+    fn extend_end(&mut self, at: Timestamp) {
+        if at <= self.end {
+            return;
+        }
+        self.end = at;
+        let due: Vec<Timestamp> = self.deferred.range(..=at).copied().collect();
+        for at in due {
+            self.deferred.remove(&at);
+            self.schedule_timer(Some(at));
+        }
     }
 
     /// Runs the queue to the end.
@@ -338,7 +371,7 @@ impl<'a> Engine<'a> {
             self.clock.set(key.at);
             match kind {
                 EventKind::Timer => self.timer()?,
-                EventKind::Completion(pending) => self.complete(pending)?,
+                EventKind::Completion(claimed) => self.complete(claimed)?,
                 EventKind::Prefetch(index) => self.prefetch(index)?,
                 EventKind::Sync(index) => self.sync(index)?,
                 EventKind::Document(index) => self.document(index)?,
@@ -389,15 +422,14 @@ impl<'a> Engine<'a> {
             return Ok(());
         }
         let pending = Pending {
-            source: ingested.source,
             synced_at: self.clock.now(),
             chunks: ingested.chunks_queued,
             claims: turn.claims.clone(),
             used: turn.used.clone(),
             name: format!("the turn at {}", turn.at),
         };
-        self.schedule_completion(pending);
-        Ok(())
+        self.pending.insert(ingested.source, pending);
+        self.start_worker()
     }
 
     fn document(&mut self, index: usize) -> Result<(), Failure> {
@@ -416,15 +448,14 @@ impl<'a> Engine<'a> {
             return Ok(());
         }
         let pending = Pending {
-            source: ingested.source,
             synced_at: self.clock.now(),
             chunks: ingested.chunks_queued,
             claims: document.claims.clone(),
             used: Vec::new(),
             name: format!("document {}", document.id),
         };
-        self.schedule_completion(pending);
-        Ok(())
+        self.pending.insert(ingested.source, pending);
+        self.start_worker()
     }
 
     fn clear(&mut self, index: usize) -> Result<(), Failure> {
@@ -434,129 +465,161 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// The later of now and the bank's previous completion, plus the
-    /// latency: each bank has one extraction worker.
-    fn schedule_completion(&mut self, pending: Pending) {
-        let start = self.clock.now().max(self.last_completion);
-        let at = start
-            .checked_add(self.settings.latency)
-            .unwrap_or(Timestamp::MAX);
-        self.last_completion = at;
-        self.push(at, 1, EventKind::Completion(pending));
+    /// When the bank's one worker is free, it claims the head of the
+    /// production queue and commits it a latency later.
+    fn start_worker(&mut self) -> Result<(), Failure> {
+        if self.working {
+            return Ok(());
+        }
+        match self.service.next_extraction(&self.settings.bank)? {
+            Some(claimed) => self.schedule_completion(claimed),
+            None => Ok(()),
+        }
     }
 
-    /// Extracts every chunk of the source with the scripted replies.
-    fn complete(&mut self, pending: Pending) -> Result<(), Failure> {
-        let mut remaining: Vec<Claim> = pending.claims.clone();
-        for _ in 0..pending.chunks {
-            let Some(Claimed {
-                lease,
-                in_context,
-                entries,
-            }) = self.service.next_extraction(&self.settings.bank)?
-            else {
-                return Err(internal(format!(
-                    "the queue was empty at the completion of {}",
-                    pending.name
-                )));
-            };
-            if lease.source != pending.source {
-                return Err(internal(format!(
-                    "the queue's head isn't {} at its completion",
-                    pending.name
-                )));
-            }
-            let chunk = lease.chunk;
-            let input = self.service.call1_input(&lease, &in_context)?;
-
-            // The chunk's claims: those whose quote is in it, in order.
-            let mut mine: Vec<Claim> = Vec::new();
-            remaining.retain(|claim| {
-                if input.text.contains(&claim.quote) {
-                    mine.push(claim.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-
-            let mut used_handles = Vec::new();
-            for label in &pending.used {
-                let id = self.labels.get(label).copied();
-                let handle = id.and_then(|id| {
-                    input
-                        .in_context
-                        .iter()
-                        .find(|memory| memory.memory == id)
-                        .map(|memory| memory.handle.clone())
-                });
-                match handle {
-                    Some(handle) => used_handles.push(handle),
-                    None => {
-                        return Err(Failure::Scenario(format!(
-                            "{} uses {label:?}, which isn't in the session's in-context set",
-                            pending.name
-                        )));
-                    }
-                }
-            }
-
-            let reply1 = call1_reply(&mine, &used_handles);
-            let call2 = self.service.call2_input(&lease, &reply1, &in_context)?;
-            let reply2 = self.call2_reply(&mine, call2.as_ref(), &pending.name)?;
-            let llm = FakeLlm::scripted(MODEL, vec![reply1, reply2]);
-            let extracted = self
-                .service
-                .extract_leased(lease, &llm, &in_context, &entries)?;
-            self.llm_calls += llm.requests().len() as u64;
-
-            let now = self.clock.now();
-            for (ordinal, claim) in mine.iter().enumerate() {
-                let id = derived(chunk, &ordinal.to_string());
-                if extracted.memories.contains(&id) {
-                    let embedding = self.embed(&claim.content)?;
-                    self.created.push(Created {
-                        memory: id,
-                        content: claim.content.clone(),
-                        embedding,
-                        created_at: now,
-                    });
-                    if let Some(label) = &claim.label {
-                        self.labels.insert(label.clone(), id);
-                    }
-                } else if let Some(label) = &claim.label {
-                    let reason = match extracted
-                        .dropped
-                        .iter()
-                        .find(|dropped| dropped.claim == ordinal)
-                    {
-                        Some(dropped) => format!(
-                            "call 1's checks dropped it: {}",
-                            drop_reason(dropped.reason)
-                        ),
-                        None => "it is absorbed by its outcomes".into(),
-                    };
-                    return Err(Failure::Scenario(format!(
-                        "the claim {label:?} in {} created no memory ({reason}), so its label names nothing",
-                        pending.name
-                    )));
-                }
-            }
-            let lag = now.duration_since(pending.synced_at);
-            self.lags_ms
-                .push(u64::try_from(lag.as_millis()).unwrap_or(0));
-        }
-        if !remaining.is_empty() {
-            return Err(Failure::Scenario(format!(
-                "{} has {} claim(s) whose quote is in none of its chunks",
-                pending.name,
-                remaining.len()
+    /// Holds the worker on `claimed` until a latency from now.
+    fn schedule_completion(&mut self, claimed: Claimed) -> Result<(), Failure> {
+        if !self.pending.contains_key(&claimed.lease.source) {
+            return Err(internal(format!(
+                "the worker claimed source {}, which the scenario didn't sync",
+                claimed.lease.source
             )));
         }
+        let at = self
+            .clock
+            .now()
+            .checked_add(self.settings.latency)
+            .unwrap_or(Timestamp::MAX);
+        self.working = true;
+        self.extend_end(at);
+        self.push(at, 1, EventKind::Completion(claimed));
+        Ok(())
+    }
+
+    /// Commits the worker's chunk, and with it the rest of its source's
+    /// chunks while they are the queue's head: the latency is per source.
+    /// Then the worker takes the next head, if any.
+    fn complete(&mut self, claimed: Claimed) -> Result<(), Failure> {
+        let source = claimed.lease.source;
+        self.extract_chunk(claimed)?;
+        let next = loop {
+            match self.service.next_extraction(&self.settings.bank)? {
+                Some(claimed) if claimed.lease.source == source => self.extract_chunk(claimed)?,
+                other => break other,
+            }
+        };
         // Notable writes start the refresh debounce from the completion.
         let refreshes = self.service.run_refreshes(&self.refresh_llm)?;
         self.count_refresh_calls();
         self.schedule_timer(refreshes.next_due);
+        self.working = false;
+        match next {
+            Some(claimed) => self.schedule_completion(claimed),
+            None => Ok(()),
+        }
+    }
+
+    /// Extracts one claimed chunk with the scripted replies.
+    fn extract_chunk(&mut self, claimed: Claimed) -> Result<(), Failure> {
+        let Claimed {
+            lease,
+            in_context,
+            entries,
+        } = claimed;
+        let source = lease.source;
+        let mut pending = self
+            .pending
+            .remove(&source)
+            .ok_or_else(|| internal(format!("no pending extraction for source {source}")))?;
+        let position = lease.position;
+        let input = self.service.call1_input(&lease, &in_context)?;
+
+        // The chunk's claims: those whose quote is in it, in order.
+        let mut mine: Vec<Claim> = Vec::new();
+        pending.claims.retain(|claim| {
+            if input.text.contains(&claim.quote) {
+                mine.push(claim.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        let mut used_handles = Vec::new();
+        for label in &pending.used {
+            let id = self.labels.get(label).copied();
+            let handle = id.and_then(|id| {
+                input
+                    .in_context
+                    .iter()
+                    .find(|memory| memory.memory == id)
+                    .map(|memory| memory.handle.clone())
+            });
+            match handle {
+                Some(handle) => used_handles.push(handle),
+                None => {
+                    return Err(Failure::Scenario(format!(
+                        "{} uses {label:?}, which isn't in the session's in-context set",
+                        pending.name
+                    )));
+                }
+            }
+        }
+
+        let reply1 = call1_reply(&mine, &used_handles);
+        let call2 = self.service.call2_input(&lease, &reply1, &in_context)?;
+        let reply2 = self.call2_reply(&mine, call2.as_ref(), &pending.name)?;
+        let llm = FakeLlm::scripted(MODEL, vec![reply1, reply2]);
+        let extracted = self
+            .service
+            .extract_leased(lease, &llm, &in_context, &entries)?;
+        self.llm_calls += llm.requests().len() as u64;
+
+        let now = self.clock.now();
+        for (ordinal, claim) in mine.iter().enumerate() {
+            let id = derived(source, &format!("{position}:{ordinal}"));
+            if extracted.memories.contains(&id) {
+                let embedding = self.embed(&claim.content)?;
+                self.created.push(Created {
+                    memory: id,
+                    content: claim.content.clone(),
+                    embedding,
+                    created_at: now,
+                });
+                if let Some(label) = &claim.label {
+                    self.labels.insert(label.clone(), id);
+                }
+            } else if let Some(label) = &claim.label {
+                let reason = match extracted
+                    .dropped
+                    .iter()
+                    .find(|dropped| dropped.claim == ordinal)
+                {
+                    Some(dropped) => format!(
+                        "call 1's checks dropped it: {}",
+                        drop_reason(dropped.reason)
+                    ),
+                    None => "it is absorbed by its outcomes".into(),
+                };
+                return Err(Failure::Scenario(format!(
+                    "the claim {label:?} in {} created no memory ({reason}), so its label names nothing",
+                    pending.name
+                )));
+            }
+        }
+        let lag = now.duration_since(pending.synced_at);
+        self.lags_ms
+            .push(u64::try_from(lag.as_millis()).unwrap_or(0));
+        pending.chunks -= 1;
+        if pending.chunks > 0 {
+            self.pending.insert(source, pending);
+        } else if !pending.claims.is_empty() {
+            return Err(Failure::Scenario(format!(
+                "{} has {} claim(s) whose quote is in none of its chunks",
+                pending.name,
+                pending.claims.len()
+            )));
+        }
         Ok(())
     }
 
@@ -844,7 +907,7 @@ impl<'a> Engine<'a> {
                 let prefetch = self.service.prefetch(
                     bank,
                     &PrefetchRequest {
-                        session_id: format!("probe-{id}"),
+                        session_id: format!("{PROBE_SESSION_PREFIX}{id}"),
                         query: query.clone(),
                         previous_query: None,
                         block_id: None,

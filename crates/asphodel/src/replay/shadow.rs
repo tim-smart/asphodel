@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use jiff::Timestamp;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use uuid::Uuid;
 
 use super::report::ReMentioned;
@@ -31,9 +31,26 @@ pub struct Created {
 }
 
 /// Writes the rows to `shadow.db` under the replay dir, replacing any
-/// earlier run's.
-pub fn write(path: &Path, rows: &[ShadowRow]) -> rusqlite::Result<()> {
-    let mut conn = Connection::open(path)?;
+/// earlier run's. The earlier file is removed, not opened, and the new one
+/// is opened without following a symlink, so the table never lands
+/// outside the replay dir.
+pub fn write(path: &Path, rows: &[ShadowRow]) -> anyhow::Result<()> {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS purged (
              memory TEXT NOT NULL,
@@ -57,7 +74,8 @@ pub fn write(path: &Path, rows: &[ShadowRow]) -> rusqlite::Result<()> {
             ))?;
         }
     }
-    tx.commit()
+    tx.commit()?;
+    Ok(())
 }
 
 /// Each memory created after time t whose nearest shadow row, purged before

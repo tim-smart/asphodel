@@ -732,8 +732,8 @@ pub struct ReplayArgs {
     pub scenario: PathBuf,
 
     /// Where to write the JSON report; `<replay dir>/reports/<name>.json`
-    /// by default.
-    #[arg(long)]
+    /// by default. Given twice, the last one wins.
+    #[arg(long, overrides_with = "report")]
     pub report: Option<PathBuf>,
 
     /// The production tuning file, layered over the code defaults.

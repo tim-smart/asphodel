@@ -7,9 +7,10 @@
 //! keeps ids minted in the same instant ordered.
 //!
 //! A replay opens its store with deterministic ids. A memory's id is then
-//! UUIDv5 of its chunk and claim ordinal, an entity's of the chunk that
-//! proposed it and its name, a source's of its key, and a chunk's of its
-//! source and position, so recorded `used` ids, reconcile targets and
+//! UUIDv5 of its source and claim ordinal (`<chunk position>:<claim>`), an
+//! entity's of the source that proposed it and its surface form, a
+//! source's of its key, and a chunk's of its source and position, so
+//! recorded `used` ids, reconcile targets and
 //! citations point at the same rows on every run. Ids with no natural
 //! parent (recall ids, edits, banks, models) count up under a fixed
 //! namespace, which is the same on every run of the same timeline.

@@ -27,8 +27,6 @@ use crate::system_prompt::BlockEntry;
 pub(super) struct Unit {
     pub bank_id: i64,
     pub chunk_id: i64,
-    /// The chunk's public id, the parent of the ids of what it creates.
-    pub chunk: Uuid,
     pub source_id: i64,
     pub tz: TimeZone,
     pub ingested_at: Timestamp,
@@ -267,7 +265,6 @@ pub(super) fn assemble(
     let unit = Unit {
         bank_id,
         chunk_id,
-        chunk: source.chunk,
         source_id: source.source_id,
         tz,
         ingested_at: source.ingested_at,

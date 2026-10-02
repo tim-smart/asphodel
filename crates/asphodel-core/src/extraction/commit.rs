@@ -41,7 +41,7 @@ pub(super) fn commit(
     let mut conn = store.connection();
     let tx = conn.transaction()?;
 
-    let (proposed, entities_created) = resolve_proposals(&tx, store, unit, checked, plan)?;
+    let (proposed, entities_created) = resolve_proposals(&tx, store, lease, unit, checked, plan)?;
 
     let mut memories = Vec::with_capacity(checked.memories.len());
     let mut written: BTreeMap<usize, Written> = BTreeMap::new();
@@ -61,7 +61,13 @@ pub(super) fn commit(
                 low_confidence,
             } => Some((*by, *until, *low_confidence)),
         };
-        let uuid = store.derived_id(unit.chunk, &memory.claim.to_string());
+        // TIM-96 decision 4: keyed by the source and the claim's ordinal,
+        // written with the chunk's position so a document's chunks can't
+        // collide.
+        let uuid = store.derived_id(
+            lease.source,
+            &format!("{}:{}", lease.position, memory.claim),
+        );
         let memory_id = insert_memory(&tx, store, unit, input, memory, uuid, ended)?;
         written.insert(
             index,
@@ -230,6 +236,7 @@ pub(super) fn commit(
 fn resolve_proposals(
     tx: &Transaction<'_>,
     store: &Store,
+    lease: &Lease,
     unit: &Unit,
     checked: &Checked,
     plan: &Plan,
@@ -246,7 +253,12 @@ fn resolve_proposals(
         .filter(|(_, fate)| **fate != Fate::Absorbed)
     {
         for link in &memory.links {
-            let Link::Proposed { name, kind, .. } = link else {
+            let Link::Proposed {
+                name,
+                kind,
+                surface_form,
+            } = link
+            else {
                 continue;
             };
             let key = name.to_lowercase();
@@ -256,8 +268,9 @@ fn resolve_proposals(
             let entity_id = match created_meanwhile(tx, unit, name, &seen)? {
                 Some(entity_id) => entity_id,
                 None => {
+                    let form = surface_form.as_deref().unwrap_or(name);
                     let (entity_id, uuid) =
-                        create_entity(tx, store, unit.bank_id, unit.chunk, name, *kind)?;
+                        create_entity(tx, store, unit.bank_id, lease.source, form, name, *kind)?;
                     created.push(uuid);
                     entity_id
                 }
@@ -293,15 +306,33 @@ fn created_meanwhile(
     Ok(None)
 }
 
+/// Creates an entity proposed by `source` under the surface form `form`
+/// (TIM-96, decision 4). With deterministic ids a source can propose two
+/// new entities under one surface form, in two chunks or under two names,
+/// so a later one is keyed `<form>#<n>`.
 fn create_entity(
     tx: &Transaction<'_>,
     store: &Store,
     bank_id: i64,
-    chunk: Uuid,
+    source: Uuid,
+    form: &str,
     name: &str,
     kind: EntityKind,
 ) -> Result<(i64, Uuid), rusqlite::Error> {
-    let uuid = store.derived_id(chunk, name);
+    let mut uuid = store.derived_id(source, form);
+    let mut n = 1;
+    while tx
+        .query_row(
+            "SELECT 1 FROM entities WHERE uuid = ?1",
+            [uuid.to_string()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        n += 1;
+        uuid = store.derived_id(source, &format!("{form}#{n}"));
+    }
     let now = micros(store.now());
     tx.execute(
         "INSERT INTO entities (uuid, bank_id, name, kind, created_at, updated_at)
