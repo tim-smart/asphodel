@@ -23,9 +23,17 @@ asphodel replay --scenario scenarios/maya-to-mia.toml \
   neither set, refuses a directory inside a git working tree (any ancestor
   holding `.git`), and refuses a directory that holds `asphodel.db` at its
   top level, which is a `serve` data dir. Its own store is under
-  `<replay dir>/store/`, under the same exclusive lock `serve` takes.
+  `<replay dir>/store/`, marked as replay's own; a `store` directory
+  replay didn't create is refused, never reset. Replay holds a lock on
+  the private dir for the whole run, so a second replay on the same dir
+  is refused, and the store is reset under that lock.
 - `--report` is where the JSON report goes. Without it the report is
-  written to `<replay dir>/reports/<scenario name>.json`.
+  written to `<replay dir>/reports/<scenario name>.json`, so a scenario's
+  `name` is one filename component. A report path inside a git working
+  tree, or one that is already a symlink, is refused. A scripted
+  scenario's report may be written outside the private dir, since it
+  derives from a checked-in fixture; a real-history report never leaves
+  it.
 - `--config` is the production tuning file and `--overrides` a file in the
   shape of `Tuning`. The layers, lowest first: code defaults, the fake
   floors (group `ci` only, below), `--config`, the scenario's own
@@ -223,7 +231,9 @@ writes an access or joins a session's in-context set. (`injects`,
 access, and never a session's set.)
 
 Every probe has `at`, `kind` and an optional `id`; without one the id is
-`p<n>`, counting from 1 in file order. `memory` is a claim label.
+`p<n>`, counting from 1 in file order, and ids are unique. `memory` is a
+claim label. The prefetch and recall probes run on sessions named
+`probe:<id>`, which no scenario session may use.
 
 | `kind` | Fields | Passes when |
 |---|---|---|
@@ -252,12 +262,16 @@ A probe naming a label no claim defines is refused before the run.
   prefetches, then syncs, then probes, and within a kind the order they
   were scheduled in. So a probe at a turn's `at` sees that turn's prefetch
   and, with zero latency, its memories.
-- **Extraction** of a turn or document is queued at its sync and committed
-  at its completion event, scheduled at the later of the sync time and the
-  bank's previous completion, plus the latency. Each bank has one
-  extraction worker, so completions never overlap. A probe or prefetch
-  between the two sees the store without the turn's memories. Accesses are
-  stamped with the source's ingest time, as in production.
+- **Extraction** is queued at a source's sync. The bank's one simulated
+  worker claims the head of the production queue (turns before documents,
+  then by observed time) as soon as it's free, at the sync or at its
+  previous completion, and commits what it claimed a latency later. So a
+  completion is for whatever the worker took, not for whichever source
+  arrived first. A probe or prefetch before the completion sees the store
+  without those memories. Accesses are stamped with the source's ingest
+  time, as in production. The run ends at the latest of the last event,
+  `--until` and the last completion, so accepted work is always
+  extracted.
 - **Sweeps** run at `mental_models.sweep_time` bank-local (04:00) on the
   simulated clock, purge first, then the source and recall-log sweep, and
   then the refreshes due. Replay records the deletion fingerprint on its
@@ -274,15 +288,14 @@ A probe naming a label no claim defines is refused before the run.
 - **Wall-clock timeouts.** The reranker deadline is off, so the reranker is
   never skipped. The in-context idle timeout and the mapping expiry run on
   the simulated clock.
-- **Ids are deterministic.** A memory id is UUIDv5 of its chunk's id and
-  its claim ordinal in call 1's reply, and an entity id of the chunk that
-  proposed it and its name (TIM-96 says the source and the surface form;
-  the chunk is what commit knows, a turn is one chunk, and the name is what
-  one entity is created under when several surface forms propose it). A
-  source's id comes from its key and a chunk's from its source and
-  position, so the chain is stable from the key down. Ids with no parent
-  (recall ids, edits, banks, models) count up under a fixed namespace.
-  Production keeps UUIDv7.
+- **Ids are deterministic** (TIM-96, decision 4). A memory id is UUIDv5
+  of its source's id and its claim ordinal, written `<chunk
+  position>:<index in call 1's reply>` so a document's chunks can't
+  collide; an entity id is UUIDv5 of the source that proposed it and the
+  surface form it was proposed under (its name when the proposal had
+  none). A source's id comes from its key and a chunk's from its source
+  and position. Ids with no parent (recall ids, edits, banks, models)
+  count up under a fixed namespace. Production keeps UUIDv7.
 - **Determinism.** With the same scenario, layers and flags, a run writes a
   byte-identical report on the same machine and build. The report carries
   no wall-clock time. Every sort that reaches ranking or the report breaks

@@ -15,8 +15,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -914,5 +915,308 @@ memory = \"nobody\"
     assert!(
         !dir.replay_dir().join("store").exists(),
         "a scenario refused at load opens no store"
+    );
+}
+
+// The TIM-116 review findings on `ceef0c5`, accepted as regressions. Each
+// names the finding it pins. They fail until the fixes land, except where
+// noted.
+
+/// Finding 1: replay resets `<replay dir>/store` without checking it made
+/// it. A store dir replay didn't create, such as a stopped daemon's data
+/// dir named `store`, is refused before anything in it is touched.
+#[test]
+fn replay_refuses_to_reset_a_store_it_didnt_create() {
+    let dir = TestDir::new();
+    let store = dir.replay_dir().join("store");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("asphodel.db"), b"").unwrap();
+    let sentinel = store.join("sentinel");
+    fs::write(&sentinel, b"a daemon's file").unwrap();
+    let run = replay(&dir, &scenario("extraction-latency"), &[]);
+    run.assert_refused("store");
+    assert!(
+        sentinel.is_file(),
+        "the sentinel in the unowned store was removed"
+    );
+}
+
+/// Finding 2: the store lock is dropped before the reset, so two replays
+/// on one private dir can race. The guard this pins: a replay holds its
+/// private dir for its whole run, so a second replay on the same dir is
+/// refused and the first finishes untouched. It passes today through the
+/// store lock; the race between the lock's release and the reset has no
+/// black-box reproduction and is fixed by control flow.
+#[test]
+fn a_second_replay_on_the_same_private_dir_is_refused_while_the_first_runs() {
+    let dir = TestDir::new();
+    let first_report = dir.path("first.json");
+    let mut first = Command::new(env!("CARGO_BIN_EXE_asphodel"))
+        .arg("replay")
+        .arg("--scenario")
+        .arg(scenario("three-week-holiday"))
+        .arg("--report")
+        .arg(&first_report)
+        .arg("--until")
+        .arg("2032-01-01T00:00:00Z")
+        .env("ASPHODEL_REPLAY_DIR", dir.replay_dir())
+        .env_remove("ASPHODEL_MODEL_DIR")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let store_db = dir.replay_dir().join("store/asphodel.db");
+    let started = Instant::now();
+    while !store_db.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the first replay never opened its store"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let second = replay(&dir, &scenario("extraction-latency"), &[]);
+    second.assert_refused("another replay");
+    let status = first.wait().unwrap();
+    assert!(status.success(), "the first replay was disturbed: {status}");
+    let report: Value = serde_json::from_slice(&fs::read(&first_report).unwrap()).unwrap();
+    assert!(
+        report["probes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|probe| probe["passed"] == true),
+        "{}",
+        report["probes"]
+    );
+}
+
+/// Finding 3: the default report path joins the scenario's name unchecked,
+/// so a name with a path in it writes outside the private dir. A name is
+/// one filename component.
+#[test]
+fn a_scenario_name_that_isnt_a_filename_is_refused() {
+    let dir = TestDir::new();
+    let path = dir.file(
+        "escaping.toml",
+        &format!("name = \"../../escaped\"\ngroup = \"ci\"\n{HOME_TURN}"),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_asphodel"))
+        .arg("replay")
+        .arg("--scenario")
+        .arg(&path)
+        .env("ASPHODEL_REPLAY_DIR", dir.replay_dir())
+        .env_remove("ASPHODEL_MODEL_DIR")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("name"), "{stderr}");
+    assert!(
+        !dir.path("escaped.json").exists(),
+        "the report escaped the private dir"
+    );
+}
+
+/// Finding 3: `--report` is checked like the private dir. A destination
+/// inside a git working tree is refused.
+#[test]
+fn a_report_path_inside_a_git_working_tree_is_refused() {
+    let dir = TestDir::new();
+    fs::create_dir_all(dir.path("repo/.git")).unwrap();
+    let report = dir.path("repo/report.json");
+    let run = replay(
+        &dir,
+        &scenario("extraction-latency"),
+        &["--report", report.to_str().unwrap()],
+    );
+    run.assert_refused("git");
+    assert!(!report.exists(), "the report was written inside the tree");
+}
+
+/// Finding 3: an existing symlink at the report path would write through
+/// to wherever it points. It's refused and left as it was.
+#[test]
+fn a_report_path_that_is_a_symlink_is_refused() {
+    let dir = TestDir::new();
+    let target = dir.path("elsewhere.json");
+    fs::write(&target, b"untouched").unwrap();
+    let link = dir.path("report.json");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let run = replay(
+        &dir,
+        &scenario("extraction-latency"),
+        &["--report", link.to_str().unwrap()],
+    );
+    run.assert_refused("symlink");
+    assert_eq!(fs::read(&target).unwrap(), b"untouched");
+}
+
+/// Finding 4: the engine schedules a completion per source and then claims
+/// whatever the queue's head is, but production orders the queue by
+/// priority (turns before documents) and observed time. The simulated
+/// worker claims the head when it's free and commits a latency later:
+/// here the first turn holds the worker, the second turn then goes before
+/// the document that arrived earlier, and the document goes last.
+#[test]
+fn the_simulated_worker_follows_the_queue_order_not_arrival_order() {
+    let dir = TestDir::new();
+    let path = inline(
+        &dir,
+        "interleave",
+        r#"latency = "10m"
+
+[[turn]]
+at = "2026-01-05T08:59:00Z"
+session = "s1"
+user = "I live in Auckland."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "home"
+content = "Tim lives in Auckland."
+quote = "I live in Auckland"
+kind = "fact"
+significance = "minor"
+
+[[document]]
+at = "2026-01-05T09:00:00Z"
+id = "notes"
+text = "My neighbour's cat is called Biscuit."
+reference_date = "2026-01-05"
+
+[[document.claim]]
+label = "cat"
+content = "Tim's neighbour's cat is called Biscuit."
+quote = "My neighbour's cat is called Biscuit"
+kind = "fact"
+significance = "trivial"
+
+[[turn]]
+at = "2026-01-05T09:01:00Z"
+session = "s1"
+user = "My favourite tea is Earl Grey."
+assistant = "A classic."
+
+[[turn.claim]]
+label = "tea"
+content = "Tim's favourite tea is Earl Grey."
+quote = "My favourite tea is Earl Grey"
+kind = "fact"
+significance = "trivial"
+
+# 08:59 + 10m: the first turn is done.
+[[probe]]
+id = "first-turn-done"
+at = "2026-01-05T09:15:00Z"
+kind = "exists"
+memory = "home"
+
+# 09:09 + 10m: the second turn went before the document.
+[[probe]]
+id = "second-turn-done-before-the-document"
+at = "2026-01-05T09:25:00Z"
+kind = "exists"
+memory = "tea"
+
+[[probe]]
+id = "document-still-queued"
+at = "2026-01-05T09:25:00Z"
+kind = "absent"
+memory = "cat"
+
+# 09:19 + 10m: the document is done.
+[[probe]]
+id = "document-done-last"
+at = "2026-01-05T09:35:00Z"
+kind = "exists"
+memory = "cat"
+"#,
+    );
+    replay(&dir, &path, &[]).assert_passed();
+}
+
+/// Finding 5: the run ends at the last event, so a completion scheduled
+/// after it never happens and the report says success with nothing
+/// extracted. Accepted work is drained before the run ends.
+#[test]
+fn accepted_sources_are_extracted_even_after_the_last_probe() {
+    let dir = TestDir::new();
+    let path = inline(&dir, "trailing", &format!("latency = \"10m\"\n{HOME_TURN}"));
+    let run = replay(&dir, &path, &[]);
+    assert_eq!(run.code(), Some(0), "stderr: {}", run.stderr());
+    let report = run.report();
+    assert_eq!(report["extraction_lag"]["samples"], 1, "{report}");
+    assert_eq!(report["extraction_lag"]["p50_ms"], 600_000, "{report}");
+    assert!(
+        report["llm"]["scripted"].as_u64().is_some_and(|n| n >= 1),
+        "{report}"
+    );
+}
+
+/// Finding 6: two probes with one id would share a probe session and, for
+/// `injects`, could evict each other's pending injections. Ids are unique
+/// and the loader says so.
+#[test]
+fn duplicate_probe_ids_are_refused_before_the_run() {
+    let dir = TestDir::new();
+    let path = inline(
+        &dir,
+        "twins",
+        &format!(
+            "{HOME_TURN}
+[[probe]]
+id = \"twin\"
+at = \"2026-01-05T10:00:00Z\"
+kind = \"exists\"
+memory = \"home\"
+
+[[probe]]
+id = \"twin\"
+at = \"2026-01-05T11:00:00Z\"
+kind = \"exists\"
+memory = \"home\"
+"
+        ),
+    );
+    let run = replay(&dir, &path, &[]);
+    run.assert_refused("twin");
+}
+
+/// Finding 6: probe sessions are `probe:<id>`, and no scenario session may
+/// start with `probe:`, so an `injects` probe can never touch a scenario
+/// session's pending injection or idle timeout.
+#[test]
+fn a_scenario_session_in_the_probe_namespace_is_refused() {
+    let dir = TestDir::new();
+    let path = inline(
+        &dir,
+        "reserved",
+        &HOME_TURN.replace("session = \"s1\"", "session = \"probe:p1\""),
+    );
+    let run = replay(&dir, &path, &[]);
+    run.assert_refused("probe:");
+}
+
+/// Finding 7: TIM-96 decision 4 keys a memory id by its source and claim
+/// ordinal. The source is the one ingest minted for the turn's key, and the
+/// ordinal is the claim's chunk position and index in call 1's reply, so a
+/// document's chunks can't collide.
+#[test]
+fn memory_ids_are_uuidv5_of_the_source_and_claim_ordinal() {
+    let dir = TestDir::new();
+    let run = replay(&dir, &scenario("extraction-latency"), &[]);
+    run.assert_passed();
+    let observed = &run.probe("first-turn-extracted-after-its-latency")["observed"]["id"];
+    let observed: uuid::Uuid = observed.as_str().unwrap().parse().unwrap();
+    // The first bank in a fresh store, session `s1`, the first turn's time.
+    let at: jiff::Timestamp = "2026-01-05T09:00:00Z".parse().unwrap();
+    let source = uuid::Uuid::new_v5(
+        &asphodel_core::store::ids::NAMESPACE,
+        format!("1:turn:s1:{}", at.as_microsecond()).as_bytes(),
+    );
+    let expected = uuid::Uuid::new_v5(&source, b"0:0");
+    assert_eq!(
+        observed, expected,
+        "the memory id isn't keyed by its source"
     );
 }
