@@ -1266,3 +1266,50 @@ fn an_entity_a_model_filter_names_survives_the_erase() {
     assert!(h.entity_exists(filtered));
     assert!(!h.entity_exists(plain));
 }
+
+// Regressions from the TIM-112 review of 6b27c51
+
+/// Puts the store back to schema version 7, as that binary left it: a
+/// mention's span lives in `accesses.spans`, and nothing a later version
+/// adds for spans exists. Reopening migrates it forward.
+fn downgrade_spans_to_v7(h: &Harness) {
+    h.service
+        .store()
+        .unwrap()
+        .connection()
+        .execute_batch(
+            "DROP TABLE IF EXISTS mention_passages;
+             DELETE FROM migrations WHERE to_version > 7;
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_mention_span_stored_by_version_7_still_redacts_after_an_upgrade() {
+    // Review finding 2 moves mention spans out of `accesses` in a new
+    // migration. A store that recorded spans under version 7 has to keep
+    // redacting them once it's upgraded.
+    let h = Harness::new();
+    let (maya, _) = h.says(notable(MAYA));
+    let mention = h.ingest("chat", "As I said, my daughter is called Maya. Anyway.");
+    h.extract_labelled_none(quoting(notable(MAYA), "my daughter is called Maya"), maya);
+    // Version 7 wrote the span on the access: characters 11 to 37 of the
+    // turn's chunk.
+    h.execute(
+        "UPDATE accesses SET spans = ?2 WHERE memory_id = ?1 AND kind = 'mentioned_again'",
+        (
+            h.rowid(maya),
+            json!([[h.chunk_of(mention), 11, 37]]).to_string(),
+        ),
+    );
+    downgrade_spans_to_v7(&h);
+    let h = h.restart_with("");
+
+    h.forget(&[maya]);
+    assert!(h.service.erase_next(BANK).unwrap().is_some());
+    assert_eq!(
+        h.source_text(mention),
+        format!("As I said, {}. Anyway.", "\u{2588}".repeat(26))
+    );
+}
