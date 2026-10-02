@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use crate::agenda::Agenda;
 use crate::clock::Clock;
-use crate::config::{ConfigError, Tuning};
+use crate::config::{ConfigError, DeletionInputs, PurgePause, Tuning};
 use crate::constants::RERANKER_DEADLINE;
+use crate::erase::{Aftermath, Erased, ForgetError, Forgotten};
 use crate::extraction::{Call1Input, Call2Input, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use crate::keep::{KeepError, Kept, Unkept};
@@ -32,6 +33,7 @@ use crate::retrieval::{Permit, Prefetch, PrefetchRequest, Recall, RecallError, R
 use crate::sessions::Sessions;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
+use crate::sweep::{PurgeError, PurgePlan, SweepSchedule, Sweeps};
 use crate::system_prompt::{Block, BlockEntry, Blocks};
 
 /// One running store: the daemon's banks, models, extraction queue and jobs,
@@ -65,6 +67,13 @@ pub struct Service {
     /// Held while a refresh runs, so the timer and `model refresh` never
     /// refresh at once.
     refreshing: Mutex<()>,
+    /// Whether purge and the source sweep run, from the stored deletion
+    /// fingerprint at startup and any ack since (ADR 0009).
+    purge: Mutex<PurgePause>,
+    /// Each bank's last nightly sweep.
+    sweeps: SweepSchedule,
+    /// Held while the sweep runs, so two callers never sweep at once.
+    sweeping: Mutex<()>,
 }
 
 /// Why a service couldn't be built on a store and models.
@@ -81,7 +90,8 @@ impl Service {
     /// use [`Service::with_models`].
     pub fn open(clock: Arc<dyn Clock>, store: Store, tuning: Tuning) -> Self {
         let sessions = Sessions::new(tuning.sessions.in_context_idle_days);
-        let schedule = Schedule::new(clock.now());
+        let started = clock.now();
+        let schedule = Schedule::new(started);
         Self {
             clock,
             store,
@@ -94,6 +104,9 @@ impl Service {
             schedule,
             blocks: Blocks::default(),
             refreshing: Mutex::new(()),
+            purge: Mutex::new(PurgePause::Running),
+            sweeps: SweepSchedule::new(started),
+            sweeping: Mutex::new(()),
         }
     }
 
@@ -112,7 +125,8 @@ impl Service {
         let ids = models.ids();
         tuning.check_floors(&ids.embedding, &ids.reranker)?;
         let sessions = Sessions::new(tuning.sessions.in_context_idle_days);
-        let schedule = Schedule::new(clock.now());
+        let started = clock.now();
+        let schedule = Schedule::new(started);
         Ok(Self {
             clock,
             store,
@@ -125,6 +139,9 @@ impl Service {
             schedule,
             blocks: Blocks::default(),
             refreshing: Mutex::new(()),
+            purge: Mutex::new(PurgePause::Running),
+            sweeps: SweepSchedule::new(started),
+            sweeping: Mutex::new(()),
         })
     }
 
@@ -135,6 +152,28 @@ impl Service {
     pub fn with_reranker_deadline(mut self, deadline: Duration) -> Self {
         self.reranker_deadline = deadline;
         self
+    }
+
+    /// The same service with the purge state `serve` read from the store at
+    /// startup ([`Store::check_fingerprint`]). A service built without it
+    /// runs purge, which is what replay wants: replay never pauses (ADR
+    /// 0009). While purge runs, the store also keeps the deletion inputs
+    /// behind its fingerprint, so `purge plan` can name what changes later.
+    pub fn with_purge_pause(self, pause: PurgePause) -> Self {
+        if pause == PurgePause::Running
+            && let Err(error) = self
+                .store
+                .record_deletion_inputs(&DeletionInputs::new(&self.tuning))
+        {
+            tracing::warn!(%error, "recording the deletion inputs failed");
+        }
+        *self.purge.lock().unwrap_or_else(|e| e.into_inner()) = pause;
+        self
+    }
+
+    /// Whether purge and the source sweep are running or paused.
+    pub fn purge_pause(&self) -> PurgePause {
+        self.purge.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The clock this service runs on.
@@ -573,6 +612,91 @@ impl Service {
             ready: true,
             now: self.now(),
         }
+    }
+}
+
+/// Forget, the erase path and the nightly sweep ("Erase path, forget, purge
+/// and the nightly sweep", TIM-112; ADRs 0008, 0009 and 0010).
+impl Service {
+    /// `memory_forget`: hides each named memory's whole chain at once and
+    /// queues its erase behind the chunks already queued
+    /// ([`crate::erase`]). Forget never pauses.
+    pub fn forget(&self, bank: &str, ids: &[String]) -> Result<Forgotten, ForgetError> {
+        let (bank_id, forgotten, aftermath) = crate::erase::forget(&self.store, bank, ids)?;
+        self.settle(bank_id, aftermath)?;
+        Ok(forgotten)
+    }
+
+    /// Runs the erase at the head of `bank`'s queue, once every chunk queued
+    /// before it has been extracted or has failed. `None` when there's none
+    /// to run yet. The bank's worker calls it before each
+    /// [`Service::extract_next`].
+    pub fn erase_next(&self, bank: &str) -> Result<Option<Erased>, QueueError> {
+        let Some((bank_id, erased, aftermath)) = crate::erase::erase_next(&self.store, bank)?
+        else {
+            return Ok(None);
+        };
+        self.settle(bank_id, aftermath)?;
+        Ok(Some(erased))
+    }
+
+    /// Runs every bank's nightly sweep that's due now: purge, then the
+    /// source, failed-chunk and recall-log sweep ([`crate::sweep`]). The
+    /// daemon calls it before [`Service::run_refreshes`], so a model citing
+    /// a purged memory refreshes once.
+    pub fn run_sweeps(&self) -> Result<Sweeps, StoreError> {
+        let _sweeping = self.sweeping.lock().unwrap_or_else(|e| e.into_inner());
+        let pause = self.purge_pause();
+        let (sweeps, aftermaths) = crate::sweep::run(
+            &self.store,
+            &self.tuning,
+            &self.sweeps,
+            &pause,
+            &self.bank_zones()?,
+        )?;
+        for (bank_id, aftermath) in aftermaths {
+            self.settle(bank_id, aftermath)?;
+        }
+        Ok(sweeps)
+    }
+
+    /// `purge plan`: which fingerprinted values changed and what the sweep
+    /// would delete now. It deletes nothing, and can run at any time.
+    pub fn purge_plan(&self) -> Result<PurgePlan, StoreError> {
+        let banks: Vec<i64> = self
+            .bank_zones()?
+            .into_iter()
+            .map(|(bank_id, _, _)| bank_id)
+            .collect();
+        crate::sweep::plan(&self.store, &self.tuning, &self.purge_pause(), &banks)
+    }
+
+    /// `purge ack --hash`: acknowledges this daemon's deletion fingerprint,
+    /// which `hash` must quote. Purging resumes at the next sweep, and the
+    /// ack is stored, so it holds after a restart.
+    pub fn purge_ack(&self, hash: &str) -> Result<(), PurgeError> {
+        crate::sweep::ack(&self.store, &self.tuning, hash)?;
+        *self.purge.lock().unwrap_or_else(|e| e.into_inner()) = PurgePause::Running;
+        Ok(())
+    }
+
+    /// What a forget or an erase leaves in memory: live sessions lose the
+    /// memories, models whose entries went are requested for a refresh, and
+    /// the bank's block is cleared.
+    fn settle(&self, bank_id: i64, aftermath: Aftermath) -> Result<(), StoreError> {
+        let now = self.now();
+        if !aftermath.scrub.is_empty() {
+            self.sessions.scrub(bank_id, &aftermath.scrub, now);
+        }
+        if !aftermath.models.is_empty() {
+            {
+                let conn = self.store.connection();
+                crate::mental_models::request(&conn, &self.schedule, &aftermath.models, now)?;
+            }
+            self.schedule.triggered(bank_id, now);
+        }
+        self.blocks.invalidate(bank_id);
+        Ok(())
     }
 }
 

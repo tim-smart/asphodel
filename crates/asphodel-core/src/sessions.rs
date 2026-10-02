@@ -21,7 +21,7 @@
 //!   `sessions.in_context_idle_days` on the service's clock is dropped. It's
 //!   garbage collection only.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, MutexGuard};
 
 use jiff::{SignedDuration, Timestamp};
@@ -166,6 +166,23 @@ impl Sessions {
     pub(crate) fn clear(&self, bank_id: i64, session_id: &str, now: Timestamp) {
         let mut sessions = self.live(now);
         sessions.remove(&(bank_id, session_id.to_owned()));
+    }
+
+    /// Takes `memories` out of every session of the bank, in context and
+    /// pending, as forget does (ADR 0010).
+    pub(crate) fn scrub(&self, bank_id: i64, memories: &BTreeSet<Uuid>, now: Timestamp) {
+        let mut sessions = self.live(now);
+        for ((bank, _), session) in sessions.iter_mut() {
+            if *bank != bank_id {
+                continue;
+            }
+            session
+                .in_context
+                .retain(|memory| !memories.contains(memory));
+            for pending in &mut session.pending {
+                pending.memories.retain(|memory| !memories.contains(memory));
+            }
+        }
     }
 
     /// The map, with every session idle past the timeout dropped.

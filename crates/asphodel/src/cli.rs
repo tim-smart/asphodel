@@ -1,9 +1,9 @@
 //! The subcommand tree from "API surface and Hermes transport" (TIM-94,
 //! decision 10), plus `replay` and `bench` from the replay harness decision
 //! (TIM-96). `serve` runs the daemon; `ingest`, `bank`, `chunks`, `recall`,
-//! `keep`, `unkeep` and `model` are HTTP clients of it ([`crate::client`]);
-//! `models fetch` and `llm login` work on files. `forget`, `replay` and `bench` are
-//! stubs that later stages fill in.
+//! `forget`, `keep`, `unkeep`, `model` and `purge` are HTTP clients of it
+//! ([`crate::client`]); `models fetch` and `llm login` work on files.
+//! `replay` and `bench` are stubs that later stages fill in.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -23,6 +23,7 @@ use asphodel_core::queue::RetryRequest;
 use asphodel_core::retrieval::{On, PhaseFilter, RecallRequest};
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::strength::Kind;
+use asphodel_core::sweep::PurgeAck;
 use clap::{Args, Parser, Subcommand};
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -70,6 +71,10 @@ enum Command {
     /// Define, list and refresh a bank's mental models.
     #[command(subcommand)]
     Model(ModelCommand),
+
+    /// See and acknowledge a purge pause.
+    #[command(subcommand)]
+    Purge(PurgeCommand),
 
     /// Fetch and manage the local models.
     #[command(subcommand)]
@@ -299,6 +304,30 @@ pub struct IdsArgs {
     pub ids: Vec<String>,
 }
 
+/// `asphodel purge`: purge and the sweep pause when the settings that
+/// decide deletion change, until an operator acknowledges them (ADR 0009,
+/// ADR 0010).
+#[derive(Debug, Subcommand)]
+pub enum PurgeCommand {
+    /// Show which settings changed and what the sweep would delete now. It
+    /// deletes nothing.
+    Plan {
+        #[command(flatten)]
+        client: ClientArgs,
+    },
+
+    /// Acknowledge the running daemon's deletion fingerprint, so purging
+    /// resumes at the next sweep.
+    Ack {
+        #[command(flatten)]
+        client: ClientArgs,
+
+        /// The fingerprint `purge plan` shows as current.
+        #[arg(long)]
+        hash: String,
+    },
+}
+
 /// `asphodel model`: only the owner defines models, through here or the
 /// API (TIM-95, decision 2).
 #[derive(Debug, Subcommand)]
@@ -470,10 +499,11 @@ impl Cli {
             }) => bank(&client, &name, identity),
             Command::Chunks(args) => chunks(args),
             Command::Recall(args) => recall(args),
-            Command::Forget(_) => stub("forget"),
-            Command::Keep(args) => keep(args, Keep::Keep),
-            Command::Unkeep(args) => keep(args, Keep::Unkeep),
+            Command::Forget(args) => by_ids(args, IdsAction::Forget),
+            Command::Keep(args) => by_ids(args, IdsAction::Keep),
+            Command::Unkeep(args) => by_ids(args, IdsAction::Unkeep),
             Command::Model(command) => model(command),
+            Command::Purge(command) => purge(command),
             Command::Models(ModelsCommand::Fetch { model_dir }) => models_fetch(model_dir),
             Command::Llm(LlmCommand::Login { data_dir }) => llm_login(&data_dir),
             Command::Replay(_) => stub("replay"),
@@ -782,18 +812,21 @@ fn recall(args: RecallArgs) -> anyhow::Result<()> {
 }
 
 #[derive(Clone, Copy)]
-enum Keep {
+enum IdsAction {
     Keep,
     Unkeep,
+    Forget,
 }
 
-/// `asphodel keep|unkeep`: `POST /v1/banks/{bank}/keep|unkeep`. Ids the
-/// bank doesn't have make it exit non-zero, after the rest are done.
-fn keep(args: IdsArgs, action: Keep) -> anyhow::Result<()> {
+/// `asphodel keep|unkeep|forget`: `POST /v1/banks/{bank}/keep|unkeep|forget`.
+/// Forget lists every version it erases. Ids the bank doesn't have make it
+/// exit non-zero, after the rest are done.
+fn by_ids(args: IdsArgs, action: IdsAction) -> anyhow::Result<()> {
     let client = Client::new(&args.client)?;
     let (route, done_key, verb) = match action {
-        Keep::Keep => ("keep", "kept", "kept"),
-        Keep::Unkeep => ("unkeep", "unkept", "unkept"),
+        IdsAction::Keep => ("keep", "kept", "kept"),
+        IdsAction::Unkeep => ("unkeep", "unkept", "unkept"),
+        IdsAction::Forget => ("forget", "forgotten", "forgot"),
     };
     let reply: Value = client.post(
         &format!("/v1/banks/{}/{route}", segment(&args.bank)),
@@ -969,6 +1002,47 @@ fn print_model(model: &Value) {
             .filter_map(Value::as_str)
             .collect();
         println!("  - {}  (cites {})", text(entry, "text"), cites.join(", "));
+    }
+}
+
+/// `asphodel purge plan|ack` over `/v1/purge`.
+fn purge(command: PurgeCommand) -> anyhow::Result<()> {
+    match command {
+        PurgeCommand::Plan { client: args } => {
+            let client = Client::new(&args)?;
+            let plan: Value = client.get("/v1/purge/plan")?;
+            if args.json {
+                return print_json(&plan);
+            }
+            let state = plan
+                .get("pause")
+                .and_then(|pause| pause.get("state"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            println!("purge: {state}");
+            println!("current fingerprint: {}", text(&plan, "current"));
+            let changed: Vec<&str> = list(&plan, "changed")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            if !changed.is_empty() {
+                println!("changed: {}", changed.join(", "));
+            }
+            println!(
+                "the sweep would delete now: {} memories, the text of {} sources and {} failed chunks, and {} recall queries",
+                count(&plan, "memories"),
+                count(&plan, "sources"),
+                count(&plan, "failed_chunks"),
+                count(&plan, "recalls"),
+            );
+            Ok(())
+        }
+        PurgeCommand::Ack { client: args, hash } => {
+            let client = Client::new(&args)?;
+            let _: Value = client.post("/v1/purge/ack", &PurgeAck { hash })?;
+            println!("acknowledged; purging resumes at the next sweep");
+            Ok(())
+        }
     }
 }
 

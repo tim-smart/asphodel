@@ -8,6 +8,9 @@
 //! before the retry when the LLM might recover, so a dead endpoint doesn't
 //! burn through the retry cap in a second.
 //!
+//! A forget's erase waits on the same queue, behind the chunks queued
+//! before it (ADR 0010), so each step runs a due erase first.
+//!
 //! On shutdown a worker finishes the chunk in flight and stops before
 //! claiming another (TIM-94, decision 3). Nothing queued is lost, since the
 //! queue is in SQLite.
@@ -124,6 +127,15 @@ struct Worker {
     stop: watch::Receiver<bool>,
 }
 
+/// What one blocking step did.
+enum Step {
+    /// An erase ran, deleting this many memories.
+    Erased(usize),
+    EraseFailed(QueueError),
+    /// No erase was due, so the head chunk was extracted, or not.
+    Extracted(Result<Option<asphodel_core::extraction::Extracted>, ExtractError>),
+}
+
 /// What a worker does after one step.
 enum Next {
     /// Take the next chunk at once.
@@ -148,11 +160,23 @@ impl Worker {
             let bank = self.bank.clone();
             // The blocking step always runs to the end: shutdown waits for
             // the chunk in flight rather than abandoning it.
-            let step =
-                tokio::task::spawn_blocking(move || service.extract_next(&bank, llm.as_ref()))
-                    .await;
+            let step = tokio::task::spawn_blocking(move || match service.erase_next(&bank) {
+                Ok(Some(erased)) => Step::Erased(erased.memories.len()),
+                Ok(None) => Step::Extracted(service.extract_next(&bank, llm.as_ref())),
+                Err(error) => Step::EraseFailed(error),
+            })
+            .await;
             let next = match step {
-                Ok(result) => self.next(result),
+                Ok(Step::Erased(memories)) => {
+                    info!(bank = %self.bank, memories, "erased a forgotten chain");
+                    Next::Continue
+                }
+                Ok(Step::EraseFailed(QueueError::UnknownBank)) => Next::Exit,
+                Ok(Step::EraseFailed(error)) => {
+                    warn!(bank = %self.bank, %error, "an erase failed");
+                    Next::Wait(ERROR_WAIT)
+                }
+                Ok(Step::Extracted(result)) => self.next(result),
                 Err(error) => {
                     warn!(bank = %self.bank, %error, "an extraction step panicked");
                     Next::Wait(ERROR_WAIT)

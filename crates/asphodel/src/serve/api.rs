@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use asphodel_core::agenda::Agenda;
 use asphodel_core::config::Secret;
+use asphodel_core::erase::{ForgetError, Forgotten};
 use asphodel_core::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use asphodel_core::keep::{KeepError, Kept, MemoryIds, Unkept};
 use asphodel_core::mental_models::{Model, ModelEdit, ModelError, ModelSpec, Outcome as Refreshed};
@@ -19,6 +20,7 @@ use asphodel_core::queue::{ChunkList, QueueError, Retried, RetryRequest};
 use asphodel_core::retrieval::{Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
 use asphodel_core::store::StoreError;
 use asphodel_core::store::bank::{Bank, BankError, BankIdentity};
+use asphodel_core::sweep::{PurgeAck, PurgeError, PurgePlan};
 use asphodel_core::system_prompt::Block;
 use asphodel_core::{Health, ResolvedConfig, Service};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -45,6 +47,7 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/v1/banks/{bank}/documents", post(documents))
         .route("/v1/banks/{bank}/prefetch", post(prefetch))
         .route("/v1/banks/{bank}/recall", post(recall))
+        .route("/v1/banks/{bank}/forget", post(forget))
         .route("/v1/banks/{bank}/keep", post(keep))
         .route("/v1/banks/{bank}/unkeep", post(unkeep))
         .route(
@@ -64,6 +67,8 @@ pub(crate) fn router(app: Shared) -> Router {
             "/v1/banks/{bank}/models/{model}/refresh",
             post(refresh_model),
         )
+        .route("/v1/purge/plan", get(purge_plan))
+        .route("/v1/purge/ack", post(purge_ack))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize));
     Router::new()
         .route("/v1/health", get(health))
@@ -195,6 +200,25 @@ impl From<KeepError> for ApiError {
     }
 }
 
+impl From<ForgetError> for ApiError {
+    fn from(error: ForgetError) -> Self {
+        match error {
+            ForgetError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            ForgetError::TooMany { .. } => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
+            ForgetError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<PurgeError> for ApiError {
+    fn from(error: PurgeError) -> Self {
+        match error {
+            PurgeError::HashMismatch => Self::new(StatusCode::CONFLICT, error.to_string()),
+            PurgeError::Store(error) => error.into(),
+        }
+    }
+}
+
 impl From<QueueError> for ApiError {
     fn from(error: QueueError) -> Self {
         match error {
@@ -309,10 +333,31 @@ async fn health(State(app): State<Shared>) -> (StatusCode, Json<Health>) {
     }
 }
 
-/// `GET /v1/config`: the resolved config, secrets redacted (ADR 0009).
+/// `GET /v1/config`: the resolved config, secrets redacted (ADR 0009), with
+/// the purge state as it is now, after any ack.
 async fn config(State(app): State<Shared>) -> Result<Json<ResolvedConfig>, ApiError> {
     let ready = app.ready().ok_or_else(ApiError::not_ready)?;
-    Ok(Json(ready.config.clone()))
+    let mut config = ready.config.clone();
+    config.purge = ready.service.purge_pause();
+    Ok(Json(config))
+}
+
+/// `GET /v1/purge/plan`: which fingerprinted values changed and what the
+/// sweep would delete now (ADR 0010). It deletes nothing.
+async fn purge_plan(State(app): State<Shared>) -> Result<Json<PurgePlan>, ApiError> {
+    let plan = app.call(|service| service.purge_plan()).await?;
+    Ok(Json(plan))
+}
+
+/// `POST /v1/purge/ack`: acknowledges the running daemon's deletion
+/// fingerprint, which the body must quote; 409 for any other hash. 204.
+async fn purge_ack(
+    State(app): State<Shared>,
+    body: Result<Json<PurgeAck>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let Json(PurgeAck { hash }) = body?;
+    app.call(move |service| service.purge_ack(&hash)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `PUT /v1/banks/{bank}`: creates the bank or merges the identity into it
@@ -405,6 +450,30 @@ async fn keep(
     let Json(MemoryIds { ids }) = body?;
     let kept = app.call(move |service| service.keep(&bank, &ids)).await?;
     Ok(Json(kept))
+}
+
+/// `POST /v1/banks/{bank}/forget`: `memory_forget`, owner-only in the
+/// plugin. Returns every id the erase removes. The erase runs at once when
+/// nothing was queued before it, and otherwise the bank's worker runs it
+/// behind those chunks (ADR 0010).
+async fn forget(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<MemoryIds>, JsonRejection>,
+) -> Result<Json<Forgotten>, ApiError> {
+    let Json(MemoryIds { ids }) = body?;
+    let name = bank.clone();
+    let forgotten = app
+        .call(move |service| {
+            let forgotten = service.forget(&name, &ids)?;
+            if !forgotten.forgotten.is_empty() {
+                service.erase_next(&name)?;
+            }
+            Ok::<_, ApiError>(forgotten)
+        })
+        .await?;
+    app.wake(&bank);
+    Ok(Json(forgotten))
 }
 
 /// `POST /v1/banks/{bank}/unkeep`: `memory_unkeep`.

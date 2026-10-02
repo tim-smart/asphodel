@@ -9,14 +9,15 @@
 
 use std::fmt;
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::config::Tuning;
 use crate::constants::{self, Significance};
 
-/// Every value that decides an irreversible deletion.
-#[derive(Debug, Clone, PartialEq)]
+/// Every value that decides an irreversible deletion. The store keeps them
+/// next to their fingerprint, so `purge plan` can say which changed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeletionInputs {
     pub s: f64,
     pub tau: f64,
@@ -69,6 +70,37 @@ impl DeletionInputs {
             overdue_days: tuning.agenda.overdue_days,
             source_horizon_days: tuning.purge.source_horizon_days,
         }
+    }
+}
+
+impl DeletionInputs {
+    /// The values that differ from `stored`, by tuning key, with
+    /// `constants` standing for every strength constant fixed in code.
+    pub fn changed_from(&self, stored: &DeletionInputs) -> Vec<String> {
+        let mut changed = Vec::new();
+        let constants = |inputs: &DeletionInputs| DeletionInputs {
+            quiet_rate: 0.0,
+            delta: None,
+            overdue_days: 0,
+            source_horizon_days: 0,
+            ..inputs.clone()
+        };
+        if constants(self) != constants(stored) {
+            changed.push("constants".to_string());
+        }
+        if self.quiet_rate != stored.quiet_rate {
+            changed.push("clock.quiet_rate".to_string());
+        }
+        if self.delta != stored.delta {
+            changed.push("purge.delta".to_string());
+        }
+        if self.overdue_days != stored.overdue_days {
+            changed.push("agenda.overdue_days".to_string());
+        }
+        if self.source_horizon_days != stored.source_horizon_days {
+            changed.push("purge.source_horizon_days".to_string());
+        }
+        changed
     }
 }
 

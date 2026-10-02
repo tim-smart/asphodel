@@ -39,7 +39,7 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::clock::Clock;
-use crate::config::{Fingerprint, PurgePause};
+use crate::config::{DeletionInputs, Fingerprint, PurgePause};
 
 pub use fs::FilesystemKind;
 pub use lock::DataDirLock;
@@ -57,6 +57,11 @@ pub const LOCK_FILE: &str = "lock";
 
 /// The `store_meta` key of the stored deletion fingerprint (ADR 0009).
 pub const META_DELETION_FINGERPRINT: &str = "deletion_fingerprint";
+
+/// The `store_meta` key of the deletion inputs behind the stored
+/// fingerprint, as JSON, so `purge plan` can say which values changed. A
+/// store from before they were kept has none.
+pub const META_DELETION_INPUTS: &str = "deletion_inputs";
 
 /// How to open a store.
 #[derive(Debug, Clone, Copy, Default)]
@@ -298,6 +303,42 @@ impl Store {
                 })
             }
         }
+    }
+
+    /// The deletion inputs behind the stored fingerprint, when the store
+    /// has them.
+    pub fn stored_deletion_inputs(&self) -> Result<Option<DeletionInputs>, StoreError> {
+        let conn = self.connection();
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = ?1",
+                [META_DELETION_INPUTS],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored.and_then(|json| serde_json::from_str(&json).ok()))
+    }
+
+    /// Records `inputs` as the ones behind the stored fingerprint, when
+    /// they hash to it. Startup calls this while purge runs, so a store
+    /// recorded before the inputs were kept gets them too.
+    pub fn record_deletion_inputs(&self, inputs: &DeletionInputs) -> Result<(), StoreError> {
+        let fingerprint = crate::config::deletion_fingerprint(inputs);
+        let conn = self.connection();
+        conn.execute(
+            "INSERT INTO store_meta (key, value, updated_at)
+             SELECT ?1, ?2, ?3 FROM store_meta WHERE key = ?4 AND value = ?5
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value,
+                                             updated_at = excluded.updated_at",
+            (
+                META_DELETION_INPUTS,
+                serde_json::to_string(inputs).expect("the inputs serialise"),
+                micros(self.clock.now()),
+                META_DELETION_FINGERPRINT,
+                fingerprint.as_str(),
+            ),
+        )?;
+        Ok(())
     }
 
     /// Deletes the pre-migration copies past their seven days on the store's

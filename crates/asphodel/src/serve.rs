@@ -331,6 +331,9 @@ fn start(
             Service::with_models(Arc::clone(&clock), store, config.tuning.clone(), models)?
         }
     };
+    // Purge and the sweep run, or wait for an ack, as the store's
+    // fingerprint says (ADR 0009). Forget never waits.
+    let service = service.with_purge_pause(config.purge.clone());
     let llm = llm_client(&config, &args.data_dir, clock, script)?;
     config.fake_llm = llm.as_ref().is_some_and(|(_, fake)| *fake);
     info!(
@@ -558,10 +561,13 @@ impl UnixSocketCleanup {
     }
 }
 
-/// Runs [`Service::housekeeping`] at each pass's `next_due`, or after
-/// [`HOUSEKEEPING_INTERVAL`] if that comes first, until the service is
-/// dropped. It holds the service weakly, and never across a wait, so the
-/// store still closes, and checkpoints, when `run` returns.
+/// Runs the nightly sweep when it's due, then [`Service::housekeeping`], at
+/// the earlier of the two `next_due`s, or after [`HOUSEKEEPING_INTERVAL`] if
+/// that comes first, until the service is dropped. The sweep runs here so
+/// it runs without an LLM too; the refresh timer also runs it first, so
+/// the night's purge always comes before its refreshes. It holds the
+/// service weakly, and never across a wait, so the store still closes, and
+/// checkpoints, when `run` returns.
 async fn housekeeping(service: Weak<Service>) {
     loop {
         let Some(service) = service.upgrade() else {
@@ -570,19 +576,26 @@ async fn housekeeping(service: Weak<Service>) {
         // The first pass runs at once: open deletes what has expired but
         // doesn't say when the next copy is due.
         let pass = tokio::task::spawn_blocking(move || {
+            let sweep_due = sweep(&service);
             let result = service.housekeeping();
-            (result, service.now())
+            (result, sweep_due, service.now())
         })
         .await;
         let wait = match pass {
-            Ok((Ok(done), now)) => done.next_due.map_or(HOUSEKEEPING_INTERVAL, |due| {
-                // A deadline already past converts to nothing: wait the
-                // minimum and run again.
-                Duration::try_from(now.duration_until(due))
-                    .unwrap_or(Duration::ZERO)
-                    .clamp(HOUSEKEEPING_MIN_WAIT, HOUSEKEEPING_INTERVAL)
-            }),
-            Ok((Err(error), _)) => {
+            Ok((Ok(done), sweep_due, now)) => {
+                let due = match (done.next_due, sweep_due) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                due.map_or(HOUSEKEEPING_INTERVAL, |due| {
+                    // A deadline already past converts to nothing: wait the
+                    // minimum and run again.
+                    Duration::try_from(now.duration_until(due))
+                        .unwrap_or(Duration::ZERO)
+                        .clamp(HOUSEKEEPING_MIN_WAIT, HOUSEKEEPING_INTERVAL)
+                })
+            }
+            Ok((Err(error), _, _)) => {
                 warn!(%error, "housekeeping failed");
                 HOUSEKEEPING_INTERVAL
             }
@@ -592,6 +605,26 @@ async fn housekeeping(service: Weak<Service>) {
             }
         };
         tokio::time::sleep(wait).await;
+    }
+}
+
+/// Runs any nightly sweep that's due ([`Service::run_sweeps`]) and says
+/// when the next is. A failure is logged, and the sweep tries again at the
+/// next pass.
+fn sweep(service: &Service) -> Option<jiff::Timestamp> {
+    match service.run_sweeps() {
+        Ok(sweeps) => {
+            for run in &sweeps.ran {
+                info!(bank = %run.bank, purged = run.purged_memories,
+                    sources = run.swept_sources, failed_chunks = run.swept_failed_chunks,
+                    recalls = run.swept_recalls, "swept");
+            }
+            sweeps.next_due
+        }
+        Err(error) => {
+            warn!(%error, "the nightly sweep failed");
+            None
+        }
     }
 }
 
@@ -610,6 +643,8 @@ async fn refreshes(service: Weak<Service>, llm: Arc<dyn LlmClient>, stop: watch:
         };
         let llm = Arc::clone(&llm);
         let pass = tokio::task::spawn_blocking(move || {
+            // The night's purge runs before its refreshes (TIM-97, decision 6).
+            sweep(&service);
             let result = service.run_refreshes(llm.as_ref());
             (result, service.now())
         })

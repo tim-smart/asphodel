@@ -414,6 +414,10 @@ pub(super) struct Plan {
     pub edits: Vec<(usize, i64, Edit)>,
     /// Accesses on neighbours, the strongest kind each.
     pub accesses: BTreeMap<i64, Label>,
+    /// Where each access's mentions were said: the chunk-relative span of
+    /// every claim that mentioned the neighbour, so a forget can redact
+    /// them (schema version 7).
+    pub mention_spans: BTreeMap<i64, Vec<(usize, usize)>>,
     /// Significance raises from `mentioned_again`, the larger each, for
     /// neighbours whose significance the owner hasn't set.
     pub raises: BTreeMap<i64, Significance>,
@@ -525,6 +529,10 @@ pub(super) fn plan(
             let same_document = document_id.is_some() && neighbour.document_id == document_id;
             if same_document {
                 continue;
+            }
+            let spans = plan.mention_spans.entry(neighbour.id).or_default();
+            if !spans.contains(&(memory.start, memory.end)) {
+                spans.push((memory.start, memory.end));
             }
             let kind = plan.accesses.entry(neighbour.id).or_insert(label);
             if label == Label::Confirmed {

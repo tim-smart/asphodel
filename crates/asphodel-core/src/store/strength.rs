@@ -246,3 +246,38 @@ pub(crate) fn significance_value(level: &str) -> f64 {
         _ => Significance::Critical.value(),
     }
 }
+
+/// The memory's validity window and its source's timezone, which purge's
+/// guards read on a chain's head (ADR 0008). `None` for an unknown kind.
+pub(crate) fn window(
+    conn: &Connection,
+    memory_id: i64,
+) -> Result<Option<(Window, TimeZone)>, rusqlite::Error> {
+    let (kind, valid_from, valid_until, due_at, timezone) = conn.query_row(
+        "SELECT m.kind, m.valid_from, m.valid_from_precision, m.valid_until,
+                m.valid_until_precision, m.due_at, m.due_at_precision, s.timezone
+         FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
+         WHERE m.id = ?1",
+        [memory_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                world_time(row.get(1)?, row.get(2)?),
+                world_time(row.get(3)?, row.get(4)?),
+                world_time(row.get(5)?, row.get(6)?),
+                row.get::<_, String>(7)?,
+            ))
+        },
+    )?;
+    Ok(memory_kind(&kind).map(|kind| {
+        (
+            Window {
+                kind,
+                valid_from,
+                valid_until,
+                due_at,
+            },
+            TimeZone::get(&timezone).unwrap_or(TimeZone::UTC),
+        )
+    }))
+}

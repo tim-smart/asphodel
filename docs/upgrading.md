@@ -77,3 +77,21 @@ in `turn_in_context`, and the row goes once the turn is extracted.
 The migration only adds the table. Turns already queued when you upgrade
 have no stored set and are extracted as if nothing was in context, which
 is what a restart did to them before. No action is needed.
+
+## Schema version 7: where a mention was said
+
+Forget erases a memory's chain behind the chunks queued before it, and
+those chunks reconcile against the hidden memory (ADR 0010). A claim that
+only mentions or confirms the memory leaves an access, and before version
+7 an access recorded only its source, so the erase couldn't tell which part
+of the turn or document to redact. From version 7, `accesses.spans` holds
+each mention's chunk and character span, and forget masks exactly those.
+
+The migration only adds the column. Accesses written before it have no
+spans, so forgetting a memory mentioned before the upgrade redacts the
+memory's own passages but not the earlier mentions. No action is needed.
+
+The first start after the upgrade also records the deletion inputs beside
+the stored fingerprint, so `asphodel purge plan` can name what changes
+later. A store that's paused when it upgrades shows `unknown` until the
+pause is acknowledged.

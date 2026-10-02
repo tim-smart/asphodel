@@ -10,6 +10,7 @@ pub mod chunking;
 pub mod clock;
 pub mod config;
 pub mod constants;
+pub mod erase;
 pub mod extraction;
 pub mod ingest;
 pub mod keep;
@@ -23,6 +24,7 @@ pub mod service;
 mod sessions;
 pub mod store;
 pub mod strength;
+pub mod sweep;
 pub mod system_prompt;
 
 pub use clock::{Clock, SimulatedClock, SystemClock};
