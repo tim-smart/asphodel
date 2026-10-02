@@ -174,6 +174,84 @@ pub fn live_script(dir: &TestDir) -> PathBuf {
     path
 }
 
+/// The test manifest with one mental model of its own beside the "User
+/// profile" every bank is seeded with. The seeded profile takes 500 of the
+/// default 800-token budget, so this one stays within the rest.
+pub fn model_manifest(question: &str) -> String {
+    format!(
+        "{}\n[[model]]\nname = \"home\"\nquestion = \"{question}\"\nkinds = [\"fact\"]\nmax_tokens = 100\n",
+        hermes::MANIFEST
+    )
+}
+
+/// The question [`imported_with_a_model`] gives its model.
+pub const HOME_QUESTION: &str = "Where does the user live?";
+
+/// The private dir holding [`hermes::small_history`] imported with
+/// [`model_manifest`] to `corpus/main.jsonl`; returns the corpus path.
+pub fn imported_with_a_model(dir: &TestDir) -> PathBuf {
+    let state_db = dir.private_path("state.db");
+    hermes::small_history(&state_db);
+    let corpus = dir.private_path("corpus/main.jsonl");
+    assert_ok(&import_with(
+        dir,
+        &state_db,
+        &corpus,
+        &model_manifest(HOME_QUESTION),
+        &[],
+    ));
+    corpus
+}
+
+/// A refresh operation adding one entry that cites `cites`.
+pub fn add_entry(text: &str, cites: &[&str]) -> Value {
+    json!({ "op": "add", "entry": null, "text": text, "cites": cites })
+}
+
+/// A script whose every step answers any call: call 1 reads `claims` and
+/// `used_injected_ids` (the home claim, as [`live_script`]), and a refresh
+/// reads `operations`, which add one entry citing `m1`, the only memory the
+/// history makes. Neither reply type refuses the other's fields, so the
+/// order calls come in doesn't matter.
+pub fn universal_script(dir: &TestDir) -> PathBuf {
+    let reply = json!({
+        "claims": [{
+            "content": hermes::HOME_SENTENCE,
+            "kind": "fact",
+            "quote": hermes::HOME_QUOTE,
+            "significance": "notable",
+            "remember_this": false,
+            "changes_something": false,
+            "valid_from": null,
+            "valid_until": null,
+            "window_confidence": "high",
+            "until_event": null,
+            "due_at": null,
+            "volatility": null,
+            "recurrence_text": null,
+            "recurrence_rrule": null,
+            "recurrence_start": null,
+            "entities": []
+        }],
+        "used_injected_ids": [],
+        "operations": [add_entry("Tim lives in Auckland.", &["m1"])]
+    });
+    let steps: Vec<Value> = (0..64).map(|_| json!({ "reply": reply })).collect();
+    let path = dir.path("universal-script.json");
+    fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
+    path
+}
+
+/// Replaces the cassette with `records`, one per line.
+pub fn write_cassette(dir: &TestDir, records: &[Value]) {
+    let mut text = String::new();
+    for record in records {
+        text.push_str(&serde_json::to_string(record).unwrap());
+        text.push('\n');
+    }
+    fs::write(dir.private_path("cassettes/main.jsonl"), text).unwrap();
+}
+
 /// A script for the `judge_used` top-up (TIM-96, decision 4): every step
 /// judges that the reply relied on nothing.
 pub fn judge_script(dir: &TestDir) -> PathBuf {

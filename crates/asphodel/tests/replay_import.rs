@@ -678,3 +678,58 @@ fn a_dry_run_prints_counts_without_text_and_writes_nothing() {
         );
     }
 }
+
+/// The manifest's `[[model]]` tables, in a scenario's shape, reach the
+/// corpus header, so the corpus hash covers them: a different question is
+/// a different corpus. A manifest without models leaves the header as it
+/// was.
+#[test]
+fn manifest_models_reach_the_corpus_header_and_its_hash() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    hermes::small_history(&state_db);
+    let header = |corpus: &Path| -> Value {
+        fs::read_to_string(corpus)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|line| line.get("event").is_none())
+            .expect("the corpus has a header")
+    };
+
+    let plain = dir.private_path("corpus/plain.jsonl");
+    assert_ok(&import(&dir, &state_db, &plain));
+    assert!(header(&plain).get("models").is_none(), "{}", header(&plain));
+
+    let home = dir.private_path("corpus/home.jsonl");
+    assert_ok(&import_with(
+        &dir,
+        &state_db,
+        &home,
+        &support::model_manifest("Where does the user live?"),
+        &[],
+    ));
+    assert_eq!(
+        header(&home)["models"],
+        serde_json::json!([{
+            "name": "home",
+            "question": "Where does the user live?",
+            "kinds": ["fact"],
+            "max_tokens": 100
+        }])
+    );
+
+    let work = dir.private_path("corpus/work.jsonl");
+    assert_ok(&import_with(
+        &dir,
+        &state_db,
+        &work,
+        &support::model_manifest("Where does the user work?"),
+        &[],
+    ));
+    let plain = fs::read(&plain).unwrap();
+    let home = fs::read(&home).unwrap();
+    let work = fs::read(&work).unwrap();
+    assert_ne!(plain, home, "the models change the corpus");
+    assert_ne!(home, work, "a model's question changes the corpus");
+}

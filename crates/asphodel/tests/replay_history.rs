@@ -19,9 +19,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use support::hermes::{self, StateDb, epoch};
 use support::{
-    PASSING_PROBES, PROBES_WITH_A_FAILURE, TestDir, asphodel, assert_ok, assert_refused,
-    cassette_records, imported_small_history, judge_script, live_script, record, replay_history,
-    stderr,
+    HOME_QUESTION, PASSING_PROBES, PROBES_WITH_A_FAILURE, TestDir, add_entry, asphodel, assert_ok,
+    assert_refused, cassette_records, imported_small_history, imported_with_a_model, judge_script,
+    live_script, record, replay_history, stderr, universal_script, write_cassette,
 };
 
 /// What a run simulated, without what identifies the run: the mode
@@ -609,4 +609,305 @@ fn the_diff_lists_fates_by_id_and_numbers_beyond_the_tolerance_by_path() {
         !paths.contains(&"injected_tokens.per_turn.p50"),
         "a difference within the tolerance isn't listed: {paths:?}"
     );
+}
+
+// Refreshes (TIM-96, decision 4). Every bank is seeded with "User profile"
+// (ADR 0007); the corpus here adds `home` from the manifest, within the
+// budget the profile leaves. The live stand-in answers every call with a
+// reply call 1 and a refresh can both read, so the order of calls doesn't
+// matter.
+
+/// Both models have an entry citing the home memory a day in.
+const MODELS_CITE_HOME: &str = r#"
+[[probe]]
+id = "p001"
+at = "2026-01-06T12:00:00Z"
+kind = "profile_has"
+model = "home"
+memory = "lives in Auckland"
+
+[[probe]]
+id = "p002"
+at = "2026-01-06T12:00:00Z"
+kind = "profile_has"
+model = "User profile"
+memory = "lives in Auckland"
+"#;
+
+/// `home` has no entry citing the home memory, at any of three days.
+const HOME_LACKS_HOME: &str = r#"
+[[probe]]
+id = "p001"
+at = "2026-01-06T12:00:00Z"
+kind = "profile_lacks"
+model = "home"
+memory = "lives in Auckland"
+
+[[probe]]
+id = "p002"
+at = "2026-01-10T12:00:00Z"
+kind = "profile_lacks"
+model = "home"
+memory = "lives in Auckland"
+"#;
+
+const HOME_HAS_HOME: &str = r#"
+[[probe]]
+id = "p001"
+at = "2026-01-06T12:00:00Z"
+kind = "profile_has"
+model = "home"
+memory = "lives in Auckland"
+"#;
+
+fn is_refresh(record: &Value) -> bool {
+    record["template"]["name"] == "refresh_model"
+}
+
+/// Whether a refresh record is `home`'s, by the question line its request
+/// starts with, which is how `--refresh recorded` tells models apart.
+fn is_home_refresh(record: &Value) -> bool {
+    is_refresh(record)
+        && record["request"]["user"]
+            .as_str()
+            .is_some_and(|user| user.starts_with(&format!("Question: {HOME_QUESTION}\n")))
+}
+
+/// A `live` run on the corpus with a manifest model; returns its report.
+fn record_with_models(dir: &TestDir, corpus: &std::path::Path) -> Value {
+    let script = universal_script(dir);
+    let run = replay_history(
+        dir,
+        corpus,
+        "live",
+        MODELS_CITE_HOME,
+        "live",
+        Some(&script),
+        &[],
+    );
+    assert_ok(&run.output);
+    run.report()
+}
+
+fn refresh_calls(report: &Value) -> u64 {
+    report["refresh_calls_per_day"]
+        .as_array()
+        .unwrap_or_else(|| panic!("refresh calls per day: {report}"))
+        .iter()
+        .map(|day| day["count"].as_u64().unwrap())
+        .sum()
+}
+
+/// The manifest's model reaches the bank and refreshes beside the seeded
+/// profile in `live`, and both refreshes are recorded.
+#[test]
+fn live_refreshes_the_seeded_profile_and_the_manifest_model_and_records_both() {
+    let dir = TestDir::new();
+    let corpus = imported_with_a_model(&dir);
+    let report = record_with_models(&dir, &corpus);
+    assert!(refresh_calls(&report) > 0, "{report}");
+
+    let records = cassette_records(&dir);
+    assert!(records.iter().any(is_home_refresh), "no refresh of home");
+    assert!(
+        records
+            .iter()
+            .any(|record| is_refresh(record) && !is_home_refresh(record)),
+        "no refresh of the seeded profile"
+    );
+}
+
+/// `--refresh off` answers every refresh with no edits, so `home` stays
+/// empty, but triggers are counted by code, so refresh calls per day match
+/// the recording.
+#[test]
+fn fast_refresh_off_makes_no_edits_but_counts_every_trigger() {
+    let dir = TestDir::new();
+    let corpus = imported_with_a_model(&dir);
+    let live = record_with_models(&dir, &corpus);
+    assert!(refresh_calls(&live) > 0, "{live}");
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        HOME_LACKS_HOME,
+        "fast-off",
+        None,
+        &["--refresh", "off"],
+    );
+    assert_ok(&run.output);
+    let report = run.report();
+    assert_eq!(report["flags"]["refresh"], "off", "{report}");
+    assert_eq!(report["llm"]["misses"], 0, "{report}");
+    assert_eq!(
+        report["refresh_calls_per_day"], live["refresh_calls_per_day"],
+        "{report}"
+    );
+}
+
+/// The cassette with `home`'s recorded refreshes replaced by two: one at
+/// the first recorded refresh's time answering `near`, and one 200 days
+/// later answering `far`, written first so file order can't pick it.
+fn with_near_and_far_home_refreshes(dir: &TestDir, near: Vec<Value>, far: Vec<Value>) {
+    let records = cassette_records(dir);
+    let first = records
+        .iter()
+        .find(|record| is_home_refresh(record))
+        .expect("the recording refreshed home")
+        .clone();
+    let at: jiff::Timestamp = first["at"].as_str().unwrap().parse().unwrap();
+    let later = at + jiff::SignedDuration::from_hours(24 * 200);
+    let copy = |at: jiff::Timestamp, operations: Vec<Value>, tag: &str| {
+        let mut record = first.clone();
+        record["at"] = Value::from(at.to_string());
+        record["key"] = Value::from(format!("{}-{tag}", first["key"].as_str().unwrap()));
+        record["response"]["json"] = serde_json::json!({ "operations": operations });
+        record
+    };
+    let mut kept: Vec<Value> = records
+        .into_iter()
+        .filter(|record| !is_home_refresh(record))
+        .collect();
+    kept.push(copy(later, far, "far"));
+    kept.push(copy(at, near, "near"));
+    write_cassette(dir, &kept);
+}
+
+/// `--refresh recorded` substitutes the recorded refresh of the same model
+/// nearest in simulated time, whichever way round the two are.
+#[test]
+fn fast_refresh_recorded_substitutes_the_nearest_recorded_refresh() {
+    let dir = TestDir::new();
+    let corpus = imported_with_a_model(&dir);
+    record_with_models(&dir, &corpus);
+
+    with_near_and_far_home_refreshes(
+        &dir,
+        vec![add_entry("Tim lives in Auckland.", &["m1"])],
+        vec![],
+    );
+    let near_adds = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        HOME_HAS_HOME,
+        "near-adds",
+        None,
+        &["--refresh", "recorded"],
+    );
+    assert_ok(&near_adds.output);
+    assert_eq!(near_adds.report()["flags"]["refresh"], "recorded");
+
+    with_near_and_far_home_refreshes(
+        &dir,
+        vec![],
+        vec![add_entry("Tim lives in Auckland.", &["m1"])],
+    );
+    let far_adds = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        HOME_LACKS_HOME,
+        "far-adds",
+        None,
+        &["--refresh", "recorded"],
+    );
+    assert_ok(&far_adds.output);
+}
+
+/// A substituted refresh can cite memories this run doesn't have. The
+/// existing citation check drops those entries, including one that mixes a
+/// real citation with a missing one, so the model holds exactly what the
+/// valid entry alone would give.
+#[test]
+fn fast_refresh_recorded_drops_entries_citing_memories_the_run_lacks() {
+    let dir = TestDir::new();
+    let corpus = imported_with_a_model(&dir);
+    record_with_models(&dir, &corpus);
+
+    with_near_and_far_home_refreshes(
+        &dir,
+        vec![add_entry("Tim lives in Auckland.", &["m1"])],
+        vec![],
+    );
+    let valid = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        HOME_HAS_HOME,
+        "valid",
+        None,
+        &["--refresh", "recorded"],
+    );
+    assert_ok(&valid.output);
+
+    with_near_and_far_home_refreshes(
+        &dir,
+        vec![
+            add_entry("Tim lives in Auckland.", &["m1"]),
+            add_entry(
+                "Tim keeps eleven cats in a lighthouse on the far side of the moon.",
+                &["m9"],
+            ),
+            add_entry(
+                "Tim sails his houseboat between Auckland and the rings of Saturn.",
+                &["m1", "m9"],
+            ),
+        ],
+        vec![],
+    );
+    let mixed = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        HOME_HAS_HOME,
+        "mixed",
+        None,
+        &["--refresh", "recorded"],
+    );
+    assert_ok(&mixed.output);
+
+    let valid = valid.report();
+    let mixed = mixed.report();
+    assert!(
+        valid["profile_tokens"]["p95"]
+            .as_u64()
+            .is_some_and(|tokens| tokens > 0),
+        "the valid entry renders: {valid}"
+    );
+    assert_eq!(
+        mixed["profile_tokens"], valid["profile_tokens"],
+        "only the valid entry survives"
+    );
+}
+
+/// `--refresh live` calls the LLM for a refresh the cassette has no record
+/// of, records it, and counts it as live.
+#[test]
+fn fast_refresh_live_calls_the_llm_for_an_unrecorded_refresh() {
+    let dir = TestDir::new();
+    let corpus = imported_with_a_model(&dir);
+    record_with_models(&dir, &corpus);
+    let unrefreshed: Vec<Value> = cassette_records(&dir)
+        .into_iter()
+        .filter(|record| !is_refresh(record))
+        .collect();
+    write_cassette(&dir, &unrefreshed);
+
+    let script = universal_script(&dir);
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        HOME_HAS_HOME,
+        "fast-live",
+        Some(&script),
+        &["--refresh", "live"],
+    );
+    assert_ok(&run.output);
+    let report = run.report();
+    let calls = refresh_calls(&report);
+    assert!(calls > 0, "{report}");
+    assert_eq!(report["llm"]["live"], calls, "{report}");
+    assert!(cassette_records(&dir).iter().any(is_home_refresh));
 }
