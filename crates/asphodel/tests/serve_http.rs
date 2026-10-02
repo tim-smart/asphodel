@@ -1618,3 +1618,46 @@ fn a_changed_fingerprint_pauses_purge_until_the_cli_acks_the_running_hash() {
         "running"
     );
 }
+
+#[test]
+fn a_ready_erase_runs_after_a_restart_without_an_llm() {
+    // Review finding 5 on TIM-112. The forget arrives while a chunk queued
+    // before it is in flight, so its erase waits. SIGTERM lets that chunk
+    // finish and stops the worker before the erase runs. Restarted with no
+    // LLM there's no worker, but the erase is ready and must still run.
+    let dir = TestDir::new();
+    let mut first = Serve::new(&dir)
+        .script(&[
+            json!({"reply": auckland_reply()}),
+            json!({"reply": empty_reply(), "delay_ms": 3000}),
+        ])
+        .ready();
+    first.create_bank("main");
+    first.ingest_notes("main", "notes.md");
+    let id = first.wait_for_memory("main");
+    first.wait_extracted("main");
+    first.ok(first.post(
+        "/v1/banks/main/documents",
+        &json!({
+            "document_id": "other.md",
+            "text": "# Other\n\nNothing to remember.\n",
+            "reference_date": "2026-09-30",
+            "reference_date_exact": true,
+            "timezone": null
+        }),
+    ));
+    first.wait_until(
+        "the second document in flight",
+        |daemon| daemon.chunks("main"),
+        |chunks| chunks["queued"][0]["in_flight"] == true,
+    );
+    let forgotten = first.ok(first.post("/v1/banks/main/forget", &json!({"ids": [id]})));
+    assert_eq!(forgotten["forgotten"], json!([id]));
+    first.sigterm();
+    assert!(first.wait_exit().success());
+    assert!(!first.log.contains("erased a chain"), "{}", first.log);
+    drop(first);
+
+    let mut second = Serve::new(&dir).ready();
+    second.wait_for_line("erased a chain");
+}

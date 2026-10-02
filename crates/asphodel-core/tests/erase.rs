@@ -1313,3 +1313,575 @@ fn a_mention_span_stored_by_version_7_still_redacts_after_an_upgrade() {
         format!("As I said, {}. Anyway.", "\u{2588}".repeat(26))
     );
 }
+
+/// The rest of the regressions from the TIM-112 review of 6b27c51, and the
+/// two gaps it left open: linking a forget to the turn that asked for it,
+/// and mentions stored before spans were. Each failed on 6b27c51 for the
+/// reason its finding gives and passes from 33d1c4c, which added the purge
+/// seam (`purge_candidates`, `purge_chain`), `run_erases` and
+/// `forget_request`.
+mod review {
+    use super::*;
+
+    use std::time::Duration;
+
+    use asphodel_core::erase::ForgetRequest;
+    use asphodel_core::extraction::Extracted;
+    use asphodel_core::ingest::{Document, Ingested};
+    use asphodel_core::models::{LlmClient, LlmError, LlmRequest, LlmResponse};
+    use asphodel_core::queue::ChunkError;
+    use jiff::civil::date;
+
+    const GARDEN: &str = "Tim's garden needs water.";
+
+    impl Harness {
+        fn doc(&self, id: &str, text: &str) -> Ingested {
+            self.service
+                .ingest_document(
+                    BANK,
+                    &Document {
+                        document_id: id.into(),
+                        text: text.into(),
+                        reference_date: date(2026, 9, 30),
+                        reference_date_exact: true,
+                        timezone: Some(TZ.into()),
+                    },
+                )
+                .unwrap()
+        }
+
+        /// Extracts the head of the queue with call 1 finding `claims`. Call
+        /// 2 labels `(claim index, neighbour, label)`, or nothing.
+        fn extract_with(&self, claims: Vec<Value>, labels: &[(usize, Uuid, &str)]) -> Extracted {
+            let call1 = json!({"claims": claims, "used_injected_ids": []});
+            let call2 = if labels.is_empty() {
+                json!({"claims": []})
+            } else {
+                let lease = self.service.claim_chunk(BANK).unwrap().expect("queued");
+                let input = self
+                    .service
+                    .call2_input(&lease, &call1, &[])
+                    .unwrap()
+                    .expect("call 2 runs");
+                let labelled: Vec<Value> = labels
+                    .iter()
+                    .map(|&(index, neighbour, label)| {
+                        let claim = input
+                            .claims
+                            .iter()
+                            .find(|claim| claim.claim == index)
+                            .unwrap_or_else(|| panic!("claim {index} reaches call 2"));
+                        let neighbour = input
+                            .neighbours
+                            .iter()
+                            .find(|n| n.memory == neighbour)
+                            .expect("the memory is a neighbour");
+                        json!({
+                            "claim": claim.handle,
+                            "labels": [{"neighbour": neighbour.handle, "label": label}],
+                        })
+                    })
+                    .collect();
+                json!({ "claims": labelled })
+            };
+            let llm = FakeLlm::scripted(MODEL, vec![call1, call2]);
+            self.service
+                .extract_next(BANK, &llm)
+                .unwrap()
+                .expect("a chunk was queued")
+        }
+
+        /// Every mention span gone, as on a store from before version 7.
+        fn make_legacy(&self) {
+            self.execute("UPDATE accesses SET spans = NULL", []);
+            let moved: Option<String> = self.optional(
+                "SELECT name FROM sqlite_master WHERE name = 'mention_passages'",
+                [],
+            );
+            if moved.is_some() {
+                self.execute("DELETE FROM mention_passages", []);
+            }
+        }
+
+        fn reply_text(&self, source: Uuid) -> String {
+            self.one::<Option<String>, _>(
+                "SELECT reply FROM sources WHERE uuid = ?1",
+                [source.to_string()],
+            )
+            .unwrap_or_default()
+        }
+
+        /// The latest `forgotten` edit's details.
+        fn forgotten_details(&self) -> Value {
+            let details: String = self.one(
+                "SELECT details FROM edits WHERE kind = 'forgotten' ORDER BY id DESC LIMIT 1",
+                [],
+            );
+            serde_json::from_str(&details).unwrap()
+        }
+
+        fn forget_in(&self, session: Option<&str>, memories: &[Uuid]) {
+            self.service
+                .forget_request(
+                    BANK,
+                    &ForgetRequest {
+                        ids: memories.iter().map(Uuid::to_string).collect(),
+                        session_id: session.map(str::to_string),
+                    },
+                )
+                .unwrap();
+        }
+
+        /// The turn that called `memory_forget`, a minute ago.
+        fn forget_turn(&self, session: &str, text: &str) -> Ingested {
+            let mut request = turn(session, self.now() - minutes(1), text);
+            request.forget_requested = true;
+            self.service.ingest_turn(BANK, &request).unwrap()
+        }
+
+        /// Every `forget` audit row's details, oldest first.
+        fn forget_rows(&self) -> Vec<Value> {
+            let store = self.service.store().unwrap();
+            let conn = store.connection();
+            let mut statement = conn
+                .prepare("SELECT details FROM edits WHERE kind = 'forget' ORDER BY id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|details| serde_json::from_str(&details.unwrap()).unwrap())
+                .collect()
+        }
+    }
+
+    // Finding 1: purge decides inside each chain's transaction.
+
+    #[test]
+    fn purge_rechecks_each_chain_inside_its_own_transaction() {
+        let h = Harness::new();
+        let kept = h.insert(faded(fact(TEA)));
+        let refined = h.insert(faded(fact(BERLIN)));
+        let forgotten = h.insert(faded(fact(MAYA)));
+        h.set(at(SWEEP));
+        let candidates = h.service.purge_candidates().unwrap();
+        let heads: BTreeSet<Uuid> = candidates.iter().map(|(_, head)| *head).collect();
+        assert_eq!(heads, BTreeSet::from([kept, refined, forgotten]));
+
+        // Between choosing and deleting: a keep, a refinement whose new head
+        // is strong, and a forget.
+        h.service.keep(BANK, &[kept.to_string()]).unwrap();
+        let moved = h.insert(fact(MOVED));
+        h.supersede(refined, moved, false);
+        h.forget(&[forgotten]);
+
+        for (bank, head) in &candidates {
+            assert_eq!(h.service.purge_chain(bank, *head).unwrap(), None, "{head}");
+        }
+        assert_eq!(h.rows(&[kept, refined, moved, forgotten]), 4);
+        assert_eq!(
+            h.one::<i64, _>("SELECT COUNT(*) FROM edits WHERE kind = 'purged'", []),
+            0
+        );
+
+        // The forget's own erase still finds its chain and records it.
+        let erased = h.service.erase_next(BANK).unwrap().expect("the erase");
+        assert_eq!(erased.memories, BTreeSet::from([forgotten]));
+        assert_eq!(h.forgotten_details()["memories"], json!([forgotten]));
+    }
+
+    // Finding 2: a same-document mention keeps its passage for the erase.
+
+    #[test]
+    fn a_reworded_section_of_the_same_document_queued_before_a_forget_is_redacted() {
+        // Not crediting a later version of the same document is right
+        // (TIM-92); dropping where it restated the memory isn't. The
+        // rewording keeps this apart from finding 7's exact-text match.
+        let h = Harness::new();
+        h.doc("family.md", "# Family\n\nMy daughter is called Maya.\n");
+        let maya = h
+            .extract_with(
+                vec![quoting(notable(MAYA), "My daughter is called Maya")],
+                &[],
+            )
+            .memories[0];
+        let v2 = h.doc("family.md", "# Family\n\nMaya, my daughter, is six now.\n");
+        h.forget(&[maya]);
+        let extracted = h.extract_with(
+            vec![quoting(notable(MAYA), "Maya, my daughter")],
+            &[(0, maya, "mentioned_again")],
+        );
+        assert!(extracted.memories.is_empty(), "the repeat is no new memory");
+
+        assert!(h.service.erase_next(BANK).unwrap().is_some());
+        let (text, chunk) = (h.source_text(v2.source), h.chunk_text(v2.source));
+        assert!(!text.contains("Maya") && !chunk.contains("Maya"), "{text}");
+        assert!(text.contains("is six now."), "{text}");
+    }
+
+    // Finding 3: a refresh in flight can't bring back a forgotten memory.
+
+    /// A refresh LLM that forgets `memory` while its call is in flight, and
+    /// with `erase` runs the erase too, then answers `reply`.
+    struct ForgetsDuringCall<'a> {
+        service: &'a Service,
+        memory: Uuid,
+        erase: bool,
+        reply: Value,
+    }
+
+    impl LlmClient for ForgetsDuringCall<'_> {
+        fn model(&self) -> &str {
+            MODEL
+        }
+
+        fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            self.service
+                .forget(BANK, &[self.memory.to_string()])
+                .unwrap();
+            if self.erase {
+                assert!(self.service.erase_next(BANK).unwrap().is_some());
+            }
+            Ok(LlmResponse {
+                json: self.reply.clone(),
+                usage: None,
+                latency: Duration::ZERO,
+            })
+        }
+    }
+
+    fn refresh_while_forgetting(erase: bool) {
+        let h = Harness::new();
+        let tea = h.insert(fact(TEA));
+        let maya = h.insert(fact(MAYA));
+        let input = h.service.refresh_input(BANK, PROFILE_NAME).unwrap();
+        let llm = ForgetsDuringCall {
+            service: &h.service,
+            memory: maya,
+            erase,
+            reply: json!({"operations": [
+                {"op": "add", "text": "Tim has a daughter called Maya.",
+                 "cites": [handle(&input, maya)]},
+                {"op": "add", "text": "Tim likes green tea.", "cites": [handle(&input, tea)]},
+            ]}),
+        };
+        let outcome = h
+            .service
+            .refresh_model(BANK, PROFILE_NAME, &llm, true)
+            .unwrap();
+        assert!(matches!(outcome, RefreshOutcome::Applied(_)), "{outcome:?}");
+        let texts: Vec<String> = h.profile().entries.into_iter().map(|e| e.text).collect();
+        assert_eq!(texts, vec!["Tim likes green tea.".to_string()]);
+    }
+
+    #[test]
+    fn a_refresh_in_flight_drops_an_entry_citing_a_memory_hidden_meanwhile() {
+        refresh_while_forgetting(false);
+    }
+
+    #[test]
+    fn a_refresh_in_flight_drops_an_entry_citing_a_memory_erased_meanwhile() {
+        refresh_while_forgetting(true);
+    }
+
+    // Finding 4: a failed sweep settles what it committed and stays due.
+
+    #[test]
+    fn a_sweep_that_fails_after_a_purge_settles_it_and_runs_again() {
+        let h = Harness::new();
+        h.insert(fact(TEA));
+        let maya = h.insert(faded(fact(MAYA)));
+        h.cite_in_profile("Tim has a daughter called Maya.", maya);
+        h.set(at(SWEEP));
+        let before = h.service.system_prompt(BANK, None).unwrap();
+        // The store's own connection: a temporary trigger fails the run row,
+        // after the purge has committed.
+        h.execute(
+            "CREATE TEMP TRIGGER injected_failure BEFORE INSERT ON sweep_runs
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            [],
+        );
+        assert!(h.service.run_sweeps().is_err());
+        assert_eq!(h.rows(&[maya]), 0, "the chain committed");
+        assert!(
+            h.one::<Option<i64>, _>(
+                "SELECT refresh_requested_at FROM mental_models WHERE name = ?1",
+                [PROFILE_NAME],
+            )
+            .is_some(),
+            "the model whose entry went is requested"
+        );
+        assert_ne!(
+            h.service.system_prompt(BANK, None).unwrap().id,
+            before.id,
+            "the block was cleared"
+        );
+
+        h.execute("DROP TRIGGER temp.injected_failure", []);
+        let again = h.service.run_sweeps().unwrap();
+        assert_eq!(again.ran.len(), 1, "the failed night is still due");
+        assert_eq!(h.one::<i64, _>("SELECT COUNT(*) FROM sweep_runs", []), 1);
+    }
+
+    // Finding 5: ready erases run without a worker. The daemon half is
+    // `a_ready_erase_runs_after_a_restart_without_an_llm` in serve_http.
+
+    #[test]
+    fn ready_erases_run_without_a_worker() {
+        let h = Harness::new();
+        let (maya, said) = h.says(notable(MAYA));
+        h.ingest("chat", "Something else entirely.");
+        h.forget(&[maya]);
+        assert!(
+            h.service.run_erases().unwrap().is_empty(),
+            "the erase waits behind the queued chunk"
+        );
+        // That chunk fails for good, with no LLM to extract it.
+        for _ in 0..CHUNK_RETRY_CAP {
+            let lease = h.service.claim_chunk(BANK).unwrap().expect("queued");
+            h.service
+                .fail_chunk(
+                    lease,
+                    ChunkError {
+                        kind: "transport",
+                        status: None,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(h.service.run_erases().unwrap().len(), 1);
+        assert_eq!(h.rows(&[maya]), 0);
+        assert!(!h.source_text(said).contains("Maya"));
+    }
+
+    // Finding 6: the plan counts what the sweep frees by purging.
+
+    #[test]
+    fn the_plan_counts_a_source_the_sweep_frees_by_purging() {
+        let h = Harness::new();
+        // The fixture source's only memory.
+        h.insert(faded(fact(MAYA)));
+        h.set(at(PAST_HORIZON));
+        let plan = h.service.purge_plan().unwrap();
+        let swept = h.sweep();
+        let run = &swept.ran[0];
+        assert_eq!((run.purged_memories, run.swept_sources), (1, 1));
+        assert_eq!(
+            (plan.memories, plan.sources),
+            (run.purged_memories, run.swept_sources)
+        );
+    }
+
+    // Finding 7: every version of a document loses a forgotten passage.
+
+    #[test]
+    fn every_version_of_a_document_loses_a_forgotten_passage() {
+        let h = Harness::new();
+        let family = "# Family\n\nMy daughter is called Maya.\n";
+        let v1 = h.doc("family.md", family).source;
+        let maya = h
+            .extract_with(
+                vec![quoting(notable(MAYA), "My daughter is called Maya")],
+                &[],
+            )
+            .memories[0];
+        // v2 adds a section; the Family section is skipped as already seen.
+        let garden = format!("{family}\n# Garden\n\nThe roses are out.\n");
+        let v2 = h.doc("family.md", &garden);
+        assert_eq!(v2.chunks_skipped, 1);
+        h.extract_with(vec![], &[]);
+
+        h.forget(&[maya]);
+        assert!(h.service.erase_next(BANK).unwrap().is_some());
+        assert!(
+            !h.source_text(v1).contains("Maya"),
+            "the memory's own version"
+        );
+        let text = h.source_text(v2.source);
+        assert!(
+            !text.contains("Maya"),
+            "the version that skipped it: {text}"
+        );
+        assert!(text.contains("The roses are out."), "{text}");
+
+        // A version sent after the forget doesn't store the passage again.
+        let v3 = h.doc(
+            "family.md",
+            &format!("{garden}\n# Kitchen\n\nThe kettle is new.\n"),
+        );
+        assert_eq!(v3.chunks_skipped, 2);
+        let text = h.source_text(v3.source);
+        assert!(!text.contains("Maya"), "{text}");
+        assert!(text.contains("The kettle is new."), "{text}");
+    }
+
+    // Gap 1: a forget is linked to the turn that asked for it (TIM-113).
+    // Each test runs at one instant on the stopped clock, so only the order
+    // of writes can tell the turns apart.
+
+    #[test]
+    fn a_forget_is_linked_to_its_request_turn_at_the_same_instant() {
+        let h = Harness::new();
+        let started = h.now();
+        let maya = h.insert(fact(MAYA));
+        h.ingest("s", "Hello.");
+        h.forget_in(Some("s"), &[maya]);
+        let rows = h.forget_rows();
+        assert_eq!(rows.len(), 1, "the row is written when forget is called");
+        assert_eq!(rows[0]["memories"], json!([maya]));
+        assert_eq!(rows[0]["session_id"], "s");
+        assert_eq!(rows[0]["request"], Value::Null);
+
+        let request = h.forget_turn("s", "Forget my daughter's name.");
+        assert_eq!(request.outcome, Outcome::Tombstone);
+        assert_eq!(h.forget_rows()[0]["request"], json!(request.source));
+        assert_eq!(h.now(), started);
+    }
+
+    #[test]
+    fn every_forget_in_the_turn_is_linked_and_other_sessions_link_none() {
+        let h = Harness::new();
+        let maya = h.insert(fact(MAYA));
+        let tea = h.insert(fact(TEA));
+        h.forget_in(Some("s"), &[maya]);
+        h.forget_in(Some("s"), &[tea]);
+
+        h.forget_turn("other", "Forget something else.");
+        assert!(h.forget_rows().iter().all(|row| row["request"].is_null()));
+
+        let request = h.forget_turn("s", "Forget those two.");
+        for row in h.forget_rows() {
+            assert_eq!(row["request"], json!(request.source));
+        }
+    }
+
+    #[test]
+    fn a_forget_whose_request_turn_never_arrived_stays_unlinked() {
+        // F1's request turn was lost; an ordinary turn followed, then F2 and
+        // its own request turn, all at the same instant.
+        let h = Harness::new();
+        let maya = h.insert(fact(MAYA));
+        let tea = h.insert(fact(TEA));
+        h.forget_in(Some("s"), &[maya]);
+        h.ingest("s", "What's for dinner?");
+        h.forget_in(Some("s"), &[tea]);
+        let request = h.forget_turn("s", "Forget the tea.");
+
+        let rows = h.forget_rows();
+        assert_eq!(rows[0]["memories"], json!([maya]));
+        assert_eq!(rows[0]["request"], Value::Null);
+        assert_eq!(rows[1]["request"], json!(request.source));
+    }
+
+    #[test]
+    fn a_forget_without_a_session_or_after_a_resent_turn_links_nothing() {
+        let h = Harness::new();
+        let maya = h.insert(fact(MAYA));
+        let tea = h.insert(fact(TEA));
+        // The CLI sends no session.
+        h.forget_in(None, &[maya]);
+        let first = h.forget_turn("s", "Forget that.");
+        assert_eq!(first.outcome, Outcome::Tombstone);
+        assert_eq!(h.forget_rows()[0]["request"], Value::Null);
+
+        // The plugin's spool sends the same request turn again after a later
+        // forget: a duplicate links nothing.
+        h.forget_in(Some("s"), &[tea]);
+        let again = h.forget_turn("s", "Forget that.");
+        assert_eq!(again.outcome, Outcome::Duplicate);
+        assert_eq!(h.forget_rows()[1]["request"], Value::Null);
+    }
+
+    // Gap 2: mentions stored before version 7 have no span. The erase masks
+    // more rather than less, keeps what surviving memories rest on, and
+    // counts the fallbacks in its audit row.
+
+    #[test]
+    fn a_legacy_mention_in_a_turn_masks_the_turn_but_what_survives() {
+        let h = Harness::new();
+        let (maya, _) = h.says(notable(MAYA));
+        let mixed = h.ingest("chat", "My daughter is called Maya. I like green tea.");
+        let tea = h
+            .extract_with(
+                vec![
+                    quoting(notable(MAYA), "My daughter is called Maya"),
+                    quoting(notable(TEA), "I like green tea"),
+                ],
+                &[(0, maya, "mentioned_again")],
+            )
+            .memories[0];
+        h.make_legacy();
+
+        h.forget(&[maya]);
+        assert!(h.service.erase_next(BANK).unwrap().is_some());
+        let text = h.source_text(mixed);
+        assert!(
+            !text.contains("Maya") && !text.contains("daughter"),
+            "{text}"
+        );
+        assert!(text.contains("I like green tea"), "{text}");
+        assert!(!h.reply_text(mixed).contains("Noted"));
+        assert_eq!(h.rows(&[tea]), 1);
+        let audit = h.forgotten_details();
+        assert_eq!(audit["legacy_mentions"], 1);
+        assert_eq!(audit["whole_source"], 0);
+    }
+
+    #[test]
+    fn a_legacy_mention_in_a_document_masks_only_an_exact_passage_when_there_is_one() {
+        let h = Harness::new();
+        // The forgotten memory's own passage is its sentence.
+        let (maya, _) = h.says(notable(MAYA));
+        let notes = h
+            .doc(
+                "notes.md",
+                &format!("# Notes\n\n{MAYA} The garden needs water.\n"),
+            )
+            .source;
+        h.extract_with(
+            vec![quoting(notable(MAYA), MAYA)],
+            &[(0, maya, "mentioned_again")],
+        );
+        h.make_legacy();
+
+        h.forget(&[maya]);
+        assert!(h.service.erase_next(BANK).unwrap().is_some());
+        let text = h.source_text(notes);
+        assert!(!text.contains("Maya"), "{text}");
+        assert!(text.contains("# Notes") && text.contains("The garden needs water."));
+        let audit = h.forgotten_details();
+        assert_eq!(audit["legacy_mentions"], 1);
+        assert_eq!(audit["whole_source"], 0);
+    }
+
+    #[test]
+    fn a_legacy_mention_in_a_document_with_no_exact_passage_masks_all_but_what_survives() {
+        let h = Harness::new();
+        let (maya, _) = h.says(notable(MAYA));
+        let notes = h
+            .doc(
+                "notes.md",
+                "# Notes\n\nMaya is my daughter. The garden needs water.\n",
+            )
+            .source;
+        let garden = h
+            .extract_with(
+                vec![
+                    quoting(notable(MAYA), "Maya is my daughter"),
+                    quoting(notable(GARDEN), "The garden needs water"),
+                ],
+                &[(0, maya, "mentioned_again")],
+            )
+            .memories[0];
+        h.make_legacy();
+
+        h.forget(&[maya]);
+        assert!(h.service.erase_next(BANK).unwrap().is_some());
+        let text = h.source_text(notes);
+        assert!(!text.contains("Maya") && !text.contains("Notes"), "{text}");
+        assert!(text.contains("The garden needs water"), "{text}");
+        assert_eq!(h.rows(&[garden]), 1);
+        let audit = h.forgotten_details();
+        assert_eq!(audit["legacy_mentions"], 1);
+        assert_eq!(audit["whole_source"], 1);
+    }
+}
