@@ -3702,7 +3702,6 @@ fn entity_id(source: Uuid, position: u32, key: &str) -> Uuid {
 }
 
 #[test]
-#[ignore = "needs TIM-116: entity ids under the amended TIM-96 decision 4"]
 fn deterministic_entity_ids_key_the_proposal_not_the_surface_form() {
     let h = Harness::deterministic();
     let ingested = ingest(
@@ -3743,7 +3742,6 @@ fn deterministic_entity_ids_key_the_proposal_not_the_surface_form() {
 }
 
 #[test]
-#[ignore = "needs TIM-116: entity ids under the amended TIM-96 decision 4"]
 fn deterministic_entity_ids_are_independent_of_existing_entities() {
     let h = Harness::deterministic();
     let ingested = ingest_doc(
@@ -3790,7 +3788,6 @@ fn deterministic_entity_ids_are_independent_of_existing_entities() {
 }
 
 #[test]
-#[ignore = "needs TIM-116: entity ids under the amended TIM-96 decision 4"]
 fn deterministic_entity_ids_use_the_normalized_dedup_key() {
     // "Zélie" composed, decomposed, padded and in capitals: one key, so one
     // id, written here already normalized.

@@ -7,11 +7,15 @@
 //! keeps ids minted in the same instant ordered.
 //!
 //! A replay opens its store with deterministic ids. A memory's id is then
-//! UUIDv5 of its source and claim ordinal (`<chunk position>:<claim>`), an
-//! entity's of the source that proposed it and its surface form, a
-//! source's of its key, and a chunk's of its source and position, so
-//! recorded `used` ids, reconcile targets and
-//! citations point at the same rows on every run. Ids with no natural
+//! UUIDv5 of (source id, `<chunk position>:<claim index in call 1's reply>`).
+//! An entity's is UUIDv5 of (creating source id,
+//! `entity:<chunk position>:<name>`), where the proposed name is composed
+//! to NFC, trimmed and lowercased: the exact key `resolve_proposals`
+//! dedups on within a commit, without a second normalization. Neither key
+//! depends on other store contents; `entity:` keeps them disjoint. A
+//! source's id is derived from its key, and a chunk's from its source and
+//! position, so recorded `used` ids, reconcile targets and citations point
+//! at the same rows on every run. Ids with no natural
 //! parent (recall ids, edits, banks, models) count up under a fixed
 //! namespace, which is the same on every run of the same timeline.
 //!

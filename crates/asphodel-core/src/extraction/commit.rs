@@ -253,12 +253,7 @@ fn resolve_proposals(
         .filter(|(_, fate)| **fate != Fate::Absorbed)
     {
         for link in &memory.links {
-            let Link::Proposed {
-                name,
-                kind,
-                surface_form,
-            } = link
-            else {
+            let Link::Proposed { name, kind, .. } = link else {
                 continue;
             };
             let key = name.to_lowercase();
@@ -268,9 +263,8 @@ fn resolve_proposals(
             let entity_id = match created_meanwhile(tx, unit, name, &seen)? {
                 Some(entity_id) => entity_id,
                 None => {
-                    let form = surface_form.as_deref().unwrap_or(name);
                     let (entity_id, uuid) =
-                        create_entity(tx, store, unit.bank_id, lease.source, form, name, *kind)?;
+                        create_entity(tx, store, unit.bank_id, lease, &key, name, *kind)?;
                     created.push(uuid);
                     entity_id
                 }
@@ -306,33 +300,20 @@ fn created_meanwhile(
     Ok(None)
 }
 
-/// Creates an entity proposed by `source` under the surface form `form`
-/// (TIM-96, decision 4). With deterministic ids a source can propose two
-/// new entities under one surface form, in two chunks or under two names,
-/// so a later one is keyed `<form>#<n>`.
+/// Creates an entity keyed by its creating source, chunk position and the
+/// exact dedup key from `resolve_proposals` (TIM-96, amended by TIM-116).
+/// The proposed name is already NFC and trimmed; the key lowercases it.
+/// No second normalization or lookup of existing ids affects replay ids.
 fn create_entity(
     tx: &Transaction<'_>,
     store: &Store,
     bank_id: i64,
-    source: Uuid,
-    form: &str,
+    lease: &Lease,
+    key: &str,
     name: &str,
     kind: EntityKind,
 ) -> Result<(i64, Uuid), rusqlite::Error> {
-    let mut uuid = store.derived_id(source, form);
-    let mut n = 1;
-    while tx
-        .query_row(
-            "SELECT 1 FROM entities WHERE uuid = ?1",
-            [uuid.to_string()],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some()
-    {
-        n += 1;
-        uuid = store.derived_id(source, &format!("{form}#{n}"));
-    }
+    let uuid = store.derived_id(lease.source, &format!("entity:{}:{key}", lease.position));
     let now = micros(store.now());
     tx.execute(
         "INSERT INTO entities (uuid, bank_id, name, kind, created_at, updated_at)

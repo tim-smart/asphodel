@@ -293,10 +293,14 @@ A probe naming a label no claim defines is refused before the run.
 - **Ids are deterministic** (TIM-96, decision 4). A memory id is UUIDv5
   of its source's id and its claim ordinal, written `<chunk
   position>:<index in call 1's reply>` so a document's chunks can't
-  collide; an entity id is UUIDv5 of the source that proposed it and the
-  surface form it was proposed under (its name when the proposal had
-  none). A source's id comes from its key and a chunk's from its source
-  and position. Ids with no parent (recall ids, edits, banks, models)
+  collide. Under the TIM-116 amendment, an entity id is UUIDv5 of (creating
+  source id, `entity:<chunk position>:<name>`), where the proposed name is
+  composed to NFC, trimmed and lowercased: the exact key
+  `resolve_proposals` dedups on within a commit. ID generation uses that
+  key unchanged, with no second normalization. Neither memory nor entity
+  keys depend on other store contents; the `entity:` prefix keeps them
+  disjoint under one source. A source's id comes from its key and a chunk's
+  from its source and position. Ids with no parent (recall ids, edits, banks, models)
   count up under a fixed namespace. Production keeps UUIDv7.
 - **Determinism.** With the same scenario, layers and flags, a run writes a
   byte-identical report on the same machine and build. The report carries
