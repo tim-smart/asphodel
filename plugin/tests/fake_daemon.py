@@ -2,7 +2,11 @@
 answering the routes the plugin uses with bodies shaped like the Rust types in
 ``crates/asphodel/src/serve/api.rs``. It records every request, and a test
 can override a route's response, delay it past the plugin's budget, or drop
-connections to simulate a daemon that's gone."""
+connections to simulate a daemon that's gone.
+
+Like the real daemon, every route but health answers 503 while ``ready`` is
+false. With ``enforce_banks`` on, a bank route answers 404 until a ``PUT``
+has created the bank, as the real API does."""
 
 from __future__ import annotations
 
@@ -14,7 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 Response = Tuple[int, Any]
@@ -63,6 +67,8 @@ class Request:
 class FakeDaemon:
     version: str = "0.1.0"
     ready: bool = True
+    enforce_banks: bool = False
+    banks: Set[str] = field(default_factory=set)
     requests: List[Request] = field(default_factory=list)
     responses: Dict[str, Any] = field(default_factory=dict)
     delays: Dict[str, float] = field(default_factory=dict)
@@ -184,12 +190,22 @@ class FakeDaemon:
             pass
 
     def _respond(self, request: Request) -> Response:
+        if not self.ready and request.key != "health":
+            return 503, {"error": "the daemon is starting: the store and models aren't ready yet"}
+        if self.enforce_banks and request.bank is not None and request.key != "put_bank":
+            if request.bank not in self.banks:
+                return 404, {"error": f"unknown bank {request.bank}"}
         scripted = self.responses.get(request.key)
         if callable(scripted):
-            return scripted(request)
-        if scripted is not None:
-            return scripted
-        return self._default(request)
+            status, body = scripted(request)
+        elif scripted is not None:
+            status, body = scripted
+        else:
+            status, body = self._default(request)
+        if request.key == "put_bank" and 200 <= status < 300:
+            with self._lock:
+                self.banks.add(request.bank)
+        return status, body
 
     def _default(self, request: Request) -> Response:
         key, body = request.key, request.body or {}

@@ -77,7 +77,7 @@ def test_timezone_falls_back_to_config_then_null(make_provider, daemon, hermes):
 def test_echoes_the_recall_id_from_the_turns_prefetch_once(make_provider, daemon):
     provider = make_provider()
     daemon.set_response("prefetch", 200, {"recall_id": "r-1", "text": "x", "injected": ["m1"], "reranked": True})
-    provider.prefetch("tea?", session_id=SESSION)
+    provider.prefetch("I drink oolong every morning.", session_id=SESSION)
     sync(provider)
     sync(provider)
     bodies = [r.body for r in daemon.requests_for("turns")]
@@ -110,3 +110,68 @@ def test_never_raises_on_a_daemon_error(make_provider, daemon):
     provider = make_provider()
     daemon.set_response("turns", 400, {"error": "invalid timezone"})
     sync(provider)
+
+
+# -- recall ids across overlapping turns (TIM-99; Hermes syncs on a background
+# worker, so the next turn's prefetch can run before this turn's sync) ----------
+
+
+def _recall_id_per_query(daemon):
+    daemon.set_handler(
+        "prefetch",
+        lambda request: (200, {"recall_id": f"r-{request.body['query']}", "text": "x", "injected": ["m1"], "reranked": True}),
+    )
+
+
+def _echoed(daemon):
+    return [r.body["recall_id"] for r in daemon.requests_for("turns")]
+
+
+def test_a_sync_after_the_next_prefetch_echoes_its_own_recall_id(make_provider, daemon):
+    provider = make_provider()
+    _recall_id_per_query(daemon)
+    provider.prefetch("where is the dentist?", session_id=SESSION)
+    provider.prefetch("and when is it?", session_id=SESSION)
+    sync(provider, user="where is the dentist?", messages=transcript("where is the dentist?", "Noted.", epoch=EPOCH))
+    sync(provider, user="and when is it?", messages=transcript("and when is it?", "Noted.", epoch=EPOCH + 60))
+    assert _echoed(daemon) == ["r-where is the dentist?", "r-and when is it?"]
+
+
+def test_an_interrupted_turns_recall_id_is_never_echoed(make_provider, daemon):
+    """Hermes skips the sync of an interrupted turn. The next turn echoes its
+    own id, and the interrupted turn's id is dropped rather than echoed later."""
+    provider = make_provider()
+    _recall_id_per_query(daemon)
+    provider.prefetch("book the dentist", session_id=SESSION)
+    provider.prefetch("book the dentist for Friday", session_id=SESSION)
+    sync(provider, user="book the dentist for Friday", messages=transcript("book the dentist for Friday", "Done.", epoch=EPOCH))
+    sync(provider, user="thanks a lot then", messages=transcript("thanks a lot then", "Any time.", epoch=EPOCH + 60))
+    assert _echoed(daemon) == ["r-book the dentist for Friday", None]
+
+
+def test_a_turn_without_a_prefetch_echoes_nothing(make_provider, daemon):
+    provider = make_provider()
+    _recall_id_per_query(daemon)
+    provider.prefetch("where is the dentist?", session_id=SESSION)
+    sync(provider, user="where is the dentist?", messages=transcript("where is the dentist?", "Noted.", epoch=EPOCH))
+    sync(provider, user="/skip", messages=transcript("/skip", "ok", epoch=EPOCH + 60))
+    assert _echoed(daemon) == ["r-where is the dentist?", None]
+
+
+def test_an_unmatched_sync_echoes_nothing_and_leaves_the_pending_id(make_provider, daemon):
+    provider = make_provider()
+    _recall_id_per_query(daemon)
+    provider.prefetch("where is the dentist?", session_id=SESSION)
+    sync(provider, user="a photo of the clinic", messages=transcript("a photo of the clinic", "Nice.", epoch=EPOCH))
+    sync(provider, user="where is the dentist?", messages=transcript("where is the dentist?", "Noted.", epoch=EPOCH + 60))
+    assert _echoed(daemon) == [None, "r-where is the dentist?"]
+
+
+def test_the_match_is_on_the_text_before_the_backfill_strip(make_provider, daemon):
+    """Hermes prefetches with the same unstripped text it later syncs."""
+    provider = make_provider()
+    _recall_id_per_query(daemon)
+    text = "[Maya] I'm moving to Wellington.\n[New message]\n[Tim] Remind me about the dentist."
+    provider.prefetch(text, session_id=SESSION)
+    sync(provider, user=text, messages=transcript(text, "Will do.", epoch=EPOCH))
+    assert _echoed(daemon) == [f"r-{text}"]

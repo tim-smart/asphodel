@@ -232,3 +232,27 @@ def _restart(daemon, port):
     daemon._thread = threading.Thread(target=lambda: daemon._server.serve_forever(poll_interval=0.02), daemon=True)
     daemon._thread.start()
     return daemon
+
+
+# -- the age cap at replay -----------------------------------------------------------
+
+
+def test_replay_drops_expired_turns_without_sending_them(tmp_path):
+    spool = Spool(tmp_path / "spool")
+    path = spool.write(turn(1))
+    stale = time.time() - 8 * 24 * 3600
+    os.utime(path, (stale, stale))
+    sent = []
+    assert spool.replay(lambda body: sent.append(body) or True) == 0
+    assert sent == []
+    assert spool.files() == []
+
+
+def test_recovery_after_a_week_delivers_only_the_new_turn(make_provider, daemon, hermes_home):
+    provider = make_provider()
+    path = Spool(spool_dir(hermes_home)).write(turn(1))
+    stale = time.time() - 8 * 24 * 3600
+    os.utime(path, (stale, stale))
+    provider.sync_turn("fresh", "ok", session_id=SESSION, messages=transcript("fresh", "ok", epoch=2.0))
+    assert [r.body["user_text"] for r in daemon.requests_for("turns")] == ["fresh"]
+    assert list(spool_dir(hermes_home).glob("*.json")) == []

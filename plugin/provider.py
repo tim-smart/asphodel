@@ -17,7 +17,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider, RecallStatus
 from tools.registry import tool_error
@@ -44,6 +44,10 @@ PRIMARY_CONTEXT = "primary"
 #: Hermes' built-in memory flags that ``post_setup`` turns off and
 #: ``initialize`` warns about (TIM-94, round 1 item 5).
 BUILTIN_MEMORY_FLAGS = ("memory_enabled", "user_profile_enabled")
+#: Hermes' ``utils.TRUTHY_STRINGS``: how it reads a string flag.
+HERMES_TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+#: Pending recalls kept per session, the daemon's ``PENDING_PER_SESSION``.
+PENDING_RECALLS_PER_SESSION = 4
 
 
 @dataclass(frozen=True)
@@ -90,14 +94,20 @@ class AsphodelMemoryProvider(MemoryProvider):
         self._author_id: Optional[str] = None
         self._author_name: Optional[str] = None
         self._author_is_bot: bool = False
-        # Decision 6: the recall_id prefetch stored for the session, which
-        # sync_turn echoes once; TIM-99: the last prefetch query, sent as the
-        # previous message and dropped on memory_forget.
-        self._pending_recall_id: Dict[str, str] = {}
+        # Decision 6: the (query, recall_id) of each prefetch whose turn
+        # hasn't synced yet, oldest first. Hermes syncs on a background worker,
+        # so the next turn's prefetch can come before this turn's sync
+        # (TIM-99), and sync_turn matches its own by the user text. TIM-99
+        # also: the last prefetch query, sent as the previous message and
+        # dropped on memory_forget.
+        self._pending_recalls: Dict[str, List[Tuple[str, str]]] = {}
         self._last_query: Dict[str, str] = {}
         self._last_injected: int = 0
         # TIM-95 decision 4: a block fetched before the session id was known.
         self._pending_block_id: Optional[str] = None
+        # Whether a PUT has set the bank up. Until one does, every bank
+        # operation retries it first.
+        self._bank_ready: bool = False
 
     # -- identity and availability -------------------------------------------
 
@@ -168,25 +178,39 @@ class AsphodelMemoryProvider(MemoryProvider):
                 )
 
     def _put_bank(self, warn) -> None:
+        try:
+            self._ensure_bank(self.timeouts.health)
+        except DaemonUnavailable:
+            # The health probe has already warned.
+            log.debug("put bank: daemon unreachable")
+        except DaemonError as error:
+            if error.status == 503:
+                # Starting or draining: the health probe has already warned,
+                # and the next bank operation retries.
+                log.debug("put bank: daemon answered 503")
+            else:
+                self._warn(warn, f"Asphodel: the daemon refused bank {self.bank} ({error.status}).")
+
+    def _ensure_bank(self, timeout: float) -> None:
+        """``PUT``s the bank unless one already succeeded. Raises what the
+        client raises. Once the bank is set up a later 404 never recreates it:
+        ``bank delete`` expects the plugin to be disabled first (ADR 0010)."""
+        if self._bank_ready:
+            return
         identity = {
             "owner_name": self.config.owner_name,
             "owner_platform_ids": list(self.config.owner_platform_ids),
             "assistant_name": self.config.assistant_name or self._profile,
             "timezone": self.config.timezone,
         }
-        try:
-            self.client.put_bank(self.bank, identity, timeout=self.timeouts.health)
-        except DaemonUnavailable:
-            # The health probe has already warned.
-            log.debug("put bank: daemon unreachable")
-        except DaemonError as error:
-            self._warn(warn, f"Asphodel: the daemon refused bank {self.bank} ({error.status}).")
+        self.client.put_bank(self.bank, identity, timeout=timeout)
+        self._bank_ready = True
+        log.debug("bank %s set up", self.bank)
 
     def _check_builtin_memory(self, warn) -> None:
-        """Hermes defaults both flags on, so a key that's absent warns. An
-        empty or missing ``memory`` section means Hermes' config couldn't be
-        read (its loader always merges the defaults), so there's nothing to
-        check."""
+        """Warns for each flag Hermes reads as on. Hermes merges its defaults,
+        which turn both on, and reads each with ``is_truthy_value(value,
+        default=True)``, so a missing key or section and ``null`` are on."""
         try:
             from hermes_cli.config import load_config as load_hermes_config
 
@@ -194,10 +218,10 @@ class AsphodelMemoryProvider(MemoryProvider):
         except Exception as error:
             log.debug("could not read Hermes' config: %s", type(error).__name__)
             return
-        if not isinstance(memory, dict) or not memory:
-            return
+        if not isinstance(memory, dict):
+            memory = {}
         for flag in BUILTIN_MEMORY_FLAGS:
-            if memory.get(flag, True):
+            if _hermes_truthy(memory.get(flag), default=True):
                 self._warn(
                     warn,
                     f"Asphodel: Hermes' built-in memory.{flag} is on, so two memories run at once. "
@@ -247,11 +271,12 @@ class AsphodelMemoryProvider(MemoryProvider):
         clear = reset or rewound or kwargs.get("reason") == "compression"
         try:
             if clear and old_session:
-                self._pending_recall_id.pop(old_session, None)
+                self._pending_recalls.pop(old_session, None)
                 self._last_query.pop(old_session, None)
                 self._pending_block_id = None
                 if self.client is not None and self.bank:
                     try:
+                        self._ensure_bank(self.timeouts.session_clear)
                         self.client.clear_session(self.bank, old_session, timeout=self.timeouts.session_clear)
                     except DaemonUnavailable:
                         log.debug("clear session: daemon unreachable")
@@ -283,6 +308,7 @@ class AsphodelMemoryProvider(MemoryProvider):
             block = None
             for attempt in range(1 + max(0, self.timeouts.system_prompt_retries)):
                 try:
+                    self._ensure_bank(self.timeouts.system_prompt)
                     block = self.client.system_prompt(self.bank, session, timeout=self.timeouts.system_prompt)
                     break
                 except DaemonUnavailable as error:
@@ -324,6 +350,7 @@ class AsphodelMemoryProvider(MemoryProvider):
             if block_id:
                 request["block_id"] = block_id
             log.log(TRACE, "prefetch query: %s", query)
+            self._ensure_bank(self.timeouts.prefetch)
             result = self.client.prefetch(self.bank, request, timeout=self.timeouts.prefetch)
         except DaemonUnavailable as error:
             log.warning("prefetch: daemon unreachable (%s)", error)
@@ -340,9 +367,9 @@ class AsphodelMemoryProvider(MemoryProvider):
         result = result if isinstance(result, dict) else {}
         recall_id = result.get("recall_id")
         if recall_id:
-            self._pending_recall_id[session] = str(recall_id)
-        else:
-            self._pending_recall_id.pop(session, None)
+            pending = self._pending_recalls.setdefault(session, [])
+            pending.append((query, str(recall_id)))
+            del pending[:-PENDING_RECALLS_PER_SESSION]
         injected = result.get("injected")
         self._last_injected = len(injected) if isinstance(injected, list) else 0
         log.debug("prefetch: recall %s injected %d", recall_id, self._last_injected)
@@ -384,8 +411,15 @@ class AsphodelMemoryProvider(MemoryProvider):
                 turn_author=turn_author,
             )
             # The recall id is echoed once, whatever happens to the turn.
-            self._pending_recall_id.pop(session, None)
+            self._consume_recall(session, user_content)
             log.log(TRACE, "turn user text: %s", turn["user_text"])
+            try:
+                self._ensure_bank(self.timeouts.ingest)
+            except (DaemonUnavailable, DaemonError) as error:
+                # Kept until the bank exists, rather than refused as unknown.
+                log.warning("ingest: bank %s isn't set up (%s); spooling the turn", self.bank, _reason(error))
+                self._spool_turn(turn)
+                return
             try:
                 self.client.ingest_turn(self.bank, turn, timeout=self.timeouts.ingest)
             except DaemonUnavailable as error:
@@ -404,6 +438,23 @@ class AsphodelMemoryProvider(MemoryProvider):
                 self.spool.replay(self._replay_one)
         except Exception as error:
             log.warning("sync_turn failed: %s", type(error).__name__)
+
+    def _recall_index(self, session: str, user_content: str) -> Optional[int]:
+        """The session's oldest pending recall whose prefetch query is this
+        turn's user text. Hermes prefetches and syncs the same text for a text
+        turn; a turn that matches none (no prefetch, or a multimodal turn)
+        echoes nothing, which the daemon treats as changing nothing."""
+        for index, (query, _) in enumerate(self._pending_recalls.get(session, ())):
+            if query == user_content:
+                return index
+        return None
+
+    def _consume_recall(self, session: str, user_content: str) -> None:
+        """Drops the matched recall and every older one: Hermes syncs turns in
+        order, so those belong to turns that were interrupted and never sync."""
+        index = self._recall_index(session, user_content)
+        if index is not None:
+            del self._pending_recalls[session][: index + 1]
 
     def _spool_turn(self, turn: Dict[str, Any]) -> None:
         if self.spool is not None:
@@ -437,6 +488,7 @@ class AsphodelMemoryProvider(MemoryProvider):
         ``author`` (``{id, name, is_bot}`` or ``None``), ``platform``, the
         echoed ``recall_id`` and ``forget_requested``."""
         session = session_id or self._session_id
+        index = self._recall_index(session, user_content)
         return {
             "session_id": session,
             "message_at": turns.message_at(messages, self._wall_clock()),
@@ -445,7 +497,7 @@ class AsphodelMemoryProvider(MemoryProvider):
             "assistant_text": assistant_content or "",
             "author": _author(turn_author),
             "platform": self._platform,
-            "recall_id": self._pending_recall_id.get(session),
+            "recall_id": None if index is None else self._pending_recalls[session][index][1],
             "forget_requested": turns.forget_requested(messages),
         }
 
@@ -503,6 +555,7 @@ class AsphodelMemoryProvider(MemoryProvider):
             if session:
                 request["session_id"] = session
             log.log(TRACE, "recall query: %s", query)
+            self._ensure_bank(timeout)
             result = self.client.recall(self.bank, request, timeout=timeout)
             results = result.get("results", []) if isinstance(result, dict) else []
             log.debug("recall: %d results", len(results))
@@ -516,6 +569,7 @@ class AsphodelMemoryProvider(MemoryProvider):
             or not all(isinstance(item, str) and item for item in ids)
         ):
             return tool_error(f"{tool_name} needs ids: a list of 1 to {tools.MAX_IDS} memory ids.")
+        self._ensure_bank(timeout)
         if tool_name == tools.FORGET_TOOL:
             result = self.client.forget(self.bank, ids, session, timeout=timeout)
             # The forget request isn't sent again as the next previous query.
@@ -586,6 +640,22 @@ class AsphodelMemoryProvider(MemoryProvider):
             memory[flag] = False
         save_hermes_config(config)
         print(f"Set {plugin_config.TOKEN_ENV_VAR} in $HERMES_HOME/.env if the daemon needs a bearer token.")
+
+
+def _hermes_truthy(value: Any, *, default: bool) -> bool:
+    """Hermes' ``utils.is_truthy_value``."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in HERMES_TRUTHY_STRINGS
+    return bool(value)
+
+
+def _reason(error: Exception) -> str:
+    """A log-safe reason: the status code, or the kind of connection failure."""
+    if isinstance(error, DaemonError):
+        return f"daemon answered {error.status}"
+    return f"daemon unreachable: {error}"
 
 
 _RECALL_ARGUMENTS = ("query", "from", "to", "on", "phase", "kinds", "entity", "limit")

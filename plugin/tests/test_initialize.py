@@ -2,6 +2,8 @@
 probe, ``PUT`` the bank with the configured identity, warnings through
 ``warning_callback``, and never a failure."""
 
+import pytest
+
 from conftest import OWNER_IDS, PROFILE, SESSION, plugin
 
 
@@ -97,3 +99,30 @@ def test_records_session_platform_and_context(make_provider):
 
 def test_backup_paths_is_empty(make_provider):
     assert make_provider().backup_paths() == []
+
+
+# -- built-in memory flags, coerced the way Hermes does (``is_truthy_value(v,
+# default=True)`` in ``tools/memory_tool.py``) -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"memory": {}},
+        {},
+        {"memory": {"memory_enabled": None, "user_profile_enabled": None}},
+        {"memory": {"memory_enabled": "true", "user_profile_enabled": "yes"}},
+    ],
+    ids=["empty-section", "no-section", "null", "truthy-strings"],
+)
+def test_flags_hermes_reads_as_on_warn(make_provider, hermes, warnings, config):
+    hermes.config = config
+    make_provider()
+    assert any("memory_enabled" in w for w in warnings)
+    assert any("user_profile_enabled" in w for w in warnings)
+
+
+def test_false_strings_are_off_and_silent(make_provider, hermes, warnings):
+    hermes.config = {"memory": {"memory_enabled": "false", "user_profile_enabled": "off"}}
+    make_provider()
+    assert warnings == []

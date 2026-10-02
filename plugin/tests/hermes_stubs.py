@@ -127,7 +127,9 @@ class HermesState:
     @classmethod
     def reset(cls) -> None:
         cls.timezone_name = "Pacific/Auckland"
-        cls.config = {"memory": {}}
+        # Built-in memory already off, as ``post_setup`` leaves it. Hermes
+        # defaults both flags on, so an empty section would warn.
+        cls.config = {"memory": {"memory_enabled": False, "user_profile_enabled": False}}
         cls.saved = []
 
 

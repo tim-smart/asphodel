@@ -112,6 +112,8 @@ class Spool:
         (a 4xx: the file is dropped), and raises
         :class:`asphodel_plugin.client.DaemonUnavailable` to stop the replay
         and keep the rest. Returns how many were delivered."""
+        # An outage's turns past the age cap are dropped, not delivered late.
+        self.enforce_caps()
         delivered = 0
         dropped = 0
         for path in self.files():
