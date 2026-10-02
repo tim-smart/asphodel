@@ -2613,6 +2613,75 @@ fn denies_on_an_ended_or_retracted_neighbour_is_rejected() {
     assert_eq!(h.edits_on(dentist, EDIT_RETRACTED), 1);
 }
 
+// A forget's queued chunks (ADR 0010; "Erase path, forget, purge and the
+// nightly sweep", TIM-112). Forget hides the chain at once and erases it
+// behind the chunks already queued. Those chunks reconcile against the
+// hidden memory, which is still there, so what they say joins its chain
+// and is erased with it. `hidden_at` is set here as forget sets it.
+
+/// Hides `memory` as forget does the moment it's called.
+fn hide(h: &Harness, memory: Uuid) {
+    h.execute(
+        "UPDATE memories SET hidden_at = ?2 WHERE uuid = ?1",
+        (memory.to_string(), micros(h.now())),
+    );
+}
+
+#[test]
+fn a_correction_queued_before_a_forget_joins_the_hidden_chain() {
+    let h = Harness::new();
+    let maya = h.fact(MAYA);
+    owner_says(&h, "My daughter is called Mia, not Maya.");
+    hide(&h, maya);
+
+    let call1 = reply(vec![changes(claim(
+        MIA,
+        "fact",
+        "My daughter is called Mia, not Maya",
+    ))]);
+    let input = call2(&h, &call1).expect("call 2 runs");
+    assert!(shown(&input).contains(&maya), "{:?}", shown(&input));
+
+    let mia = one_label(&h, call1, maya, "retracts").memories[0];
+    assert_eq!(h.change(maya).superseded_by, Some(mia));
+    let links: Vec<Link> = h
+        .all::<i64, _>("SELECT id FROM memories", [])
+        .into_iter()
+        .map(|id| Link {
+            id,
+            superseded_by: h.one("SELECT superseded_by FROM memories WHERE id = ?1", [id]),
+            ended_by: None,
+        })
+        .collect();
+    assert_eq!(
+        inherits_from(&links, h.rowid(mia)),
+        BTreeSet::from([h.rowid(maya), h.rowid(mia)]),
+        "Mia is the head of the chain the erase takes"
+    );
+}
+
+#[test]
+fn a_mention_queued_before_a_forget_is_an_access_on_the_hidden_memory() {
+    // The access names the turn it came from, which is how the erase finds
+    // that turn's passage to redact.
+    let h = Harness::new();
+    let maya = h.fact(MAYA);
+    let source = owner_says(&h, "My daughter is called Maya.");
+    hide(&h, maya);
+
+    let extracted = one_label(
+        &h,
+        reply(vec![claim(MAYA, "fact", "My daughter is called Maya")]),
+        maya,
+        "mentioned_again",
+    );
+    assert!(extracted.memories.is_empty());
+    let accesses = h.accesses(maya);
+    assert_eq!(accesses.len(), 2, "{accesses:?}");
+    assert_eq!(accesses[1].kind, "mentioned_again");
+    assert_eq!(accesses[1].source, Some(source));
+}
+
 // Mental models.
 
 #[test]
