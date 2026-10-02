@@ -662,6 +662,47 @@ impl Service {
         }))
     }
 
+    /// The first half of [`Service::extract_leased`]: runs the LLM calls
+    /// and plans the chunk, holding its lease, without writing anything.
+    /// Replay runs it when the worker claims the chunk and
+    /// [`Service::commit_extraction`] a latency later (TIM-96, decision 3).
+    pub fn prepare_extraction(
+        &self,
+        lease: Lease,
+        llm: &dyn LlmClient,
+        in_context: &[Uuid],
+        entries: &[BlockEntry],
+    ) -> Result<crate::extraction::Prepared, ExtractError> {
+        let models = self.models.as_ref().ok_or(ExtractError::NoModels)?;
+        let bank_id = lease.bank_id();
+        crate::extraction::prepare(
+            &self.store,
+            &self.leases,
+            &self.tuning,
+            self.bank_embedder(models, bank_id)?,
+            lease,
+            llm,
+            in_context,
+            entries,
+        )
+    }
+
+    /// The second half of [`Service::extract_leased`]: commits a prepared
+    /// chunk, then runs what follows writes.
+    pub fn commit_extraction(
+        &self,
+        prepared: crate::extraction::Prepared,
+    ) -> Result<Extracted, ExtractError> {
+        let bank_id = prepared.lease().bank_id();
+        let watermark = {
+            let conn = self.store.connection();
+            crate::mental_models::watermark(&conn, bank_id).map_err(StoreError::Sqlite)?
+        };
+        let extracted = crate::extraction::commit_prepared(&self.store, &self.leases, prepared)?;
+        self.after_writes(bank_id, watermark, &extracted.memories)?;
+        Ok(extracted)
+    }
+
     /// The second half of [`Service::extract_next`]: extracts a chunk
     /// claimed by [`Service::next_extraction`] with the in-context set and
     /// entries it returned.

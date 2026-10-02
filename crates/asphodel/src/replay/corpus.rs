@@ -116,12 +116,15 @@ pub fn load(path: &Path) -> anyhow::Result<Corpus> {
     let hash = hex(&Sha256::digest(&bytes));
     let text = std::str::from_utf8(&bytes)
         .with_context(|| format!("the corpus {} isn't UTF-8", path.display()))?;
-    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-    let Some(first) = lines.next() else {
+    let Some((first_line, first)) = text
+        .lines()
+        .enumerate()
+        .find(|(_, line)| !line.trim().is_empty())
+    else {
         bail!("the corpus {} is empty", path.display());
     };
     let header: Header = serde_json::from_str(first)
-        .with_context(|| format!("the first line of {} isn't a corpus header", path.display()))?;
+        .map_err(|error| super::json_error(path, first_line + 1, "a corpus header", &error))?;
     if header.corpus != VERSION {
         bail!(
             "the corpus {} is version {}, and this build reads version {VERSION}",
@@ -130,9 +133,12 @@ pub fn load(path: &Path) -> anyhow::Result<Corpus> {
         );
     }
     let mut events = Vec::new();
-    for (number, line) in lines.enumerate() {
+    for (number, line) in text.lines().enumerate().skip(first_line + 1) {
+        if line.trim().is_empty() {
+            continue;
+        }
         let event: Event = serde_json::from_str(line)
-            .with_context(|| format!("line {} of {} isn't an event", number + 2, path.display()))?;
+            .map_err(|error| super::json_error(path, number + 1, "an event", &error))?;
         events.push(event);
     }
     Ok(Corpus {

@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asphodel_core::extraction::{Call1Input, DropReason, Extracted};
+use asphodel_core::extraction::{Call1Input, DropReason, Extracted, Prepared};
 use asphodel_core::ingest::{Document, Outcome as IngestOutcome, Turn, TurnAuthor};
 use asphodel_core::inspect::InspectError;
 use asphodel_core::models::{FakeLlm, LlmClient, LlmError, LlmRequest, LlmResponse};
@@ -110,8 +110,9 @@ pub struct Settings {
     /// The simulated extraction latency, when it isn't taken from the
     /// cassette.
     pub latency: SignedDuration,
-    /// Take each chunk's latency from the cassette's records for it when
-    /// there are any (TIM-96, decision 3), else `latency`.
+    /// Take each chunk's latency from how long the calls that answered it
+    /// took (TIM-96, decision 3): recorded for a record, measured for a
+    /// live call. Otherwise `latency`.
     pub latency_from_cassette: bool,
     pub until: Option<Timestamp>,
 }
@@ -165,9 +166,21 @@ struct Pending {
     name: String,
 }
 
+/// A chunk the worker has claimed and prepared: its LLM calls ran at the
+/// claim, and it commits at its completion.
+struct Ready {
+    prepared: Prepared,
+    source: Uuid,
+    position: u32,
+    /// Its scripted claims: those whose quote is in it.
+    mine: Vec<Claim>,
+    /// How long it takes, in simulated time, from the claim to the commit.
+    latency: SignedDuration,
+}
+
 enum EventKind {
     Timer,
-    Completion(Claimed),
+    Completion(Box<Ready>),
     Prefetch(usize),
     Sync(usize),
     Document(usize),
@@ -292,7 +305,7 @@ impl<'a> Engine<'a> {
                 .iter()
                 .map(|probe| Regex::new(probe.check.memory()).map(Some))
                 .collect::<Result<_, _>>()
-                .map_err(|error| Failure::Scenario(format!("a probe's regex: {error}")))?,
+                .map_err(|_| Failure::Scenario("a probe's memory regex doesn't parse".into()))?,
         };
         let mut engine = Self {
             service,
@@ -437,7 +450,7 @@ impl<'a> Engine<'a> {
             self.clock.set(key.at);
             match kind {
                 EventKind::Timer => self.timer()?,
-                EventKind::Completion(claimed) => self.complete(claimed)?,
+                EventKind::Completion(ready) => self.complete(*ready)?,
                 EventKind::Prefetch(index) => self.prefetch(index)?,
                 EventKind::Sync(index) => self.sync(index)?,
                 EventKind::Document(index) => self.document(index)?,
@@ -548,62 +561,47 @@ impl<'a> Engine<'a> {
     }
 
     /// When the bank's one worker is free, it claims the head of the
-    /// production queue and commits it a latency later.
+    /// production queue, runs its LLM calls at once, and commits it a
+    /// latency later.
     fn start_worker(&mut self) -> Result<(), Failure> {
         if self.working {
             return Ok(());
         }
         match self.service.next_extraction(&self.settings.bank)? {
-            Some(claimed) => self.schedule_completion(claimed),
+            Some(claimed) => {
+                let ready = self.prepare_chunk(claimed)?;
+                self.schedule_completion(ready)
+            }
             None => Ok(()),
         }
     }
 
-    /// The latency a chunk's completion is scheduled with: the cassette's
-    /// recorded latency for it when asked and there is one, else the
-    /// settings' constant.
-    fn latency_for(&self, claimed: &Claimed) -> SignedDuration {
-        if self.settings.latency_from_cassette
-            && let Llm::Recorded(recorder, _) = self.llm
-            && let Some(recorded) = recorder.recorded_latency(&ChunkKey {
-                source: claimed.lease.source,
-                position: claimed.lease.position,
-            })
-        {
-            return SignedDuration::try_from(recorded).unwrap_or(SignedDuration::MAX);
-        }
-        self.settings.latency
-    }
-
-    /// Holds the worker on `claimed` until a latency from now.
-    fn schedule_completion(&mut self, claimed: Claimed) -> Result<(), Failure> {
-        if !self.pending.contains_key(&claimed.lease.source) {
-            return Err(internal(format!(
-                "the worker claimed source {}, which the timeline didn't sync",
-                claimed.lease.source
-            )));
-        }
-        let latency = self.latency_for(&claimed);
+    /// Holds the worker on a prepared chunk until its latency from now.
+    fn schedule_completion(&mut self, ready: Ready) -> Result<(), Failure> {
         let at = self
             .clock
             .now()
-            .checked_add(latency)
+            .checked_add(ready.latency)
             .unwrap_or(Timestamp::MAX);
         self.working = true;
         self.extend_end(at);
-        self.push(at, 1, EventKind::Completion(claimed));
+        self.push(at, 1, EventKind::Completion(Box::new(ready)));
         Ok(())
     }
 
     /// Commits the worker's chunk, and with it the rest of its source's
-    /// chunks while they are the queue's head: the latency is per source.
-    /// Then the worker takes the next head, if any.
-    fn complete(&mut self, claimed: Claimed) -> Result<(), Failure> {
-        let source = claimed.lease.source;
-        self.extract_chunk(claimed)?;
+    /// chunks while they are the queue's head: the latency is per source,
+    /// so those are prepared and committed here. Then the worker takes
+    /// the next head, if any.
+    fn complete(&mut self, ready: Ready) -> Result<(), Failure> {
+        let source = ready.source;
+        self.commit_chunk(ready)?;
         let next = loop {
             match self.service.next_extraction(&self.settings.bank)? {
-                Some(claimed) if claimed.lease.source == source => self.extract_chunk(claimed)?,
+                Some(claimed) if claimed.lease.source == source => {
+                    let ready = self.prepare_chunk(claimed)?;
+                    self.commit_chunk(ready)?;
+                }
                 other => break other,
             }
         };
@@ -612,7 +610,10 @@ impl<'a> Engine<'a> {
         self.schedule_timer(refreshes);
         self.working = false;
         match next {
-            Some(claimed) => self.schedule_completion(claimed),
+            Some(claimed) => {
+                let ready = self.prepare_chunk(claimed)?;
+                self.schedule_completion(ready)
+            }
             None => Ok(()),
         }
     }
@@ -648,38 +649,45 @@ impl<'a> Engine<'a> {
         Ok(next_due)
     }
 
-    /// Extracts one claimed chunk: with the scripted replies, or through
-    /// the cassette.
-    fn extract_chunk(&mut self, claimed: Claimed) -> Result<(), Failure> {
+    /// Prepares one claimed chunk: its call 1 and call 2 run now, with the
+    /// scripted replies or through the cassette, and the latency it
+    /// completes after is the settings' constant, or, when it's taken from
+    /// the recording, how long the calls that answered took (TIM-96,
+    /// decision 3).
+    fn prepare_chunk(&mut self, claimed: Claimed) -> Result<Ready, Failure> {
         let Claimed {
             lease,
             in_context,
             entries,
         } = claimed;
         let source = lease.source;
-        let mut pending = self
-            .pending
-            .remove(&source)
-            .ok_or_else(|| internal(format!("no pending extraction for source {source}")))?;
         let position = lease.position;
         let input = self.service.call1_input(&lease, &in_context)?;
+        let (mine, used, name) = {
+            let pending = self.pending.get_mut(&source).ok_or_else(|| {
+                internal(format!(
+                    "the worker claimed source {source}, which the timeline didn't sync"
+                ))
+            })?;
+            // The chunk's scripted claims: those whose quote is in it, in
+            // order.
+            let mut mine: Vec<Claim> = Vec::new();
+            pending.claims.retain(|claim| {
+                if input.text.contains(&claim.quote) {
+                    mine.push(claim.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            (mine, pending.used.clone(), pending.name.clone())
+        };
         self.chunks += 1;
 
-        // The chunk's scripted claims: those whose quote is in it, in order.
-        let mut mine: Vec<Claim> = Vec::new();
-        pending.claims.retain(|claim| {
-            if input.text.contains(&claim.quote) {
-                mine.push(claim.clone());
-                false
-            } else {
-                true
-            }
-        });
-
-        let extracted = match self.llm {
+        let (prepared, latency) = match self.llm {
             Llm::Scripted => {
                 let mut used_handles = Vec::new();
-                for label in &pending.used {
+                for label in &used {
                     let id = self.labels.get(label).copied();
                     let handle = id.and_then(|id| {
                         input
@@ -692,8 +700,7 @@ impl<'a> Engine<'a> {
                         Some(handle) => used_handles.push(handle),
                         None => {
                             return Err(Failure::Scenario(format!(
-                                "{} uses {label:?}, which isn't in the session's in-context set",
-                                pending.name
+                                "{name} uses {label:?}, which isn't in the session's in-context set"
                             )));
                         }
                     }
@@ -703,18 +710,48 @@ impl<'a> Engine<'a> {
                 if call2.is_some() {
                     self.call2_chunks += 1;
                 }
-                let reply2 = self.call2_reply(&mine, call2.as_ref(), &pending.name)?;
+                let reply2 = self.call2_reply(&mine, call2.as_ref(), &name)?;
                 let llm = FakeLlm::scripted(MODEL, vec![reply1, reply2]);
-                let extracted = self
-                    .service
-                    .extract_leased(lease, &llm, &in_context, &entries)?;
+                let prepared =
+                    self.service
+                        .prepare_extraction(lease, &llm, &in_context, &entries)?;
                 self.llm_calls += llm.requests().len() as u64;
-                extracted
+                (prepared, self.settings.latency)
             }
             Llm::Recorded(recorder, mode) => {
-                self.extract_recorded(recorder, mode, lease, &in_context, &entries, &input)?
+                let (prepared, served) =
+                    self.prepare_recorded(recorder, mode, lease, &in_context, &entries, &input)?;
+                let latency = if self.settings.latency_from_cassette {
+                    SignedDuration::try_from(served).unwrap_or(SignedDuration::MAX)
+                } else {
+                    self.settings.latency
+                };
+                (prepared, latency)
             }
         };
+        Ok(Ready {
+            prepared,
+            source,
+            position,
+            mine,
+            latency,
+        })
+    }
+
+    /// Commits a prepared chunk at its completion.
+    fn commit_chunk(&mut self, ready: Ready) -> Result<(), Failure> {
+        let Ready {
+            prepared,
+            source,
+            position,
+            mine,
+            ..
+        } = ready;
+        let mut pending = self
+            .pending
+            .remove(&source)
+            .ok_or_else(|| internal(format!("no pending extraction for source {source}")))?;
+        let extracted = self.service.commit_extraction(prepared)?;
 
         let now = self.clock.now();
         self.note_created(&extracted, source, position, &mine, &pending.name)?;
@@ -734,9 +771,10 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Extracts through the cassette (TIM-96, decision 4). In `fast` mode
-    /// call 1 is composed from the recording when the chunk has one.
-    fn extract_recorded(
+    /// Prepares a chunk through the cassette (TIM-96, decision 4), with
+    /// how long the calls that answered took. In `fast` mode call 1 is
+    /// composed from the recording when the chunk has one.
+    fn prepare_recorded(
         &mut self,
         recorder: &Recorder,
         mode: ReplayMode,
@@ -744,7 +782,7 @@ impl<'a> Engine<'a> {
         in_context: &[Uuid],
         entries: &[asphodel_core::system_prompt::BlockEntry],
         input: &Call1Input,
-    ) -> Result<Extracted, Failure> {
+    ) -> Result<(Prepared, Duration), Failure> {
         let context = ChunkContext::new(
             ChunkKey {
                 source: lease.source,
@@ -763,7 +801,7 @@ impl<'a> Engine<'a> {
             Ok(Some(reply1)) => {
                 let chained = Chained::new(reply1, recorder);
                 self.service
-                    .extract_leased(lease, &chained, in_context, entries)
+                    .prepare_extraction(lease, &chained, in_context, entries)
             }
             Ok(None) => {
                 recorder.with_counts(|counts| match mode {
@@ -771,16 +809,17 @@ impl<'a> Engine<'a> {
                     ReplayMode::Live | ReplayMode::Fast => counts.verdicts.live += judged,
                 });
                 self.service
-                    .extract_leased(lease, recorder, in_context, entries)
+                    .prepare_extraction(lease, recorder, in_context, entries)
             }
             Err(error) => Err(asphodel_core::extraction::ExtractError::Held { error }),
         };
+        let served = recorder.served_latency();
         recorder.leave();
         if recorder.with_counts(|counts| counts.call2) > call2_before {
             self.call2_chunks += 1;
         }
         match result {
-            Ok(extracted) => Ok(extracted),
+            Ok(prepared) => Ok((prepared, served)),
             Err(error) => Err(match recorder.first_miss() {
                 Some(miss) => Failure::Internal(anyhow::anyhow!(
                     "{miss}; a replay fails on a miss, and fast needs an LLM for one"

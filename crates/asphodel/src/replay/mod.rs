@@ -54,7 +54,7 @@ use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::{DB_FILE, DataDirLock, LOCK_FILE, OpenOptions, StoreError};
 use asphodel_core::{Clock, Models, Service, SimulatedClock, Store, Tuning, VERSION};
 use jiff::tz::TimeZone;
-use tracing::info;
+use tracing::{info, trace};
 
 use crate::cli::ReplayArgs;
 use engine::{Engine, Failure, Llm, Settings};
@@ -439,6 +439,13 @@ fn is_reserved(dir: &Path, path: &Path) -> bool {
 /// A file derived from real history (TIM-96, decision 8): it must be
 /// under the private dir, and not one of replay's own files.
 pub(crate) fn inside_private(dir: &Path, path: &Path, what: &str) -> anyhow::Result<PathBuf> {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!(
+            "{what} {} is a symlink; everything derived from real history stays inside the private directory {}, so replay never follows one",
+            path.display(),
+            dir.display()
+        );
+    }
     let path = resolve(path, what)?;
     if !path.starts_with(dir) {
         bail!(
@@ -451,6 +458,49 @@ pub(crate) fn inside_private(dir: &Path, path: &Path, what: &str) -> anyhow::Res
         bail!("{what} {} is a reserved replay destination", path.display());
     }
     Ok(path)
+}
+
+/// A TOML file that didn't parse, as an error that names the file and
+/// where, and holds none of the file's text (ADR 0010, "Logging"): the
+/// parser's own message quotes the source, so it goes to `trace` only.
+pub(crate) fn toml_error(path: &Path, text: &str, error: &toml::de::Error) -> anyhow::Error {
+    trace!(file = %path.display(), %error, "a private TOML file didn't parse");
+    match error.span() {
+        Some(span) => {
+            let before = &text[..span.start.min(text.len())];
+            let line = before.matches('\n').count() + 1;
+            let column = before.len() - before.rfind('\n').map_or(0, |at| at + 1) + 1;
+            anyhow!(
+                "{} doesn't parse at line {line}, column {column}",
+                path.display()
+            )
+        }
+        None => anyhow!("{} doesn't parse", path.display()),
+    }
+}
+
+/// A JSON line that didn't parse, as an error that names the file, the
+/// line and the column, and holds none of the line's text (ADR 0010,
+/// "Logging"): serde's message can quote a value, so it goes to `trace`
+/// only.
+pub(crate) fn json_error(
+    path: &Path,
+    line: usize,
+    what: &str,
+    error: &serde_json::Error,
+) -> anyhow::Error {
+    trace!(file = %path.display(), line, %error, "a private JSON line didn't parse");
+    let kind = match error.classify() {
+        serde_json::error::Category::Io => "can't be read",
+        serde_json::error::Category::Syntax => "isn't valid JSON",
+        serde_json::error::Category::Data => "has a field of the wrong shape",
+        serde_json::error::Category::Eof => "ends early",
+    };
+    anyhow!(
+        "line {line} of {} isn't {what}: it {kind} at column {}",
+        path.display(),
+        error.column()
+    )
 }
 
 /// Where the report goes, checked before the run (TIM-96, decision 8):

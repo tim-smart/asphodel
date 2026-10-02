@@ -91,8 +91,8 @@ impl Manifest {
 pub fn load(path: &Path) -> anyhow::Result<Manifest> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading the manifest {}", path.display()))?;
-    let manifest: Manifest = toml::from_str(&text)
-        .with_context(|| format!("parsing the manifest {}", path.display()))?;
+    let manifest: Manifest =
+        toml::from_str(&text).map_err(|error| super::toml_error(path, &text, &error))?;
     TimeZone::get(&manifest.timezone)
         .with_context(|| format!("the manifest's timezone {:?}", manifest.timezone))?;
     if manifest.bank.is_empty() {
@@ -104,13 +104,10 @@ pub fn load(path: &Path) -> anyhow::Result<Manifest> {
             bail!("a manifest speaker has an empty name or id");
         }
         if !names.insert(speaker.name.as_str()) {
-            bail!("the manifest lists the speaker {:?} twice", speaker.name);
+            bail!("the manifest lists one speaker's name twice");
         }
         if manifest.owner.name.as_deref() == Some(speaker.name.as_str()) {
-            bail!(
-                "the manifest lists the owner {:?} as a speaker too",
-                speaker.name
-            );
+            bail!("the manifest lists the owner as a speaker too");
         }
     }
     let mut models = std::collections::BTreeSet::new();

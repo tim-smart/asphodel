@@ -89,7 +89,11 @@ pub fn run(args: ImportArgs) -> anyhow::Result<()> {
 
 fn execute(args: &ImportArgs) -> anyhow::Result<()> {
     let dir = super::private_dir(args.replay_dir.as_deref())?;
-    let manifest = super::manifest::load(&args.manifest)?;
+    // Both inputs are real history, so both stay inside the private dir
+    // (TIM-96, decision 8), checked before either is read.
+    let manifest_path = super::inside_private(&dir, &args.manifest, "the manifest")?;
+    let state_db = super::inside_private(&dir, &args.state_db, "the state.db copy")?;
+    let manifest = super::manifest::load(&manifest_path)?;
     let out = match &args.out {
         Some(path) => super::inside_private(&dir, path, "the corpus")?,
         None => {
@@ -108,8 +112,8 @@ fn execute(args: &ImportArgs) -> anyhow::Result<()> {
     };
     super::refuse_symlink(&out)?;
 
-    let conn = open_read_only(&args.state_db)?;
-    let schema_version = check_schema(&conn, &args.state_db)?;
+    let conn = open_read_only(&state_db)?;
+    let schema_version = check_schema(&conn, &state_db)?;
     let (header, events, counts) = import(&conn, &manifest, schema_version)?;
     if args.dry_run {
         println!("{}", serde_json::to_string_pretty(&counts)?);
@@ -485,8 +489,11 @@ fn plain_text(
     let (text, multimodal) = match content.strip_prefix(MULTIMODAL_PREFIX) {
         Some(json) => {
             counts.multimodal_rows += 1;
-            let parts: Value =
-                serde_json::from_str(json).context("a multimodal row's parts aren't JSON")?;
+            // serde's message can quote the row, so only `trace` sees it.
+            let parts: Value = serde_json::from_str(json).map_err(|error| {
+                tracing::trace!(%error, "a multimodal row's parts aren't JSON");
+                anyhow::anyhow!("a multimodal row's parts aren't JSON")
+            })?;
             let Value::Array(parts) = parts else {
                 bail!("a multimodal row's parts aren't a list");
             };

@@ -25,7 +25,7 @@ pub fn load(path: &Path, group: Group) -> anyhow::Result<Vec<Probe>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading the probes file {}", path.display()))?;
     let file: File =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        toml::from_str(&text).map_err(|error| super::toml_error(path, &text, &error))?;
     let mut errors = Vec::new();
     let mut ids = BTreeSet::new();
     for (index, probe) in file.probes.iter().enumerate() {
@@ -38,10 +38,11 @@ pub fn load(path: &Path, group: Group) -> anyhow::Result<Vec<Probe>> {
                 "the probe id {id:?} can't start with {PROBE_SESSION_PREFIX:?}"
             ));
         }
+        // The regex error quotes the pattern, which is about Tim's
+        // memories, so only `trace` sees it (ADR 0010).
         if let Err(error) = Regex::new(probe.check.memory()) {
-            errors.push(format!(
-                "probe {id}: its memory regex doesn't parse: {error}"
-            ));
+            tracing::trace!(probe = %id, %error, "a probe's memory regex doesn't parse");
+            errors.push(format!("probe {id}: its memory regex doesn't parse"));
         }
         if probe.check.needs_models() && group == Group::Ci {
             errors.push(format!(

@@ -82,6 +82,10 @@ pub struct Record {
     /// SHA-256 of the assistant's reply in the chunk.
     #[serde(default)]
     pub reply_hash: Option<String>,
+    /// For a refresh, the memory or entry each of its handles stood for,
+    /// so a substituted reply can be carried over by identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identities: Vec<(String, Uuid)>,
     pub request: LlmRequest,
     pub response: LlmResponse,
 }
@@ -249,13 +253,19 @@ pub struct Recorder {
     counts: Mutex<Counts>,
     file: Mutex<Option<File>>,
     first_miss: Mutex<Option<String>>,
+    /// The latency of the responses served since the last
+    /// [`Recorder::enter`], in milliseconds: recorded for the records that
+    /// answered, measured for live calls.
+    served_ms: Mutex<u64>,
     /// SHA-256 of the file as it stood when opened.
     pub hash: String,
 }
 
 impl Recorder {
     /// Opens the cassette, reading what it holds. The file is created on
-    /// the first record, never followed through a symlink.
+    /// the first record, never followed through a symlink. With
+    /// `no_cache` it's emptied instead: a re-recording starts afresh, and
+    /// the hash is of what the run could read, which is nothing.
     pub fn open(
         path: &Path,
         mode: ReplayMode,
@@ -265,12 +275,20 @@ impl Recorder {
         clock: Arc<SimulatedClock>,
     ) -> anyhow::Result<Self> {
         super::refuse_symlink(path)?;
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("reading the cassette {}", path.display()));
+        let bytes = if no_cache {
+            if path.exists() {
+                File::create(path)
+                    .with_context(|| format!("emptying the cassette {}", path.display()))?;
+            }
+            Vec::new()
+        } else {
+            match fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading the cassette {}", path.display()));
+                }
             }
         };
         let hash = hex(&Sha256::digest(&bytes));
@@ -281,12 +299,8 @@ impl Recorder {
             if line.trim().is_empty() {
                 continue;
             }
-            let record: Record = serde_json::from_str(line).with_context(|| {
-                format!(
-                    "line {} of the cassette {} isn't a record",
-                    number + 1,
-                    path.display()
-                )
+            let record: Record = serde_json::from_str(line).map_err(|error| {
+                super::json_error(path, number + 1, "a cassette record", &error)
             })?;
             index.insert(record);
         }
@@ -311,17 +325,29 @@ impl Recorder {
             counts: Mutex::new(Counts::default()),
             file: Mutex::new(None),
             first_miss: Mutex::new(None),
+            served_ms: Mutex::new(0),
             hash,
         })
     }
 
     /// Tells the recorder which chunk the next calls are for.
     pub fn enter(&self, context: ChunkContext) {
+        *lock(&self.served_ms) = 0;
         *lock(&self.chunk) = Some(context);
     }
 
     pub fn leave(&self) {
         *lock(&self.chunk) = None;
+    }
+
+    /// How long the calls for the chunk since [`Recorder::enter`] took
+    /// (TIM-96, decision 3): the recorded latency of each record that
+    /// answered, and the measured latency of each live call, which is what
+    /// its record will say. Only the responses actually served count, so
+    /// older recordings of the chunk, other models' and top-ups that
+    /// weren't needed never do.
+    pub fn served_latency(&self) -> Duration {
+        Duration::from_millis(*lock(&self.served_ms))
     }
 
     /// The first miss that couldn't be answered, if any.
@@ -353,19 +379,6 @@ impl Recorder {
         }
     }
 
-    /// The recorded latency of a chunk's calls, summed, when the cassette
-    /// holds any for it (TIM-96, decision 3).
-    pub fn recorded_latency(&self, key: &ChunkKey) -> Option<Duration> {
-        let index = lock(&self.index);
-        let mut total = None;
-        for record in &index.records {
-            if record.chunk.as_ref() == Some(key) {
-                total = Some(total.unwrap_or(0) + record.latency_ms);
-            }
-        }
-        total.map(Duration::from_millis)
-    }
-
     /// `fast` mode's call 1 (TIM-96, decision 4): the chunk's recorded
     /// claims, the `used` verdicts the pair cache holds, and one top-up for
     /// the pairs it doesn't. `None` when the chunk has no record, which is
@@ -377,7 +390,9 @@ impl Recorder {
             let Some(&position) = index.claims.get(&key) else {
                 return Ok(None);
             };
-            let claims = index.records[position]
+            let record = &index.records[position];
+            *lock(&self.served_ms) += record.latency_ms;
+            let claims = record
                 .response
                 .json
                 .get("claims")
@@ -445,7 +460,7 @@ impl Recorder {
             in_context: unknown.to_vec(),
             entries: Vec::new(),
         };
-        let response = self.answer(&request, Some(&subset))?;
+        let response = self.answer(&request, Some(&subset), &[])?;
         let judged: Vec<String> = response
             .json
             .get("used")
@@ -472,13 +487,17 @@ impl Recorder {
         &self,
         request: &LlmRequest,
         context: Option<&ChunkContext>,
+        identities: &[(String, Uuid)],
     ) -> Result<LlmResponse, LlmError> {
         let key = key_of(&self.model, request);
         if !self.no_cache {
             let index = lock(&self.index);
             if let Some(&position) = index.by_key.get(&key) {
-                let response = index.records[position].response.clone();
+                let record = &index.records[position];
+                let response = record.response.clone();
+                let latency_ms = record.latency_ms;
                 drop(index);
+                *lock(&self.served_ms) += latency_ms;
                 lock(&self.counts).cache += 1;
                 return Ok(response);
             }
@@ -507,12 +526,12 @@ impl Recorder {
             }
         };
         let response = call_with_retries(live.as_ref(), request)?;
+        let latency_ms = u64::try_from(response.latency.as_millis()).unwrap_or(u64::MAX);
+        *lock(&self.served_ms) += latency_ms;
         {
             let mut counts = lock(&self.counts);
             counts.live += 1;
-            counts
-                .latencies_ms
-                .push(u64::try_from(response.latency.as_millis()).unwrap_or(u64::MAX));
+            counts.latencies_ms.push(latency_ms);
         }
         let current = lock(&self.chunk);
         let context = context.or(current.as_ref());
@@ -521,7 +540,7 @@ impl Recorder {
             model: self.model.clone(),
             template: request.template.clone(),
             at: self.clock.now(),
-            latency_ms: u64::try_from(response.latency.as_millis()).unwrap_or(u64::MAX),
+            latency_ms,
             chunk: context.map(|context| context.key.clone()),
             in_context: context
                 .filter(|_| request.template.name != CALL2_TEMPLATE)
@@ -543,6 +562,7 @@ impl Recorder {
             reply_hash: context
                 .filter(|_| request.template.name != CALL2_TEMPLATE)
                 .map(|context| context.reply_hash.clone()),
+            identities: identities.to_vec(),
             request: request.clone(),
             response: response.clone(),
         };
@@ -577,22 +597,87 @@ impl Recorder {
     }
 
     /// `fast` with `--refresh recorded`: the recorded refresh of the same
-    /// model nearest in simulated time, by the question line the request
-    /// starts with.
-    fn nearest_refresh(&self, request: &LlmRequest) -> Option<LlmResponse> {
+    /// mental model, by the question line the request starts with, nearest
+    /// in simulated time, among those made with this run's LLM model and
+    /// the request's template version. Its operations are carried over by
+    /// identity: each handle goes to the memory or entry it stood for when
+    /// recorded, then to that one's handle now, and an operation whose
+    /// entry or any cited memory isn't in this input is dropped, since
+    /// it would say something the LLM never said about what's here.
+    fn nearest_refresh(
+        &self,
+        request: &LlmRequest,
+        identities: &[(String, Uuid)],
+    ) -> Option<LlmResponse> {
         let question = request.user.lines().next().unwrap_or("").to_string();
         let now = self.clock.now();
         let index = lock(&self.index);
-        index
+        let record = index
             .refreshes
             .iter()
             .map(|&position| &index.records[position])
-            .filter(|record| record.request.user.lines().next().unwrap_or("") == question)
+            .filter(|record| {
+                record.model == self.model
+                    && record.template.version == request.template.version
+                    && record.request.user.lines().next().unwrap_or("") == question
+            })
             .min_by_key(|record| {
                 let distance = record.at.duration_since(now).abs();
                 (distance, record.at)
-            })
-            .map(|record| record.response.clone())
+            })?;
+        Some(carry_over(record, identities))
+    }
+}
+
+/// A recorded refresh's response with its handles carried over to
+/// `identities` (see [`Recorder::nearest_refresh`]). A record without
+/// identities, from before they were kept, carries nothing over.
+fn carry_over(record: &Record, identities: &[(String, Uuid)]) -> LlmResponse {
+    let meant: BTreeMap<&str, Uuid> = record
+        .identities
+        .iter()
+        .map(|(handle, id)| (handle.as_str(), *id))
+        .collect();
+    let current: BTreeMap<Uuid, &str> = identities
+        .iter()
+        .map(|(handle, id)| (*id, handle.as_str()))
+        .collect();
+    let carry = |handle: &str| -> Option<String> {
+        let id = meant.get(handle.trim())?;
+        current.get(id).map(|handle| (*handle).to_string())
+    };
+    let operations = record
+        .response
+        .json
+        .get("operations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut kept = Vec::new();
+    for mut operation in operations {
+        if let Some(entry) = operation.get("entry").and_then(Value::as_str) {
+            match carry(entry) {
+                Some(handle) => operation["entry"] = Value::from(handle),
+                None => continue,
+            }
+        }
+        if let Some(cites) = operation.get("cites").and_then(Value::as_array) {
+            let carried: Option<Vec<Value>> = cites
+                .iter()
+                .map(|cite| cite.as_str().and_then(carry).map(Value::from))
+                .collect();
+            match carried {
+                Some(cites) => operation["cites"] = Value::Array(cites),
+                None => continue,
+            }
+        }
+        kept.push(operation);
+    }
+    let mut json = record.response.json.clone();
+    json["operations"] = Value::Array(kept);
+    LlmResponse {
+        json,
+        ..record.response.clone()
     }
 }
 
@@ -602,6 +687,14 @@ impl LlmClient for Recorder {
     }
 
     fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.complete_identified(request, &[])
+    }
+
+    fn complete_identified(
+        &self,
+        request: &LlmRequest,
+        identities: &[(String, Uuid)],
+    ) -> Result<LlmResponse, LlmError> {
         if request.template.name == REFRESH_TEMPLATE {
             lock(&self.counts).refresh_times.push(self.clock.now());
             if self.mode == ReplayMode::Fast {
@@ -614,7 +707,7 @@ impl LlmClient for Recorder {
                         });
                     }
                     RefreshMode::Recorded => {
-                        if let Some(response) = self.nearest_refresh(request) {
+                        if let Some(response) = self.nearest_refresh(request, identities) {
                             lock(&self.counts).cache += 1;
                             return Ok(response);
                         }
@@ -626,7 +719,7 @@ impl LlmClient for Recorder {
         if request.template.name == CALL2_TEMPLATE {
             lock(&self.counts).call2 += 1;
         }
-        self.answer(request, None)
+        self.answer(request, None, identities)
     }
 }
 

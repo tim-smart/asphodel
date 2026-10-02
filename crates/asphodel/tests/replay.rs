@@ -1407,3 +1407,75 @@ fn memory_ids_are_uuidv5_of_the_source_and_claim_ordinal() {
         "the memory id isn't keyed by its source"
     );
 }
+
+/// TIM-117 review, blocker 2 (Run D): extraction searches neighbours when
+/// the worker claims a chunk and commits a latency later, as production's
+/// worker does when call 1 returns. A neighbour purged by the 04:00 sweep
+/// in between is tolerated: the claim that would have refined it commits
+/// as a new memory, and the run doesn't fail.
+///
+/// The cat, mentioned once as trivial with bank time at world speed, is
+/// purged at the 2026-09-26 sweep (see `purge-table`). The turn that
+/// refines it syncs at 03:55 with a 10-minute latency, so the worker claims
+/// it before the sweep and commits after.
+#[test]
+fn a_neighbour_purged_between_claim_and_commit_leaves_the_claim_new() {
+    let dir = TestDir::new();
+    let path = inline(
+        &dir,
+        "purged-between-claim-and-commit",
+        r#"
+latency = "10m"
+
+[bank]
+timezone = "UTC"
+
+[tuning]
+clock.quiet_rate = 1.0
+
+[[turn]]
+at = "2026-01-05T09:00:00Z"
+session = "s1"
+user = "My neighbour's cat is called Biscuit."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "cat"
+content = "Tim's neighbour's cat is called Biscuit."
+quote = "My neighbour's cat is called Biscuit"
+kind = "fact"
+significance = "trivial"
+
+[[turn]]
+at = "2026-09-26T03:55:00Z"
+session = "s1"
+user = "My neighbour's cat is called Biscuit the Second, actually."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "second"
+content = "Tim's neighbour's cat is called Biscuit the Second."
+quote = "My neighbour's cat is called Biscuit the Second"
+kind = "fact"
+significance = "trivial"
+changes_something = true
+reconcile = [{ memory = "cat", outcome = "refines" }]
+
+[[probe]]
+id = "cat-is-purged"
+at = "2026-09-26T05:00:00Z"
+kind = "absent"
+memory = "cat"
+
+[[probe]]
+id = "second-is-new"
+at = "2026-09-26T05:00:00Z"
+kind = "exists"
+memory = "second"
+head = true
+"#,
+    );
+    let run = replay(&dir, &path, &[]);
+    run.assert_passed();
+    assert_eq!(purges(run.report()), 1, "{}", run.report());
+}

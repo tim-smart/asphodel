@@ -514,6 +514,31 @@ pub(crate) fn call2_input(
     Ok(search.map(|search| search.input))
 }
 
+/// A leased chunk extracted up to its commit: call 1's checked claims,
+/// their embeddings, the neighbours call 2 was shown with its labels, and
+/// the plan. The lease is still held. [`commit_prepared`] writes it.
+///
+/// Production runs the two halves back to back. Replay runs the first
+/// when the worker claims the chunk, so the LLM calls are measured, and
+/// the second a latency later (TIM-96, decision 3).
+pub struct Prepared {
+    lease: Lease,
+    input: Call1Input,
+    unit: input::Unit,
+    checked: claims::Checked,
+    vectors: Vec<Vec<f32>>,
+    search: Option<reconcile::Search>,
+    labels: Vec<call2::ClaimLabels>,
+    plan: reconcile::Plan,
+}
+
+impl Prepared {
+    /// The lease the chunk is held under.
+    pub fn lease(&self) -> &Lease {
+        &self.lease
+    }
+}
+
 /// Runs call 1 on the leased chunk, or takes its saved reply, reconciles
 /// the claims with call 2 when they land near something stored, and commits
 /// the result.
@@ -528,6 +553,25 @@ pub(crate) fn extract(
     in_context: &[Uuid],
     entries: &[BlockEntry],
 ) -> Result<Extracted, ExtractError> {
+    let prepared = prepare(
+        store, leases, tuning, embedder, lease, llm, in_context, entries,
+    )?;
+    commit_prepared(store, leases, prepared)
+}
+
+/// The first half of [`extract`]: everything up to the commit, the LLM
+/// calls included.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare(
+    store: &Store,
+    leases: &Leases,
+    tuning: &Tuning,
+    embedder: &dyn Embedder,
+    lease: Lease,
+    llm: &dyn LlmClient,
+    in_context: &[Uuid],
+    entries: &[BlockEntry],
+) -> Result<Prepared, ExtractError> {
     queue::check_held(leases, &lease)?;
     let (input, mut unit, saved) = {
         let conn = store.connection();
@@ -598,8 +642,8 @@ pub(crate) fn extract(
             });
         }
     };
-    let plan = match &search {
-        None => reconcile::Plan::all_new(checked.memories.len()),
+    let (labels, plan) = match &search {
+        None => (Vec::new(), reconcile::Plan::all_new(checked.memories.len())),
         Some(search) => {
             if !resumed {
                 save(store, &lease, &reply, &unit)?;
@@ -621,9 +665,72 @@ pub(crate) fn extract(
                     return Err(ExtractError::Call2 { error, failure });
                 }
             };
-            reconcile::plan(search, &input, &unit, &checked, &labels)
+            let plan = reconcile::plan(search, &input, &unit, &checked, &labels);
+            (labels, plan)
         }
     };
+    Ok(Prepared {
+        lease,
+        input,
+        unit,
+        checked,
+        vectors,
+        search,
+        labels,
+        plan,
+    })
+}
+
+/// The second half of [`extract`]: writes a prepared chunk. A neighbour
+/// that went between the halves, purged or forgotten, is planned without:
+/// call 2's labels on it are dropped, so a claim that would have ended,
+/// refined or restated it is new instead, as if it had never been stored.
+pub(crate) fn commit_prepared(
+    store: &Store,
+    leases: &Leases,
+    prepared: Prepared,
+) -> Result<Extracted, ExtractError> {
+    let Prepared {
+        lease,
+        input,
+        unit,
+        checked,
+        vectors,
+        search,
+        labels,
+        mut plan,
+    } = prepared;
+    queue::check_held(leases, &lease)?;
+    if let Some(search) = &search {
+        let gone = vanished(store, &search.neighbours)?;
+        if !gone.is_empty() {
+            let gone_handles: std::collections::BTreeSet<&str> = search
+                .input
+                .neighbours
+                .iter()
+                .zip(&search.neighbours)
+                .filter(|(_, neighbour)| gone.contains(&neighbour.id))
+                .map(|(shown, _)| shown.handle.as_str())
+                .collect();
+            let kept: Vec<call2::ClaimLabels> = labels
+                .iter()
+                .map(|(claim, claim_labels)| {
+                    let still: Vec<_> = claim_labels
+                        .iter()
+                        .filter(|(neighbour, _)| !gone_handles.contains(neighbour.as_str()))
+                        .cloned()
+                        .collect();
+                    (claim.clone(), still)
+                })
+                .collect();
+            tracing::info!(
+                chunk = %input.chunk,
+                neighbours = gone.len(),
+                "neighbours went between call 2 and the commit; their labels are dropped"
+            );
+            plan = reconcile::plan(search, &input, &unit, &checked, &kept);
+        }
+    }
 
     let neighbours = search.as_ref().map(|search| search.neighbours.as_slice());
     match commit::commit(
@@ -657,6 +764,19 @@ pub(crate) fn extract(
             Err(ExtractError::Commit { error, failure })
         }
     }
+}
+
+/// The ids among `neighbours` that are no longer in the store.
+fn vanished(store: &Store, neighbours: &[reconcile::Neighbour]) -> Result<Vec<i64>, StoreError> {
+    let conn = store.connection();
+    let mut statement = conn.prepare("SELECT 1 FROM memories WHERE id = ?1")?;
+    let mut gone = Vec::new();
+    for neighbour in neighbours {
+        if !statement.exists([neighbour.id])? {
+            gone.push(neighbour.id);
+        }
+    }
+    Ok(gone)
 }
 
 /// The reconcile floor for the embedder's exact model. The service refuses

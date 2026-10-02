@@ -265,9 +265,13 @@ A probe naming a label no claim defines is refused before the run.
 - **Extraction** is queued at a source's sync. Each bank has one simulated
   worker. Whenever it's free, at a sync or at its previous completion, it
   claims the head of the production queue (turns before documents, then
-  observed time) and commits that chunk a latency later. At that moment
-  it also commits the same source's next chunks, for as long as each is
-  the queue's head. Once another source is at the head, for example a
+  observed time), runs its LLM calls and neighbour search at once, as
+  production's worker does when it claims, and commits that chunk a
+  latency later. A neighbour that a sweep purged in between is planned
+  without: call 2's labels on it are dropped, so a claim that would have
+  ended, refined or restated it commits as new. At the completion the
+  worker also prepares and commits the same source's next chunks, for as
+  long as each is the queue's head. Once another source is at the head, for example a
   turn synced in the meantime, the worker claims that instead. The rest
   of the document then waits behind it and is charged another latency
   when its turn comes. A probe or prefetch before a completion sees the
@@ -382,12 +386,23 @@ workspaces tree.
 A `live` run sends the history to the LLM endpoint `--config` names, as
 production already does. A hosted endpoint sees it.
 
+Errors hold no content (ADR 0010, "Logging"). A manifest, probes file,
+corpus or cassette that doesn't parse is named with the line and column,
+never quoted; a probe whose regex doesn't compile is named by its id, not
+its pattern. The parser's own message, which can quote the input, is
+logged at `trace` only.
+
 ### Importing
 
 ```
 asphodel import --state-db <copy of state.db> --manifest <file> \
     [--out <replay dir>/corpus/<name>.jsonl] [--dry-run]
 ```
+
+Both inputs are real history, so both must be inside the private dir:
+the manifest and the `state.db` copy are refused anywhere else, and as a
+symlink, before either is read. Copy `state.db` into the private dir
+first.
 
 The importer reads only `sessions(id, source, parent_session_id,
 started_at)` and `messages(role, content, timestamp, active, compacted,
@@ -454,7 +469,9 @@ asphodel replay --corpus <file> --mode live|replay|fast \
 - **Modes** (TIM-96, decision 4). Every LLM call is keyed by SHA-256 of
   the model id, the template name and version, and the whole request.
   `live` answers from the cassette and calls and records on a miss;
-  `--no-cache` ignores the cassette and re-records. `replay` answers from
+  `--no-cache` empties the cassette when the run opens it and records
+  afresh, so a re-recording leaves one record per call, and the report's
+  cassette hash is of the empty cassette it started from. `replay` answers from
   the cassette and fails on a miss, with exit 2 and no report. `fast`
   reuses call 1's claims by chunk (source id and chunk position) and `used`
   verdicts by (reply hash, sentence hash) pair, judges the pairs nobody has
@@ -462,8 +479,16 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   by request key, calling the LLM on a miss when one is configured. The
   report counts every miss, so "fast with zero misses" is a number.
 - **Refreshes in `fast`**: `--refresh recorded` (the default) substitutes
-  the recorded refresh of the same model nearest in simulated time, `live`
-  calls on a miss, and `off` answers with no edits. Triggers are counted
+  the recorded refresh of the same mental model nearest in simulated time,
+  among those made with this run's LLM model and template version; `live`
+  calls on a miss, and `off` answers with no edits. Refresh handles (`m1`,
+  `e1`, …) are positional, so a refresh's record keeps the memory or entry
+  each stood for, and a substituted reply is carried over by identity: a
+  handle goes to the memory it meant, then to that memory's handle now.
+  An operation whose entry or any cited memory isn't in this run's input
+  is dropped whole, which is the citation check TIM-96 asks for, by
+  identity rather than by name. A refresh recorded before identities were
+  kept carries nothing over. Triggers are counted
   by code in every mode. The mental models to refresh are the manifest's
   `[[model]]` tables, carried in the corpus header.
 - **The LLM** for `live` and `fast` is built as `serve` builds its own:
@@ -474,11 +499,15 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   the simulated time, and for extraction calls the chunk and the handles
   with a hash of each sentence. The report embeds its SHA-256 as it stood
   when the run started.
-- **Latency.** `--latency` sets every chunk's. Without it, a chunk whose
-  calls are in the cassette is scheduled with their recorded latency, and a
-  chunk recorded during this run completes at once, with its measured
-  latency recorded for the next run. The measured round trips of live calls
-  are reported under `llm.latency_ms`.
+- **Latency** (TIM-96, decision 3). `--latency` sets every chunk's.
+  Without it, a chunk's calls run when the worker claims it, and it
+  completes after the latency of the responses that answered them: the
+  recorded latency of each record served, and the measured round trip of
+  each live call, which is what its record says. Only the responses
+  actually served count, never older recordings of the chunk or another
+  model's, so a `live` run and the `replay` of its cassette simulate the
+  same lag. The measured round trips of live calls are reported under
+  `llm.latency_ms`.
 - **Models.** The real models run with ONNX Runtime's intra-op threads
   pinned to `--onnx-threads` (1 by default). `ASPHODEL_MODELS=fake` runs the
   deterministic fakes, for tests.

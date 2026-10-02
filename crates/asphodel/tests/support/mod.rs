@@ -242,6 +242,69 @@ pub fn universal_script(dir: &TestDir) -> PathBuf {
     path
 }
 
+/// The call 1 claim [`live_script`] makes, as JSON.
+pub fn home_claim() -> Value {
+    claim(hermes::HOME_SENTENCE, hermes::HOME_QUOTE, "fact")
+}
+
+/// A call 1 claim of `kind`, notable, with nothing else set.
+pub fn claim(content: &str, quote: &str, kind: &str) -> Value {
+    json!({
+        "content": content,
+        "kind": kind,
+        "quote": quote,
+        "significance": "notable",
+        "remember_this": false,
+        "changes_something": false,
+        "valid_from": null,
+        "valid_until": null,
+        "window_confidence": "high",
+        "until_event": null,
+        "due_at": null,
+        "volatility": null,
+        "recurrence_text": null,
+        "recurrence_rrule": null,
+        "recurrence_start": null,
+        "entities": []
+    })
+}
+
+/// [`live_script`] with every step taking `delay_ms` to answer, so a
+/// `live` run measures that latency. The reply also reads as a refresh
+/// with no edits, so the seeded profile's refreshes succeed.
+pub fn delayed_script(dir: &TestDir, delay_ms: u64) -> PathBuf {
+    let reply = json!({
+        "claims": [home_claim()],
+        "used_injected_ids": [],
+        "operations": []
+    });
+    let steps: Vec<Value> = (0..64)
+        .map(|_| json!({ "reply": reply, "delay_ms": delay_ms }))
+        .collect();
+    let path = dir.path(&format!("delayed-script-{delay_ms}.json"));
+    fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
+    path
+}
+
+/// A script whose every step answers any call with `claims` and
+/// `operations`, as [`universal_script`] does.
+pub fn script_answering_everything(
+    dir: &TestDir,
+    name: &str,
+    claims: Vec<Value>,
+    operations: Vec<Value>,
+) -> PathBuf {
+    let reply = json!({
+        "claims": claims,
+        "used_injected_ids": [],
+        "operations": operations
+    });
+    let steps: Vec<Value> = (0..64).map(|_| json!({ "reply": reply })).collect();
+    let path = dir.path(&format!("{name}.json"));
+    fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
+    path
+}
+
 /// Replaces the cassette with `records`, one per line.
 pub fn write_cassette(dir: &TestDir, records: &[Value]) {
     let mut text = String::new();

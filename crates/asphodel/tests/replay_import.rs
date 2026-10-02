@@ -15,6 +15,7 @@ mod support;
 
 use std::fs;
 use std::path::Path;
+use std::process::Output;
 
 use jiff::Timestamp;
 use serde_json::Value;
@@ -732,4 +733,133 @@ fn manifest_models_reach_the_corpus_header_and_its_hash() {
     let work = fs::read(&work).unwrap();
     assert_ne!(plain, home, "the models change the corpus");
     assert_ne!(home, work, "a model's question changes the corpus");
+}
+
+// The TIM-117 review findings on `4ac0205` (Run D), as regressions. Each
+// names the blocker it pins.
+
+/// `asphodel import` with the given manifest and `state.db` paths, as
+/// they are, and the corpus to `out`.
+fn import_paths(dir: &TestDir, state_db: &Path, manifest: &Path, out: &Path) -> Output {
+    support::asphodel(dir)
+        .arg("import")
+        .arg("--state-db")
+        .arg(state_db)
+        .arg("--manifest")
+        .arg(manifest)
+        .arg("--out")
+        .arg(out)
+        .output()
+        .unwrap()
+}
+
+/// Exit 2, `sentinel` in neither stream, and `words` in stderr.
+fn assert_refused_without(output: &Output, sentinel: &str, words: &[&str]) {
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(output));
+    assert!(
+        !stdout(output).contains(sentinel),
+        "stdout echoes the input"
+    );
+    assert!(
+        !stderr(output).contains(sentinel),
+        "stderr echoes the input: {}",
+        stderr(output)
+    );
+    for word in words {
+        assert!(
+            stderr(output).contains(word),
+            "stderr should name {word:?}: {}",
+            stderr(output)
+        );
+    }
+}
+
+/// Blocker 1 (ADR 0010, "Logging"): a manifest that doesn't parse is
+/// refused naming the file and the line, never quoting it.
+#[test]
+fn a_malformed_manifest_is_refused_without_quoting_it() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    hermes::small_history(&state_db);
+    let sentinel = "SENTINEL-PRIVATE-NAME-4e1";
+    let text = format!("{}\nnickname = {sentinel}\n", hermes::MANIFEST);
+    let line = text
+        .lines()
+        .position(|line| line.contains(sentinel))
+        .unwrap()
+        + 1;
+    let corpus = dir.private_path("corpus/main.jsonl");
+    let output = import_with(&dir, &state_db, &corpus, &text, &[]);
+    assert_refused_without(
+        &output,
+        sentinel,
+        &["manifest.toml", &format!("line {line}")],
+    );
+    assert!(!corpus.exists());
+}
+
+/// Blocker 1: a multimodal row whose parts aren't JSON is refused without
+/// quoting the row.
+#[test]
+fn a_malformed_multimodal_row_is_refused_without_quoting_it() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    let db = StateDb::create(&state_db);
+    let t = epoch("2026-01-05T09:00:00Z");
+    db.session("s1", "discord", Some("discord:1"), None, t);
+    let sentinel = "SENTINEL-MULTIMODAL-TEXT-91c";
+    db.turn(
+        "s1",
+        t,
+        &format!("\u{0}json:[{{\"type\": \"text\", \"text\": \"{sentinel}"),
+        "Okay.",
+    );
+    drop(db);
+    let corpus = dir.private_path("corpus/main.jsonl");
+    let output = import(&dir, &state_db, &corpus);
+    assert_refused_without(&output, sentinel, &[]);
+    assert!(!corpus.exists());
+}
+
+/// Blocker 5 (TIM-96, decision 8): the manifest and the `state.db` copy
+/// are private, so each is refused outside the private dir, and through a
+/// symlink inside it that points outside. Nothing is read: the manifest's
+/// sentinel never appears, and no corpus is written.
+#[test]
+fn import_inputs_outside_the_private_dir_are_refused() {
+    let dir = TestDir::new();
+    let sentinel = "SENTINEL-OUTSIDE-MANIFEST-3d7";
+    let private_db = dir.private_path("state.db");
+    hermes::small_history(&private_db);
+    let private_manifest = dir.private_file("manifest.toml", hermes::MANIFEST);
+
+    let outside_db = dir.path("outside-state.db");
+    hermes::small_history(&outside_db);
+    let outside_manifest = dir.path("outside-manifest.toml");
+    fs::write(
+        &outside_manifest,
+        format!("{}\nnickname = {sentinel}\n", hermes::MANIFEST),
+    )
+    .unwrap();
+    let linked_db = dir.private().join("linked-state.db");
+    std::os::unix::fs::symlink(&outside_db, &linked_db).unwrap();
+    let linked_manifest = dir.private().join("linked-manifest.toml");
+    std::os::unix::fs::symlink(&outside_manifest, &linked_manifest).unwrap();
+
+    let corpus = dir.private_path("corpus/main.jsonl");
+    for (state_db, manifest) in [
+        (&private_db, &outside_manifest),
+        (&private_db, &linked_manifest),
+        (&outside_db, &private_manifest),
+        (&linked_db, &private_manifest),
+    ] {
+        let output = import_paths(&dir, state_db, manifest, &corpus);
+        assert_refused_without(&output, sentinel, &["private"]);
+        assert!(
+            !corpus.exists(),
+            "{} with {} wrote a corpus",
+            state_db.display(),
+            manifest.display()
+        );
+    }
 }

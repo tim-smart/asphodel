@@ -240,7 +240,20 @@ pub(crate) fn refresh(
         return Ok(Outcome::Applied(applied));
     }
     let request = request(&selection.input);
-    let reply = match llm.complete(&request) {
+    let identities: Vec<(String, Uuid)> = selection
+        .input
+        .memories
+        .iter()
+        .map(|memory| (memory.handle.clone(), memory.memory))
+        .chain(
+            selection
+                .input
+                .entries
+                .iter()
+                .map(|entry| (entry.handle.clone(), entry.entry)),
+        )
+        .collect();
+    let reply = match llm.complete_identified(&request, &identities) {
         Ok(response) => response.json,
         Err(error) => {
             tracing::warn!(model = %model.uuid, %error, "a mental model refresh failed");

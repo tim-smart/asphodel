@@ -207,6 +207,21 @@ pub trait LlmClient: Send + Sync {
     fn model(&self) -> &str;
 
     fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
+
+    /// [`LlmClient::complete`] for a request whose handles (`m1`, `e1`, …)
+    /// stand for the memories and entries `identities` names. Handles are
+    /// positional, so only the identities say which memory a recorded
+    /// reply meant: replay's cassette keeps them, to carry a recorded
+    /// refresh over to a run where the handles name other memories
+    /// (TIM-96, decision 4). Every other client ignores them.
+    fn complete_identified(
+        &self,
+        request: &LlmRequest,
+        identities: &[(String, uuid::Uuid)],
+    ) -> Result<LlmResponse, LlmError> {
+        let _ = identities;
+        self.complete(request)
+    }
 }
 
 /// The real client, for any OpenAI-compatible `chat/completions`.
