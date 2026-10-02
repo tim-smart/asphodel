@@ -267,6 +267,12 @@ impl Worker {
                 Next::Wait(retry_wait(*failure))
             }
             ExtractError::Queue(QueueError::UnknownBank) => Next::Exit,
+            // Nothing was counted: the queue holds until a re-embed moves
+            // the bank to a model the daemon carries, which wakes it.
+            ExtractError::ModelUnavailable { .. } => {
+                warn!(bank = %self.bank, %error, "extraction waits for a re-embed");
+                Next::Wait(HELD_WAIT)
+            }
             _ => {
                 warn!(bank = %self.bank, %error, "extraction failed");
                 Next::Wait(ERROR_WAIT)

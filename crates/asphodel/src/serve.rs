@@ -381,7 +381,7 @@ fn start(
         "resolved config"
     );
     for (bank, model) in service.banks_without_their_model()? {
-        warn!(%bank, %model, "the bank records an embedding model this daemon doesn't carry, so it's served with the daemon's own; run `asphodel reembed --bank` to move it");
+        warn!(%bank, %model, "the bank records an embedding model this daemon doesn't carry, so its recall and extraction are refused; run `asphodel reembed --bank` to move it");
     }
     let banks = service.bank_names()?;
     Ok(Some(Started {

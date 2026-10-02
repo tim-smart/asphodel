@@ -238,6 +238,14 @@ pub enum RecallError {
     #[error("embedding the query failed: {error}")]
     Model { error: ModelError },
 
+    /// The bank's recorded embedding model isn't loaded, so its vectors
+    /// can't be searched (ADR 0010). `asphodel reembed --bank` moves it to
+    /// the daemon's model.
+    #[error(
+        "the bank records embedding model {model}, which this daemon doesn't carry; run `asphodel reembed --bank` to move it"
+    )]
+    ModelUnavailable { model: String },
+
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -403,20 +411,18 @@ pub(crate) struct Context<'a> {
 
 impl Context<'_> {
     /// The embedder `bank_id` is served with: the model it recorded, until
-    /// a re-embed swaps it (ADR 0010).
+    /// a re-embed swaps it (ADR 0010). Refused when the daemon doesn't
+    /// carry that model.
     pub(crate) fn embedder(
         &self,
         bank_id: i64,
-    ) -> Result<&dyn crate::models::Embedder, rusqlite::Error> {
+    ) -> Result<&dyn crate::models::Embedder, RecallError> {
         let recorded = {
             let conn = self.store.connection();
             crate::reembed::recorded_model(&conn, bank_id)?
         };
-        Ok(crate::models::serving(
-            self.models,
-            self.previous,
-            &recorded,
-        ))
+        crate::models::serving(self.models, self.previous, &recorded)
+            .ok_or(RecallError::ModelUnavailable { model: recorded })
     }
 }
 

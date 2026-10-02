@@ -72,12 +72,19 @@ it (ADR 0010). During a change the image carries both models: the daemon
 runs the new one and keeps the old one for banks still recorded under it
 (`Service::with_previous_embedder`). The manifest lists one embedding
 model today, so a change adds the new model to it and keeps the old one as
-the previous embedder until every bank has moved. A bank recorded under a
-model the daemon doesn't carry is served with the daemon's model, and the
-daemon warns about it at startup.
+the previous embedder until every bank has moved.
 
-The re-embed is a daemon job. It embeds the bank's memories with the new
-model into a side table, in rowid order, recording how far it got, so a
+A bank recorded under a model the daemon doesn't carry is refused rather
+than served with another model, whose vectors aren't comparable with its
+own: recall and prefetch answer 503, its chunks wait on the queue without
+counting a failure, and its mental models' refreshes fail. The daemon warns
+about it at startup and `asphodel status` asks for attention. Re-embedding
+needs only the daemon's model, so `asphodel reembed --bank` is how such a
+bank recovers.
+
+The re-embed is a daemon job, and its tables are the schema's version 10
+migration. It embeds the bank's memories with the new model into a side
+table, in rowid order, recording how far it got, so a
 restart resumes it rather than starting over. Extraction carries on with
 the recorded model meanwhile. The swap waits for the chunk in flight, embeds
 whatever arrived since, and in one transaction replaces the bank's vectors,

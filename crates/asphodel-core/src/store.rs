@@ -201,7 +201,6 @@ impl Store {
         } else {
             None
         };
-        crate::reembed::ensure_tables(&conn)?;
         expire_copies(&conn, dir, clock.now())?;
 
         info!(

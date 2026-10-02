@@ -192,8 +192,9 @@ impl Service {
     }
 
     /// The banks recorded under an embedding model this service doesn't
-    /// carry, with that model. They're served with the daemon's model, so
-    /// `serve` warns about each at startup.
+    /// carry, with that model. Recall and extraction are refused for them
+    /// until a re-embed moves them, so `serve` warns about each at startup
+    /// and `status` asks for attention.
     pub fn banks_without_their_model(&self) -> Result<Vec<(String, String)>, StoreError> {
         let Some(models) = &self.models else {
             return Ok(Vec::new());
@@ -216,21 +217,19 @@ impl Service {
     }
 
     /// The embedder `bank_id` is served with: the model it recorded, until
-    /// a re-embed swaps it (ADR 0010).
+    /// a re-embed swaps it (ADR 0010). Refused when this service doesn't
+    /// carry that model, so no vector is written or compared under another.
     fn bank_embedder<'a>(
         &'a self,
         models: &'a Models,
         bank_id: i64,
-    ) -> Result<&'a dyn Embedder, StoreError> {
+    ) -> Result<&'a dyn Embedder, ExtractError> {
         let recorded = {
             let conn = self.store.connection();
-            crate::reembed::recorded_model(&conn, bank_id)?
+            crate::reembed::recorded_model(&conn, bank_id).map_err(StoreError::Sqlite)?
         };
-        Ok(crate::models::serving(
-            models,
-            &self.previous_embedders,
-            &recorded,
-        ))
+        crate::models::serving(models, &self.previous_embedders, &recorded)
+            .ok_or(ExtractError::ModelUnavailable { model: recorded })
     }
 
     /// The same service with the reranker deadline set to
@@ -722,11 +721,17 @@ impl Service {
     /// `GET /v1/status`: what an operator alerts on, and what needs
     /// attention now.
     pub fn status(&self) -> Result<Status, StoreError> {
-        crate::operations::status(
+        let mut status = crate::operations::status(
             &self.store,
             self.purge_pause(),
             self.tuning.deletion_fingerprint(),
-        )
+        )?;
+        for (bank, model) in self.banks_without_their_model()? {
+            status.attention.push(format!(
+                "{bank}: its recorded embedding model {model} isn't loaded, so recall and extraction are refused; run `asphodel reembed --bank {bank}`"
+            ));
+        }
+        Ok(status)
     }
 
     /// `GET /v1/banks/{bank}/{purges,forgets,sweeps,recalls}`, newest first.

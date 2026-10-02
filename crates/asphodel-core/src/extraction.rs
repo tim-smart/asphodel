@@ -418,6 +418,15 @@ pub enum ExtractError {
     #[error("no models are loaded, so nothing can be extracted")]
     NoModels,
 
+    /// The bank's recorded embedding model isn't loaded, so its claims
+    /// can't be compared with its memories or given vectors that fit them
+    /// (ADR 0010). Nothing is counted: the queue holds until a re-embed
+    /// moves the bank to the daemon's model.
+    #[error(
+        "the bank records embedding model {model}, which this daemon doesn't carry; run `asphodel reembed --bank` to move it"
+    )]
+    ModelUnavailable { model: String },
+
     /// The commit transaction failed and was rolled back, and the queue
     /// counted it, so a fault that recurs reaches the retry cap rather than
     /// holding the bank's queue.
@@ -446,6 +455,7 @@ impl ExtractError {
             | ExtractError::Rejected { .. }
             | ExtractError::Model { .. }
             | ExtractError::NoModels
+            | ExtractError::ModelUnavailable { .. }
             | ExtractError::Queue(_)
             | ExtractError::Store(_) => None,
         }

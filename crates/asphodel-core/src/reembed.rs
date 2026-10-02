@@ -17,6 +17,13 @@
 //! table's, records the new model, and deletes the job and its side rows.
 //! A memory erased during the job is left out: its side row is skipped.
 //!
+//! The job and its side table are the schema's version 10 migration.
+//!
+//! A bank whose recorded model the daemon doesn't carry is refused recall
+//! and extraction rather than served with another model, whose vectors
+//! aren't comparable with its own. A re-embed is how it recovers: it needs
+//! only the daemon's model, and once it swaps the bank is served again.
+//!
 //! The new model's reconcile floor has to be in the tuning before the
 //! deploy, calibrated in replay; the daemon won't start without it.
 //!
@@ -30,39 +37,6 @@ use crate::ingest::find_bank;
 use crate::models::{Embedder, ModelError};
 use crate::queue::BankHold;
 use crate::store::{Store, StoreError, VectorIndex, micros, timestamp};
-
-/// The job and its side table. `reembeds` holds the model a bank's job
-/// embeds with and the last memory rowid it reached; `reembed_vectors`
-/// holds the vectors until the swap. The side table has no foreign key to
-/// `memories`: an erase during the job leaves its rows behind, and the swap
-/// takes only rows whose memory is still there.
-///
-/// They're created when the store opens, `IF NOT EXISTS`, rather than by a
-/// schema migration, so the schema version stays at 9 for now. They're
-/// harmless to a binary that doesn't know them.
-const TABLES: &str = "
-CREATE TABLE IF NOT EXISTS reembeds (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  bank_id    INTEGER NOT NULL UNIQUE REFERENCES banks(id),
-  model      TEXT NOT NULL,
-  cursor     INTEGER NOT NULL DEFAULT 0,
-  embedded   INTEGER NOT NULL DEFAULT 0,
-  started_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS reembed_vectors (
-  id        INTEGER PRIMARY KEY AUTOINCREMENT,
-  bank_id   INTEGER NOT NULL,
-  memory_id INTEGER NOT NULL UNIQUE,
-  embedding BLOB NOT NULL
-);
-CREATE INDEX IF NOT EXISTS reembed_vectors_bank ON reembed_vectors(bank_id, memory_id);
-";
-
-/// Creates the re-embed tables when they aren't there yet.
-pub(crate) fn ensure_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(TABLES)
-}
 
 /// How many memories one step embeds.
 pub const REEMBED_BATCH: usize = 32;
