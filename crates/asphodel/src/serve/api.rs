@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use asphodel_core::agenda::Agenda;
 use asphodel_core::config::Secret;
-use asphodel_core::erase::{ForgetError, Forgotten};
+use asphodel_core::erase::{ForgetError, ForgetRequest, Forgotten};
 use asphodel_core::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use asphodel_core::keep::{KeepError, Kept, MemoryIds, Unkept};
 use asphodel_core::mental_models::{Model, ModelEdit, ModelError, ModelSpec, Outcome as Refreshed};
@@ -453,19 +453,20 @@ async fn keep(
 }
 
 /// `POST /v1/banks/{bank}/forget`: `memory_forget`, owner-only in the
-/// plugin. Returns every id the erase removes. The erase runs at once when
-/// nothing was queued before it, and otherwise the bank's worker runs it
+/// plugin, with the session its request turn will arrive in. Returns every
+/// id the erase removes. The erase runs at once when nothing was queued
+/// before it, and otherwise the bank's worker or housekeeping runs it
 /// behind those chunks (ADR 0010).
 async fn forget(
     State(app): State<Shared>,
     Path(bank): Path<String>,
-    body: Result<Json<MemoryIds>, JsonRejection>,
+    body: Result<Json<ForgetRequest>, JsonRejection>,
 ) -> Result<Json<Forgotten>, ApiError> {
-    let Json(MemoryIds { ids }) = body?;
+    let Json(request) = body?;
     let name = bank.clone();
     let forgotten = app
         .call(move |service| {
-            let forgotten = service.forget(&name, &ids)?;
+            let forgotten = service.forget_request(&name, &request)?;
             if !forgotten.forgotten.is_empty() {
                 service.erase_next(&name)?;
             }

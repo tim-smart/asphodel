@@ -233,12 +233,14 @@ pub fn ingest_turn(
                 now,
             ),
         )?;
+        let source_id = tx.last_insert_rowid();
         if let Some(recall_id) = &turn.recall_id {
             tx.execute(
                 "DELETE FROM recalls WHERE bank_id = ?1 AND uuid = ?2",
                 (bank_id, recall_id),
             )?;
         }
+        link_forgets(&tx, bank_id, &turn.session_id, source_id, source)?;
         count_turn(&tx, bank_id, message_at)?;
         tx.commit()?;
         tracing::debug!(%source, "stored a forget request as a tombstone");
@@ -391,6 +393,9 @@ pub fn ingest_document(
 
     let mut queued = 0;
     let mut skipped = 0;
+    // What a forget masked in a chunk this version shares with an earlier
+    // one, masked again in this version's text (schema version 8).
+    let mut masks: Vec<(usize, usize)> = Vec::new();
     for (position, chunk) in split_document(&scanned.text).iter().enumerate() {
         let new = NewChunk {
             position,
@@ -401,6 +406,16 @@ pub fn ingest_document(
         };
         if seen_before(&tx, bank_id, &document.document_id, source_id, &new.hash())? {
             skipped += 1;
+            masks.extend(
+                crate::erase::recorded_redactions(
+                    &tx,
+                    bank_id,
+                    &document.document_id,
+                    &new.hash(),
+                )?
+                .into_iter()
+                .map(|(start, end)| (chunk.start + start, chunk.start + end)),
+            );
             continue;
         }
         insert_chunk(
@@ -414,6 +429,12 @@ pub fn ingest_document(
         )?;
         queued += 1;
     }
+    if !masks.is_empty() {
+        tx.execute(
+            "UPDATE sources SET text = ?2 WHERE id = ?1",
+            (source_id, crate::erase::mask(&scanned.text, &masks)),
+        )?;
+    }
     tx.commit()?;
     if !scanned.kinds.is_empty() {
         tracing::info!(%source, kinds = ?scanned.kinds, "redacted secrets from a document");
@@ -426,6 +447,37 @@ pub fn ingest_document(
         secret_kinds: scanned.kinds,
         speaker: None,
     })
+}
+
+/// Links the `forget` audit rows a request turn answers (ADR 0010): those
+/// in its session, not yet linked, written after the session's previous
+/// turn. Order is by rowid, never by clock, so a forget and its turn at the
+/// same instant still pair, and a forget whose request turn never arrived
+/// isn't claimed by a later one: another turn in the session came between.
+fn link_forgets(
+    tx: &Transaction<'_>,
+    bank_id: i64,
+    session: &str,
+    source_id: i64,
+    source: Uuid,
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "UPDATE edits SET details = json_set(details, '$.request', ?3)
+         WHERE bank_id = ?1 AND kind = ?5
+           AND json_extract(details, '$.session_id') = ?2
+           AND json_extract(details, '$.request') IS NULL
+           AND json_extract(details, '$.after') =
+               (SELECT COALESCE(MAX(id), 0) FROM sources
+                WHERE bank_id = ?1 AND kind = 'turn' AND session_id = ?2 AND id < ?4)",
+        (
+            bank_id,
+            session.trim(),
+            source.to_string(),
+            source_id,
+            crate::erase::EDIT_FORGET,
+        ),
+    )?;
+    Ok(())
 }
 
 /// The bank's rowid and default timezone, or `None` when there's no such

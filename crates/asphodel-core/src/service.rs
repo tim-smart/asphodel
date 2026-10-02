@@ -17,7 +17,7 @@ use crate::agenda::Agenda;
 use crate::clock::Clock;
 use crate::config::{ConfigError, DeletionInputs, PurgePause, Tuning};
 use crate::constants::RERANKER_DEADLINE;
-use crate::erase::{Aftermath, Erased, ForgetError, Forgotten};
+use crate::erase::{Aftermath, Erased, ForgetError, ForgetRequest, Forgotten};
 use crate::extraction::{Call1Input, Call2Input, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use crate::keep::{KeepError, Kept, Unkept};
@@ -622,9 +622,47 @@ impl Service {
     /// queues its erase behind the chunks already queued
     /// ([`crate::erase`]). Forget never pauses.
     pub fn forget(&self, bank: &str, ids: &[String]) -> Result<Forgotten, ForgetError> {
-        let (bank_id, forgotten, aftermath) = crate::erase::forget(&self.store, bank, ids)?;
+        self.forget_request(
+            bank,
+            &ForgetRequest {
+                ids: ids.to_vec(),
+                session_id: None,
+            },
+        )
+    }
+
+    /// [`Service::forget`] with the request as the plugin sends it: the
+    /// session its request turn will arrive in, so the audit row can be
+    /// linked to that turn when it's ingested (ADR 0010).
+    pub fn forget_request(
+        &self,
+        bank: &str,
+        request: &ForgetRequest,
+    ) -> Result<Forgotten, ForgetError> {
+        let (bank_id, forgotten, aftermath) = crate::erase::forget(&self.store, bank, request)?;
         self.settle(bank_id, aftermath)?;
         Ok(forgotten)
+    }
+
+    /// Runs every erase that's ready, in every bank, behind the same
+    /// barrier as [`Service::erase_next`]. Housekeeping calls it, so a ready
+    /// erase runs even when there's no LLM and so no worker.
+    pub fn run_erases(&self) -> Result<Vec<Erased>, StoreError> {
+        let mut erased = Vec::new();
+        for (_, bank, _) in self.bank_zones()? {
+            loop {
+                match self.erase_next(&bank) {
+                    Ok(Some(one)) => erased.push(one),
+                    Ok(None) | Err(QueueError::UnknownBank) => break,
+                    Err(QueueError::Store(error)) => return Err(error),
+                    Err(error @ QueueError::NotHeld { .. }) => {
+                        tracing::warn!(%error, "an erase failed");
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(erased)
     }
 
     /// Runs the erase at the head of `bank`'s queue, once every chunk queued
@@ -647,17 +685,81 @@ impl Service {
     pub fn run_sweeps(&self) -> Result<Sweeps, StoreError> {
         let _sweeping = self.sweeping.lock().unwrap_or_else(|e| e.into_inner());
         let pause = self.purge_pause();
-        let (sweeps, aftermaths) = crate::sweep::run(
+        let mut settled = Vec::new();
+        let result = crate::sweep::run(
             &self.store,
             &self.tuning,
             &self.sweeps,
             &pause,
             &self.bank_zones()?,
-        )?;
-        for (bank_id, aftermath) in aftermaths {
-            self.settle(bank_id, aftermath)?;
-        }
+            &mut settled,
+        );
+        // What committed is settled even when a later step failed.
+        let settling = settled
+            .into_iter()
+            .try_for_each(|(bank_id, aftermath)| self.settle(bank_id, aftermath));
+        let sweeps = result?;
+        settling?;
         Ok(sweeps)
+    }
+
+    /// Purge's first phase, as the nightly sweep runs it: the head of every
+    /// chain eligible now, by bank. Nothing is deleted. Exposed so tests can
+    /// change a chain between the phases.
+    #[doc(hidden)]
+    pub fn purge_candidates(&self) -> Result<Vec<(String, Uuid)>, StoreError> {
+        let now = self.now();
+        let mut found = Vec::new();
+        if self.purge_pause() != PurgePause::Running {
+            return Ok(found);
+        }
+        for (bank_id, bank, _) in self.bank_zones()? {
+            for head in crate::sweep::candidates(&self.store, &self.tuning, bank_id, now)? {
+                let uuid: String = self.store.connection().query_row(
+                    "SELECT uuid FROM memories WHERE id = ?1",
+                    [head],
+                    |row| row.get(0),
+                )?;
+                found.push((bank.clone(), uuid.parse().expect("a stored uuid parses")));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Purge's second phase for one chain: decides again, inside its
+    /// transaction, and purges it only if it's still eligible. `None` when
+    /// nothing was purged.
+    #[doc(hidden)]
+    pub fn purge_chain(&self, bank: &str, head: Uuid) -> Result<Option<Erased>, StoreError> {
+        let found: Option<(i64, i64)> = {
+            let conn = self.store.connection();
+            conn.query_row(
+                "SELECT m.bank_id, m.id FROM memories m JOIN banks b ON b.id = m.bank_id
+                 WHERE b.name = ?1 AND m.uuid = ?2",
+                (bank.trim(), head.to_string()),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        };
+        let Some((bank_id, head)) = found else {
+            return Ok(None);
+        };
+        let purged = crate::sweep::purge_chain(
+            &self.store,
+            &self.tuning,
+            &self.purge_pause(),
+            bank_id,
+            head,
+            self.now(),
+        )?;
+        let Some((memories, aftermath)) = purged else {
+            return Ok(None);
+        };
+        self.settle(bank_id, aftermath)?;
+        Ok(Some(Erased {
+            reason: crate::erase::EraseReason::Purge,
+            memories,
+        }))
     }
 
     /// `purge plan`: which fingerprinted values changed and what the sweep

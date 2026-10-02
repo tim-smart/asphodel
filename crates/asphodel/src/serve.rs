@@ -561,7 +561,8 @@ impl UnixSocketCleanup {
     }
 }
 
-/// Runs the nightly sweep when it's due, then [`Service::housekeeping`], at
+/// Runs ready erases, the nightly sweep when it's due, then
+/// [`Service::housekeeping`], at
 /// the earlier of the two `next_due`s, or after [`HOUSEKEEPING_INTERVAL`] if
 /// that comes first, until the service is dropped. The sweep runs here so
 /// it runs without an LLM too; the refresh timer also runs it first, so
@@ -576,6 +577,7 @@ async fn housekeeping(service: Weak<Service>) {
         // The first pass runs at once: open deletes what has expired but
         // doesn't say when the next copy is due.
         let pass = tokio::task::spawn_blocking(move || {
+            erase(&service);
             let sweep_due = sweep(&service);
             let result = service.housekeeping();
             (result, sweep_due, service.now())
@@ -605,6 +607,21 @@ async fn housekeeping(service: Weak<Service>) {
             }
         };
         tokio::time::sleep(wait).await;
+    }
+}
+
+/// Runs every erase that's ready ([`Service::run_erases`]). The workers
+/// run them too, but only when there's an LLM; this is how a forget queued
+/// before a restart without one still completes. A failure is logged and
+/// the next pass tries again.
+fn erase(service: &Service) {
+    match service.run_erases() {
+        Ok(erased) => {
+            for one in &erased {
+                info!(memories = one.memories.len(), "erased a forgotten chain");
+            }
+        }
+        Err(error) => warn!(%error, "running ready erases failed"),
     }
 }
 

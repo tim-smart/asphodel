@@ -29,6 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -545,6 +546,34 @@ fn trim(selected: &[Selected], max_tokens: u32, drafts: &mut Vec<Draft>, applied
     }
 }
 
+/// Whether every memory `draft` cites is still there and visible, and the
+/// entry it edits, if any, still exists.
+fn still_standing(tx: &rusqlite::Transaction<'_>, draft: &Draft) -> Result<bool, rusqlite::Error> {
+    for memory in &draft.cites {
+        let visible: Option<bool> = tx
+            .query_row(
+                "SELECT hidden_at IS NULL FROM memories WHERE id = ?1",
+                [memory],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if visible != Some(true) {
+            return Ok(false);
+        }
+    }
+    match draft.stored {
+        Some(entry) => Ok(tx
+            .query_row(
+                "SELECT 1 FROM mental_model_entries WHERE id = ?1",
+                [entry],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()),
+        None => Ok(true),
+    }
+}
+
 fn write(
     cx: &Context<'_>,
     model: &ModelRow,
@@ -555,6 +584,19 @@ fn write(
     let now = micros(cx.store.now());
     let mut conn = cx.store.connection();
     let tx = conn.transaction()?;
+    // The LLM answered from a selection made before its call. A memory
+    // forgotten or erased since can't be cited again, and an entry a forget
+    // dropped meanwhile can't be edited back (the TIM-112 review): such a
+    // draft goes, as one failing the citation check does.
+    let drafts: Vec<&Draft> = {
+        let mut standing = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            if still_standing(&tx, draft)? {
+                standing.push(draft);
+            }
+        }
+        standing
+    };
     let kept: BTreeSet<i64> = drafts.iter().filter_map(|draft| draft.stored).collect();
     for entry in selection.survivors.iter().chain(&selection.dropped) {
         if !kept.contains(&entry.id) {

@@ -89,7 +89,7 @@ pub(super) fn commit(
         link_entities(&tx, store, unit, memory_id, &memory.links, &proposed)?;
         // TIM-92: the created access carries the source's ingested_at, never
         // the time extraction ran.
-        insert_access(&tx, unit, memory_id, "created", &[])?;
+        insert_access(&tx, unit, memory_id, "created")?;
         memories.push(uuid);
     }
 
@@ -165,11 +165,10 @@ pub(super) fn commit(
     }
 
     for (&neighbour, &label) in &plan.accesses {
-        let spans = plan
-            .mention_spans
-            .get(&neighbour)
-            .map_or(&[][..], Vec::as_slice);
-        insert_access(&tx, unit, neighbour, label.as_str(), spans)?;
+        insert_access(&tx, unit, neighbour, label.as_str())?;
+    }
+    for (&neighbour, spans) in &plan.mention_spans {
+        record_passages(&tx, unit, neighbour, spans)?;
     }
     for (&neighbour, &significance) in &plan.raises {
         let raised = tx.execute(
@@ -207,7 +206,7 @@ pub(super) fn commit(
     // strongest (TIM-90). `used` weighs least, so an access already in this
     // turn always stays.
     for (memory_id, _) in &checked.used {
-        insert_access(&tx, unit, *memory_id, "used", &[])?;
+        insert_access(&tx, unit, *memory_id, "used")?;
     }
 
     queue::finish(&tx, now, lease)?;
@@ -424,32 +423,21 @@ fn has_alias(tx: &Transaction<'_>, entity_id: i64, alias: &str) -> Result<bool, 
 /// more. A memory has at most one access per turn (TIM-90), and one per
 /// document: a document carries the number of the turn before it, and its
 /// mention is a separate, independent one (CONTEXT.md, "Mentioned again").
-///
-/// `spans` are where a mention was said in the chunk. They're kept on the
-/// access whatever kind wins, so a forget can redact every passage that
-/// restated the memory (schema version 7).
 fn insert_access(
     tx: &Transaction<'_>,
     unit: &Unit,
     memory_id: i64,
     kind: &str,
-    spans: &[(usize, usize)],
 ) -> Result<(), rusqlite::Error> {
     // TIM-97 decision 4: a memory erased since the chunk's input was read
     // (purged, or forgotten from a live in-context set) takes no access.
-    let exists = tx
-        .query_row("SELECT 1 FROM memories WHERE id = ?1", [memory_id], |_| {
-            Ok(())
-        })
-        .optional()?
-        .is_some();
-    if !exists {
+    if !exists(tx, memory_id)? {
         return Ok(());
     }
     // ?3 is the document's source, or NULL for a turn.
-    let existing: Option<(i64, String, Option<String>)> = tx
+    let existing: Option<(i64, String)> = tx
         .query_row(
-            "SELECT a.id, a.kind, a.spans FROM accesses a LEFT JOIN sources s ON s.id = a.source_id
+            "SELECT a.id, a.kind FROM accesses a LEFT JOIN sources s ON s.id = a.source_id
              WHERE a.memory_id = ?1 AND a.turn = ?2
                AND (CASE WHEN ?3 IS NULL THEN s.kind IS NOT 'document'
                          ELSE a.source_id = ?3 END)",
@@ -458,21 +446,14 @@ fn insert_access(
                 unit.turn,
                 unit.document_id.is_some().then_some(unit.source_id),
             ),
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let here: Vec<(i64, usize, usize)> = spans
-        .iter()
-        .map(|&(start, end)| (unit.chunk_id, start, end))
-        .collect();
-    let spans_json = |spans: &[(i64, usize, usize)]| {
-        (!spans.is_empty()).then(|| serde_json::to_string(spans).expect("spans serialise"))
-    };
     match existing {
         None => {
             tx.execute(
-                "INSERT INTO accesses (bank_id, memory_id, kind, at, turn, source_id, spans)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO accesses (bank_id, memory_id, kind, at, turn, source_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 (
                     unit.bank_id,
                     memory_id,
@@ -480,34 +461,50 @@ fn insert_access(
                     micros(unit.ingested_at),
                     unit.turn,
                     unit.source_id,
-                    spans_json(&here),
                 ),
             )?;
         }
-        Some((id, old, stored)) => {
-            if weight(kind) > weight(&old) {
-                tx.execute(
-                    "UPDATE accesses SET kind = ?2, at = ?3 WHERE id = ?1",
-                    (id, kind, micros(unit.ingested_at)),
-                )?;
-            }
-            if !here.is_empty() {
-                let mut merged: Vec<(i64, usize, usize)> = stored
-                    .and_then(|stored| serde_json::from_str(&stored).ok())
-                    .unwrap_or_default();
-                for span in &here {
-                    if !merged.contains(span) {
-                        merged.push(*span);
-                    }
-                }
-                tx.execute(
-                    "UPDATE accesses SET spans = ?2 WHERE id = ?1",
-                    (id, spans_json(&merged)),
-                )?;
-            }
+        Some((id, old)) if weight(kind) > weight(&old) => {
+            tx.execute(
+                "UPDATE accesses SET kind = ?2, at = ?3 WHERE id = ?1",
+                (id, kind, micros(unit.ingested_at)),
+            )?;
         }
+        Some(_) => {}
     }
     Ok(())
+}
+
+/// Records where the chunk restated `memory_id` without making a memory of
+/// it, so a forget can redact those passages (schema version 8). Kept
+/// apart from strength: a later version of the same document repeating
+/// itself is no access, but its passage still goes when the memory does.
+fn record_passages(
+    tx: &Transaction<'_>,
+    unit: &Unit,
+    memory_id: i64,
+    spans: &[(usize, usize)],
+) -> Result<(), rusqlite::Error> {
+    if !exists(tx, memory_id)? {
+        return Ok(());
+    }
+    let mut statement = tx.prepare_cached(
+        "INSERT OR IGNORE INTO mention_passages (memory_id, chunk_id, start_offset, end_offset)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for &(start, end) in spans {
+        statement.execute((memory_id, unit.chunk_id, start as i64, end as i64))?;
+    }
+    Ok(())
+}
+
+fn exists(tx: &Transaction<'_>, memory_id: i64) -> Result<bool, rusqlite::Error> {
+    Ok(tx
+        .query_row("SELECT 1 FROM memories WHERE id = ?1", [memory_id], |_| {
+            Ok(())
+        })
+        .optional()?
+        .is_some())
 }
 
 fn weight(kind: &str) -> f64 {

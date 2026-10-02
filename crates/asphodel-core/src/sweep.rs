@@ -43,7 +43,7 @@ use crate::erase::{Aftermath, EraseReason, bank_links, erase_chain};
 use crate::mental_models::schedule::next_local;
 use crate::store::strength::{StrengthLoader, window};
 use crate::store::{META_DELETION_FINGERPRINT, META_DELETION_INPUTS, Store, StoreError, micros};
-use crate::strength::{PurgeRule, chain, purge_eligible};
+use crate::strength::{PurgeRule, chain, chain_head, purge_eligible};
 
 /// The edit kind an acknowledgement writes, with no bank.
 pub const EDIT_PURGE_ACKED: &str = "purge_acked";
@@ -155,37 +155,40 @@ struct Counts {
 }
 
 /// Runs each bank's sweep that's due at `now`. `banks` is every bank's
-/// rowid, name and timezone. Returns what ran, when the next is due, and
-/// what the purges leave the service to do, by bank.
+/// rowid, name and timezone. Returns what ran and when the next is due.
+///
+/// What each committed purge leaves the service to do is pushed to
+/// `settled` as it commits, so a failure later in the sweep can't lose it.
+/// A bank counts as swept only once its run row is written: a sweep that
+/// fails stays due, and the daemon's timers retry it.
 pub(crate) fn run(
     store: &Store,
     tuning: &Tuning,
     schedule: &SweepSchedule,
     pause: &PurgePause,
     banks: &[(i64, String, TimeZone)],
-) -> Result<(Sweeps, Vec<(i64, Aftermath)>), StoreError> {
+    settled: &mut Vec<(i64, Aftermath)>,
+) -> Result<Sweeps, StoreError> {
     let now = store.now();
     let fingerprint = tuning.deletion_fingerprint();
     let mut ran = Vec::new();
-    let mut aftermaths = Vec::new();
     for (bank_id, bank, tz) in banks {
         if schedule.next(*bank_id, tz, tuning) > now {
             continue;
         }
-        schedule.swept(*bank_id, now);
         if *pause != PurgePause::Running {
+            schedule.swept(*bank_id, now);
             tracing::warn!(bank = %bank, "the sweep is paused until the deletion fingerprint is acknowledged");
             continue;
         }
         let mut counts = Counts::default();
-        let mut aftermath = Aftermath::default();
-        for chain in purgeable(store, tuning, *bank_id, now)? {
-            let mut conn = store.connection();
-            let tx = conn.transaction()?;
-            let (purged, after) = erase_chain(&tx, store, *bank_id, &chain, EraseReason::Purge)?;
-            tx.commit()?;
-            counts.purged_memories += purged.len();
-            aftermath.models.extend(after.models);
+        for head in candidates(store, tuning, *bank_id, now)? {
+            if let Some((purged, aftermath)) =
+                purge_chain(store, tuning, pause, *bank_id, head, now)?
+            {
+                counts.purged_memories += purged.len();
+                settled.push((*bank_id, aftermath));
+            }
         }
         sweep_sources(store, tuning, *bank_id, now, &mut counts)?;
         {
@@ -209,6 +212,7 @@ pub(crate) fn run(
                 ],
             )?;
         }
+        schedule.swept(*bank_id, now);
         tracing::info!(
             bank = %bank,
             purged = counts.purged_memories,
@@ -228,30 +232,29 @@ pub(crate) fn run(
             swept_failed_chunks: counts.swept_failed_chunks,
             swept_recalls: counts.swept_recalls,
         });
-        aftermaths.push((*bank_id, aftermath));
     }
     let next_due = banks
         .iter()
         .map(|(bank_id, _, tz)| schedule.next(*bank_id, tz, tuning))
         .min();
-    Ok((Sweeps { ran, next_due }, aftermaths))
+    Ok(Sweeps { ran, next_due })
 }
 
-/// The bank's chains purge would take at `now`, each as its members.
-fn purgeable(
+/// Purge's first phase: the heads of the bank's chains that are eligible
+/// at `now`, with any chain a forget hid left to its erase. Nothing is
+/// deleted; [`purge_chain`] decides again before it deletes.
+pub(crate) fn candidates(
     store: &Store,
     tuning: &Tuning,
     bank_id: i64,
     now: Timestamp,
-) -> Result<Vec<BTreeSet<i64>>, StoreError> {
+) -> Result<Vec<i64>, StoreError> {
     let rule = PurgeRule::from_tuning(tuning);
     if rule.delta.is_none() {
         return Ok(Vec::new());
     }
     let conn = store.connection();
     let loader = StrengthLoader::new(&conn, bank_id, tuning.clock.quiet_rate, now)?;
-    let links = bank_links(&conn, bank_id)?;
-    // Heads, with any chain a forget hid left to its erase.
     let heads: Vec<i64> = {
         let mut statement = conn.prepare(
             "SELECT id FROM memories
@@ -262,17 +265,97 @@ fn purgeable(
             .query_map([bank_id], |row| row.get(0))?
             .collect::<Result<_, _>>()?
     };
-    let mut chains = Vec::new();
+    let mut eligible = Vec::new();
     for head in heads {
-        let Some((window, tz)) = window(&conn, head)? else {
-            continue;
-        };
-        let strength = loader.strength(&conn, head)?.value;
-        if purge_eligible(&rule, strength, &window, &tz, now) {
-            chains.push(chain(&links, head));
+        if is_eligible(&conn, &loader, &rule, head, now)? {
+            eligible.push(head);
         }
     }
-    Ok(chains)
+    Ok(eligible)
+}
+
+fn is_eligible(
+    conn: &Connection,
+    loader: &StrengthLoader,
+    rule: &PurgeRule,
+    head: i64,
+    now: Timestamp,
+) -> Result<bool, rusqlite::Error> {
+    let Some((window, tz)) = window(conn, head)? else {
+        return Ok(false);
+    };
+    let strength = loader.strength(conn, head)?.value;
+    Ok(purge_eligible(rule, strength, &window, &tz, now))
+}
+
+/// Purge's second phase, in one transaction: re-reads the chain `head` is
+/// in now, whether any of it is hidden, its head's strength and both
+/// guards, and purges the chain only if it's still eligible (the TIM-112
+/// review). Between the phases a keep, a mention or a new successor can
+/// make it ineligible, and a forget can hide it, which leaves it to the
+/// forget's erase, the one that redacts. `None` when nothing was purged.
+pub(crate) fn purge_chain(
+    store: &Store,
+    tuning: &Tuning,
+    pause: &PurgePause,
+    bank_id: i64,
+    head: i64,
+    now: Timestamp,
+) -> Result<Option<(BTreeSet<uuid::Uuid>, Aftermath)>, StoreError> {
+    let rule = PurgeRule::from_tuning(tuning);
+    if *pause != PurgePause::Running || rule.delta.is_none() {
+        return Ok(None);
+    }
+    let mut conn = store.connection();
+    let tx = conn.transaction()?;
+    let exists = tx
+        .query_row(
+            "SELECT 1 FROM memories WHERE id = ?1 AND bank_id = ?2",
+            (head, bank_id),
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(None);
+    }
+    let links = bank_links(&tx, bank_id)?;
+    let head = chain_head(&links, head);
+    let members = chain(&links, head);
+    for member in &members {
+        let hidden = tx
+            .query_row(
+                "SELECT 1 FROM memories WHERE id = ?1 AND hidden_at IS NOT NULL",
+                [member],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if hidden {
+            return Ok(None);
+        }
+    }
+    let loader = StrengthLoader::new(&tx, bank_id, tuning.clock.quiet_rate, now)?;
+    if !is_eligible(&tx, &loader, &rule, head, now)? {
+        return Ok(None);
+    }
+    let (purged, aftermath) = erase_chain(&tx, store, bank_id, &members, EraseReason::Purge)?;
+    tx.commit()?;
+    Ok(Some((purged, aftermath)))
+}
+
+/// The bank's chains purge would take at `now`, each as its members, read
+/// without deleting anything: what `purge plan` counts.
+fn purgeable(
+    store: &Store,
+    tuning: &Tuning,
+    bank_id: i64,
+    now: Timestamp,
+) -> Result<Vec<BTreeSet<i64>>, StoreError> {
+    let heads = candidates(store, tuning, bank_id, now)?;
+    let conn = store.connection();
+    let links = bank_links(&conn, bank_id)?;
+    Ok(heads.into_iter().map(|head| chain(&links, head)).collect())
 }
 
 /// The source, failed-chunk and recall-log sweep past the horizon.
@@ -295,7 +378,7 @@ fn sweep_sources(
         (bank_id, horizon, now),
     )?;
 
-    let sources: Vec<i64> = sweepable_sources(&tx, bank_id, horizon)?;
+    let sources: Vec<i64> = sweepable_sources(&tx, bank_id, horizon, &BTreeSet::new())?;
     for source in &sources {
         counts.swept_chunks += tx.execute(
             "UPDATE chunks SET text = NULL, call1_output = NULL, tombstoned_at = ?2
@@ -333,24 +416,44 @@ fn horizon(tuning: &Tuning, now: Timestamp) -> i64 {
 }
 
 /// Sources past the horizon that still have text, that no memory rests on
-/// and that have no chunk waiting on the queue.
+/// except those in `purged`, and that have no chunk waiting on the queue.
+/// The sweep passes nothing for `purged`, since it has purged by then; the
+/// plan passes what it projects the purge will take.
 fn sweepable_sources(
     conn: &Connection,
     bank_id: i64,
     horizon: i64,
+    purged: &BTreeSet<i64>,
 ) -> Result<Vec<i64>, rusqlite::Error> {
-    let mut statement = conn.prepare_cached(
-        "SELECT s.id FROM sources s
-         WHERE s.bank_id = ?1 AND s.ingested_at < ?2 AND s.tombstoned_at IS NULL
-           AND NOT EXISTS (SELECT 1 FROM memories m JOIN chunks c ON c.id = m.chunk_id
-                           WHERE c.source_id = s.id)
-           AND NOT EXISTS (SELECT 1 FROM extraction_queue q JOIN chunks c ON c.id = q.chunk_id
-                           WHERE c.source_id = s.id)
-         ORDER BY s.id",
+    let candidates: Vec<i64> = {
+        let mut statement = conn.prepare_cached(
+            "SELECT s.id FROM sources s
+             WHERE s.bank_id = ?1 AND s.ingested_at < ?2 AND s.tombstoned_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM extraction_queue q JOIN chunks c ON c.id = q.chunk_id
+                               WHERE c.source_id = s.id)
+             ORDER BY s.id",
+        )?;
+        statement
+            .query_map((bank_id, horizon), |row| row.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    let mut resting = conn.prepare_cached(
+        "SELECT m.id FROM memories m JOIN chunks c ON c.id = m.chunk_id WHERE c.source_id = ?1",
     )?;
-    statement
-        .query_map((bank_id, horizon), |row| row.get(0))?
-        .collect()
+    let mut sources = Vec::new();
+    for source in candidates {
+        let mut free = true;
+        for memory in resting.query_map([source], |row| row.get::<_, i64>(0))? {
+            if !purged.contains(&memory?) {
+                free = false;
+                break;
+            }
+        }
+        if free {
+            sources.push(source);
+        }
+    }
+    Ok(sources)
 }
 
 /// What the sweep would delete now, without deleting anything.
@@ -381,12 +484,13 @@ pub(crate) fn plan(
     };
     let horizon = horizon(tuning, now);
     for &bank_id in banks {
-        plan.memories += purgeable(store, tuning, bank_id, now)?
-            .iter()
-            .map(BTreeSet::len)
-            .sum::<usize>();
+        let purged: BTreeSet<i64> = purgeable(store, tuning, bank_id, now)?
+            .into_iter()
+            .flatten()
+            .collect();
+        plan.memories += purged.len();
         let conn = store.connection();
-        plan.sources += sweepable_sources(&conn, bank_id, horizon)?.len();
+        plan.sources += sweepable_sources(&conn, bank_id, horizon, &purged)?.len();
         plan.failed_chunks += conn.query_row(
             "SELECT COUNT(*) FROM chunks
              WHERE bank_id = ?1 AND failed_at IS NOT NULL AND tombstoned_at IS NULL

@@ -88,10 +88,39 @@ of the turn or document to redact. From version 7, `accesses.spans` holds
 each mention's chunk and character span, and forget masks exactly those.
 
 The migration only adds the column. Accesses written before it have no
-spans, so forgetting a memory mentioned before the upgrade redacts the
-memory's own passages but not the earlier mentions. No action is needed.
+spans. Version 8 says what forget does about them.
 
 The first start after the upgrade also records the deletion inputs beside
 the stored fingerprint, so `asphodel purge plan` can name what changes
 later. A store that's paused when it upgrades shows `unknown` until the
 pause is acknowledged.
+
+## Schema version 8: mention passages, and what a forget masked
+
+Version 7 kept a mention's span on its access, but a later version of the
+same document repeating a memory isn't an access (TIM-92), so its passage
+went unrecorded and survived a forget (the TIM-112 review). From version 8,
+`mention_passages` records every passage that restated a memory without
+becoming one, credited or not, and forget masks them. The migration copies
+the spans version 7 stored, and `accesses.spans` is no longer written.
+
+`chunk_redactions` records what forget masked in each chunk. A document's
+new version stores its full text, but a section it shares with an earlier
+version gets no chunk row, so forget also masks each passage wherever it
+appears verbatim in the document's other versions, and a version ingested
+after the forget masks the recorded characters before its text is stored.
+
+**Mentions from before version 7 have no span**, and nothing can recover
+one: call 1's reply was dropped when each chunk committed. Forget masks
+more rather than less for them:
+
+- in a turn, the whole message and reply, except the passages surviving
+  memories rest on;
+- in a document, the forgotten memory's own passages wherever they appear
+  verbatim, or the whole document, except surviving passages, when they
+  appear nowhere.
+
+The `forgotten` edit counts these as `legacy_mentions` and `whole_source`,
+so the wider masking can be seen in the edit log. No action is needed, but
+forgetting a memory mentioned before version 7 can mask more of an old turn
+or document than the mention itself.

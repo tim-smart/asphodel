@@ -414,9 +414,11 @@ pub(super) struct Plan {
     pub edits: Vec<(usize, i64, Edit)>,
     /// Accesses on neighbours, the strongest kind each.
     pub accesses: BTreeMap<i64, Label>,
-    /// Where each access's mentions were said: the chunk-relative span of
-    /// every claim that mentioned the neighbour, so a forget can redact
-    /// them (schema version 7).
+    /// Where the chunk restated each neighbour without a new memory: the
+    /// chunk-relative span of every claim that mentioned or confirmed it,
+    /// same-document repeats included, and of an older claim whose
+    /// retraction or refinement created nothing. A forget redacts them
+    /// (schema version 8). It's provenance, not strength.
     pub mention_spans: BTreeMap<i64, Vec<(usize, usize)>>,
     /// Significance raises from `mentioned_again`, the larger each, for
     /// neighbours whose significance the owner hasn't set.
@@ -426,6 +428,13 @@ pub(super) struct Plan {
 }
 
 impl Plan {
+    fn add_passage(&mut self, neighbour: i64, span: (usize, usize)) {
+        let spans = self.mention_spans.entry(neighbour).or_default();
+        if !spans.contains(&span) {
+            spans.push(span);
+        }
+    }
+
     /// Every claim new, as when call 2 doesn't run.
     pub fn all_new(claims: usize) -> Self {
         Self {
@@ -518,7 +527,10 @@ pub(super) fn plan(
                 Label::Ends => {
                     older_end.get_or_insert(n);
                 }
-                Label::Retracts | Label::Denies | Label::Refines => older_nothing = true,
+                Label::Retracts | Label::Denies | Label::Refines => {
+                    older_nothing = true;
+                    plan.add_passage(neighbour.id, (memory.start, memory.end));
+                }
             }
         }
 
@@ -526,13 +538,11 @@ pub(super) fn plan(
             let neighbour = &search.neighbours[n];
             // TIM-92: a later version of the same document repeating itself
             // isn't an independent mention.
+            // Its passage is recorded either way: it restated the memory.
+            plan.add_passage(neighbour.id, (memory.start, memory.end));
             let same_document = document_id.is_some() && neighbour.document_id == document_id;
             if same_document {
                 continue;
-            }
-            let spans = plan.mention_spans.entry(neighbour.id).or_default();
-            if !spans.contains(&(memory.start, memory.end)) {
-                spans.push((memory.start, memory.end));
             }
             let kind = plan.accesses.entry(neighbour.id).or_insert(label);
             if label == Label::Confirmed {

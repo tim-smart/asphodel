@@ -16,8 +16,10 @@
 //! redacting the passages and the tombstone wait on the bank's queue as an
 //! `erase` job, behind every chunk queued before it. Those chunks reconcile
 //! against the hidden memory, so a new version of it joins the chain
-//! (hidden as it's committed) and a mention leaves an access with its
-//! spans, and the erase takes both. Forget never pauses.
+//! (hidden as it's committed) and a mention leaves its passage in
+//! `mention_passages`, credited or not, and the erase takes both. Forget
+//! never pauses. It writes a `forget` audit row there and then, which the
+//! request turn is linked to when it's ingested ([`crate::ingest`]).
 //!
 //! **The erase** takes a chain and a reason. In common it deletes the
 //! memory rows (their vectors, FTS rows, entity links, accesses, recall
@@ -33,12 +35,15 @@
 //! character, so the spans of other memories in the same chunk still hold.
 //! The source keeps its key and content hash, and the chunk its hash, so
 //! sending the same turn or document again is a duplicate and a later
-//! version can't bring the passage back (ADR 0002, TIM-92).
+//! version can't bring the passage back for extraction (ADR 0002, TIM-92).
+//! A document's other versions hold the passage in their own text, so it's
+//! masked wherever it appears verbatim in them, and the masks are recorded
+//! in `chunk_redactions` for a version ingested later to apply to its text.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, OptionalExtension, Transaction};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::ingest::{TURN_SEPARATOR, find_bank};
@@ -49,6 +54,10 @@ use crate::store::{Store, StoreError, VectorIndex, micros};
 use crate::strength::{Link, chain};
 use crate::system_prompt::BlockEntry;
 
+/// The edit kind forget writes when it's called: the audit row, which the
+/// turn that asked for the forget is linked to once it's ingested.
+pub const EDIT_FORGET: &str = "forget";
+
 /// The edit kind a forget's erase writes.
 pub const EDIT_FORGOTTEN: &str = "forgotten";
 
@@ -58,6 +67,17 @@ pub const EDIT_PURGED: &str = "purged";
 /// What each character of a redacted passage becomes. Masking character
 /// for character keeps every other span in the chunk where it was.
 pub const REDACTION_MASK: char = '\u{2588}';
+
+/// What `memory_forget` and `POST /v1/banks/{bank}/forget` take (TIM-94,
+/// decision 9). `session_id` is the Hermes session whose `sync_turn` will
+/// carry the request turn, so the audit row can be linked to it (ADR 0010);
+/// the CLI sends none.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ForgetRequest {
+    pub ids: Vec<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
 
 /// What `forget` returns (TIM-94, decision 9, as amended by TIM-97).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -127,8 +147,14 @@ pub(crate) struct Aftermath {
 pub(crate) fn forget(
     store: &Store,
     bank: &str,
-    ids: &[String],
+    request: &ForgetRequest,
 ) -> Result<(i64, Forgotten, Aftermath), ForgetError> {
+    let ids = &request.ids;
+    let session = request
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|session| !session.is_empty());
     if ids.len() > MAX_IDS {
         return Err(ForgetError::TooMany { given: ids.len() });
     }
@@ -175,6 +201,32 @@ pub(crate) fn forget(
         let scrub: BTreeSet<Uuid> = uuids.iter().copied().collect();
         scrub_stored(&tx, bank_id, &scrub)?;
         aftermath.scrub = scrub;
+        // The audit row (ADR 0010), written now so a crash before the
+        // erase still leaves it. `after` is the session's latest turn so
+        // far: the request turn is the next one, whatever the clock says.
+        let after: Option<i64> = match session {
+            Some(session) => Some(tx.query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM sources
+                 WHERE bank_id = ?1 AND kind = 'turn' AND session_id = ?2",
+                (bank_id, session),
+                |row| row.get(0),
+            )?),
+            None => None,
+        };
+        log_edit(
+            &tx,
+            store,
+            bank_id,
+            EDIT_FORGET,
+            None,
+            &serde_json::json!({
+                "memories": uuids,
+                "session_id": session,
+                "after": after,
+                "request": null,
+            })
+            .to_string(),
+        )?;
         tx.execute(
             "INSERT INTO extraction_queue (bank_id, kind, memory_ids, reason, priority,
                                            observed_at, enqueued_at)
@@ -293,28 +345,9 @@ pub(crate) fn erase_chain(
     }
 
     aftermath.models = drop_entries(tx, members)?;
+    let mut redacted = Redacted::default();
     if reason == EraseReason::Forget {
-        let mut spans: BTreeMap<i64, Vec<(usize, usize)>> = BTreeMap::new();
-        for row in &rows {
-            spans
-                .entry(row.chunk_id)
-                .or_default()
-                .push((row.start, row.end));
-        }
-        let mut mentions = tx.prepare_cached(
-            "SELECT spans FROM accesses WHERE memory_id = ?1 AND spans IS NOT NULL",
-        )?;
-        for member in members {
-            for stored in mentions.query_map([member], |row| row.get::<_, String>(0))? {
-                let stored: Vec<(i64, usize, usize)> =
-                    serde_json::from_str(&stored?).unwrap_or_default();
-                for (chunk, start, end) in stored {
-                    spans.entry(chunk).or_default().push((start, end));
-                }
-            }
-        }
-        drop(mentions);
-        redact(tx, &spans)?;
+        redacted = redact_chain(tx, members, &rows)?;
         delete_recalls(tx, members)?;
         scrub_stored(tx, bank_id, &uuids)?;
         aftermath.scrub = uuids.clone();
@@ -331,7 +364,11 @@ pub(crate) fn erase_chain(
     delete_orphans(tx, &entities)?;
 
     let details = match reason {
-        EraseReason::Forget => serde_json::json!({ "memories": uuids }),
+        EraseReason::Forget => serde_json::json!({
+            "memories": uuids,
+            "legacy_mentions": redacted.legacy_mentions,
+            "whole_source": redacted.whole_source,
+        }),
         EraseReason::Purge => serde_json::json!({
             "memories": rows
                 .iter()
@@ -525,12 +562,216 @@ fn scrub_stored(
     Ok(())
 }
 
+/// What a forget's redaction did beyond the chain's recorded passages.
+#[derive(Debug, Default)]
+struct Redacted {
+    /// Mentions stored before version 7, which have no span.
+    legacy_mentions: usize,
+    /// Documents masked whole for one, because no exact passage was found.
+    whole_source: usize,
+}
+
+/// Masks every passage the chain rests on or was restated in: the members'
+/// own spans and their recorded mention passages. A mention from before
+/// version 7 has no span, so its source is masked more widely rather than
+/// not at all (the TIM-112 review): a turn except what surviving memories
+/// rest on, and a document at the chain's own passages wherever they appear
+/// verbatim, or else whole, again except surviving passages.
+fn redact_chain(
+    tx: &Transaction<'_>,
+    members: &BTreeSet<i64>,
+    rows: &[Passage],
+) -> Result<Redacted, rusqlite::Error> {
+    let mut spans: BTreeMap<i64, Vec<(usize, usize)>> = BTreeMap::new();
+    for row in rows {
+        spans
+            .entry(row.chunk_id)
+            .or_default()
+            .push((row.start, row.end));
+    }
+    let mut legacy_sources: Vec<i64> = Vec::new();
+    {
+        let mut mentions = tx.prepare_cached(
+            "SELECT chunk_id, start_offset, end_offset FROM mention_passages WHERE memory_id = ?1",
+        )?;
+        let mut legacy = tx.prepare_cached(
+            "SELECT a.source_id FROM accesses a
+             WHERE a.memory_id = ?1 AND a.kind IN ('mentioned_again', 'confirmed')
+               AND a.source_id IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM mention_passages p
+                               JOIN chunks c ON c.id = p.chunk_id
+                               WHERE p.memory_id = a.memory_id AND c.source_id = a.source_id)",
+        )?;
+        for member in members {
+            for row in mentions.query_map([member], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })? {
+                let (chunk, start, end) = row?;
+                spans
+                    .entry(chunk)
+                    .or_default()
+                    .push((offset(start), offset(end)));
+            }
+            for source in legacy.query_map([member], |row| row.get::<_, i64>(0))? {
+                legacy_sources.push(source?);
+            }
+        }
+    }
+
+    let mut redacted = Redacted {
+        legacy_mentions: legacy_sources.len(),
+        whole_source: 0,
+    };
+    if !legacy_sources.is_empty() {
+        // The chain's own passages, read before anything is masked.
+        let own: Vec<String> = rows
+            .iter()
+            .filter_map(|row| {
+                chunk_text(tx, row.chunk_id)
+                    .ok()
+                    .flatten()
+                    .map(|text| slice(&text, row.start, row.end))
+            })
+            .filter(|passage| !passage.trim().is_empty())
+            .collect();
+        legacy_sources.sort_unstable();
+        legacy_sources.dedup();
+        for source in legacy_sources {
+            let kind: String =
+                tx.query_row("SELECT kind FROM sources WHERE id = ?1", [source], |row| {
+                    row.get(0)
+                })?;
+            let chunks = chunks_of(tx, source)?;
+            let found: Vec<(i64, Vec<(usize, usize)>)> = if kind == "document" {
+                chunks
+                    .iter()
+                    .map(|(chunk, text)| {
+                        let hits = own
+                            .iter()
+                            .flat_map(|passage| occurrences(text, passage))
+                            .collect();
+                        (*chunk, hits)
+                    })
+                    .filter(|(_, hits): &(i64, Vec<(usize, usize)>)| !hits.is_empty())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if !found.is_empty() {
+                for (chunk, hits) in found {
+                    spans.entry(chunk).or_default().extend(hits);
+                }
+                continue;
+            }
+            if kind == "document" {
+                redacted.whole_source += 1;
+            }
+            for (chunk, text) in &chunks {
+                let keep = surviving(tx, *chunk, members)?;
+                spans
+                    .entry(*chunk)
+                    .or_default()
+                    .extend(complement(text.chars().count(), &keep));
+            }
+        }
+    }
+    redact(tx, &spans)?;
+    Ok(redacted)
+}
+
+fn offset(value: i64) -> usize {
+    usize::try_from(value).unwrap_or(0)
+}
+
+fn chunk_text(conn: &Connection, chunk: i64) -> Result<Option<String>, rusqlite::Error> {
+    conn.query_row("SELECT text FROM chunks WHERE id = ?1", [chunk], |row| {
+        row.get(0)
+    })
+}
+
+/// A source's chunks that still have text.
+fn chunks_of(conn: &Connection, source: i64) -> Result<Vec<(i64, String)>, rusqlite::Error> {
+    let mut statement = conn.prepare_cached(
+        "SELECT id, text FROM chunks WHERE source_id = ?1 AND text IS NOT NULL ORDER BY position",
+    )?;
+    statement
+        .query_map([source], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect()
+}
+
+/// The own passages of memories outside `members` that rest on `chunk`.
+fn surviving(
+    conn: &Connection,
+    chunk: i64,
+    members: &BTreeSet<i64>,
+) -> Result<Vec<(usize, usize)>, rusqlite::Error> {
+    let mut statement = conn
+        .prepare_cached("SELECT id, source_start, source_end FROM memories WHERE chunk_id = ?1")?;
+    let rows: Vec<(i64, i64, i64)> = statement
+        .query_map([chunk], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(id, _, _)| !members.contains(id))
+        .map(|(_, start, end)| (offset(start), offset(end)))
+        .collect())
+}
+
+/// Every span of `0..len` outside `keep`.
+fn complement(len: usize, keep: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut keep = keep.to_vec();
+    keep.sort_unstable();
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for (start, end) in keep {
+        if start > at {
+            spans.push((at, start.min(len)));
+        }
+        at = at.max(end);
+    }
+    if at < len {
+        spans.push((at, len));
+    }
+    spans
+}
+
+/// The characters `start..end` of `text`.
+fn slice(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+/// Where `needle` appears in `text`, in characters, overlapping included.
+fn occurrences(text: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() || needle.contains(REDACTION_MASK) {
+        return Vec::new();
+    }
+    let length = needle.chars().count();
+    text.char_indices()
+        .enumerate()
+        .filter(|(_, (byte, _))| text[*byte..].starts_with(needle))
+        .map(|(index, _)| (index, index + length))
+        .collect()
+}
+
 /// Masks `spans` (chunk-relative characters, by chunk rowid) in each
-/// chunk's text and in its source. A turn's chunk is the message, the
-/// separator and the reply, so a span maps into `text` or `reply`; a
-/// document's chunk starts at its `start_offset` in the source text. Text
-/// already swept is left as it is. Call 1's saved reply goes too, since it
-/// quotes the chunk.
+/// chunk's text and in its source, and records them in `chunk_redactions`
+/// so a document version ingested later masks the same characters. A
+/// turn's chunk is the message, the separator and the reply, so a span maps
+/// into `text` or `reply`; a document's chunk starts at its `start_offset`
+/// in the source text. Text already swept is left as it is. Call 1's saved
+/// reply goes too, since it quotes the chunk.
+///
+/// A document's other versions hold the same passages in their own text:
+/// in chunks that changed, and in sections they share with this one, which
+/// have no chunk row of their own. Each passage is masked wherever it
+/// appears verbatim in them too.
 fn redact(
     conn: &Connection,
     spans: &BTreeMap<i64, Vec<(usize, usize)>>,
@@ -541,15 +782,27 @@ fn redact(
             [chunk_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        conn.execute(
-            "UPDATE chunks SET text = ?2, call1_output = NULL WHERE id = ?1",
-            (chunk_id, text.map(|text| mask(&text, spans))),
-        )?;
+        let passages: Vec<String> = text
+            .as_deref()
+            .map(|text| {
+                spans
+                    .iter()
+                    .map(|&(start, end)| slice(text, start, end))
+                    .filter(|passage| !passage.trim().is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        mask_chunk(conn, chunk_id, text.as_deref(), spans)?;
 
-        let (kind, source_text, reply): (String, Option<String>, Option<String>) = conn.query_row(
-            "SELECT kind, text, reply FROM sources WHERE id = ?1",
+        let (kind, document_id, source_text, reply): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT kind, document_id, text, reply FROM sources WHERE id = ?1",
             [source_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         let (source_text, reply) = if kind == "turn" {
             let message = source_text
@@ -571,7 +824,7 @@ fn redact(
                 reply.map(|reply| mask(&reply, &in_reply)),
             )
         } else {
-            let offset = usize::try_from(start_offset).unwrap_or(0);
+            let offset = offset(start_offset);
             let shifted: Vec<(usize, usize)> = spans
                 .iter()
                 .map(|&(start, end)| (start + offset, end + offset))
@@ -582,13 +835,125 @@ fn redact(
             "UPDATE sources SET text = ?2, reply = ?3 WHERE id = ?1",
             (source_id, source_text, reply),
         )?;
+
+        if let Some(document_id) = document_id.filter(|_| !passages.is_empty()) {
+            redact_versions(conn, source_id, &document_id, &passages)?;
+        }
     }
     Ok(())
 }
 
+/// Masks `spans` in a chunk's text, drops call 1's saved reply, and records
+/// the spans.
+fn mask_chunk(
+    conn: &Connection,
+    chunk_id: i64,
+    text: Option<&str>,
+    spans: &[(usize, usize)],
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE chunks SET text = ?2, call1_output = NULL WHERE id = ?1",
+        (chunk_id, text.map(|text| mask(text, spans))),
+    )?;
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT spans FROM chunk_redactions WHERE chunk_id = ?1",
+            [chunk_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut all: Vec<(usize, usize)> = stored
+        .and_then(|stored| serde_json::from_str(&stored).ok())
+        .unwrap_or_default();
+    all.extend_from_slice(spans);
+    all.sort_unstable();
+    all.dedup();
+    conn.execute(
+        "INSERT INTO chunk_redactions (chunk_id, spans) VALUES (?1, ?2)
+         ON CONFLICT (chunk_id) DO UPDATE SET spans = excluded.spans",
+        (
+            chunk_id,
+            serde_json::to_string(&all).expect("spans serialise"),
+        ),
+    )?;
+    Ok(())
+}
+
+/// Masks each of `passages` wherever it appears verbatim in the other
+/// versions of a document: their source text and their chunks.
+fn redact_versions(
+    conn: &Connection,
+    source_id: i64,
+    document_id: &str,
+    passages: &[String],
+) -> Result<(), rusqlite::Error> {
+    let versions: Vec<(i64, Option<String>)> = {
+        let mut statement = conn.prepare_cached(
+            "SELECT id, text FROM sources
+             WHERE bank_id = (SELECT bank_id FROM sources WHERE id = ?1)
+               AND kind = 'document' AND document_id = ?2 AND id != ?1",
+        )?;
+        statement
+            .query_map((source_id, document_id), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<_, _>>()?
+    };
+    for (version, text) in versions {
+        if let Some(text) = text {
+            let hits: Vec<(usize, usize)> = passages
+                .iter()
+                .flat_map(|passage| occurrences(&text, passage))
+                .collect();
+            if !hits.is_empty() {
+                conn.execute(
+                    "UPDATE sources SET text = ?2 WHERE id = ?1",
+                    (version, mask(&text, &hits)),
+                )?;
+            }
+        }
+        for (chunk, text) in chunks_of(conn, version)? {
+            let hits: Vec<(usize, usize)> = passages
+                .iter()
+                .flat_map(|passage| occurrences(&text, passage))
+                .collect();
+            if !hits.is_empty() {
+                mask_chunk(conn, chunk, Some(&text), &hits)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The masks recorded for chunks of a document with `content_hash`, from
+/// any of its versions: what a version sharing that chunk masks in its own
+/// text when it's ingested (schema version 8).
+pub(crate) fn recorded_redactions(
+    conn: &Connection,
+    bank_id: i64,
+    document_id: &str,
+    content_hash: &str,
+) -> Result<Vec<(usize, usize)>, rusqlite::Error> {
+    let mut statement = conn.prepare_cached(
+        "SELECT r.spans FROM chunk_redactions r
+         JOIN chunks c ON c.id = r.chunk_id
+         JOIN sources s ON s.id = c.source_id
+         WHERE c.bank_id = ?1 AND c.content_hash = ?2
+           AND s.kind = 'document' AND s.document_id = ?3",
+    )?;
+    let mut all = Vec::new();
+    for spans in statement.query_map((bank_id, content_hash, document_id), |row| {
+        row.get::<_, String>(0)
+    })? {
+        let spans: Vec<(usize, usize)> = serde_json::from_str(&spans?).unwrap_or_default();
+        all.extend(spans);
+    }
+    Ok(all)
+}
+
 /// `text` with every character inside `spans` replaced by
 /// [`REDACTION_MASK`], except line breaks, which keep a document's lines.
-fn mask(text: &str, spans: &[(usize, usize)]) -> String {
+pub(crate) fn mask(text: &str, spans: &[(usize, usize)]) -> String {
     text.chars()
         .enumerate()
         .map(|(index, c)| {
