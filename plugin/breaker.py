@@ -4,8 +4,9 @@ restart doesn't cost every turn a timeout."""
 
 from __future__ import annotations
 
+import threading
 import time
-from typing import Callable
+from typing import Callable, Optional
 
 BREAKER_FAILURES = 3
 BREAKER_COOLDOWN_S = 30.0
@@ -25,17 +26,30 @@ class CircuitBreaker:
         self.failures = failures
         self.cooldown = cooldown
         self._clock = clock
+        self._lock = threading.Lock()
+        self._consecutive = 0
+        self._opened_at: Optional[float] = None
 
     def allow(self) -> bool:
         """False while open: no request should be made."""
-        raise NotImplementedError
+        with self._lock:
+            if self._opened_at is None:
+                return True
+            return self._clock() - self._opened_at >= self.cooldown
 
     def record_success(self) -> None:
-        raise NotImplementedError
+        with self._lock:
+            self._consecutive = 0
+            self._opened_at = None
 
     def record_failure(self) -> None:
-        raise NotImplementedError
+        """After the cooldown the count isn't reset, so one more failure
+        reopens the breaker at once."""
+        with self._lock:
+            self._consecutive += 1
+            if self._consecutive >= self.failures:
+                self._opened_at = self._clock()
 
     @property
     def is_open(self) -> bool:
-        raise NotImplementedError
+        return not self.allow()

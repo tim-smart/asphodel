@@ -12,15 +12,20 @@ ids, counts and status codes only (ADR 0010). Content is logged only at
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider, RecallStatus
+from tools.registry import tool_error
 
+from . import config as plugin_config
+from . import tools, turns
 from .breaker import CircuitBreaker
-from .client import DaemonClient
+from .client import DaemonClient, DaemonError, DaemonUnavailable
 from .config import PluginConfig
 from .spool import Spool
 
@@ -104,10 +109,16 @@ class AsphodelMemoryProvider(MemoryProvider):
         """Config only (TIM-94, decision 3): True when a URL resolves from
         ``ASPHODEL_URL`` or ``config.json`` under the active ``HERMES_HOME``.
         Never touches the network; a dead daemon never drops the provider."""
-        raise NotImplementedError
+        try:
+            return bool(plugin_config.load_config(self._resolve_home()).url)
+        except Exception:
+            return False
 
     def unavailable_reason(self) -> str:
-        raise NotImplementedError
+        return (
+            "No Asphodel daemon URL: set url in $HERMES_HOME/asphodel/config.json "
+            f"or {plugin_config.URL_ENV_VAR} in the environment."
+        )
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -116,12 +127,107 @@ class AsphodelMemoryProvider(MemoryProvider):
         ``warning_callback`` when the daemon isn't ready or its major version
         differs), ``PUT``s the bank with the configured identity, and warns if
         Hermes' built-in memory flags are still on. Never fails."""
-        raise NotImplementedError
+        warn = kwargs.get("warning_callback")
+        try:
+            self._hermes_home = str(kwargs.get("hermes_home") or self._resolve_home())
+            self._session_id = session_id or ""
+            self._platform = kwargs.get("platform") or None
+            self._agent_context = kwargs.get("agent_context") or PRIMARY_CONTEXT
+            self._profile = kwargs.get("agent_identity") or "default"
+            self.config = plugin_config.load_config(self._hermes_home)
+            self.client = DaemonClient(self.config.url, token=self.config.token, breaker=self.breaker)
+            self.spool = Spool(plugin_config.spool_dir(self._hermes_home))
+            self.bank = self.config.bank or self._profile
+            self._probe_health(warn)
+            self._put_bank(warn)
+            self._check_builtin_memory(warn)
+        except Exception as error:
+            log.warning("initialize failed: %s", type(error).__name__)
+
+    def _probe_health(self, warn) -> None:
+        url = self.config.url
+        try:
+            status, health = self.client.health(timeout=self.timeouts.health)
+        except DaemonUnavailable:
+            self._warn(warn, f"Asphodel: can't reach the daemon at {url}; memory is off until it's back.")
+            return
+        except DaemonError as error:
+            self._warn(warn, f"Asphodel: the daemon's health check answered {error.status}.")
+            return
+        health = health if isinstance(health, dict) else {}
+        if status != 200 or not health.get("ready", False):
+            self._warn(warn, f"Asphodel: the daemon at {url} isn't ready yet (status {status}).")
+        version = health.get("version")
+        if isinstance(version, str):
+            major = version.split(".", 1)[0]
+            if major != str(DAEMON_MAJOR_VERSION):
+                self._warn(
+                    warn,
+                    f"Asphodel: the daemon's version is {version}, but this plugin was written "
+                    f"for {DAEMON_MAJOR_VERSION}.x.",
+                )
+
+    def _put_bank(self, warn) -> None:
+        identity = {
+            "owner_name": self.config.owner_name,
+            "owner_platform_ids": list(self.config.owner_platform_ids),
+            "assistant_name": self.config.assistant_name or self._profile,
+            "timezone": self.config.timezone,
+        }
+        try:
+            self.client.put_bank(self.bank, identity, timeout=self.timeouts.health)
+        except DaemonUnavailable:
+            # The health probe has already warned.
+            log.debug("put bank: daemon unreachable")
+        except DaemonError as error:
+            self._warn(warn, f"Asphodel: the daemon refused bank {self.bank} ({error.status}).")
+
+    def _check_builtin_memory(self, warn) -> None:
+        """Hermes defaults both flags on, so a key that's absent warns. An
+        empty or missing ``memory`` section means Hermes' config couldn't be
+        read (its loader always merges the defaults), so there's nothing to
+        check."""
+        try:
+            from hermes_cli.config import load_config as load_hermes_config
+
+            memory = (load_hermes_config() or {}).get("memory")
+        except Exception as error:
+            log.debug("could not read Hermes' config: %s", type(error).__name__)
+            return
+        if not isinstance(memory, dict) or not memory:
+            return
+        for flag in BUILTIN_MEMORY_FLAGS:
+            if memory.get(flag, True):
+                self._warn(
+                    warn,
+                    f"Asphodel: Hermes' built-in memory.{flag} is on, so two memories run at once. "
+                    "Run `hermes memory setup` or set it to false.",
+                )
+
+    @staticmethod
+    def _warn(callback, message: str) -> None:
+        log.warning("%s", message)
+        if callable(callback):
+            try:
+                callback(message)
+            except Exception:
+                pass
+
+    def _resolve_home(self) -> str:
+        if self._hermes_home:
+            return self._hermes_home
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home())
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Records ``author_id``, ``author_name`` and ``author_is_bot`` for the
         owner check (decision 1)."""
-        raise NotImplementedError
+        author_id = kwargs.get("author_id")
+        self._author_id = str(author_id) if author_id not in (None, "") else None
+        author_name = kwargs.get("author_name")
+        self._author_name = str(author_name) if author_name else None
+        self._author_is_bot = bool(kwargs.get("author_is_bot", False))
 
     def on_session_switch(
         self,
@@ -137,7 +243,24 @@ class AsphodelMemoryProvider(MemoryProvider):
         old session's in-context set through
         ``POST /v1/banks/{bank}/sessions/{id}/clear`` and drops the pending
         recall id, last query and block mapping."""
-        raise NotImplementedError
+        old_session = self._session_id or parent_session_id
+        clear = reset or rewound or kwargs.get("reason") == "compression"
+        try:
+            if clear and old_session:
+                self._pending_recall_id.pop(old_session, None)
+                self._last_query.pop(old_session, None)
+                self._pending_block_id = None
+                if self.client is not None and self.bank:
+                    try:
+                        self.client.clear_session(self.bank, old_session, timeout=self.timeouts.session_clear)
+                    except DaemonUnavailable:
+                        log.debug("clear session: daemon unreachable")
+                    except DaemonError as error:
+                        log.warning("clear session: daemon answered %d", error.status)
+        except Exception as error:
+            log.warning("on_session_switch failed: %s", type(error).__name__)
+        finally:
+            self._session_id = new_session_id or self._session_id
 
     def shutdown(self) -> None:
         """Nothing to drain: the plugin owns no threads."""
@@ -153,19 +276,84 @@ class AsphodelMemoryProvider(MemoryProvider):
         ``system_prompt`` budget and ``system_prompt_retries`` more attempts
         on a connection failure. Returns the block's text, or "" when the
         daemon can't be reached or the breaker is open."""
-        raise NotImplementedError
+        try:
+            if self.client is None or not self.bank:
+                return ""
+            session = self._session_id or None
+            block = None
+            for attempt in range(1 + max(0, self.timeouts.system_prompt_retries)):
+                try:
+                    block = self.client.system_prompt(self.bank, session, timeout=self.timeouts.system_prompt)
+                    break
+                except DaemonUnavailable as error:
+                    log.debug("system prompt attempt %d: daemon unreachable (%s)", attempt + 1, error)
+                    if not self.breaker.allow():
+                        break
+            if not isinstance(block, dict):
+                log.warning("system prompt: daemon unreachable")
+                return ""
+            text = block.get("text") or ""
+            block_id = block.get("id")
+            self._pending_block_id = block_id if not session and block_id else None
+            log.debug("system prompt: block %s", block_id)
+            log.log(TRACE, "system prompt block: %s", text)
+            return text
+        except DaemonError as error:
+            log.warning("system prompt: daemon answered %d", error.status)
+        except Exception as error:
+            log.warning("system_prompt_block failed: %s", type(error).__name__)
+        return ""
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """``POST /v1/banks/{bank}/prefetch`` with the query, the session's
         last prefetch query as ``previous_query`` and, once, a pending block
         id. Stores the ``recall_id`` for ``sync_turn`` and the injected count
         for ``recall_status``. "" on any failure."""
-        raise NotImplementedError
+        self._last_injected = 0
+        try:
+            if self.client is None or not self.bank:
+                return ""
+            session = session_id or self._session_id
+            if not self._session_id:
+                self._session_id = session
+            request: Dict[str, Any] = {"session_id": session, "query": query}
+            previous = self._last_query.get(session)
+            if previous:
+                request["previous_query"] = previous
+            block_id = self._pending_block_id
+            if block_id:
+                request["block_id"] = block_id
+            log.log(TRACE, "prefetch query: %s", query)
+            result = self.client.prefetch(self.bank, request, timeout=self.timeouts.prefetch)
+        except DaemonUnavailable as error:
+            log.warning("prefetch: daemon unreachable (%s)", error)
+            return ""
+        except DaemonError as error:
+            log.warning("prefetch: daemon answered %d", error.status)
+            return ""
+        except Exception as error:
+            log.warning("prefetch failed: %s", type(error).__name__)
+            return ""
+        if block_id and self._pending_block_id == block_id:
+            self._pending_block_id = None
+        self._last_query[session] = query
+        result = result if isinstance(result, dict) else {}
+        recall_id = result.get("recall_id")
+        if recall_id:
+            self._pending_recall_id[session] = str(recall_id)
+        else:
+            self._pending_recall_id.pop(session, None)
+        injected = result.get("injected")
+        self._last_injected = len(injected) if isinstance(injected, list) else 0
+        log.debug("prefetch: recall %s injected %d", recall_id, self._last_injected)
+        return result.get("text") or ""
 
     def recall_status(self) -> Optional[RecallStatus]:
         """The last prefetch's injected count; ``None`` when it injected
         nothing or failed."""
-        raise NotImplementedError
+        if self._last_injected <= 0:
+            return None
+        return RecallStatus(provider_label=PROVIDER_LABEL, count=self._last_injected)
 
     # -- ingest --------------------------------------------------------------
 
@@ -182,7 +370,56 @@ class AsphodelMemoryProvider(MemoryProvider):
         ``ingest`` is on. Builds the ``Turn`` body with :func:`build_turn`,
         ``POST``s it, and spools it on a connection failure or 5xx. After a
         2xx it replays the spool."""
-        raise NotImplementedError
+        try:
+            if self.client is None or self.config is None or not self.bank:
+                return
+            if self._agent_context != PRIMARY_CONTEXT or not self.config.ingest:
+                return
+            session = session_id or self._session_id
+            turn = self.build_turn(
+                user_content,
+                assistant_content,
+                session_id=session,
+                messages=messages,
+                turn_author=turn_author,
+            )
+            # The recall id is echoed once, whatever happens to the turn.
+            self._pending_recall_id.pop(session, None)
+            log.log(TRACE, "turn user text: %s", turn["user_text"])
+            try:
+                self.client.ingest_turn(self.bank, turn, timeout=self.timeouts.ingest)
+            except DaemonUnavailable as error:
+                log.warning("ingest: daemon unreachable (%s); spooling the turn", error)
+                self._spool_turn(turn)
+                return
+            except DaemonError as error:
+                if error.status >= 500:
+                    log.warning("ingest: daemon answered %d; spooling the turn", error.status)
+                    self._spool_turn(turn)
+                else:
+                    log.warning("ingest: daemon answered %d; dropping the turn", error.status)
+                return
+            log.debug("ingest: turn delivered (forget_requested=%s)", turn["forget_requested"])
+            if self.spool is not None:
+                self.spool.replay(self._replay_one)
+        except Exception as error:
+            log.warning("sync_turn failed: %s", type(error).__name__)
+
+    def _spool_turn(self, turn: Dict[str, Any]) -> None:
+        if self.spool is not None:
+            self.spool.write(turn)
+
+    def _replay_one(self, turn: Dict[str, Any]) -> bool:
+        """``Spool.replay``'s sender: a 4xx drops the turn, a 5xx stops the
+        replay like a connection failure."""
+        try:
+            self.client.ingest_turn(self.bank, turn, timeout=self.timeouts.ingest)
+        except DaemonError as error:
+            if error.status >= 500:
+                raise DaemonUnavailable(f"daemon answered {error.status}") from None
+            log.warning("replay: daemon answered %d; dropping a spooled turn", error.status)
+            return False
+        return True
 
     def build_turn(
         self,
@@ -199,12 +436,34 @@ class AsphodelMemoryProvider(MemoryProvider):
         ``user_text`` with the backfill stripped, ``assistant_text``,
         ``author`` (``{id, name, is_bot}`` or ``None``), ``platform``, the
         echoed ``recall_id`` and ``forget_requested``."""
-        raise NotImplementedError
+        session = session_id or self._session_id
+        return {
+            "session_id": session,
+            "message_at": turns.message_at(messages, self._wall_clock()),
+            "timezone": self._timezone(),
+            "user_text": turns.strip_backfill(user_content or ""),
+            "assistant_text": assistant_content or "",
+            "author": _author(turn_author),
+            "platform": self._platform,
+            "recall_id": self._pending_recall_id.get(session),
+            "forget_requested": turns.forget_requested(messages),
+        }
+
+    def _timezone(self) -> Optional[str]:
+        try:
+            from hermes_time import get_timezone_name
+
+            name = get_timezone_name()
+        except Exception:
+            name = None
+        if name:
+            return name
+        return self.config.timezone if self.config is not None else None
 
     # -- tools ---------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        raise NotImplementedError
+        return copy.deepcopy(tools.TOOL_SCHEMAS)
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Dispatches the four tools. Owner-only tools return ``tool_error``
@@ -212,18 +471,94 @@ class AsphodelMemoryProvider(MemoryProvider):
         daemon's ``results`` list as JSON. A daemon error or an unreachable
         daemon returns ``tool_error``; ``memory_forget`` drops the session's
         last prefetch query on success."""
-        raise NotImplementedError
+        try:
+            return self._handle_tool_call(tool_name, args)
+        except DaemonUnavailable:
+            log.warning("%s: daemon unreachable", tool_name)
+            return tool_error("Asphodel's daemon can't be reached right now; try again later.")
+        except DaemonError as error:
+            log.warning("%s: daemon answered %d", tool_name, error.status)
+            return tool_error(f"Asphodel answered {error.status}: {error.message}")
+        except Exception as error:
+            log.warning("%s failed: %s", tool_name, type(error).__name__)
+            return tool_error(f"{tool_name} failed inside the Asphodel plugin.")
+
+    def _handle_tool_call(self, tool_name: str, args: Any) -> str:
+        if tool_name not in (tools.RECALL_TOOL, *tools.OWNER_ONLY_TOOLS):
+            return tool_error(f"Asphodel has no tool named {tool_name}.")
+        if not isinstance(args, dict):
+            return tool_error(f"{tool_name} takes an object of arguments.")
+        if tool_name in tools.OWNER_ONLY_TOOLS and not self.is_owner_turn():
+            return tool_error(f"Only the owner may call {tool_name}.")
+        if self.client is None or not self.bank:
+            return tool_error("Asphodel isn't initialised.")
+        session = self._session_id or None
+        timeout = self.timeouts.tool
+
+        if tool_name == tools.RECALL_TOOL:
+            query = args.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return tool_error("memory_recall needs a non-empty query.")
+            request = {key: args[key] for key in _RECALL_ARGUMENTS if args.get(key) is not None}
+            if session:
+                request["session_id"] = session
+            log.log(TRACE, "recall query: %s", query)
+            result = self.client.recall(self.bank, request, timeout=timeout)
+            results = result.get("results", []) if isinstance(result, dict) else []
+            log.debug("recall: %d results", len(results))
+            return json.dumps(results, ensure_ascii=False)
+
+        ids = args.get("ids")
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or len(ids) > tools.MAX_IDS
+            or not all(isinstance(item, str) and item for item in ids)
+        ):
+            return tool_error(f"{tool_name} needs ids: a list of 1 to {tools.MAX_IDS} memory ids.")
+        if tool_name == tools.FORGET_TOOL:
+            result = self.client.forget(self.bank, ids, session, timeout=timeout)
+            # The forget request isn't sent again as the next previous query.
+            if session:
+                self._last_query.pop(session, None)
+        elif tool_name == tools.KEEP_TOOL:
+            result = self.client.keep(self.bank, ids, timeout=timeout)
+        else:
+            result = self.client.unkeep(self.bank, ids, timeout=timeout)
+        log.debug("%s: %d ids", tool_name, len(ids))
+        return json.dumps(result, ensure_ascii=False)
 
     def is_owner_turn(self) -> bool:
-        raise NotImplementedError
+        return tools.is_owner(
+            author_id=self._author_id,
+            author_is_bot=self._author_is_bot,
+            platform=self._platform,
+            owner_platform_ids=self.config.owner_platform_ids if self.config is not None else [],
+            agent_context=self._agent_context,
+        )
 
     # -- setup ---------------------------------------------------------------
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
-        raise NotImplementedError
+        return plugin_config.config_schema()
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
-        raise NotImplementedError
+        """Writes the non-secret values to ``config.json``. The token never
+        goes there: Hermes writes it to ``.env`` as ``ASPHODEL_TOKEN``."""
+        secrets = {field["key"] for field in plugin_config.config_schema() if field.get("secret")}
+        cleaned: Dict[str, Any] = {}
+        for key, value in values.items():
+            if key in secrets or value is None:
+                continue
+            if key == "owner_platform_ids":
+                cleaned[key] = plugin_config.parse_platform_ids(value)
+            elif key == "ingest":
+                cleaned[key] = plugin_config.parse_bool(value, default=True)
+            elif isinstance(value, str):
+                cleaned[key] = value.strip() or None
+            else:
+                cleaned[key] = value
+        plugin_config.save_config(hermes_home, cleaned)
 
     def post_setup(self, hermes_home: str, config: Dict[str, Any], *, prompt: Callable[[str], str] = input) -> None:
         """``hermes memory setup``: prompts for each schema field (empty keeps
@@ -231,4 +566,38 @@ class AsphodelMemoryProvider(MemoryProvider):
         ``asphodel`` and ``memory.memory_enabled`` and
         ``memory.user_profile_enabled`` to false, and saves Hermes' config
         through ``hermes_cli.config.save_config``."""
-        raise NotImplementedError
+        from hermes_cli.config import save_config as save_hermes_config
+
+        values: Dict[str, Any] = {}
+        for field in plugin_config.config_schema():
+            if field.get("secret"):
+                continue
+            default = field.get("default")
+            hint = f" [{str(default).lower() if isinstance(default, bool) else default}]" if default is not None else ""
+            answer = prompt(f"{field['key']}: {field['description']}{hint} ").strip()
+            if answer:
+                values[field["key"]] = answer
+        self.save_config(values, hermes_home)
+        memory = config.get("memory")
+        if not isinstance(memory, dict):
+            memory = config["memory"] = {}
+        memory["provider"] = PROVIDER_NAME
+        for flag in BUILTIN_MEMORY_FLAGS:
+            memory[flag] = False
+        save_hermes_config(config)
+        print(f"Set {plugin_config.TOKEN_ENV_VAR} in $HERMES_HOME/.env if the daemon needs a bearer token.")
+
+
+_RECALL_ARGUMENTS = ("query", "from", "to", "on", "phase", "kinds", "entity", "limit")
+
+
+def _author(turn_author: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Hermes' ``turn_author`` as the daemon's ``TurnAuthor``."""
+    if not isinstance(turn_author, dict) or turn_author.get("id") in (None, ""):
+        return None
+    name = turn_author.get("name")
+    return {
+        "id": str(turn_author["id"]),
+        "name": str(name) if name else None,
+        "is_bot": bool(turn_author.get("is_bot", False)),
+    }

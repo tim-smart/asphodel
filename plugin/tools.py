@@ -89,4 +89,10 @@ def is_owner(
     author, the owner is matched by speaker id ``<platform>:<author_id>``
     against the configured owner ids. Bots and cron runs are never the
     owner."""
-    raise NotImplementedError
+    if agent_context == "cron" or author_is_bot:
+        return False
+    if not author_id:
+        return True
+    if not platform:
+        return False
+    return f"{platform}:{author_id}" in owner_platform_ids
