@@ -2680,6 +2680,41 @@ fn a_proposed_entity_reuses_one_created_while_call_1_ran() {
 }
 
 #[test]
+fn a_known_link_resolves_through_a_merge_made_while_call_1_ran() {
+    let h = Harness::new();
+    let sam = h.insert_entity("main", "Sam", "person", &["Sam"]);
+    let samuel = h.insert_entity("main", "Samuel", "person", &["Samuel"]);
+    ingest(&h, &turn("s1", T1, "Sam is moving.", "Where to?"));
+    let sam_handle = handle(&input(&h, "main", &[]), sam);
+    let llm = Meanwhile {
+        h: &h,
+        during: |h| {
+            let sam = h.entities_named("main", "Sam")[0];
+            let samuel = h.entities_named("main", "Samuel")[0];
+            h.merge(sam, samuel);
+        },
+        reply: reply(
+            vec![
+                claim("Sam is moving.", "event", "Sam is moving")
+                    .with("entities", json!([link(&sam_handle, "Sam")])),
+            ],
+            &[],
+        ),
+    };
+    let extracted = h
+        .service
+        .extract_chunk(lease(&h, "main"), &llm, &[])
+        .unwrap();
+
+    // ADR 0010: commit resolves links through `merged_into` for a chunk whose
+    // first call ran before the merge.
+    assert_eq!(
+        h.links(extracted.memories[0]),
+        BTreeSet::from([(samuel, Some("Sam".into()))])
+    );
+}
+
+#[test]
 fn a_link_that_names_no_entity_is_dropped() {
     let h = Harness::new();
     let entities_before = h.count("SELECT COUNT(*) FROM entities");
