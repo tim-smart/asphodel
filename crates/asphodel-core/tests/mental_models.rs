@@ -31,10 +31,12 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use asphodel_core::ingest::Turn;
 use asphodel_core::models::{
-    Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmError, ModelError as EmbedError, Models,
+    Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest, LlmResponse,
+    ModelError as EmbedError, Models,
 };
 use asphodel_core::retrieval::{PrefetchRequest, estimate_tokens};
 use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME, PROFILE_QUESTION};
@@ -2486,4 +2488,257 @@ fn a_block_id_from_another_bank_maps_nothing() {
     prefetch_holding(&h, "s1", "hello there", Some(theirs.id));
     assert_eq!(mapped_block(&h, "s1"), None);
     assert!(h.in_context("s1").is_empty());
+}
+
+// Regressions from the TIM-111 review of c8f2230, fixed in f6da4b2
+
+/// A refresh LLM that, while its first call is in flight, has the owner
+/// keep `keep`: a triggering write landing in the middle of a refresh.
+struct KeepsDuringCall<'a> {
+    service: &'a Service,
+    keep: Uuid,
+    calls: AtomicUsize,
+}
+
+impl LlmClient for KeepsDuringCall<'_> {
+    fn model(&self) -> &str {
+        MODEL
+    }
+
+    fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.service.keep(BANK, &[self.keep.to_string()]).unwrap();
+        }
+        Ok(LlmResponse {
+            json: reply(vec![]),
+            usage: None,
+            latency: Duration::ZERO,
+        })
+    }
+}
+
+#[test]
+fn a_trigger_during_a_refresh_is_refreshed_after_the_interval() {
+    // Review finding 1. The refresh selected its inputs before the keep, so
+    // the kept memory was never shown to the LLM. The request the keep made
+    // has to survive the refresh's completion and run once the minimum
+    // interval has passed, not wait for the next write or the 04:00 sweep.
+    let h = Harness::new();
+    let surfing = h.insert(faded(fact("Tim once tried surfing in Raglan.")));
+    h.says(notable(TEA));
+    h.advance(minutes(5));
+    let refreshed = h.now();
+    let llm = KeepsDuringCall {
+        service: &h.service,
+        keep: surfing,
+        calls: AtomicUsize::new(0),
+    };
+    let ran = h.service.run_refreshes(&llm).unwrap();
+    assert_eq!(ran.ran.len(), 1);
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ran.next_due,
+        Some(refreshed + minutes(30)),
+        "the trigger during the refresh was dropped"
+    );
+
+    h.set(refreshed + minutes(30));
+    let quiet = quiet_llm(1);
+    assert_eq!(h.tick(&quiet).ran.len(), 1);
+    assert!(quiet.requests()[0].user.contains("surfing in Raglan"));
+}
+
+#[test]
+fn a_stated_end_holds_through_its_unit_in_the_block() {
+    // Review finding 2. A stored time is the start of its unit, so an end
+    // of 1 October holds through 1 October, and an end in October through
+    // October (`Window::closes_at`). A future ending, already recorded with
+    // `ended_by`, hasn't ended anything yet.
+    let h = Harness::new();
+    let lisbon = h.insert(Memory {
+        kind: "state",
+        volatility: Some("months"),
+        valid_until: Some((local("2026-10-01T00:00"), "day")),
+        ..fact("Tim is in Lisbon until 1 October 2026.")
+    });
+    let course = h.insert(Memory {
+        kind: "state",
+        volatility: Some("months"),
+        valid_until: Some((local("2026-10-01T00:00"), "month")),
+        ..fact("Tim is doing a pottery course until October 2026.")
+    });
+    let acme = h.insert(fact("Tim works at Acme."));
+    let leaving = h.insert(event(
+        "Tim leaves Acme on 30 November 2026.",
+        "2026-11-30T00:00",
+    ));
+    h.mark_ended(acme, leaving, local("2026-11-30T00:00"));
+    h.refresh_adding(
+        PROFILE_NAME,
+        &[
+            ("Tim is in Lisbon for now.", &[lisbon]),
+            ("Tim is doing a pottery course.", &[course]),
+            ("Tim works at Acme.", &[acme]),
+        ],
+    );
+
+    let block = h.block(None);
+    for entry in [
+        "Tim is in Lisbon for now.",
+        "Tim is doing a pottery course.",
+        "Tim works at Acme.",
+    ] {
+        assert!(
+            block.text.contains(entry),
+            "{entry:?} wasn't rendered:\n{}",
+            block.text
+        );
+    }
+
+    // The day ends at local midnight; the month and November go on.
+    h.set(local("2026-10-02T00:00"));
+    let block = h.block(None);
+    assert!(!block.text.contains("Tim is in Lisbon for now."));
+    assert!(block.text.contains("Tim is doing a pottery course."));
+    assert!(block.text.contains("Tim works at Acme."));
+    h.set(local("2026-11-01T00:00"));
+    assert!(
+        !h.block(None)
+            .text
+            .contains("Tim is doing a pottery course.")
+    );
+}
+
+#[test]
+fn a_stated_end_holds_through_its_unit_on_the_agenda() {
+    let h = Harness::new();
+    let gutters = h.insert(Memory {
+        valid_until: Some((local("2026-10-01T00:00"), "day")),
+        ..task("Tim needs to clean the gutters today.")
+    });
+    let swim = h.insert(Memory {
+        valid_until: Some((local("2026-10-01T00:00"), "month")),
+        ..recurring(
+            "Tim swims on Tuesdays until October.",
+            Some("FREQ=WEEKLY;BYDAY=TU"),
+            "2026-01-06T00:00",
+        )
+    });
+    let yoga = h.insert(recurring(
+        "Tim does yoga on Thursdays.",
+        Some("FREQ=WEEKLY;BYDAY=TH"),
+        "2026-01-01T00:00",
+    ));
+    let stopping = h.insert(event(
+        "Tim stops yoga on 1 December 2026.",
+        "2026-12-01T00:00",
+    ));
+    h.mark_ended(yoga, stopping, local("2026-12-01T00:00"));
+
+    let agenda = h.agenda();
+    assert_eq!(agenda.undated_tasks, vec![gutters]);
+    let routines: BTreeSet<Uuid> = agenda.routines.iter().copied().collect();
+    assert_eq!(routines, BTreeSet::from([swim, yoga]));
+
+    h.set(local("2026-10-02T00:00"));
+    let agenda = h.agenda();
+    assert!(agenda.undated_tasks.is_empty());
+    assert!(agenda.routines.contains(&swim));
+}
+
+/// A sentence made `'static`, for fixtures built in a loop.
+fn sentence(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
+}
+
+#[test]
+fn the_whole_block_stays_within_the_budget_and_records_only_what_it_renders() {
+    // Review finding 3. ADR 0007: every model "shares about 800 tokens of
+    // `system_prompt_block()` with the agenda". The agenda keeps its own
+    // caps and is laid out first, so today's appointment can't be pushed
+    // out by a model; the models get what's left. What the block lists or
+    // cites, and so puts in a session's context, is only what it rendered.
+    let h = Harness::new();
+    let today = h.insert(event(
+        "Tim has a dentist appointment this evening at the clinic on Queen Street.",
+        "2026-10-01T00:00",
+    ));
+    for n in 0..14 {
+        let day = 2 + n % 7;
+        h.insert(event(
+            sentence(format!(
+                "Tim has appointment number {n} with the planning committee about the new library."
+            )),
+            &format!("2026-10-{day:02}T00:00"),
+        ));
+    }
+    for n in 0..4 {
+        h.insert(recurring(
+            sentence(format!(
+                "Tim goes to evening class number {n} at the community hall weekly."
+            )),
+            Some("FREQ=WEEKLY;BYDAY=WE"),
+            "2026-01-07T00:00",
+        ));
+    }
+    for n in 0..5 {
+        h.insert(task(sentence(format!(
+            "Tim needs to sort out household job number {n} before the weekend."
+        ))));
+    }
+    let facts: Vec<Uuid> = (0..25)
+        .map(|n| {
+            h.insert(fact(sentence(format!(
+                "Tim's profile fact number {n} is here."
+            ))))
+        })
+        .collect();
+    let entries: Vec<(String, Uuid)> = facts
+        .iter()
+        .enumerate()
+        .map(|(n, fact)| {
+            (
+                format!(
+                    "Tim is described here by profile entry number {n:02}, as fact {n:02} says."
+                ),
+                *fact,
+            )
+        })
+        .collect();
+    let adds: Vec<(&str, Vec<Uuid>)> = entries
+        .iter()
+        .map(|(text, fact)| (text.as_str(), vec![*fact]))
+        .collect();
+    let adds: Vec<(&str, &[Uuid])> = adds.iter().map(|(t, c)| (*t, c.as_slice())).collect();
+    h.refresh_adding(PROFILE_NAME, &adds);
+
+    let block = h.block(Some("s1"));
+    let budget = h.tuning.mental_models.budget as usize;
+    let tokens = estimate_tokens(&block.text);
+    assert!(
+        tokens <= budget,
+        "the block is {tokens} tokens:\n{}",
+        block.text
+    );
+    assert!(
+        block.agenda.contains(&today),
+        "today's appointment was dropped"
+    );
+    assert!(block.text.contains("dentist appointment this evening"));
+    assert!(
+        block.text.contains("memory_recall"),
+        "the pointer line was dropped"
+    );
+
+    // Only what's rendered is recorded, and so put in context.
+    for (text, fact) in &entries {
+        assert_eq!(
+            block.cited.contains(fact),
+            block.text.contains(text.as_str()),
+            "{text:?}"
+        );
+    }
+    let in_context: BTreeSet<Uuid> = h.in_context("s1").into_iter().collect();
+    let shown: BTreeSet<Uuid> = block.agenda.iter().chain(&block.cited).copied().collect();
+    assert_eq!(in_context, shown);
 }
