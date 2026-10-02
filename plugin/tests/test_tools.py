@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from conftest import SESSION, plugin
 from fake_daemon import recalled
 
@@ -54,9 +56,18 @@ def test_the_owner_may_forget_keep_and_unkeep(make_provider, daemon):
     assert daemon.requests_for("unkeep")[0].body == {"ids": ["m2"]}
 
 
-def test_another_speaker_is_refused_without_a_request(make_provider, daemon):
-    provider = make_provider()
-    provider.on_turn_start(1, "forget it", author_id="222", author_name="Maya", author_is_bot=False)
+@pytest.mark.parametrize(
+    "init, author",
+    [
+        ({}, dict(author_id="222", author_name="Maya", author_is_bot=False)),
+        ({}, dict(author_id="111", author_name="Relay", author_is_bot=True)),
+        ({"agent_context": "cron"}, {}),
+    ],
+    ids=["another-speaker", "bot-with-owner-id", "cron"],
+)
+def test_a_non_owner_is_refused_without_a_request(make_provider, daemon, init, author):
+    provider = make_provider(init=init)
+    provider.on_turn_start(1, "forget it", **author)
     for tool in ("memory_forget", "memory_keep", "memory_unkeep"):
         message = error_of(provider.handle_tool_call(tool, {"ids": ["m1"]}))
         assert message and "owner" in message.lower()

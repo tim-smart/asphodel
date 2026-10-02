@@ -1062,6 +1062,16 @@ fn assert_reserved_report(destination: &str) {
 }
 
 #[test]
+fn a_report_over_the_replay_lock_is_refused() {
+    assert_reserved_report("lock");
+}
+
+#[test]
+fn a_report_over_the_shadow_table_is_refused() {
+    assert_reserved_report("shadow.db");
+}
+
+#[test]
 fn a_report_over_the_shadow_wal_is_refused() {
     assert_reserved_report("shadow.db-wal");
 }
