@@ -16,13 +16,14 @@ use asphodel_core::clock::SimulatedClock;
 use asphodel_core::config::Tuning;
 use asphodel_core::entities::{EntityError, MergeRequest};
 use asphodel_core::erase::BankDeleteError;
+use asphodel_core::extraction::ExtractError;
 use asphodel_core::ingest::Turn;
-use asphodel_core::mental_models::ModelSpec;
+use asphodel_core::mental_models::{FailureKind, ModelSpec, Outcome as RefreshOutcome};
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, ModelError, Models,
 };
 use asphodel_core::reembed::{REEMBED_BATCH, ReembedError, ReembedState};
-use asphodel_core::retrieval::RecallRequest;
+use asphodel_core::retrieval::{PrefetchRequest, RecallError, RecallRequest};
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::{OpenOptions, Store, micros};
 use jiff::Timestamp;
@@ -185,6 +186,28 @@ impl Harness {
             .unwrap()
             .with_previous_embedder(previous)
             .unwrap();
+        Self {
+            service,
+            clock,
+            dir,
+        }
+    }
+
+    /// A daemon restart on `current` alone: banks recorded under any other
+    /// model have no embedder to be served with.
+    fn restart_on(self, current: Arc<dyn Embedder>) -> Self {
+        let Harness {
+            service,
+            clock,
+            dir,
+        } = self;
+        drop(service);
+        let store = Store::open(&dir.data(), OpenOptions::default(), clock.clone()).unwrap();
+        let models = Models {
+            embedder: current,
+            reranker: Arc::new(FakeReranker),
+        };
+        let service = Service::with_models(clock.clone(), store, tuning(), models).unwrap();
         Self {
             service,
             clock,
@@ -789,4 +812,241 @@ fn deleting_a_bank_erases_it_and_leaves_the_other_alone() {
     assert_eq!(details["memories"], 1);
     assert_eq!(details["bank"], deleted.bank.to_string());
     assert!(!rows[0].contains("tea"), "{}", rows[0]);
+}
+
+// A bank whose recorded model isn't loaded
+
+/// The turn `populate` extracts, queued in `main` and not yet extracted.
+fn queue_tea(h: &Harness) {
+    h.service
+        .ingest_turn(
+            "main",
+            &turn("s1", "2026-10-01T06:30:00Z", "Sam drinks tea.", "Noted."),
+        )
+        .unwrap();
+}
+
+/// Call 1's reply to [`queue_tea`]'s turn: one fact, no entities.
+fn tea_reply() -> Value {
+    json!({
+        "claims": [{
+            "content": "Sam drinks tea.",
+            "kind": "fact",
+            "quote": "Sam drinks tea",
+            "significance": "notable",
+            "remember_this": false,
+            "changes_something": false,
+            "valid_from": null,
+            "valid_until": null,
+            "window_confidence": "high",
+            "until_event": null,
+            "due_at": null,
+            "volatility": null,
+            "recurrence_text": null,
+            "recurrence_rrule": null,
+            "recurrence_start": null,
+            "entities": [],
+        }],
+        "used_injected_ids": [],
+    })
+}
+
+/// The `main` chunk's attempt count and failure time.
+fn chunk_errors(h: &Harness) -> (i64, Option<i64>) {
+    let bank_id = h.bank_id("main");
+    let store = h.service.store().unwrap();
+    let conn = store.connection();
+    conn.query_row(
+        "SELECT c.error_count, c.failed_at FROM chunks c JOIN sources s ON s.id = c.source_id
+         WHERE s.bank_id = ?1 AND s.session_id = 's1'",
+        [bank_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap()
+}
+
+/// The `attention` lines naming a bank whose recorded model isn't loaded.
+fn model_attention(h: &Harness) -> Vec<String> {
+    h.service
+        .status()
+        .unwrap()
+        .attention
+        .into_iter()
+        .filter(|line| line.contains("isn't loaded"))
+        .collect()
+}
+
+#[test]
+fn a_bank_whose_recorded_model_isnt_loaded_is_refused_without_embedding() {
+    let h = Harness::new();
+    h.memory("main", "Tim likes tea.");
+    h.service
+        .create_model(
+            "main",
+            &ModelSpec {
+                name: "tea".into(),
+                question: "What does Tim drink?".into(),
+                kinds: vec![],
+                entity: None,
+                min_volatility: None,
+                max_tokens: 50,
+                enabled: true,
+            },
+        )
+        .unwrap();
+    queue_tea(&h);
+
+    // The daemon moves to v2 without carrying v1, which both banks
+    // recorded. A bank created now records v2.
+    let new = Counting::new(Arc::new(FakeEmbedderV2), None);
+    let h = h.restart_on(new.clone());
+    h.service
+        .ensure_bank_with_models("fresh", &identity())
+        .unwrap();
+    let unavailable = |model: &str| model == FakeEmbedder::MODEL_ID;
+
+    // ADR 0010, as decided on TIM-115: recall and prefetch are refused
+    // rather than searched with another model's vectors.
+    match h.service.recall(
+        "main",
+        &RecallRequest {
+            query: "tea".into(),
+            ..RecallRequest::default()
+        },
+    ) {
+        Err(RecallError::ModelUnavailable { model }) => assert!(unavailable(&model)),
+        other => panic!("expected ModelUnavailable, got {other:?}"),
+    }
+    match h.service.prefetch(
+        "main",
+        &PrefetchRequest {
+            session_id: "s1".into(),
+            query: "What does Tim drink?".into(),
+            previous_query: None,
+            block_id: None,
+        },
+    ) {
+        Err(RecallError::ModelUnavailable { model }) => assert!(unavailable(&model)),
+        other => panic!("expected ModelUnavailable, got {other:?}"),
+    }
+
+    // Extraction is refused before the LLM or the embedder runs, and the
+    // attempt isn't counted: the chunk waits at the head of the queue.
+    let llm = FakeLlm::scripted("fake-llm", vec![tea_reply()]);
+    let lease = h.service.claim_chunk("main").unwrap().unwrap();
+    let refused = h.service.extract_chunk(lease, &llm, &[]);
+    match &refused {
+        Err(error @ ExtractError::ModelUnavailable { model }) => {
+            assert!(unavailable(model));
+            assert_eq!(error.failure(), None);
+        }
+        other => panic!("expected ModelUnavailable, got {other:?}"),
+    }
+    assert!(llm.requests().is_empty());
+    assert_eq!(chunk_errors(&h), (0, None));
+    assert_eq!(h.service.queue_depth("main").unwrap(), 1);
+    assert!(h.service.failed_chunks("main").unwrap().is_empty());
+    assert!(h.service.claim_chunk("main").unwrap().is_some());
+
+    // A refresh records a retrieval failure without calling the LLM.
+    let llm = FakeLlm::scripted("fake-llm", vec![]);
+    let outcome = h.service.refresh_model("main", "tea", &llm, true).unwrap();
+    assert!(
+        matches!(outcome, RefreshOutcome::Failed(FailureKind::Retrieval)),
+        "{outcome:?}"
+    );
+    assert!(llm.requests().is_empty());
+
+    // Nothing was embedded with the daemon's model for either bank.
+    assert_eq!(new.calls(), 0);
+
+    // Status names each refused bank and its model, and not the bank on
+    // the daemon's model, which is served.
+    let lines = model_attention(&h);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for bank in ["main", "other"] {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with(&format!("{bank}:"))
+                    && line.contains(FakeEmbedder::MODEL_ID)
+                    && line.contains(&format!("asphodel reembed --bank {bank}"))),
+            "{lines:?}"
+        );
+    }
+    assert!(
+        !lines.iter().any(|line| line.contains("fresh")),
+        "{lines:?}"
+    );
+    h.recall("fresh", "tea");
+    assert!(new.calls() > 0);
+}
+
+#[test]
+fn a_reembed_recovers_a_bank_whose_recorded_model_isnt_loaded() {
+    let h = Harness::new();
+    let tea = h.memory("main", "Tim likes tea.");
+    queue_tea(&h);
+    let new = Counting::new(Arc::new(FakeEmbedderV2), None);
+    let h = h.restart_on(new.clone());
+    assert!(matches!(
+        h.service.recall(
+            "main",
+            &RecallRequest {
+                query: "tea".into(),
+                ..RecallRequest::default()
+            }
+        ),
+        Err(RecallError::ModelUnavailable { .. })
+    ));
+
+    // The re-embed needs only the daemon's model.
+    assert_eq!(
+        h.service.start_reembed("main").unwrap().state,
+        ReembedState::Pending
+    );
+    let done = h.service.run_reembed("main").unwrap();
+    assert_eq!(done.state, ReembedState::Current);
+    assert_eq!(h.recorded_model("main"), FakeEmbedderV2::MODEL_ID);
+
+    // The bank is served again, on v2, and leaves status; the other bank,
+    // still on v1, doesn't.
+    assert!(h.recall("main", "tea").contains(&tea));
+    let lines = model_attention(&h);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("other:"), "{lines:?}");
+
+    // The chunk that waited is extracted, its first attempt, and its
+    // memory gets a v2 vector.
+    let embedded = new.texts();
+    let lease = h.service.claim_chunk("main").unwrap().unwrap();
+    let extracted = h
+        .service
+        .extract_chunk(
+            lease,
+            &FakeLlm::scripted("fake-llm", vec![tea_reply()]),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(extracted.memories.len(), 1);
+    assert!(new.texts() > embedded);
+    assert_eq!(h.service.queue_depth("main").unwrap(), 0);
+    let memory_id: i64 = h.one(
+        "SELECT id FROM memories WHERE uuid = ?1",
+        [extracted.memories[0].to_string()],
+    );
+    assert_eq!(
+        h.one::<i64, _>(
+            "SELECT COUNT(*) FROM memory_vectors WHERE memory_id = ?1",
+            [memory_id]
+        ),
+        1
+    );
+    assert_eq!(
+        h.one::<i64, _>(
+            "SELECT error_count FROM chunks WHERE id = (SELECT chunk_id FROM memories WHERE id = ?1)",
+            [memory_id]
+        ),
+        0
+    );
 }
