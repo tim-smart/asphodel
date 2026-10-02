@@ -1411,6 +1411,20 @@ mod review {
             .unwrap_or_default()
         }
 
+        /// The only `sweep_runs` row: its purged count and when it started.
+        fn sweep_run(&self) -> (i64, i64) {
+            self.service
+                .store()
+                .unwrap()
+                .connection()
+                .query_row(
+                    "SELECT purged_memories, started_at FROM sweep_runs",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        }
+
         /// The latest `forgotten` edit's details.
         fn forgotten_details(&self) -> Value {
             let details: String = self.one(
@@ -1620,6 +1634,35 @@ mod review {
         let again = h.service.run_sweeps().unwrap();
         assert_eq!(again.ran.len(), 1, "the failed night is still due");
         assert_eq!(h.one::<i64, _>("SELECT COUNT(*) FROM sweep_runs", []), 1);
+        // The re-review of 4c5d9e1: the run row counts what the failed
+        // attempt deleted, and says when that attempt started.
+        assert_eq!(again.ran[0].purged_memories, 1);
+        assert_eq!(h.sweep_run(), (1, micros(at(SWEEP))));
+    }
+
+    #[test]
+    fn a_sweep_that_fails_is_counted_when_it_resumes_after_a_restart() {
+        let h = Harness::new();
+        h.insert(fact(TEA));
+        let maya = h.insert(faded(fact(MAYA)));
+        h.set(at(SWEEP));
+        h.execute(
+            "CREATE TEMP TRIGGER injected_failure BEFORE INSERT ON sweep_runs
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            [],
+        );
+        assert!(h.service.run_sweeps().is_err());
+        assert_eq!(h.rows(&[maya]), 0, "the chain committed");
+
+        // The temporary trigger goes with the old connection. The restarted
+        // daemon's first sweep is the next 04:00.
+        let h = h.restart_with("");
+        h.set(at(SWEEP) + days(1));
+        let resumed = h.service.run_sweeps().unwrap();
+        assert_eq!(resumed.ran.len(), 1);
+        assert_eq!(resumed.ran[0].purged_memories, 1);
+        assert_eq!(h.one::<i64, _>("SELECT COUNT(*) FROM sweep_runs", []), 1);
+        assert_eq!(h.sweep_run(), (1, micros(at(SWEEP))));
     }
 
     // Finding 5: ready erases run without a worker. The daemon half is
@@ -1883,5 +1926,81 @@ mod review {
         let audit = h.forgotten_details();
         assert_eq!(audit["legacy_mentions"], 1);
         assert_eq!(audit["whole_source"], 1);
+    }
+
+    // The re-review of 4c5d9e1, finding 1: overlapping passages across
+    // versions. Masking one passage in a version mustn't stop a longer one
+    // that contains it being found there, in one erase or in a later one.
+
+    const DIAGNOSIS: &str = "Tim has a diagnosis.";
+    const HIV: &str = "Tim has a diagnosis. It is HIV.";
+    const HEALTH_V2: &str = "# Health\n\nTim has a diagnosis. It is HIV.\n";
+
+    /// v1 says DIAGNOSIS and is extracted; v2 says HIV and is queued.
+    /// Returns the DIAGNOSIS memory and v2's source.
+    fn health(h: &Harness) -> (Uuid, Uuid) {
+        h.doc("health.md", "# Health\n\nTim has a diagnosis.\n");
+        let diagnosis = h
+            .extract_with(vec![quoting(notable(DIAGNOSIS), DIAGNOSIS)], &[])
+            .memories[0];
+        (diagnosis, h.doc("health.md", HEALTH_V2).source)
+    }
+
+    /// v3 shares v2's Health section, so it has no chunk of its own for it,
+    /// and adds a Garden section with nothing in it.
+    fn garden_v3(h: &Harness) -> Uuid {
+        let v3 = h.doc(
+            "health.md",
+            &format!("{HEALTH_V2}\n# Garden\n\nThe roses are out.\n"),
+        );
+        assert_eq!(v3.chunks_skipped, 1);
+        h.extract_with(vec![], &[]);
+        v3.source
+    }
+
+    fn assert_masked(h: &Harness, v2: Uuid, v3: Uuid) {
+        for (version, source) in [("v2", v2), ("v3", v3)] {
+            let text = h.source_text(source);
+            assert!(
+                !text.contains("HIV") && !text.contains("diagnosis"),
+                "{version}: {text}"
+            );
+        }
+        assert!(h.source_text(v3).contains("The roses are out."));
+    }
+
+    #[test]
+    fn overlapping_passages_in_one_chain_leave_no_version_unmasked() {
+        let h = Harness::new();
+        let (diagnosis, v2) = health(&h);
+        let hiv = h
+            .extract_with(
+                vec![quoting(notable(HIV), HIV)],
+                &[(0, diagnosis, "refines")],
+            )
+            .memories[0];
+        assert_eq!(h.superseded_by(diagnosis), Some(hiv));
+        let v3 = garden_v3(&h);
+
+        h.forget(&[diagnosis]);
+        assert!(h.service.erase_next(BANK).unwrap().is_some());
+        assert_masked(&h, v2, v3);
+    }
+
+    #[test]
+    fn a_second_forget_masks_a_passage_an_earlier_forget_partly_masked() {
+        let h = Harness::new();
+        let (diagnosis, v2) = health(&h);
+        let hiv = h
+            .extract_with(vec![quoting(notable(HIV), HIV)], &[])
+            .memories[0];
+        assert_eq!(h.superseded_by(diagnosis), None, "two separate memories");
+        let v3 = garden_v3(&h);
+
+        h.forget(&[diagnosis]);
+        assert!(h.service.erase_next(BANK).unwrap().is_some());
+        h.forget(&[hiv]);
+        assert!(h.service.erase_next(BANK).unwrap().is_some());
+        assert_masked(&h, v2, v3);
     }
 }
