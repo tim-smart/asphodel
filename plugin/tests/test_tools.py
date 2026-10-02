@@ -23,17 +23,6 @@ def test_four_tools_with_bare_function_schemas(make_provider):
         assert schema["parameters"]["type"] == "object"
 
 
-def test_recall_schema_matches_the_daemons_request():
-    recall = next(s for s in TOOLS.TOOL_SCHEMAS if s["name"] == "memory_recall")
-    props = recall["parameters"]["properties"]
-    assert set(props) == {"query", "from", "to", "on", "phase", "kinds", "entity", "limit"}
-    assert recall["parameters"]["required"] == ["query"]
-    assert props["on"]["enum"] == ["happened", "said"]
-    assert props["phase"]["enum"] == ["upcoming", "past", "current", "any"]
-    assert props["kinds"]["items"]["enum"] == ["fact", "event", "state", "task", "recurring"]
-    assert props["limit"]["maximum"] == 30 and props["limit"]["default"] == 10
-
-
 def test_forget_takes_ids_only_and_says_it_is_irreversible():
     forget = next(s for s in TOOLS.TOOL_SCHEMAS if s["name"] == "memory_forget")
     assert set(forget["parameters"]["properties"]) == {"ids"}

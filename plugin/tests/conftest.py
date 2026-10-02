@@ -42,8 +42,7 @@ def load_plugin():
 
 plugin = load_plugin()
 
-# Budgets short enough that a timeout test takes well under a second. The
-# defaults are asserted separately in test_budgets.
+# Budgets short enough that a timeout test takes well under a second.
 FAST = plugin.provider.Timeouts(
     health=0.5, prefetch=0.4, system_prompt=0.4, system_prompt_retries=1, ingest=0.5, tool=0.5, session_clear=0.5
 )

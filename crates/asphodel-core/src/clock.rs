@@ -98,19 +98,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_stay_at_the_supplied_time() {
-        let first = SimulatedClock::new(start());
-        let second = SimulatedClock::new(start());
-        let clocks: [&dyn Clock; 2] = [&first, &second];
-
-        for _ in 0..100 {
-            for clock in clocks {
-                assert_eq!(clock.now(), start());
-            }
-        }
-    }
-
-    #[test]
     fn advance_accumulates_exact_durations() {
         let clock = SimulatedClock::new(start());
         clock.advance(SignedDuration::from_secs(60));

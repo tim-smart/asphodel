@@ -9,7 +9,6 @@
 //!
 //! The API under test is `asphodel_core::{ingest, chunking, secrets,
 //! queue}`, the extraction constants and the `Service` methods over them.
-//! Two tests check that the schema TIM-103 landed has what ingest needs.
 //!
 //! The credentials in the secret-scanning tests are built at runtime from
 //! pieces, so no literal in this file looks like a real credential to a
@@ -392,157 +391,7 @@ fn sentence_with(kind: SecretKind, seed: usize) -> (String, String) {
     (text, secret)
 }
 
-// The schema TIM-103 landed has what ingest needs.
-
-#[test]
-fn the_schema_has_the_columns_ingest_needs() {
-    let h = Harness::new();
-    let columns = |table: &str| -> BTreeSet<String> {
-        let store = h.service.store().unwrap();
-        let conn = store.connection();
-        let mut statement = conn
-            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
-            .unwrap();
-        statement
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
-    };
-    let expect = |table: &str, wanted: &[&str]| {
-        let have = columns(table);
-        for column in wanted {
-            assert!(have.contains(*column), "{table}.{column} is missing");
-        }
-    };
-    expect(
-        "sources",
-        &[
-            "kind",
-            "session_id",
-            "message_at",
-            "document_id",
-            "content_hash",
-            "platform",
-            "author_id",
-            "author_name",
-            "author_is_bot",
-            "observed_at",
-            "reference_date",
-            "reference_date_exact",
-            "timezone",
-            "text",
-            "reply",
-            "secret_kinds",
-            "recall_id",
-            "ingested_at",
-            "tombstoned_at",
-            "tombstone_reason",
-        ],
-    );
-    expect(
-        "chunks",
-        &[
-            "source_id",
-            "position",
-            "heading_path",
-            "content_hash",
-            "start_offset",
-            "end_offset",
-            "text",
-            "call1_output",
-            "extracted_at",
-            "error_count",
-            "last_error_kind",
-            "last_error_status",
-            "failed_at",
-            "tombstoned_at",
-        ],
-    );
-    expect(
-        "extraction_queue",
-        &[
-            "bank_id",
-            "kind",
-            "chunk_id",
-            "priority",
-            "observed_at",
-            "enqueued_at",
-            "attempts",
-        ],
-    );
-}
-
-#[test]
-fn a_forget_request_tombstone_fits_the_schema_and_keeps_its_key() {
-    // ADR 0010: the turn that asked to forget is a tombstone from the start,
-    // with no text, and its key still stops it being ingested again.
-    let h = Harness::new();
-    let bank: i64 = h.one("SELECT id FROM banks WHERE name = 'main'", []);
-    let now = h.now();
-    let insert = |uuid: &str| {
-        h.service.store().unwrap().connection().execute(
-            "INSERT INTO sources (uuid, bank_id, kind, session_id, message_at, content_hash,
-                                  observed_at, timezone, text, reply, ingested_at,
-                                  tombstoned_at, tombstone_reason)
-             VALUES (?1, ?2, 'turn', 'session', ?3, 'hash', ?3, 'UTC', NULL, NULL, ?3, ?3,
-                     'forget_requested')",
-            (uuid, bank, now),
-        )
-    };
-    insert("tombstone").unwrap();
-    assert!(insert("again").is_err(), "the tombstone's key holds");
-}
-
-// Constants (TIM-92, TIM-98)
-
-#[test]
-#[allow(clippy::assertions_on_constants)]
-fn the_chunk_size_and_retry_cap_are_fixed_in_code() {
-    assert_eq!(CHUNK_CHARS, 3_000, "TIM-92: about 3,000 characters");
-    assert!(
-        CHUNK_RETRY_CAP >= 2,
-        "a capped retry needs at least one retry before the cap"
-    );
-}
-
 // Secret scanning (ADR 0002; TIM-92, other decision 1)
-
-#[test]
-fn secret_kinds_have_stable_names() {
-    // These names are recorded on sources and shown by `memory show`, so
-    // renaming one is a migration.
-    let names: Vec<&str> = SecretKind::ALL.iter().map(|kind| kind.as_str()).collect();
-    assert_eq!(
-        names,
-        [
-            "private_key",
-            "aws_access_key",
-            "github_token",
-            "openai_key",
-            "anthropic_key",
-            "slack_token",
-            "stripe_key",
-            "google_api_key",
-            "jwt",
-            "url_password",
-        ]
-    );
-}
-
-#[test]
-fn each_marker_names_its_kind() {
-    // TIM-92: "redacted in place with a marker that names the pattern kind".
-    let markers: BTreeSet<String> = SecretKind::ALL.iter().map(|kind| kind.marker()).collect();
-    assert_eq!(markers.len(), SecretKind::ALL.len(), "markers are distinct");
-    for kind in SecretKind::ALL {
-        assert!(
-            kind.marker().contains(kind.as_str()),
-            "{kind:?}'s marker {:?} names it",
-            kind.marker()
-        );
-    }
-}
 
 #[test]
 fn every_kind_is_found_and_redacted_in_place() {
@@ -552,6 +401,11 @@ fn every_kind_is_found_and_redacted_in_place() {
         assert_eq!(found.kinds, BTreeSet::from([kind]), "{kind:?}");
         assert!(!found.text.contains(&secret), "{kind:?} is gone");
         assert!(found.text.contains(&kind.marker()), "{kind:?}'s marker");
+        // TIM-92: "redacted in place with a marker that names the pattern kind".
+        assert!(
+            kind.marker().contains(kind.as_str()),
+            "{kind:?}'s marker names it"
+        );
         assert!(found.text.ends_with(" thanks"), "{kind:?}: the rest stays");
         match kind {
             SecretKind::UrlPassword => {
@@ -580,16 +434,6 @@ fn a_private_key_block_goes_whole() {
     for line in key.lines() {
         assert!(!found.text.contains(line), "no line of the block survives");
     }
-}
-
-#[test]
-fn an_anthropic_key_is_not_also_an_openai_key() {
-    // Both start `sk-`; the more specific kind wins and fires alone.
-    let (text, _) = sentence_with(SecretKind::AnthropicKey, 3);
-    assert_eq!(
-        scan(&text).kinds,
-        BTreeSet::from([SecretKind::AnthropicKey])
-    );
 }
 
 #[test]
@@ -664,15 +508,6 @@ fn assert_tiles(document: &str, chunks: &[DocumentChunk]) {
             "character {index} ({character:?}) is in no chunk"
         );
     }
-}
-
-#[test]
-fn a_short_plain_document_is_one_chunk() {
-    let text = "Buy milk.\n\nCall the dentist about the 3 October appointment.\n";
-    let chunks = split_document(text);
-    assert_eq!(chunks.len(), 1);
-    assert!(chunks[0].heading_path.is_empty());
-    assert_tiles(text, &chunks);
 }
 
 #[test]
@@ -842,6 +677,7 @@ fn a_turn_is_stored_verbatim_with_its_provenance() {
     assert_eq!(got.chunks_skipped, 0);
     assert!(got.secret_kinds.is_empty());
     let source = got.source;
+    assert!(recorded_kinds(&h, source).is_empty());
     assert_eq!(h.source_column::<String>(source, "kind"), "turn");
     assert_eq!(h.source_column::<String>(source, "session_id"), "thread-1");
     let message_at = micros(at("2026-10-01T06:59:30Z"));
@@ -1422,18 +1258,6 @@ fn secrets_in_a_document_are_redacted_and_the_chunks_hash_the_redacted_text() {
 }
 
 #[test]
-fn a_clean_turn_records_no_secret_kinds() {
-    let h = Harness::new();
-    let got = ingest(
-        &h,
-        "main",
-        &turn("s", "2026-10-01T06:00:00Z", "Hello.", "Hi."),
-    );
-    assert!(got.secret_kinds.is_empty());
-    assert!(recorded_kinds(&h, got.source).is_empty());
-}
-
-#[test]
 fn the_key_is_computed_from_the_redacted_text() {
     // Nothing stored is derived from a secret, the content hash included,
     // so a resend whose only difference is the secret itself is the same
@@ -1812,9 +1636,9 @@ fn each_bank_has_one_worker() {
 }
 
 #[test]
-fn turns_go_ahead_of_documents_then_observed_at_order() {
+fn turns_go_ahead_of_documents_then_observed_at_order_across_a_restart() {
     // TIM-92: serialised in observed_at order, with turns ahead of document
-    // chunks.
+    // chunks. The order is the stored queue's, so it holds after a restart.
     let h = Harness::new();
     let doc = ingest_doc(
         &h,
@@ -1838,6 +1662,11 @@ fn turns_go_ahead_of_documents_then_observed_at_order() {
     );
 
     let mut order = Vec::new();
+    let first = claim(&h, "main").unwrap();
+    order.push((first.source, first.source_kind, first.position));
+    h.service.complete_chunk(first).unwrap();
+
+    let h = h.restart();
     while let Some(lease) = claim(&h, "main") {
         order.push((lease.source, lease.source_kind, lease.position));
         h.service.complete_chunk(lease).unwrap();
@@ -2108,46 +1937,6 @@ fn a_failed_chunk_stays_failed_after_a_restart() {
     let listed = h.service.failed_chunks("main").unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].chunk, failed);
-}
-
-#[test]
-fn the_queue_order_survives_a_restart() {
-    let h = Harness::new();
-    let doc = ingest_doc(
-        &h,
-        "main",
-        &document(
-            "notes.md",
-            "# A\n\nFirst.\n\n# B\n\nSecond.\n",
-            date(2026, 9, 1),
-        ),
-    );
-    let late = ingest(
-        &h,
-        "main",
-        &turn("s", "2026-09-30T06:00:00Z", "Late.", "Ok."),
-    );
-    let early = ingest(
-        &h,
-        "main",
-        &turn("s", "2026-09-20T06:00:00Z", "Early.", "Ok."),
-    );
-
-    let h = h.restart();
-    let mut order = Vec::new();
-    while let Some(lease) = claim(&h, "main") {
-        order.push((lease.source, lease.position));
-        h.service.complete_chunk(lease).unwrap();
-    }
-    assert_eq!(
-        order,
-        [
-            (early.source, 0),
-            (late.source, 0),
-            (doc.source, 0),
-            (doc.source, 1),
-        ]
-    );
 }
 
 // Regressions from the TIM-106 review

@@ -155,5 +155,6 @@ mod tests {
             .flat_map(|s| s.files.iter().map(|f| &f.url))
             .collect();
         assert_eq!(urls.len(), 10, "every file has its own URL");
+        assert_ne!(manifest[0].dir, manifest[1].dir, "the models share a dir");
     }
 }

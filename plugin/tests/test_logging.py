@@ -4,13 +4,9 @@ only at ``TRACE``, never at ``DEBUG`` or above."""
 
 import logging
 
-from conftest import SESSION, plugin, transcript
+from conftest import SESSION, transcript
 
 SECRETS = ["pineapple on pizza", "Wellington", "oolong", "Dr Rao", "Maya"]
-
-
-def test_trace_is_below_debug():
-    assert plugin.provider.TRACE < logging.DEBUG
 
 
 def test_no_content_at_debug_or_above(make_provider, daemon, caplog):

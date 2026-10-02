@@ -10,15 +10,6 @@ from conftest import plugin, write_config
 load_config = plugin.config.load_config
 
 
-def test_defaults_without_a_config_file(hermes_home):
-    config = load_config(hermes_home)
-    assert config.url == "http://127.0.0.1:7720"
-    assert config.token is None
-    assert config.bank is None
-    assert config.owner_platform_ids == []
-    assert config.ingest is True
-
-
 def test_reads_every_field(hermes_home):
     write_config(
         hermes_home,

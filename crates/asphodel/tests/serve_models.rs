@@ -240,26 +240,6 @@ fn a_model_dir_that_does_not_exist_stops_startup_without_creating_it() {
 }
 
 #[test]
-fn fake_models_still_need_floors() {
-    // ADR 0009: a missing floor for a configured model stops the daemon,
-    // whichever models are configured.
-    let dir = TestDir::new();
-    let output = run(serve_in(&dir)
-        .env("ASPHODEL_MODELS", "fake")
-        .args(["--listen", "127.0.0.1:0"]));
-    assert!(!output.status.success());
-    let stderr = stderr(&output);
-    assert!(
-        stderr.contains(&format!("reconcile.embedding_floors.\"{FAKE_EMBEDDER}\"")),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("injection.reranker_floors.\"{FAKE_RERANKER}\"")),
-        "{stderr}"
-    );
-}
-
-#[test]
 fn fake_models_with_floors_start_and_show_in_the_resolved_config() {
     let dir = TestDir::new();
     let tuning = dir.floors_for_fakes();
@@ -278,9 +258,10 @@ fn fake_models_with_floors_start_and_show_in_the_resolved_config() {
 
 #[test]
 fn a_floor_for_the_real_models_does_not_cover_the_fakes() {
-    // Floors are keyed by the exact model string. A production tuning file
-    // doesn't make a fake daemon start, so the switch can't hide a missing
-    // floor.
+    // ADR 0009: a missing floor for a configured model stops the daemon,
+    // whichever models are configured. Floors are keyed by the exact model
+    // string, so a production tuning file doesn't make a fake daemon start,
+    // and the switch can't hide a missing floor.
     let dir = TestDir::new();
     let tuning = dir.file(
         "tuning.toml",
@@ -293,25 +274,13 @@ fn a_floor_for_the_real_models_does_not_cover_the_fakes() {
         .arg(&tuning)
         .args(["--listen", "127.0.0.1:0"]));
     assert!(!output.status.success());
+    let stderr = stderr(&output);
     assert!(
-        stderr(&output).contains(FAKE_EMBEDDER),
-        "{}",
-        stderr(&output)
+        stderr.contains(&format!("reconcile.embedding_floors.\"{FAKE_EMBEDDER}\"")),
+        "{stderr}"
     );
-}
-
-#[test]
-fn the_llm_key_never_reaches_the_resolved_config_or_the_log() {
-    let dir = TestDir::new();
-    let tuning = dir.floors_for_fakes();
-    let daemon = start(
-        serve_in(&dir)
-            .env("ASPHODEL_MODELS", "fake")
-            .env("ASPHODEL_LLM_API_KEY", "sk-live-41b2e8-secret")
-            .arg("--config")
-            .arg(&tuning),
+    assert!(
+        stderr.contains(&format!("injection.reranker_floors.\"{FAKE_RERANKER}\"")),
+        "{stderr}"
     );
-    let config = resolved_config(&daemon.log);
-    assert_eq!(config["deployment"]["llm_api_key"], "[redacted]");
-    assert!(!daemon.log.contains("41b2e8"), "{}", daemon.log);
 }

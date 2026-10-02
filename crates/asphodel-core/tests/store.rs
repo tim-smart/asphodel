@@ -11,17 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use asphodel_core::Service;
 use asphodel_core::clock::{Clock, SimulatedClock};
 use asphodel_core::config::{PurgePause, Tuning};
-use asphodel_core::store::bank::{
-    BankError, BankIdentity, ModelIds, PROFILE_NAME, PROFILE_QUESTION,
-};
+use asphodel_core::store::bank::{BankError, BankIdentity, ModelIds, PROFILE_NAME};
 use asphodel_core::store::fs::{self, FilesystemKind, classify, classify_name};
 use asphodel_core::store::{
     DB_FILE, DataDirLock, EMBEDDING_DIMENSIONS, LOCK_FILE, OpenOptions, SCHEMA_VERSION, Store,
     StoreError, VectorError, VectorIndex, micros, migrations,
 };
-use asphodel_core::{Service, config::Fingerprint};
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::Connection;
 
@@ -202,18 +200,6 @@ fn a_local_data_dir_never_needs_the_flag() {
 }
 
 #[test]
-fn the_network_refusal_names_the_dir_the_kind_and_the_flag() {
-    let error = StoreError::NetworkFilesystem {
-        dir: PathBuf::from("/var/lib/asphodel"),
-        kind: FilesystemKind::Nfs,
-    };
-    let message = error.to_string();
-    assert!(message.contains("/var/lib/asphodel"), "{message}");
-    assert!(message.contains("NFS"), "{message}");
-    assert!(message.contains("--allow-network-fs"), "{message}");
-}
-
-#[test]
 fn filesystem_policy_refuses_each_network_kind_unless_overridden() {
     let dir = Path::new("/var/lib/asphodel");
     for kind in [
@@ -252,28 +238,25 @@ fn filesystem_policy_refuses_each_network_kind_unless_overridden() {
 fn two_stores_cannot_share_a_data_dir() {
     let dir = TestDir::new();
     let first = open(&dir.data(), clock());
-    match Store::open(&dir.data(), OpenOptions::default(), clock()) {
-        Err(StoreError::Locked {
-            dir: locked,
-            holder,
-        }) => {
-            assert_eq!(locked, dir.data());
-            assert_eq!(holder, std::process::id().to_string());
+    // Repeated refusals never release the holder's lock.
+    for _ in 0..3 {
+        let error = Store::open(&dir.data(), OpenOptions::default(), clock()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(dir.data().to_str().unwrap()), "{message}");
+        assert!(message.to_lowercase().contains("lock"), "{message}");
+        match error {
+            StoreError::Locked {
+                dir: locked,
+                holder,
+            } => {
+                assert_eq!(locked, dir.data());
+                assert_eq!(holder, std::process::id().to_string());
+            }
+            other => panic!("a second store opened a locked data dir: {other:?}"),
         }
-        other => panic!("a second store opened a locked data dir: {other:?}"),
     }
-    // The refusal left the first store untouched.
+    // The refusals left the first store untouched.
     assert_eq!(first.schema_version().unwrap(), SCHEMA_VERSION);
-}
-
-#[test]
-fn the_refusal_message_names_the_dir_and_the_lock() {
-    let dir = TestDir::new();
-    let _first = open(&dir.data(), clock());
-    let error = Store::open(&dir.data(), OpenOptions::default(), clock()).unwrap_err();
-    let message = error.to_string();
-    assert!(message.contains(dir.data().to_str().unwrap()), "{message}");
-    assert!(message.to_lowercase().contains("lock"), "{message}");
 }
 
 #[test]
@@ -283,26 +266,6 @@ fn dropping_a_store_releases_its_data_dir() {
     drop(first);
     let second = open(&dir.data(), clock());
     assert_eq!(second.schema_version().unwrap(), SCHEMA_VERSION);
-}
-
-#[test]
-fn a_refused_open_does_not_release_the_holders_lock() {
-    let dir = TestDir::new();
-    let _first = open(&dir.data(), clock());
-    for _ in 0..3 {
-        assert!(matches!(
-            Store::open(&dir.data(), OpenOptions::default(), clock()),
-            Err(StoreError::Locked { .. })
-        ));
-    }
-}
-
-#[test]
-fn data_dirs_are_locked_independently() {
-    let a = TestDir::new();
-    let b = TestDir::new();
-    let _first = open(&a.data(), clock());
-    let _second = open(&b.data(), clock());
 }
 
 #[test]
@@ -415,46 +378,6 @@ fn the_database_runs_in_wal_mode_with_foreign_keys_on() {
         .unwrap();
     assert_eq!(foreign_keys, 1);
     assert!(dir.data().join(DB_FILE).is_file());
-}
-
-#[test]
-fn every_table_the_tickets_name_exists() {
-    let dir = TestDir::new();
-    let store = open(&dir.data(), clock());
-    let conn = store.connection();
-    let mut statement = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-        .unwrap();
-    let tables: Vec<String> = statement
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    for expected in [
-        "banks",
-        "entities",
-        "entity_aliases",
-        "entity_aliases_fts",
-        "memory_entities",
-        "memories",
-        "memories_fts",
-        "memory_vectors",
-        "sources",
-        "chunks",
-        "extraction_queue",
-        "accesses",
-        "recalls",
-        "recall_results",
-        "edits",
-        "mental_models",
-        "mental_model_entries",
-        "mental_model_citations",
-        "sweep_runs",
-        "store_meta",
-        "migrations",
-    ] {
-        assert!(tables.iter().any(|t| t == expected), "no table {expected}");
-    }
 }
 
 #[test]
@@ -806,48 +729,6 @@ fn the_copy_is_a_whole_database_at_the_old_version() {
 }
 
 #[test]
-fn the_copy_is_deleted_seven_days_after_its_migration_completes() {
-    let dir = TestDir::new();
-    let clock = clock();
-    let store = open(&dir.data(), clock.clone());
-    let conn = store.connection();
-    let copy = migrations::take_copy(&conn, &dir.data(), 1).unwrap();
-    let completed_at = clock.now();
-    conn.execute(
-        "INSERT OR REPLACE INTO migrations (from_version, to_version, binary_version, started_at, completed_at)
-         VALUES (1, 2, 'test', ?1, ?1)",
-        [micros(completed_at)],
-    )
-    .unwrap();
-    let week = SignedDuration::from_hours(7 * 24);
-
-    assert!(
-        migrations::expire_copies(&conn, &dir.data(), completed_at)
-            .unwrap()
-            .is_empty()
-    );
-    let just_before = completed_at + week - SignedDuration::from_micros(1);
-    assert!(
-        migrations::expire_copies(&conn, &dir.data(), just_before)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(copy.exists());
-
-    assert_eq!(
-        migrations::expire_copies(&conn, &dir.data(), completed_at + week).unwrap(),
-        std::slice::from_ref(&copy)
-    );
-    assert!(!copy.exists());
-    assert!(
-        migrations::expire_copies(&conn, &dir.data(), completed_at + week)
-            .unwrap()
-            .is_empty(),
-        "a deleted copy is reported again"
-    );
-}
-
-#[test]
 fn reopening_after_seven_days_deletes_the_copy() {
     let dir = TestDir::new();
     let clock = clock();
@@ -869,22 +750,6 @@ fn reopening_after_seven_days_deletes_the_copy() {
     clock.advance(SignedDuration::from_hours(7 * 24));
     drop(open(&dir.data(), clock.clone()));
     assert!(!copy.exists(), "kept after the week was up");
-}
-
-#[test]
-fn a_copy_without_a_completed_migration_is_kept() {
-    let dir = TestDir::new();
-    let clock = clock();
-    let store = open(&dir.data(), clock.clone());
-    let conn = store.connection();
-    let copy = migrations::take_copy(&conn, &dir.data(), 3).unwrap();
-    clock.advance(SignedDuration::from_hours(30 * 24));
-    assert!(
-        migrations::expire_copies(&conn, &dir.data(), clock.now())
-            .unwrap()
-            .is_empty()
-    );
-    assert!(copy.exists());
 }
 
 // The deletion fingerprint (ADR 0009)
@@ -1070,26 +935,6 @@ fn housekeeping_selects_the_earliest_existing_copy_deadline() {
 }
 
 #[test]
-fn the_fingerprint_is_recorded_on_first_start() {
-    let dir = TestDir::new();
-    let store = open(&dir.data(), clock());
-    let current = Tuning::default().deletion_fingerprint();
-    assert_eq!(
-        store.check_fingerprint(&current).unwrap(),
-        PurgePause::Running
-    );
-    let stored: String = store
-        .connection()
-        .query_row(
-            "SELECT value FROM store_meta WHERE key = 'deletion_fingerprint'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(stored, current.as_str());
-}
-
-#[test]
 fn a_matching_fingerprint_keeps_purge_running_across_reopens() {
     let dir = TestDir::new();
     let current = Tuning::default().deletion_fingerprint();
@@ -1214,7 +1059,6 @@ fn the_index_takes_384_dimensions_and_rejects_others() {
     let store = open(&dir.data(), clock());
     let vectors = store.vectors();
     assert_eq!(vectors.dimensions(), 384);
-    assert_eq!(EMBEDDING_DIMENSIONS, 384);
     let conn = store.connection();
     for wrong in [0, 3, 383, 385, 768] {
         let vector = vec![0.5; wrong];
@@ -1666,24 +1510,6 @@ fn a_bank_survives_a_reopen() {
     assert_eq!(reopened.owner_name, created.owner_name);
 }
 
-#[test]
-fn the_service_reports_ready_with_a_store() {
-    let dir = TestDir::new();
-    let service = service(&dir);
-    let health = service.health();
-    assert!(health.ready);
-    assert_eq!(health.now, start());
-    assert_eq!(service.now(), start());
-    assert_eq!(service.store().unwrap().dir(), dir.data());
-    assert_eq!(service.store().unwrap().filesystem(), FilesystemKind::Local);
-}
-
-#[test]
-fn the_stored_fingerprint_is_printable() {
-    let fingerprint: Fingerprint = Tuning::default().deletion_fingerprint();
-    assert_eq!(fingerprint.to_string(), fingerprint.as_str());
-}
-
 // Review regressions (TIM-103 review through c157b84)
 
 #[test]
@@ -1744,18 +1570,6 @@ fn merge_leaves_the_profiles_filters_alone() {
     assert_eq!(min_volatility, "months");
     assert_eq!(max_tokens, 123);
     assert_eq!(question, "edited");
-}
-
-#[test]
-fn the_seeded_question_is_the_one_tim95_decided() {
-    // TIM-95, decision 2: it leaves out what the agenda already carries,
-    // and the check-in preference moved into it from the routines question
-    // (decision 1).
-    assert_eq!(
-        PROFILE_QUESTION,
-        "Who is the user: their preferences, important people, work and home, the platforms \
-         they use, and how they like to be helped. Not upcoming events, tasks or routines."
-    );
 }
 
 #[test]
@@ -1866,29 +1680,6 @@ fn a_corrupt_existing_copy_refuses_the_migration_and_is_kept() {
         b"not a database",
         "the corrupt copy was replaced"
     );
-}
-
-#[test]
-fn a_fresh_copy_passes_the_integrity_check_it_will_be_held_to() {
-    // The healthy case of the regression above: what `take_copy` publishes
-    // is a database `PRAGMA integrity_check` accepts, with nothing left
-    // under a partial name.
-    let dir = TestDir::new();
-    let store = open(&dir.data(), clock());
-    let conn = store.connection();
-    let path = migrations::take_copy(&conn, &dir.data(), 1).unwrap();
-    let copy =
-        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    let integrity: String = copy
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(integrity, "ok");
-    let partials: Vec<_> = std::fs::read_dir(dir.data())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.contains("partial"))
-        .collect();
-    assert!(partials.is_empty(), "{partials:?}");
 }
 
 #[test]

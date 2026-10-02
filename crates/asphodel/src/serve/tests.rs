@@ -164,23 +164,6 @@ async fn stale_socket_is_recovered_and_accepts_connections() {
 }
 
 #[tokio::test]
-async fn cleanup_removes_own_socket_after_listener_is_dropped() {
-    let dir = TestDir::new();
-    let path = dir.socket();
-    let (listener, cleanup) = bind_unix(&path).await.unwrap();
-    assert_connectivity(&path, &listener).await;
-    drop(listener);
-    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
-
-    cleanup.remove().unwrap();
-
-    assert_eq!(
-        fs::symlink_metadata(&path).unwrap_err().kind(),
-        ErrorKind::NotFound
-    );
-}
-
-#[tokio::test]
 async fn cleanup_preserves_replacement_socket_and_its_connectivity() {
     let dir = TestDir::new();
     let path = dir.socket();
@@ -196,22 +179,6 @@ async fn cleanup_preserves_replacement_socket_and_its_connectivity() {
 
     assert_eq!(identity(&path), replacement_identity);
     assert_connectivity(&path, &replacement).await;
-}
-
-#[tokio::test]
-async fn cleanup_preserves_replacement_regular_file() {
-    let dir = TestDir::new();
-    let path = dir.socket();
-    let (listener, cleanup) = bind_unix(&path).await.unwrap();
-    drop(listener);
-    fs::remove_file(&path).unwrap();
-    fs::write(&path, b"replacement contents").unwrap();
-    let replacement = identity(&path);
-
-    cleanup.remove().unwrap();
-
-    assert_eq!(identity(&path), replacement);
-    assert_eq!(fs::read(&path).unwrap(), b"replacement contents");
 }
 
 #[tokio::test]

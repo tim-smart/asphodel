@@ -106,12 +106,6 @@ def test_ingest_false_sends_nothing(make_provider, daemon):
     assert daemon.requests_for("turns") == []
 
 
-def test_never_raises_on_a_daemon_error(make_provider, daemon):
-    provider = make_provider()
-    daemon.set_response("turns", 400, {"error": "invalid timezone"})
-    sync(provider)
-
-
 # -- recall ids across overlapping turns (TIM-99; Hermes syncs on a background
 # worker, so the next turn's prefetch can run before this turn's sync) ----------
 

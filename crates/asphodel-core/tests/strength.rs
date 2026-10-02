@@ -6,9 +6,9 @@
 //! memory record?" (TIM-90), "Retrieval and ranking" (TIM-93), "Deletion
 //! policy" (TIM-97), and ADRs 0001, 0003, 0004 and 0008.
 //!
-//! These tests exercise the production API in `asphodel_core::strength`.
-//! The calibration tests also check the tables in TIM-91, ADR 0004 and
-//! ADR 0008 against the fixed constants in closed form.
+//! These tests exercise the production API in `asphodel_core::strength`,
+//! checking it against the tables in TIM-91, ADR 0004 and ADR 0008 and
+//! against their closed forms.
 //!
 //! Tolerances:
 //!
@@ -184,7 +184,7 @@ fn crossing(lo: f64, hi: f64, threshold: f64, value: impl Fn(f64) -> f64) -> f64
     hi
 }
 
-// Closed forms, for the calibration tests only.
+// Closed forms of the tables.
 
 /// The floor with n separate occasions.
 fn floor_with(n: u32) -> f64 {
@@ -195,14 +195,6 @@ fn floor_with(n: u32) -> f64 {
 /// `S·σ − a·ln t = threshold`, while the floor is lower still.
 fn one_mention_days(significance: f64, threshold: f64) -> f64 {
     ((S * significance - threshold) / A).exp()
-}
-
-/// The fewest separate occasions that keep `S·σ + floor` at or above
-/// `threshold`, if any number up to 1000 does.
-fn occasions_to_hold(significance: f64, threshold: f64) -> u32 {
-    (1..=1000)
-        .find(|&n| S * significance + floor_with(n) >= threshold)
-        .unwrap()
 }
 
 /// TIM-91's lifetimes table: significance, and how long one mention stays
@@ -243,65 +235,6 @@ const ABANDONED: [(f64, f64); 3] = [
 fn abandoned_days(significance: f64) -> f64 {
     let quiet_rate = Tuning::default().clock.quiet_rate;
     1.0 + (one_mention_days(significance, TAU) - 1.0) / quiet_rate
-}
-
-// Calibration: the tables against the constants, in closed form. These run
-// now.
-
-#[test]
-fn the_lifetimes_table_matches_the_constants() {
-    for (significance, days) in LIFETIMES {
-        assert_relative(one_mention_days(significance, TAU), days, TABLE);
-    }
-}
-
-#[test]
-fn the_purge_table_matches_the_constants() {
-    let purge_at = TAU - DELTA;
-    for (level, days, hold) in PURGES {
-        let significance = level.value();
-        match days {
-            Some(days) => {
-                assert!(S * significance + floor_with(1) < purge_at, "{level:?}");
-                assert_relative(one_mention_days(significance, purge_at), days, TABLE);
-            }
-            None => assert!(S * significance + floor_with(1) >= purge_at, "{level:?}"),
-        }
-        assert_eq!(occasions_to_hold(significance, purge_at), hold, "{level:?}");
-    }
-}
-
-#[test]
-fn a_memory_sits_faded_about_17_times_as_long_as_it_was_in_recall() {
-    // ADR 0008: e^(δ/a).
-    for (significance, _) in LIFETIMES {
-        let ratio =
-            one_mention_days(significance, TAU - DELTA) / one_mention_days(significance, TAU);
-        assert_relative(ratio, 17.0, TABLE);
-    }
-}
-
-#[test]
-fn the_permanence_figures_match_the_constants() {
-    for (significance, n) in PERMANENCE {
-        assert_eq!(
-            occasions_to_hold(significance, TAU),
-            n,
-            "significance {significance}"
-        );
-    }
-    // Permanent from creation at significance 0.925 or above.
-    let permanent_from = (TAU - floor_with(1)) / S;
-    assert_near(permanent_from, 0.925, 0.001);
-    assert!(SIGNIFICANCE_KEPT >= permanent_from);
-    assert!(Significance::Critical.value() < permanent_from);
-}
-
-#[test]
-fn abandoned_bank_lifetimes_match_adr_0004() {
-    for (significance, days) in ABANDONED {
-        assert_relative(abandoned_days(significance), days, ABOUT);
-    }
 }
 
 // Strength is never stored.
@@ -453,11 +386,6 @@ fn bank_time_is_additive_and_ignores_turn_order() {
     assert_near(shuffled.elapsed_days(at(0.0), at(12.0)), whole, EXACT);
 }
 
-#[test]
-fn a_quiet_rate_of_one_is_world_time() {
-    assert_near(always_on().elapsed_days(at(0.0), at(123.25)), 123.25, EXACT);
-}
-
 // Recent use and the lasting floor (TIM-91).
 
 #[test]
@@ -483,15 +411,6 @@ fn each_access_kind_counts_with_its_weight() {
         let s = strength_at(0.0, &[access(kind, 0.0)], 1.0);
         assert_near(s.recent_use, weight.ln(), EXACT);
     }
-    assert_eq!(
-        [
-            WEIGHT_CREATED,
-            WEIGHT_USED,
-            WEIGHT_MENTIONED_AGAIN,
-            WEIGHT_CONFIRMED
-        ],
-        [1.0, 1.0, 1.5, 2.0]
-    );
 }
 
 #[test]

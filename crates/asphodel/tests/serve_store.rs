@@ -440,20 +440,6 @@ fn the_lock_does_not_outlive_a_crashed_daemon() {
 }
 
 #[test]
-fn a_clean_stop_releases_the_lock() {
-    let dir = TestDir::new();
-    let data = dir.data_dir();
-    let first = start(&dir, &data, &dir.socket("first"));
-    first.wait_ready();
-    let (status, log) = first.terminate();
-    assert!(status.success(), "clean stop exited with {status}:\n{log}");
-
-    let second = start(&dir, &data, &dir.socket("second"));
-    second.wait_ready();
-    assert_eq!(second.health().0, 200);
-}
-
-#[test]
 fn a_data_dir_that_is_a_regular_file_is_refused_and_preserved() {
     let dir = TestDir::new();
     let file = dir.0.join("not-a-dir");

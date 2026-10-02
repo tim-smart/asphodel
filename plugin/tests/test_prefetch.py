@@ -2,7 +2,7 @@
 amendment): the body, the previous query, the pending ``recall_id``, the 3 s
 budget and "" on every failure."""
 
-from conftest import SESSION, plugin
+from conftest import SESSION
 from fake_daemon import INJECTION
 
 

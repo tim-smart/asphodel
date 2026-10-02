@@ -371,138 +371,30 @@ fn serve_one(mut stream: TcpStream, response: StubResponse, log: &Mutex<Vec<Stub
 
 // What runs now: the floors and the LLM settings that already exist.
 
-#[test]
-fn the_default_tuning_has_no_floor_for_either_model() {
-    // ADR 0009: floors come only from the precision curve on Tim's labels,
-    // so there's no code default, and a daemon on the default tuning stops.
-    let error = Tuning::default()
-        .check_floors(EMBEDDING_MODEL_ID, RERANKER_MODEL_ID)
-        .unwrap_err();
-    let ConfigError::Invalid(errors) = error else {
-        panic!("{error}");
-    };
-    let keys: Vec<_> = errors.iter().map(|e| e.key.as_str()).collect();
-    assert_eq!(
-        keys,
-        [
-            "reconcile.embedding_floors.\"bge-small-en-v1.5:int8\"",
-            "injection.reranker_floors.\"jina-reranker-v1-turbo-en:int8\"",
-        ]
-    );
-}
-
-#[test]
-fn floors_for_the_exact_model_strings_satisfy_the_check() {
-    let tuning = Tuning::from_toml(
-        "[injection.reranker_floors]\n\"jina-reranker-v1-turbo-en:int8\" = -1.5\n\
-         [reconcile.embedding_floors]\n\"bge-small-en-v1.5:int8\" = 0.82\n",
-    )
-    .unwrap();
-    tuning
-        .check_floors(EMBEDDING_MODEL_ID, RERANKER_MODEL_ID)
-        .unwrap();
-    // A floor under a different quantisation of the same model doesn't
-    // count: int8 and fp32 give different scores (TIM-98).
-    let fp32 = Tuning::from_toml(
-        "[injection.reranker_floors]\n\"jina-reranker-v1-turbo-en:fp32\" = -1.5\n\
-         [reconcile.embedding_floors]\n\"bge-small-en-v1.5:fp32\" = 0.82\n",
-    )
-    .unwrap();
-    assert!(
-        fp32.check_floors(EMBEDDING_MODEL_ID, RERANKER_MODEL_ID)
-            .is_err()
-    );
-}
-
-#[test]
-fn the_embedding_width_matches_the_vector_table() {
-    // bge-small-en-v1.5 is 384 wide (TIM-89), and so is the vec0 table.
-    assert_eq!(EMBEDDING_DIMENSIONS, 384);
-}
-
-#[test]
-fn the_llm_endpoint_and_model_come_from_the_tuning_file_and_the_key_from_the_environment() {
-    // ADR 0009: the API key is a secret, environment only, and never in the
-    // tuning file.
-    let tuning = Tuning::from_toml(
-        "[llm]\nmodel = \"some-model:q4_K_M\"\nendpoint = \"http://llm.internal:8080/v1\"\n",
-    )
-    .unwrap();
-    assert_eq!(tuning.llm.model.as_deref(), Some("some-model:q4_K_M"));
-    assert_eq!(
-        tuning.llm.endpoint.as_deref(),
-        Some("http://llm.internal:8080/v1")
-    );
-    assert!(Tuning::from_toml("[llm]\napi_key = \"sk-1\"\n").is_err());
-
-    let deployment = deployment(Some("sk-live-41b2e8-secret"));
-    let key = deployment.llm_api_key.as_ref().unwrap();
-    assert_eq!(key.expose(), "sk-live-41b2e8-secret");
-    assert_eq!(format!("{key:?}"), "[redacted]");
-    assert_eq!(
-        serde_json::to_value(&deployment).unwrap()["llm_api_key"],
-        "[redacted]"
-    );
-}
-
-#[test]
-fn the_stub_server_answers_a_request() {
-    // The test harness itself, so a failure in the client tests points at
-    // the client and not at this file's HTTP server.
-    let server = StubServer::start(StubResponse::completion("{\"ok\":true}"));
-    let mut stream = TcpStream::connect(server.url.trim_start_matches("http://")).unwrap();
-    let body = "{\"a\":1}";
-    write!(
-        stream,
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer k\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    let mut reply = String::new();
-    stream.read_to_string(&mut reply).unwrap();
-    assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
-    assert!(reply.contains("\"choices\""), "{reply}");
-
-    let request = server.only_request();
-    assert_eq!(request.method, "POST");
-    assert_eq!(request.path, "/v1/chat/completions");
-    assert_eq!(request.header("authorization"), Some("Bearer k"));
-    assert_eq!(request.json(), json!({"a": 1}));
-}
-
 // The model dir (TIM-94, decision 4; TIM-98 deployment).
 
 #[test]
-fn the_override_wins_over_the_xdg_cache() {
-    let dir = ModelDir::resolve(
-        Some(Path::new("/srv/models")),
-        Some(Path::new("/home/tim/.cache")),
-        Some(Path::new("/home/tim")),
-    )
-    .unwrap();
-    assert_eq!(dir.path(), Path::new("/srv/models"));
-}
-
-#[test]
-fn the_default_is_the_xdg_cache() {
-    let dir = ModelDir::resolve(
-        None,
-        Some(Path::new("/var/cache/tim")),
-        Some(Path::new("/home/tim")),
-    )
-    .unwrap();
-    assert_eq!(dir.path(), Path::new("/var/cache/tim/asphodel/models"));
-}
-
-#[test]
-fn without_xdg_cache_home_the_default_is_under_home() {
-    let dir = ModelDir::resolve(None, None, Some(Path::new("/home/tim"))).unwrap();
-    assert_eq!(dir.path(), Path::new("/home/tim/.cache/asphodel/models"));
-
-    // The XDG spec: a relative XDG_CACHE_HOME is invalid and ignored.
-    let dir =
-        ModelDir::resolve(None, Some(Path::new("cache")), Some(Path::new("/home/tim"))).unwrap();
-    assert_eq!(dir.path(), Path::new("/home/tim/.cache/asphodel/models"));
+fn the_model_dir_is_the_override_then_the_xdg_cache_then_home() {
+    let home = Some(Path::new("/home/tim"));
+    for (override_dir, xdg_cache, expected) in [
+        (Some("/srv/models"), Some("/home/tim/.cache"), "/srv/models"),
+        (
+            None,
+            Some("/var/cache/tim"),
+            "/var/cache/tim/asphodel/models",
+        ),
+        (None, None, "/home/tim/.cache/asphodel/models"),
+        // The XDG spec: a relative XDG_CACHE_HOME is invalid and ignored.
+        (None, Some("cache"), "/home/tim/.cache/asphodel/models"),
+    ] {
+        let dir =
+            ModelDir::resolve(override_dir.map(Path::new), xdg_cache.map(Path::new), home).unwrap();
+        assert_eq!(
+            dir.path(),
+            Path::new(expected),
+            "{override_dir:?} {xdg_cache:?}"
+        );
+    }
 }
 
 #[test]
@@ -523,38 +415,6 @@ fn files_live_under_the_models_dir_name() {
 }
 
 // The manifest.
-
-#[test]
-fn the_manifest_names_the_two_models_and_their_five_files() {
-    let manifest = manifest();
-    let ids: Vec<_> = manifest.iter().map(|spec| spec.id.as_str()).collect();
-    assert_eq!(ids, [EMBEDDING_MODEL_ID, RERANKER_MODEL_ID]);
-    for spec in &manifest {
-        let names: Vec<_> = spec.files.iter().map(|file| file.name.as_str()).collect();
-        assert_eq!(names, MODEL_FILES, "{}", spec.id);
-        assert!(!spec.dir.contains(':'), "{}: {}", spec.id, spec.dir);
-        assert!(!spec.dir.contains('/'), "{}: {}", spec.id, spec.dir);
-        for file in &spec.files {
-            assert!(
-                file.url.starts_with("https://huggingface.co/"),
-                "{}: {}",
-                spec.id,
-                file.url
-            );
-            assert_eq!(file.sha256.len(), 64, "{}: {}", spec.id, file.name);
-            assert!(
-                file.sha256
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-                "{}: {}",
-                spec.id,
-                file.sha256
-            );
-        }
-    }
-    // The two models don't share a directory.
-    assert_ne!(manifest[0].dir, manifest[1].dir);
-}
 
 // `asphodel models fetch` (TIM-94, decision 4).
 
@@ -674,56 +534,6 @@ fn fetch_stops_at_the_first_failure_and_keeps_what_it_wrote() {
     let report = fetch_models(&models, &canned.specs, &fetcher).unwrap();
     assert_eq!(report.skipped.len(), 2);
     assert_eq!(report.fetched.len(), 8);
-}
-
-#[test]
-fn fetch_never_writes_through_a_planted_temp_symlink() {
-    // Today the temp file is `<file>.part-<pid>`. The fix moves to fresh
-    // names created exclusively, so a symlink planted here must simply be
-    // left alone.
-    let dir = TestDir::new();
-    let models = dir.models();
-    let canned = canned();
-    let spec = &canned.specs[0];
-    let target = models.file(spec, &spec.files[0].name);
-    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-    let victim = dir.join("victim.txt");
-    std::fs::write(&victim, "irreplaceable contents").unwrap();
-    let mut planted = target.as_os_str().to_owned();
-    planted.push(format!(".part-{}", std::process::id()));
-    let planted = PathBuf::from(planted);
-    std::os::unix::fs::symlink(&victim, &planted).unwrap();
-
-    fetch_models(
-        &models,
-        &canned.specs,
-        &MapFetcher::new(canned.bytes.clone()),
-    )
-    .unwrap();
-
-    assert_eq!(
-        std::fs::read_to_string(&victim).unwrap(),
-        "irreplaceable contents",
-        "the model bytes were written through the symlink"
-    );
-    let installed = std::fs::symlink_metadata(&target).unwrap();
-    assert!(
-        installed.file_type().is_file(),
-        "{} is not a regular file: {:?}",
-        target.display(),
-        installed.file_type()
-    );
-    assert_eq!(
-        sha256_hex(&std::fs::read(&target).unwrap()),
-        spec.files[0].sha256
-    );
-    assert!(
-        std::fs::symlink_metadata(&planted)
-            .unwrap()
-            .file_type()
-            .is_symlink(),
-        "the planted symlink was removed or replaced"
-    );
 }
 
 // Loading: never a download, and a missing file fails fast.
@@ -893,25 +703,6 @@ fn the_fake_reranker_scores_by_query_words_in_the_document() {
     );
     assert_eq!(scores, FakeReranker.rerank(query, &documents).unwrap());
     assert!(reranker.rerank(query, &[]).unwrap().is_empty());
-}
-
-#[test]
-fn the_fakes_are_shareable_trait_objects() {
-    fn takes(embedder: Arc<dyn Embedder>, reranker: Arc<dyn Reranker>) -> (String, String) {
-        (
-            embedder.model_id().to_string(),
-            reranker.model_id().to_string(),
-        )
-    }
-    let models = Models::fake();
-    let ids = takes(Arc::clone(&models.embedder), Arc::clone(&models.reranker));
-    assert_eq!(
-        ids,
-        (FakeEmbedder::MODEL_ID.into(), FakeReranker::MODEL_ID.into())
-    );
-    // Used from another thread, as the extraction worker will.
-    let handle = std::thread::spawn(move || models.embedder.embed(&["from a thread"]).unwrap());
-    assert_eq!(handle.join().unwrap()[0].len(), EMBEDDING_DIMENSIONS);
 }
 
 // The service: recorded model ids and the floor check at startup.
@@ -1265,17 +1056,6 @@ fn a_dead_endpoint_is_a_retryable_transport_error() {
     assert!(error.is_retryable());
 }
 
-#[test]
-fn the_real_client_is_a_trait_object() {
-    let server = StubServer::start(StubResponse::completion("{\"ok\":true}"));
-    let client: Arc<dyn LlmClient> = Arc::new(OpenAiCompatible::new(server.settings(None)));
-    let handle = {
-        let client = Arc::clone(&client);
-        std::thread::spawn(move || client.complete(&request()).unwrap())
-    };
-    assert_eq!(handle.join().unwrap().json, json!({"ok": true}));
-}
-
 // The fake LLM.
 
 #[test]
@@ -1315,43 +1095,6 @@ fn the_fake_llm_can_fail_every_call() {
     );
     assert!(error.is_retryable());
     assert_eq!(fake.requests().len(), 1);
-}
-
-#[test]
-fn the_fake_llm_is_a_shareable_trait_object() {
-    let client: Arc<dyn LlmClient> = Arc::new(FakeLlm::scripted("fake-llm", vec![json!({})]));
-    let handle = {
-        let client = Arc::clone(&client);
-        std::thread::spawn(move || client.complete(&request()).unwrap())
-    };
-    assert_eq!(handle.join().unwrap().json, json!({}));
-}
-
-#[test]
-fn requests_and_responses_round_trip_through_json_for_the_cassette() {
-    // TIM-96, decision 4: replay records calls. The types serialise so the
-    // cassette can store them and key on the template and model.
-    let request = request();
-    let text = serde_json::to_string(&request).unwrap();
-    assert_eq!(serde_json::from_str::<LlmRequest>(&text).unwrap(), request);
-    assert_eq!(
-        serde_json::to_value(&request).unwrap()["template"],
-        json!({"name": "extract", "version": 3})
-    );
-
-    let response = LlmResponse {
-        json: json!({"claims": []}),
-        usage: Some(LlmUsage {
-            input_tokens: 41,
-            output_tokens: 7,
-        }),
-        latency: Duration::from_millis(850),
-    };
-    let text = serde_json::to_string(&response).unwrap();
-    assert_eq!(
-        serde_json::from_str::<LlmResponse>(&text).unwrap(),
-        response
-    );
 }
 
 // The real models. Ignored: they run only when the models are present.

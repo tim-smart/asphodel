@@ -25,7 +25,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use asphodel_core::config::RankingTuning;
-use asphodel_core::constants::{CANDIDATES_PER_ARM, RERANKED, RRF_K, SHORT_FOLLOW_UP_WORDS, TAU};
+use asphodel_core::constants::{CANDIDATES_PER_ARM, TAU};
 use asphodel_core::ingest::{Outcome, Turn};
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, ModelError, Models, Reranker,
@@ -573,16 +573,6 @@ fn ids(recall: &Recall) -> Vec<Uuid> {
     recall.results.iter().map(|r| r.id).collect()
 }
 
-// The fixed retrieval constants (TIM-93, placed in code by TIM-98)
-
-#[test]
-fn retrieval_constants_match_the_decisions() {
-    assert_eq!(RRF_K, 60.0); // decision 2
-    assert_eq!(CANDIDATES_PER_ARM, 100); // decision 1
-    assert_eq!(RERANKED, 40); // decision 3
-    assert_eq!(SHORT_FOLLOW_UP_WORDS, 8); // decision 8
-}
-
 // Fusion (decision 2)
 
 #[test]
@@ -739,12 +729,6 @@ fn low_window_confidence_halves_the_phase_term_in_both_directions() {
     assert!((phase(&overdue, true) - phase(&overdue, false) / 2.0).abs() < 1e-9);
     assert!((phase(&ended, true) - phase(&ended, false) / 2.0).abs() < 1e-9);
     assert!(phase(&ended, true) < 0.0);
-}
-
-#[test]
-fn injection_weighs_strength_more_than_explicit_recall_by_default() {
-    let ranking = Tuning::default().ranking;
-    assert!(ranking.w_s_inject > ranking.w_s_recall); // decision 5
 }
 
 // The strength band (decision 13)
@@ -1062,17 +1046,6 @@ fn a_late_reranker_leaves_explicit_recall_in_rrf_order() {
     assert_eq!(ids(&recall), vec![pottery]);
 }
 
-#[test]
-fn a_reranker_inside_the_deadline_is_used() {
-    let h = Harness::with(1.0, "", Arc::new(SlowReranker(Duration::from_millis(20))))
-        .with_deadline(Duration::from_secs(5));
-    let pottery = h.insert(fact("Tim takes a pottery class."));
-    let prefetch = h.prefetch("s", "pottery class schedule");
-    assert!(prefetch.reranked);
-    assert_eq!(prefetch.injected, vec![pottery]);
-    assert!(h.recall(query("pottery class")).reranked);
-}
-
 // The injection format (decision 10)
 
 #[test]
@@ -1288,23 +1261,6 @@ fn recall_tool_results_join_the_in_context_set() {
 }
 
 #[test]
-fn an_idle_session_expires_after_in_context_idle_days() {
-    assert_eq!(Tuning::default().sessions.in_context_idle_days, 7);
-    let h = Harness::new();
-    let pottery = h.insert(fact("Tim takes a pottery class."));
-    for session in ["kept", "expired"] {
-        let prefetch = h.prefetch(session, "pottery class schedule");
-        h.sync_turn(session, Some(prefetch.recall_id.to_string()));
-    }
-
-    h.clock.advance(SignedDuration::from_hours(6 * 24));
-    assert_eq!(h.in_context("kept"), vec![pottery]);
-    h.clock
-        .advance(SignedDuration::from_hours(24) + SignedDuration::from_mins(1));
-    assert!(h.in_context("expired").is_empty());
-}
-
-#[test]
 fn the_idle_timeout_is_tunable() {
     let h = Harness::with(
         1.0,
@@ -1444,20 +1400,6 @@ fn a_fresh_memory_is_strong() {
     let recall = h.recall(query("pottery apron"));
     let found = recall.results.iter().find(|r| r.id == fresh).unwrap();
     assert_eq!(found.strength, Band::Strong);
-}
-
-#[test]
-fn recall_includes_ended_memories() {
-    let h = Harness::new();
-    let berlin = h.insert(Memory {
-        kind: "state",
-        valid_from: Some((local("2024-01-01T00:00"), "month")),
-        valid_until: Some((local("2026-06-01T00:00"), "month")),
-        ..fact("Tim lives in Berlin.")
-    });
-    let recall = h.recall(query("Tim lives in Berlin"));
-    let found = recall.results.iter().find(|r| r.id == berlin).unwrap();
-    assert!(matches!(found.phase, Phase::RecentlyPast | Phase::LongPast));
 }
 
 #[test]

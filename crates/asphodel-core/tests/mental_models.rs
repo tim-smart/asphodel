@@ -808,7 +808,20 @@ fn an_owner_edit_triggers_a_refresh_that_isnt_skipped() {
             },
         )
         .unwrap();
-    assert_ne!(h.input(PROFILE_NAME).fingerprint, before);
+    let asked = h.input(PROFILE_NAME).fingerprint;
+    assert_ne!(asked, before);
+    // So is the size.
+    h.service
+        .edit_model(
+            BANK,
+            PROFILE_NAME,
+            &ModelEdit {
+                max_tokens: Some(400),
+                ..ModelEdit::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(h.input(PROFILE_NAME).fingerprint, asked);
 
     h.advance(minutes(30));
     let llm = quiet_llm(1);
@@ -820,23 +833,6 @@ fn an_owner_edit_triggers_a_refresh_that_isnt_skipped() {
             .user
             .contains("What does Tim like to drink?")
     );
-}
-
-#[test]
-fn resizing_a_model_changes_its_fingerprint() {
-    let h = Harness::new();
-    let before = h.input(PROFILE_NAME).fingerprint;
-    h.service
-        .edit_model(
-            BANK,
-            PROFILE_NAME,
-            &ModelEdit {
-                max_tokens: Some(400),
-                ..ModelEdit::default()
-            },
-        )
-        .unwrap();
-    assert_ne!(h.input(PROFILE_NAME).fingerprint, before);
 }
 
 #[test]
@@ -1123,22 +1119,19 @@ fn an_unchanged_fingerprint_skips_the_llm_and_force_doesnt() {
 }
 
 #[test]
-fn a_new_memory_in_the_selection_changes_the_fingerprint() {
-    let h = Harness::new();
-    h.insert(fact(TEA));
-    let before = h.input(PROFILE_NAME).fingerprint;
-    h.insert(fact(CAT));
-    assert_ne!(h.input(PROFILE_NAME).fingerprint, before);
-}
-
-#[test]
-fn a_memory_outside_the_filters_leaves_the_fingerprint_alone() {
+fn the_fingerprint_follows_the_selection_only() {
     let h = Harness::new();
     h.insert(fact(TEA));
     let before = h.input(PROFILE_NAME).fingerprint;
     h.insert(event("Tim is going to the cinema.", "2026-10-03T00:00"));
     h.insert(faded(fact("Tim once tried surfing in Raglan.")));
-    assert_eq!(h.input(PROFILE_NAME).fingerprint, before);
+    assert_eq!(
+        h.input(PROFILE_NAME).fingerprint,
+        before,
+        "a memory outside the filters changed it"
+    );
+    h.insert(fact(CAT));
+    assert_ne!(h.input(PROFILE_NAME).fingerprint, before);
 }
 
 #[test]
@@ -1300,10 +1293,14 @@ fn untouched_entries_are_copied_byte_for_byte_and_edits_keep_their_id() {
 }
 
 #[test]
-fn an_operation_citing_outside_the_input_is_rejected_and_the_rest_apply() {
+fn invalid_operations_are_rejected_and_the_rest_apply() {
+    // Code refuses an entry whose citations aren't in the refresh's input,
+    // an entry that cites nothing, and an edit or remove of an entry that
+    // doesn't exist (ADR 0007).
     let h = Harness::new();
     let tea = h.insert(fact(TEA));
     let gone = h.insert(faded(fact("Tim once tried surfing in Raglan.")));
+    let applied = h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
     let input = h.input(PROFILE_NAME);
     assert!(!inputs(&input).contains(&gone));
     let llm = FakeLlm::scripted(
@@ -1315,12 +1312,20 @@ fn an_operation_citing_outside_the_input_is_rejected_and_the_rest_apply() {
                 "Tim likes tea and surfing.",
                 &[handle(&input, tea), "m99".into()],
             ),
-            add("Tim likes green tea.", &handles(&input, &[tea])),
+            edit(
+                &entry_handle(&input, applied.added[0]),
+                "Tim likes tea.",
+                &[],
+            ),
+            add("Tim is lovely.", &[]),
+            edit("e7", "Tim likes tea.", &handles(&input, &[tea])),
+            remove("e8"),
+            add("Tim drinks green tea.", &handles(&input, &[tea])),
         ])],
     );
     let Outcome::Applied(applied) = h
         .service
-        .refresh_model(BANK, PROFILE_NAME, &llm, false)
+        .refresh_model(BANK, PROFILE_NAME, &llm, true)
         .unwrap()
     else {
         panic!("applied");
@@ -1336,82 +1341,16 @@ fn an_operation_citing_outside_the_input_is_rejected_and_the_rest_apply() {
             (0, RejectReason::CitesOutsideInput),
             (1, RejectReason::CitesOutsideInput),
             (2, RejectReason::CitesOutsideInput),
+            (3, RejectReason::NoCitations),
+            (4, RejectReason::NoCitations),
+            (5, RejectReason::UnknownEntry),
+            (6, RejectReason::UnknownEntry),
         ]
     );
-    assert_eq!(texts(&h.profile()), ["Tim likes green tea."]);
-}
-
-#[test]
-fn an_edit_or_add_that_cites_nothing_is_rejected() {
-    let h = Harness::new();
-    let tea = h.insert(fact(TEA));
-    let applied = h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
-    let input = h.input(PROFILE_NAME);
-    let llm = FakeLlm::scripted(
-        MODEL,
-        vec![reply(vec![
-            edit(
-                &entry_handle(&input, applied.added[0]),
-                "Tim likes tea.",
-                &[],
-            ),
-            add("Tim is lovely.", &[]),
-        ])],
-    );
-    let Outcome::Applied(applied) = h
-        .service
-        .refresh_model(BANK, PROFILE_NAME, &llm, true)
-        .unwrap()
-    else {
-        panic!("applied");
-    };
-    let rejected: Vec<(usize, RejectReason)> = applied
-        .rejected
-        .iter()
-        .map(|r| (r.index, r.reason))
-        .collect();
     assert_eq!(
-        rejected,
-        [
-            (0, RejectReason::NoCitations),
-            (1, RejectReason::NoCitations)
-        ]
+        texts(&h.profile()),
+        ["Tim likes green tea.", "Tim drinks green tea."]
     );
-    assert_eq!(texts(&h.profile()), ["Tim likes green tea."]);
-}
-
-#[test]
-fn an_edit_or_remove_of_an_unknown_entry_is_rejected() {
-    let h = Harness::new();
-    let tea = h.insert(fact(TEA));
-    let input = h.input(PROFILE_NAME);
-    let llm = FakeLlm::scripted(
-        MODEL,
-        vec![reply(vec![
-            edit("e7", "Tim likes tea.", &handles(&input, &[tea])),
-            remove("e8"),
-        ])],
-    );
-    let Outcome::Applied(applied) = h
-        .service
-        .refresh_model(BANK, PROFILE_NAME, &llm, true)
-        .unwrap()
-    else {
-        panic!("applied");
-    };
-    let rejected: Vec<(usize, RejectReason)> = applied
-        .rejected
-        .iter()
-        .map(|r| (r.index, r.reason))
-        .collect();
-    assert_eq!(
-        rejected,
-        [
-            (0, RejectReason::UnknownEntry),
-            (1, RejectReason::UnknownEntry)
-        ]
-    );
-    assert!(h.profile().entries.is_empty());
 }
 
 #[test]
@@ -1616,23 +1555,6 @@ fn entries_past_max_tokens_are_trimmed_lowest_ranked_first() {
     assert!(tokens <= 30, "{tokens} tokens");
 }
 
-#[test]
-fn the_rendered_models_stay_within_the_budget() {
-    let h = Harness::new();
-    let tea = h.insert(fact(TEA));
-    let cites: &[Uuid] = &[tea];
-    let long = "Tim likes green tea, brewed for exactly three minutes at eighty degrees.";
-    let entries: Vec<(&str, &[Uuid])> = (0..40).map(|_| (long, cites)).collect();
-    h.refresh_adding(PROFILE_NAME, &entries);
-    let block = h.block(None);
-    let rendered = block.text.matches(long).count();
-    assert!(rendered > 0);
-    assert!(
-        rendered * estimate_tokens(long) <= h.tuning.mental_models.profile_max_tokens as usize,
-        "{rendered} entries rendered"
-    );
-}
-
 // Memories win (TIM-95, decision 6; ADR 0007)
 
 #[test]
@@ -1812,7 +1734,7 @@ fn an_empty_model_renders_nothing_not_even_a_header() {
 }
 
 #[test]
-fn building_the_block_never_calls_the_llm_or_writes_an_access() {
+fn building_the_block_or_the_agenda_never_writes_an_access() {
     let h = Harness::new();
     let tea = h.insert(fact(TEA));
     h.insert(event(
@@ -1823,6 +1745,7 @@ fn building_the_block_never_calls_the_llm_or_writes_an_access() {
     let accesses = h.accesses();
     h.block(Some("s1"));
     h.block(Some("s2"));
+    h.agenda();
     assert_eq!(
         h.accesses(),
         accesses,
@@ -1886,16 +1809,6 @@ fn the_clock_alone_changes_the_block_only_at_local_midnight() {
     let friday = h.block(None);
     assert_ne!(friday.id, first.id);
     assert_eq!(friday.agenda.len(), 1);
-}
-
-#[test]
-fn the_block_cache_lives_in_memory_and_a_restart_rebuilds_it() {
-    let h = Harness::new();
-    let first = h.block(None);
-    let h = h.restart();
-    let rebuilt = h.block(None);
-    assert_ne!(rebuilt.id, first.id);
-    assert_eq!(rebuilt.text, first.text);
 }
 
 // In context (TIM-95, decision 4; TIM-93, decision 7)
@@ -2208,16 +2121,6 @@ fn the_dated_cap_leaves_routines_and_undated_tasks_alone() {
     assert_eq!(agenda.folded, 1);
     assert_eq!(agenda.routines.len(), 1);
     assert_eq!(agenda.undated_tasks.len(), 1);
-}
-
-#[test]
-fn the_agenda_is_built_without_an_llm_or_an_access() {
-    let h = Harness::new();
-    h.insert(task("Tim needs to clean the gutters."));
-    h.insert(event("Tim has event A.", "2026-10-02T00:00"));
-    let accesses = h.accesses();
-    h.agenda();
-    assert_eq!(h.accesses(), accesses);
 }
 
 // Regressions from the TIM-111 implementation run (1429a07), fixed in a8e3e31

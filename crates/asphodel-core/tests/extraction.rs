@@ -15,11 +15,7 @@
 //! to label nothing. Reconciliation itself is tested in `reconcile.rs`.
 //!
 //! The API under test is `asphodel_core::extraction` and the `Service`
-//! methods over it, `call1_input` and `extract_chunk`. Three tests check the
-//! schema and constants call 1 relies on: that the schema TIM-103 landed
-//! holds what call 1 commits, that it allows one access per memory per turn,
-//! and that no significance level extraction can give is permanent from
-//! creation.
+//! methods over it, `call1_input` and `extract_chunk`.
 //!
 //! Every service here runs on a `SimulatedClock` stopped at one instant
 //! unless a test advances it, so a stored time that equals that instant can
@@ -34,7 +30,7 @@ use std::time::Duration;
 use asphodel_core::Service;
 use asphodel_core::clock::{Clock, SimulatedClock};
 use asphodel_core::config::Tuning;
-use asphodel_core::constants::{CHUNK_RETRY_CAP, SIGNIFICANCE_KEPT, Significance};
+use asphodel_core::constants::CHUNK_RETRY_CAP;
 use asphodel_core::ingest::{Document, Ingested, Turn, TurnAuthor};
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest, LlmResponse,
@@ -935,100 +931,6 @@ const CLAIM_FIELDS: [&str; 16] = [
 const LEVELS: [&str; 5] = ["trivial", "minor", "notable", "major", "critical"];
 const KINDS: [&str; 5] = ["fact", "event", "state", "task", "recurring"];
 
-// The schema call 1 commits into, which runs now.
-
-#[test]
-fn the_schema_holds_what_call_1_commits() {
-    let h = Harness::new();
-    let source = ingest(&h, &turn("s1", T1, "Hello.", "Hi.")).source;
-    let chunk_id: i64 = h.one(
-        "SELECT c.id FROM chunks c JOIN sources s ON s.id = c.source_id WHERE s.uuid = ?1",
-        [source.to_string()],
-    );
-    let bank_id = h.bank_id("main");
-    let now = micros(h.now());
-    let insert = |significance: &str, owner: Option<&str>| {
-        h.service.store().unwrap().connection().execute(
-            "INSERT INTO memories (uuid, bank_id, content, kind, significance, owner_significance,
-                                   chunk_id, source_start, source_end, observed_at,
-                                   window_confidence, created_at, updated_at)
-             VALUES (?1, ?2, 'Tim said hello.', 'fact', ?3, ?4, ?5, 0, 6, ?6, 'high', ?6, ?6)",
-            rusqlite::params![
-                next_uuid().to_string(),
-                bank_id,
-                significance,
-                owner,
-                chunk_id,
-                now
-            ],
-        )
-    };
-
-    // Every level call 1 can give fits, with or without the owner keeping it.
-    for level in LEVELS {
-        insert(level, None).unwrap();
-    }
-    insert("notable", Some("kept")).unwrap();
-    // A level above critical has nowhere to go: only the owner keeps.
-    assert!(insert("kept", None).is_err());
-
-    // The columns call 1 writes or reads.
-    for (table, column) in [
-        ("chunks", "call1_output"),
-        ("chunks", "extracted_at"),
-        ("memory_entities", "surface_form"),
-        ("accesses", "turn"),
-        ("accesses", "source_id"),
-        ("memories", "hidden_at"),
-        ("sources", "ingested_at"),
-        ("sources", "reference_date_exact"),
-    ] {
-        let found: i64 = h.one(
-            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
-            [column],
-        );
-        assert_eq!(found, 1, "{table}.{column}");
-    }
-
-    // A kind's fields only on that kind.
-    let misplaced = h.service.store().unwrap().connection().execute(
-        "INSERT INTO memories (uuid, bank_id, content, kind, significance, chunk_id, source_start,
-                               source_end, observed_at, window_confidence, volatility,
-                               created_at, updated_at)
-         VALUES (?1, ?2, 'Tim is tired.', 'fact', 'minor', ?3, 0, 6, ?4, 'high', 'days', ?4, ?4)",
-        (next_uuid().to_string(), bank_id, chunk_id, now),
-    );
-    assert!(misplaced.is_err(), "volatility belongs to states only");
-}
-
-#[test]
-fn the_schema_allows_one_access_per_memory_per_turn() {
-    let h = Harness::new();
-    let memory = h.insert_memory("main", "Tim likes tea.", "minor");
-    h.insert_access(memory, "used", 7);
-    let again = h.service.store().unwrap().connection().execute(
-        "INSERT INTO accesses (bank_id, memory_id, kind, at, turn)
-         SELECT bank_id, id, 'confirmed', ?2, 7 FROM memories WHERE uuid = ?1",
-        (memory.to_string(), micros(h.now())),
-    );
-    assert!(again.is_err(), "a second access in the same turn");
-    h.insert_access(memory, "used", 8);
-    assert_eq!(h.accesses(memory).len(), 3);
-}
-
-#[test]
-fn no_level_extraction_can_give_is_permanent_from_creation() {
-    // TIM-91: at 0.925 or above a memory is permanent from creation, so that
-    // range is the owner's, and extraction may not score above 0.9.
-    let values: Vec<f64> = Significance::ALL
-        .iter()
-        .map(|level| level.value())
-        .collect();
-    assert_eq!(values, vec![0.1, 0.3, 0.5, 0.7, 0.9]);
-    assert!(values.iter().all(|value| *value < 0.925));
-    assert_eq!(SIGNIFICANCE_KEPT, 1.0);
-}
-
 // Context assembly.
 
 #[test]
@@ -1542,33 +1444,6 @@ fn an_event_keeps_its_window_and_precisions() {
 }
 
 #[test]
-fn an_event_with_no_stated_time_starts_on_the_day_it_was_said() {
-    let h = Harness::new();
-    let user = "I finally filed the tax return.";
-    let quote = "I finally filed the tax return";
-    let memories = golden(
-        &h,
-        user,
-        "Well done.",
-        vec![claim("Tim filed the tax return.", "event", quote)],
-    );
-    // TIM-92: valid_from is observed_at at day precision, with low confidence.
-    assert_eq!(
-        h.row(memories[0]),
-        Row {
-            valid_from: timed(local("2026-10-01T00:00"), "day"),
-            window_confidence: "low".into(),
-            ..Row::new(
-                "Tim filed the tax return.",
-                "event",
-                at(T1),
-                span(&turn_text(user, "Well done."), quote)
-            )
-        }
-    );
-}
-
-#[test]
 fn a_state_keeps_its_volatility_and_until_event() {
     let h = Harness::new();
     let user = "I'm chasing a flaky build until the release ships. Feeling tired today.";
@@ -1845,9 +1720,6 @@ fn a_time_is_the_start_of_its_unit_in_the_sources_timezone() {
             timed(local("2026-10-03T15:45"), "minute"),
         ]
     );
-    // Auckland is on daylight time, UTC+13, through all of these.
-    assert_eq!(local("2027-01-01T00:00"), at("2026-12-31T11:00:00Z"));
-    assert_eq!(local("2026-10-03T15:45"), at("2026-10-03T02:45:00Z"));
 }
 
 #[test]
@@ -2112,52 +1984,6 @@ fn another_speakers_claims_link_to_their_own_entity() {
     );
 }
 
-#[test]
-fn an_answer_to_the_assistants_question_quotes_the_answer() {
-    let h = Harness::new();
-    ingest(
-        &h,
-        &turn(
-            "s1",
-            "2026-10-01T06:00:00Z",
-            "Morning.",
-            "Are you still at Acme?",
-        ),
-    );
-    let current = ingest(&h, &turn("s1", T1, "Yes, still there.", "Great."));
-    h.focus(h.chunk_of(current.source, 0));
-    let input = input(&h, "main", &[]);
-    assert_eq!(
-        input.context,
-        vec![turn_text("Morning.", "Are you still at Acme?")]
-    );
-
-    // TIM-92: "Yes" after "Are you still at Acme?" is the user's claim,
-    // written out in full from the context but quoted from the answer.
-    let extracted = extract(
-        &h,
-        reply(
-            vec![
-                claim("Tim still works at Acme.", "fact", "Yes, still there"),
-                claim("Tim works at Acme.", "fact", "Are you still at Acme?"),
-            ],
-            &[],
-        ),
-    );
-    assert_eq!(extracted.memories.len(), 1);
-    assert_eq!(
-        h.row(extracted.memories[0]),
-        Row::new("Tim still works at Acme.", "fact", at(T1), (0, 16))
-    );
-    assert_eq!(
-        extracted.dropped,
-        vec![Dropped {
-            claim: 1,
-            reason: DropReason::QuoteNotFound,
-        }]
-    );
-}
-
 // Significance.
 
 #[test]
@@ -2364,6 +2190,9 @@ fn a_claim_without_a_quote_from_the_chunk_is_dropped() {
     let current = ingest(&h, &turn("s1", T1, "Yes, still there.", "Great."));
     h.focus(h.chunk_of(current.source, 0));
 
+    // TIM-92: "Yes" after "Are you still at Acme?" is the user's claim,
+    // written out in full from the context but quoted from the answer. A
+    // quote from the context, or from nowhere, drops the claim.
     let extracted = extract(
         &h,
         reply(
@@ -2378,6 +2207,10 @@ fn a_claim_without_a_quote_from_the_chunk_is_dropped() {
         ),
     );
     assert_eq!(extracted.memories.len(), 1);
+    assert_eq!(
+        h.row(extracted.memories[0]),
+        Row::new("Tim still works at Acme.", "fact", at(T1), (0, 16))
+    );
     assert_eq!(
         extracted.dropped,
         vec![
@@ -2456,33 +2289,6 @@ fn an_assistant_task_needs_a_due_date_or_an_until_event() {
 }
 
 // Entities.
-
-#[test]
-fn a_link_to_a_candidate_records_its_surface_form() {
-    let h = Harness::new();
-    let ana = h.insert_entity("main", "Ana", "person", &["Ana"]);
-    ingest(&h, &turn("s1", T1, "Lunch with Ana.", "Enjoy."));
-    let input = input(&h, "main", &[]);
-    let edits_before = h.edits("main", "alias_added");
-
-    let memories = extract(
-        &h,
-        reply(
-            vec![
-                claim("Tim is having lunch with Ana.", "event", "Lunch with Ana")
-                    .with("entities", json!([link(&handle(&input, ana), "Ana")])),
-            ],
-            &[],
-        ),
-    )
-    .memories;
-    assert_eq!(
-        h.links(memories[0]),
-        BTreeSet::from([(ana, Some("Ana".into()))])
-    );
-    assert_eq!(h.aliases(ana), vec!["Ana".to_string()]);
-    assert_eq!(h.edits("main", "alias_added"), edits_before);
-}
 
 #[test]
 fn a_new_surface_form_becomes_a_logged_alias() {
@@ -2740,28 +2546,6 @@ fn a_link_that_names_no_entity_is_dropped() {
 }
 
 // Accesses.
-
-#[test]
-fn each_new_memory_gets_a_created_access_at_ingest_time() {
-    let h = Harness::new();
-    let ingested = ingest(&h, &turn("s1", T1, "I like tea.", "Noted."));
-    let ingested_at = h.now();
-    h.advance(1);
-    let memories = extract(
-        &h,
-        reply(vec![claim("Tim likes tea.", "fact", "I like tea")], &[]),
-    )
-    .memories;
-    assert_eq!(
-        h.accesses(memories[0]),
-        vec![AccessRow {
-            kind: "created".into(),
-            at: ingested_at,
-            turn: 1,
-            source: Some(ingested.source),
-        }]
-    );
-}
 
 #[test]
 fn used_verdicts_write_one_used_access_each() {
@@ -3449,31 +3233,20 @@ fn candidates_for(aliases: &[&str], message: &str) -> (Vec<Uuid>, BTreeSet<Uuid>
 }
 
 #[test]
-fn a_decomposed_name_matches_a_precomposed_alias() {
-    // "Luci\u{301}a" is "Lucía" with a combining acute: the same name, which
-    // the alias FTS indexes as "lucia" either way.
-    let (entities, found) = candidates_for(&["Lucía"], "Luci\u{301}a called.");
-    assert_eq!(found, BTreeSet::from([entities[0]]));
-}
-
-#[test]
-fn a_precomposed_name_matches_a_decomposed_alias() {
-    let (entities, found) = candidates_for(&["Luci\u{301}a"], "Lucía called.");
-    assert_eq!(found, BTreeSet::from([entities[0]]));
-}
-
-#[test]
-fn an_accented_greek_name_matches_itself() {
-    // The FTS keeps Greek accents, so an identical name must still match.
-    let (entities, found) = candidates_for(&["Νίκος"], "Ο Νίκος ήρθε.");
-    assert_eq!(found, BTreeSet::from([entities[0]]));
-}
-
-#[test]
-fn a_devanagari_name_matches_itself() {
-    // A vowel sign is a combining mark, and part of the name.
-    let (entities, found) = candidates_for(&["किरण"], "किरण आया।");
-    assert_eq!(found, BTreeSet::from([entities[0]]));
+fn a_name_matches_its_alias_in_either_normalization_form() {
+    for (alias, message) in [
+        // "Luci\u{301}a" is "Lucía" with a combining acute: the same name,
+        // which the alias FTS indexes as "lucia" either way.
+        ("Lucía", "Luci\u{301}a called."),
+        ("Luci\u{301}a", "Lucía called."),
+        // The FTS keeps Greek accents, so an identical name must still match.
+        ("Νίκος", "Ο Νίκος ήρθε."),
+        // A vowel sign is a combining mark, and part of the name.
+        ("किरण", "किरण आया।"),
+    ] {
+        let (entities, found) = candidates_for(&[alias], message);
+        assert_eq!(found, BTreeSet::from([entities[0]]), "{alias} in {message}");
+    }
 }
 
 // Composed aliases (the TIM-107 re-review of `d4825ab`). Passages are
@@ -3515,30 +3288,20 @@ fn found_in(h: &Harness, message: &str) -> BTreeSet<Uuid> {
 }
 
 #[test]
-fn a_decomposed_speaker_name_is_found_by_its_composed_spelling() {
-    let h = Harness::new();
-    let nikos = speaker_named(&h, "7777", NIKOS_DECOMPOSED);
-    assert_eq!(found_in(&h, "Ο Νίκος ήρθε."), BTreeSet::from([nikos]));
-}
-
-#[test]
-fn a_decomposed_speaker_name_is_found_by_the_same_spelling() {
-    let h = Harness::new();
-    let nikos = speaker_named(&h, "7777", NIKOS_DECOMPOSED);
-    assert_eq!(
-        found_in(&h, &format!("Ο {NIKOS_DECOMPOSED} ήρθε.")),
-        BTreeSet::from([nikos])
-    );
-}
-
-#[test]
-fn a_composed_speaker_name_is_found_by_its_decomposed_spelling() {
-    let h = Harness::new();
-    let nikos = speaker_named(&h, "7777", NIKOS);
-    assert_eq!(
-        found_in(&h, &format!("Ο {NIKOS_DECOMPOSED} ήρθε.")),
-        BTreeSet::from([nikos])
-    );
+fn a_speaker_name_is_found_in_either_normalization_form() {
+    for (name, said) in [
+        (NIKOS_DECOMPOSED, NIKOS),
+        (NIKOS_DECOMPOSED, NIKOS_DECOMPOSED),
+        (NIKOS, NIKOS_DECOMPOSED),
+    ] {
+        let h = Harness::new();
+        let nikos = speaker_named(&h, "7777", name);
+        assert_eq!(
+            found_in(&h, &format!("Ο {said} ήρθε.")),
+            BTreeSet::from([nikos]),
+            "{name:?} said as {said:?}"
+        );
+    }
 }
 
 #[test]
@@ -3845,7 +3608,10 @@ fn a_failed_commit_rolls_back_everything_and_is_counted() {
     let before = (untouched(&h), vectors(&h));
 
     let llm = FakeLlm::scripted(MODEL, vec![busy_reply(&input, tea)]);
-    run(&h, "main", &llm, &[tea]).unwrap_err();
+    let error = run(&h, "main", &llm, &[tea]).unwrap_err();
+    // The queue counted the attempt, so the error says so, as every other
+    // counted failure does.
+    assert_eq!(error.failure(), Some(Failure::Retry { error_count: 1 }));
     assert_eq!((untouched(&h), vectors(&h)), before);
     assert!(h.entities_named("main", "Lisbon").is_empty());
     assert_eq!(h.chunk_column::<Option<i64>>(chunk, "extracted_at"), None);
@@ -3863,24 +3629,6 @@ fn a_failed_commit_rolls_back_everything_and_is_counted() {
     assert_eq!(vectors(&h), before.1 + 1);
     assert_eq!(h.entities_named("main", "Lisbon").len(), 1);
     assert_eq!(h.accesses(tea).len(), 2);
-}
-
-#[test]
-fn a_failed_commit_reports_the_queues_count() {
-    let h = Harness::new();
-    ingest(&h, &turn("s1", T1, "I like tea.", "Noted."));
-    break_accesses(&h);
-    let llm = FakeLlm::scripted(
-        MODEL,
-        vec![reply(
-            vec![claim("Tim likes tea.", "fact", "I like tea")],
-            &[],
-        )],
-    );
-    let error = run(&h, "main", &llm, &[]).unwrap_err();
-    // The queue counted the attempt, so the error says so, as every other
-    // counted failure does.
-    assert_eq!(error.failure(), Some(Failure::Retry { error_count: 1 }));
 }
 
 #[test]

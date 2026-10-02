@@ -303,14 +303,10 @@ fn secrets_are_read_from_the_environment_and_never_logged() {
     assert!(!daemon.log.contains("41b2e8"));
 
     let config = resolved_config(&daemon.log);
-    let deployment = &config["deployment"];
-    assert!(
-        deployment["token"].is_string(),
-        "token not recorded: {config}"
-    );
-    assert!(
-        deployment["llm_api_key"].is_string(),
-        "LLM key not recorded: {config}"
+    assert_eq!(config["deployment"]["token"], "[redacted]", "{config}");
+    assert_eq!(
+        config["deployment"]["llm_api_key"], "[redacted]",
+        "{config}"
     );
 }
 
@@ -348,22 +344,6 @@ fn off_loopback_needs_a_token_from_the_environment() {
             "the daemon bound before refusing:\n{}",
             stderr(&output)
         );
-    }
-}
-
-#[test]
-fn the_startup_log_carries_the_resolved_config() {
-    let dir = TestDir::new();
-    let daemon = start(&mut serve_with_floors(&dir));
-    let config = resolved_config(&daemon.log);
-    for key in [
-        "tuning",
-        "deployment",
-        "constants",
-        "deletion_fingerprint",
-        "purge",
-    ] {
-        assert!(!config[key].is_null(), "missing {key} in {config}");
     }
 }
 

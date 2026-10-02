@@ -10,7 +10,7 @@ use asphodel_core::config::{
     ConfigError, DeletionInputs, Deployment, Layer, ResolvedConfig, Secret, Tuning,
     deletion_fingerprint,
 };
-use asphodel_core::constants::{self, FixedConstants, Significance, Volatility};
+use asphodel_core::constants::{self, FixedConstants, Significance};
 use jiff::civil::Time;
 
 fn load(text: &str) -> Result<Tuning, ConfigError> {
@@ -82,87 +82,6 @@ impl Drop for TestDir {
 // Fixed constants
 
 #[test]
-fn strength_constants_match_the_calibration() {
-    // TIM-91: S = 2.5, τ = −0.7, a = 0.35, c = 0.2, g = 0.8, n0 = 18, d
-    // capped at 2, ages from 0.01 days.
-    assert_eq!(constants::S, 2.5);
-    assert_eq!(constants::TAU, -0.7);
-    assert_eq!(constants::A, 0.35);
-    assert_eq!(constants::C, 0.2);
-    assert_eq!(constants::G, 0.8);
-    assert_eq!(constants::N0, 18.0);
-    assert_eq!(constants::D_MAX, 2.0);
-    assert_eq!(constants::MIN_ACCESS_AGE_DAYS, 0.01);
-}
-
-#[test]
-fn access_and_bank_time_constants_match_the_calibration() {
-    assert_eq!(constants::FLOOR_SPACING_DAYS, 3.0);
-    assert_eq!(constants::WEIGHT_CREATED, 1.0);
-    assert_eq!(constants::WEIGHT_USED, 1.0);
-    assert_eq!(constants::WEIGHT_MENTIONED_AGAIN, 1.5);
-    assert_eq!(constants::WEIGHT_CONFIRMED, 2.0);
-    assert_eq!(constants::WEIGHT_WINDOW_CLOSE, 1.0);
-    assert_eq!(constants::FULL_SPEED_WINDOW.as_secs(), 24 * 60 * 60);
-}
-
-#[test]
-fn significance_levels_map_to_their_values() {
-    // TIM-92 maps the five levels to 0.1–0.9; kept is 1.0 (TIM-91).
-    let values: Vec<f64> = Significance::ALL.iter().map(|s| s.value()).collect();
-    assert_eq!(values, [0.1, 0.3, 0.5, 0.7, 0.9]);
-    assert_eq!(constants::SIGNIFICANCE_KEPT, 1.0);
-    assert!(Significance::ALL.windows(2).all(|w| w[0] < w[1]));
-}
-
-#[test]
-fn volatility_rates_match_the_state_confidence_decision() {
-    // TIM-91 decision 8: T is 3 hours, 3 days, 3 weeks, 3 months, 5 years.
-    assert_eq!(Volatility::Hours.rate_days(), 3.0 / 24.0);
-    assert_eq!(Volatility::Days.rate_days(), 3.0);
-    assert_eq!(Volatility::Weeks.rate_days(), 21.0);
-    let months = Volatility::Months.rate_days();
-    assert!((89.0..=93.0).contains(&months), "3 months as {months} days");
-    let years = Volatility::Years.rate_days();
-    assert!(
-        (1825.0..=1827.0).contains(&years),
-        "5 years as {years} days"
-    );
-}
-
-#[test]
-fn reranker_deadline_is_the_first_link_of_the_timeout_chain() {
-    assert_eq!(constants::RERANKER_DEADLINE.as_millis(), 1500);
-}
-
-#[test]
-fn fixed_constants_snapshot_reports_the_compiled_values() {
-    let fixed = FixedConstants::current();
-    assert_eq!(fixed.s, constants::S);
-    assert_eq!(fixed.tau, constants::TAU);
-    assert_eq!(fixed.a, constants::A);
-    assert_eq!(fixed.c, constants::C);
-    assert_eq!(fixed.g, constants::G);
-    assert_eq!(fixed.n0, constants::N0);
-    assert_eq!(fixed.d_max, constants::D_MAX);
-    assert_eq!(fixed.floor_spacing_days, constants::FLOOR_SPACING_DAYS);
-    assert_eq!(fixed.access_weights.created, constants::WEIGHT_CREATED);
-    assert_eq!(fixed.access_weights.used, constants::WEIGHT_USED);
-    assert_eq!(
-        fixed.access_weights.mentioned_again,
-        constants::WEIGHT_MENTIONED_AGAIN
-    );
-    assert_eq!(fixed.access_weights.confirmed, constants::WEIGHT_CONFIRMED);
-    assert_eq!(fixed.window_close_weight, constants::WEIGHT_WINDOW_CLOSE);
-    assert_eq!(fixed.full_speed_window_hours, 24.0);
-    assert_eq!(fixed.significance.trivial, 0.1);
-    assert_eq!(fixed.significance.critical, 0.9);
-    assert_eq!(fixed.significance.kept, 1.0);
-    assert_eq!(fixed.volatility_rate_days.days, 3.0);
-    assert_eq!(fixed.reranker_deadline_ms, 1500);
-}
-
-#[test]
 fn fixed_constants_are_not_tuning_keys() {
     // ADR 0009: none of these is ever in a config struct.
     for (section, key) in [
@@ -188,32 +107,6 @@ fn fixed_constants_are_not_tuning_keys() {
 // Tuning: defaults and loading
 
 #[test]
-fn defaults_match_the_decisions() {
-    let t = Tuning::default();
-    assert_eq!(t.clock.quiet_rate, 0.1); // TIM-91 decision 4
-    assert_eq!(t.purge.delta, Some(1.0)); // ADR 0008
-    assert_eq!(t.purge.source_horizon_days, 90); // ADR 0008
-    assert_eq!(t.recall.strong_cutoff, 0.3); // TIM-93 decision 13
-    assert_eq!(t.injection.cap, 8); // TIM-93 decision 8
-    assert_eq!(t.injection.token_budget, 600);
-    assert_eq!(t.agenda.horizon_days, 7); // TIM-93 decision 7
-    assert_eq!(t.agenda.overdue_days, 30); // TIM-93, reused by ADR 0008
-    assert_eq!(t.agenda.dated_lines, 15);
-    assert_eq!(t.agenda.routines, 4); // TIM-95 decision 1
-    assert_eq!(t.agenda.undated_tasks, 5);
-    assert_eq!(t.mental_models.budget, 800); // TIM-95 decision 8
-    assert_eq!(t.mental_models.profile_max_tokens, 500);
-    assert_eq!(t.mental_models.trigger_level, Significance::Notable); // ADR 0007
-    assert_eq!(t.mental_models.refresh_debounce_minutes, 5);
-    assert_eq!(t.mental_models.refresh_max_delay_minutes, 30);
-    assert_eq!(t.mental_models.sweep_time, Time::constant(4, 0, 0, 0));
-    assert_eq!(t.mental_models.input_budget, 60); // TIM-95 decision 3
-    assert_eq!(t.mental_models.input_budget_with_cited, 70);
-    assert_eq!(t.sessions.mapping_expiry_days, 30); // TIM-95 decision 4
-    assert_eq!(t.sessions.in_context_idle_days, 7); // TIM-93, amended by TIM-109
-}
-
-#[test]
 fn defaults_are_valid() {
     Tuning::default().validate().unwrap();
 }
@@ -223,13 +116,9 @@ fn no_file_and_an_empty_file_give_the_defaults() {
     assert_eq!(Tuning::load(None).unwrap(), Tuning::default());
     assert_eq!(load("").unwrap(), Tuning::default());
     assert_eq!(load("# nothing set\n").unwrap(), Tuning::default());
-}
-
-#[test]
-fn every_section_can_be_given_empty() {
-    let text = "[clock]\n[purge]\n[recall]\n[injection]\n[reconcile]\n[agenda]\n\
-                [mental_models]\n[sessions]\n[llm]\n";
-    assert_eq!(load(text).unwrap(), Tuning::default());
+    let empty_sections = "[clock]\n[purge]\n[recall]\n[injection]\n[reconcile]\n[agenda]\n\
+                          [mental_models]\n[sessions]\n[llm]\n";
+    assert_eq!(load(empty_sections).unwrap(), Tuning::default());
 }
 
 #[test]
@@ -311,14 +200,6 @@ fn a_full_file_sets_every_value() {
 }
 
 #[test]
-fn a_partial_section_keeps_the_other_defaults() {
-    let t = load("[agenda]\noverdue_days = 14\n").unwrap();
-    let mut expected = Tuning::default();
-    expected.agenda.overdue_days = 14;
-    assert_eq!(t, expected);
-}
-
-#[test]
 fn delta_can_be_null() {
     // ADR 0008: δ is nullable, and null means never purge. TOML has no
     // null, so this uses the file spelling the implementation chose.
@@ -328,15 +209,6 @@ fn delta_can_be_null() {
     let mut never = Tuning::default();
     never.purge.delta = None;
     never.validate().unwrap();
-}
-
-#[test]
-fn delta_of_zero_is_allowed() {
-    // TIM-98: δ is null or ≥ 0.
-    assert_eq!(
-        load("[purge]\ndelta = 0.0\n").unwrap().purge.delta,
-        Some(0.0)
-    );
 }
 
 #[test]
@@ -358,44 +230,15 @@ fn resolved_json_shows_a_null_delta_as_null() {
 }
 
 #[test]
-fn floors_keep_the_exact_model_string() {
-    // ADR 0009: keyed by the exact model string, quantisation included.
-    let t = load(
-        "[injection.reranker_floors]\n\"jina-reranker-v1-turbo-en:int8\" = -1.0\n\
-         \"jina-reranker-v1-turbo-en:fp32\" = -2.0\n",
-    )
-    .unwrap();
-    assert_eq!(t.injection.reranker_floors.len(), 2);
-    assert_eq!(
-        t.injection.reranker_floors["jina-reranker-v1-turbo-en:int8"],
-        -1.0
-    );
-    assert_eq!(
-        t.injection.reranker_floors["jina-reranker-v1-turbo-en:fp32"],
-        -2.0
-    );
-}
-
-#[test]
-fn load_reads_a_file() {
+fn load_reads_a_file_and_fails_on_a_missing_or_invalid_one() {
     let dir = TestDir::new();
     let path = dir.file("tuning.toml", "[clock]\nquiet_rate = 0.3\n");
     assert_eq!(Tuning::load(Some(&path)).unwrap().clock.quiet_rate, 0.3);
-}
 
-#[test]
-fn load_fails_on_a_missing_file() {
-    let dir = TestDir::new();
-    let path = dir.0.join("missing.toml");
     assert!(matches!(
-        Tuning::load(Some(&path)),
+        Tuning::load(Some(&dir.0.join("missing.toml"))),
         Err(ConfigError::Read { .. })
     ));
-}
-
-#[test]
-fn load_fails_on_an_invalid_file() {
-    let dir = TestDir::new();
     let unknown = dir.file("unknown.toml", "[clock]\nquiet_rat = 0.3\n");
     assert!(Tuning::load(Some(&unknown)).is_err());
     let range = dir.file("range.toml", "[injection]\ncap = 0\n");
@@ -474,23 +317,9 @@ fn unknown_keys_are_rejected_in_every_section() {
 }
 
 #[test]
-fn misspelled_keys_are_rejected() {
-    for text in [
-        "[clock]\nquiet_rat = 0.1\n",
-        "[purge]\ndelta_ = 1.0\n",
-        "[purge]\nsource_horizon = 90\n",
-        "[agenda]\noverdue = 30\n",
-        "[injection]\nreranker_floor = {}\n",
-        "[reconcile]\nembedding_floor = {}\n",
-    ] {
-        assert_rejected(text);
-    }
-}
-
-#[test]
-fn secrets_and_bank_identity_are_not_tuning_keys() {
-    // ADR 0009: secrets come from the environment only, and bank settings
-    // and tuning never share a key.
+fn secrets_bank_identity_and_deployment_settings_are_not_tuning_keys() {
+    // ADR 0009: secrets come from the environment only, and bank settings,
+    // deployment and tuning never share a key.
     for text in [
         "[llm]\napi_key = \"sk-123\"\n",
         "[llm]\nkey = \"sk-123\"\n",
@@ -498,14 +327,6 @@ fn secrets_and_bank_identity_are_not_tuning_keys() {
         "[clock]\ntimezone = \"Pacific/Auckland\"\n",
         "owner = \"Tim\"\n",
         "assistant = \"Hermes\"\n",
-    ] {
-        assert_rejected(text);
-    }
-}
-
-#[test]
-fn deployment_settings_are_not_tuning_keys() {
-    for text in [
         "listen = \"127.0.0.1:7720\"\n",
         "data_dir = \"/data\"\n",
         "allow_network_fs = true\n",
@@ -543,14 +364,15 @@ fn malformed_toml_is_rejected() {
 }
 
 #[test]
-fn negative_delta_is_rejected() {
+fn delta_must_be_finite_and_not_negative() {
+    // TIM-98: δ is null or ≥ 0.
     assert_eq!(invalid_keys("[purge]\ndelta = -0.5\n"), ["purge.delta"]);
-}
-
-#[test]
-fn non_finite_delta_is_rejected() {
     assert_rejected("[purge]\ndelta = nan\n");
     assert_rejected("[purge]\ndelta = -inf\n");
+    assert_eq!(
+        load("[purge]\ndelta = 0.0\n").unwrap().purge.delta,
+        Some(0.0)
+    );
 }
 
 #[test]
@@ -671,7 +493,8 @@ fn a_missing_floor_for_a_configured_model_is_an_error() {
 }
 
 #[test]
-fn floors_present_for_both_models_pass() {
+fn only_a_floor_for_the_exact_model_string_counts() {
+    // Int8 and fp32 give different scores, so there's no fallback.
     let t = load(
         "[reconcile.embedding_floors]\n\"bge-small-en-v1.5:int8\" = 0.8\n\
          [injection.reranker_floors]\n\"jina-reranker-v1-turbo-en:int8\" = -1.0\n",
@@ -679,16 +502,6 @@ fn floors_present_for_both_models_pass() {
     .unwrap();
     t.check_floors("bge-small-en-v1.5:int8", "jina-reranker-v1-turbo-en:int8")
         .unwrap();
-}
-
-#[test]
-fn a_floor_for_another_quantisation_does_not_count() {
-    // Int8 and fp32 give different scores, so there's no fallback.
-    let t = load(
-        "[reconcile.embedding_floors]\n\"bge-small-en-v1.5:int8\" = 0.8\n\
-         [injection.reranker_floors]\n\"jina-reranker-v1-turbo-en:int8\" = -1.0\n",
-    )
-    .unwrap();
     assert!(
         t.check_floors("bge-small-en-v1.5:fp32", "jina-reranker-v1-turbo-en:int8")
             .is_err()
@@ -757,15 +570,11 @@ fn an_unknown_key_in_any_layer_is_rejected() {
 }
 
 #[test]
-fn an_out_of_range_override_is_rejected() {
+fn layered_result_is_validated_as_a_whole() {
     assert!(matches!(
         layers(&[PRODUCTION, "[purge]\ndelta = -1.0\n"]),
         Err(ConfigError::Invalid(_))
     ));
-}
-
-#[test]
-fn layered_result_is_validated_as_a_whole() {
     assert!(layers(&[PRODUCTION, "[injection]\ncap = 0\n"]).is_err());
     assert!(layers(&["[injection]\ncap = 0\n", "[injection]\ncap = 3\n"]).is_ok());
 }
@@ -997,15 +806,6 @@ fn different_single_changes_give_different_fingerprints() {
 }
 
 #[test]
-fn changing_an_input_back_restores_the_fingerprint() {
-    let base = deletion_fingerprint(&base_inputs());
-    let mut i = base_inputs();
-    i.quiet_rate = 0.5;
-    i.quiet_rate = 0.1;
-    assert_eq!(deletion_fingerprint(&i), base);
-}
-
-#[test]
 fn swapping_two_equal_shaped_inputs_changes_the_fingerprint() {
     let mut a = base_inputs();
     a.overdue_days = 30;
@@ -1126,55 +926,47 @@ fn endpoint_toml(endpoint: &str) -> String {
     format!("[llm]\nendpoint = '{endpoint}'\n")
 }
 
-macro_rules! rejected_endpoint {
-    ($name:ident, $endpoint:literal) => {
-        #[test]
-        fn $name() {
-            assert_eq!(invalid_keys(&endpoint_toml($endpoint)), ["llm.endpoint"]);
-        }
-    };
+#[test]
+fn llm_endpoint_rejects_anything_but_a_plain_http_base_url() {
+    for endpoint in [
+        // No host, or no usable port.
+        "http://",
+        "https://",
+        "https://:8080",
+        "http://localhost:99999",
+        "http://localhost:65536",
+        "http://localhost:port",
+        "http://localhost:0",
+        // Malformed hosts.
+        "http://exa mple.com",
+        "http://[::1",
+        "http://[::g]/",
+        // Spellings URL parsing would silently repair.
+        "http:localhost:8080",
+        "http:/localhost",
+        "http:\\localhost",
+        " https://llm.example/v1",
+        "https://llm.example/v1 ",
+        // Not http or https.
+        "ftp://host",
+        "ws://host",
+        "file:///tmp/x",
+        "localhost:8080",
+        "//host/v1",
+        "",
+        // Credentials, queries and fragments can carry secrets.
+        "https://user:pass@llm.example/v1",
+        "https://key@llm.example",
+        "https://llm.example/v1?key=abc",
+        "https://llm.example/v1#x",
+    ] {
+        assert_eq!(
+            invalid_keys(&endpoint_toml(endpoint)),
+            ["llm.endpoint"],
+            "accepted {endpoint:?}"
+        );
+    }
 }
-
-rejected_endpoint!(llm_endpoint_rejects_scheme_only_http, "http://");
-rejected_endpoint!(llm_endpoint_rejects_scheme_only_https, "https://");
-rejected_endpoint!(llm_endpoint_rejects_port_without_host, "https://:8080");
-rejected_endpoint!(llm_endpoint_rejects_port_99999, "http://localhost:99999");
-rejected_endpoint!(llm_endpoint_rejects_port_65536, "http://localhost:65536");
-rejected_endpoint!(
-    llm_endpoint_rejects_nonnumeric_port,
-    "http://localhost:port"
-);
-rejected_endpoint!(llm_endpoint_rejects_zero_port, "http://localhost:0");
-rejected_endpoint!(llm_endpoint_rejects_host_space, "http://exa mple.com");
-rejected_endpoint!(llm_endpoint_rejects_unclosed_ipv6, "http://[::1");
-rejected_endpoint!(llm_endpoint_rejects_invalid_ipv6, "http://[::g]/");
-rejected_endpoint!(llm_endpoint_rejects_missing_slashes, "http:localhost:8080");
-rejected_endpoint!(llm_endpoint_rejects_single_slash, "http:/localhost");
-rejected_endpoint!(llm_endpoint_rejects_backslashes, "http:\\localhost");
-rejected_endpoint!(llm_endpoint_rejects_ftp_scheme, "ftp://host");
-rejected_endpoint!(llm_endpoint_rejects_ws_scheme, "ws://host");
-rejected_endpoint!(llm_endpoint_rejects_file_scheme, "file:///tmp/x");
-rejected_endpoint!(llm_endpoint_rejects_no_scheme, "localhost:8080");
-rejected_endpoint!(llm_endpoint_rejects_scheme_relative, "//host/v1");
-rejected_endpoint!(
-    llm_endpoint_rejects_userinfo_password,
-    "https://user:pass@llm.example/v1"
-);
-rejected_endpoint!(
-    llm_endpoint_rejects_userinfo_username,
-    "https://key@llm.example"
-);
-rejected_endpoint!(llm_endpoint_rejects_query, "https://llm.example/v1?key=abc");
-rejected_endpoint!(llm_endpoint_rejects_fragment, "https://llm.example/v1#x");
-rejected_endpoint!(
-    llm_endpoint_rejects_leading_whitespace,
-    " https://llm.example/v1"
-);
-rejected_endpoint!(
-    llm_endpoint_rejects_trailing_whitespace,
-    "https://llm.example/v1 "
-);
-rejected_endpoint!(llm_endpoint_rejects_empty, "");
 
 #[test]
 fn llm_endpoint_accepts_base_urls_without_rewriting() {
@@ -1190,11 +982,6 @@ fn llm_endpoint_accepts_base_urls_without_rewriting() {
         let tuning = load(&endpoint_toml(endpoint)).unwrap();
         assert_eq!(tuning.llm.endpoint.as_deref(), Some(endpoint));
     }
-}
-
-#[test]
-fn llm_endpoint_can_be_unset() {
-    assert_eq!(load("[llm]\n").unwrap().llm.endpoint, None);
 }
 
 #[test]

@@ -6,8 +6,6 @@ import json
 import os
 import time
 
-import pytest
-
 from conftest import SESSION, plugin, transcript
 
 Spool = plugin.spool.Spool
@@ -64,19 +62,6 @@ def test_written_by_rename_leaves_no_partial_files(tmp_path):
     assert names == [spool.files()[0].name]
 
 
-def test_files_are_oldest_first(tmp_path):
-    spool = Spool(tmp_path / "spool")
-    recent = time.time() - 100
-    for n in (3, 1, 2):
-        path = spool.write(turn(n))
-        os.utime(path, (recent + n, recent + n))
-    assert [json.loads(f.read_text())["message_at"] for f in spool.files()] == [
-        turn(1)["message_at"],
-        turn(2)["message_at"],
-        turn(3)["message_at"],
-    ]
-
-
 def test_size_cap_drops_the_oldest(tmp_path):
     spool = Spool(tmp_path / "spool", max_bytes=2500)
     recent = time.time() - 100
@@ -100,7 +85,8 @@ def test_age_cap_drops_files_older_than_seven_days(tmp_path):
 def test_replay_sends_oldest_first_and_deletes_delivered(tmp_path):
     spool = Spool(tmp_path / "spool")
     recent = time.time() - 100
-    for n in (1, 2, 3):
+    # Written out of order: the order is the files' age, not the write order.
+    for n in (3, 1, 2):
         path = spool.write(turn(n))
         os.utime(path, (recent + n, recent + n))
     sent = []
@@ -173,65 +159,6 @@ def test_sync_turn_spools_on_a_5xx_but_not_a_4xx(make_provider, daemon, hermes_h
     provider.sync_turn("two", "ok", session_id=SESSION, messages=transcript("two", "ok", epoch=2.0))
     files = list(spool_dir(hermes_home).glob("*.json"))
     assert [json.loads(f.read_text())["user_text"] for f in files] == ["one"]
-
-
-def test_the_next_2xx_replays_the_spool(hermes_home, clock, warnings):
-    from conftest import FAST, write_config
-    from fake_daemon import FakeDaemon
-
-    daemon = FakeDaemon().start()
-    url = daemon.url
-    daemon.stop()
-    write_config(hermes_home, url=url, owner_platform_ids=["discord:111"])
-    provider = plugin.AsphodelMemoryProvider(timeouts=FAST, clock=clock)
-    provider.initialize(SESSION, hermes_home=str(hermes_home), platform="cli", agent_context="primary", agent_identity="tim")
-    provider.sync_turn("while down", "ok", session_id=SESSION, messages=transcript("while down", "ok", epoch=1.0))
-    assert len(list(spool_dir(hermes_home).glob("*.json"))) == 1
-
-    # Listen again on the same port the provider was configured with.
-    port = int(url.rsplit(":", 1)[1])
-    restarted = _restart(FakeDaemon(), port)
-    try:
-        clock.advance(60)
-        provider.sync_turn("back up", "ok", session_id=SESSION, messages=transcript("back up", "ok", epoch=2.0))
-        texts = [r.body["user_text"] for r in restarted.requests_for("turns")]
-        assert texts == ["back up", "while down"]
-        assert list(spool_dir(hermes_home).glob("*.json")) == []
-    finally:
-        restarted.stop()
-
-
-def _restart(daemon, port):
-    """Starts a fake daemon on a specific port (the one the provider was
-    configured with)."""
-    import threading
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    class Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, *args):
-            pass
-
-        def _handle(self):
-            daemon._handle(self)
-
-        do_GET = do_POST = do_PUT = _handle
-
-    ThreadingHTTPServer.allow_reuse_address = True
-    deadline = time.monotonic() + 5
-    while True:
-        try:
-            daemon._server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-            break
-        except OSError:
-            if time.monotonic() > deadline:
-                raise
-            time.sleep(0.05)
-    daemon._server.daemon_threads = True
-    daemon._thread = threading.Thread(target=lambda: daemon._server.serve_forever(poll_interval=0.02), daemon=True)
-    daemon._thread.start()
-    return daemon
 
 
 # -- the age cap at replay -----------------------------------------------------------

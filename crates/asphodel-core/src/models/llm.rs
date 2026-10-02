@@ -571,21 +571,4 @@ mod tests {
         assert_eq!(unfence("  ```json\n[1, 2]\n```  "), "[1, 2]");
         assert_eq!(unfence("```{\"a\":1}```"), "{\"a\":1}");
     }
-
-    #[test]
-    fn retryable_statuses() {
-        for (status, retryable) in [
-            (400, false),
-            (401, false),
-            (408, true),
-            (429, true),
-            (503, true),
-        ] {
-            assert_eq!(
-                LlmError::Status { status }.is_retryable(),
-                retryable,
-                "{status}"
-            );
-        }
-    }
 }

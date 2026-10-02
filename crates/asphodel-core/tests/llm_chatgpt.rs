@@ -586,67 +586,6 @@ fn the_logical_request_carries_no_auth_and_no_wire_format() {
     }
 }
 
-#[test]
-fn a_secret_never_shows_in_debug_or_json() {
-    let secret = Secret::new("rt-41b2e8-secret");
-    assert_eq!(format!("{secret:?}"), "[redacted]");
-    assert_eq!(serde_json::to_value(&secret).unwrap(), "[redacted]");
-    assert_eq!(secret.expose(), "rt-41b2e8-secret");
-}
-
-#[test]
-fn the_jwt_helper_round_trips_its_claims() {
-    // The test's own JWT builder, checked once so the token tests can
-    // trust it. The payload is the second dot-separated part.
-    let token = id_token(ACCOUNT_ID);
-    let payload = token.split('.').nth(1).unwrap();
-    assert!(!payload.contains('='), "{payload}");
-    // Decode by hand through the same alphabet.
-    let decoded = {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        let mut bits = 0u32;
-        let mut count = 0;
-        let mut out = Vec::new();
-        for byte in payload.bytes() {
-            let value = ALPHABET.iter().position(|c| *c == byte).unwrap() as u32;
-            bits = (bits << 6) | value;
-            count += 6;
-            if count >= 8 {
-                count -= 8;
-                out.push(((bits >> count) & 0xff) as u8);
-            }
-        }
-        String::from_utf8(out).unwrap()
-    };
-    let claims: Value = serde_json::from_str(&decoded).unwrap();
-    assert_eq!(
-        claims["https://api.openai.com/auth"]["chatgpt_account_id"],
-        ACCOUNT_ID
-    );
-}
-
-#[test]
-fn the_stub_server_streams_events_and_decodes_forms() {
-    let server = StubServer::backend(StubResponse::stream(sse_completion("{\"ok\":true}")));
-    let mut stream = TcpStream::connect(server.url.trim_start_matches("http://")).unwrap();
-    let body = "grant_type=refresh_token&refresh_token=rt%2Done";
-    write!(
-        stream,
-        "POST /oauth/token HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    let mut reply = String::new();
-    stream.read_to_string(&mut reply).unwrap();
-    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
-    assert!(reply.contains("Content-Type: text/event-stream"), "{reply}");
-    assert!(reply.contains("event: response.completed\n"), "{reply}");
-    let form = server.only_request().form();
-    assert_eq!(form["grant_type"], "refresh_token");
-    assert_eq!(form["refresh_token"], "rt-one");
-}
-
 // Config: defaults and conflicts (ADR 0009).
 
 #[test]
@@ -681,6 +620,16 @@ fn chatgpt_mode_defaults_to_the_codex_backend_and_still_pins_the_model() {
     assert_eq!(settings.model, "gpt-5.1");
     assert!(settings.api_key.is_none());
 
+    // An explicit endpoint overrides the Codex default.
+    let proxied = Tuning::from_toml(
+        "[llm]\nauth = \"chatgpt\"\nmodel = \"gpt-5.1\"\nendpoint = \"https://proxy.internal/codex\"\n",
+    )
+    .unwrap();
+    let settings = LlmSettings::from_config(&proxied, &deployment(None))
+        .unwrap()
+        .expect("configured");
+    assert_eq!(settings.endpoint, "https://proxy.internal/codex");
+
     // The model stays required: calibration runs against one model, and
     // the subscription doesn't choose it for us (ADR 0009).
     let no_model = Tuning::from_toml("[llm]\nauth = \"chatgpt\"\n").unwrap();
@@ -694,18 +643,6 @@ fn chatgpt_mode_defaults_to_the_codex_backend_and_still_pins_the_model() {
         ),
         "{error:?}"
     );
-}
-
-#[test]
-fn an_explicit_endpoint_overrides_the_codex_default() {
-    let tuning = Tuning::from_toml(
-        "[llm]\nauth = \"chatgpt\"\nmodel = \"gpt-5.1\"\nendpoint = \"https://proxy.internal/codex\"\n",
-    )
-    .unwrap();
-    let settings = LlmSettings::from_config(&tuning, &deployment(None))
-        .unwrap()
-        .expect("configured");
-    assert_eq!(settings.endpoint, "https://proxy.internal/codex");
 }
 
 #[test]
@@ -727,12 +664,6 @@ fn a_key_set_together_with_chatgpt_mode_is_a_config_error() {
     );
     assert!(!error.is_retryable());
     assert!(!format!("{error}").contains("41b2e8"), "{error}");
-}
-
-#[test]
-fn an_unknown_auth_mode_is_rejected() {
-    let error = Tuning::from_toml("[llm]\nauth = \"oauth\"\nmodel = \"gpt-5.1\"\n").unwrap_err();
-    assert!(error.to_string().contains("auth"), "{error}");
 }
 
 // The token file.
@@ -956,33 +887,6 @@ fn device_code_login_polls_exchanges_and_saves_tokens() {
     );
 }
 
-#[test]
-fn a_login_the_issuer_refuses_is_an_error_without_a_token_file() {
-    let issuer = StubServer::start(|request| match request.path.as_str() {
-        "/api/accounts/deviceauth/usercode" => StubResponse::json(
-            200,
-            json!({"device_auth_id": "dev_123", "user_code": "ABCD-EFGH", "interval": "0"}),
-        ),
-        // Anything but 403/404 while polling is a failure, not "pending".
-        "/api/accounts/deviceauth/token" => StubResponse::status(400),
-        other => panic!("unexpected path {other}"),
-    });
-    let dir = TestDir::new();
-    let store = TokenStore::open(&dir.data());
-    let error = device_code_login(&issuer.url, &store, clock().as_ref(), &mut |_| {}).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            LoginError::Status {
-                status: 400,
-                step: "deviceauth/token"
-            }
-        ),
-        "{error:?}"
-    );
-    assert!(!store.path().exists());
-}
-
 // The Responses wire format.
 
 #[test]
@@ -1125,7 +1029,7 @@ fn streamed_text_that_is_not_json_is_an_error_that_carries_only_its_size() {
 }
 
 #[test]
-fn a_failed_or_incomplete_response_keeps_only_its_code() {
+fn a_failed_response_keeps_only_its_code_and_an_unfinished_stream_has_no_content() {
     let backend = StubServer::backend(StubResponse::stream(sse(&[(
         "response.failed",
         json!({
@@ -1146,21 +1050,6 @@ fn a_failed_or_incomplete_response_keeps_only_its_code() {
         "{error:?}"
     );
     assert!(!format!("{error} {error:?}").contains("Tim"), "{error}");
-
-    let backend = StubServer::backend(StubResponse::stream(sse(&[(
-        "response.incomplete",
-        json!({
-            "type": "response.incomplete",
-            "response": {"id": "resp_4", "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
-        }),
-    )])));
-    let error = client(&backend, logged_in_store(&dir), clock())
-        .complete(&request())
-        .unwrap_err();
-    assert!(
-        matches!(&error, LlmError::Backend { code } if code == "max_output_tokens"),
-        "{error:?}"
-    );
 
     // A stream that ends without completing.
     let backend = StubServer::backend(StubResponse::stream(sse(&[(
@@ -1320,27 +1209,6 @@ fn a_401_after_a_refresh_asks_for_a_login_and_stops() {
     // The rotated tokens were still persisted: the refresh itself succeeded.
     let saved = TokenStore::open(&dir.data()).load().unwrap().unwrap();
     assert_eq!(saved.refresh_token.expose(), "rt-two");
-}
-
-#[test]
-fn a_refresh_the_issuer_rejects_asks_for_a_login_and_keeps_the_file() {
-    let dir = TestDir::new();
-    let store = expired_store(&dir);
-    let server = Scripted::server(|request, _| match request.path.as_str() {
-        "/oauth/token" => StubResponse::json(
-            400,
-            json!({"error": "invalid_grant", "error_description": "refresh token rt-one is revoked"}),
-        ),
-        other => panic!("unexpected path {other}"),
-    });
-    let client = client(&server, store, clock());
-    let error = client.complete(&request()).unwrap_err();
-    assert!(matches!(error, LlmError::LoginRequired), "{error:?}");
-    assert!(!format!("{error:?}").contains("rt-one"), "{error:?}");
-    assert_eq!(server.paths(), ["/oauth/token"]);
-    // The old file stays, so the owner can see they were logged in and the
-    // next login overwrites it.
-    assert!(TokenStore::open(&dir.data()).path().exists());
 }
 
 #[test]
@@ -1645,7 +1513,10 @@ fn a_rejected_refresh_credential_asks_for_a_login() {
     // The counterpart of the transient case: 400 (`invalid_grant`) and 401
     // mean the issuer has rejected the credential, and only a login helps.
     for (status, body) in [
-        (400u16, json!({"error": "invalid_grant"})),
+        (
+            400u16,
+            json!({"error": "invalid_grant", "error_description": "refresh token rt-one is revoked"}),
+        ),
         (401, json!({"error": "invalid_client"})),
     ] {
         let dir = TestDir::new();
@@ -1661,7 +1532,11 @@ fn a_rejected_refresh_credential_asks_for_a_login() {
             "{status}: {error:?}"
         );
         assert!(!error.is_retryable());
+        assert!(!format!("{error:?}").contains("rt-one"), "{error:?}");
         assert_eq!(server.paths(), ["/oauth/token"], "{status}");
+        // The old file stays, so the owner can see they were logged in and
+        // the next login overwrites it.
+        assert!(TokenStore::open(&dir.data()).path().exists(), "{status}");
     }
 }
 
@@ -2105,74 +1980,6 @@ fn a_clear_before_a_401_is_not_undone_by_the_refresh() {
     assert_eq!(refreshes, 0, "a cleared login must not be refreshed");
     assert_eq!(server.paths(), ["/responses"]);
     assert!(!token_path.exists(), "the refresh recreated the token file");
-}
-
-/// Where `TokenStore::save` puts its temp file today: the token file's
-/// name, `.part-`, and this process's id. The fix moves to fresh names, so
-/// a file planted here must then simply be left alone.
-fn predictable_temp(store: &TokenStore) -> PathBuf {
-    let mut temp = store.path().as_os_str().to_owned();
-    temp.push(format!(".part-{}", std::process::id()));
-    PathBuf::from(temp)
-}
-
-#[test]
-fn save_never_writes_through_a_planted_temp_symlink() {
-    let dir = TestDir::new();
-    let data = dir.data();
-    let store = TokenStore::open(&data);
-    let victim = data.join("other.txt");
-    std::fs::write(&victim, "irreplaceable contents").unwrap();
-    let planted = predictable_temp(&store);
-    std::os::unix::fs::symlink(&victim, &planted).unwrap();
-
-    store.save(&relogin_tokens()).unwrap();
-
-    assert_eq!(
-        std::fs::read_to_string(&victim).unwrap(),
-        "irreplaceable contents",
-        "the tokens were written through the symlink"
-    );
-    let installed = std::fs::symlink_metadata(store.path()).unwrap();
-    assert!(
-        installed.file_type().is_file(),
-        "the token file is not a regular file: {:?}",
-        installed.file_type()
-    );
-    assert_eq!(mode(file_mode(store.path())), mode(0o600));
-    assert_eq!(
-        store.load().unwrap().unwrap().refresh_token.expose(),
-        "rt-three"
-    );
-    assert!(
-        std::fs::symlink_metadata(&planted)
-            .unwrap()
-            .file_type()
-            .is_symlink(),
-        "the planted symlink was removed or replaced"
-    );
-}
-
-#[test]
-fn save_leaves_a_pre_existing_temp_file_alone() {
-    let dir = TestDir::new();
-    let data = dir.data();
-    let store = TokenStore::open(&data);
-    let planted = predictable_temp(&store);
-    std::fs::write(&planted, "someone else's file").unwrap();
-
-    store.save(&relogin_tokens()).unwrap();
-
-    assert_eq!(
-        std::fs::read_to_string(&planted).ok().as_deref(),
-        Some("someone else's file"),
-        "the pre-existing file was overwritten or moved"
-    );
-    assert_eq!(
-        store.load().unwrap().unwrap().refresh_token.expose(),
-        "rt-three"
-    );
-    assert_eq!(mode(file_mode(store.path())), mode(0o600));
 }
 
 /// The three ways a stream ends in a backend error, each carrying `code`

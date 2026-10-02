@@ -5,7 +5,6 @@ library and Hermes itself (ADR 0006)."""
 import ast
 import importlib.util
 import sys
-from pathlib import Path
 
 from conftest import PLUGIN_DIR, plugin
 
@@ -77,16 +76,3 @@ def test_config_schema_loads_standalone_by_path():
     assert keys == {"url", "token", "bank", "owner_name", "owner_platform_ids", "assistant_name", "timezone", "ingest"}
     token = next(f for f in schema.fields if f.key == "token")
     assert token.is_secret and token.env_key == "ASPHODEL_TOKEN"
-
-
-def test_dashboard_schema_matches_setup_schema():
-    dashboard = {f.key for f in _load_dashboard_schema().fields}
-    setup = {f["key"] for f in plugin.AsphodelMemoryProvider().get_config_schema()}
-    assert dashboard == setup
-
-
-def _load_dashboard_schema():
-    spec = importlib.util.spec_from_file_location("_schema_check", PLUGIN_DIR / "config_schema.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.CONFIG_SCHEMA

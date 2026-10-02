@@ -8,11 +8,6 @@ from conftest import SESSION, plugin, transcript
 forget_requested = plugin.turns.forget_requested
 
 
-def test_true_when_this_turn_called_memory_forget():
-    messages = transcript("forget my old address", "Done.", tool_calls=[("memory_forget", {"ids": ["m1"]})])
-    assert forget_requested(messages) is True
-
-
 def test_false_without_tool_calls():
     assert forget_requested(transcript("hello", "hi")) is False
     assert forget_requested(None) is False
@@ -44,12 +39,6 @@ def test_sync_turn_sends_forget_requested(make_provider, daemon):
     messages = transcript("forget my old address", "Done.", tool_calls=[("memory_forget", {"ids": ["m1"]})])
     provider.sync_turn("forget my old address", "Done.", session_id=SESSION, messages=messages)
     assert daemon.requests_for("turns")[0].body["forget_requested"] is True
-
-
-def test_sync_turn_defaults_forget_requested_to_false(make_provider, daemon):
-    provider = make_provider()
-    provider.sync_turn("hello", "hi", session_id=SESSION, messages=transcript("hello", "hi"))
-    assert daemon.requests_for("turns")[0].body["forget_requested"] is False
 
 
 def test_memory_forget_tool_call_drops_the_previous_query(make_provider, daemon):

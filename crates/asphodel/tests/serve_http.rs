@@ -913,6 +913,37 @@ fn errors_are_json_with_the_right_status() {
             400,
         ),
         ("GET", "/v1/nowhere", None, 404),
+        ("GET", "/v1/banks/nope/system-prompt", None, 404),
+        ("GET", "/v1/banks/nope/agenda", None, 404),
+        ("GET", "/v1/banks/nope/models", None, 404),
+        (
+            "PATCH",
+            "/v1/banks/main/models/Nope",
+            Some(json!({"enabled": false})),
+            404,
+        ),
+        (
+            "POST",
+            "/v1/banks/main/models",
+            Some(json!({"name": "", "question": "Who?", "max_tokens": 10})),
+            422,
+        ),
+        (
+            "POST",
+            "/v1/banks/main/models",
+            Some(
+                json!({"name": "Ana", "question": "Who is Ana?", "entity": "Ana",
+                        "max_tokens": 10}),
+            ),
+            422,
+        ),
+        // No LLM is configured, so nothing can be refreshed.
+        (
+            "POST",
+            "/v1/banks/main/models/User%20profile/refresh",
+            Some(Value::Null),
+            503,
+        ),
     ] {
         let reply = daemon.send(method, path, body.as_ref());
         assert_eq!(reply.status, status, "{method} {path}: {}", reply.body);
@@ -922,6 +953,14 @@ fn errors_are_json_with_the_right_status() {
             reply.body
         );
     }
+
+    // An empty bank's block is the pointer line alone.
+    let block = daemon.ok(daemon.get("/v1/banks/main/system-prompt"));
+    let text = block["text"].as_str().unwrap();
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.starts_with("Built "), "{text}");
+    assert_eq!(block["agenda"], json!([]));
+    assert_eq!(block["cited"], json!([]));
 }
 
 // SIGTERM (TIM-94, decision 3).
@@ -1358,63 +1397,6 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
 }
 
 #[test]
-fn model_routes_answer_with_the_right_status() {
-    let dir = TestDir::new();
-    let daemon = Serve::new(&dir).ready();
-    daemon.create_bank("main");
-
-    for (method, path, body, status) in [
-        ("GET", "/v1/banks/nope/system-prompt", None, 404),
-        ("GET", "/v1/banks/nope/agenda", None, 404),
-        ("GET", "/v1/banks/nope/models", None, 404),
-        (
-            "PATCH",
-            "/v1/banks/main/models/Nope",
-            Some(json!({"enabled": false})),
-            404,
-        ),
-        (
-            "POST",
-            "/v1/banks/main/models",
-            Some(json!({"name": "", "question": "Who?", "max_tokens": 10})),
-            422,
-        ),
-        (
-            "POST",
-            "/v1/banks/main/models",
-            Some(
-                json!({"name": "Ana", "question": "Who is Ana?", "entity": "Ana",
-                        "max_tokens": 10}),
-            ),
-            422,
-        ),
-        // No LLM is configured, so nothing can be refreshed.
-        (
-            "POST",
-            "/v1/banks/main/models/User%20profile/refresh",
-            Some(Value::Null),
-            503,
-        ),
-    ] {
-        let reply = daemon.send(method, path, body.as_ref());
-        assert_eq!(reply.status, status, "{method} {path}: {}", reply.body);
-        assert!(
-            reply.json()["error"].is_string(),
-            "{method} {path}: {}",
-            reply.body
-        );
-    }
-
-    // An empty bank's block is the pointer line alone.
-    let block = daemon.ok(daemon.get("/v1/banks/main/system-prompt"));
-    let text = block["text"].as_str().unwrap();
-    assert_eq!(text.lines().count(), 1, "{text}");
-    assert!(text.starts_with("Built "), "{text}");
-    assert_eq!(block["agenda"], json!([]));
-    assert_eq!(block["cited"], json!([]));
-}
-
-#[test]
 fn the_cli_creates_lists_edits_and_refreshes_models() {
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir)
@@ -1595,6 +1577,20 @@ fn a_changed_fingerprint_pauses_purge_until_the_cli_acks_the_running_hash() {
     assert_eq!(plan["current"], current.as_str());
     assert_eq!(plan["changed"], json!(["purge.delta"]));
 
+    // Status needs attention while purge is paused, and shows both hashes.
+    let status = second.ok(second.get("/v1/status"));
+    assert_ne!(status["attention"], json!([]), "{status}");
+    let body = status.to_string();
+    assert!(
+        body.contains(&stored) && body.contains(&current),
+        "{status}"
+    );
+    let output = run(cli(&second).arg("status"));
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let out = stdout(&output);
+    assert!(out.contains("paused"), "{out}");
+    assert!(out.contains(&stored) && out.contains(&current), "{out}");
+
     // Only the hash the running daemon computed is accepted.
     let output = run(cli(&second).args(["purge", "ack", "--hash", "nope"]));
     assert!(!output.status.success());
@@ -1616,6 +1612,7 @@ fn a_changed_fingerprint_pauses_purge_until_the_cli_acks_the_running_hash() {
         second.ok(second.get("/v1/purge/plan"))["changed"],
         json!([])
     );
+    succeeded(run(cli(&second).arg("status")));
     second.sigterm();
     assert!(second.wait_exit().success());
     drop(second);
@@ -2229,44 +2226,6 @@ fn status_needs_attention_while_a_chunk_has_failed() {
     daemon.wait_for_memory("main");
     daemon.wait_extracted("main");
     succeeded(run(cli(&daemon).arg("status")));
-}
-
-#[test]
-fn status_needs_attention_while_purge_is_paused_and_shows_both_hashes() {
-    let dir = TestDir::new();
-    let mut first = Serve::new(&dir).ready();
-    first.create_bank("main");
-    let stored = first.ok(first.get("/v1/config"))["deletion_fingerprint"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    succeeded(run(cli(&first).arg("status")));
-    first.sigterm();
-    assert!(first.wait_exit().success());
-    drop(first);
-
-    let second = Serve::new(&dir).tuning("[purge]\ndelta = 0.5\n").ready();
-    let current = second.ok(second.get("/v1/config"))["deletion_fingerprint"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_ne!(current, stored);
-
-    let status = second.ok(second.get("/v1/status"));
-    assert_ne!(status["attention"], json!([]), "{status}");
-    let body = status.to_string();
-    assert!(
-        body.contains(&stored) && body.contains(&current),
-        "{status}"
-    );
-    let output = run(cli(&second).arg("status"));
-    assert!(!output.status.success(), "{}", stdout(&output));
-    let out = stdout(&output);
-    assert!(out.contains("paused"), "{out}");
-    assert!(out.contains(&stored) && out.contains(&current), "{out}");
-
-    succeeded(run(cli(&second).args(["purge", "ack", "--hash", &current])));
-    succeeded(run(cli(&second).arg("status")));
 }
 
 #[test]

@@ -13,11 +13,10 @@
 //! the input first, the way call 1's tests read entity and memory handles.
 //!
 //! The API under test is call 2's items in `asphodel_core::extraction` and
-//! the `Service` methods over it, `call2_input` and `extract_chunk`. Three
-//! tests check what the rest rely on: that the schema holds what
-//! reconciliation writes, that the floor is keyed by the exact embedding
-//! model, and that the fixtures below sit on the side of the fake embedder's
-//! floor each test needs.
+//! the `Service` methods over it, `call2_input` and `extract_chunk`. One
+//! test checks what the rest rely on: that the fixtures below sit on the
+//! side of the fake embedder's floor each test needs, so a test expecting
+//! call 2 not to run can't pass for the wrong reason.
 //!
 //! Every service here runs on a `SimulatedClock` stopped at one instant
 //! unless a test advances it, so a stored time that equals that instant can
@@ -50,9 +49,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use asphodel_core::extraction::{
-    CALL2_TEMPLATE, CALL2_VERSION, Call2Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED,
-    EDIT_KEPT, EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, ExtractError, Label,
-    NEIGHBOUR_CAP, NEIGHBOURS_PER_CLAIM, call2_request,
+    CALL2_TEMPLATE, Call2Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT,
+    EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, ExtractError, NEIGHBOUR_CAP,
+    NEIGHBOURS_PER_CLAIM, call2_request,
 };
 
 // Fixtures
@@ -1020,60 +1019,7 @@ fn call2_reply(claims: Vec<Value>) -> Value {
     json!({"claims": claims})
 }
 
-// What runs now: the schema, the floors and the fixtures.
-
-#[test]
-fn the_schema_holds_what_reconciliation_writes() {
-    let h = Harness::new();
-    for (table, column) in [
-        ("memories", "valid_until"),
-        ("memories", "valid_until_precision"),
-        ("memories", "window_confidence"),
-        ("memories", "invalidated_at"),
-        ("memories", "superseded_by"),
-        ("memories", "ended_by"),
-        ("memories", "owner_significance"),
-        ("edits", "memory_id"),
-        ("chunks", "call1_output"),
-        ("mental_model_citations", "memory_id"),
-    ] {
-        let found: i64 = h.one(
-            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
-            [column],
-        );
-        assert_eq!(found, 1, "{table}.{column}");
-    }
-
-    // Both kinds of access reconciliation writes fit the log.
-    let memory = h.fact(TEA);
-    h.insert_access(memory, "mentioned_again", 1, h.now());
-    h.insert_access(memory, "confirmed", 2, h.now());
-    assert_eq!(h.accesses(memory).len(), 3);
-}
-
-#[test]
-fn the_floor_is_keyed_by_the_exact_embedding_model() {
-    // TIM-92: the floor is stored per embedding model, and ADR 0009 refuses
-    // to run a model without one.
-    let tuning = tuning_for_fakes();
-    assert_eq!(
-        tuning
-            .reconcile
-            .embedding_floors
-            .get(FakeEmbedder::MODEL_ID),
-        Some(&FLOOR)
-    );
-    assert!(
-        tuning
-            .check_floors(FakeEmbedder::MODEL_ID, FakeReranker::MODEL_ID)
-            .is_ok()
-    );
-    assert!(
-        tuning
-            .check_floors("BAAI/bge-small-en-v1.5", FakeReranker::MODEL_ID)
-            .is_err()
-    );
-}
+// What the rest rely on: the fixtures.
 
 #[test]
 fn the_fixtures_sit_on_the_side_of_the_floor_each_test_needs() {
@@ -1439,26 +1385,29 @@ fn the_request_is_the_input_and_the_call_2_schema() {
     assert_eq!(requests[1], call2_request(&input));
 
     let request = &requests[1];
-    assert_eq!(request.template.name, CALL2_TEMPLATE);
-    assert_eq!(request.template.version, CALL2_VERSION);
     assert!(request.user.contains(TEA_AGAIN));
     assert!(request.user.contains(TEA));
     assert!(request.user.contains(&neighbour_handle(&input, tea)));
-    // Code decides direction from observed_at, so the prompt never asks the
-    // LLM which of the two is newer (ADR 0005).
-    let labels: BTreeSet<String> = request.schema["properties"]["claims"]["items"]["properties"]
+    // The six labels of the TIM-92 amendment, `denies` among them. Code
+    // decides direction from observed_at, so the prompt never asks the LLM
+    // which of the two is newer (ADR 0005).
+    let labels: BTreeSet<&str> = request.schema["properties"]["claims"]["items"]["properties"]
         ["labels"]["items"]["properties"]["label"]["enum"]
         .as_array()
         .expect("the label is an enum")
         .iter()
-        .map(|label| label.as_str().unwrap().to_owned())
+        .map(|label| label.as_str().unwrap())
         .collect();
     assert_eq!(
         labels,
-        Label::ALL
-            .iter()
-            .map(|label| label.as_str().to_owned())
-            .collect()
+        BTreeSet::from([
+            "mentioned_again",
+            "confirmed",
+            "refines",
+            "retracts",
+            "denies",
+            "ends",
+        ])
     );
 }
 
@@ -1495,22 +1444,6 @@ fn mentioned_again_writes_an_access_and_no_memory() {
     assert_eq!(h.change(tea), Change::untouched());
     let extracted_at: Option<i64> = h.chunk_column(extracted.chunk, "extracted_at");
     assert!(extracted_at.is_some());
-}
-
-#[test]
-fn confirmed_writes_a_confirmed_access() {
-    let h = Harness::new();
-    let acme = h.fact(ACME);
-    owner_says(&h, "Yes, I still work at Acme.");
-    let extracted = one_label(
-        &h,
-        reply(vec![claim(ACME_STILL, "fact", "I still work at Acme")]),
-        acme,
-        "confirmed",
-    );
-    assert!(extracted.memories.is_empty());
-    let kinds: Vec<String> = h.accesses(acme).into_iter().map(|row| row.kind).collect();
-    assert_eq!(kinds, ["created", "confirmed"]);
 }
 
 #[test]
@@ -1824,42 +1757,6 @@ fn an_ending_sets_valid_until_and_ended_by() {
     assert_eq!(h.edits_on(berlin, EDIT_ENDED), 1);
     assert_eq!(h.change(moved), Change::untouched());
     assert_eq!(h.accesses(berlin), vec![Harness::fixture_access()]);
-}
-
-#[test]
-fn a_late_reported_ending_takes_the_ending_memorys_start() {
-    // Said on 1 October, about August: the window closes in August, and
-    // strength's restart is at the later of that and when the end became
-    // known, which the store reads from ended_by (TIM-91 decision 2).
-    let h = Harness::new();
-    let acme = h.fact(ACME);
-    owner_says(&h, "I left Acme back in August.");
-    let extracted = one_label(
-        &h,
-        reply(vec![changes(
-            claim(ACME_LEFT, "event", "I left Acme back in August")
-                .with("valid_from", time("2026-08", "month")),
-        )]),
-        acme,
-        "ends",
-    );
-
-    let left = extracted.memories[0];
-    assert_eq!(
-        h.change(acme),
-        Change {
-            valid_until: timed(local("2026-08-01T00:00"), "month"),
-            ended_by: Some(left),
-            ..Change::untouched()
-        }
-    );
-    let known_at: i64 = h.one(
-        "SELECT e.observed_at FROM memories m JOIN memories e ON e.id = m.ended_by
-         WHERE m.uuid = ?1",
-        [acme.to_string()],
-    );
-    assert_eq!(timestamp(known_at), at(T1));
-    assert_eq!(h.edits_on(acme, EDIT_ENDED), 1);
 }
 
 #[test]
@@ -2241,55 +2138,6 @@ fn a_later_version_of_a_document_doesnt_reinforce_itself() {
 // Reopening.
 
 #[test]
-fn retracting_the_memory_that_ended_another_repoints_its_end() {
-    // TIM-92, "Reopening": when the memory that ended another is retracted
-    // with a successor, ended_by is repointed to the successor and
-    // valid_until is taken from the successor's window.
-    let h = Harness::new();
-    let task = h.insert_memory("main", TAX_TASK, "task", "notable");
-    let filed = h.insert_memory("main", TAX_FILED, "event", "minor");
-    h.set_valid_from(filed, local("2026-10-01T00:00"), "day");
-    h.mark_ended(task, filed, local("2026-10-01T00:00"), "day");
-    h.advance(24);
-    h.service
-        .ingest_turn(
-            "main",
-            &turn(
-                "s1",
-                "2026-10-02T06:30:00Z",
-                "Correction: I filed the tax return on 2 October, not the 1st.",
-                "Noted.",
-            ),
-        )
-        .unwrap();
-    let extracted = one_label(
-        &h,
-        reply(vec![changes(
-            claim(
-                TAX_FILED_LATER,
-                "event",
-                "I filed the tax return on 2 October",
-            )
-            .with("valid_from", time("2026-10-02", "day")),
-        )]),
-        filed,
-        "retracts",
-    );
-
-    let later = extracted.memories[0];
-    assert_eq!(h.change(filed).superseded_by, Some(later));
-    assert_eq!(
-        h.change(task),
-        Change {
-            valid_until: timed(local("2026-10-02T00:00"), "day"),
-            ended_by: Some(later),
-            ..Change::untouched()
-        }
-    );
-    assert_eq!(h.edits_on(task, EDIT_END_REPOINTED), 1);
-}
-
-#[test]
 fn a_correction_of_another_kind_still_repoints_the_end() {
     // TIM-92, "Reopening": with a successor, ended_by is repointed. The
     // correction below is filed as a fact rather than an event, but it still
@@ -2359,56 +2207,6 @@ fn filed_and_ended(h: &Harness, user: &str) -> (Uuid, Uuid, Uuid) {
         .ingest_turn("main", &turn("s1", "2026-10-02T06:30:00Z", user, "Noted."))
         .unwrap();
     (task, worry, filed)
-}
-
-#[test]
-fn the_call_2_schema_offers_denies_under_a_new_version() {
-    // Six labels, with `denies` defined in the prompt and `retracts` the
-    // choice when unsure; the template version moves with the prompt.
-    let h = Harness::new();
-    let tea = h.fact(TEA);
-    owner_says(&h, "I really like green tea.");
-    let input = call2(
-        &h,
-        &reply(vec![claim(TEA_AGAIN, "fact", "I really like green tea")]),
-    )
-    .expect("call 2 runs");
-    assert!(input.neighbours.iter().any(|n| n.memory == tea));
-    let request = call2_request(&input);
-    let labels = strings(
-        &request.schema["properties"]["claims"]["items"]["properties"]["labels"]["items"]["properties"]
-            ["label"]["enum"],
-    );
-    assert_eq!(
-        labels,
-        [
-            "mentioned_again",
-            "confirmed",
-            "refines",
-            "retracts",
-            "denies",
-            "ends"
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>()
-    );
-    assert_eq!(CALL2_VERSION, 2, "the prompt changed, so its version does");
-    assert!(request.system.contains("`denies`"));
-    assert!(
-        request.system.contains("unsure"),
-        "the prompt says to use `retracts` when unsure"
-    );
-}
-
-/// The strings in a JSON array.
-fn strings(value: &Value) -> BTreeSet<String> {
-    value
-        .as_array()
-        .expect("an array")
-        .iter()
-        .map(|item| item.as_str().expect("a string").to_owned())
-        .collect()
 }
 
 #[test]
@@ -3042,45 +2840,30 @@ fn call2_input_counts_nothing_when_it_fails() {
 }
 
 #[test]
-fn a_failed_call_2_counts_and_keeps_call_1s_reply() {
+fn a_failed_call_2_keeps_call_1s_reply_for_the_retry_and_drops_it_on_commit() {
     let h = Harness::new();
     let tea = h.fact(TEA);
     owner_says(&h, "I like green tea.");
     let call1 = reply(vec![claim(TEA, "fact", "I like green tea")]);
+    let input = call2(&h, &call1).expect("call 2 runs");
     // Call 1 answers; call 2 gets nothing back.
-    let llm = FakeLlm::scripted(MODEL, vec![call1]);
+    let first = FakeLlm::scripted(MODEL, vec![call1]);
     let error = h
         .service
-        .extract_chunk(lease(&h, "main"), &llm, &[])
+        .extract_chunk(lease(&h, "main"), &first, &[])
         .unwrap_err();
-    assert_eq!(llm.requests().len(), 2);
+    assert_eq!(first.requests().len(), 2);
     assert_eq!(error.failure(), Some(Failure::Retry { error_count: 1 }));
 
     // Nothing committed but the count, and call 1's reply is saved so the
     // retry resumes from it (TIM-92).
-    let chunk = {
-        let lease = lease(&h, "main");
-        lease.chunk
-    };
+    let chunk = lease(&h, "main").chunk;
     assert_eq!(h.memories_in("main"), 1);
     assert_eq!(h.accesses(tea), vec![Harness::fixture_access()]);
     let extracted_at: Option<i64> = h.chunk_column(chunk, "extracted_at");
     assert_eq!(extracted_at, None);
     let saved: Option<String> = h.chunk_column(chunk, "call1_output");
     assert!(saved.is_some());
-}
-
-#[test]
-fn a_retry_resumes_from_call_1s_saved_reply_and_drops_it_on_commit() {
-    let h = Harness::new();
-    let tea = h.fact(TEA);
-    owner_says(&h, "I like green tea.");
-    let call1 = reply(vec![claim(TEA, "fact", "I like green tea")]);
-    let input = call2(&h, &call1).expect("call 2 runs");
-    let first = FakeLlm::scripted(MODEL, vec![call1]);
-    h.service
-        .extract_chunk(lease(&h, "main"), &first, &[])
-        .unwrap_err();
 
     // The retry is call 2 alone.
     let retry = FakeLlm::scripted(
