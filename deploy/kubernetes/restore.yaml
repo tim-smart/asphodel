@@ -12,13 +12,17 @@
 #   kubectl scale statefulset hermes --replicas=1
 #
 # The pod never restarts, so it ends Succeeded only when both containers
-# exited 0. If the wait fails, read the logs of both containers. A failed
-# restore leaves the live store as it was.
+# exited 0. If the wait doesn't succeed, keep the StatefulSet at zero. A
+# timeout means the pod may still be running. A failure before the restore
+# installs the copy leaves the live store untouched, but an error that names
+# a move or the sync of /data itself can leave the old store, the restored
+# one, or files part-way between them. docs/operations.md, "Restore", says
+# how to tell and how to recover.
 #
 # The init container fetches the backup with the same rclone secret the
-# backup job uses; `asphodel restore` checks its integrity and schema
-# version, moves the current database aside (it isn't deleted) and copies the
-# backup in.
+# backup job uses. `asphodel restore` checks its integrity and schema
+# version, stages a copy beside the live database, then renames the current
+# database aside (it isn't deleted) and the copy into its place.
 apiVersion: v1
 kind: Pod
 metadata:

@@ -342,9 +342,22 @@ Restore is offline. `asphodel restore <file> --data-dir <dir>` takes the
 data-dir lock, checks the backup's integrity and that its schema version
 isn't newer than the binary, copies the backup in beside the live
 database with a `restored` edit row (the backup time, the restore time and
-the binary version), and only then moves the current database aside (it
-isn't deleted) and puts the copy in its place. A restore that fails at any
-step leaves the live store as it was.
+the binary version), and only then installs it: it renames the current
+database (and its `-wal` and `-shm`) to `asphodel.db.before-restore-<time>`,
+renames the copy to `asphodel.db`, and syncs the directory. Nothing is
+deleted.
+
+What a failure leaves behind depends on when it happened:
+
+- **Before installing.** A held lock, a backup that fails its integrity or
+  schema check, or an error while staging the copy (including `syncing
+  .../asphodel.db.restore.part-...`) leaves the live store untouched.
+- **While installing.** An error that names a move (`moving ... to ...`)
+  or the sync of the data dir itself (`syncing /data`) can leave it with the
+  old store, the restored one, or files part-way between them. A failed
+  rename is rolled back on a best-effort basis that ignores its own
+  errors, and a failed sync comes after the restored copy is already in
+  place. Inspect the data dir before going on.
 
 The lock is taken without waiting: if a daemon still holds it, restore
 fails at once rather than queueing behind it. In Kubernetes:
@@ -374,10 +387,48 @@ fails at once rather than queueing behind it. In Kubernetes:
    ```
 
    The log names the schema version and where the old database was moved.
-   If the wait fails, check `kubectl get pod asphodel-restore` and the logs
-   of both containers (`-c fetch`, `-c restore`). Don't count the restore
-   as done: the live store is unchanged, and scaling back up serves it as
-   it was.
+   If the wait doesn't succeed, keep the StatefulSet at zero and find out
+   why before anything else:
+
+   - A timeout says nothing about the restore. The pod may still be
+     running. Check `kubectl get pod asphodel-restore` and wait for it to
+     end.
+   - If `fetch` failed, `asphodel restore` never ran and the live store is
+     untouched. Fix the fetch and run the pod again.
+   - If `restore` failed, read `kubectl logs asphodel-restore -c restore`.
+     An error from before installing (see above) left the live store
+     untouched. An error that names a move or the data dir's sync means
+     you need to look at the data dir.
+
+   The image has no shell, so look with a throwaway pod that mounts the
+   claim:
+
+   ```sh
+   kubectl run asphodel-inspect --rm -it --restart=Never --image=busybox \
+     --overrides='{"spec":{"containers":[{"name":"asphodel-inspect",
+       "image":"busybox","stdin":true,"tty":true,"command":["sh"],
+       "volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+       "volumes":[{"name":"data","persistentVolumeClaim":
+       {"claimName":"asphodel-data-hermes-0"}}]}}'
+   ls -la /data
+   ```
+
+   `asphodel.db.before-restore-<time>` (with `-wal` and `-shm` when it
+   had them) is the store from before the restore, and
+   `asphodel.db.restore.part-*` is a staged copy that was never installed.
+
+   - If `asphodel.db` exists, running the restore again is safe: it moves
+     `asphodel.db` and its `-wal` and `-shm` aside under a new name rather
+     than overwriting them.
+   - If `asphodel.db` is missing but `asphodel.db-wal` or `asphodel.db-shm`
+     is still there, they belong to the old store. Rename them beside its
+     `before-restore` file (`asphodel.db.before-restore-<time>-wal`, and
+     the same for `-shm`) before running the restore again, so SQLite never
+     reads them with another database.
+   - To go back to the old store instead, rename the `before-restore` files
+     to `asphodel.db`, `asphodel.db-wal` and `asphodel.db-shm`.
+
+   Only scale back up once you know which store `asphodel.db` is.
 4. Delete the pod, scale back to one replica, wait for it to be ready, and
    run `asphodel status`.
 
