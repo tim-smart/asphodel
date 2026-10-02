@@ -3,8 +3,9 @@
 This page is a handoff for a local agent that evaluates Asphodel against
 Tim's real Hermes history, on Tim's machine, with the replay harness
 (`docs/replay.md`). Hand the agent everything from "Who does what" down.
-It covers the commands, what to measure, and a feedback template that
-carries numbers and ids but never content.
+It covers the commands, how the agent drafts probes and labels for Tim to
+approve, what to measure, and a feedback template that carries numbers and
+ids but never content.
 
 Every `asphodel` command here exists in `--help` on this branch. The build,
 the model fetch, the scripted replay and the report commands were run while
@@ -13,23 +14,28 @@ since they need Tim's data.
 
 ## Who does what
 
-You are a local agent running on Tim's machine. You run commands, collect
-numbers, and prepare material. Three things are not yours:
+You are a local agent running on Tim's machine. You run commands, draft
+the evaluation data, collect numbers, and prepare material. Three things
+are not yours:
 
-1. **Tim writes the real-history probes and the labels.** You may draft
-   nothing in `probes.toml` or `labels.toml`. You may prepare the files'
-   skeletons and tell Tim what the report shows, but every `[[probe]]` and
-   every label line is his.
+1. **Tim approves the probes and the labels.** You draft them: you propose
+   the questions, the expected answers and the labels, grounded in what the
+   replayed store actually holds, and you keep every draft in
+   `$ASPHODEL_REPLAY_DIR/drafts/`. Nothing reaches `probes.toml` or
+   `labels.toml` until Tim has approved that exact entry in this session.
+   Those two files are the evaluation data; the drafts are not. Only runs on
+   the approved files go into the feedback.
 2. **Nothing goes to an LLM backend without Tim's explicit approval in this
    session.** Before any `--mode live`, any `--mode fast` with an LLM
    configured, or `asphodel llm login`, stop, state the endpoint and model
-   that will see the history, and wait for a yes.
+   that will see the history, and wait for a yes. Browsing (step 5),
+   `replay` mode and `report` never call a backend.
 3. **Nothing from the private directory leaves it except the aggregate
    export and the feedback template below.** No sentence, query, entity
    name, alias, source text or LLM reply goes into a ticket, a PR, a chat
    reply or a file outside `ASPHODEL_REPLAY_DIR`. Memory ids and probe ids
-   are fine. The output of `asphodel recalls` and `memory show` is content:
-   read it, never quote it.
+   are fine. The output of `asphodel recall`, `recalls` and `memory show` is
+   content: read it, show it to Tim, never quote it anywhere else.
 
 ## 0. Setup
 
@@ -100,7 +106,7 @@ if it refuses, report the message verbatim and stop.
 
 ## 3. Backend configuration
 
-`$ASPHODEL_REPLAY_DIR/replay.toml`. Floors are placeholders until step 7;
+`$ASPHODEL_REPLAY_DIR/replay.toml`. Floors are placeholders until step 8;
 the run refuses to start without them.
 
 ```toml
@@ -146,14 +152,125 @@ asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode replay
 asphodel report html "$ASPHODEL_REPLAY_DIR/reports/state-live.json"
 ```
 
-## 5. Probes (Tim)
+## 5. Browse the replayed memories
 
-Show Tim the HTML page and the `memories` list in the report. He writes
-`$ASPHODEL_REPLAY_DIR/probes.toml`, with opaque ids and `memory` a regex
-over sentences. The kinds are `band`, `faded_at`, `exists`, `absent`,
-`agenda_has`, `agenda_lacks`, `recall_finds`, `recall_lacks`, `injects`,
-`not_injects`, `profile_has`, `profile_lacks`; field shapes are in
-`docs/replay.md`. Then:
+The report's `memories` list has ids and times but no sentences. To see
+what a memory says, serve a copy of the replayed store with no LLM. The
+copy keeps the bank's recorded models, so `ASPHODEL_MODEL_DIR` must be set,
+and the floors in `replay.toml` are enough config. Nothing here calls a
+backend: recall runs the local embedder and reranker only.
+
+```sh
+cp -r "$ASPHODEL_REPLAY_DIR/store" "$ASPHODEL_REPLAY_DIR/browse"
+asphodel serve --data-dir "$ASPHODEL_REPLAY_DIR/browse" --config "$ASPHODEL_REPLAY_DIR/replay.toml" \
+    --listen 127.0.0.1:7741 2> "$ASPHODEL_REPLAY_DIR/browse.log" &
+export ASPHODEL_URL=http://127.0.0.1:7741
+asphodel recall --bank main "what is my sister called"
+asphodel memory show --bank main <id>
+```
+
+The daemon warns that the deletion fingerprint changed and purge is
+paused: good, nothing is deleted while you browse. Recall writes the copy's
+recall log only. Stop it with `kill` when done, and delete `browse/` after
+the evaluation: it is a second copy of the history. Never point this at a
+`serve` data dir Hermes uses.
+
+`memory show` is how you ground a probe: it gives the sentence, kind,
+window, phase, the source passage, the supersession chain, the access log,
+and the projected fade date.
+
+## 6. Probes: drafted by you, approved by Tim
+
+A probe pins a time and an expectation (`docs/replay.md`, "Probes"). The
+kinds are `band`, `faded_at`, `exists`, `absent`, `agenda_has`,
+`agenda_lacks`, `recall_finds`, `recall_lacks`, `injects`, `not_injects`,
+`profile_has`, `profile_lacks`. In real history `memory` is a regex over
+sentences, and the earliest matching memory is the one probed.
+
+**Propose.** Using the browse daemon and `labelling.json`, draft 20 to 40
+probes. Cover each of these, so the run says something about every part of
+the model:
+
+- *Things Tim told Hermes that it should still know.* A question in Tim's
+  words, the memory that answers it (ask the browse daemon the question,
+  pick the memory, read it with `memory show`), as `recall_finds` and, for
+  the strongest cases, `injects`.
+- *Things that changed.* A corrected name, a rescheduled date, a finished
+  task: `exists` with `head = true` on the new memory and `retracted =
+  true` or `ended = true` on the old one, and `recall_lacks` for the old
+  version where the correction should hide it.
+- *Things that should have faded.* Trivial one-off mentions: `band` with
+  `faded` at a date well after the mention, and `faded_at` with a range
+  around the projected fade date `memory show` reports.
+- *Things that should not have faded.* Facts mentioned on several occasions:
+  `band` with `strong` at the end of the run.
+- *Upcoming and overdue.* Appointments and tasks: `agenda_has` shortly
+  before the date, `agenda_lacks` well after it.
+- *The profile.* `profile_has` with `model = "User profile"` for two or
+  three facts about Tim that a profile should carry.
+
+Write them to `$ASPHODEL_REPLAY_DIR/drafts/probes.draft.toml`. Every probe
+gets a comment block above it with the question, the expected answer in
+plain words, the memory id it was grounded on, and its status. Anchor the
+regex on distinctive words of the sentence, not on the whole sentence, and
+check with the browse daemon that it matches the memory you mean and no
+earlier one.
+
+```toml
+# question: what is my sister called
+# expected: the corrected name, not the one first given
+# grounded on: b4ccd45d-80dd-53dd-9b22-b1c8f9f43bc5
+# status: proposed
+[[probe]]
+id = "p001"
+at = "2026-11-01T00:00:00Z"
+kind = "recall_finds"
+memory = "(?i)sister.*Mia"
+query = "what is my sister called"
+
+# question: does the old name stay hidden
+# expected: the retracted memory is still in the store but not the head
+# grounded on: 41c78166-793c-50c2-bca7-c1d7227c222e
+# status: proposed
+[[probe]]
+id = "p002"
+at = "2026-11-01T00:00:00Z"
+kind = "exists"
+memory = "(?i)sister.*Maya"
+retracted = true
+head = false
+```
+
+**Validate.** A probe never changes a run, so the draft can be run as it
+is. `replay` mode needs the cassette from step 4 and no backend.
+
+```sh
+asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode replay \
+    --config "$ASPHODEL_REPLAY_DIR/replay.toml" --probes "$ASPHODEL_REPLAY_DIR/drafts/probes.draft.toml" \
+    --report "$ASPHODEL_REPLAY_DIR/reports/probes-draft.json"
+```
+
+Exit 2 means the file was refused: a duplicate id, a regex that doesn't
+parse, a `faded_at` range that ends after its `at`. Fix and re-run. Exit 0
+or 1 gives a report whose `probes` list has `observed` for every probe:
+the band and strength, the ids recall returned, the agenda's ids, the
+fade instant. Read it before the review, so you can tell Tim what the
+system actually did next to what you expected.
+
+**Review.** Walk Tim through the draft in batches of about ten. For each
+probe show the question, your expected answer, the grounding memory's
+sentence, and what the draft run observed. Tim approves, edits or rejects.
+An approved probe moves into `$ASPHODEL_REPLAY_DIR/probes.toml` with its
+comment block and `# status: approved by Tim <date>`. An edited probe is
+re-shown before it moves. A rejected probe stays in the draft marked
+`rejected`, so it isn't proposed again. Never write anything else into
+`probes.toml`.
+
+A failing probe is not a reason to change its expectation. If Tim says the
+expectation is right and the observation is wrong, that is a finding:
+approve the probe as written and it goes into the feedback as a failed id.
+
+**Run the approved set.** This is the run the feedback reports.
 
 ```sh
 asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode replay \
@@ -164,7 +281,7 @@ asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode replay
 Exit 0 all passed, 1 some failed (the report says what each observed), 2
 refused.
 
-## 6. Bench
+## 7. Bench
 
 ```sh
 asphodel bench --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" \
@@ -174,26 +291,62 @@ asphodel bench --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" \
 
 It copies the replayed store under `bench/` and starts a daemon on loopback
 with the production 1.5 s reranker deadline on. It never touches another
-store.
+store. Stop the browse daemon first if it is on the same port.
 
-## 7. Labels and calibration (Tim)
+## 8. Labels: guided by you, decided by Tim
 
-Tim labels candidates in `labelling.json` into
-`$ASPHODEL_REPLAY_DIR/labels.toml` (`"r1.1" = true`, one line per candidate
-id). Then:
+`labelling.json` (step 4) holds 50 sampled prefetches, each with its query
+and the reranked candidates before the gate, and every candidate list call
+2 was shown, each with its claim and neighbours. Every candidate has an id
+(`r1.1`, `c1.1`), the memory's id, its score and its sentence.
+
+**The two questions.** For a recall candidate: given this query, would a
+good assistant want this memory in front of it for the reply? Related is
+not enough; it has to help answer. For a call-2 candidate: is it about the
+same thing as the claim, so that the claim restates, confirms, refines,
+ends or contradicts it? Same person and topic is not enough; it has to be
+the same fact.
+
+**Guide.** Go sample by sample. Show Tim the query (or the claim), then
+each candidate with its id, score and sentence, your suggested label and a
+one-line reason. He confirms or flips each. Suggest, don't decide: the
+curve is only as good as his labels. Ten recall samples and ten call-2
+samples, about two hundred labels, is enough to start; more samples
+sharpen the curve around the floor. Do every candidate in a sample you
+start, including the low-scored ones, or the curve's low end is missing.
+
+Write confirmed labels to `$ASPHODEL_REPLAY_DIR/drafts/labels.draft.toml`
+as you go, one comment per sample saying which one it was and whether Tim
+has finished it. When a sample is finished, move its labels to
+`$ASPHODEL_REPLAY_DIR/labels.toml`. The approved file holds only labels Tim
+confirmed; a label he hasn't looked at never goes there.
+
+```toml
+# sample r1, finished by Tim 2026-10-03
+"r1.1" = true
+"r1.2" = false
+"r1.3" = false
+```
+
+**The curve.** Run it on the approved file. Running it on the draft is fine
+for a preview, but say so.
 
 ```sh
 asphodel report precision --labels "$ASPHODEL_REPLAY_DIR/labels.toml" --material "$ASPHODEL_REPLAY_DIR/labelling.json"
 ```
 
-The curve is numbers only and may be reported whole. Tim picks the two
-floors from it; put them in `replay.toml` and in the production
-`asphodel.toml`. The recall curve matches the gate exactly. The call-2 curve
-covers only candidates the placeholder reconcile floor let call 2 see, so
-after the floors change, re-run step 4 (approval again) and re-label if the
-material changed.
+It prints, for recall and for call 2, how many candidates were labelled and
+how many weren't, and one point per distinct score: at that `floor`, how
+many labelled candidates were kept, how many were relevant, and the
+precision. Numbers only; it may be reported whole. Tim picks the two
+floors: for recall, the lowest logit at which precision is still what he
+wants; for call 2, the lowest cosine. Put them in `replay.toml` and in the
+production `asphodel.toml`. The recall curve matches the gate exactly. The
+call-2 curve covers only candidates the placeholder reconcile floor let
+call 2 see, so after the floors change, re-run step 4 (approval again) and
+re-label if the material changed.
 
-## 8. A/B runs
+## 9. A/B runs
 
 `fast` reuses recorded claims and verdicts and calls the LLM only for pairs
 nobody has judged, so it also needs approval. Overrides take the shape of
@@ -225,9 +378,9 @@ so rather than improvise.
   apart; `call2_rate`; `llm.used_verdicts` by source (recorded, top-up,
   live, none); `agenda_lines_per_day`; `bands_per_week`;
   `fade_outs_per_week`; `purged_then_re_mentioned.rate`.
-- Shipped, for Tim's eyes: `asphodel recalls --bank main --limit 50` on the
-  bench daemon, then `asphodel memory show` on injected ids. Tim judges
-  relevance; you count his verdicts.
+- Shipped, for Tim's eyes: on the browse daemon (step 5), `asphodel
+  recalls --bank main --limit 50` after the probe run, then `asphodel memory
+  show` on returned ids. Tim judges relevance; you count his verdicts.
 - Manual: sanity bounds. Per-turn injected p95 should stay well under the
   prompt's budget; a `used` rate near zero across a run means injection
   isn't being relied on; a `call2_rate` near 1.0 means almost every claim is
@@ -310,6 +463,7 @@ from a report, any query, any name: if one is there, remove it.
 - LLM: auth=<api_key|chatgpt> model=<model> · approved by Tim on <date>
 - modes run: live <y/n>, replay --self-test <passed/failed>, fast <n runs>
 - overrides tried: <key = value, ...> (or none)
+- probes: <n> approved by Tim (<n> drafted, <n> rejected) · labels: <n> approved by Tim over <n> samples
 
 ### Retrieval
 - probes: <passed>/<total>; failed ids: <p003, p007>
@@ -347,6 +501,8 @@ from a report, any query, any name: if one is there, remove it.
 ## Known limits, so you don't chase them
 
 - No `state.db` export command; step 1 is general SQLite tooling.
+- The report lists memory ids without sentences. Sentences come from the
+  browse daemon (step 5) or the labelling material, both private.
 - Floors must be set before the run that calibrates them; one re-run is
   expected.
 - Reranker versus rank fusion has no tooling.
