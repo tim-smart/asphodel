@@ -3,8 +3,8 @@
 //! deletion" (TIM-115), TIM-99 decisions 5 and 10, and ADR 0010.
 //!
 //! The API under test is the `Service` methods: `merge_entities`,
-//! `unmerge_entity`, `start_reembed`, `run_reembed`, `reembed_status` and
-//! `delete_bank`. A merge made while a chunk's call 1 is in flight is
+//! `unmerge_entity`, `unlink_entity`, `start_reembed`, `run_reembed`,
+//! `reembed_status`, `delete_bank`, and `show_memory`'s purge projection. A merge made while a chunk's call 1 is in flight is
 //! checked in `extraction.rs`.
 
 use std::path::PathBuf;
@@ -1048,5 +1048,278 @@ fn a_reembed_recovers_a_bank_whose_recorded_model_isnt_loaded() {
             [memory_id]
         ),
         0
+    );
+}
+
+// Review regressions: a re-embed's swap racing recall, staged vectors and
+// erasure, the purge projection across a window close, and unlink after
+// two merges.
+
+/// An embedder that, once armed, stops inside its next call until the test
+/// releases it, so something else can happen while the model runs.
+struct Gate {
+    inner: Arc<dyn Embedder>,
+    armed: std::sync::atomic::AtomicBool,
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+impl Gate {
+    fn new(inner: Arc<dyn Embedder>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        })
+    }
+}
+
+impl Embedder for Gate {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.entered.wait();
+            self.release.wait();
+        }
+        self.inner.embed(texts)
+    }
+}
+
+#[test]
+fn a_query_embedded_before_a_swap_is_embedded_again_with_the_new_model() {
+    let h = Harness::new();
+    for k in 0..5 {
+        h.memory("main", &format!("Tim likes tea number {k}."));
+    }
+    let old = Gate::new(Arc::new(FakeEmbedder));
+    let new = Counting::new(Arc::new(FakeEmbedderV2), None);
+    let h = h.restart_with(new.clone(), old.clone());
+    old.armed.store(true, Ordering::SeqCst);
+    // The recall's v1 embedding stops; the bank is re-embedded and swapped to
+    // v2 meanwhile; then the recall carries on.
+    let (calls, ok) = std::thread::scope(|scope| {
+        let recall = scope.spawn(|| {
+            h.service.recall(
+                "main",
+                &RecallRequest {
+                    query: "tea".into(),
+                    ..RecallRequest::default()
+                },
+            )
+        });
+        old.entered.wait();
+        h.service.start_reembed("main").unwrap();
+        h.service.run_reembed("main").unwrap();
+        assert_eq!(h.recorded_model("main"), FakeEmbedderV2::MODEL_ID);
+        let calls = new.calls();
+        old.release.wait();
+        let result = recall.join().unwrap();
+        (calls, result.is_ok())
+    });
+    // The query is embedded again with v2 rather than searched against
+    // vectors of another model.
+    assert!(ok);
+    assert!(
+        new.calls() > calls,
+        "the query was embedded with v1 and searched against the swapped-in v2 vectors"
+    );
+}
+
+#[test]
+fn forgetting_a_memory_during_an_interrupted_reembed_erases_its_staged_vector() {
+    let h = Harness::new();
+    let memories: Vec<Uuid> = (0..REEMBED_BATCH + 8)
+        .map(|k| h.memory("main", &format!("Memory number {k} about tea.")))
+        .collect();
+    let old = Counting::new(Arc::new(FakeEmbedder), None);
+    let new = Counting::new(Arc::new(FakeEmbedderV2), Some(2));
+    let h = h.restart_with(new.clone(), old);
+    h.service.start_reembed("main").unwrap();
+    assert!(h.service.run_reembed("main").is_err());
+    let forgotten = memories[0];
+    let rowid: i64 = h.one(
+        "SELECT id FROM memories WHERE uuid = ?1",
+        [forgotten.to_string()],
+    );
+    assert_eq!(
+        h.one::<i64, _>(
+            "SELECT COUNT(*) FROM reembed_vectors WHERE memory_id = ?1",
+            [rowid]
+        ),
+        1,
+        "precondition: staged"
+    );
+    h.service.forget("main", &[forgotten.to_string()]).unwrap();
+    h.service
+        .erase_next("main")
+        .unwrap()
+        .expect("the erase ran");
+    assert_eq!(
+        h.one::<i64, _>("SELECT COUNT(*) FROM memories WHERE id = ?1", [rowid]),
+        0
+    );
+    assert_eq!(
+        h.one::<i64, _>(
+            "SELECT COUNT(*) FROM reembed_vectors WHERE memory_id = ?1",
+            [rowid]
+        ),
+        0,
+        "the forgotten memory's staged vector survives its erase"
+    );
+}
+
+#[test]
+fn deleting_a_bank_while_a_reembed_batch_is_in_flight_leaves_nothing_staged() {
+    let h = Harness::new();
+    for k in 0..5 {
+        h.memory("main", &format!("Memory number {k} about tea."));
+    }
+    let new = Gate::new(Arc::new(FakeEmbedderV2));
+    let h = h.restart_with(new.clone(), Arc::new(FakeEmbedder));
+    h.service.start_reembed("main").unwrap();
+    new.armed.store(true, Ordering::SeqCst);
+    std::thread::scope(|scope| {
+        let run = scope.spawn(|| h.service.run_reembed("main"));
+        new.entered.wait();
+        h.service.delete_bank("main", "main").unwrap();
+        new.release.wait();
+        let _ = run.join().unwrap();
+    });
+    assert_eq!(h.one::<i64, _>("SELECT COUNT(*) FROM reembeds", []), 0);
+    assert_eq!(
+        h.one::<i64, _>("SELECT COUNT(*) FROM reembed_vectors", []),
+        0,
+        "the in-flight batch staged vectors for a deleted bank"
+    );
+}
+
+#[test]
+fn the_projected_purge_date_waits_for_a_window_close_to_fade() {
+    use asphodel_core::Clock;
+    let h = Harness::new();
+    let chunk = h.fixture_chunk("main");
+    let event = next_uuid();
+    let now = h.now();
+    let until = now
+        .checked_add(jiff::SignedDuration::from_hours(72))
+        .unwrap();
+    let long_ago = now
+        .checked_sub(jiff::SignedDuration::from_hours(24 * 3000))
+        .unwrap();
+    h.execute(
+        "INSERT INTO memories (uuid, bank_id, content, kind, significance, chunk_id,
+                               source_start, source_end, observed_at, valid_until,
+                               valid_until_precision, window_confidence, created_at, updated_at)
+         VALUES (?1, ?2, 'Tim is away until Sunday.', 'event', 'trivial', ?3, 0, 9, ?4, ?5,
+                 'day', 'high', ?4, ?4)",
+        (
+            event.to_string(),
+            h.bank_id("main"),
+            chunk,
+            micros(long_ago),
+            micros(until),
+        ),
+    );
+    h.execute(
+        "INSERT INTO accesses (bank_id, memory_id, kind, at, turn)
+         SELECT bank_id, id, 'created', ?2, 0 FROM memories WHERE uuid = ?1",
+        (event.to_string(), micros(long_ago)),
+    );
+    // Below the purge line now, held by its date until the window closes,
+    // which restarts recent use and lifts it above the line again.
+    let view = h.service.show_memory("main", &event.to_string()).unwrap();
+    let line = view.purge.line.unwrap();
+    assert!(
+        view.strength.value < line,
+        "precondition: below the purge line now"
+    );
+    let projected = view.projection.purge.clone().expect("a purge date");
+    // The date is the earliest, at full speed: a turn at least once a day
+    // keeps bank time there until then.
+    let mut turn_at = now;
+    let mut k = 0;
+    while turn_at <= projected.earliest_at {
+        h.execute(
+            "INSERT INTO sources (uuid, bank_id, kind, session_id, message_at, content_hash,
+                                  observed_at, timezone, ingested_at)
+             VALUES (?1, ?2, 'turn', 'clock', ?3, ?4, ?3, 'UTC', ?3)",
+            (
+                next_uuid().to_string(),
+                h.bank_id("main"),
+                micros(turn_at),
+                format!("clock-{k}"),
+            ),
+        );
+        turn_at = turn_at
+            .checked_add(jiff::SignedDuration::from_hours(12))
+            .unwrap();
+        k += 1;
+    }
+    let before = projected
+        .earliest_at
+        .checked_sub(jiff::SignedDuration::from_secs(120))
+        .unwrap();
+    h.clock.advance(before.duration_since(h.clock.now()));
+    assert!(
+        !h.service
+            .purge_candidates()
+            .unwrap()
+            .iter()
+            .any(|(_, head)| *head == event),
+        "purgeable before the projected date"
+    );
+    let at = projected
+        .earliest_at
+        .checked_add(jiff::SignedDuration::from_secs(60))
+        .unwrap();
+    h.clock.advance(at.duration_since(h.clock.now()));
+    let candidates = h.service.purge_candidates().unwrap();
+    assert!(
+        candidates.iter().any(|(_, head)| *head == event),
+        "projected purgeable at {} ({} bank days), but at that time the sweep doesn't purge it: {:?}",
+        projected.earliest_at,
+        projected.bank_days,
+        h.service
+            .show_memory("main", &event.to_string())
+            .unwrap()
+            .purge
+    );
+}
+
+#[test]
+fn unlinking_after_two_merges_leaves_no_link_resolving_to_the_entity() {
+    let h = Harness::new();
+    let a = h.entity("Ana", &["Ana"]);
+    let b = h.entity("Anna", &["Anna"]);
+    let c = h.entity("Annie", &["Annie"]);
+    let memory = h.memory("main", "Ana and Anna are one person.");
+    h.link(memory, a);
+    h.link(memory, b);
+    // The first merge keeps the Ana link Anna already had; the second moves
+    // Anna's to Annie, leaving the memory linked to Ana and Annie.
+    merge(&h, "Ana", "Anna").unwrap();
+    merge(&h, "Anna", "Annie").unwrap();
+    assert_eq!(h.links(memory), vec![a, c], "precondition");
+    let unlinked = h
+        .service
+        .unlink_entity(
+            "main",
+            &asphodel_core::entities::LinkRequest {
+                memory: memory.to_string(),
+                entity: "Annie".into(),
+            },
+        )
+        .unwrap();
+    assert!(unlinked.changed);
+    assert_eq!(
+        h.links(memory),
+        Vec::<Uuid>::new(),
+        "a link on an entity merged two hops into Annie survives the unlink"
     );
 }
