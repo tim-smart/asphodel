@@ -1,0 +1,482 @@
+# Operations
+
+How to run Asphodel and look after it. Every operator command is an HTTP
+client of the running daemon, and anything that changes the store at scale
+runs as a daemon job (ADR 0010). There are two exceptions, both offline:
+`asphodel restore`, and the copy the daemon takes before a schema
+migration.
+
+## The image
+
+`nix build .#image` builds a layered OCI image, `asphodel:<version>`, from
+the flake. It holds:
+
+- the `asphodel` binary, wrapped so `ORT_DYLIB_PATH` points at nixpkgs'
+  ONNX Runtime;
+- the model dir, at `ASPHODEL_MODEL_DIR`, with every file the manifest in
+  `crates/asphodel-core/src/models/manifest.rs` lists;
+- the timezone database, at `TZDIR`.
+
+There's no shell, no package manager and no `/etc/passwd`. The entrypoint
+is `asphodel` and the default command is `serve`, so
+`kubectl exec <pod> -c asphodel -- asphodel status` runs any other
+subcommand. It runs as uid and gid 65532.
+
+The models come from fixed-output nix fetches at the revisions and
+SHA-256s the manifest pins (`nix/models.nix`), so fastembed never downloads
+at runtime and the daemon's startup check always passes. The build runs
+`asphodel models fetch` against the result as a check: any file the
+manifest lists that isn't there would need the network, which the build
+sandbox doesn't have, so a manifest change that `nix/models.nix` doesn't
+follow fails the build.
+
+`ASPHODEL_DATA_DIR` isn't set and the image has no `/data`. A pod whose
+volume didn't mount fails at startup instead of serving an empty store from
+the container's own filesystem.
+
+CI builds the image on every push and serves it once, on the real models,
+until `/v1/health` answers 200.
+
+`nix build .#asphodel` (the default package) is the wrapped binary on its
+own, and `nix build .#models` is the model dir, for a host that runs the
+daemon outside a container.
+
+## Deploying next to Hermes
+
+`deploy/kubernetes/hermes.yaml` is the example: Hermes with Asphodel as a
+native sidecar (Kubernetes 1.29 or later) in a single-replica StatefulSet.
+
+- **One replica.** The daemon takes an exclusive lock on its data dir, and
+  only one process may hold a bank's extraction worker. A StatefulSet never
+  runs two pods for one ordinal. A Deployment works too, with
+  `replicas: 1` and the `Recreate` strategy; `RollingUpdate` would start
+  the new pod while the old one holds the lock.
+- **Storage.** The data dir is a `ReadWriteOnce` local or block volume. At
+  startup the daemon checks the filesystem and refuses NFS, SMB/CIFS,
+  CephFS and FUSE, because SQLite's locking and WAL aren't safe on them.
+  `--allow-network-fs` overrides that, at your own risk.
+- **Readiness.** `/v1/health` answers 503 while the store migrates and the
+  models load, and 200 with the version once the daemon is ready. It needs
+  no token. The example gates the sidecar's startup probe on it, so Hermes
+  starts once Asphodel can answer.
+- **Listening.** The kubelet probes the pod's IP, not its loopback, so the
+  example listens on `0.0.0.0:7720`. Off loopback the daemon requires a
+  bearer token from `ASPHODEL_TOKEN` and refuses to start without one, and
+  once a token is set every client sends it, Hermes included. The `asphodel`
+  Service exists only for the backup job; Hermes uses
+  `http://127.0.0.1:7720`. A NetworkPolicy can limit port 7720 to the
+  backup job's pods, but write it to allow Hermes' own ports too: a policy
+  that selects the pod denies every ingress it doesn't allow.
+- **Shutdown.** On SIGTERM the daemon stops taking ingest, finishes the
+  chunk in flight and checkpoints the WAL. The extraction queue is in
+  SQLite, so nothing queued is lost. Native sidecars stop after the main
+  containers, so Hermes stops first. The example gives the pod 120 s, which
+  covers one LLM call.
+- **While the daemon is down** Hermes carries on without memory. The plugin
+  spools turns under `$HERMES_HOME/asphodel/spool/` and replays them once
+  the daemon answers.
+
+### Secrets and environment
+
+| Variable | Flag | What it is |
+|---|---|---|
+| `ASPHODEL_TOKEN` | none | The bearer token. Required off loopback. Clients read it too. |
+| `ASPHODEL_LLM_API_KEY` | none | The LLM key, for `auth = "api_key"`. |
+| `ASPHODEL_LISTEN` | `--listen` | `host:port` or `unix:/path`. Default `127.0.0.1:7720`. |
+| `ASPHODEL_DATA_DIR` | `--data-dir` | The store and its lock. Required, with no default. |
+| `ASPHODEL_CONFIG` | `--config` | The tuning file. |
+| `ASPHODEL_MODEL_DIR` | `--model-dir` | The models. The image sets it. |
+| `ASPHODEL_ALLOW_NETWORK_FS` | `--allow-network-fs` | Run on a network filesystem. |
+| `ASPHODEL_ONNX_THREADS` | `--onnx-threads` | ONNX Runtime's intra-op threads. |
+| `ASPHODEL_URL` | `--url` | Where a client finds the daemon. Default `http://127.0.0.1:7720`. |
+| `ASPHODEL_LOG` | none | The log filter (`docs/logging.md`). Default `info`. |
+
+Secrets have no flag, so they never show in a process list.
+
+### The tuning file
+
+The tuning file is TOML, and every key in it is optional except two kinds
+(ADR 0009):
+
+- `[llm] model`, the exact model string. The floors are calibrated against
+  one model.
+- A floor for each local model the daemon runs:
+  `reconcile.embedding_floors."bge-small-en-v1.5:int8"` and
+  `injection.reranker_floors."jina-reranker-v1-turbo-en:int8"`. They're set
+  in replay from labelled history (`docs/replay.md`, "Labelling and the
+  precision curve"), and the daemon refuses to start without them.
+
+An unknown key or an out-of-range value stops the daemon too. The LLM's two
+modes, an API key or a ChatGPT subscription, are in `docs/models.md`. For
+the subscription, log in once the pod is up:
+
+```sh
+kubectl exec -it hermes-0 -c asphodel -- asphodel llm login --data-dir /data
+```
+
+It writes `/data/llm-tokens.json`, which the daemon reads before every call,
+so no restart is needed. Without `[llm]` the daemon still serves recall and
+injection, and chunks wait on the queue.
+
+Some tuning values decide irreversible deletions. When they change, purge
+and the sweep pause until you acknowledge them ("Purge pauses" below).
+
+### Reaching the daemon from a laptop
+
+```sh
+kubectl port-forward hermes-0 7720
+ASPHODEL_TOKEN=... asphodel status
+```
+
+The forward ends on the pod's loopback. A daemon listening only on loopback
+with no token configured needs no token; the example's does.
+
+## Setting up Hermes
+
+### Installing the plugin
+
+Copy `plugin/` into `$HERMES_HOME/plugins/asphodel/`. Hermes finds it there
+because `__init__.py` names `register_memory_provider`, and it survives
+Hermes updates because the plugin declares no Python dependencies. Use the
+plugin from the same release as the daemon: the plugin warns at
+`initialize` when the daemon's major version differs from the one it was
+written for.
+
+### `hermes memory setup`
+
+Pick `asphodel`. Its `post_setup` prompts for each field (an empty answer
+keeps the default), writes `$HERMES_HOME/asphodel/config.json`, sets
+`memory.provider` to `asphodel`, and sets `memory.memory_enabled` and
+`memory.user_profile_enabled` to false, because Hermes' built-in
+`MEMORY.md` and `USER.md` are off when Asphodel is in use.
+
+| Field | Default | What it is |
+|---|---|---|
+| `url` | `http://127.0.0.1:7720` | The daemon. `ASPHODEL_URL` overrides it. |
+| `bank` | the profile name | One bank per Hermes profile. |
+| `owner_name` | none | The owner's name, an alias of the `user` entity. |
+| `owner_platform_ids` | none | The owner's speaker ids, comma-separated, such as `discord:1234`. |
+| `assistant_name` | the profile name | An alias of the `assistant` entity. |
+| `timezone` | Hermes' timezone | For sources that don't give one. |
+| `ingest` | `true` | Off means recall and injection only. |
+
+The token isn't prompted for. Set `ASPHODEL_TOKEN` in `$HERMES_HOME/.env`,
+or in the Hermes container's environment as the example does.
+
+**The dashboard skips `post_setup`.** It writes the fields through
+`config_schema.py` and `save_config`, but leaves the built-in memory flags
+alone. Set `memory.memory_enabled` and `memory.user_profile_enabled` to
+false yourself. Until you do, `initialize` warns about it.
+
+On `initialize` the plugin calls `PUT /v1/banks/{bank}`, which creates the
+bank or merges the fields in. Fields it sends are set, aliases are added,
+and fields it leaves out are untouched, so a running plugin can't undo a
+change made with `asphodel bank config`.
+
+Turns are ingested only from primary agents. Cron runs get injection and
+the prompt block but are never ingested.
+
+## Commands
+
+Every command below except `serve`, `restore`, `models fetch` and `llm
+login` talks to the daemon. They take `--url` (or `ASPHODEL_URL`) and read
+`ASPHODEL_TOKEN`, and `--json` prints the daemon's reply as it came.
+
+### Banks
+
+- `asphodel bank create <bank> [--owner-name N] [--owner-id P:ID]...
+  [--assistant-name N] [--timezone TZ]` creates a bank, or merges the given
+  fields into one that exists. The plugin's `initialize` does the same, so
+  this is only needed before Hermes first runs or for a bank Hermes doesn't
+  use.
+- `asphodel bank config <bank> ...` takes the same fields. Fields not given
+  are left as they are, and a new name adds an alias without removing the
+  old one.
+- `asphodel bank delete <bank> --confirm <bank>`: see "Deleting a bank".
+
+### Documents
+
+`asphodel ingest <file> --bank B --date YYYY-MM-DD [--inexact] [--id ID]`
+ingests plain text or markdown. `--date` is the reference date relative
+times resolve against, and `--inexact` says it's approximate. The id
+defaults to the file's name. Ingesting the same id again with new text is
+an edit, even with an earlier date. A document never makes a memory kept,
+whatever it says.
+
+### Memories
+
+- `asphodel recall --bank B <query> [--from T] [--to T] [--on happened|said]
+  [--phase upcoming|past|current|any] [--kind K]... [--entity E]
+  [--limit N]` is the same recall the agent's `memory_recall` tool runs.
+  It's how you find memory ids.
+- `asphodel keep --bank B <id>...` sets the owner's significance to kept,
+  so the memory never fades. `asphodel unkeep` hands it back to the level
+  extraction gave.
+- `asphodel memory significance --bank B <id> <level|clear>` sets the
+  owner's significance to `trivial`, `minor`, `notable`, `major`,
+  `critical` or `kept`, or clears it. It's the field keep and unkeep write.
+- `asphodel memory show --bank B <id>` answers "why do you think X?": the
+  sentence, kind, window and phase, both significance fields, the source
+  passage or why it's gone, the access and edit logs, the supersession
+  chain, the secret-scan kinds, strength in its parts, any guard holding
+  back a purge, and projected fade and purge dates. The dates are bank-time
+  durations plus the earliest world date at full speed.
+- `asphodel forget --bank B <id>...`: see "Forgetting".
+
+A memory's sentence, kind and window are never edited from the CLI. Those
+change through conversation.
+
+### Entities
+
+An entity is named by its id, `user`, `assistant`, or a name or alias only
+one entity in the bank has.
+
+- `asphodel entity show --bank B <entity>`: aliases, merges, linked
+  memories and edits.
+- `asphodel entity merge --bank B <from> <into>` moves `from`'s aliases and
+  links to `into` and keeps `from` as merged. `user` and `assistant` can
+  only be `into`. It prints an edit id.
+- `asphodel entity unmerge --bank B <edit>` undoes that merge, provided
+  `into` hasn't been merged again since.
+- `asphodel entity alias rm --bank B <entity> <alias> [--relink-to E]`
+  removes a wrong alias. With `--relink-to`, the links that named the
+  entity by that alias move to `E`, which gets the alias.
+- `asphodel entity link --bank B <memory> <entity>` and `entity unlink`
+  edit a memory's entity links.
+
+### Mental models
+
+Only the owner defines mental models, through these commands or the API.
+
+- `asphodel model create --bank B <name> --question Q --max-tokens N
+  [--kind K]... [--entity E] [--min-volatility V] [--disabled]`
+- `asphodel model list --bank B`
+- `asphodel model edit --bank B <name> [--question Q] [--max-tokens N]
+  [--kind K... | --all-kinds] [--min-volatility V|none] [--enable |
+  --disable]`
+- `asphodel model refresh --bank B <name> [--force]` refreshes now. It's
+  skipped when the inputs haven't changed, unless `--force`.
+- `asphodel model show --bank B <name> [--entry ID]` answers "why does the
+  profile say X?": each entry with the memories it cites, and whether the
+  prompt block shows it.
+
+### Health and failures
+
+`asphodel status` shows queue depth, failed chunks, failed refreshes, the
+purge pause and both fingerprint hashes, the last sweep, the pre-migration
+copy, banks recorded under an embedding model the daemon doesn't carry, and
+when
+`POST /v1/backup` last completed. That last one says nothing about whether
+the stream reached its destination. It exits non-zero when anything needs
+attention, which is what to alert on; there's no Prometheus endpoint.
+
+```sh
+kubectl exec hermes-0 -c asphodel -- asphodel status
+```
+
+`asphodel chunks --bank B [--failed [--retry]]` lists a bank's extraction
+chunks. `--failed` lists only those whose extraction failed past the retry
+cap, with the error kind and HTTP status (never the response), and
+`--retry` puts them back on the queue. The nightly sweep deletes failed
+chunks past the 90-day horizon.
+
+### Audit lists
+
+`asphodel purges`, `forgets`, `sweeps` and `recalls`, each with `--bank B
+[--limit N]`, list newest first, and the daemon caps the limit at 1000.
+Purge and forget rows hold ids, times, chunks and spans, never content. A
+sweep row holds counts, plus the fingerprint and δ it ran under, and is kept
+indefinitely. `recalls` shows each recall's query, which is content, so
+treat its output like the store.
+
+### Models
+
+`asphodel models fetch [--model-dir D]` fills the model dir from the
+manifest, for hosts outside the image. It skips files already present with
+the right checksum and resumes after a failure (`docs/models.md`).
+
+### Replay
+
+`asphodel import`, `replay`, `report` and `bench` belong to the replay
+harness, which runs on its own store under `ASPHODEL_REPLAY_DIR` and never
+touches a `serve` data dir. `docs/replay.md` covers them.
+
+## Backup
+
+`asphodel backup --out <file|->` asks the daemon for `POST /v1/backup`,
+which takes an online copy with SQLite's backup API, checks it with
+`PRAGMA integrity_check`, and streams it with its SHA-256 and length in
+headers. The client checks both. To a file, it also runs its own integrity
+check, and the file only appears under its final name once everything
+passed. `-` writes to stdout.
+
+Asphodel has no destination, schedule or retention of its own.
+`deploy/kubernetes/backup.yaml` is a nightly CronJob. The image has no
+shell, so the job takes the copy in two steps: an init container runs
+`asphodel backup --out /backup/asphodel.db` against the `asphodel`
+Service, and an rclone container uploads the checked file under a
+timestamped name. Retention is the bucket's lifecycle rule.
+
+From a host with a shell, the stream can go straight to its destination:
+
+```sh
+kubectl exec hermes-0 -c asphodel -- asphodel backup --out - \
+  | rclone rcat "remote:my-bucket/asphodel/asphodel-$(date -u +%Y%m%dT%H%M%SZ).db"
+```
+
+The hash is checked as the stream ends, after the upload has started, so a
+failed check exits non-zero but leaves a partial object behind. Writing to
+a file first avoids that.
+
+Hermes' own backup doesn't cover Asphodel: the plugin's `backup_paths()` is
+empty, because the data lives in the sidecar.
+
+## Restore
+
+Restore is offline. `asphodel restore <file> --data-dir <dir>` takes the
+data-dir lock, checks the backup's integrity and that its schema version
+isn't newer than the binary, moves the current database aside (it isn't
+deleted), copies the backup in, and writes a `restored` edit row with the
+backup time, the restore time and the binary version.
+
+In Kubernetes:
+
+1. Scale the StatefulSet to zero: `kubectl scale statefulset hermes
+   --replicas=0`. That stops Hermes too, so no turns arrive meanwhile.
+2. Set the backup's name in `deploy/kubernetes/restore.yaml` and apply it.
+   Its init container fetches the backup with the same rclone secret the
+   backup job uses, and its main container runs `asphodel restore`.
+3. Check `kubectl logs asphodel-restore -c restore`, then delete the pod.
+4. Scale back to one replica, wait for it to be ready, and run `asphodel
+   status`.
+
+Then check what the restore changed:
+
+- Turns between the backup and the restore are lost. Hermes still has them
+  in its own transcript, but the plugin doesn't send them again.
+- Memories forgotten after the backup was taken are back. Forget them
+  again.
+- If the restored store's deletion fingerprint differs from the binary's,
+  purge and the sweep pause. `asphodel status` shows it, and "Purge pauses"
+  below says what to do.
+- A backup from an older schema migrates on the first start, as an upgrade
+  does. `docs/upgrading.md` says whether that needs anything from you.
+
+## Upgrading
+
+Upgrade by deploying the new image. Before a schema migration the daemon
+copies the database into the data dir, keyed by the schema version it came
+from. A copy for the same version is never overwritten, so a migration
+that crash-loops can't replace the clean copy with a damaged one. The copy
+is deleted 7 days after the migration completes, and `asphodel status`
+shows it until then. `docs/upgrading.md` lists what each migration needs
+from you.
+
+## Purge pauses
+
+The store keeps a fingerprint of every setting that decides an
+irreversible deletion: the fixed strength constants, `clock.quiet_rate`,
+`purge.delta`, `agenda.overdue_days` and `purge.source_horizon_days` (ADR
+0009). When the daemon starts with a fingerprint that differs from the
+stored one, purge and the sweep of sources and recall rows pause. Forget
+never pauses.
+
+1. `asphodel purge plan` shows which values changed and how many memories,
+   sources and rows the sweep would delete now. It deletes nothing and can
+   run at any time.
+2. `asphodel purge ack --hash <h>` acknowledges the change. The hash has to
+   be the one the running daemon computed, as `purge plan` shows it. The
+   ack is stored as an edit row, so it survives restarts and travels with a
+   restore. Purging resumes at the next sweep.
+
+Running the plan first is recommended, but nothing enforces it.
+
+## Forgetting
+
+The owner forgets through the agent's `memory_forget` tool, and the
+operator with `asphodel forget --bank B <id>...`. Forget is irreversible
+and erases a memory, every earlier and later version of it, and the
+passages they came from (ADR 0010).
+
+The erase happens in two parts. At once, the chain is hidden from recall,
+injection, the agenda, mental model refreshes and `used` credit; model
+entries citing it are dropped; the prompt block cache is cleared; in-context
+sets are scrubbed; and recall rows naming it are deleted. Deleting the
+rows, redacting the passages and writing the tombstone wait on the bank's
+extraction queue, behind the chunks queued before the forget, so those
+chunks reconcile against the hidden memory and their passages are erased
+with it. `asphodel forgets` lists what was forgotten, by id.
+
+The turn that asks to forget is never stored. The plugin sees the
+`memory_forget` call and sends the turn with `forget_requested`, and the
+daemon keeps only its key, as a tombstone.
+
+What forget can't reach:
+
+- **Backups.** A backup taken before the forget still holds the content
+  until your retention removes it. Restoring one brings the memory back.
+- **The pre-migration copy**, for the 7 days it's kept, if the forget came
+  after the migration it precedes.
+- **Hermes.** Its own transcript, and the context of the session where the
+  forget happened, are outside Asphodel.
+- **A queued `ends` claim.** A chunk queued before the forget can end the
+  forgotten memory with a new one outside its chain, whose sentence may
+  restate the forgotten content. The erase clears its `ended_by` and leaves
+  it. Find it with `asphodel recall` and forget it too.
+- **New input.** Forget blocks the same input, not the same words. A later
+  turn that repeats them, or an edited section of a document that still
+  contains them, is new input and can bring the memory back. Take the words
+  out of a document before sending its next version.
+- **Old mentions.** A memory mentioned before schema version 7 has no
+  recorded span for the mention, so forget masks more of that turn or
+  document than the mention itself (`docs/upgrading.md`, version 8).
+
+## Deleting a bank
+
+`asphodel bank delete <bank> --confirm <bank>` erases everything in the bank
+through the same path forget uses, removes its tombstones, edit rows and
+session mappings, and writes a daemon-wide `bank_deleted` row with counts.
+
+**Disable the plugin first.** Every plugin `initialize` calls
+`PUT /v1/banks/{bank}`, which creates the bank again, empty, and `ingest:
+false` doesn't stop that. Set `memory.provider` in the profile's
+`config.yaml` to something other than `asphodel`, restart every Hermes
+process that uses the profile (the gateway, and any CLI or TUI), and then
+delete the bank. Hermes' built-in memory stays off until you turn it back
+on.
+
+## Changing the embedding model
+
+A bank records the embedding and reranker models it was created under, and
+is served with its recorded embedding model until it's re-embedded. A bank
+recorded under a model the daemon doesn't carry is refused: recall and
+prefetch answer 503, and its chunks wait on the queue. So the image has to
+carry both embedding models for as long as any bank is still on the old
+one (`docs/models.md`, "Changing the embedding model").
+
+1. **Build an image with both models.** The release that changes the model
+   adds the new one to the manifest and keeps the old one as the previous
+   embedder. `nix/models.nix` lists every model the manifest does, and the
+   image build fails until it matches.
+2. **Calibrate the new floor.** Set the new model's
+   `reconcile.embedding_floors` entry from replay before the deploy. The
+   daemon won't start without it.
+3. **Deploy.** Banks keep serving with their recorded model. New banks get
+   the new one.
+4. **Re-embed each bank.** `asphodel reembed --bank B` starts a daemon job
+   that embeds the bank's memories with the new model into a side table,
+   then swaps them in with one transaction and records the new model.
+   Extraction carries on with the old model until the swap. The command
+   follows the job to the swap; `--no-wait` returns at once, and running it
+   again shows where the job stands. A restart resumes the job rather than
+   starting over.
+5. **Drop the old model** in a later release, once every bank has moved.
+   `asphodel bank config <bank>` with no fields changes nothing and prints
+   the model a bank is recorded under, and `asphodel reembed --bank B` says
+   when a bank is already on the daemon's model.
+
+A bank already refused because the daemon dropped its model recovers the
+same way: `asphodel reembed --bank B` needs only the daemon's model.
+
+A reranker-only change needs only its new `injection.reranker_floors`
+entry. Reranker scores aren't stored, so there's nothing to re-embed.

@@ -1,0 +1,57 @@
+# A one-off restore (ADR 0010, docs/operations.md "Restore"). Restore is
+# offline: scale the StatefulSet to zero first, so nothing holds the data-dir
+# lock, then apply this pod.
+#
+#   kubectl scale statefulset hermes --replicas=0
+#   kubectl apply -f restore.yaml        # set BACKUP below first
+#   kubectl logs -f asphodel-restore -c restore
+#   kubectl delete pod asphodel-restore
+#   kubectl scale statefulset hermes --replicas=1
+#
+# The init container fetches the backup with the same rclone secret the
+# backup job uses; `asphodel restore` checks its integrity and schema
+# version, moves the current database aside (it isn't deleted) and copies the
+# backup in.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: asphodel-restore
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+  initContainers:
+    - name: fetch
+      image: rclone/rclone:1
+      command: [sh, -c]
+      args: ['rclone copyto "$DESTINATION/$BACKUP" /backup/asphodel.db']
+      env:
+        - name: BACKUP
+          value: asphodel-20261002T033000Z.db
+      envFrom:
+        - secretRef:
+            name: asphodel-backup
+      volumeMounts:
+        - name: backup
+          mountPath: /backup
+  containers:
+    - name: restore
+      image: registry.example.com/asphodel:0.1.0
+      args: [restore, /backup/asphodel.db, --data-dir=/data]
+      volumeMounts:
+        - name: backup
+          mountPath: /backup
+          readOnly: true
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: backup
+      emptyDir:
+        sizeLimit: 5Gi
+    # The StatefulSet's claim for ordinal 0.
+    - name: data
+      persistentVolumeClaim:
+        claimName: asphodel-data-hermes-0

@@ -1,0 +1,75 @@
+# A nightly backup (ADR 0010). Asphodel has no destination, schedule or
+# retention of its own, so this job owns all three.
+#
+# The image has no shell, so the copy is taken in two steps: the init
+# container writes a checked file with `asphodel backup --out <file>`, which
+# verifies the length and SHA-256 and runs its own integrity check before
+# the file appears, and rclone uploads it under a timestamped name. Retention
+# is the bucket's lifecycle rule. Without a file in between, the stream would
+# reach the bucket before its hash was checked:
+#
+#   asphodel backup --out - | rclone rcat remote:asphodel/asphodel.db
+#
+# is fine from a host that has both binaries, but leaves a partial object
+# behind when the check fails.
+#
+# The rclone remote is configured from the `asphodel-backup` secret, e.g.
+#   kubectl create secret generic asphodel-backup \
+#     --from-literal=RCLONE_CONFIG_REMOTE_TYPE=s3 \
+#     --from-literal=RCLONE_CONFIG_REMOTE_PROVIDER=AWS \
+#     --from-literal=RCLONE_CONFIG_REMOTE_ENV_AUTH=false \
+#     --from-literal=RCLONE_CONFIG_REMOTE_ACCESS_KEY_ID=... \
+#     --from-literal=RCLONE_CONFIG_REMOTE_SECRET_ACCESS_KEY=... \
+#     --from-literal=RCLONE_CONFIG_REMOTE_REGION=... \
+#     --from-literal=DESTINATION=remote:my-bucket/asphodel
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: asphodel-backup
+spec:
+  schedule: "30 3 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+          initContainers:
+            - name: backup
+              image: registry.example.com/asphodel:0.1.0
+              args: [backup, --out=/backup/asphodel.db]
+              env:
+                - name: ASPHODEL_URL
+                  value: http://asphodel:7720
+                - name: ASPHODEL_TOKEN
+                  valueFrom:
+                    secretKeyRef: {name: asphodel, key: token}
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+          containers:
+            - name: upload
+              image: rclone/rclone:1
+              command: [sh, -c]
+              args:
+                - >-
+                  rclone copyto /backup/asphodel.db
+                  "$DESTINATION/asphodel-$(date -u +%Y%m%dT%H%M%SZ).db"
+              envFrom:
+                - secretRef:
+                    name: asphodel-backup
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+                  readOnly: true
+          volumes:
+            # The copy is the whole store, so size this to fit it.
+            - name: backup
+              emptyDir:
+                sizeLimit: 5Gi
