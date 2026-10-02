@@ -2364,6 +2364,73 @@ fn a_restored_store_keeps_its_fingerprint_and_pauses_purge_under_another() {
     assert!(out.contains(&backed_up) && out.contains(&current), "{out}");
 }
 
+/// SQL that undoes the latest registered migration, `SCHEMA_VERSION`'s, by
+/// dropping the tables and indexes it creates. It only handles a migration
+/// that creates tables and indexes and nothing else, and fails loudly on any
+/// other, so this test is extended when such a migration lands rather than
+/// downgrading to a schema no older binary wrote.
+fn undo_latest_migration() -> String {
+    use asphodel_core::store::SCHEMA_VERSION;
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../asphodel-core/migrations");
+    let mut files: Vec<(u32, PathBuf)> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            let version = name.split('_').next()?.parse().ok()?;
+            Some((version, path))
+        })
+        .collect();
+    files.sort();
+    let (version, path) = files.last().expect("migrations exist");
+    assert_eq!(
+        *version,
+        SCHEMA_VERSION,
+        "the newest migration file, {}, is the latest registered one",
+        path.display()
+    );
+    let sql = fs::read_to_string(path).unwrap();
+    let mut undo = Vec::new();
+    for statement in sql
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
+        let words: Vec<&str> = statement.split_whitespace().collect();
+        let upper: Vec<String> = words.iter().map(|word| word.to_uppercase()).collect();
+        let name = |at: usize| {
+            let at = if upper.get(at..at + 3) == Some(&["IF".into(), "NOT".into(), "EXISTS".into()])
+            {
+                at + 3
+            } else {
+                at
+            };
+            words[at].trim_end_matches('(').to_string()
+        };
+        match upper.iter().map(String::as_str).take(3).collect::<Vec<_>>()[..] {
+            ["CREATE", "TABLE", ..] => undo.push(format!("DROP TABLE IF EXISTS {};", name(2))),
+            ["CREATE", "VIRTUAL", "TABLE"] => {
+                undo.push(format!("DROP TABLE IF EXISTS {};", name(3)))
+            }
+            ["CREATE", "INDEX", ..] | ["CREATE", "UNIQUE", "INDEX"] => {
+                let at = if upper[1] == "UNIQUE" { 3 } else { 2 };
+                undo.push(format!("DROP INDEX IF EXISTS {};", name(at)))
+            }
+            _ => panic!(
+                "{} does more than create tables and indexes; extend this downgrade for it",
+                path.display()
+            ),
+        }
+    }
+    assert!(!undo.is_empty(), "{} creates nothing", path.display());
+    undo.join("\n")
+}
+
 #[test]
 fn an_older_backup_restores_into_a_new_data_dir_and_migrates_with_a_copy() {
     use asphodel_core::store::{OpenOptions, SCHEMA_VERSION, Store};
@@ -2382,21 +2449,31 @@ fn an_older_backup_restores_into_a_new_data_dir_and_migrates_with_a_copy() {
     succeeded(run(cli(&daemon).arg("backup").arg("--out").arg(&file)));
     drop(daemon);
 
-    // The copy put back to schema version 8, as that binary would have
-    // left a fresh store: no `sweep_progress`, which version 9 adds, and
-    // one migration row from 0 to 8.
+    // The copy put back one schema version, as the binary before the latest
+    // registered migration would have left a fresh store: without what that
+    // migration creates, and with one migration row from 0 to the version
+    // before it.
     let older = SCHEMA_VERSION - 1;
-    assert_eq!(older, 8, "this downgrade undoes version 9 only");
     let older_file = dir.path("older.db");
     fs::copy(&file, &older_file).unwrap();
-    rusqlite::Connection::open(&older_file)
-        .unwrap()
-        .execute_batch(
-            "DROP TABLE sweep_progress;
-             UPDATE migrations SET to_version = 8 WHERE to_version = 9;
-             PRAGMA user_version = 8;",
-        )
+    let conn = rusqlite::Connection::open(&older_file).unwrap();
+    let latest: u32 = conn
+        .query_row("SELECT MAX(to_version) FROM migrations", [], |row| {
+            row.get(0)
+        })
         .unwrap();
+    assert_eq!(
+        latest, SCHEMA_VERSION,
+        "the backup is at the latest registered migration"
+    );
+    conn.execute_batch(&undo_latest_migration()).unwrap();
+    conn.execute(
+        "UPDATE migrations SET to_version = ?1 WHERE to_version = ?2",
+        (older, SCHEMA_VERSION),
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", older).unwrap();
+    drop(conn);
 
     // The data dir doesn't exist yet, nor does its parent.
     let data = dir.path("volume").join("data");
