@@ -9,8 +9,9 @@
 #
 # The cat is stated again after its memory was purged. Reconciliation has
 # nothing to match, so it comes back as a new memory, and the shadow table
-# counts it as purged then re-mentioned: 3 purges by the end (the cat, its
-# re-mention and the bus) and 1 re-mention.
+# counts it as purged then re-mentioned: 5 purges by the end (the cat, its
+# re-mention, the bus, the single minor and the single notable) and
+# 1 re-mention, a rate of 0.2.
 
 name = "purge-table"
 group = "ci"

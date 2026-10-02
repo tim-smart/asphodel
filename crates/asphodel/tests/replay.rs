@@ -367,12 +367,14 @@ fn the_purge_table_reproduces_adr_0008_and_the_shadow_table_counts_re_mentions()
     let run = replay(&dir, &scenario("purge-table"), &[]);
     run.assert_passed();
     let report = run.report();
-    assert_eq!(purges(report), 3, "{}", report["purges_per_day"]);
+    // ADR 0008 protects the reinforced memories and the major one, not
+    // the single minor/notable mentions. Both purge before the run ends.
+    assert_eq!(purges(report), 5, "{}", report["purges_per_day"]);
     let shadow = &report["purged_then_re_mentioned"];
-    assert_eq!(shadow["purged"], 3, "{shadow}");
+    assert_eq!(shadow["purged"], 5, "{shadow}");
     assert_eq!(shadow["re_mentioned"], 1, "{shadow}");
     let rate = shadow["rate"].as_f64().expect("a rate");
-    assert!((rate - 1.0 / 3.0).abs() < 1e-3, "{shadow}");
+    assert!((rate - 0.2).abs() < 1e-3, "{shadow}");
 }
 
 #[test]
@@ -446,6 +448,174 @@ fn until_keeps_sweeping_past_the_last_turn() {
         2,
         "{}",
         run.report()["purges_per_day"]
+    );
+}
+
+#[test]
+fn scheduled_model_refreshes_are_counted_on_their_bank_local_day() {
+    let dir = TestDir::new();
+    let path = inline(
+        &dir,
+        "scheduled-refreshes",
+        &format!(
+            r#"
+[bank]
+timezone = "Pacific/Auckland"
+
+[[model]]
+name = "profile"
+question = "Who is the user?"
+kinds = ["fact"]
+max_tokens = 100
+
+{HOME_TURN}
+
+[[probe]]
+at = "2026-01-05T09:00:00Z"
+kind = "exists"
+memory = "home"
+"#
+        ),
+    );
+    let before = replay(&dir, &path, &["--until", "2026-01-05T09:04:59Z"]);
+    before.assert_passed();
+    assert_eq!(
+        before.report()["refresh_calls_per_day"],
+        serde_json::json!([])
+    );
+
+    let debounced = replay(&dir, &path, &["--until", "2026-01-05T09:05:00Z"]);
+    debounced.assert_passed();
+    assert_eq!(debounced.report()["flags"]["refresh"], "scripted");
+    assert_eq!(
+        debounced.report()["refresh_calls_per_day"],
+        serde_json::json!([{ "day": "2026-01-05", "count": 1 }])
+    );
+
+    let daily_path = dir.file(
+        "daily-refresh.toml",
+        &format!(
+            r#"{}
+# A minor write changes the inputs without requesting a notable-write
+# refresh. The daily sweep must pick it up at 04:00 bank-local.
+[[turn]]
+at = "2026-01-05T14:00:00Z"
+session = "s1"
+user = "My bicycle is blue."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "bicycle"
+content = "Tim's bicycle is blue."
+quote = "My bicycle is blue"
+kind = "fact"
+significance = "minor"
+"#,
+            fs::read_to_string(&path).unwrap()
+        ),
+    );
+    let before_sweep = replay(&dir, &daily_path, &["--until", "2026-01-05T14:59:59Z"]);
+    before_sweep.assert_passed();
+    assert_eq!(
+        before_sweep.report()["refresh_calls_per_day"],
+        debounced.report()["refresh_calls_per_day"]
+    );
+    let swept = replay(&dir, &daily_path, &["--until", "2026-01-05T15:00:00Z"]);
+    swept.assert_passed();
+    // ADR 0007's seeded "User profile" also refreshes at the sweep.
+    // Only the explicit model had a creation-triggered debounce earlier.
+    assert_eq!(
+        swept.report()["refresh_calls_per_day"],
+        serde_json::json!([
+            { "day": "2026-01-05", "count": 1 },
+            { "day": "2026-01-06", "count": 2 }
+        ])
+    );
+    assert_eq!(swept.report()["llm"]["live"], 0);
+    let unchanged = replay(&dir, &daily_path, &["--until", "2026-01-06T15:00:00Z"]);
+    unchanged.assert_passed();
+    assert_eq!(
+        unchanged.report()["refresh_calls_per_day"],
+        swept.report()["refresh_calls_per_day"],
+        "an unchanged fingerprint skips the next day's LLM calls"
+    );
+}
+
+#[test]
+fn a_multi_chunk_document_routes_claims_by_quote_and_has_distinct_stable_ids() {
+    let dir = TestDir::new();
+    let path = inline(
+        &dir,
+        "multi-chunk",
+        r##"
+latency = "10m"
+
+[[document]]
+at = "2026-01-05T09:00:00Z"
+id = "notes"
+reference_date = "2026-01-05"
+text = "# Home\nTim lives in Auckland.\n\n# Transport\nTim's bicycle is blue."
+
+# Deliberately reverse document order: assignment must follow the quote,
+# not the ordinal in the scenario's claim list.
+[[document.claim]]
+label = "bicycle"
+content = "Tim's bicycle is blue."
+quote = "Tim's bicycle is blue"
+kind = "fact"
+significance = "minor"
+
+[[document.claim]]
+label = "home"
+content = "Tim lives in Auckland."
+quote = "Tim lives in Auckland"
+kind = "fact"
+significance = "minor"
+
+[[probe]]
+at = "2026-01-05T09:05:00Z"
+kind = "absent"
+memory = "home"
+
+[[probe]]
+at = "2026-01-05T09:05:00Z"
+kind = "absent"
+memory = "bicycle"
+
+[[probe]]
+id = "home-extracted"
+at = "2026-01-05T09:10:00Z"
+kind = "exists"
+memory = "home"
+head = true
+
+[[probe]]
+id = "bicycle-extracted"
+at = "2026-01-05T09:10:00Z"
+kind = "exists"
+memory = "bicycle"
+head = true
+"##,
+    );
+    let run = replay(&dir, &path, &[]);
+    run.assert_passed();
+    let home = &run.probe("home-extracted")["observed"]["id"];
+    let bicycle = &run.probe("bicycle-extracted")["observed"]["id"];
+    assert!(home.is_string() && bicycle.is_string(), "{home} {bicycle}");
+    assert_ne!(
+        home, bicycle,
+        "the first claim in each chunk needs its own id"
+    );
+    assert_eq!(run.report()["extraction_lag"]["samples"], 2);
+    assert_eq!(run.report()["extraction_lag"]["p50_ms"], 600_000);
+    assert_eq!(run.report()["extraction_lag"]["p95_ms"], 600_000);
+
+    let other = TestDir::new();
+    let repeated = replay(&other, &path, &[]);
+    repeated.assert_passed();
+    assert_eq!(
+        fs::read(&run.report_path).unwrap(),
+        fs::read(&repeated.report_path).unwrap()
     );
 }
 
