@@ -1,0 +1,72 @@
+# Extraction latency in simulated time (TIM-96, decision 3). With a
+# ten-minute latency, a turn synced at 09:00 has its memories from 09:10,
+# and a second turn synced at 09:02 waits for the bank's one extraction
+# worker: its completion is the later of its sync and the previous
+# completion, plus the latency, so 09:20. A probe between a sync and its
+# completion sees the store without that turn's memories.
+#
+# `--latency` overrides the scenario's latency; the test runs it with `0s`
+# to see the first probe fail. Bank time runs at world speed so the same
+# file serves the `--until` test: both memories are trivial and are purged
+# at the first sweep after day 262.8.
+
+name = "extraction-latency"
+group = "ci"
+description = "A turn's memories exist from its completion event, and a bank's completions queue behind each other."
+latency = "10m"
+
+[bank]
+timezone = "UTC"
+
+[tuning]
+clock.quiet_rate = 1.0
+
+[[turn]]
+at = "2026-01-05T09:00:00Z"
+session = "s1"
+user = "My favourite tea is Earl Grey."
+assistant = "A classic."
+
+[[turn.claim]]
+label = "tea"
+content = "Tim's favourite tea is Earl Grey."
+quote = "My favourite tea is Earl Grey"
+kind = "fact"
+significance = "trivial"
+
+[[turn]]
+at = "2026-01-05T09:02:00Z"
+session = "s2"
+user = "My favourite biscuit is shortbread."
+assistant = "Also a classic."
+
+[[turn.claim]]
+label = "biscuit"
+content = "Tim's favourite biscuit is shortbread."
+quote = "My favourite biscuit is shortbread"
+kind = "fact"
+significance = "trivial"
+
+[[probe]]
+id = "first-turn-not-yet-extracted"
+at = "2026-01-05T09:05:00Z"
+kind = "absent"
+memory = "tea"
+
+[[probe]]
+id = "first-turn-extracted-after-its-latency"
+at = "2026-01-05T09:15:00Z"
+kind = "exists"
+memory = "tea"
+
+[[probe]]
+id = "second-turn-waits-for-the-worker"
+at = "2026-01-05T09:15:00Z"
+kind = "absent"
+memory = "biscuit"
+
+[[probe]]
+id = "second-turn-extracted-after-both-latencies"
+at = "2026-01-05T09:25:00Z"
+kind = "exists"
+memory = "biscuit"

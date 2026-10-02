@@ -119,6 +119,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]

@@ -1,0 +1,91 @@
+# TIM-91's lifetimes table through the store: one mention at each
+# significance level, and how long it stays in recall. Bank time runs at
+# world speed here, so the table's bank days read as days. The ranges are
+# 5% either side of the closed-form crossing, e^((S·σ − τ) / a) days after
+# the mention: 15.09, 62.98, 262.8, 1096.6 and 4576 days.
+
+name = "lifetimes"
+group = "ci"
+description = "One mention fades at 15 days, 2 months, 9 months, 3 years and 12 years of bank time."
+
+[bank]
+timezone = "UTC"
+
+[tuning]
+clock.quiet_rate = 1.0
+
+[[turn]]
+at = "2026-01-05T09:00:00Z"
+session = "s1"
+user = "Some things about me: my neighbour's cat is called Biscuit, I take my coffee black, I grew up in Dunedin, my daughter is called Ada, and I am allergic to penicillin."
+assistant = "Thanks, I'll remember those."
+
+[[turn.claim]]
+label = "trivial"
+content = "Tim's neighbour's cat is called Biscuit."
+quote = "my neighbour's cat is called Biscuit"
+kind = "fact"
+significance = "trivial"
+
+[[turn.claim]]
+label = "minor"
+content = "Tim takes his coffee black."
+quote = "I take my coffee black"
+kind = "fact"
+significance = "minor"
+
+[[turn.claim]]
+label = "notable"
+content = "Tim grew up in Dunedin."
+quote = "I grew up in Dunedin"
+kind = "fact"
+significance = "notable"
+
+[[turn.claim]]
+label = "major"
+content = "Tim's daughter is called Ada."
+quote = "my daughter is called Ada"
+kind = "fact"
+significance = "major"
+
+[[turn.claim]]
+label = "critical"
+content = "Tim is allergic to penicillin."
+quote = "I am allergic to penicillin"
+kind = "fact"
+significance = "critical"
+
+[[probe]]
+id = "trivial-fades"
+at = "2026-01-22T09:00:00Z"
+kind = "faded_at"
+memory = "trivial"
+between = ["2026-01-19T17:08:23Z", "2026-01-21T05:21:54Z"]
+
+[[probe]]
+id = "minor-fades"
+at = "2026-03-14T09:00:00Z"
+kind = "faded_at"
+memory = "minor"
+between = ["2026-03-06T05:00:06Z", "2026-03-12T12:09:35Z"]
+
+[[probe]]
+id = "notable-fades"
+at = "2026-10-09T09:00:00Z"
+kind = "faded_at"
+memory = "notable"
+between = ["2026-09-12T01:03:08Z", "2026-10-08T07:47:40Z"]
+
+[[probe]]
+id = "major-fades"
+at = "2029-03-03T09:00:00Z"
+kind = "faded_at"
+memory = "major"
+between = ["2028-11-12T04:14:11Z", "2029-03-01T20:09:22Z"]
+
+[[probe]]
+id = "critical-fades"
+at = "2039-03-04T09:00:00Z"
+kind = "faded_at"
+memory = "critical"
+between = ["2037-11-30T12:51:05Z", "2039-03-03T03:09:06Z"]
