@@ -620,6 +620,85 @@ head = true
     );
 }
 
+#[test]
+fn a_turn_between_a_documents_chunks_costs_the_rest_another_latency() {
+    let dir = TestDir::new();
+    let path = inline(
+        &dir,
+        "interrupted-document",
+        r##"
+latency = "10m"
+
+[[document]]
+at = "2026-01-05T09:00:00Z"
+id = "notes"
+reference_date = "2026-01-05"
+text = "# Home\nTim lives in Auckland.\n\n# Transport\nTim's bicycle is blue."
+
+[[document.claim]]
+label = "bicycle"
+content = "Tim's bicycle is blue."
+quote = "Tim's bicycle is blue"
+kind = "fact"
+significance = "minor"
+
+[[document.claim]]
+label = "home"
+content = "Tim lives in Auckland."
+quote = "Tim lives in Auckland"
+kind = "fact"
+significance = "minor"
+
+[[turn]]
+at = "2026-01-05T09:05:00Z"
+session = "s1"
+user = "My favourite tea is Earl Grey."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "tea"
+content = "Tim's favourite tea is Earl Grey."
+quote = "My favourite tea is Earl Grey"
+kind = "fact"
+significance = "minor"
+
+[[probe]]
+at = "2026-01-05T09:15:00Z"
+kind = "exists"
+memory = "home"
+
+[[probe]]
+at = "2026-01-05T09:15:00Z"
+kind = "absent"
+memory = "bicycle"
+
+[[probe]]
+at = "2026-01-05T09:15:00Z"
+kind = "absent"
+memory = "tea"
+
+[[probe]]
+at = "2026-01-05T09:25:00Z"
+kind = "exists"
+memory = "tea"
+
+[[probe]]
+at = "2026-01-05T09:25:00Z"
+kind = "absent"
+memory = "bicycle"
+
+[[probe]]
+at = "2026-01-05T09:35:00Z"
+kind = "exists"
+memory = "bicycle"
+"##,
+    );
+    let run = replay(&dir, &path, &[]);
+    run.assert_passed();
+    assert_eq!(run.report()["extraction_lag"]["samples"], 3);
+    assert_eq!(run.report()["extraction_lag"]["p95_ms"], 1_800_000);
+}
+
 // The report.
 
 #[test]
@@ -1049,6 +1128,123 @@ fn a_report_path_that_is_a_symlink_is_refused() {
     );
     run.assert_refused("symlink");
     assert_eq!(fs::read(&target).unwrap(), b"untouched");
+}
+
+/// Reserved report destinations must be rejected before resetting a
+/// previously populated store. The second scenario has different memories,
+/// so a reset cannot hide behind reproducing the first run's contents.
+fn assert_reserved_report(destination: &str) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = TestDir::new();
+    let seed = inline(
+        &dir,
+        "reserved-report-seed",
+        &format!(
+            "{HOME_TURN}\n[[probe]]\nat = \"2026-01-05T09:01:00Z\"\nkind = \"exists\"\nmemory = \"home\"\n"
+        ),
+    );
+    replay(&dir, &seed, &[]).assert_passed();
+    let private = dir.replay_dir();
+    let db = private.join("store/asphodel.db");
+    let before = fs::read(&db).unwrap();
+    let lock = private.join("lock");
+    let lock_inode = fs::metadata(&lock).unwrap().ino();
+    let sentinel = private.join("store/nested/pre-run-contents");
+    fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    fs::write(&sentinel, b"keep the pre-run store, including descendants").unwrap();
+    let marker = private.join("store/replay-store");
+    let marker_before = fs::read(&marker).unwrap();
+
+    let target = private.join(destination);
+    let shadow_sentinel = destination.starts_with("shadow.db");
+    if shadow_sentinel {
+        fs::write(&target, b"keep the pre-run shadow file").unwrap();
+    }
+    let run = replay(
+        &dir,
+        &scenario("extraction-latency"),
+        &["--report", target.to_str().unwrap()],
+    );
+
+    // Check preservation even when the exit code or diagnostic is wrong.
+    assert!(
+        fs::read(&db).unwrap() == before,
+        "report destination {destination:?} changed the pre-run database"
+    );
+    assert_eq!(
+        fs::read(&sentinel).unwrap(),
+        b"keep the pre-run store, including descendants",
+        "report destination {destination:?} reset the store"
+    );
+    assert_eq!(fs::read(&marker).unwrap(), marker_before);
+    assert_eq!(
+        fs::metadata(&lock).unwrap().ino(),
+        lock_inode,
+        "report destination {destination:?} replaced the private lock inode"
+    );
+    if shadow_sentinel {
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"keep the pre-run shadow file",
+            "report destination {destination:?} overwrote the shadow sentinel"
+        );
+    }
+    run.assert_refused("reserved");
+}
+
+#[test]
+#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
+fn a_report_over_the_private_directory_is_refused() {
+    assert_reserved_report("");
+}
+
+#[test]
+#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
+fn a_report_over_the_replay_lock_is_refused() {
+    assert_reserved_report("lock");
+}
+
+#[test]
+#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
+fn a_report_over_the_shadow_table_is_refused() {
+    assert_reserved_report("shadow.db");
+}
+
+#[test]
+#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
+fn a_report_over_the_shadow_journal_is_refused() {
+    assert_reserved_report("shadow.db-journal");
+}
+
+#[test]
+#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
+fn a_report_over_the_shadow_wal_is_refused() {
+    assert_reserved_report("shadow.db-wal");
+}
+
+#[test]
+#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
+fn a_report_over_the_shadow_shared_memory_is_refused() {
+    assert_reserved_report("shadow.db-shm");
+}
+
+#[test]
+#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
+fn a_report_over_the_store_directory_is_refused() {
+    assert_reserved_report("store");
+}
+
+#[test]
+#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
+fn a_report_inside_the_store_is_refused() {
+    assert_reserved_report("store/asphodel.db");
+}
+
+#[test]
+#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
+fn a_report_inside_a_store_descendant_is_refused() {
+    assert_reserved_report("store/nested/pre-run-contents");
 }
 
 /// Finding 4: the engine schedules a completion per source and then claims
