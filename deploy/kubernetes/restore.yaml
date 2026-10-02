@@ -1,12 +1,19 @@
 # A one-off restore (ADR 0010, docs/operations.md "Restore"). Restore is
-# offline: scale the StatefulSet to zero first, so nothing holds the data-dir
-# lock, then apply this pod.
+# offline and takes the data-dir lock without waiting, so the old pod must be
+# gone, not just scaled away, before this one starts.
 #
 #   kubectl scale statefulset hermes --replicas=0
+#   kubectl wait --for=delete pod/hermes-0 --timeout=5m
 #   kubectl apply -f restore.yaml        # set BACKUP below first
-#   kubectl logs -f asphodel-restore -c restore
+#   kubectl wait --for=jsonpath='{.status.phase}'=Succeeded \
+#     pod/asphodel-restore --timeout=15m
+#   kubectl logs asphodel-restore -c restore
 #   kubectl delete pod asphodel-restore
 #   kubectl scale statefulset hermes --replicas=1
+#
+# The pod never restarts, so it ends Succeeded only when both containers
+# exited 0. If the wait fails, read the logs of both containers. A failed
+# restore leaves the live store as it was.
 #
 # The init container fetches the backup with the same rclone secret the
 # backup job uses; `asphodel restore` checks its integrity and schema

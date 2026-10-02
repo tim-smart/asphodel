@@ -72,7 +72,11 @@ it (ADR 0010). During a change the image carries both models: the daemon
 runs the new one and keeps the old one for banks still recorded under it
 (`Service::with_previous_embedder`). The manifest lists one embedding
 model today, so a change adds the new model to it and keeps the old one as
-the previous embedder until every bank has moved.
+the previous embedder until every bank has moved. Only the fakes load a
+previous embedder so far. For the ONNX models, `Models::load` takes the
+manifest's first two entries as the embedder and reranker, so the first
+release that changes the model has to teach the loader and `serve` about
+the previous one (`docs/operations.md`, "Changing the embedding model").
 
 A bank recorded under a model the daemon doesn't carry is refused rather
 than served with another model, whose vectors aren't comparable with its

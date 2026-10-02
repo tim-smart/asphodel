@@ -317,16 +317,21 @@ shell, so the job takes the copy in two steps: an init container runs
 Service, and an rclone container uploads the checked file under a
 timestamped name. Retention is the bucket's lifecycle rule.
 
-From a host with a shell, the stream can go straight to its destination:
+From a host with Bash, the stream can go straight to its destination:
 
-```sh
+```bash
+set -o pipefail
 kubectl exec hermes-0 -c asphodel -- asphodel backup --out - \
   | rclone rcat "remote:my-bucket/asphodel/asphodel-$(date -u +%Y%m%dT%H%M%SZ).db"
 ```
 
-The hash is checked as the stream ends, after the upload has started, so a
-failed check exits non-zero but leaves a partial object behind. Writing to
-a file first avoids that.
+`pipefail` matters. `asphodel backup` checks the length and hash only
+once the whole stream has been written, and rclone uploads whatever it
+received and exits 0. Without `pipefail` the pipeline's status is rclone's,
+so a failed check would still count as a good backup to whatever scheduled
+it. With it, the pipeline fails, but the bad object is already in the
+bucket and has to be deleted. Writing to a file first, as the CronJob does,
+means nothing is uploaded unless the copy passed.
 
 Hermes' own backup doesn't cover Asphodel: the plugin's `backup_paths()` is
 empty, because the data lives in the sidecar.
@@ -335,20 +340,53 @@ empty, because the data lives in the sidecar.
 
 Restore is offline. `asphodel restore <file> --data-dir <dir>` takes the
 data-dir lock, checks the backup's integrity and that its schema version
-isn't newer than the binary, moves the current database aside (it isn't
-deleted), copies the backup in, and writes a `restored` edit row with the
-backup time, the restore time and the binary version.
+isn't newer than the binary, copies the backup in beside the live
+database with a `restored` edit row (the backup time, the restore time and
+the binary version), and only then moves the current database aside (it
+isn't deleted) and puts the copy in its place. A restore that fails at any
+step leaves the live store as it was.
 
-In Kubernetes:
+The lock is taken without waiting: if a daemon still holds it, restore
+fails at once rather than queueing behind it. In Kubernetes:
 
-1. Scale the StatefulSet to zero: `kubectl scale statefulset hermes
-   --replicas=0`. That stops Hermes too, so no turns arrive meanwhile.
+1. Scale the StatefulSet to zero, and wait for the pod to be gone. Scaling
+   returns at once, while the old pod can take up to its 120 s grace period
+   to drain, and on the same node a `ReadWriteOnce` volume can be mounted
+   by both pods.
+
+   ```sh
+   kubectl scale statefulset hermes --replicas=0
+   kubectl wait --for=delete pod/hermes-0 --timeout=5m
+   ```
+
+   That stops Hermes too, so no turns arrive meanwhile.
 2. Set the backup's name in `deploy/kubernetes/restore.yaml` and apply it.
    Its init container fetches the backup with the same rclone secret the
    backup job uses, and its main container runs `asphodel restore`.
-3. Check `kubectl logs asphodel-restore -c restore`, then delete the pod.
-4. Scale back to one replica, wait for it to be ready, and run `asphodel
-   status`.
+3. Wait for the pod to succeed. The pod never restarts, so it ends
+   `Succeeded` only when both containers exited 0, and `Failed` otherwise.
+
+   ```sh
+   kubectl apply -f deploy/kubernetes/restore.yaml
+   kubectl wait --for=jsonpath='{.status.phase}'=Succeeded \
+     pod/asphodel-restore --timeout=15m
+   kubectl logs asphodel-restore -c restore
+   ```
+
+   The log names the schema version and where the old database was moved.
+   If the wait fails, check `kubectl get pod asphodel-restore` and the logs
+   of both containers (`-c fetch`, `-c restore`). Don't count the restore
+   as done: the live store is unchanged, and scaling back up serves it as
+   it was.
+4. Delete the pod, scale back to one replica, wait for it to be ready, and
+   run `asphodel status`.
+
+   ```sh
+   kubectl delete pod asphodel-restore
+   kubectl scale statefulset hermes --replicas=1
+   kubectl rollout status statefulset hermes
+   kubectl exec hermes-0 -c asphodel -- asphodel status
+   ```
 
 Then check what the restore changed:
 
@@ -454,13 +492,30 @@ prefetch answer 503, and its chunks wait on the queue. So the image has to
 carry both embedding models for as long as any bank is still on the old
 one (`docs/models.md`, "Changing the embedding model").
 
-1. **Build an image with both models.** The release that changes the model
-   adds the new one to the manifest and keeps the old one as the previous
-   embedder. `nix/models.nix` lists every model the manifest does, and the
-   image build fails until it matches.
+**Today's daemon can't do this with the real models yet.** Serving two
+embedding models works only on the fakes (`ASPHODEL_MODELS=fake-v2`). For
+the ONNX models, `Models::load` reads the manifest's first entry as the
+embedder and its second as the reranker, and `serve` registers no previous
+embedder. Adding a model to the manifest and the image isn't enough on its
+own. Before the first release that changes the embedding model, the code
+has to:
+
+- tell the manifest's current embedder, previous embedder and reranker
+  apart, rather than going by position;
+- load the previous embedder from the model dir and register it with
+  `Service::with_previous_embedder`, as the `fake-v2` path does;
+- keep failing fast when any of the three is missing or corrupt.
+
+With that in place, a change goes like this:
+
+1. **Build an image with both models.** The release adds the new model to
+   the manifest and keeps the old one as the previous embedder.
+   `nix/models.nix` lists every model the manifest does, and the image
+   build fails until it matches.
 2. **Calibrate the new floor.** Set the new model's
    `reconcile.embedding_floors` entry from replay before the deploy. The
-   daemon won't start without it.
+   daemon won't start without it. Keep the old model's entry as well,
+   because banks still on it reconcile against it until they move.
 3. **Deploy.** Banks keep serving with their recorded model. New banks get
    the new one.
 4. **Re-embed each bank.** `asphodel reembed --bank B` starts a daemon job

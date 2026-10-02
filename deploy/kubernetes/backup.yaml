@@ -6,12 +6,14 @@
 # verifies the length and SHA-256 and runs its own integrity check before
 # the file appears, and rclone uploads it under a timestamped name. Retention
 # is the bucket's lifecycle rule. Without a file in between, the stream would
-# reach the bucket before its hash was checked:
+# reach the bucket before its hash was checked. From a host with Bash and
+# both binaries,
 #
+#   set -o pipefail
 #   asphodel backup --out - | rclone rcat remote:asphodel/asphodel.db
 #
-# is fine from a host that has both binaries, but leaves a partial object
-# behind when the check fails.
+# fails when the check fails, but leaves the bad object in the bucket.
+# Without pipefail it reports success.
 #
 # The rclone remote is configured from the `asphodel-backup` secret, e.g.
 #   kubectl create secret generic asphodel-backup \
