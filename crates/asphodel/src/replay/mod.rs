@@ -33,7 +33,9 @@ pub mod corpus;
 pub mod diff;
 pub mod engine;
 pub mod history;
+pub mod html;
 pub mod import;
+pub mod labelling;
 pub mod manifest;
 pub mod probes;
 pub mod report;
@@ -201,6 +203,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             latency,
             latency_from_cassette: false,
             until: args.until,
+            labelling: false,
         };
         let engine = Engine::new(
             &service,

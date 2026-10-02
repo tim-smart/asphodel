@@ -54,6 +54,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::cassette::{Chained, ChunkContext, ChunkKey, Recorder};
+use super::labelling::{Collector, Material};
 use super::report::{
     Call2Rate, DayCount, InjectedTokens, Lag, LlmCounts, MemoryOutcome, Percentiles, ProbeResult,
     SessionTokens, WeekBands, WeekCount,
@@ -115,6 +116,8 @@ pub struct Settings {
     /// live call. Otherwise `latency`.
     pub latency_from_cassette: bool,
     pub until: Option<Timestamp>,
+    /// Collect the labelling material (TIM-96, decision 6).
+    pub labelling: bool,
 }
 
 /// What a run produced for the report.
@@ -135,6 +138,8 @@ pub struct Outcome {
     pub llm: LlmCounts,
     pub created: Vec<Created>,
     pub shadow: Vec<ShadowRow>,
+    /// The labelling material, when the settings asked for it.
+    pub material: Option<Material>,
 }
 
 /// A turn as the engine plays it.
@@ -280,6 +285,8 @@ pub struct Engine<'a> {
     agenda_lines: BTreeMap<String, u64>,
     significance_histogram: BTreeMap<String, u64>,
     kind_histogram: BTreeMap<String, u64>,
+    /// The labelling material as it's collected.
+    labelling: Option<Collector>,
 }
 
 impl<'a> Engine<'a> {
@@ -307,6 +314,7 @@ impl<'a> Engine<'a> {
                 .collect::<Result<_, _>>()
                 .map_err(|_| Failure::Scenario("a probe's memory regex doesn't parse".into()))?,
         };
+        let labelling = settings.labelling.then(Collector::default);
         let mut engine = Self {
             service,
             clock: Arc::clone(&clock),
@@ -348,6 +356,7 @@ impl<'a> Engine<'a> {
             agenda_lines: BTreeMap::new(),
             significance_histogram: BTreeMap::new(),
             kind_histogram: BTreeMap::new(),
+            labelling,
         };
         engine.plan();
         Ok(engine)
@@ -464,7 +473,7 @@ impl<'a> Engine<'a> {
 
     fn prefetch(&mut self, index: usize) -> Result<(), Failure> {
         let turn = &self.turns[index];
-        let prefetch = self.service.prefetch(
+        let scored = self.service.scored_prefetch(
             &self.settings.bank,
             &PrefetchRequest {
                 session_id: turn.session.clone(),
@@ -473,6 +482,15 @@ impl<'a> Engine<'a> {
                 block_id: None,
             },
         )?;
+        // The material samples synced turns: what a turn is shown, which
+        // cron prefetches and probes aren't.
+        if let Some(collector) = &mut self.labelling
+            && turn.class == SessionClass::Primary
+            && !turn.prefetch_only
+        {
+            collector.turn(turn.at, &turn.session, &scored.query, &scored.candidates);
+        }
+        let prefetch = scored.prefetch;
         let tokens = estimate_tokens(&prefetch.text) as u64;
         match turn.class {
             SessionClass::Cron => {
@@ -729,6 +747,13 @@ impl<'a> Engine<'a> {
                 (prepared, latency)
             }
         };
+        if self.labelling.is_some() {
+            let lists = self.service.call2_lists(&prepared)?;
+            let now = self.clock.now();
+            if let Some(collector) = &mut self.labelling {
+                collector.call2(now, lists);
+            }
+        }
         Ok(Ready {
             prepared,
             source,
@@ -1375,6 +1400,7 @@ impl<'a> Engine<'a> {
             llm,
             created: self.created,
             shadow: self.shadow,
+            material: self.labelling.map(Collector::finish),
         })
     }
 }

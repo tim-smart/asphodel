@@ -500,13 +500,25 @@ impl Service {
     /// injection, holding it as the session's pending set until the turn
     /// that echoes its `recall_id` ([`crate::retrieval`]).
     pub fn prefetch(&self, bank: &str, request: &PrefetchRequest) -> Result<Prefetch, RecallError> {
+        self.scored_prefetch(bank, request)
+            .map(|scored| scored.prefetch)
+    }
+
+    /// [`Service::prefetch`], also returning what the gate was shown: the
+    /// query and every reranked candidate with its logit, for replay's
+    /// labelling material (TIM-96, decision 6).
+    pub fn scored_prefetch(
+        &self,
+        bank: &str,
+        request: &PrefetchRequest,
+    ) -> Result<crate::retrieval::ScoredPrefetch, RecallError> {
         if let Ok(bank_id) = self.bank_id(bank) {
             if let Some(block) = request.block_id {
                 self.map_held_block(bank_id, &request.session_id, block)?;
             }
             self.restore_block(bank_id, &request.session_id)?;
         }
-        crate::retrieval::prefetch(&self.retrieval()?, bank, request)
+        crate::retrieval::scored_prefetch(&self.retrieval()?, bank, request)
     }
 
     /// Explicit recall, as the `memory_recall` tool asks for it
@@ -685,6 +697,16 @@ impl Service {
             in_context,
             entries,
         )
+    }
+
+    /// The candidate lists call 2 was shown for a prepared chunk, with each
+    /// neighbour's similarity to its claim, for replay's labelling material
+    /// (TIM-96, decision 6). Reads only.
+    pub fn call2_lists(
+        &self,
+        prepared: &crate::extraction::Prepared,
+    ) -> Result<Vec<crate::extraction::Call2List>, StoreError> {
+        crate::extraction::call2_lists(&self.store, prepared)
     }
 
     /// The second half of [`Service::extract_leased`]: commits a prepared

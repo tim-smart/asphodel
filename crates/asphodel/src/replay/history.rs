@@ -81,6 +81,11 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         .as_deref()
         .map(|path| super::aggregate_path(path, &dir))
         .transpose()?;
+    let labelling_path = args
+        .labelling
+        .as_deref()
+        .map(|path| super::inside_private(&dir, path, "the labelling material"))
+        .transpose()?;
     let shadow_path = dir.join(SHADOW_FILE);
     super::refuse_symlink(&shadow_path)?;
 
@@ -141,7 +146,8 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         _ => "request",
     };
 
-    super::deliver(args, &report_path, aggregate_path.as_deref(), || {
+    let mut material = None;
+    let finished = super::deliver(args, &report_path, aggregate_path.as_deref(), || {
         let clock = Arc::new(SimulatedClock::new(start));
         let store = super::open_store(&dir, Arc::clone(&clock) as Arc<dyn Clock>)?;
         store.check_fingerprint(&tuning.deletion_fingerprint())?;
@@ -168,6 +174,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             latency: latency.unwrap_or(jiff::SignedDuration::ZERO),
             latency_from_cassette: latency.is_none(),
             until: args.until,
+            labelling: labelling_path.is_some(),
         };
         let engine = Engine::new(
             &service,
@@ -178,7 +185,8 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             Llm::Recorded(&recorder, mode),
         )
         .map_err(failure)?;
-        let outcome = engine.run().map_err(failure)?;
+        let mut outcome = engine.run().map_err(failure)?;
+        material = outcome.material.take();
         let purged_then_re_mentioned =
             super::write_shadow(&service, &tuning, &shadow_path, &outcome)?;
         Ok(Report {
@@ -217,7 +225,14 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             memories: outcome.memories,
             llm: outcome.llm,
         })
-    })
+    })?;
+    if let (Some(path), Some(material)) = (&labelling_path, material) {
+        let mut json = serde_json::to_vec_pretty(&material)?;
+        json.push(b'\n');
+        super::write_file(path, &json)
+            .with_context(|| format!("writing the labelling material to {}", path.display()))?;
+    }
+    Ok(finished)
 }
 
 fn mode_name(mode: ReplayMode) -> &'static str {

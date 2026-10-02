@@ -569,6 +569,38 @@ impl Prepared {
     }
 }
 
+/// A claim and the neighbours call 2 was shown for it, for replay's
+/// labelling material (TIM-96, decision 6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call2List {
+    /// The claim's sentence.
+    pub claim: String,
+    pub candidates: Vec<Call2Candidate>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call2Candidate {
+    pub memory: Uuid,
+    pub sentence: String,
+    /// The claim's cosine similarity to it, which the reconcile floor
+    /// compares; `None` when its vector has gone since.
+    pub similarity: Option<f64>,
+}
+
+/// The lists call 2 was shown for a prepared chunk, one per claim; empty
+/// when call 2 didn't run. Only what call 2 was shown: neighbours below
+/// the floor never reach it, so they aren't here either.
+pub(crate) fn call2_lists(
+    store: &Store,
+    prepared: &Prepared,
+) -> Result<Vec<Call2List>, StoreError> {
+    let Some(search) = &prepared.search else {
+        return Ok(Vec::new());
+    };
+    let conn = store.connection();
+    Ok(reconcile::shown_lists(&conn, search, &prepared.vectors)?)
+}
+
 /// Runs call 1 on the leased chunk, or takes its saved reply, reconciles
 /// the claims with call 2 when they land near something stored, and commits
 /// the result.

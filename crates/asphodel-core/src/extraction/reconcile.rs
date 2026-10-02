@@ -40,8 +40,8 @@ use uuid::Uuid;
 use super::claims::{Checked, Link, NewMemory, Precision, Stamp, start_of_day};
 use super::input::Unit;
 use super::{
-    Call1Input, Call2Input, Label, NEIGHBOUR_CAP, NEIGHBOURS_PER_CLAIM, NeighbourMemory,
-    ReconcileClaim,
+    Call1Input, Call2Candidate, Call2Input, Call2List, Label, NEIGHBOUR_CAP, NEIGHBOURS_PER_CLAIM,
+    NeighbourMemory, ReconcileClaim,
 };
 use crate::constants::Significance;
 use crate::retrieval::{bm25, fuse};
@@ -226,6 +226,59 @@ pub(super) fn search(
         },
         neighbours,
     }))
+}
+
+/// Each claim call 2 was shown, with its neighbours and the cosine
+/// similarity of the claim to each, the value the reconcile floor
+/// compares, in the metric the search used (TIM-96, decision 6). A
+/// neighbour whose vector is gone has no similarity.
+pub(super) fn shown_lists(
+    conn: &Connection,
+    search: &Search,
+    vectors: &[Vec<f32>],
+) -> Result<Vec<Call2List>, rusqlite::Error> {
+    let mut statement = conn.prepare_cached(
+        "SELECT 1.0 - vec_distance_cosine(embedding, ?2) FROM memory_vectors
+         WHERE memory_id = ?1",
+    )?;
+    let mut lists = Vec::with_capacity(search.input.claims.len());
+    for (claim, vector) in search.input.claims.iter().zip(vectors) {
+        let bytes: Vec<u8> = vector
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let mut candidates = Vec::with_capacity(claim.neighbours.len());
+        for handle in &claim.neighbours {
+            let Some(index) = search
+                .input
+                .neighbours
+                .iter()
+                .position(|shown| &shown.handle == handle)
+            else {
+                continue;
+            };
+            let shown = &search.input.neighbours[index];
+            let similarity = statement
+                .query_row((search.neighbours[index].id, &bytes), |row| {
+                    row.get::<_, f64>(0)
+                })
+                .map(Some)
+                .or_else(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    error => Err(error),
+                })?;
+            candidates.push(Call2Candidate {
+                memory: shown.memory,
+                sentence: shown.content.clone(),
+                similarity,
+            });
+        }
+        lists.push(Call2List {
+            claim: claim.content.clone(),
+            candidates,
+        });
+    }
+    Ok(lists)
 }
 
 fn chain_links(conn: &Connection, bank_id: i64) -> Result<Vec<ChainLink>, rusqlite::Error> {

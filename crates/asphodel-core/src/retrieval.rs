@@ -461,13 +461,35 @@ impl Context<'_> {
     }
 }
 
+/// A prefetch's candidate as the gate saw it, before the gate: the
+/// reranker logit the floor compares, or `None` when the reranker missed
+/// its deadline. Replay's labelling material lists these (TIM-96,
+/// decision 6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateCandidate {
+    pub memory: Uuid,
+    pub sentence: String,
+    pub logit: Option<f64>,
+}
+
+/// A prefetch with what the gate was shown: the query it recalled for,
+/// after a short follow-up borrowed the previous one, and every reranked
+/// candidate in ranked order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredPrefetch {
+    pub prefetch: Prefetch,
+    pub query: String,
+    pub candidates: Vec<GateCandidate>,
+}
+
 /// Prefetch: recalls for the current message and injects what passes the
-/// gate, holding the injection as the session's pending set.
-pub(crate) fn prefetch(
+/// gate, holding the injection as the session's pending set. The
+/// candidates the gate was shown come back beside it.
+pub(crate) fn scored_prefetch(
     cx: &Context<'_>,
     bank: &str,
     request: &PrefetchRequest,
-) -> Result<Prefetch, RecallError> {
+) -> Result<ScoredPrefetch, RecallError> {
     let started = Instant::now();
     let deadline = started + cx.deadline;
     let now = cx.store.now();
@@ -518,6 +540,7 @@ pub(crate) fn prefetch(
     let mut lines = Vec::new();
     let mut injected = Vec::new();
     let mut logged = Vec::with_capacity(ranked.len());
+    let mut shown = Vec::with_capacity(ranked.len());
     for item in &ranked {
         // Past the deadline, or when the reranker fails, there's no logit,
         // so nothing passes the gate and nothing is injected; the candidates
@@ -540,6 +563,11 @@ pub(crate) fn prefetch(
             memory_id: item.candidate.id,
             score: item.score,
             injected: take,
+        });
+        shown.push(GateCandidate {
+            memory: item.candidate.uuid,
+            sentence: item.candidate.content.clone(),
+            logit: item.logit,
         });
     }
     let text = if lines.is_empty() {
@@ -577,11 +605,15 @@ pub(crate) fn prefetch(
         reranked,
         "prefetched"
     );
-    Ok(Prefetch {
-        recall_id,
-        text,
-        injected,
-        reranked,
+    Ok(ScoredPrefetch {
+        prefetch: Prefetch {
+            recall_id,
+            text,
+            injected,
+            reranked,
+        },
+        query,
+        candidates: shown,
     })
 }
 

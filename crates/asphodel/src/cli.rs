@@ -7,8 +7,10 @@
 //! and `llm login` work on files, and `restore` works on the data dir
 //! offline (ADR 0010).
 //! `replay` runs scripted scenarios and real-history corpora, `import`
-//! writes those corpora, `report diff` compares runs and `bench` drives a
-//! daemon on a copy of a replayed store (TIM-96, TIM-117).
+//! writes those corpora, `report diff` compares runs, `report html` renders
+//! one, `report precision` turns labelled material into a precision curve,
+//! and `bench` drives a daemon on a copy of a replayed store (TIM-96,
+//! TIM-117, TIM-121).
 
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -138,7 +140,7 @@ enum Command {
     /// Replay recorded sessions on a simulated clock.
     Replay(ReplayArgs),
 
-    /// Compare replay reports.
+    /// Compare, render and calibrate from replay reports.
     #[command(subcommand)]
     Report(ReportCommand),
 
@@ -772,6 +774,11 @@ pub struct ReplayArgs {
     #[arg(long)]
     pub aggregate: Option<PathBuf>,
 
+    /// Also write the labelling material, under the private dir: recall
+    /// candidates at 50 sampled turns and call 2's candidate lists.
+    #[arg(long, conflicts_with = "scenario")]
+    pub labelling: Option<PathBuf>,
+
     /// Where to write the JSON report; `<replay dir>/reports/<name>.json`
     /// by default. Given twice, the last one wins.
     #[arg(long, overrides_with = "report")]
@@ -860,6 +867,45 @@ pub struct ImportArgs {
 pub enum ReportCommand {
     /// The A/B diff of two replay reports.
     Diff(DiffArgs),
+
+    /// A replay report as one self-contained HTML page.
+    Html(HtmlArgs),
+
+    /// The precision curve of the labelled labelling material.
+    Precision(PrecisionArgs),
+}
+
+/// `asphodel report html`: the page goes beside the report unless `--out`
+/// says otherwise; both stay under the private dir (TIM-96, decision 7).
+#[derive(Debug, Args)]
+pub struct HtmlArgs {
+    /// The private directory the report and the page are in.
+    #[arg(long, env = "ASPHODEL_REPLAY_DIR")]
+    pub replay_dir: Option<PathBuf>,
+
+    /// The JSON report.
+    pub report: PathBuf,
+
+    /// Where to write the page; the report's path with the extension
+    /// `html` by default.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+/// `asphodel report precision`: the curve on stdout (TIM-96, decision 6).
+#[derive(Debug, Args)]
+pub struct PrecisionArgs {
+    /// The private directory the labels and the material are in.
+    #[arg(long, env = "ASPHODEL_REPLAY_DIR")]
+    pub replay_dir: Option<PathBuf>,
+
+    /// The labels: a TOML table of candidate id to `true` or `false`.
+    #[arg(long)]
+    pub labels: PathBuf,
+
+    /// The material `asphodel replay --labelling` wrote.
+    #[arg(long)]
+    pub material: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -943,6 +989,8 @@ impl Cli {
             Command::Import(args) => crate::replay::import::run(args),
             Command::Replay(args) => crate::replay::run(args),
             Command::Report(ReportCommand::Diff(args)) => crate::replay::diff::run(args),
+            Command::Report(ReportCommand::Html(args)) => crate::replay::html::run(args),
+            Command::Report(ReportCommand::Precision(args)) => crate::replay::labelling::run(args),
             Command::Bench(args) => crate::bench::run(args),
         }
     }

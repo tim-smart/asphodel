@@ -6,8 +6,9 @@ seconds. This page is the contract for the scripted side of it: the scenario
 file, the command, the report and the probes. It comes from "Replay harness:
 simulated-clock replay of recorded sessions" (TIM-96) and its amendments
 from TIM-97, TIM-98 and TIM-116, and from ADRs 0004 and 0008. Real-history
-replay (the `state.db` importer, cassettes, `fast` mode, `bench` and the
-A/B diff) builds on the same engine and is under "Real history" below.
+replay (the `state.db` importer, cassettes, `fast` mode, `bench`, the
+A/B diff, the HTML page, and the labelling material and precision curve)
+builds on the same engine and is under "Real history" below.
 
 ## Running a scenario
 
@@ -382,7 +383,8 @@ Tim's whole Hermes history replays privately (TIM-96, decisions 1, 3, 4, 6,
 7 and 8; TIM-117). Everything derived from it lives under
 `ASPHODEL_REPLAY_DIR` and is refused anywhere else: the `state.db` copy, the
 manifest, the corpus, the cassettes, the replayed store with its recall
-log, the probes file and the reports. Only the `--aggregate` export may
+log, the probes file, the reports and their pages, and the labelling
+material and labels. Only the `--aggregate` export may
 leave. Agents never read the directory; keep it outside the Multica
 workspaces tree.
 
@@ -464,7 +466,7 @@ writes nothing; the counts hold no text, so they can be shared.
 ```
 asphodel replay --corpus <file> --mode live|replay|fast \
     [--cassette <file>] [--probes <file>] [--report <file>] [--aggregate <file>] \
-    [--no-cache] [--refresh live|recorded|off] [--self-test] \
+    [--labelling <file>] [--no-cache] [--refresh live|recorded|off] [--self-test] \
     [--config FILE] [--overrides FILE] [--latency DURATION] [--until TIMESTAMP] \
     [--onnx-threads N] [--token-dir DIR]
 ```
@@ -548,6 +550,91 @@ on a different corpus or cassette unless forced, lists probes whose result
 changed, numbers that differ beyond a tolerance of one in a million, and
 the memories that faded or were purged in one run and not the other, by
 id.
+
+### The HTML page
+
+```
+asphodel report html <report> [--out <file>]
+```
+
+writes one static page from a JSON report (TIM-96, decision 7): its
+identity (kind, corpus and cassette hashes, git SHA), the probe results,
+and every number the report holds, from injected tokens to the histograms
+and where the LLM replies came from. Styles and any charts are inline, and
+nothing on the page loads from anywhere: no `src`, `href` or `url(` but a
+fragment or a `data:` URL, no `@import`, and no script that opens a
+connection. The page goes to `--out`, or beside the report with the
+extension `html`. Both the report and the page must be inside the private
+dir, and neither may be a symlink.
+
+### Labelling and the precision curve
+
+The two calibrated floors, the reranker gate floor (TIM-93) and the
+reconcile similarity floor (TIM-92), are set from Tim's labels, not by eye
+(TIM-96, decision 6). `asphodel replay --corpus ... --labelling <file>`
+writes the material to label, inside the private dir. Writing it changes
+nothing the run simulates, and the same run writes the same bytes.
+
+The material is one JSON object:
+
+```json
+{
+  "version": 1,
+  "recall": [
+    { "sample": "r1", "at": "<prefetch time>", "session": "<session id>",
+      "query": "<the query the reranker scored against>",
+      "candidates": [
+        { "id": "r1.1", "memory": "<uuid>", "score": 1.5, "sentence": "..." } ] } ],
+  "call2": [
+    { "sample": "c1", "at": "<when the worker claimed the chunk>",
+      "claim": "<the claim's sentence>",
+      "candidates": [
+        { "id": "c1.1", "memory": "<uuid>", "score": 0.93, "sentence": "..." } ] } ]
+}
+```
+
+- `recall` holds 50 of the run's synced turns, or every one when there
+  are fewer. Cron prefetches, probes and refreshes aren't turns and are
+  never sampled. The sample is spread evenly over the run in time order
+  (turn `i × n / 50` of `n`), so the same run always samples the same
+  turns. Each lists the prefetch's reranked candidates in ranked order
+  before the gate, including those the gate turned away, scored with the
+  reranker logit the gate floor compares. `query` is what the reranker
+  scored against, after a short follow-up borrowed the previous message.
+- `call2` holds every candidate list call 2 was shown, one per claim:
+  the claim and its neighbours, scored with the cosine similarity of the
+  claim to each, which the reconcile floor compares. Only what call 2
+  was shown is here. Neighbours below the floor never reach call 2, so the
+  material says what raising the reconcile floor would drop, but not what
+  lowering it would add; calibrating it downward would need those hits
+  too, and is outside this material.
+- A candidate's `id` is unique in the file and is what a label names;
+  `memory` is the memory's id in the replayed store.
+
+The labels file is TOML, written by Tim inside the private dir: one key
+per candidate id, `true` when the candidate is relevant (for recall, worth
+injecting for the query; for call 2, about the same thing as the claim)
+and `false` when it isn't. Candidates without a label are left out and
+counted.
+
+```toml
+"r1.1" = true
+"r1.2" = false
+"c1.1" = true
+```
+
+```
+asphodel report precision --labels <file> --material <file>
+```
+
+prints the curve as JSON: for `recall` and for `call2`, `labelled`,
+`unlabelled` and `curve`, one point per distinct score among the labelled
+candidates in ascending order. At each point's `floor`, `kept` counts the
+labelled candidates scoring at or above it, as the gate and call 2 keep
+one, `relevant` counts those labelled `true`, and `precision` is
+`relevant / kept`. The curve is numbers only. A label naming no candidate
+in the material is refused. Both files must be inside the private dir, and
+an error names the file and line, never the text.
 
 ### Bench
 
