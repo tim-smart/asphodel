@@ -17,6 +17,7 @@ pub mod keep;
 pub mod logging;
 pub mod mental_models;
 pub mod models;
+pub mod operations;
 pub mod queue;
 pub mod retrieval;
 pub mod secrets;

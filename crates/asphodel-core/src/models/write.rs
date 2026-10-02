@@ -37,7 +37,7 @@ pub(crate) fn replace_file(path: &Path, bytes: &[u8], mode: u32) -> std::io::Res
 /// counter. The mode is set at creation (less the umask) so the file is
 /// never readable beyond `mode`, even before [`replace_file`] fixes it
 /// exactly.
-fn create_temp(path: &Path, mode: u32) -> std::io::Result<(PathBuf, File)> {
+pub(crate) fn create_temp(path: &Path, mode: u32) -> std::io::Result<(PathBuf, File)> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut last = None;
     for _ in 0..ATTEMPTS {

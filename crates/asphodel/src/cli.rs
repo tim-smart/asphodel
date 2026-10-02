@@ -1,10 +1,13 @@
 //! The subcommand tree from "API surface and Hermes transport" (TIM-94,
 //! decision 10), plus `replay` and `bench` from the replay harness decision
 //! (TIM-96). `serve` runs the daemon; `ingest`, `bank`, `chunks`, `recall`,
-//! `forget`, `keep`, `unkeep`, `model` and `purge` are HTTP clients of it
-//! ([`crate::client`]); `models fetch` and `llm login` work on files.
+//! `forget`, `keep`, `unkeep`, `model`, `purge`, `backup`, `status` and the
+//! audit lists are HTTP clients of it ([`crate::client`]); `models fetch`
+//! and `llm login` work on files, and `restore` works on the data dir
+//! offline (ADR 0010).
 //! `replay` and `bench` are stubs that later stages fill in.
 
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -19,16 +22,22 @@ use asphodel_core::models::{
     AUTH_ISSUER, DeviceCode, HttpFetcher, ModelDir, TokenStore, device_code_login, fetch_models,
     manifest,
 };
+use asphodel_core::operations::{
+    AuditList, BACKED_UP_AT_HEADER, LENGTH_HEADER, SHA256_HEADER, check_copy, temp_file_beside,
+};
 use asphodel_core::queue::RetryRequest;
 use asphodel_core::retrieval::{On, PhaseFilter, RecallRequest};
+use asphodel_core::store::OpenOptions;
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::strength::Kind;
 use asphodel_core::sweep::PurgeAck;
+use axum::http::HeaderMap;
 use clap::{Args, Parser, Subcommand};
 use jiff::Timestamp;
 use jiff::civil::Date;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::client::{Client, segment};
 use crate::listen::Listen;
@@ -75,6 +84,29 @@ enum Command {
     /// See and acknowledge a purge pause.
     #[command(subcommand)]
     Purge(PurgeCommand),
+
+    /// Stream a checked copy of the store from the daemon to a file or
+    /// stdout.
+    Backup(BackupArgs),
+
+    /// Replace the store with a backup. Offline: stop the daemon first.
+    Restore(RestoreArgs),
+
+    /// Show the queue, failures, the purge pause, the last sweep and backup.
+    /// Exits non-zero when anything needs attention.
+    Status(StatusArgs),
+
+    /// List a bank's purges, newest first.
+    Purges(ListArgs),
+
+    /// List a bank's forgets, newest first.
+    Forgets(ListArgs),
+
+    /// List a bank's nightly sweeps, newest first.
+    Sweeps(ListArgs),
+
+    /// List a bank's recalls with their queries, newest first.
+    Recalls(ListArgs),
 
     /// Fetch and manage the local models.
     #[command(subcommand)]
@@ -328,6 +360,57 @@ pub enum PurgeCommand {
     },
 }
 
+/// `asphodel backup` (ADR 0010). Asphodel has no destination, schedule or
+/// retention of its own: a timer pipes `--out -` wherever it should go.
+#[derive(Debug, Args)]
+pub struct BackupArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+
+    /// Where the copy goes: a file, or `-` for stdout. A file is written
+    /// beside its final name and only renamed into place once its length,
+    /// hash and integrity check pass.
+    #[arg(long)]
+    pub out: PathBuf,
+}
+
+/// `asphodel restore` (ADR 0010): offline, under the data-dir lock.
+#[derive(Debug, Args)]
+pub struct RestoreArgs {
+    /// The backup to restore.
+    pub file: PathBuf,
+
+    /// The data dir whose store it replaces. The current database is moved
+    /// aside, not deleted.
+    #[arg(long, env = "ASPHODEL_DATA_DIR")]
+    pub data_dir: PathBuf,
+
+    /// Run even when the data dir is on a network filesystem.
+    #[arg(long, env = "ASPHODEL_ALLOW_NETWORK_FS")]
+    pub allow_network_fs: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+}
+
+/// The audit lists (TIM-99, decision 7).
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+
+    /// The bank whose list to show.
+    #[arg(long)]
+    pub bank: String,
+
+    /// How many rows, newest first. The daemon caps it at 1000.
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
 /// `asphodel model`: only the owner defines models, through here or the
 /// API (TIM-95, decision 2).
 #[derive(Debug, Subcommand)]
@@ -504,6 +587,13 @@ impl Cli {
             Command::Unkeep(args) => by_ids(args, IdsAction::Unkeep),
             Command::Model(command) => model(command),
             Command::Purge(command) => purge(command),
+            Command::Backup(args) => backup(args),
+            Command::Restore(args) => restore(args),
+            Command::Status(args) => status(args),
+            Command::Purges(args) => audit(args, AuditList::Purges),
+            Command::Forgets(args) => audit(args, AuditList::Forgets),
+            Command::Sweeps(args) => audit(args, AuditList::Sweeps),
+            Command::Recalls(args) => audit(args, AuditList::Recalls),
             Command::Models(ModelsCommand::Fetch { model_dir }) => models_fetch(model_dir),
             Command::Llm(LlmCommand::Login { data_dir }) => llm_login(&data_dir),
             Command::Replay(_) => stub("replay"),
@@ -1044,6 +1134,317 @@ fn purge(command: PurgeCommand) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// `asphodel backup --out <file|->`: streams `POST /v1/backup` and checks
+/// its length and SHA-256 against the headers. A file is written under a
+/// temporary name beside it, integrity-checked, and renamed into place only
+/// when everything passes, so a failed backup leaves nothing at `--out`.
+/// Stdout can't be taken back, so there a mismatch only fails the command,
+/// which a pipe into storage sees as the exit code.
+fn backup(args: BackupArgs) -> anyhow::Result<()> {
+    let client = Client::new(&args.client)?;
+    if args.out.as_os_str() == "-" {
+        let mut stdout = std::io::stdout().lock();
+        let mut received = Received::default();
+        let headers = client.download("/v1/backup", &mut |bytes| {
+            received.add(bytes);
+            stdout
+                .write_all(bytes)
+                .context("writing the backup to stdout")
+        })?;
+        stdout.flush().context("writing the backup to stdout")?;
+        received.verify(&headers)?;
+        return Ok(());
+    }
+
+    let (temp, mut file) = temp_file_beside(&args.out)
+        .with_context(|| format!("creating a file beside {}", args.out.display()))?;
+    let written = (|| {
+        let mut received = Received::default();
+        let headers = client.download("/v1/backup", &mut |bytes| {
+            received.add(bytes);
+            file.write_all(bytes)
+                .with_context(|| format!("writing {}", temp.display()))
+        })?;
+        file.sync_all()
+            .with_context(|| format!("writing {}", temp.display()))?;
+        let summary = received.verify(&headers)?;
+        check_copy(&temp)
+            .map_err(|detail| anyhow::anyhow!("the backup failed its integrity check: {detail}"))?;
+        std::fs::rename(&temp, &args.out)
+            .with_context(|| format!("renaming the backup to {}", args.out.display()))?;
+        Ok::<_, anyhow::Error>(summary)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    let summary = written?;
+    if args.client.json {
+        return print_json(&serde_json::json!({
+            "out": args.out,
+            "length": summary.length,
+            "sha256": summary.sha256,
+            "backed_up_at": summary.backed_up_at,
+        }));
+    }
+    println!(
+        "wrote {}: {} bytes, sha256 {}{}",
+        args.out.display(),
+        summary.length,
+        summary.sha256,
+        summary
+            .backed_up_at
+            .map(|at| format!(", taken {at}"))
+            .unwrap_or_default(),
+    );
+    Ok(())
+}
+
+/// What a backup stream delivered, hashed as it arrives.
+#[derive(Default)]
+struct Received {
+    hasher: Sha256,
+    length: u64,
+}
+
+/// A backup that matched its headers.
+struct Verified {
+    length: u64,
+    sha256: String,
+    backed_up_at: Option<String>,
+}
+
+impl Received {
+    fn add(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+        self.length += bytes.len() as u64;
+    }
+
+    /// Checks the length and hash against the daemon's headers.
+    fn verify(self, headers: &HeaderMap) -> anyhow::Result<Verified> {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .with_context(|| format!("the daemon sent no {name} header"))
+        };
+        let expected: u64 = header(LENGTH_HEADER)?
+            .parse()
+            .with_context(|| format!("the {LENGTH_HEADER} header isn't a length"))?;
+        let expected_hash = header(SHA256_HEADER)?.to_ascii_lowercase();
+        if self.length != expected {
+            bail!(
+                "the backup stream was cut short: {} of {expected} bytes arrived",
+                self.length
+            );
+        }
+        let sha256: String = self
+            .hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if sha256 != expected_hash {
+            bail!("the backup's SHA-256 is {sha256}, but the daemon sent {expected_hash}");
+        }
+        Ok(Verified {
+            length: self.length,
+            sha256,
+            backed_up_at: header(BACKED_UP_AT_HEADER).ok().map(str::to_string),
+        })
+    }
+}
+
+/// `asphodel restore <file> --data-dir <dir>`: offline, so it refuses
+/// while a daemon holds the lock. Purge pauses at the next start if the
+/// restored store's deletion fingerprint differs from this binary's.
+fn restore(args: RestoreArgs) -> anyhow::Result<()> {
+    let options = OpenOptions {
+        allow_network_fs: args.allow_network_fs,
+    };
+    let restored =
+        asphodel_core::operations::restore(&args.file, &args.data_dir, options, &SystemClock)
+            .with_context(|| {
+                format!(
+                    "restoring {} into {}",
+                    args.file.display(),
+                    args.data_dir.display()
+                )
+            })?;
+    println!(
+        "restored {} into {} (schema version {}, taken {})",
+        args.file.display(),
+        args.data_dir.display(),
+        restored.schema_version,
+        restored
+            .backed_up_at
+            .map_or_else(|| "at an unknown time".to_string(), |at| at.to_string()),
+    );
+    if let Some(aside) = &restored.moved_aside {
+        println!("the database it replaced is at {}", aside.display());
+    }
+    if restored.schema_version < asphodel_core::store::SCHEMA_VERSION {
+        println!(
+            "the daemon migrates it from schema version {} when it starts",
+            restored.schema_version
+        );
+    }
+    Ok(())
+}
+
+/// `asphodel status`: `GET /v1/status`, printed, and a non-zero exit when
+/// anything needs attention, with `--json` too.
+fn status(args: StatusArgs) -> anyhow::Result<()> {
+    let client = Client::new(&args.client)?;
+    let status: Value = client.get("/v1/status")?;
+    let attention: Vec<&str> = list(&status, "attention")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if args.client.json {
+        print_json(&status)?;
+    } else {
+        print_status(&status, &attention);
+    }
+    if !attention.is_empty() {
+        bail!("{} things need attention", attention.len());
+    }
+    Ok(())
+}
+
+fn print_status(status: &Value, attention: &[&str]) {
+    if attention.is_empty() {
+        println!(
+            "asphodel {}: nothing needs attention",
+            text(status, "version")
+        );
+    } else {
+        println!(
+            "asphodel {}: {} things need attention",
+            text(status, "version"),
+            attention.len()
+        );
+        for item in attention {
+            println!("  ! {item}");
+        }
+    }
+    let current = text(status, "deletion_fingerprint");
+    let purge = &status["purge"];
+    match text(purge, "state") {
+        "paused" => println!(
+            "purge: paused; stored fingerprint {}, running daemon's {current}",
+            text(purge, "stored")
+        ),
+        state => println!("purge: {state}; deletion fingerprint {current}"),
+    }
+    if let Some(banks) = status["banks"].as_object() {
+        for (name, bank) in banks {
+            println!(
+                "bank {name}: {} queued, {} failed chunks, {} failed refreshes",
+                count(bank, "queued"),
+                count(bank, "failed_chunks"),
+                count(bank, "failed_refreshes"),
+            );
+        }
+    }
+    match &status["last_sweep"] {
+        Value::Null => println!("last sweep: never"),
+        sweep => println!(
+            "last sweep: {} (bank {}): {} memories purged; the text of {} sources, {} chunks and {} failed chunks swept, and {} recall queries",
+            text(sweep, "completed_at"),
+            text(sweep, "bank"),
+            count(sweep, "purged_memories"),
+            count(sweep, "swept_sources"),
+            count(sweep, "swept_chunks"),
+            count(sweep, "swept_failed_chunks"),
+            count(sweep, "swept_recalls"),
+        ),
+    }
+    match &status["pre_migration_copy"] {
+        Value::Null => println!("pre-migration copy: none"),
+        copy => println!(
+            "pre-migration copy: from schema version {} at {}, deleted after {}",
+            count(copy, "from_version"),
+            text(copy, "path"),
+            text(copy, "expires_at"),
+        ),
+    }
+    match status["last_backup_at"].as_str() {
+        Some(at) => println!("last backup: {at}"),
+        None => println!("last backup: never"),
+    }
+}
+
+/// `asphodel purges|forgets|sweeps|recalls --bank <bank>`.
+fn audit(args: ListArgs, kind: AuditList) -> anyhow::Result<()> {
+    let client = Client::new(&args.client)?;
+    let name = kind.as_str();
+    let mut path = format!("/v1/banks/{}/{name}", segment(&args.bank));
+    if let Some(limit) = args.limit {
+        path.push_str(&format!("?limit={limit}"));
+    }
+    let reply: Value = client.get(&path)?;
+    if args.client.json {
+        return print_json(&reply);
+    }
+    let rows = list(&reply, name);
+    if rows.is_empty() {
+        println!("no {name} in {}", args.bank);
+    }
+    let ids = |row: &Value, key: &str| {
+        list(row, key)
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for row in rows {
+        match kind {
+            AuditList::Purges => println!(
+                "{}  purge {}: {} memories: {}",
+                text(row, "at"),
+                text(row, "edit"),
+                list(row, "memories").len(),
+                ids(row, "memories"),
+            ),
+            AuditList::Forgets => println!(
+                "{}  forget {}: {}{}",
+                text(row, "at"),
+                text(row, "edit"),
+                ids(row, "memories"),
+                if row["pending"].as_bool() == Some(true) {
+                    "  (erase pending)"
+                } else {
+                    ""
+                },
+            ),
+            AuditList::Sweeps => println!(
+                "{}  sweep: {} memories purged; the text of {} sources, {} chunks and {} failed chunks swept, and {} recall queries (fingerprint {}, delta {})",
+                text(row, "completed_at"),
+                count(row, "purged_memories"),
+                count(row, "swept_sources"),
+                count(row, "swept_chunks"),
+                count(row, "swept_failed_chunks"),
+                count(row, "swept_recalls"),
+                text(row, "fingerprint"),
+                row["delta"]
+                    .as_f64()
+                    .map_or_else(|| "none".to_string(), |delta| delta.to_string()),
+            ),
+            AuditList::Recalls => println!(
+                "{}  {} {} ({} ms, {} results): {}",
+                text(row, "at"),
+                text(row, "kind"),
+                text(row, "id"),
+                count(row, "latency_ms"),
+                list(row, "results").len(),
+                row["query"].as_str().unwrap_or("[swept]"),
+            ),
+        }
+    }
+    Ok(())
 }
 
 fn stub(name: &str) -> anyhow::Result<()> {

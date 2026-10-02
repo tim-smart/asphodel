@@ -25,7 +25,7 @@ mod fetch;
 mod llm;
 mod manifest;
 mod onnx;
-mod write;
+pub(crate) mod write;
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;

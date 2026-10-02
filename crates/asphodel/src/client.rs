@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
-use axum::http::{Method, Request, Uri, header};
+use axum::http::{HeaderMap, Method, Request, Response, Uri, header};
 use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use hyper::body::{Bytes, Incoming};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -85,6 +85,45 @@ impl Client {
         self.request(Method::PUT, path, Some(serde_json::to_vec(body)?))
     }
 
+    /// `POST path` with no body, handing the reply's body to `sink` frame
+    /// by frame as it arrives, for the backup stream, which can be larger
+    /// than is sensible to hold. Returns the reply's headers once the body
+    /// has ended. A stream the daemon or the network cuts short is an
+    /// error. Each frame gets [`REQUEST_TIMEOUT`], not the whole stream.
+    pub(crate) fn download(
+        &self,
+        path: &str,
+        sink: &mut dyn FnMut(&[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<HeaderMap> {
+        let timed_out = || anyhow!("the daemon at {} didn't answer in time", self.url);
+        self.runtime.block_on(async {
+            let response =
+                tokio::time::timeout(REQUEST_TIMEOUT, self.open(Method::POST, path, None))
+                    .await
+                    .map_err(|_| timed_out())??;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let mut body = response.into_body();
+            if !status.is_success() {
+                let bytes = tokio::time::timeout(REQUEST_TIMEOUT, body.collect())
+                    .await
+                    .map_err(|_| timed_out())??
+                    .to_bytes();
+                bail!("the daemon answered {status}: {}", error_message(&bytes));
+            }
+            while let Some(frame) = tokio::time::timeout(REQUEST_TIMEOUT, body.frame())
+                .await
+                .map_err(|_| timed_out())?
+            {
+                let frame = frame.context("the stream from the daemon was cut short")?;
+                if let Some(data) = frame.data_ref() {
+                    sink(data)?;
+                }
+            }
+            Ok(headers)
+        })
+    }
+
     fn request<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -98,11 +137,7 @@ impl Client {
             })
             .map_err(|_| anyhow!("the daemon at {} didn't answer in time", self.url))??;
         if !status.is_success() {
-            let message = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|body| body.get("error")?.as_str().map(str::to_string))
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).trim().to_string());
-            bail!("the daemon answered {status}: {message}");
+            bail!("the daemon answered {status}: {}", error_message(&bytes));
         }
         let bytes = if bytes.is_empty() {
             Bytes::from_static(b"null")
@@ -118,6 +153,20 @@ impl Client {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> anyhow::Result<(hyper::StatusCode, Bytes)> {
+        let response = self.open(method, path, body).await?;
+        let status = response.status();
+        let bytes = response.into_body().collect().await?.to_bytes();
+        Ok((status, bytes))
+    }
+
+    /// Sends one request on its own connection and returns the reply with
+    /// its body still to read.
+    async fn open(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> anyhow::Result<Response<Incoming>> {
         let unreachable = || {
             format!(
                 "can't reach the daemon at {}: is `asphodel serve` running?",
@@ -158,23 +207,24 @@ impl Client {
     }
 }
 
-/// One request on its own connection.
-async fn exchange<S>(
-    stream: S,
-    request: Request<Full<Bytes>>,
-) -> anyhow::Result<(hyper::StatusCode, Bytes)>
+/// One request on its own connection. The connection runs until the
+/// reply's body has been read or dropped.
+async fn exchange<S>(stream: S, request: Request<Full<Bytes>>) -> anyhow::Result<Response<Incoming>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (mut sender, connection) =
         hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-    let connection = tokio::spawn(connection);
-    let response = sender.send_request(request).await?;
-    let status = response.status();
-    let bytes = response.into_body().collect().await?.to_bytes();
-    drop(sender);
-    let _ = connection.await;
-    Ok((status, bytes))
+    tokio::spawn(connection);
+    Ok(sender.send_request(request).await?)
+}
+
+/// The `error` of a JSON error body, or the body itself.
+fn error_message(bytes: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|body| body.get("error")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| String::from_utf8_lossy(bytes).trim().to_string())
 }
 
 /// Parses `--url`: `unix:/path`, or `http://host[:port][/prefix]`.

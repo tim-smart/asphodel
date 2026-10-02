@@ -1668,9 +1668,7 @@ fn a_ready_erase_runs_after_a_restart_without_an_llm() {
 // Backup, restore, status and the audit lists (TIM-114; TIM-99, decisions 1,
 // 6 and 7; ADR 0010, "Backup and restore" and "Sweeps, pauses and failures").
 //
-// Tests first: none of these routes or subcommands exist yet, so every test
-// here is ignored until TIM-114 adds them. The contract they pin, beyond
-// what the ADR says:
+// The contract these tests pin, beyond what the ADR says:
 //
 // - `POST /v1/backup` answers 200 with the copy as its body and the
 //   copy's SHA-256 (lowercase hex) and length in bytes in
@@ -1907,7 +1905,6 @@ fn is_sqlite(path: &Path) -> bool {
 const LIVE_FILES: &[&str] = &["asphodel.db", "asphodel.db-shm", "asphodel.db-wal", "lock"];
 
 #[test]
-#[ignore = "needs TIM-114: POST /v1/backup"]
 fn backup_streams_a_checked_copy_with_its_hash_and_length() {
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).bind();
@@ -1950,7 +1947,6 @@ fn backup_streams_a_checked_copy_with_its_hash_and_length() {
 }
 
 #[test]
-#[ignore = "needs TIM-114: asphodel backup and restore"]
 fn a_backup_restores_offline_and_writes_a_restored_edit_row() {
     use asphodel_core::store::{OpenOptions, Store};
     use asphodel_core::{Clock, SystemClock};
@@ -2031,7 +2027,6 @@ fn a_backup_restores_offline_and_writes_a_restored_edit_row() {
 }
 
 #[test]
-#[ignore = "needs TIM-114: asphodel restore"]
 fn restore_refuses_while_the_lock_is_held_and_a_newer_schema() {
     let dir = TestDir::new();
     let daemon = Serve::new(&dir).ready();
@@ -2068,7 +2063,6 @@ fn restore_refuses_while_the_lock_is_held_and_a_newer_schema() {
 }
 
 #[test]
-#[ignore = "needs TIM-114: POST /v1/backup and asphodel backup"]
 fn the_cli_rejects_a_truncated_or_damaged_backup_stream() {
     let dir = TestDir::new();
     let daemon = Serve::new(&dir).ready();
@@ -2141,7 +2135,6 @@ fn the_cli_rejects_a_truncated_or_damaged_backup_stream() {
 }
 
 #[test]
-#[ignore = "needs TIM-114: GET /v1/status and asphodel status"]
 fn status_needs_attention_while_a_chunk_has_failed() {
     let dir = TestDir::new();
     let mut steps = vec![json!({"fail": "no_content"}); 5];
@@ -2193,7 +2186,6 @@ fn status_needs_attention_while_a_chunk_has_failed() {
 }
 
 #[test]
-#[ignore = "needs TIM-114: GET /v1/status and asphodel status"]
 fn status_needs_attention_while_purge_is_paused_and_shows_both_hashes() {
     let dir = TestDir::new();
     let mut first = Serve::new(&dir).ready();
@@ -2232,7 +2224,6 @@ fn status_needs_attention_while_purge_is_paused_and_shows_both_hashes() {
 }
 
 #[test]
-#[ignore = "needs TIM-114: the purges, forgets, sweeps and recalls lists"]
 fn the_audit_lists_hold_no_content_except_recalls() {
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir)

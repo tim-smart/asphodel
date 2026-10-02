@@ -113,20 +113,26 @@ pub fn take_copy(conn: &Connection, dir: &Path, from: u32) -> Result<PathBuf, St
 /// Runs `PRAGMA integrity_check` on a copy, naming `path` on failure. A file
 /// SQLite can't read as a database fails the same way as a damaged one.
 fn check_integrity(copy: &Connection, path: &Path) -> Result<(), StoreError> {
-    let corrupt = |detail: String| StoreError::CorruptCopy {
+    integrity_problems(copy).map_err(|detail| StoreError::CorruptCopy {
         path: path.to_owned(),
         detail,
-    };
-    let mut statement = copy
+    })
+}
+
+/// `PRAGMA integrity_check`, with what it found when that isn't `ok`. A
+/// file SQLite can't read as a database fails with the reading error.
+/// Backup and restore check their copies with it too (ADR 0010).
+pub(crate) fn integrity_problems(conn: &Connection) -> Result<(), String> {
+    let mut statement = conn
         .prepare("PRAGMA integrity_check")
-        .map_err(|error| corrupt(error.to_string()))?;
+        .map_err(|error| error.to_string())?;
     let problems = statement
         .query_map([], |row| row.get::<_, String>(0))
         .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        .map_err(|error| corrupt(error.to_string()))?;
+        .map_err(|error| error.to_string())?;
     match problems.as_slice() {
         [ok] if ok == "ok" => Ok(()),
-        _ => Err(corrupt(problems.join("; "))),
+        _ => Err(problems.join("; ")),
     }
 }
 
@@ -208,20 +214,38 @@ pub fn next_copy_expiry(conn: &Connection, dir: &Path) -> Result<Option<Timestam
         .min())
 }
 
+/// Every pre-migration copy still on disk: the version it was taken from,
+/// its path and when it's deleted. `asphodel status` reports them.
+pub fn copies(conn: &Connection, dir: &Path) -> Result<Vec<(u32, PathBuf, Timestamp)>, StoreError> {
+    Ok(copy_rows(conn, dir)?
+        .into_iter()
+        .filter(|(_, path, _)| path.exists())
+        .collect())
+}
+
 /// Every copy a completed migration has a row for, with when it expires.
 fn copy_deadlines(conn: &Connection, dir: &Path) -> Result<Vec<(PathBuf, Timestamp)>, StoreError> {
+    Ok(copy_rows(conn, dir)?
+        .into_iter()
+        .map(|(_, path, expires_at)| (path, expires_at))
+        .collect())
+}
+
+/// Every copy a completed migration has a row for: the version it was
+/// taken from, where it lives and when it expires.
+fn copy_rows(conn: &Connection, dir: &Path) -> Result<Vec<(u32, PathBuf, Timestamp)>, StoreError> {
     let mut statement = conn.prepare(
         "SELECT from_version, completed_at FROM migrations WHERE from_version > 0 ORDER BY to_version",
     )?;
     let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
-    let mut deadlines = Vec::new();
+    let mut copies = Vec::new();
     for row in rows {
         let (from, completed_at) = row?;
         let from = u32::try_from(from).unwrap_or(0);
         let expires_at = timestamp(completed_at)
             .checked_add(PRE_MIGRATION_COPY_TTL)
             .unwrap_or(Timestamp::MAX);
-        deadlines.push((copy_path(dir, from), expires_at));
+        copies.push((from, copy_path(dir, from), expires_at));
     }
-    Ok(deadlines)
+    Ok(copies)
 }

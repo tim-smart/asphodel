@@ -17,7 +17,7 @@ axum = "0.8"
 chrono = { version = "0.4", default-features = false }
 fastembed = { version = "7.1.0", default-features = false, features = ["ort-load-dynamic"] }
 clap = { version = "4", features = ["derive", "env"] }
-http-body-util = "0.1"
+http-body-util = { version = "0.1", features = ["channel"] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jiff = { version = "0.2", features = ["serde"] }

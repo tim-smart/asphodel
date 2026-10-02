@@ -8,6 +8,7 @@
 //! the daemon is ready, and needs the bearer token when one is configured.
 //! After SIGTERM, health and ingest answer 503 while the daemon drains.
 
+use std::io::Read;
 use std::sync::Arc;
 
 use asphodel_core::agenda::Agenda;
@@ -16,6 +17,10 @@ use asphodel_core::erase::{ForgetError, ForgetRequest, Forgotten};
 use asphodel_core::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use asphodel_core::keep::{KeepError, Kept, MemoryIds, Unkept};
 use asphodel_core::mental_models::{Model, ModelEdit, ModelError, ModelSpec, Outcome as Refreshed};
+use asphodel_core::operations::{
+    Audit, AuditError, AuditList, BACKED_UP_AT_HEADER, Backup, BackupError, LENGTH_HEADER,
+    SHA256_HEADER, Status,
+};
 use asphodel_core::queue::{ChunkList, QueueError, Retried, RetryRequest};
 use asphodel_core::retrieval::{Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
 use asphodel_core::store::StoreError;
@@ -23,6 +28,7 @@ use asphodel_core::store::bank::{Bank, BankError, BankIdentity};
 use asphodel_core::sweep::{PurgeAck, PurgeError, PurgePlan};
 use asphodel_core::system_prompt::Block;
 use asphodel_core::{Health, ResolvedConfig, Service};
+use axum::body::{Body, Bytes};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -30,6 +36,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
+use http_body_util::channel::Channel;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -67,6 +74,12 @@ pub(crate) fn router(app: Shared) -> Router {
             "/v1/banks/{bank}/models/{model}/refresh",
             post(refresh_model),
         )
+        .route("/v1/banks/{bank}/purges", get(purges))
+        .route("/v1/banks/{bank}/forgets", get(forgets))
+        .route("/v1/banks/{bank}/sweeps", get(sweeps))
+        .route("/v1/banks/{bank}/recalls", get(recalls))
+        .route("/v1/backup", post(backup))
+        .route("/v1/status", get(status))
         .route("/v1/purge/plan", get(purge_plan))
         .route("/v1/purge/ack", post(purge_ack))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize));
@@ -219,6 +232,24 @@ impl From<PurgeError> for ApiError {
     }
 }
 
+impl From<BackupError> for ApiError {
+    fn from(error: BackupError) -> Self {
+        match error {
+            BackupError::Corrupt { .. } => Self::internal(error),
+            BackupError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<AuditError> for ApiError {
+    fn from(error: AuditError) -> Self {
+        match error {
+            AuditError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            AuditError::Store(error) => error.into(),
+        }
+    }
+}
+
 impl From<QueueError> for ApiError {
     fn from(error: QueueError) -> Self {
         match error {
@@ -358,6 +389,128 @@ async fn purge_ack(
     let Json(PurgeAck { hash }) = body?;
     app.call(move |service| service.purge_ack(&hash)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// How much of a backup is read and sent at a time.
+const BACKUP_CHUNK: usize = 64 * 1024;
+
+/// `POST /v1/backup`: an online backup of the store, integrity-checked,
+/// streamed with its SHA-256 and length in headers (ADR 0010). The copy is
+/// unlinked from the data dir before the first byte goes, so a stream that
+/// stops part way leaves nothing behind. The completion is recorded for
+/// `status` just before the last bytes are sent.
+async fn backup(State(app): State<Shared>) -> Result<Response, ApiError> {
+    let service = Arc::clone(&app.ready().ok_or_else(ApiError::not_ready)?.service);
+    let Backup {
+        mut file,
+        sha256,
+        length,
+        backed_up_at,
+    } = app.call(|service| service.backup()).await?;
+    let (mut sender, body) = Channel::<Bytes, std::io::Error>::new(4);
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let mut buffer = vec![0; BACKUP_CHUNK];
+        let mut sent = 0;
+        loop {
+            let read = match file.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(read) => read,
+                Err(error) => {
+                    warn!(%error, "reading the backup copy failed; the stream stops short");
+                    sender.abort(error);
+                    return;
+                }
+            };
+            sent += read as u64;
+            if sent == length
+                && let Err(error) = service.record_backup()
+            {
+                warn!(%error, "recording the backup's completion failed");
+            }
+            let chunk = Bytes::copy_from_slice(&buffer[..read]);
+            if runtime.block_on(sender.send_data(chunk)).is_err() {
+                // The client went away.
+                return;
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.sqlite3")
+        .header(header::CONTENT_LENGTH, length)
+        .header(SHA256_HEADER, sha256)
+        .header(LENGTH_HEADER, length)
+        .header(BACKED_UP_AT_HEADER, backed_up_at.to_string())
+        .body(Body::new(body))
+        .map_err(ApiError::internal)
+}
+
+/// `GET /v1/status`: queue depth, failures, the purge pause with both
+/// hashes, the last sweep, the pre-migration copy and the last backup, and
+/// what needs attention (ADR 0010). Always 200: `asphodel status` decides
+/// its exit code from `attention`.
+async fn status(State(app): State<Shared>) -> Result<Json<Status>, ApiError> {
+    let status = app.call(|service| service.status()).await?;
+    Ok(Json(status))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListQuery {
+    /// How many rows, newest first.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// One audit list of a bank (TIM-99, decision 7).
+async fn audit(
+    app: Shared,
+    bank: String,
+    query: Result<Query<ListQuery>, QueryRejection>,
+    list: AuditList,
+) -> Result<Json<Audit>, ApiError> {
+    let Query(query) = query?;
+    let audit = app
+        .call(move |service| service.audit(&bank, list, query.limit))
+        .await?;
+    Ok(Json(audit))
+}
+
+/// `GET /v1/banks/{bank}/purges[?limit=N]`: ids only.
+async fn purges(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    query: Result<Query<ListQuery>, QueryRejection>,
+) -> Result<Json<Audit>, ApiError> {
+    audit(app, bank, query, AuditList::Purges).await
+}
+
+/// `GET /v1/banks/{bank}/forgets[?limit=N]`: ids and turn keys only.
+async fn forgets(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    query: Result<Query<ListQuery>, QueryRejection>,
+) -> Result<Json<Audit>, ApiError> {
+    audit(app, bank, query, AuditList::Forgets).await
+}
+
+/// `GET /v1/banks/{bank}/sweeps[?limit=N]`: counts only.
+async fn sweeps(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    query: Result<Query<ListQuery>, QueryRejection>,
+) -> Result<Json<Audit>, ApiError> {
+    audit(app, bank, query, AuditList::Sweeps).await
+}
+
+/// `GET /v1/banks/{bank}/recalls[?limit=N]`: the one list with content, its
+/// queries, until the sweep clears them.
+async fn recalls(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    query: Result<Query<ListQuery>, QueryRejection>,
+) -> Result<Json<Audit>, ApiError> {
+    audit(app, bank, query, AuditList::Recalls).await
 }
 
 /// `PUT /v1/banks/{bank}`: creates the bank or merges the identity into it

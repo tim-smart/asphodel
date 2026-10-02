@@ -26,6 +26,7 @@ use crate::mental_models::{
     Refreshes, Schedule,
 };
 use crate::models::{LlmClient, Models};
+use crate::operations::{Audit, AuditError, AuditList, Backup, BackupError, Status};
 use crate::queue::{
     ChunkError, ChunkList, FailedChunk, Failure, Lease, Leases, QueueError, Retried, SourceKind,
 };
@@ -612,6 +613,42 @@ impl Service {
             ready: true,
             now: self.now(),
         }
+    }
+}
+
+/// Backup, status and the audit lists ("Operations: backup, restore,
+/// status and audit lists", TIM-114; ADR 0010). Restore is offline, under
+/// the data-dir lock, so it isn't here: [`crate::operations::restore`].
+impl Service {
+    /// `POST /v1/backup`: an online backup of the store, checked, in a file
+    /// already unlinked from the data dir ([`crate::operations`]).
+    pub fn backup(&self) -> Result<Backup, BackupError> {
+        crate::operations::take_backup(&self.store)
+    }
+
+    /// Records that a backup's stream completed now, for `status`.
+    pub fn record_backup(&self) -> Result<(), StoreError> {
+        crate::operations::record_backup(&self.store, self.now())
+    }
+
+    /// `GET /v1/status`: what an operator alerts on, and what needs
+    /// attention now.
+    pub fn status(&self) -> Result<Status, StoreError> {
+        crate::operations::status(
+            &self.store,
+            self.purge_pause(),
+            self.tuning.deletion_fingerprint(),
+        )
+    }
+
+    /// `GET /v1/banks/{bank}/{purges,forgets,sweeps,recalls}`, newest first.
+    pub fn audit(
+        &self,
+        bank: &str,
+        list: AuditList,
+        limit: Option<usize>,
+    ) -> Result<Audit, AuditError> {
+        crate::operations::audit(&self.store, bank, list, limit)
     }
 }
 

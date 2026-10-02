@@ -21,7 +21,7 @@
 
 pub mod bank;
 pub mod fs;
-mod ids;
+pub(crate) mod ids;
 mod lock;
 pub mod migrations;
 pub(crate) mod strength;
@@ -395,7 +395,7 @@ fn expire_copies(
 
 /// Makes sure `dir` is a directory, creating it when nothing is there. A
 /// file at the path is refused and left alone.
-fn prepare_dir(dir: &Path) -> Result<(), StoreError> {
+pub(crate) fn prepare_dir(dir: &Path) -> Result<(), StoreError> {
     match std::fs::metadata(dir) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(StoreError::NotADirectory {
@@ -418,7 +418,7 @@ fn prepare_dir(dir: &Path) -> Result<(), StoreError> {
 
 /// Registers sqlite-vec with SQLite once, before any connection opens, so
 /// every connection has `vec0` (TIM-89).
-fn register_extensions() {
+pub(crate) fn register_extensions() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // SAFETY: `sqlite3_vec_init` is sqlite-vec's extension entry point,
