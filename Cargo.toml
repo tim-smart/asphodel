@@ -37,7 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unicode-normalization = "0.1"
 ureq = { version = "3.4", features = ["json"] }
 url = "2"
-uuid = { version = "1", features = ["v7", "serde"] }
+uuid = { version = "1", features = ["v5", "v7", "serde"] }
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"

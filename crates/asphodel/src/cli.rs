@@ -716,11 +716,46 @@ pub enum LlmCommand {
     },
 }
 
+/// `asphodel replay`: a scripted scenario on a simulated clock (TIM-96;
+/// `docs/replay.md`). Exit 0 when every probe passed, 1 when one failed
+/// (the report is still written), 2 when the run was refused or failed.
 #[derive(Debug, Args)]
 pub struct ReplayArgs {
-    /// The private directory holding the corpus, cassettes and reports.
+    /// The private directory holding the replayed store, the shadow table
+    /// and the reports. Never inside a git working tree or a `serve` data
+    /// dir.
     #[arg(long, env = "ASPHODEL_REPLAY_DIR")]
     pub replay_dir: Option<PathBuf>,
+
+    /// The scenario file to run.
+    #[arg(long)]
+    pub scenario: PathBuf,
+
+    /// Where to write the JSON report; `<replay dir>/reports/<name>.json`
+    /// by default.
+    #[arg(long)]
+    pub report: Option<PathBuf>,
+
+    /// The production tuning file, layered over the code defaults.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
+    /// A file in the shape of `Tuning`, layered over everything else.
+    #[arg(long)]
+    pub overrides: Option<PathBuf>,
+
+    /// The simulated extraction latency, such as `10m`; overrides the
+    /// scenario's own.
+    #[arg(long)]
+    pub latency: Option<String>,
+
+    /// Keep running sweeps and refreshes past the last event until here.
+    #[arg(long)]
+    pub until: Option<jiff::Timestamp>,
+
+    /// Where the real models are, for scenarios in group `models`.
+    #[arg(long, env = "ASPHODEL_MODEL_DIR")]
+    pub model_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -768,7 +803,7 @@ impl Cli {
             Command::Recalls(args) => audit(args, AuditList::Recalls),
             Command::Models(ModelsCommand::Fetch { model_dir }) => models_fetch(model_dir),
             Command::Llm(LlmCommand::Login { data_dir }) => llm_login(&data_dir),
-            Command::Replay(_) => stub("replay"),
+            Command::Replay(args) => crate::replay::run(args),
             Command::Bench(_) => stub("bench"),
         }
     }
@@ -1513,6 +1548,7 @@ impl Received {
 fn restore(args: RestoreArgs) -> anyhow::Result<()> {
     let options = OpenOptions {
         allow_network_fs: args.allow_network_fs,
+        deterministic_ids: false,
     };
     let restored =
         asphodel_core::operations::restore(&args.file, &args.data_dir, options, &SystemClock)

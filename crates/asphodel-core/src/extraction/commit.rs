@@ -61,7 +61,7 @@ pub(super) fn commit(
                 low_confidence,
             } => Some((*by, *until, *low_confidence)),
         };
-        let uuid = store.new_id();
+        let uuid = store.derived_id(unit.chunk, &memory.claim.to_string());
         let memory_id = insert_memory(&tx, store, unit, input, memory, uuid, ended)?;
         written.insert(
             index,
@@ -256,7 +256,8 @@ fn resolve_proposals(
             let entity_id = match created_meanwhile(tx, unit, name, &seen)? {
                 Some(entity_id) => entity_id,
                 None => {
-                    let (entity_id, uuid) = create_entity(tx, store, unit.bank_id, name, *kind)?;
+                    let (entity_id, uuid) =
+                        create_entity(tx, store, unit.bank_id, unit.chunk, name, *kind)?;
                     created.push(uuid);
                     entity_id
                 }
@@ -296,10 +297,11 @@ fn create_entity(
     tx: &Transaction<'_>,
     store: &Store,
     bank_id: i64,
+    chunk: Uuid,
     name: &str,
     kind: EntityKind,
 ) -> Result<(i64, Uuid), rusqlite::Error> {
-    let uuid = store.new_id();
+    let uuid = store.derived_id(chunk, name);
     let now = micros(store.now());
     tx.execute(
         "INSERT INTO entities (uuid, bank_id, name, kind, created_at, updated_at)

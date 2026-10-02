@@ -92,6 +92,16 @@ pub struct Service {
     reembeds: Mutex<ReembedRuns>,
 }
 
+/// A chunk claimed by [`Service::next_extraction`], with what call 1 is
+/// shown besides its text: the session's in-context set as the turn stored
+/// it, and the block entries it held.
+#[derive(Debug)]
+pub struct Claimed {
+    pub lease: Lease,
+    pub in_context: Vec<Uuid>,
+    pub entries: Vec<BlockEntry>,
+}
+
 /// What [`Service`] keeps in memory about re-embeds.
 #[derive(Debug, Default)]
 struct ReembedRuns {
@@ -586,6 +596,25 @@ impl Service {
         bank: &str,
         llm: &dyn LlmClient,
     ) -> Result<Option<Extracted>, ExtractError> {
+        let Some(Claimed {
+            lease,
+            in_context,
+            entries,
+        }) = self.next_extraction(bank)?
+        else {
+            return Ok(None);
+        };
+        self.extract_leased(lease, llm, &in_context, &entries)
+            .map(Some)
+    }
+
+    /// The first half of [`Service::extract_next`]: claims the head of
+    /// `bank`'s queue and reads the in-context set and block entries stored
+    /// with it. The replay harness takes the lease from here so it can
+    /// script the LLM's replies against what call 1 and call 2 are shown
+    /// (TIM-96, decisions 2 and 3), then finishes with
+    /// [`Service::extract_leased`].
+    pub fn next_extraction(&self, bank: &str) -> Result<Option<Claimed>, ExtractError> {
         let Some(lease) = self.claim_chunk(bank)? else {
             return Ok(None);
         };
@@ -626,8 +655,24 @@ impl Service {
                 }
             }
         };
-        self.extract_with_entries(lease, llm, &in_context, &entries)
-            .map(Some)
+        Ok(Some(Claimed {
+            lease,
+            in_context,
+            entries,
+        }))
+    }
+
+    /// The second half of [`Service::extract_next`]: extracts a chunk
+    /// claimed by [`Service::next_extraction`] with the in-context set and
+    /// entries it returned.
+    pub fn extract_leased(
+        &self,
+        lease: Lease,
+        llm: &dyn LlmClient,
+        in_context: &[Uuid],
+        entries: &[BlockEntry],
+    ) -> Result<Extracted, ExtractError> {
+        self.extract_with_entries(lease, llm, in_context, entries)
     }
 
     /// The names of every bank in the store, so the daemon can start a
@@ -770,6 +815,20 @@ impl Service {
         entry: Option<&str>,
     ) -> Result<ModelView, InspectError> {
         crate::inspect::model_view(&self.store, bank, name, entry)
+    }
+
+    /// The first instant the memory's strength fell below τ, from its
+    /// access log and the bank's clock as they stand now, to the minute.
+    /// `None` when it hasn't faded yet. It's what a replay's `faded_at`
+    /// probe reads (TIM-96, decision 5).
+    pub fn faded_at(&self, bank: &str, id: Uuid) -> Result<Option<Timestamp>, InspectError> {
+        crate::inspect::faded_at(&self.store, &self.tuning, bank, id)
+    }
+
+    /// Every live memory's strength now, by id: neither forgotten nor
+    /// retracted. The replay report counts bands from it.
+    pub fn strengths(&self, bank: &str) -> Result<Vec<(Uuid, f64)>, InspectError> {
+        crate::inspect::strengths(&self.store, &self.tuning, bank)
     }
 
     /// `memory significance <id> <level|clear>`: the owner's significance,

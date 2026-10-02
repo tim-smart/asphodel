@@ -320,6 +320,7 @@ fn start(
 
     let options = OpenOptions {
         allow_network_fs: args.allow_network_fs,
+        deterministic_ids: false,
     };
     let store = Store::open(&args.data_dir, options, Arc::clone(&clock))
         .with_context(|| format!("opening the store in {}", args.data_dir.display()))?;

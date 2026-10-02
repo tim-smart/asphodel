@@ -955,3 +955,106 @@ pub(crate) fn model_view(
         entry_views,
     })
 }
+
+/// The first instant the memory's strength fell below τ, or `None` when
+/// it's at or above τ now and always was. Between two accesses (and after a
+/// window close that restarted recent use) strength only falls, so each
+/// stretch is checked at its end and the first that ends below τ is
+/// bisected to the minute, the precision of `memory show`'s projection.
+pub(crate) fn faded_at(
+    store: &Store,
+    tuning: &Tuning,
+    bank: &str,
+    id: Uuid,
+) -> Result<Option<Timestamp>, InspectError> {
+    let now = store.now();
+    let conn = store.connection();
+    let (bank_id, _) = find_bank(&conn, bank)?.ok_or(InspectError::UnknownBank)?;
+    let memory_id: i64 = conn
+        .query_row(
+            "SELECT id FROM memories WHERE uuid = ?1 AND bank_id = ?2",
+            (id.to_string(), bank_id),
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(InspectError::UnknownMemory)?;
+    let loader = StrengthLoader::new(&conn, bank_id, tuning.clock.quiet_rate, now)?;
+    let inputs = loader.inputs(&conn, memory_id)?;
+    let bank_time = loader.bank_time();
+    let value = |at: Timestamp| {
+        crate::strength::strength(
+            inputs.significance,
+            &inputs.accesses,
+            inputs.close,
+            bank_time,
+            at,
+        )
+        .value
+    };
+
+    let mut points: Vec<Timestamp> = inputs
+        .accesses
+        .iter()
+        .map(|access| access.at)
+        .filter(|at| *at <= now)
+        .collect();
+    if let Some(close) = inputs.close {
+        let restart = close.closes_at.max(close.known_at);
+        if restart <= now {
+            points.push(restart);
+        }
+    }
+    points.sort();
+    points.dedup();
+
+    let minute = jiff::SignedDuration::from_mins(1);
+    let microsecond = jiff::SignedDuration::from_micros(1);
+    for (index, &start) in points.iter().enumerate() {
+        let next = points.get(index + 1).copied();
+        // Just before the next access, which lifts strength again; or now.
+        let end = match next {
+            Some(next) => next.checked_sub(microsecond).unwrap_or(next),
+            None => now,
+        };
+        if end <= start || value(end) >= TAU {
+            continue;
+        }
+        let (mut above, mut below) = (start, end);
+        while below.duration_since(above) > minute {
+            let middle = above
+                .checked_add(below.duration_since(above) / 2)
+                .unwrap_or(below);
+            if value(middle) < TAU {
+                below = middle;
+            } else {
+                above = middle;
+            }
+        }
+        return Ok(Some(below));
+    }
+    Ok(None)
+}
+
+/// Every live memory's strength now: neither forgotten nor retracted, in
+/// rowid order.
+pub(crate) fn strengths(
+    store: &Store,
+    tuning: &Tuning,
+    bank: &str,
+) -> Result<Vec<(Uuid, f64)>, InspectError> {
+    let now = store.now();
+    let conn = store.connection();
+    let (bank_id, _) = find_bank(&conn, bank)?.ok_or(InspectError::UnknownBank)?;
+    let loader = StrengthLoader::new(&conn, bank_id, tuning.clock.quiet_rate, now)?;
+    let mut statement = conn.prepare_cached(
+        "SELECT id, uuid FROM memories
+         WHERE bank_id = ?1 AND hidden_at IS NULL AND invalidated_at IS NULL
+         ORDER BY id",
+    )?;
+    let rows: Vec<(i64, String)> = statement
+        .query_map([bank_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    rows.into_iter()
+        .map(|(memory_id, uuid)| Ok((parse(&uuid), loader.strength(&conn, memory_id)?.value)))
+        .collect()
+}

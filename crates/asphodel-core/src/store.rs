@@ -21,7 +21,7 @@
 
 pub mod bank;
 pub mod fs;
-pub(crate) mod ids;
+pub mod ids;
 mod lock;
 pub mod migrations;
 pub(crate) mod strength;
@@ -68,6 +68,10 @@ pub const META_DELETION_INPUTS: &str = "deletion_inputs";
 pub struct OpenOptions {
     /// `--allow-network-fs`: run on NFS, SMB/CIFS, CephFS or FUSE anyway.
     pub allow_network_fs: bool,
+    /// Mint public ids from their parents and a counter rather than from
+    /// the clock, so a replay gets the same ids on every run (TIM-96,
+    /// decision 4). Only `asphodel replay` sets it.
+    pub deterministic_ids: bool,
 }
 
 /// Why a store couldn't be opened or used. Every variant that stops the
@@ -213,7 +217,11 @@ impl Store {
             dir: dir.to_owned(),
             conn: Mutex::new(conn),
             clock,
-            ids: ids::IdSource::new(),
+            ids: if options.deterministic_ids {
+                ids::IdSource::counting()
+            } else {
+                ids::IdSource::timed()
+            },
             applied,
             filesystem,
             _lock: lock,
@@ -248,6 +256,15 @@ impl Store {
     /// A fresh UUIDv7 for a row's public id, timed by the store's clock.
     pub fn new_id(&self) -> Uuid {
         self.ids.next(self.clock.now())
+    }
+
+    /// A public id for a row that belongs to `parent`, distinguished by
+    /// `name` among the parent's rows. In production it's a fresh UUIDv7
+    /// like [`Store::new_id`]; a store opened with deterministic ids derives
+    /// it as UUIDv5 of the parent and name, so a replay mints the same
+    /// memory and entity ids on every run (TIM-96, decision 4).
+    pub fn derived_id(&self, parent: Uuid, name: &str) -> Uuid {
+        self.ids.derived(parent, name, self.clock.now())
     }
 
     /// The connection, for the service layer. Held for one operation at a

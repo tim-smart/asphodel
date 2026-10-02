@@ -214,7 +214,14 @@ pub fn ingest_turn(
         return Ok(Ingested::nothing(parse_uuid(&existing), Outcome::Duplicate));
     }
 
-    let source = store.new_id();
+    let source = store.derived_id(
+        crate::store::ids::NAMESPACE,
+        &format!(
+            "{bank_id}:turn:{}:{}",
+            turn.session_id,
+            micros(turn.message_at)
+        ),
+    );
     if turn.forget_requested {
         // ADR 0010: only the key, from the start. No text, no provenance
         // beyond the key, nothing to extract.
@@ -312,7 +319,7 @@ pub fn ingest_turn(
         &tx,
         store,
         bank_id,
-        source_id,
+        (source_id, source),
         &chunk,
         PRIORITY_TURN,
         message_at,
@@ -369,7 +376,10 @@ pub fn ingest_document(
         return Ok(Ingested::nothing(parse_uuid(&existing), Outcome::Duplicate));
     }
 
-    let source = store.new_id();
+    let source = store.derived_id(
+        crate::store::ids::NAMESPACE,
+        &format!("{bank_id}:document:{}:{content_hash}", document.document_id),
+    );
     tx.execute(
         "INSERT INTO sources (uuid, bank_id, kind, document_id, content_hash, observed_at,
                               reference_date, reference_date_exact, timezone, text, secret_kinds,
@@ -422,7 +432,7 @@ pub fn ingest_document(
             &tx,
             store,
             bank_id,
-            source_id,
+            (source_id, source),
             &new,
             PRIORITY_DOCUMENT,
             observed_at,
@@ -579,7 +589,8 @@ fn insert_chunk(
     tx: &Transaction<'_>,
     store: &Store,
     bank_id: i64,
-    source_id: i64,
+    // The source's rowid and public id.
+    source: (i64, Uuid),
     chunk: &NewChunk<'_>,
     priority: i64,
     observed_at: i64,
@@ -591,9 +602,11 @@ fn insert_chunk(
                              start_offset, end_offset, text)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
-            store.new_id().to_string(),
+            store
+                .derived_id(source.1, &chunk.position.to_string())
+                .to_string(),
             bank_id,
-            source_id,
+            source.0,
             chunk.position as i64,
             heading_path,
             chunk.hash(),
@@ -658,7 +671,10 @@ fn resolve_speaker(
         .filter(|name| !name.is_empty())
         .unwrap_or(&platform_id));
     let name = name.as_str();
-    let uuid = store.new_id();
+    let uuid = store.derived_id(
+        crate::store::ids::NAMESPACE,
+        &format!("{bank_id}:speaker:{}", platform_id.trim()),
+    );
     let now = micros(store.now());
     tx.execute(
         "INSERT INTO entities (uuid, bank_id, name, kind, created_at, updated_at)

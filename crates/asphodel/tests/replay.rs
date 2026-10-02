@@ -4,14 +4,11 @@
 //! (TIM-97, decision 7), the lifetimes in "Strength model" (TIM-91), and
 //! ADRs 0004 and 0008. The contract these tests pin is `docs/replay.md`.
 //!
-//! `asphodel replay` is a stub, so every test that runs it is ignored until
-//! TIM-116 lands. They drive the binary as a process, as `serve_http.rs`
-//! does, and read the JSON report, so nothing here depends on how the
-//! engine is laid out inside. The scenario files under `scenarios/` are the
-//! fixtures; [`contract`] holds their shape as serde types, and the tests
-//! that run now parse every checked-in scenario with it and check that
-//! labels resolve. To activate: move [`contract`] into the crate as the
-//! scenario loader, import it here, and drop the `ignore` attributes.
+//! The tests drive the binary as a process, as `serve_http.rs` does, and
+//! read the JSON report, so nothing here depends on how the engine is laid
+//! out inside. The scenario files under `scenarios/` are the fixtures; the
+//! command's own loader (`asphodel::replay::scenario`) parses every
+//! checked-in one here and checks that labels resolve.
 //!
 //! Where TIM-96 leaves a detail open, `docs/replay.md` proposes one and
 //! says so. Those are the places to argue with.
@@ -40,435 +37,7 @@ fn scenario(name: &str) -> PathBuf {
     Path::new(SCENARIOS).join(format!("{name}.toml"))
 }
 
-/// The scenario file's shape, as `docs/replay.md` gives it.
-///
-/// The enums for kinds, significance, outcomes, bands and phases are the
-/// production ones, so the file's words are exactly the API's. Only the
-/// time precision is defined here, since extraction keeps its own private.
-mod contract {
-    #![allow(dead_code)]
-
-    use asphodel_core::constants::{Significance, Volatility};
-    use asphodel_core::extraction::Label;
-    use asphodel_core::retrieval::Band;
-    use asphodel_core::strength::{Kind, Phase};
-    use jiff::Timestamp;
-    use jiff::civil::Date;
-    use serde::Deserialize;
-
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Scenario {
-        pub name: String,
-        pub group: Group,
-        #[serde(default)]
-        pub description: Option<String>,
-        /// The simulated extraction latency, such as `10m`; `0s` when absent.
-        /// `--latency` overrides it.
-        #[serde(default)]
-        pub latency: Option<String>,
-        #[serde(default)]
-        pub bank: Option<BankSection>,
-        /// A layer in the shape of `Tuning`, above `--config` and below
-        /// `--overrides`.
-        #[serde(default)]
-        pub tuning: Option<toml::Table>,
-        #[serde(default, rename = "turn")]
-        pub turns: Vec<Turn>,
-        #[serde(default)]
-        pub chatter: Vec<Chatter>,
-        #[serde(default, rename = "document")]
-        pub documents: Vec<Document>,
-        #[serde(default, rename = "clear")]
-        pub clears: Vec<Clear>,
-        #[serde(default, rename = "probe")]
-        pub probes: Vec<Probe>,
-    }
-
-    /// `ci` runs on the fake models in CI; `models` needs the real ones in
-    /// `ASPHODEL_MODEL_DIR`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-    #[serde(rename_all = "lowercase")]
-    pub enum Group {
-        Ci,
-        Models,
-    }
-
-    #[derive(Debug, Default, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct BankSection {
-        #[serde(default)]
-        pub name: Option<String>,
-        #[serde(default)]
-        pub timezone: Option<String>,
-        #[serde(default)]
-        pub owner: Option<String>,
-        #[serde(default)]
-        pub assistant: Option<String>,
-        #[serde(default)]
-        pub owner_platform_ids: Vec<String>,
-    }
-
-    /// One user message and the assistant's reply. Prefetch runs at `at`,
-    /// `sync_turn` at `reply_at` (or `at`).
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Turn {
-        pub at: Timestamp,
-        #[serde(default)]
-        pub reply_at: Option<Timestamp>,
-        pub session: String,
-        pub user: String,
-        pub assistant: String,
-        #[serde(default)]
-        pub author: Option<Author>,
-        #[serde(default)]
-        pub platform: Option<String>,
-        #[serde(default, rename = "claim")]
-        pub claims: Vec<Claim>,
-        /// Labels of memories the reply relied on. Each must be in the
-        /// session's in-context set at the turn, or the run is a scenario
-        /// error.
-        #[serde(default)]
-        pub used: Vec<String>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Author {
-        pub id: String,
-        #[serde(default)]
-        pub name: Option<String>,
-    }
-
-    /// A run of turns with nothing to extract, to keep the bank in
-    /// conversation.
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Chatter {
-        pub from: Timestamp,
-        /// A duration such as `1d` or `12h`.
-        pub every: String,
-        pub count: u32,
-        #[serde(default)]
-        pub session: Option<String>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Document {
-        pub at: Timestamp,
-        pub id: String,
-        pub text: String,
-        pub reference_date: Date,
-        #[serde(default)]
-        pub timezone: Option<String>,
-        #[serde(default, rename = "claim")]
-        pub claims: Vec<Claim>,
-    }
-
-    /// Clears a session's in-context set and pending injection.
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Clear {
-        pub at: Timestamp,
-        pub session: String,
-    }
-
-    /// What extraction would have found: call 1's reply, and the outcomes
-    /// call 2 gives it.
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Claim {
-        /// Names the memory the claim creates. Unique across the scenario.
-        #[serde(default)]
-        pub label: Option<String>,
-        pub content: String,
-        pub quote: String,
-        pub kind: Kind,
-        pub significance: Significance,
-        #[serde(default)]
-        pub remember_this: bool,
-        #[serde(default)]
-        pub changes_something: bool,
-        #[serde(default)]
-        pub valid_from: Option<When>,
-        #[serde(default)]
-        pub valid_until: Option<When>,
-        #[serde(default)]
-        pub low_confidence: bool,
-        #[serde(default)]
-        pub until_event: Option<String>,
-        #[serde(default)]
-        pub due_at: Option<When>,
-        #[serde(default)]
-        pub volatility: Option<Volatility>,
-        #[serde(default)]
-        pub recurrence_text: Option<String>,
-        #[serde(default)]
-        pub recurrence_rrule: Option<String>,
-        #[serde(default)]
-        pub recurrence_start: Option<When>,
-        #[serde(default)]
-        pub reconcile: Vec<Outcome>,
-    }
-
-    /// A time as call 1 returns it: local to the source's timezone, at a
-    /// precision.
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct When {
-        pub at: String,
-        pub precision: Precision,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-    #[serde(rename_all = "lowercase")]
-    pub enum Precision {
-        Year,
-        Month,
-        Day,
-        Hour,
-        Minute,
-    }
-
-    /// One of the claim's outcomes against an existing memory.
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Outcome {
-        pub memory: String,
-        pub outcome: Label,
-    }
-
-    impl Outcome {
-        /// Whether the outcome absorbs the claim into the memory rather than
-        /// creating one.
-        pub fn absorbs(&self) -> bool {
-            matches!(self.outcome, Label::MentionedAgain | Label::Confirmed)
-        }
-    }
-
-    /// A time and an expectation. Never changes the run.
-    #[derive(Debug, Deserialize)]
-    pub struct Probe {
-        /// `p<n>` in file order when absent.
-        #[serde(default)]
-        pub id: Option<String>,
-        pub at: Timestamp,
-        #[serde(flatten)]
-        pub check: Check,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(tag = "kind", rename_all = "snake_case")]
-    pub enum Check {
-        Band {
-            memory: String,
-            band: Band,
-        },
-        /// The first instant strength fell below τ, inclusive at both ends.
-        FadedAt {
-            memory: String,
-            between: [Timestamp; 2],
-        },
-        Exists {
-            memory: String,
-            #[serde(default)]
-            memory_kind: Option<Kind>,
-            #[serde(default)]
-            ended: Option<bool>,
-            #[serde(default)]
-            retracted: Option<bool>,
-            /// Whether it's the head of its supersession chain.
-            #[serde(default)]
-            head: Option<bool>,
-            #[serde(default)]
-            phase: Option<Phase>,
-        },
-        Absent {
-            memory: String,
-        },
-        AgendaHas {
-            memory: String,
-        },
-        AgendaLacks {
-            memory: String,
-        },
-        RecallFinds {
-            memory: String,
-            query: String,
-        },
-        RecallLacks {
-            memory: String,
-            query: String,
-        },
-        /// Group `models` only.
-        Injects {
-            memory: String,
-            query: String,
-        },
-        NotInjects {
-            memory: String,
-            query: String,
-        },
-        ProfileHas {
-            model: String,
-            memory: String,
-        },
-        ProfileLacks {
-            model: String,
-            memory: String,
-        },
-    }
-
-    impl Check {
-        pub fn memory(&self) -> &str {
-            match self {
-                Check::Band { memory, .. }
-                | Check::FadedAt { memory, .. }
-                | Check::Exists { memory, .. }
-                | Check::Absent { memory }
-                | Check::AgendaHas { memory }
-                | Check::AgendaLacks { memory }
-                | Check::RecallFinds { memory, .. }
-                | Check::RecallLacks { memory, .. }
-                | Check::Injects { memory, .. }
-                | Check::NotInjects { memory, .. }
-                | Check::ProfileHas { memory, .. }
-                | Check::ProfileLacks { memory, .. } => memory,
-            }
-        }
-
-        /// Whether the probe needs the real models.
-        pub fn needs_models(&self) -> bool {
-            matches!(self, Check::Injects { .. } | Check::NotInjects { .. })
-        }
-    }
-
-    /// The checks the loader makes before a run, each as a sentence naming
-    /// the label at fault. Empty when the scenario is well formed.
-    pub fn check(scenario: &Scenario) -> Vec<String> {
-        let mut errors = Vec::new();
-        // Every labelled claim, with when its event happens.
-        let mut labels: Vec<(String, Timestamp)> = Vec::new();
-        let mut claims: Vec<(Timestamp, &str, &Claim)> = Vec::new();
-        for turn in &scenario.turns {
-            let chunk = format!("{}\n{}", turn.user, turn.assistant);
-            for claim in &turn.claims {
-                if !turn.user.contains(&claim.quote) && !turn.assistant.contains(&claim.quote) {
-                    errors.push(format!(
-                        "the quote {:?} isn't in the turn at {}: {chunk:?}",
-                        claim.quote, turn.at
-                    ));
-                }
-                claims.push((turn.at, "turn", claim));
-            }
-            for used in &turn.used {
-                if !labels_before(&claims, used, turn.at) {
-                    errors.push(format!(
-                        "the turn at {} uses {used:?}, which no earlier claim labels",
-                        turn.at
-                    ));
-                }
-            }
-        }
-        for document in &scenario.documents {
-            for claim in &document.claims {
-                if !document.text.contains(&claim.quote) {
-                    errors.push(format!(
-                        "the quote {:?} isn't in document {}",
-                        claim.quote, document.id
-                    ));
-                }
-                claims.push((document.at, "document", claim));
-            }
-        }
-        claims.sort_by_key(|(at, _, _)| *at);
-        for (at, _, claim) in &claims {
-            if let Some(label) = &claim.label {
-                if labels.iter().any(|(known, _)| known == label) {
-                    errors.push(format!("the label {label:?} is used twice"));
-                }
-                if !claim.reconcile.is_empty() && claim.reconcile.iter().all(Outcome::absorbs) {
-                    errors.push(format!(
-                        "the claim {label:?} is absorbed by its outcomes, so its label names nothing"
-                    ));
-                }
-                labels.push((label.clone(), *at));
-            }
-            for outcome in &claim.reconcile {
-                let earlier = labels
-                    .iter()
-                    .any(|(known, when)| known == &outcome.memory && when < at);
-                if !earlier {
-                    errors.push(format!(
-                        "the claim at {at} reconciles against {:?}, which no earlier claim labels",
-                        outcome.memory
-                    ));
-                }
-            }
-        }
-        for chatter in &scenario.chatter {
-            if chatter.count == 0 {
-                errors.push(format!("the chatter from {} has count 0", chatter.from));
-            }
-            if chatter.every.parse::<jiff::Span>().is_err() {
-                errors.push(format!(
-                    "the chatter from {} has an interval that doesn't parse: {:?}",
-                    chatter.from, chatter.every
-                ));
-            }
-        }
-        if let Some(latency) = &scenario.latency
-            && latency.parse::<jiff::Span>().is_err()
-        {
-            errors.push(format!("the latency doesn't parse: {latency:?}"));
-        }
-        for (index, probe) in scenario.probes.iter().enumerate() {
-            let id = probe
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("p{}", index + 1));
-            let memory = probe.check.memory();
-            match labels.iter().find(|(known, _)| known == memory) {
-                None => errors.push(format!(
-                    "probe {id} names {memory:?}, which no claim labels"
-                )),
-                Some((_, created)) => {
-                    if !matches!(probe.check, Check::Absent { .. }) && probe.at < *created {
-                        errors.push(format!(
-                            "probe {id} at {} is before {memory:?} is created at {created}",
-                            probe.at
-                        ));
-                    }
-                }
-            }
-            if let Check::FadedAt { between, .. } = &probe.check {
-                if between[0] > between[1] {
-                    errors.push(format!("probe {id} has its range backwards"));
-                }
-                if probe.at < between[1] {
-                    errors.push(format!(
-                        "probe {id} at {} is before the end of its range {}",
-                        probe.at, between[1]
-                    ));
-                }
-            }
-            if probe.check.needs_models() && scenario.group == Group::Ci {
-                errors.push(format!(
-                    "probe {id} needs the real models but the group is ci"
-                ));
-            }
-        }
-        errors
-    }
-
-    fn labels_before(claims: &[(Timestamp, &str, &Claim)], label: &str, at: Timestamp) -> bool {
-        claims
-            .iter()
-            .any(|(when, _, claim)| *when < at && claim.label.as_deref() == Some(label))
-    }
-}
+use asphodel::replay::scenario as contract;
 
 // Test support.
 
@@ -775,7 +344,6 @@ fn an_unknown_scenario_field_doesnt_parse() {
 // The first set, through `asphodel replay`.
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn lifetimes_reproduce_tim_91_within_tolerance() {
     let dir = TestDir::new();
     let run = replay(&dir, &scenario("lifetimes"), &[]);
@@ -794,7 +362,6 @@ fn lifetimes_reproduce_tim_91_within_tolerance() {
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn the_purge_table_reproduces_adr_0008_and_the_shadow_table_counts_re_mentions() {
     let dir = TestDir::new();
     let run = replay(&dir, &scenario("purge-table"), &[]);
@@ -809,7 +376,6 @@ fn the_purge_table_reproduces_adr_0008_and_the_shadow_table_counts_re_mentions()
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn maya_corrected_to_mia_keeps_her_strength() {
     let dir = TestDir::new();
     let run = replay(&dir, &scenario("maya-to-mia"), &[]);
@@ -825,21 +391,18 @@ fn maya_corrected_to_mia_keeps_her_strength() {
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn a_rescheduled_appointment_moves_on_the_agenda() {
     let dir = TestDir::new();
     replay(&dir, &scenario("rescheduled-appointment"), &[]).assert_passed();
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn a_three_week_holiday_runs_on_bank_time() {
     let dir = TestDir::new();
     replay(&dir, &scenario("three-week-holiday"), &[]).assert_passed();
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn extraction_latency_is_modelled_in_simulated_time() {
     let dir = TestDir::new();
     let run = replay(&dir, &scenario("extraction-latency"), &[]);
@@ -863,7 +426,6 @@ fn extraction_latency_is_modelled_in_simulated_time() {
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn until_keeps_sweeping_past_the_last_turn() {
     let dir = TestDir::new();
     let run = replay(&dir, &scenario("extraction-latency"), &[]);
@@ -890,7 +452,6 @@ fn until_keeps_sweeping_past_the_last_turn() {
 // The report.
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn the_report_names_its_run_and_defaults_its_path() {
     let dir = TestDir::new();
     let run = replay(&dir, &scenario("extraction-latency"), &[]);
@@ -931,7 +492,6 @@ fn the_report_names_its_run_and_defaults_its_path() {
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn probes_without_an_id_are_numbered_in_file_order() {
     let dir = TestDir::new();
     let path = inline(
@@ -959,7 +519,6 @@ band = \"strong\"
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn replay_is_deterministic() {
     let first = TestDir::new();
     let second = TestDir::new();
@@ -977,7 +536,6 @@ fn replay_is_deterministic() {
 // Overrides and layering (TIM-98 amendment).
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn overrides_layer_over_the_production_file_in_the_shape_of_tuning() {
     let dir = TestDir::new();
     let config = dir.file("production.toml", "[clock]\nquiet_rate = 0.2\n");
@@ -1010,7 +568,6 @@ fn overrides_layer_over_the_production_file_in_the_shape_of_tuning() {
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn an_overrides_file_with_an_unknown_key_is_refused_before_the_run() {
     let dir = TestDir::new();
     let overrides = dir.file("overrides.toml", "[clock]\nspeed = 2.0\n");
@@ -1025,7 +582,6 @@ fn an_overrides_file_with_an_unknown_key_is_refused_before_the_run() {
 // Privacy and the private directory (TIM-96, decisions 3 and 8).
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn replay_refuses_to_run_without_a_private_directory() {
     let dir = TestDir::new();
     let report = dir.path("report.json");
@@ -1045,7 +601,6 @@ fn replay_refuses_to_run_without_a_private_directory() {
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn replay_refuses_a_private_directory_inside_a_git_working_tree() {
     let dir = TestDir::new();
     fs::create_dir_all(dir.path("repo/.git")).unwrap();
@@ -1064,7 +619,6 @@ fn replay_refuses_a_private_directory_inside_a_git_working_tree() {
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn replay_refuses_a_serve_data_dir() {
     let dir = TestDir::new();
     // A data dir is recognised by the store file at its top level; replay's
@@ -1077,7 +631,6 @@ fn replay_refuses_a_serve_data_dir() {
 // Scenario errors: the engine never guesses (docs/replay.md, "Claims").
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn a_scripted_outcome_whose_target_isnt_a_neighbour_is_a_scenario_error() {
     let dir = TestDir::new();
     let path = inline(
@@ -1112,7 +665,6 @@ memory = \"home\"
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn a_used_memory_that_isnt_in_context_is_a_scenario_error() {
     let dir = TestDir::new();
     // A new session whose query shares no word with the memory: nothing is
@@ -1140,7 +692,6 @@ memory = \"home\"
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn a_label_on_an_absorbed_claim_is_a_scenario_error() {
     let dir = TestDir::new();
     let path = inline(
@@ -1173,7 +724,6 @@ memory = \"home\"
 }
 
 #[test]
-#[ignore = "needs TIM-116: asphodel replay"]
 fn a_probe_naming_an_unknown_label_is_refused_before_the_run() {
     let dir = TestDir::new();
     let path = inline(

@@ -352,7 +352,7 @@ fn stage(
     conn.execute(
         "INSERT INTO edits (uuid, bank_id, kind, details, at) VALUES (?1, NULL, ?2, ?3, ?4)",
         (
-            IdSource::new().next(restored_at).to_string(),
+            IdSource::timed().next(restored_at).to_string(),
             EDIT_RESTORED,
             serde_json::json!({
                 "backed_up_at": backed_up_at,

@@ -31,6 +31,8 @@ asphodel replay --scenario scenarios/maya-to-mia.toml \
   floors (group `ci` only, below), `--config`, the scenario's own
   `[tuning]`, then `--overrides`. Each layer must have the shape of
   `Tuning` on its own; an unknown key is refused before anything runs.
+- `--model-dir`, or `ASPHODEL_MODEL_DIR`, is where group `models` finds the
+  real models.
 - `--latency` is the simulated extraction latency, a duration such as
   `10m` or `30s`. It overrides the scenario's `latency`; the default is
   `0s`.
@@ -96,6 +98,19 @@ head = true
 Events are `[[turn]]`, `[[chatter]]`, `[[document]]` and `[[clear]]`, each
 with an `at`. They may be listed in any order; the engine sorts them. A
 scenario with no claims anywhere is allowed and extracts nothing.
+
+### Models
+
+```toml
+[[model]]
+name = "profile"
+question = "Who is the user?"
+max_tokens = 500                # optional; the default
+kinds = ["fact", "state"]       # optional; every kind when absent
+```
+
+Created in the bank before the first event, enabled, with no entity
+filter. See "Refreshes" under "The simulation".
 
 ### Turns
 
@@ -247,14 +262,27 @@ A probe naming a label no claim defines is refused before the run.
   simulated clock, purge first, then the source and recall-log sweep, and
   then the refreshes due. Replay records the deletion fingerprint on its
   own store and never pauses purge.
+- **Refreshes** run on the production schedule: the debounce after a
+  notable write starts from the completion event, and the daily sweep
+  follows the purge. A scenario's `[[model]]` sections create mental
+  models before the first event so there is something to refresh. The
+  scripted LLM answers every refresh with no edits, so entries stay empty
+  and `refresh_calls_per_day` is what a scenario can watch; scripted
+  refresh replies are still open.
 - **Bank time** comes from the turns the engine ingests, chatter included.
   Documents don't move it.
 - **Wall-clock timeouts.** The reranker deadline is off, so the reranker is
   never skipped. The in-context idle timeout and the mapping expiry run on
   the simulated clock.
-- **Ids are deterministic.** A memory id is UUIDv5 of (source id, claim
-  ordinal), and an entity id is UUIDv5 of (creating source id, surface
-  form). Production keeps UUIDv7.
+- **Ids are deterministic.** A memory id is UUIDv5 of its chunk's id and
+  its claim ordinal in call 1's reply, and an entity id of the chunk that
+  proposed it and its name (TIM-96 says the source and the surface form;
+  the chunk is what commit knows, a turn is one chunk, and the name is what
+  one entity is created under when several surface forms propose it). A
+  source's id comes from its key and a chunk's from its source and
+  position, so the chain is stable from the key down. Ids with no parent
+  (recall ids, edits, banks, models) count up under a fixed namespace.
+  Production keeps UUIDv7.
 - **Determinism.** With the same scenario, layers and flags, a run writes a
   byte-identical report on the same machine and build. The report carries
   no wall-clock time. Every sort that reaches ranking or the report breaks
