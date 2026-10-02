@@ -110,6 +110,14 @@ version gets no chunk row, so forget also masks each passage wherever it
 appears verbatim in the document's other versions, and a version ingested
 after the forget masks the recorded characters before its text is stored.
 
+What forget blocks is the same input, not the same words (ADR 0002). A
+section a later version leaves unchanged is masked as above. A section the
+owner edits is new input: if it still contains the forgotten words, it's
+stored and extracted like any other new text, and can bring the memory
+back. A later turn that repeats the words is new input too. To keep
+something forgotten, take it out of the document before sending the next
+version.
+
 **Mentions from before version 7 have no span**, and nothing can recover
 one: call 1's reply was dropped when each chunk committed. Forget masks
 more rather than less for them:
@@ -124,3 +132,17 @@ The `forgotten` edit counts these as `legacy_mentions` and `whole_source`,
 so the wider masking can be seen in the edit log. No action is needed, but
 forgetting a memory mentioned before version 7 can mask more of an old turn
 or document than the mention itself.
+
+## Schema version 9: a sweep's counts survive its failure
+
+The nightly sweep writes one run row per bank, with counts only (ADR 0010).
+Each purge and the source sweep commit on their own before the row is
+written, so before version 9 a sweep that failed after deleting something,
+and was run again, wrote a row that left out what the failed attempt
+deleted. From version 9, `sweep_progress` holds a bank's counts while its
+sweep runs: each deletion adds to it in its own transaction, and the row is
+written from it at the end. A sweep resumed after a failure or a restart
+keeps counting into the same progress, so its run row counts every attempt
+and keeps the first attempt's start time.
+
+The migration only adds the table. No action is needed.

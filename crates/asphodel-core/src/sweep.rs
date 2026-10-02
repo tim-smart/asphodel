@@ -20,7 +20,10 @@
 //! a chunk is still queued, and its stored in-context set goes. A recall
 //! row loses its query and results. Every key stays as the tombstone, so
 //! ingest stays idempotent. One `sweep_runs` row per bank records the
-//! counts, the fingerprint and δ.
+//! counts, the fingerprint and δ. The counts build up in `sweep_progress`,
+//! in the same transaction as each deletion, and the row is written from
+//! them at the end, so a sweep that fails and resumes, after a restart
+//! too, still counts what it deleted before the failure (schema version 9).
 //!
 //! **The pause.** While the stored deletion fingerprint differs from the
 //! daemon's, purge and the source sweep don't run at all, as if δ were
@@ -35,7 +38,7 @@ use std::sync::Mutex;
 
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{DeletionInputs, Fingerprint, PurgePause, Tuning};
@@ -181,63 +184,147 @@ pub(crate) fn run(
             tracing::warn!(bank = %bank, "the sweep is paused until the deletion fingerprint is acknowledged");
             continue;
         }
-        let mut counts = Counts::default();
+        begin(store, *bank_id, now, &fingerprint, tuning.purge.delta)?;
         for head in candidates(store, tuning, *bank_id, now)? {
-            if let Some((purged, aftermath)) =
-                purge_chain(store, tuning, pause, *bank_id, head, now)?
-            {
-                counts.purged_memories += purged.len();
+            if let Some((_, aftermath)) = purge_chain(store, tuning, pause, *bank_id, head, now)? {
                 settled.push((*bank_id, aftermath));
             }
         }
-        sweep_sources(store, tuning, *bank_id, now, &mut counts)?;
-        {
-            let conn = store.connection();
-            conn.execute(
-                "INSERT INTO sweep_runs (bank_id, started_at, completed_at, fingerprint, delta,
-                                         purged_memories, swept_sources, swept_chunks,
-                                         swept_failed_chunks, swept_recalls)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                rusqlite::params![
-                    bank_id,
-                    micros(now),
-                    micros(store.now()),
-                    fingerprint.as_str(),
-                    tuning.purge.delta,
-                    counts.purged_memories as i64,
-                    counts.swept_sources as i64,
-                    counts.swept_chunks as i64,
-                    counts.swept_failed_chunks as i64,
-                    counts.swept_recalls as i64,
-                ],
-            )?;
-        }
+        sweep_sources(store, tuning, *bank_id, now)?;
+        let run = {
+            let mut conn = store.connection();
+            let tx = conn.transaction()?;
+            let run = finish(&tx, *bank_id, store.now())?;
+            tx.commit()?;
+            run
+        };
         schedule.swept(*bank_id, now);
-        tracing::info!(
-            bank = %bank,
-            purged = counts.purged_memories,
-            sources = counts.swept_sources,
-            chunks = counts.swept_chunks,
-            failed_chunks = counts.swept_failed_chunks,
-            recalls = counts.swept_recalls,
-            "swept"
-        );
-        ran.push(SweepRun {
-            bank: bank.clone(),
-            fingerprint: fingerprint.clone(),
-            delta: tuning.purge.delta,
-            purged_memories: counts.purged_memories,
-            swept_sources: counts.swept_sources,
-            swept_chunks: counts.swept_chunks,
-            swept_failed_chunks: counts.swept_failed_chunks,
-            swept_recalls: counts.swept_recalls,
-        });
+        if let Some((fingerprint, delta, counts)) = run {
+            tracing::info!(
+                bank = %bank,
+                purged = counts.purged_memories,
+                sources = counts.swept_sources,
+                chunks = counts.swept_chunks,
+                failed_chunks = counts.swept_failed_chunks,
+                recalls = counts.swept_recalls,
+                "swept"
+            );
+            ran.push(SweepRun {
+                bank: bank.clone(),
+                fingerprint,
+                delta,
+                purged_memories: counts.purged_memories,
+                swept_sources: counts.swept_sources,
+                swept_chunks: counts.swept_chunks,
+                swept_failed_chunks: counts.swept_failed_chunks,
+                swept_recalls: counts.swept_recalls,
+            });
+        }
     }
     let next_due = banks
         .iter()
         .map(|(bank_id, _, tz)| schedule.next(*bank_id, tz, tuning))
         .min();
     Ok(Sweeps { ran, next_due })
+}
+
+/// Starts the bank's sweep progress (schema version 9), or carries on with
+/// the one a failed or interrupted sweep left, keeping its start and its
+/// counts. One left under another fingerprint or δ is written as a run of
+/// its own first: its counts were made under other settings.
+fn begin(
+    store: &Store,
+    bank_id: i64,
+    now: Timestamp,
+    fingerprint: &Fingerprint,
+    delta: Option<f64>,
+) -> Result<(), StoreError> {
+    let mut conn = store.connection();
+    let tx = conn.transaction()?;
+    let left: Option<(String, Option<f64>)> = tx
+        .query_row(
+            "SELECT fingerprint, delta FROM sweep_progress WHERE bank_id = ?1",
+            [bank_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((left_fingerprint, left_delta)) = left
+        && (left_fingerprint != fingerprint.as_str() || left_delta != delta)
+    {
+        finish(&tx, bank_id, store.now())?;
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO sweep_progress (bank_id, started_at, fingerprint, delta)
+         VALUES (?1, ?2, ?3, ?4)",
+        (bank_id, micros(now), fingerprint.as_str(), delta),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Writes the bank's run row from its sweep progress and deletes the
+/// progress, in the caller's transaction. `None` when there's none.
+fn finish(
+    tx: &Transaction<'_>,
+    bank_id: i64,
+    completed_at: Timestamp,
+) -> Result<Option<(Fingerprint, Option<f64>, Counts)>, rusqlite::Error> {
+    let progress: Option<(i64, String, Option<f64>, [i64; 5])> = tx
+        .query_row(
+            "SELECT started_at, fingerprint, delta, purged_memories, swept_sources,
+                    swept_chunks, swept_failed_chunks, swept_recalls
+             FROM sweep_progress WHERE bank_id = ?1",
+            [bank_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    [
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ],
+                ))
+            },
+        )
+        .optional()?;
+    let Some((started_at, fingerprint, delta, counts)) = progress else {
+        return Ok(None);
+    };
+    tx.execute(
+        "INSERT INTO sweep_runs (bank_id, started_at, completed_at, fingerprint, delta,
+                                 purged_memories, swept_sources, swept_chunks,
+                                 swept_failed_chunks, swept_recalls)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            bank_id,
+            started_at,
+            micros(completed_at),
+            fingerprint,
+            delta,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+        ],
+    )?;
+    tx.execute("DELETE FROM sweep_progress WHERE bank_id = ?1", [bank_id])?;
+    let count = |value: i64| usize::try_from(value).unwrap_or(0);
+    Ok(Some((
+        Fingerprint::from_stored(fingerprint),
+        delta,
+        Counts {
+            purged_memories: count(counts[0]),
+            swept_sources: count(counts[1]),
+            swept_chunks: count(counts[2]),
+            swept_failed_chunks: count(counts[3]),
+            swept_recalls: count(counts[4]),
+        },
+    )))
 }
 
 /// Purge's first phase: the heads of the bank's chains that are eligible
@@ -340,6 +427,13 @@ pub(crate) fn purge_chain(
         return Ok(None);
     }
     let (purged, aftermath) = erase_chain(&tx, store, bank_id, &members, EraseReason::Purge)?;
+    // Counted in the same transaction as the deletion, so a sweep that fails
+    // later still counts it when it resumes. A purge outside a sweep has no
+    // progress row to count in.
+    tx.execute(
+        "UPDATE sweep_progress SET purged_memories = purged_memories + ?2 WHERE bank_id = ?1",
+        (bank_id, purged.len() as i64),
+    )?;
     tx.commit()?;
     Ok(Some((purged, aftermath)))
 }
@@ -358,20 +452,20 @@ fn purgeable(
     Ok(heads.into_iter().map(|head| chain(&links, head)).collect())
 }
 
-/// The source, failed-chunk and recall-log sweep past the horizon.
+/// The source, failed-chunk and recall-log sweep past the horizon, counted
+/// in the bank's sweep progress in the same transaction.
 fn sweep_sources(
     store: &Store,
     tuning: &Tuning,
     bank_id: i64,
     now: Timestamp,
-    counts: &mut Counts,
 ) -> Result<(), StoreError> {
     let horizon = horizon(tuning, now);
     let now = micros(now);
     let mut conn = store.connection();
     let tx = conn.transaction()?;
 
-    counts.swept_failed_chunks = tx.execute(
+    let swept_failed_chunks = tx.execute(
         "UPDATE chunks SET text = NULL, call1_output = NULL, tombstoned_at = ?3
          WHERE bank_id = ?1 AND failed_at IS NOT NULL AND tombstoned_at IS NULL
            AND source_id IN (SELECT id FROM sources WHERE bank_id = ?1 AND ingested_at < ?2)",
@@ -379,8 +473,9 @@ fn sweep_sources(
     )?;
 
     let sources: Vec<i64> = sweepable_sources(&tx, bank_id, horizon, &BTreeSet::new())?;
+    let mut swept_chunks = 0;
     for source in &sources {
-        counts.swept_chunks += tx.execute(
+        swept_chunks += tx.execute(
             "UPDATE chunks SET text = NULL, call1_output = NULL, tombstoned_at = ?2
              WHERE source_id = ?1 AND tombstoned_at IS NULL",
             (source, now),
@@ -394,17 +489,37 @@ fn sweep_sources(
         tx.execute("DELETE FROM turn_in_context WHERE source_id = ?1", [source])?;
         tx.execute("DELETE FROM turn_entries WHERE source_id = ?1", [source])?;
     }
-    counts.swept_sources = sources.len();
 
     tx.execute(
         "DELETE FROM recall_results WHERE recall_id IN
            (SELECT id FROM recalls WHERE bank_id = ?1 AND at < ?2 AND swept_at IS NULL)",
         (bank_id, horizon),
     )?;
-    counts.swept_recalls = tx.execute(
+    let swept_recalls = tx.execute(
         "UPDATE recalls SET query = NULL, swept_at = ?3
          WHERE bank_id = ?1 AND at < ?2 AND swept_at IS NULL",
         (bank_id, horizon, now),
+    )?;
+    let counts = Counts {
+        purged_memories: 0,
+        swept_sources: sources.len(),
+        swept_chunks,
+        swept_failed_chunks,
+        swept_recalls,
+    };
+    tx.execute(
+        "UPDATE sweep_progress
+         SET swept_sources = swept_sources + ?2, swept_chunks = swept_chunks + ?3,
+             swept_failed_chunks = swept_failed_chunks + ?4,
+             swept_recalls = swept_recalls + ?5
+         WHERE bank_id = ?1",
+        (
+            bank_id,
+            counts.swept_sources as i64,
+            counts.swept_chunks as i64,
+            counts.swept_failed_chunks as i64,
+            counts.swept_recalls as i64,
+        ),
     )?;
     tx.commit()?;
     Ok(())

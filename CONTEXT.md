@@ -192,7 +192,7 @@ The exact input a memory came from, either a conversation turn or a document, ke
 _Avoid_: Episode, chunk, input, raw message
 
 **Tombstone**:
-What's left of a source, or of a passage in one, once its text is gone: the key and content hash, with no text. It stops the same input being ingested and extracted again. A turn that asked to forget is stored as a tombstone from the start.
+What's left of a source, or of a passage in one, once its text is gone: the key and content hash, with no text. It stops the same input being ingested and extracted again. An edited section of a document, or a later turn that repeats the same words, is new input, not the same input. A turn that asked to forget is stored as a tombstone from the start.
 _Avoid_: Marker, stub, deleted row
 
 **Sweep**:

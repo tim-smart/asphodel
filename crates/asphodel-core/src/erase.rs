@@ -748,16 +748,50 @@ fn slice(text: &str, start: usize, end: usize) -> String {
 }
 
 /// Where `needle` appears in `text`, in characters, overlapping included.
+/// A mask on either side matches any character: an earlier forget masked
+/// part of the same passage there, or in the text the needle was read from,
+/// and that mustn't hide the rest of it (the re-review of 4c5d9e1). At
+/// least one character that isn't a mask or whitespace has to match, so a
+/// run of masks finds nothing. Matching only ever widens what's masked.
 fn occurrences(text: &str, needle: &str) -> Vec<(usize, usize)> {
-    if needle.is_empty() || needle.contains(REDACTION_MASK) {
+    let needle: Vec<char> = needle.chars().collect();
+    if !needle
+        .iter()
+        .any(|c| *c != REDACTION_MASK && !c.is_whitespace())
+    {
         return Vec::new();
     }
-    let length = needle.chars().count();
-    text.char_indices()
-        .enumerate()
-        .filter(|(_, (byte, _))| text[*byte..].starts_with(needle))
-        .map(|(index, _)| (index, index + length))
+    let text: Vec<char> = text.chars().collect();
+    if needle.len() > text.len() {
+        return Vec::new();
+    }
+    (0..=text.len() - needle.len())
+        .filter(|&start| {
+            let mut anchored = false;
+            for (n, t) in needle.iter().zip(&text[start..]) {
+                if *n == REDACTION_MASK || *t == REDACTION_MASK {
+                    continue;
+                }
+                if n != t {
+                    return false;
+                }
+                anchored |= !n.is_whitespace();
+            }
+            anchored
+        })
+        .map(|start| (start, start + needle.len()))
         .collect()
+}
+
+/// Character spans, start inclusive and end exclusive.
+type Spans = Vec<(usize, usize)>;
+
+/// What one redaction masks: chunk-relative spans by chunk rowid, and spans
+/// of each source's `text` and `reply` by source rowid.
+#[derive(Debug, Default)]
+struct Masks {
+    chunks: BTreeMap<i64, Spans>,
+    sources: BTreeMap<i64, (Spans, Spans)>,
 }
 
 /// Masks `spans` (chunk-relative characters, by chunk rowid) in each
@@ -771,74 +805,95 @@ fn occurrences(text: &str, needle: &str) -> Vec<(usize, usize)> {
 /// A document's other versions hold the same passages in their own text:
 /// in chunks that changed, and in sections they share with this one, which
 /// have no chunk row of their own. Each passage is masked wherever it
-/// appears verbatim in them too.
+/// appears in them too ([`occurrences`]).
+///
+/// Every target is read before anything is masked, and each is masked once
+/// with the union of its spans (the re-review of 4c5d9e1). Masking one
+/// passage first would hide a longer one that contains it from the search
+/// in the other versions.
 fn redact(
     conn: &Connection,
     spans: &BTreeMap<i64, Vec<(usize, usize)>>,
 ) -> Result<(), rusqlite::Error> {
+    let mut masks = Masks::default();
+    let mut passages: BTreeMap<(i64, String), Vec<String>> = BTreeMap::new();
     for (&chunk_id, spans) in spans {
         let (source_id, start_offset, text): (i64, i64, Option<String>) = conn.query_row(
             "SELECT source_id, start_offset, text FROM chunks WHERE id = ?1",
             [chunk_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        let passages: Vec<String> = text
-            .as_deref()
-            .map(|text| {
-                spans
-                    .iter()
-                    .map(|&(start, end)| slice(text, start, end))
-                    .filter(|passage| !passage.trim().is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        mask_chunk(conn, chunk_id, text.as_deref(), spans)?;
-
-        let (kind, document_id, source_text, reply): (
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = conn.query_row(
-            "SELECT kind, document_id, text, reply FROM sources WHERE id = ?1",
-            [source_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        let (source_text, reply) = if kind == "turn" {
+        masks
+            .chunks
+            .entry(chunk_id)
+            .or_default()
+            .extend_from_slice(spans);
+        let (kind, document_id, source_text): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT kind, document_id, text FROM sources WHERE id = ?1",
+                [source_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let (in_text, in_reply) = masks.sources.entry(source_id).or_default();
+        if kind == "turn" {
             let message = source_text
                 .as_deref()
                 .map_or(0, |text| text.chars().count());
             let reply_start = message + TURN_SEPARATOR.chars().count();
-            let in_message: Vec<(usize, usize)> = spans
-                .iter()
-                .filter(|(start, _)| *start < message)
-                .map(|&(start, end)| (start, end.min(message)))
-                .collect();
-            let in_reply: Vec<(usize, usize)> = spans
-                .iter()
-                .filter(|(_, end)| *end > reply_start)
-                .map(|&(start, end)| (start.max(reply_start) - reply_start, end - reply_start))
-                .collect();
-            (
-                source_text.map(|text| mask(&text, &in_message)),
-                reply.map(|reply| mask(&reply, &in_reply)),
-            )
+            in_text.extend(
+                spans
+                    .iter()
+                    .filter(|(start, _)| *start < message)
+                    .map(|&(start, end)| (start, end.min(message))),
+            );
+            in_reply.extend(
+                spans
+                    .iter()
+                    .filter(|(_, end)| *end > reply_start)
+                    .map(|&(start, end)| (start.max(reply_start) - reply_start, end - reply_start)),
+            );
         } else {
             let offset = offset(start_offset);
-            let shifted: Vec<(usize, usize)> = spans
-                .iter()
-                .map(|&(start, end)| (start + offset, end + offset))
-                .collect();
-            (source_text.map(|text| mask(&text, &shifted)), reply)
-        };
+            in_text.extend(
+                spans
+                    .iter()
+                    .map(|&(start, end)| (start + offset, end + offset)),
+            );
+        }
+        if let (Some(document_id), Some(text)) = (document_id, text) {
+            passages
+                .entry((source_id, document_id))
+                .or_default()
+                .extend(
+                    spans
+                        .iter()
+                        .map(|&(start, end)| slice(&text, start, end))
+                        .filter(|passage| !passage.trim().is_empty()),
+                );
+        }
+    }
+    for ((source_id, document_id), passages) in &passages {
+        versions(conn, *source_id, document_id, passages, &mut masks)?;
+    }
+
+    for (chunk_id, spans) in &masks.chunks {
+        let text: Option<String> = chunk_text(conn, *chunk_id)?;
+        mask_chunk(conn, *chunk_id, text.as_deref(), spans)?;
+    }
+    for (source_id, (in_text, in_reply)) in &masks.sources {
+        let (text, reply): (Option<String>, Option<String>) = conn.query_row(
+            "SELECT text, reply FROM sources WHERE id = ?1",
+            [source_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         conn.execute(
             "UPDATE sources SET text = ?2, reply = ?3 WHERE id = ?1",
-            (source_id, source_text, reply),
+            (
+                source_id,
+                text.map(|text| mask(&text, in_text)),
+                reply.map(|reply| mask(&reply, in_reply)),
+            ),
         )?;
-
-        if let Some(document_id) = document_id.filter(|_| !passages.is_empty()) {
-            redact_versions(conn, source_id, &document_id, &passages)?;
-        }
     }
     Ok(())
 }
@@ -879,15 +934,17 @@ fn mask_chunk(
     Ok(())
 }
 
-/// Masks each of `passages` wherever it appears verbatim in the other
-/// versions of a document: their source text and their chunks.
-fn redact_versions(
+/// Adds to `masks` every place `passages` appear in the other versions of a
+/// document, read as they are before this redaction masks anything: their
+/// source text and their chunks.
+fn versions(
     conn: &Connection,
     source_id: i64,
     document_id: &str,
     passages: &[String],
+    masks: &mut Masks,
 ) -> Result<(), rusqlite::Error> {
-    let versions: Vec<(i64, Option<String>)> = {
+    let others: Vec<(i64, Option<String>)> = {
         let mut statement = conn.prepare_cached(
             "SELECT id, text FROM sources
              WHERE bank_id = (SELECT bank_id FROM sources WHERE id = ?1)
@@ -899,26 +956,23 @@ fn redact_versions(
             })?
             .collect::<Result<_, _>>()?
     };
-    for (version, text) in versions {
+    let hits = |text: &str| -> Vec<(usize, usize)> {
+        passages
+            .iter()
+            .flat_map(|passage| occurrences(text, passage))
+            .collect()
+    };
+    for (version, text) in others {
         if let Some(text) = text {
-            let hits: Vec<(usize, usize)> = passages
-                .iter()
-                .flat_map(|passage| occurrences(&text, passage))
-                .collect();
-            if !hits.is_empty() {
-                conn.execute(
-                    "UPDATE sources SET text = ?2 WHERE id = ?1",
-                    (version, mask(&text, &hits)),
-                )?;
+            let found = hits(&text);
+            if !found.is_empty() {
+                masks.sources.entry(version).or_default().0.extend(found);
             }
         }
         for (chunk, text) in chunks_of(conn, version)? {
-            let hits: Vec<(usize, usize)> = passages
-                .iter()
-                .flat_map(|passage| occurrences(&text, passage))
-                .collect();
-            if !hits.is_empty() {
-                mask_chunk(conn, chunk, Some(&text), &hits)?;
+            let found = hits(&text);
+            if !found.is_empty() {
+                masks.chunks.entry(chunk).or_default().extend(found);
             }
         }
     }
