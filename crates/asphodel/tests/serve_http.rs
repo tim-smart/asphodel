@@ -7,7 +7,9 @@
 //! flight and checkpointing the WAL, and every CLI subcommand reaching the
 //! daemon over `--url`. "Agenda, mental models and the system prompt block"
 //! (TIM-111) adds the model routes, `/system-prompt`, `/agenda` and
-//! `asphodel model`.
+//! `asphodel model`. "Erase path, forget, purge and the nightly sweep"
+//! (TIM-112) adds `forget`, `/v1/purge/plan` and `/v1/purge/ack`, and
+//! `asphodel forget` and `asphodel purge plan|ack`.
 //!
 //! The daemon runs on the fake models (`ASPHODEL_MODELS=fake`) and a
 //! scripted fake LLM (`ASPHODEL_LLM_SCRIPT`), both environment only. The
@@ -99,13 +101,15 @@ impl TestDir {
         path
     }
 
-    /// A tuning file with a floor for each fake model.
-    fn floors_for_fakes(&self) -> PathBuf {
+    /// A tuning file with a floor for each fake model, and `extra` TOML.
+    fn floors_for_fakes(&self, extra: &str) -> PathBuf {
         let path = self.path("tuning.toml");
         fs::write(
             &path,
-            "[injection.reranker_floors]\n\"fake-reranker:v1\" = 0.0\n\
-             [reconcile.embedding_floors]\n\"fake-embedder:v1\" = 0.5\n",
+            format!(
+                "[injection.reranker_floors]\n\"fake-reranker:v1\" = 0.0\n\
+                 [reconcile.embedding_floors]\n\"fake-embedder:v1\" = 0.5\n{extra}"
+            ),
         )
         .unwrap();
         path
@@ -247,6 +251,8 @@ struct Serve<'a> {
     script: Option<PathBuf>,
     gate: Option<PathBuf>,
     token: Option<&'a str>,
+    /// More tuning TOML, after the floors.
+    tuning: &'a str,
 }
 
 impl<'a> Serve<'a> {
@@ -259,6 +265,7 @@ impl<'a> Serve<'a> {
             script: None,
             gate: None,
             token: None,
+            tuning: "",
         }
     }
 
@@ -282,6 +289,11 @@ impl<'a> Serve<'a> {
         self
     }
 
+    fn tuning(mut self, extra: &'a str) -> Self {
+        self.tuning = extra;
+        self
+    }
+
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
         command
@@ -290,7 +302,7 @@ impl<'a> Serve<'a> {
             .env("ASPHODEL_LOG", "info")
             .arg("serve")
             .arg("--config")
-            .arg(self.dir.floors_for_fakes())
+            .arg(self.dir.floors_for_fakes(self.tuning))
             .arg("--data-dir")
             .arg(&self.data_dir)
             .arg("--listen")
@@ -1485,5 +1497,124 @@ fn the_cli_creates_lists_edits_and_refreshes_models() {
         stderr(&output).contains("no such model"),
         "{}",
         stderr(&output)
+    );
+}
+
+// Forget and the purge pause (TIM-112; TIM-94, decision 9, as amended by
+// TIM-97; ADR 0009; ADR 0010).
+
+#[test]
+fn forget_erases_over_http_and_the_cli() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir)
+        .script(&[json!({"reply": auckland_reply()})])
+        .ready();
+    daemon.create_bank("main");
+    let ingested = daemon.ingest_notes("main", "notes.md");
+    let id = daemon.wait_for_memory("main");
+    daemon.wait_extracted("main");
+
+    // Nothing was queued before the forget, so the erase runs at once.
+    let out = succeeded(run(cli(&daemon).args(["forget", "--bank", "main", &id])));
+    assert!(out.contains(&format!("forgot {id}")), "{out}");
+    let recall = daemon.recall("main", "where does Tim live? Auckland");
+    assert!(
+        !recall["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["id"] == id.as_str()),
+        "{recall}"
+    );
+
+    // The key and hash are the tombstone: the same document brings nothing
+    // back and queues nothing.
+    let again = daemon.ingest_notes("main", "notes.md");
+    assert_eq!(again["outcome"], "duplicate");
+    assert_eq!(again["source"], ingested["source"]);
+    assert_eq!(daemon.chunks("main")["queued"], json!([]));
+
+    // A forgotten id is unknown from then on, over HTTP and the CLI.
+    let forgotten =
+        daemon.ok(daemon.post("/v1/banks/main/forget", &json!({"ids": [id, "not-an-id"]})));
+    assert_eq!(forgotten["forgotten"], json!([]));
+    assert_eq!(forgotten["unknown"], json!([id, "not-an-id"]));
+    let output = run(cli(&daemon).args(["forget", "--bank", "main", &id]));
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains(&id), "{}", stderr(&output));
+
+    let ids: Vec<String> = (0..51).map(|_| id.clone()).collect();
+    let too_many = daemon.post("/v1/banks/main/forget", &json!({ "ids": ids }));
+    assert_eq!(too_many.status, 400, "{}", too_many.body);
+    let no_bank = daemon.post("/v1/banks/nobody/forget", &json!({"ids": [id]}));
+    assert_eq!(no_bank.status, 404, "{}", no_bank.body);
+}
+
+#[test]
+fn a_changed_fingerprint_pauses_purge_until_the_cli_acks_the_running_hash() {
+    let dir = TestDir::new();
+    let mut first = Serve::new(&dir).ready();
+    first.create_bank("main");
+    let config = first.ok(first.get("/v1/config"));
+    assert_eq!(config["purge"]["state"], "running");
+    let stored = config["deletion_fingerprint"].as_str().unwrap().to_string();
+    let plan = first.ok(first.get("/v1/purge/plan"));
+    assert_eq!(plan["pause"]["state"], "running");
+    assert_eq!(plan["changed"], json!([]));
+    first.sigterm();
+    assert!(first.wait_exit().success());
+    drop(first);
+
+    let delta = "[purge]\ndelta = 0.5\n";
+    let mut second = Serve::new(&dir).tuning(delta).ready();
+    let config = second.ok(second.get("/v1/config"));
+    let current = config["deletion_fingerprint"].as_str().unwrap().to_string();
+    assert_ne!(current, stored);
+    assert_eq!(
+        config["purge"],
+        json!({"state": "paused", "stored": stored})
+    );
+
+    let out = succeeded(run(cli(&second).args(["purge", "plan"])));
+    assert!(out.contains("purge: paused"), "{out}");
+    assert!(out.contains("changed: purge.delta"), "{out}");
+    assert!(out.contains(&current), "{out}");
+    let plan: Value = serde_json::from_str(&succeeded(run(
+        cli(&second).args(["purge", "plan", "--json"])
+    )))
+    .unwrap();
+    assert_eq!(plan["current"], current.as_str());
+    assert_eq!(plan["changed"], json!(["purge.delta"]));
+
+    // Only the hash the running daemon computed is accepted.
+    let output = run(cli(&second).args(["purge", "ack", "--hash", "nope"]));
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("409"), "{}", stderr(&output));
+    let stale = second.post("/v1/purge/ack", &json!({"hash": stored}));
+    assert_eq!(stale.status, 409, "{}", stale.body);
+    assert_eq!(
+        second.ok(second.get("/v1/config"))["purge"]["state"],
+        "paused"
+    );
+
+    let out = succeeded(run(cli(&second).args(["purge", "ack", "--hash", &current])));
+    assert!(out.contains("acknowledged"), "{out}");
+    assert_eq!(
+        second.ok(second.get("/v1/config"))["purge"]["state"],
+        "running"
+    );
+    assert_eq!(
+        second.ok(second.get("/v1/purge/plan"))["changed"],
+        json!([])
+    );
+    second.sigterm();
+    assert!(second.wait_exit().success());
+    drop(second);
+
+    // The ack is stored, so it holds after a restart.
+    let third = Serve::new(&dir).tuning(delta).ready();
+    assert_eq!(
+        third.ok(third.get("/v1/config"))["purge"]["state"],
+        "running"
     );
 }
