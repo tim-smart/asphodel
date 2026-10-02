@@ -66,9 +66,10 @@ def test_written_by_rename_leaves_no_partial_files(tmp_path):
 
 def test_files_are_oldest_first(tmp_path):
     spool = Spool(tmp_path / "spool")
+    recent = time.time() - 100
     for n in (3, 1, 2):
         path = spool.write(turn(n))
-        os.utime(path, (1000 + n, 1000 + n))
+        os.utime(path, (recent + n, recent + n))
     assert [json.loads(f.read_text())["message_at"] for f in spool.files()] == [
         turn(1)["message_at"],
         turn(2)["message_at"],
@@ -78,9 +79,10 @@ def test_files_are_oldest_first(tmp_path):
 
 def test_size_cap_drops_the_oldest(tmp_path):
     spool = Spool(tmp_path / "spool", max_bytes=2500)
+    recent = time.time() - 100
     for n in range(1, 6):
         path = spool.write(turn(n, size=800))
-        os.utime(path, (1000 + n, 1000 + n))
+        os.utime(path, (recent + n, recent + n))
     kept = [json.loads(f.read_text())["message_at"] for f in spool.files()]
     assert sum(f.stat().st_size for f in spool.files()) <= 2500
     assert kept == [turn(4)["message_at"], turn(5)["message_at"]]
@@ -97,9 +99,10 @@ def test_age_cap_drops_files_older_than_seven_days(tmp_path):
 
 def test_replay_sends_oldest_first_and_deletes_delivered(tmp_path):
     spool = Spool(tmp_path / "spool")
+    recent = time.time() - 100
     for n in (1, 2, 3):
         path = spool.write(turn(n))
-        os.utime(path, (1000 + n, 1000 + n))
+        os.utime(path, (recent + n, recent + n))
     sent = []
     delivered = spool.replay(lambda body: sent.append(body["message_at"]) or True)
     assert delivered == 3
@@ -109,9 +112,10 @@ def test_replay_sends_oldest_first_and_deletes_delivered(tmp_path):
 
 def test_replay_stops_at_the_first_connection_failure_and_keeps_the_rest(tmp_path):
     spool = Spool(tmp_path / "spool")
+    recent = time.time() - 100
     for n in (1, 2, 3):
         path = spool.write(turn(n))
-        os.utime(path, (1000 + n, 1000 + n))
+        os.utime(path, (recent + n, recent + n))
     calls = []
 
     def send(body):
