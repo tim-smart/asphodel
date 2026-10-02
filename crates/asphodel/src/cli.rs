@@ -6,7 +6,9 @@
 //! ([`crate::client`]); `models fetch`
 //! and `llm login` work on files, and `restore` works on the data dir
 //! offline (ADR 0010).
-//! `replay` and `bench` are stubs that later stages fill in.
+//! `replay` runs scripted scenarios and real-history corpora, `import`
+//! writes those corpora, `report diff` compares runs and `bench` drives a
+//! daemon on a copy of a replayed store (TIM-96, TIM-117).
 
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -130,8 +132,15 @@ enum Command {
     #[command(subcommand)]
     Llm(LlmCommand),
 
+    /// Turn a copy of Hermes' `state.db` into a replay corpus.
+    Import(ImportArgs),
+
     /// Replay recorded sessions on a simulated clock.
     Replay(ReplayArgs),
+
+    /// Compare replay reports.
+    #[command(subcommand)]
+    Report(ReportCommand),
 
     /// Run concurrent prefetches against a daemon on a copy of a store.
     Bench(BenchArgs),
@@ -728,8 +737,40 @@ pub struct ReplayArgs {
     pub replay_dir: Option<PathBuf>,
 
     /// The scenario file to run.
+    #[arg(long, required_unless_present = "corpus", conflicts_with = "corpus")]
+    pub scenario: Option<PathBuf>,
+
+    /// The corpus `asphodel import` wrote, for a real-history run.
     #[arg(long)]
-    pub scenario: PathBuf,
+    pub corpus: Option<PathBuf>,
+
+    /// Where real-history LLM replies come from.
+    #[arg(long, value_enum, conflicts_with = "scenario")]
+    pub mode: Option<ReplayMode>,
+
+    /// The cassette of recorded LLM calls, under the private dir.
+    #[arg(long, conflicts_with = "scenario")]
+    pub cassette: Option<PathBuf>,
+
+    /// Ignore every recorded call and record afresh (`live` only).
+    #[arg(long, conflicts_with = "scenario")]
+    pub no_cache: bool,
+
+    /// How `fast` answers refreshes.
+    #[arg(long, value_enum, conflicts_with = "scenario")]
+    pub refresh: Option<RefreshMode>,
+
+    /// The real-history probes file, under the private dir.
+    #[arg(long, conflicts_with = "scenario")]
+    pub probes: Option<PathBuf>,
+
+    /// Run twice and compare the reports byte for byte.
+    #[arg(long)]
+    pub self_test: bool,
+
+    /// Also write the aggregate export: probe ids and numbers only.
+    #[arg(long)]
+    pub aggregate: Option<PathBuf>,
 
     /// Where to write the JSON report; `<replay dir>/reports/<name>.json`
     /// by default. Given twice, the last one wins.
@@ -756,12 +797,123 @@ pub struct ReplayArgs {
     /// Where the real models are, for scenarios in group `models`.
     #[arg(long, env = "ASPHODEL_MODEL_DIR")]
     pub model_dir: Option<PathBuf>,
+
+    /// ONNX Runtime's intra-op threads, pinned so a run is repeatable;
+    /// 1 by default.
+    #[arg(long, env = "ASPHODEL_ONNX_THREADS")]
+    pub onnx_threads: Option<NonZeroUsize>,
+
+    /// Where the ChatGPT login lives, for `live` and `fast` with
+    /// `llm.auth = "chatgpt"`; the private dir by default.
+    #[arg(long)]
+    pub token_dir: Option<PathBuf>,
+}
+
+/// Where a real-history replay's LLM replies come from (TIM-96, decision
+/// 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReplayMode {
+    /// Use the cassette, and call and record on a miss.
+    Live,
+    /// Use the cassette, and fail on a miss.
+    Replay,
+    /// Reuse claims by chunk and `used` verdicts by pair, topping up the
+    /// rest.
+    Fast,
+}
+
+/// How `fast` answers refreshes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RefreshMode {
+    Live,
+    Recorded,
+    Off,
+}
+
+/// `asphodel import`: a copy of Hermes' `state.db` and the private
+/// manifest into a replay corpus (TIM-96, decision 1).
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// The private directory the corpus goes under.
+    #[arg(long, env = "ASPHODEL_REPLAY_DIR")]
+    pub replay_dir: Option<PathBuf>,
+
+    /// A copy of Hermes' `state.db`.
+    #[arg(long)]
+    pub state_db: PathBuf,
+
+    /// The private manifest: timezone, owner, assistant and speakers.
+    #[arg(long)]
+    pub manifest: PathBuf,
+
+    /// Where to write the corpus, under the private dir.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+
+    /// What to do with rows that have `active=0` and `compacted=0`: the
+    /// verbatim tail a compaction carried forward, or turns a rewind
+    /// discarded. Required when the history has any; the choice is still
+    /// open on TIM-117.
+    #[arg(long, value_enum)]
+    pub inactive_rows: Option<InactiveRows>,
+
+    /// Check the history and print the counts, writing nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// How `asphodel import` treats `active=0, compacted=0` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InactiveRows {
+    /// Leave them out.
+    Skip,
+    /// Replay them like any other row.
+    Replay,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReportCommand {
+    /// The A/B diff of two replay reports.
+    Diff(DiffArgs),
 }
 
 #[derive(Debug, Args)]
+pub struct DiffArgs {
+    pub a: PathBuf,
+    pub b: PathBuf,
+
+    /// Compare runs with a different corpus or cassette.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `asphodel bench`: concurrent prefetches over HTTP against a daemon
+/// started on a copy of the replayed store (TIM-96, decision 3).
+#[derive(Debug, Args)]
 pub struct BenchArgs {
-    #[command(flatten)]
-    pub client: ClientArgs,
+    /// The private directory whose replayed store is copied.
+    #[arg(long, env = "ASPHODEL_REPLAY_DIR")]
+    pub replay_dir: Option<PathBuf>,
+
+    /// The corpus the prefetch queries are sampled from.
+    #[arg(long)]
+    pub corpus: Option<PathBuf>,
+
+    /// A concurrency level to measure; given more than once, each is.
+    #[arg(long)]
+    pub concurrency: Vec<NonZeroUsize>,
+
+    /// Prefetches per concurrency level.
+    #[arg(long)]
+    pub requests: Option<NonZeroUsize>,
+
+    /// Where the bench daemon listens. Loopback only.
+    #[arg(long)]
+    pub listen: Option<Listen>,
+
+    /// Where to write the JSON report, under the private dir.
+    #[arg(long)]
+    pub report: Option<PathBuf>,
 }
 
 impl Cli {
@@ -803,8 +955,10 @@ impl Cli {
             Command::Recalls(args) => audit(args, AuditList::Recalls),
             Command::Models(ModelsCommand::Fetch { model_dir }) => models_fetch(model_dir),
             Command::Llm(LlmCommand::Login { data_dir }) => llm_login(&data_dir),
+            Command::Import(args) => crate::replay::import::run(args),
             Command::Replay(args) => crate::replay::run(args),
-            Command::Bench(_) => stub("bench"),
+            Command::Report(ReportCommand::Diff(args)) => crate::replay::diff::run(args),
+            Command::Bench(args) => crate::bench::run(args),
         }
     }
 }
@@ -2353,8 +2507,4 @@ fn reembed(args: ReembedArgs) -> anyhow::Result<()> {
         text(&status, "recorded_model")
     );
     Ok(())
-}
-
-fn stub(name: &str) -> anyhow::Result<()> {
-    bail!("`asphodel {name}` isn't implemented yet")
 }

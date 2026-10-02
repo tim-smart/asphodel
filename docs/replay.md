@@ -5,9 +5,9 @@ simulation on a simulated clock, so decay can be watched over years in
 seconds. This page is the contract for the scripted side of it: the scenario
 file, the command, the report and the probes. It comes from "Replay harness:
 simulated-clock replay of recorded sessions" (TIM-96) and its amendments
-from TIM-97 and TIM-98, and from ADRs 0004 and 0008. Real-history replay
-(the `state.db` importer, cassettes, `fast` mode, `bench` and the A/B diff)
-builds on the same engine and is documented when it lands.
+from TIM-97, TIM-98 and TIM-116, and from ADRs 0004 and 0008. Real-history
+replay (the `state.db` importer, cassettes, `fast` mode, `bench` and the
+A/B diff) builds on the same engine and is under "Real history" below.
 
 ## Running a scenario
 
@@ -368,3 +368,155 @@ order, so two runs compare byte for byte.
 The tolerance for the lifetimes and purge ranges is 5% of the closed-form
 crossing, the same as the unit tests on the pure function, plus one day on
 purges for the nightly sweep.
+
+## Real history
+
+Tim's whole Hermes history replays privately (TIM-96, decisions 1, 3, 4, 6,
+7 and 8; TIM-117). Everything derived from it lives under
+`ASPHODEL_REPLAY_DIR` and is refused anywhere else: the `state.db` copy, the
+manifest, the corpus, the cassettes, the replayed store with its recall
+log, the probes file and the reports. Only the `--aggregate` export may
+leave. Agents never read the directory; keep it outside the Multica
+workspaces tree.
+
+A `live` run sends the history to the LLM endpoint `--config` names, as
+production already does. A hosted endpoint sees it.
+
+### Importing
+
+```
+asphodel import --state-db <copy of state.db> --manifest <file> \
+    [--out <replay dir>/corpus/<name>.jsonl] [--inactive-rows skip|replay] [--dry-run]
+```
+
+The importer reads only `sessions(id, source, parent_session_id,
+started_at)` and `messages(role, content, timestamp, active, compacted,
+_compressed_summary, tool_calls)`, and never the system prompt or
+`api_content`. It checks `PRAGMA table_info` for each of those columns and
+the `schema_version` table against the versions it was written against
+(31, hermes-agent `bfc71526`), and refuses the file naming everything
+wrong. Then, per primary session in `started_at` order:
+
+- a turn is a `user` row and the final `assistant` row before the next
+  `user` row; assistant rows that only call tools, and `tool` rows, are
+  skipped. The turn is a `prefetch` event at the user row's time and a
+  `sync` event at the reply's time, with the previous user message as the
+  prefetch's `previous_query`;
+- compacted rows (`active=0, compacted=1`) are replayed, a `clear` is
+  emitted at the row that ends the compacted run, and Hermes' summary row
+  (`_compressed_summary=1`) is skipped;
+- rows with `active=0, compacted=0` (a verbatim tail a compaction carried
+  forward, or turns a rewind discarded) are refused until
+  `--inactive-rows` says what to do with them. Which is right is still open
+  on TIM-117;
+- the user text is shaped as `sync_turn` shapes it: multimodal content
+  (`\0json:` and a parts list) keeps its text parts, the memory block
+  (`<memory-context>…</memory-context>`, or the manifest's
+  `[memory_block]`) is cut out, backfill before the last `[New message]`
+  is stripped, and the `[Name] ` prefix stays and picks the speaker: a
+  manifest `[[speaker]]` by name, else the owner;
+- cron sessions (`source = "cron"`) get prefetch only, as class `cron`;
+  subagent sessions (`parent_session_id` set) produce nothing.
+
+The manifest is TOML: `timezone`, `bank` (default `main`), `assistant`,
+`[owner] name, platform_ids`, `[[speaker]] name, id` and an optional
+`[memory_block] start, end`.
+
+The corpus is JSON lines: a header (version, bank identity, timezone, the
+Hermes schema version and the import's counts) then one event per line in
+time order. Its SHA-256 is the `corpus_hash` every report embeds. The same
+history always imports to the same bytes. `--dry-run` prints the counts and
+writes nothing; the counts hold no text, so they can be shared.
+
+### Running
+
+```
+asphodel replay --corpus <file> --mode live|replay|fast \
+    [--cassette <file>] [--probes <file>] [--report <file>] [--aggregate <file>] \
+    [--no-cache] [--refresh live|recorded|off] [--self-test] \
+    [--config FILE] [--overrides FILE] [--latency DURATION] [--until TIMESTAMP] \
+    [--onnx-threads N] [--token-dir DIR]
+```
+
+- **Modes** (TIM-96, decision 4). Every LLM call is keyed by SHA-256 of
+  the model id, the template name and version, and the whole request.
+  `live` answers from the cassette and calls and records on a miss;
+  `--no-cache` ignores the cassette and re-records. `replay` answers from
+  the cassette and fails on a miss, with exit 2 and no report. `fast`
+  reuses call 1's claims by chunk (source id and chunk position) and `used`
+  verdicts by (reply hash, sentence hash) pair, judges the pairs nobody has
+  judged with one short `judge_used` call, and answers call 2 and refreshes
+  by request key, calling the LLM on a miss when one is configured. The
+  report counts every miss, so "fast with zero misses" is a number.
+- **Refreshes in `fast`**: `--refresh recorded` (the default) substitutes
+  the recorded refresh of the same model nearest in simulated time, `live`
+  calls on a miss, and `off` answers with no edits. Triggers are counted
+  by code in every mode. Real history holds no mental models, so there is
+  nothing to refresh until a way to define them for a corpus exists.
+- **The LLM** for `live` and `fast` is built as `serve` builds its own:
+  `[llm]` in `--config` with `ASPHODEL_LLM_API_KEY`, or the ChatGPT login
+  under `--token-dir` (the private dir by default). `replay` refuses one.
+- **The cassette** defaults to `<replay dir>/cassettes/<corpus stem>.jsonl`:
+  one record per line with the request, the reply, the measured latency,
+  the simulated time, and for extraction calls the chunk and the handles
+  with a hash of each sentence. The report embeds its SHA-256 as it stood
+  when the run started.
+- **Latency.** `--latency` sets every chunk's. Without it, a chunk whose
+  calls are in the cassette is scheduled with their recorded latency, and a
+  chunk recorded during this run completes at once, with its measured
+  latency recorded for the next run. The measured round trips of live calls
+  are reported under `llm.latency_ms`.
+- **Models.** The real models run with ONNX Runtime's intra-op threads
+  pinned to `--onnx-threads` (1 by default). `ASPHODEL_MODELS=fake` runs the
+  deterministic fakes, for tests.
+- **Probes** are a TOML file of `[[probe]]` tables with the scripted kinds
+  and fields, opaque ids and `memory` a regex over sentences: the earliest
+  memory whose sentence matches is the one probed. `injects` and
+  `not_injects` need the real models.
+- **`--self-test`** runs the simulation twice under the one lock and
+  requires byte-identical reports. It is refused in `live`, which measures
+  latency and records as it goes.
+- The report goes to `--report` or `<replay dir>/reports/<stem>-<mode>.json`,
+  inside the private dir only.
+
+### The report and the aggregate
+
+A real-history report has `kind` `live`, `replay` or `fast`, `group`
+`models` or `fake`, `corpus_hash` and `cassette_hash`, and beside the
+scripted fields: `injected_tokens` (per session with a synced turn, the
+per-turn p50 and p95, and cron apart), `profile_tokens` (sampled daily),
+`call2_rate`, `agenda_lines_per_day`, `significance_histogram`,
+`kind_histogram`, `memories` (each created memory with when it faded and
+whether it was purged), and `llm` with `cache`, `top_up`, `live`, `misses`,
+`used_verdicts` by source and `latency_ms`. A `live` run and the `replay`
+of its cassette differ only in `kind`, `flags`, `llm` and `cassette_hash`.
+
+`--aggregate <file>` writes the one thing that may leave the private dir
+(TIM-117). Its type has no string field but a probe's id: the run's kind
+is a set of booleans, days are days since the epoch, weeks are two
+integers, and the hashes and the git SHA are byte arrays. It carries the
+probe results, the purge, fade and band series, the token, lag and call
+counts, and the histograms.
+
+`asphodel report diff A B [--force]` compares two reports: it refuses runs
+on a different corpus or cassette unless forced, lists probes whose result
+changed, numbers that differ beyond a tolerance of one in a million, and
+the memories that faded or were purged in one run and not the other, by
+id.
+
+### Bench
+
+```
+asphodel bench --corpus <file> [--concurrency N]... [--requests N] \
+    [--listen 127.0.0.1:0] [--report <file>]
+```
+
+`bench` copies the replayed store under `<replay dir>/bench/`, starts the
+daemon on the copy on a loopback address with the production reranker
+deadline on, and for each concurrency level (1, 4 and 16 by default) runs
+`--requests` prefetches (32 by default) over HTTP from that many
+connections, with the corpus's prefetch queries in order. It never runs
+against any other store: the original is read only, and a private dir
+with no replayed store, or a listen address off loopback, is refused. The
+report lists per level the p50, p95, p99 and maximum latency in
+milliseconds and the fraction the reranker answered within its deadline.

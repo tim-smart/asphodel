@@ -20,24 +20,28 @@
 //! store without those memories. Accesses are stamped with the source's
 //! ingest time, as in production. The run ends at the latest of the last
 //! event, `--until` and the last completion.
-//! The LLM is answered from the scenario's claims: call 1's reply is built
-//! from them, and call 2's from their outcomes against the neighbours the
-//! real reconciliation found, so nothing in reconciliation is replay-only.
-//! Where the scenario says something production wouldn't do (an outcome
-//! against a memory call 2 isn't shown, a `used` memory that isn't in
-//! context, a label on a claim its outcomes absorb), the run stops with a
-//! scenario error rather than guessing.
+//!
+//! The LLM is answered one of two ways. For a scenario, from its claims:
+//! call 1's reply is built from them, and call 2's from their outcomes
+//! against the neighbours the real reconciliation found, so nothing in
+//! reconciliation is replay-only. Where the scenario says something
+//! production wouldn't do (an outcome against a memory call 2 isn't shown,
+//! a `used` memory that isn't in context, a label on a claim its outcomes
+//! absorb), the run stops with a scenario error rather than guessing. For
+//! real history, through the cassette [`Recorder`] (TIM-96, decision 4),
+//! with `fast` mode's call 1 composed from the recording and the rest
+//! answered by request.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asphodel_core::extraction::{Call2Input, DropReason};
+use asphodel_core::extraction::{Call1Input, DropReason, Extracted};
 use asphodel_core::ingest::{Document, Outcome as IngestOutcome, Turn, TurnAuthor};
 use asphodel_core::inspect::InspectError;
 use asphodel_core::models::{FakeLlm, LlmClient, LlmError, LlmRequest, LlmResponse};
-use asphodel_core::retrieval::{Band, PrefetchRequest, RecallRequest, band};
+use asphodel_core::retrieval::{Band, PrefetchRequest, RecallRequest, band, estimate_tokens};
 use asphodel_core::service::Claimed;
 use asphodel_core::store::ids::derived;
 use asphodel_core::strength::Phase;
@@ -45,12 +49,19 @@ use asphodel_core::{Clock, Service, SimulatedClock, Tuning};
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
+use regex::Regex;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::report::{DayCount, Lag, ProbeResult, WeekBands, WeekCount};
-use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX, Scenario};
+use super::cassette::{Chained, ChunkContext, ChunkKey, Recorder};
+use super::report::{
+    Call2Rate, DayCount, InjectedTokens, Lag, LlmCounts, MemoryOutcome, Percentiles, ProbeResult,
+    SessionTokens, WeekBands, WeekCount,
+};
+use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX};
 use super::shadow::{Created, ShadowRow};
+use super::timeline::{Matching, SessionClass, Timeline};
+use crate::cli::ReplayMode;
 
 /// The scripted LLM's model name.
 const MODEL: &str = "scripted";
@@ -83,11 +94,25 @@ fn internal(message: impl Into<String>) -> Failure {
     Failure::Internal(anyhow::anyhow!(message.into()))
 }
 
-/// What the engine needs besides the scenario.
+/// Who answers the LLM calls.
+#[derive(Clone, Copy)]
+pub enum Llm<'a> {
+    /// A scenario's claims.
+    Scripted,
+    /// The cassette, in the mode it was opened in.
+    Recorded(&'a Recorder, ReplayMode),
+}
+
+/// What the engine needs besides the timeline.
 pub struct Settings {
     pub bank: String,
     pub timezone: TimeZone,
+    /// The simulated extraction latency, when it isn't taken from the
+    /// cassette.
     pub latency: SignedDuration,
+    /// Take each chunk's latency from the cassette's records for it when
+    /// there are any (TIM-96, decision 3), else `latency`.
+    pub latency_from_cassette: bool,
     pub until: Option<Timestamp>,
 }
 
@@ -99,20 +124,30 @@ pub struct Outcome {
     pub bands_per_week: Vec<WeekBands>,
     pub extraction_lag: Lag,
     pub refresh_calls_per_day: Vec<DayCount>,
-    pub llm_calls: u64,
+    pub injected_tokens: InjectedTokens,
+    pub profile_tokens: Percentiles,
+    pub call2_rate: Call2Rate,
+    pub agenda_lines_per_day: Vec<DayCount>,
+    pub significance_histogram: BTreeMap<String, u64>,
+    pub kind_histogram: BTreeMap<String, u64>,
+    pub memories: Vec<MemoryOutcome>,
+    pub llm: LlmCounts,
     pub created: Vec<Created>,
     pub shadow: Vec<ShadowRow>,
 }
 
-/// A turn as the engine plays it: a scripted one or chatter.
+/// A turn as the engine plays it.
 struct PlannedTurn {
     at: Timestamp,
     reply_at: Timestamp,
     session: String,
     user: String,
     assistant: String,
+    previous_query: Option<String>,
     author: Option<Author>,
     platform: Option<String>,
+    class: SessionClass,
+    prefetch_only: bool,
     claims: Vec<Claim>,
     used: Vec<String>,
     recall_id: Option<String>,
@@ -180,12 +215,21 @@ impl LlmClient for NoEdits {
     }
 }
 
+/// Tokens injected by a session's prefetches.
+#[derive(Default)]
+struct SessionCount {
+    prefetches: u64,
+    tokens: u64,
+    synced: bool,
+}
+
 pub struct Engine<'a> {
     service: &'a Service,
     clock: Arc<SimulatedClock>,
-    scenario: &'a Scenario,
+    timeline: &'a Timeline,
     settings: Settings,
     tuning: &'a Tuning,
+    llm: Llm<'a>,
     turns: Vec<PlannedTurn>,
     queue: BinaryHeap<Reverse<Key>>,
     events: BTreeMap<u64, EventKind>,
@@ -197,6 +241,8 @@ pub struct Engine<'a> {
     end: Timestamp,
     /// Claim labels to the memories they created.
     labels: BTreeMap<String, Uuid>,
+    /// Each probe's memory regex, in real history.
+    regexes: Vec<Option<Regex>>,
     created: Vec<Created>,
     shadow: Vec<ShadowRow>,
     /// Synced sources by id, until their last chunk is extracted.
@@ -211,29 +257,50 @@ pub struct Engine<'a> {
     refresh_calls: BTreeMap<String, u64>,
     snapshots: Vec<Snapshot>,
     previous_strengths: BTreeMap<Uuid, f64>,
+    sessions: BTreeMap<String, SessionCount>,
+    turn_tokens: Vec<u64>,
+    cron_prefetches: u64,
+    cron_tokens: u64,
+    profile_tokens: Vec<u64>,
+    chunks: u64,
+    call2_chunks: u64,
+    agenda_lines: BTreeMap<String, u64>,
+    significance_histogram: BTreeMap<String, u64>,
+    kind_histogram: BTreeMap<String, u64>,
 }
 
 impl<'a> Engine<'a> {
     pub fn new(
         service: &'a Service,
         clock: Arc<SimulatedClock>,
-        scenario: &'a Scenario,
+        timeline: &'a Timeline,
         tuning: &'a Tuning,
         settings: Settings,
+        llm: Llm<'a>,
     ) -> Result<Self, Failure> {
-        let start = scenario.earliest().ok_or_else(|| {
+        let start = timeline.earliest().ok_or_else(|| {
             Failure::Scenario("a scenario needs at least one event or probe".into())
         })?;
-        let end = scenario
+        let end = timeline
             .latest()
             .unwrap_or(start)
             .max(settings.until.unwrap_or(start));
+        let regexes = match timeline.matching {
+            Matching::Label => vec![None; timeline.probes.len()],
+            Matching::Sentence => timeline
+                .probes
+                .iter()
+                .map(|probe| Regex::new(probe.check.memory()).map(Some))
+                .collect::<Result<_, _>>()
+                .map_err(|error| Failure::Scenario(format!("a probe's regex: {error}")))?,
+        };
         let mut engine = Self {
             service,
             clock: Arc::clone(&clock),
-            scenario,
+            timeline,
             settings,
             tuning,
+            llm,
             turns: Vec::new(),
             queue: BinaryHeap::new(),
             events: BTreeMap::new(),
@@ -242,6 +309,7 @@ impl<'a> Engine<'a> {
             deferred: BTreeSet::new(),
             end,
             labels: BTreeMap::new(),
+            regexes,
             created: Vec::new(),
             shadow: Vec::new(),
             pending: BTreeMap::new(),
@@ -257,67 +325,62 @@ impl<'a> Engine<'a> {
             refresh_calls: BTreeMap::new(),
             snapshots: Vec::new(),
             previous_strengths: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            turn_tokens: Vec::new(),
+            cron_prefetches: 0,
+            cron_tokens: 0,
+            profile_tokens: Vec::new(),
+            chunks: 0,
+            call2_chunks: 0,
+            agenda_lines: BTreeMap::new(),
+            significance_histogram: BTreeMap::new(),
+            kind_histogram: BTreeMap::new(),
         };
-        engine.plan()?;
+        engine.plan();
         Ok(engine)
     }
 
-    /// Lays every scenario event on the queue.
-    fn plan(&mut self) -> Result<(), Failure> {
-        for turn in &self.scenario.turns {
+    /// Lays every timeline event on the queue.
+    fn plan(&mut self) {
+        for turn in &self.timeline.turns {
             self.turns.push(PlannedTurn {
                 at: turn.at,
-                reply_at: turn.reply_at.unwrap_or(turn.at),
+                reply_at: turn.reply_at,
                 session: turn.session.clone(),
                 user: turn.user.clone(),
                 assistant: turn.assistant.clone(),
+                previous_query: turn.previous_query.clone(),
                 author: turn.author.clone(),
                 platform: turn.platform.clone(),
+                class: turn.class,
+                prefetch_only: turn.prefetch_only,
                 claims: turn.claims.clone(),
                 used: turn.used.clone(),
                 recall_id: None,
             });
         }
-        for chatter in &self.scenario.chatter {
-            let every = super::scenario::duration(&chatter.every)
-                .map_err(|error| Failure::Scenario(format!("chatter interval: {error}")))?;
-            let session = chatter.session.clone().unwrap_or_else(|| "chatter".into());
-            let mut at = chatter.from;
-            for n in 1..=chatter.count {
-                self.turns.push(PlannedTurn {
-                    at,
-                    reply_at: at,
-                    session: session.clone(),
-                    user: format!("Just checking in ({n})."),
-                    assistant: "Hello again.".into(),
-                    author: None,
-                    platform: None,
-                    claims: Vec::new(),
-                    used: Vec::new(),
-                    recall_id: None,
-                });
-                at = at
-                    .checked_add(every)
-                    .map_err(|_| internal("chatter runs past the end of time"))?;
-            }
-        }
         // Turns in time order, so a prefetch's seq follows the clock.
         self.turns.sort_by_key(|turn| turn.at);
         for index in 0..self.turns.len() {
-            let (at, reply_at) = (self.turns[index].at, self.turns[index].reply_at);
+            let (at, reply_at, prefetch_only) = (
+                self.turns[index].at,
+                self.turns[index].reply_at,
+                self.turns[index].prefetch_only,
+            );
             self.push(at, 2, EventKind::Prefetch(index));
-            self.push(reply_at.max(at), 3, EventKind::Sync(index));
+            if !prefetch_only {
+                self.push(reply_at.max(at), 3, EventKind::Sync(index));
+            }
         }
-        for (index, document) in self.scenario.documents.iter().enumerate() {
+        for (index, document) in self.timeline.documents.iter().enumerate() {
             self.push(document.at, 3, EventKind::Document(index));
         }
-        for (index, clear) in self.scenario.clears.iter().enumerate() {
+        for (index, clear) in self.timeline.clears.iter().enumerate() {
             self.push(clear.at, 3, EventKind::Clear(index));
         }
-        for (index, probe) in self.scenario.probes.iter().enumerate() {
+        for (index, probe) in self.timeline.probes.iter().enumerate() {
             self.push(probe.at, 4, EventKind::Probe(index));
         }
-        Ok(())
     }
 
     fn push(&mut self, at: Timestamp, rank: u8, kind: EventKind) {
@@ -383,7 +446,7 @@ impl<'a> Engine<'a> {
             }
         }
         self.clock.set(self.end);
-        Ok(self.finish())
+        self.finish()
     }
 
     fn prefetch(&mut self, index: usize) -> Result<(), Failure> {
@@ -393,10 +456,26 @@ impl<'a> Engine<'a> {
             &PrefetchRequest {
                 session_id: turn.session.clone(),
                 query: turn.user.clone(),
-                previous_query: None,
+                previous_query: turn.previous_query.clone(),
                 block_id: None,
             },
         )?;
+        let tokens = estimate_tokens(&prefetch.text) as u64;
+        match turn.class {
+            SessionClass::Cron => {
+                self.cron_prefetches += 1;
+                self.cron_tokens += tokens;
+            }
+            SessionClass::Primary => {
+                let session = self.sessions.entry(turn.session.clone()).or_default();
+                session.prefetches += 1;
+                session.tokens += tokens;
+                if !turn.prefetch_only {
+                    session.synced = true;
+                    self.turn_tokens.push(tokens);
+                }
+            }
+        }
         self.turns[index].recall_id = Some(prefetch.recall_id.to_string());
         Ok(())
     }
@@ -436,7 +515,7 @@ impl<'a> Engine<'a> {
     }
 
     fn document(&mut self, index: usize) -> Result<(), Failure> {
-        let document = &self.scenario.documents[index];
+        let document = &self.timeline.documents[index];
         let ingested = self.service.ingest_document(
             &self.settings.bank,
             &Document {
@@ -462,7 +541,7 @@ impl<'a> Engine<'a> {
     }
 
     fn clear(&mut self, index: usize) -> Result<(), Failure> {
-        let clear = &self.scenario.clears[index];
+        let clear = &self.timeline.clears[index];
         self.service
             .clear_session(&self.settings.bank, &clear.session)?;
         Ok(())
@@ -480,18 +559,35 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The latency a chunk's completion is scheduled with: the cassette's
+    /// recorded latency for it when asked and there is one, else the
+    /// settings' constant.
+    fn latency_for(&self, claimed: &Claimed) -> SignedDuration {
+        if self.settings.latency_from_cassette
+            && let Llm::Recorded(recorder, _) = self.llm
+            && let Some(recorded) = recorder.recorded_latency(&ChunkKey {
+                source: claimed.lease.source,
+                position: claimed.lease.position,
+            })
+        {
+            return SignedDuration::try_from(recorded).unwrap_or(SignedDuration::MAX);
+        }
+        self.settings.latency
+    }
+
     /// Holds the worker on `claimed` until a latency from now.
     fn schedule_completion(&mut self, claimed: Claimed) -> Result<(), Failure> {
         if !self.pending.contains_key(&claimed.lease.source) {
             return Err(internal(format!(
-                "the worker claimed source {}, which the scenario didn't sync",
+                "the worker claimed source {}, which the timeline didn't sync",
                 claimed.lease.source
             )));
         }
+        let latency = self.latency_for(&claimed);
         let at = self
             .clock
             .now()
-            .checked_add(self.settings.latency)
+            .checked_add(latency)
             .unwrap_or(Timestamp::MAX);
         self.working = true;
         self.extend_end(at);
@@ -512,9 +608,8 @@ impl<'a> Engine<'a> {
             }
         };
         // Notable writes start the refresh debounce from the completion.
-        let refreshes = self.service.run_refreshes(&self.refresh_llm)?;
-        self.count_refresh_calls();
-        self.schedule_timer(refreshes.next_due);
+        let refreshes = self.run_refreshes()?;
+        self.schedule_timer(refreshes);
         self.working = false;
         match next {
             Some(claimed) => self.schedule_completion(claimed),
@@ -522,7 +617,39 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Extracts one claimed chunk with the scripted replies.
+    /// Runs the refreshes due with the run's refresh client and counts
+    /// their calls by bank-local day. Returns when the next is due.
+    fn run_refreshes(&mut self) -> Result<Option<Timestamp>, Failure> {
+        let (next_due, calls) = match self.llm {
+            Llm::Scripted => {
+                let refreshes = self.service.run_refreshes(&self.refresh_llm)?;
+                let calls: Vec<Timestamp> = std::mem::take(
+                    &mut *self
+                        .refresh_llm
+                        .calls
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+                self.llm_calls += calls.len() as u64;
+                (refreshes.next_due, calls)
+            }
+            Llm::Recorded(recorder, _) => {
+                let refreshes = self.service.run_refreshes(recorder)?;
+                (refreshes.next_due, recorder.take_refresh_times())
+            }
+        };
+        for at in calls {
+            let day = at
+                .to_zoned(self.settings.timezone.clone())
+                .date()
+                .to_string();
+            *self.refresh_calls.entry(day).or_default() += 1;
+        }
+        Ok(next_due)
+    }
+
+    /// Extracts one claimed chunk: with the scripted replies, or through
+    /// the cassette.
     fn extract_chunk(&mut self, claimed: Claimed) -> Result<(), Failure> {
         let Claimed {
             lease,
@@ -536,8 +663,9 @@ impl<'a> Engine<'a> {
             .ok_or_else(|| internal(format!("no pending extraction for source {source}")))?;
         let position = lease.position;
         let input = self.service.call1_input(&lease, &in_context)?;
+        self.chunks += 1;
 
-        // The chunk's claims: those whose quote is in it, in order.
+        // The chunk's scripted claims: those whose quote is in it, in order.
         let mut mine: Vec<Claim> = Vec::new();
         pending.claims.retain(|claim| {
             if input.text.contains(&claim.quote) {
@@ -548,68 +676,48 @@ impl<'a> Engine<'a> {
             }
         });
 
-        let mut used_handles = Vec::new();
-        for label in &pending.used {
-            let id = self.labels.get(label).copied();
-            let handle = id.and_then(|id| {
-                input
-                    .in_context
-                    .iter()
-                    .find(|memory| memory.memory == id)
-                    .map(|memory| memory.handle.clone())
-            });
-            match handle {
-                Some(handle) => used_handles.push(handle),
-                None => {
-                    return Err(Failure::Scenario(format!(
-                        "{} uses {label:?}, which isn't in the session's in-context set",
-                        pending.name
-                    )));
+        let extracted = match self.llm {
+            Llm::Scripted => {
+                let mut used_handles = Vec::new();
+                for label in &pending.used {
+                    let id = self.labels.get(label).copied();
+                    let handle = id.and_then(|id| {
+                        input
+                            .in_context
+                            .iter()
+                            .find(|memory| memory.memory == id)
+                            .map(|memory| memory.handle.clone())
+                    });
+                    match handle {
+                        Some(handle) => used_handles.push(handle),
+                        None => {
+                            return Err(Failure::Scenario(format!(
+                                "{} uses {label:?}, which isn't in the session's in-context set",
+                                pending.name
+                            )));
+                        }
+                    }
                 }
+                let reply1 = call1_reply(&mine, &used_handles);
+                let call2 = self.service.call2_input(&lease, &reply1, &in_context)?;
+                if call2.is_some() {
+                    self.call2_chunks += 1;
+                }
+                let reply2 = self.call2_reply(&mine, call2.as_ref(), &pending.name)?;
+                let llm = FakeLlm::scripted(MODEL, vec![reply1, reply2]);
+                let extracted = self
+                    .service
+                    .extract_leased(lease, &llm, &in_context, &entries)?;
+                self.llm_calls += llm.requests().len() as u64;
+                extracted
             }
-        }
-
-        let reply1 = call1_reply(&mine, &used_handles);
-        let call2 = self.service.call2_input(&lease, &reply1, &in_context)?;
-        let reply2 = self.call2_reply(&mine, call2.as_ref(), &pending.name)?;
-        let llm = FakeLlm::scripted(MODEL, vec![reply1, reply2]);
-        let extracted = self
-            .service
-            .extract_leased(lease, &llm, &in_context, &entries)?;
-        self.llm_calls += llm.requests().len() as u64;
+            Llm::Recorded(recorder, mode) => {
+                self.extract_recorded(recorder, mode, lease, &in_context, &entries, &input)?
+            }
+        };
 
         let now = self.clock.now();
-        for (ordinal, claim) in mine.iter().enumerate() {
-            let id = derived(source, &format!("{position}:{ordinal}"));
-            if extracted.memories.contains(&id) {
-                let embedding = self.embed(&claim.content)?;
-                self.created.push(Created {
-                    memory: id,
-                    content: claim.content.clone(),
-                    embedding,
-                    created_at: now,
-                });
-                if let Some(label) = &claim.label {
-                    self.labels.insert(label.clone(), id);
-                }
-            } else if let Some(label) = &claim.label {
-                let reason = match extracted
-                    .dropped
-                    .iter()
-                    .find(|dropped| dropped.claim == ordinal)
-                {
-                    Some(dropped) => format!(
-                        "call 1's checks dropped it: {}",
-                        drop_reason(dropped.reason)
-                    ),
-                    None => "it is absorbed by its outcomes".into(),
-                };
-                return Err(Failure::Scenario(format!(
-                    "the claim {label:?} in {} created no memory ({reason}), so its label names nothing",
-                    pending.name
-                )));
-            }
-        }
+        self.note_created(&extracted, source, position, &mine, &pending.name)?;
         let lag = now.duration_since(pending.synced_at);
         self.lags_ms
             .push(u64::try_from(lag.as_millis()).unwrap_or(0));
@@ -626,13 +734,140 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// Extracts through the cassette (TIM-96, decision 4). In `fast` mode
+    /// call 1 is composed from the recording when the chunk has one.
+    fn extract_recorded(
+        &mut self,
+        recorder: &Recorder,
+        mode: ReplayMode,
+        lease: asphodel_core::queue::Lease,
+        in_context: &[Uuid],
+        entries: &[asphodel_core::system_prompt::BlockEntry],
+        input: &Call1Input,
+    ) -> Result<Extracted, Failure> {
+        let context = ChunkContext::new(
+            ChunkKey {
+                source: lease.source,
+                position: lease.position,
+            },
+            input,
+        );
+        let judged = context.in_context.len() as u64;
+        recorder.enter(context.clone());
+        let composed = match mode {
+            ReplayMode::Fast => recorder.compose_call1(&context),
+            _ => Ok(None),
+        };
+        let call2_before = recorder.with_counts(|counts| counts.call2);
+        let result = match composed {
+            Ok(Some(reply1)) => {
+                let chained = Chained::new(reply1, recorder);
+                self.service
+                    .extract_leased(lease, &chained, in_context, entries)
+            }
+            Ok(None) => {
+                recorder.with_counts(|counts| match mode {
+                    ReplayMode::Replay => counts.verdicts.recorded += judged,
+                    ReplayMode::Live | ReplayMode::Fast => counts.verdicts.live += judged,
+                });
+                self.service
+                    .extract_leased(lease, recorder, in_context, entries)
+            }
+            Err(error) => Err(asphodel_core::extraction::ExtractError::Held { error }),
+        };
+        recorder.leave();
+        if recorder.with_counts(|counts| counts.call2) > call2_before {
+            self.call2_chunks += 1;
+        }
+        match result {
+            Ok(extracted) => Ok(extracted),
+            Err(error) => Err(match recorder.first_miss() {
+                Some(miss) => Failure::Internal(anyhow::anyhow!(
+                    "{miss}; a replay fails on a miss, and fast needs an LLM for one"
+                )),
+                None => error.into(),
+            }),
+        }
+    }
+
+    /// Records what the extraction created: the shadow metric's rows, the
+    /// histograms, and the scripted labels, which it checks.
+    fn note_created(
+        &mut self,
+        extracted: &Extracted,
+        source: Uuid,
+        position: u32,
+        mine: &[Claim],
+        event: &str,
+    ) -> Result<(), Failure> {
+        let now = self.clock.now();
+        match self.llm {
+            Llm::Scripted => {
+                for (ordinal, claim) in mine.iter().enumerate() {
+                    let id = derived(source, &format!("{position}:{ordinal}"));
+                    if extracted.memories.contains(&id) {
+                        let embedding = self.embed(&claim.content)?;
+                        self.created.push(Created {
+                            memory: id,
+                            content: claim.content.clone(),
+                            embedding,
+                            created_at: now,
+                        });
+                        if let Some(label) = &claim.label {
+                            self.labels.insert(label.clone(), id);
+                        }
+                    } else if let Some(label) = &claim.label {
+                        let reason = match extracted
+                            .dropped
+                            .iter()
+                            .find(|dropped| dropped.claim == ordinal)
+                        {
+                            Some(dropped) => format!(
+                                "call 1's checks dropped it: {}",
+                                drop_reason(dropped.reason)
+                            ),
+                            None => "it is absorbed by its outcomes".into(),
+                        };
+                        return Err(Failure::Scenario(format!(
+                            "the claim {label:?} in {event} created no memory ({reason}), so its label names nothing"
+                        )));
+                    }
+                }
+            }
+            Llm::Recorded(..) => {
+                for id in &extracted.memories {
+                    let Some(view) = self.view(Some(*id))? else {
+                        continue;
+                    };
+                    let embedding = self.embed(&view.sentence)?;
+                    self.created.push(Created {
+                        memory: *id,
+                        content: view.sentence,
+                        embedding,
+                        created_at: now,
+                    });
+                }
+            }
+        }
+        for id in &extracted.memories {
+            if let Some(view) = self.view(Some(*id))? {
+                *self.kind_histogram.entry(view.kind).or_default() += 1;
+                *self
+                    .significance_histogram
+                    .entry(view.significance.extracted)
+                    .or_default() += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Call 2's reply from the claims' outcomes, against the neighbours
     /// reconciliation found. An outcome whose target isn't among them is a
     /// scenario error.
     fn call2_reply(
         &self,
         mine: &[Claim],
-        call2: Option<&Call2Input>,
+        call2: Option<&asphodel_core::extraction::Call2Input>,
         event: &str,
     ) -> Result<Value, Failure> {
         let mut claims = Vec::new();
@@ -690,8 +925,8 @@ impl<'a> Engine<'a> {
         Ok(vectors.pop().unwrap_or_default())
     }
 
-    /// The sweep, the shadow table, the daily band snapshot and the
-    /// refreshes due.
+    /// The sweep, the shadow table, the daily band snapshot, the daily
+    /// agenda and profile samples, and the refreshes due.
     fn timer(&mut self) -> Result<(), Failure> {
         let bank = self.settings.bank.clone();
         // What purge would take now, with its content, read before the
@@ -720,7 +955,7 @@ impl<'a> Engine<'a> {
                 .map(|run| run.purged_memories as u64)
                 .sum();
             if purged > 0 {
-                *self.purges.entry(day).or_default() += purged;
+                *self.purges.entry(day.clone()).or_default() += purged;
             }
             let now = self.clock.now();
             for (head, members) in chains {
@@ -742,12 +977,31 @@ impl<'a> Engine<'a> {
                 }
             }
             self.snapshot_bands()?;
+            let agenda = self.service.agenda(&bank)?.listed().len() as u64;
+            self.agenda_lines.insert(day, agenda);
+            self.sample_profile_tokens()?;
         }
 
-        let refreshes = self.service.run_refreshes(&self.refresh_llm)?;
-        self.count_refresh_calls();
+        let refreshes = self.run_refreshes()?;
         self.schedule_timer(sweeps.next_due);
-        self.schedule_timer(refreshes.next_due);
+        self.schedule_timer(refreshes);
+        Ok(())
+    }
+
+    /// The tokens the bank's mental model entries hold now.
+    fn sample_profile_tokens(&mut self) -> Result<(), Failure> {
+        let bank = &self.settings.bank;
+        let mut tokens = 0u64;
+        for model in self.service.list_models(bank)? {
+            let view = self.service.show_model(bank, &model.name, None)?;
+            tokens += view
+                .entry_views
+                .iter()
+                .filter(|entry| entry.renders)
+                .map(|entry| estimate_tokens(&entry.text) as u64)
+                .sum::<u64>();
+        }
+        self.profile_tokens.push(tokens);
         Ok(())
     }
 
@@ -788,24 +1042,6 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn count_refresh_calls(&mut self) {
-        let calls: Vec<Timestamp> = std::mem::take(
-            &mut *self
-                .refresh_llm
-                .calls
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        self.llm_calls += calls.len() as u64;
-        for at in calls {
-            let day = at
-                .to_zoned(self.settings.timezone.clone())
-                .date()
-                .to_string();
-            *self.refresh_calls.entry(day).or_default() += 1;
-        }
-    }
-
     fn local_day(&self) -> String {
         self.clock
             .now()
@@ -814,11 +1050,26 @@ impl<'a> Engine<'a> {
             .to_string()
     }
 
+    /// The memory a probe names: by label in a scenario, or the earliest
+    /// created memory whose sentence its regex matches in real history.
+    fn probe_memory(&self, index: usize) -> Option<Uuid> {
+        let memory = self.timeline.probes[index].check.memory();
+        match &self.regexes[index] {
+            None => self.labels.get(memory).copied(),
+            Some(regex) => self
+                .created
+                .iter()
+                .filter(|created| regex.is_match(&created.content))
+                .min_by_key(|created| (created.created_at, created.memory))
+                .map(|created| created.memory),
+        }
+    }
+
     fn probe(&mut self, index: usize) -> Result<(), Failure> {
-        let probe = &self.scenario.probes[index];
+        let probe = &self.timeline.probes[index];
         let id = probe.id(index);
         let bank = &self.settings.bank;
-        let memory = self.labels.get(probe.check.memory()).copied();
+        let memory = self.probe_memory(index);
         let (passed, observed) = match &probe.check {
             Check::Band { band: expected, .. } => match self.view(memory)? {
                 Some(view) => {
@@ -963,7 +1214,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn finish(self) -> Outcome {
+    fn finish(self) -> Result<Outcome, Failure> {
         let mut fade_outs: BTreeMap<String, u64> = BTreeMap::new();
         let mut bands: BTreeMap<String, WeekBands> = BTreeMap::new();
         for snapshot in &self.snapshots {
@@ -982,14 +1233,38 @@ impl<'a> Engine<'a> {
         }
         let mut lags = self.lags_ms.clone();
         lags.sort_unstable();
-        let percentile = |p: f64| -> u64 {
-            if lags.is_empty() {
-                return 0;
-            }
-            let index = ((lags.len() as f64 - 1.0) * p).round() as usize;
-            lags[index.min(lags.len() - 1)]
+        let percentile = |p: f64| -> u64 { super::report::percentile(&lags, p) };
+
+        let purged_at: BTreeMap<Uuid, Timestamp> = self
+            .shadow
+            .iter()
+            .map(|row| (row.memory, row.purged_at))
+            .collect();
+        let mut memories = Vec::new();
+        for created in &self.created {
+            let faded_at = match self.service.faded_at(&self.settings.bank, created.memory) {
+                Ok(faded_at) => faded_at,
+                Err(InspectError::UnknownMemory) => None,
+                Err(error) => return Err(error.into()),
+            };
+            memories.push(MemoryOutcome {
+                id: created.memory,
+                created_at: created.created_at,
+                faded_at,
+                purged_at: purged_at.get(&created.memory).copied(),
+            });
+        }
+
+        let mut turn_tokens = self.turn_tokens;
+        let mut profile_tokens = self.profile_tokens;
+        let llm = match self.llm {
+            Llm::Scripted => LlmCounts {
+                scripted: self.llm_calls,
+                ..LlmCounts::default()
+            },
+            Llm::Recorded(recorder, _) => recorder.llm_counts(),
         };
-        Outcome {
+        Ok(Outcome {
             probes: self.probes,
             purges_per_day: self
                 .purges
@@ -1019,10 +1294,49 @@ impl<'a> Engine<'a> {
                     purged: None,
                 })
                 .collect(),
-            llm_calls: self.llm_calls,
+            injected_tokens: InjectedTokens {
+                sessions: self
+                    .sessions
+                    .into_iter()
+                    .filter(|(_, count)| count.synced)
+                    .map(|(session, count)| SessionTokens {
+                        session,
+                        prefetches: count.prefetches,
+                        tokens: count.tokens,
+                    })
+                    .collect(),
+                per_turn: Percentiles::of(&mut turn_tokens),
+                cron: super::report::CronTokens {
+                    prefetches: self.cron_prefetches,
+                    tokens: self.cron_tokens,
+                },
+            },
+            profile_tokens: Percentiles::of(&mut profile_tokens),
+            call2_rate: Call2Rate {
+                chunks: self.chunks,
+                call2: self.call2_chunks,
+                rate: if self.chunks == 0 {
+                    0.0
+                } else {
+                    self.call2_chunks as f64 / self.chunks as f64
+                },
+            },
+            agenda_lines_per_day: self
+                .agenda_lines
+                .into_iter()
+                .map(|(day, count)| DayCount {
+                    day,
+                    count,
+                    purged: None,
+                })
+                .collect(),
+            significance_histogram: self.significance_histogram,
+            kind_histogram: self.kind_histogram,
+            memories,
+            llm,
             created: self.created,
             shadow: self.shadow,
-        }
+        })
     }
 }
 

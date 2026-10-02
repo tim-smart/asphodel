@@ -110,6 +110,29 @@ enum Bound {
 }
 
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
+    let (stop_tx, stop) = watch::channel(false);
+    let signals = tokio::spawn({
+        let stop_tx = stop_tx.clone();
+        async move {
+            shutdown_signal().await;
+            let _ = stop_tx.send(true);
+        }
+    });
+    let served = run_with(args, stop_tx, stop, None).await;
+    signals.abort();
+    served
+}
+
+/// The daemon under a caller's stop signal, telling `bound` the address it
+/// listens on once it does. `run` adds the signal handlers; `asphodel
+/// bench` runs this on a copy of a replayed store and stops it itself
+/// (TIM-96, decision 3).
+pub(crate) async fn run_with(
+    args: ServeArgs,
+    stop_tx: watch::Sender<bool>,
+    stop: watch::Receiver<bool>,
+    bound_tx: Option<tokio::sync::oneshot::Sender<String>>,
+) -> anyhow::Result<()> {
     let config = resolve_config(&args)?;
     if !args.listen.is_local() && config.deployment.token.is_none() {
         bail!(
@@ -125,7 +148,6 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let gate = startup_gate();
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let (stop_tx, stop) = watch::channel(false);
     let app: Shared = Arc::new(App {
         clock: Arc::clone(&clock),
         token: config.deployment.token.clone(),
@@ -139,13 +161,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         listen = %address,
         "asphodel starting: /v1/health answers 503 until the store and models are ready"
     );
-    let signals = tokio::spawn({
-        let stop_tx = stop_tx.clone();
-        async move {
-            shutdown_signal().await;
-            let _ = stop_tx.send(true);
-        }
-    });
+    if let Some(bound_tx) = bound_tx {
+        let _ = bound_tx.send(address.clone());
+    }
     let router = api::router(Arc::clone(&app));
     let (server, cleanup) = match bound {
         Bound::Tcp(listener) => (
@@ -185,7 +203,6 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         Ok(None) | Err(_) => {
             let _ = stop_tx.send(true);
             let served = server.await;
-            signals.abort();
             if let Some(cleanup) = cleanup {
                 cleanup.remove()?;
             }
@@ -234,7 +251,6 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // decision 3). The queue is in SQLite, so nothing waiting is lost.
     let served = server.await;
     let _ = stop_tx.send(true);
-    signals.abort();
     if let Some(workers) = &workers {
         workers.join().await;
     }
@@ -397,10 +413,10 @@ fn start(
 /// plays the file's steps in order ([`FakeLlm::from_script`]). It is for
 /// integration tests, environment only, never in `--help`, and the resolved
 /// config says so.
-const LLM_SCRIPT_ENV: &str = "ASPHODEL_LLM_SCRIPT";
+pub(crate) const LLM_SCRIPT_ENV: &str = "ASPHODEL_LLM_SCRIPT";
 
 /// The model name the scripted LLM reports when `llm.model` isn't set.
-const FAKE_LLM_MODEL: &str = "fake-llm";
+pub(crate) const FAKE_LLM_MODEL: &str = "fake-llm";
 
 /// Reads the LLM script, if there is one, before anything binds.
 fn llm_script() -> anyhow::Result<Option<String>> {
@@ -459,7 +475,7 @@ fn llm_client(
 /// `ASPHODEL_MODELS=fake` runs the daemon on the deterministic fake models.
 /// It is for tests, environment only, never in `--help`, and the resolved
 /// config says so.
-const MODELS_ENV: &str = "ASPHODEL_MODELS";
+pub(crate) const MODELS_ENV: &str = "ASPHODEL_MODELS";
 
 enum ModelsSwitch {
     None,

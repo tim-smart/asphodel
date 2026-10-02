@@ -6,6 +6,7 @@
 //! It's a library as well as a binary so the replay tests can read
 //! scenarios with the same loader the command uses.
 
+pub mod bench;
 pub mod cli;
 mod client;
 mod listen;

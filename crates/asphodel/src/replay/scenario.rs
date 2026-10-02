@@ -18,7 +18,7 @@ use asphodel_core::retrieval::Band;
 use asphodel_core::strength::{Kind, Phase};
 use jiff::civil::Date;
 use jiff::{SignedDuration, Span, SpanRelativeTo, Timestamp};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The prefix of the sessions the prefetch probes run on, `probe:<id>`.
 /// No scenario session may start with it, so a probe never touches a
@@ -133,7 +133,7 @@ pub struct Turn {
     pub used: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Author {
     pub id: String,
@@ -154,7 +154,7 @@ pub struct Chatter {
     pub session: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
     pub at: Timestamp,
@@ -168,7 +168,7 @@ pub struct Document {
 }
 
 /// Clears a session's in-context set and pending injection.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Clear {
     pub at: Timestamp,
@@ -272,7 +272,7 @@ impl Outcome {
 }
 
 /// A time and an expectation. Never changes the run.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Probe {
     /// `p<n>` in file order when absent.
     #[serde(default)]
@@ -282,7 +282,7 @@ pub struct Probe {
     pub check: Check,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Check {
     Band {
