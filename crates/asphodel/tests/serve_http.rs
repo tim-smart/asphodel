@@ -9,7 +9,10 @@
 //! (TIM-111) adds the model routes, `/system-prompt`, `/agenda` and
 //! `asphodel model`. "Erase path, forget, purge and the nightly sweep"
 //! (TIM-112) adds `forget`, `/v1/purge/plan` and `/v1/purge/ack`, and
-//! `asphodel forget` and `asphodel purge plan|ack`.
+//! `asphodel forget` and `asphodel purge plan|ack`. "Operations: backup,
+//! restore, status and audit lists" (TIM-114) adds `/v1/backup`,
+//! `/v1/status` and the audit lists, `asphodel backup`, `status` and the
+//! list commands, and the offline `asphodel restore`.
 //!
 //! The daemon runs on the fake models (`ASPHODEL_MODELS=fake`) and a
 //! scripted fake LLM (`ASPHODEL_LLM_SCRIPT`), both environment only. The
@@ -22,7 +25,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -1660,4 +1663,620 @@ fn a_ready_erase_runs_after_a_restart_without_an_llm() {
 
     let mut second = Serve::new(&dir).ready();
     second.wait_for_line("erased a chain");
+}
+
+// Backup, restore, status and the audit lists (TIM-114; TIM-99, decisions 1,
+// 6 and 7; ADR 0010, "Backup and restore" and "Sweeps, pauses and failures").
+//
+// Tests first: none of these routes or subcommands exist yet, so every test
+// here is ignored until TIM-114 adds them. The contract they pin, beyond
+// what the ADR says:
+//
+// - `POST /v1/backup` answers 200 with the copy as its body and the
+//   copy's SHA-256 (lowercase hex) and length in bytes in
+//   `SHA256_HEADER` and `LENGTH_HEADER`, and leaves no temporary file in
+//   the data dir. It needs the bearer token like every route but health.
+// - `asphodel backup --out <file|->` fails, and leaves nothing at `<file>`,
+//   when the stream is cut short, its length or hash doesn't match the
+//   headers, or, for a file, the copy fails `PRAGMA integrity_check`.
+// - `asphodel restore <file> --data-dir <dir>` keeps the old database (and
+//   its WAL) in the data dir under another name, and writes a daemon-wide
+//   `restored` edit row whose details hold `backed_up_at`, `restored_at`
+//   and `binary_version`. The backup time has to travel inside the copy,
+//   since the stream reaches the restore through pipes.
+// - `GET /v1/status` holds `attention` (an array, empty when nothing needs
+//   it), `last_backup_at`, `last_sweep`, `pre_migration_copy` and
+//   `banks.<bank>.{queued, failed_chunks, failed_refreshes}`. `asphodel
+//   status` prints it, and exits non-zero whenever `attention` isn't empty,
+//   with `--json` too.
+// - `GET /v1/banks/{bank}/{purges,forgets,sweeps,recalls}` answer
+//   `{"<list>": [...]}`, and `asphodel <list> --bank <bank>` prints them.
+
+/// The response header holding the backup's SHA-256, as lowercase hex.
+const SHA256_HEADER: &str = "asphodel-sha256";
+
+/// The response header holding the backup's length in bytes.
+const LENGTH_HEADER: &str = "asphodel-length";
+
+/// Every SQLite database file starts with this.
+const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+
+/// A reply read as bytes, for the backup stream, which isn't UTF-8.
+struct RawReply {
+    status: u16,
+    /// The header block, lowercased.
+    headers: String,
+    /// The body, dechunked.
+    body: Vec<u8>,
+}
+
+impl RawReply {
+    fn header(&self, name: &str) -> Option<&str> {
+        header(&self.headers, name)
+    }
+}
+
+/// The value of `name` in a lowercased header block.
+fn header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == name).then(|| value.trim())
+    })
+}
+
+/// A bodiless request on its own connection, read as bytes.
+fn request_raw(addr: &Addr, method: &str, path: &str, token: Option<&str>) -> RawReply {
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: asphodel\r\nConnection: close\r\nContent-Length: 0\r\n"
+    );
+    if let Some(token) = token {
+        head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut response = Vec::new();
+    match addr {
+        Addr::Tcp(addr) => {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(SETTLE)).unwrap();
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.read_to_end(&mut response).unwrap();
+        }
+        Addr::Unix(path) => {
+            let mut stream = UnixStream::connect(path).unwrap();
+            stream.set_read_timeout(Some(SETTLE)).unwrap();
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.read_to_end(&mut response).unwrap();
+        }
+    }
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("a header block");
+    let headers = String::from_utf8_lossy(&response[..split]).to_lowercase();
+    let status = headers
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in:\n{headers}"));
+    let body = &response[split + 4..];
+    let body = if headers.contains("transfer-encoding: chunked") {
+        dechunk_bytes(body)
+    } else {
+        body.to_vec()
+    };
+    RawReply {
+        status,
+        headers,
+        body,
+    }
+}
+
+fn dechunk_bytes(mut body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let line = body
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .expect("a chunk size line");
+        let size = std::str::from_utf8(&body[..line]).unwrap();
+        let size = usize::from_str_radix(size.trim(), 16).expect("a hex chunk size");
+        if size == 0 {
+            return out;
+        }
+        let rest = &body[line + 2..];
+        out.extend_from_slice(&rest[..size]);
+        body = &rest[size + 2..];
+    }
+}
+
+/// The SHA-256 of `bytes` as lowercase hex, from coreutils, so the tests
+/// need no hashing dependency.
+fn sha256(bytes: &[u8]) -> String {
+    let mut child = Command::new("sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    stdout(&output)
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// Serves one reply on a loopback port, as a daemon whose backup went wrong
+/// would: it reads the request, writes `head` and then `body`, and closes
+/// the connection. Returns the `--url` that reaches it.
+fn serve_once(head: String, body: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        stream.set_read_timeout(Some(SETTLE)).unwrap();
+        // Read the whole request first, so closing with it unread can't
+        // reset the connection before the client reads the reply.
+        let mut reader = BufReader::new(stream);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some(value) = header(&line.to_lowercase(), "content-length") {
+                length = value.parse().unwrap_or(0);
+            }
+        }
+        let mut request_body = vec![0; length];
+        let _ = reader.read_exact(&mut request_body);
+        let mut stream = reader.into_inner();
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&body);
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    });
+    url
+}
+
+/// A 200 head carrying `backup`'s headers, with `replace` swapped in and a
+/// `Content-Length` of `length`. The framing headers aren't carried over:
+/// the body the fake serves is framed by its own length.
+fn backup_head(backup: &RawReply, replace: &[(&str, String)], length: usize) -> String {
+    let mut head = String::from("HTTP/1.1 200 OK\r\n");
+    for line in backup.headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if ["content-length", "transfer-encoding", "connection", "date"].contains(&name) {
+            continue;
+        }
+        let value = replace
+            .iter()
+            .find(|(replaced, _)| *replaced == name)
+            .map_or(value.trim(), |(_, value)| value.as_str());
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(&format!(
+        "content-length: {length}\r\nconnection: close\r\n\r\n"
+    ));
+    head
+}
+
+/// `asphodel` with a clean environment and `ASPHODEL_URL` set to `url`.
+fn cli_at(url: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
+    command
+        .env_clear()
+        .env("ASPHODEL_URL", url)
+        .stdin(Stdio::null());
+    command
+}
+
+/// `asphodel restore <backup> --data-dir <data>`, which runs offline.
+fn restore(backup: &Path, data: &Path) -> Output {
+    run(Command::new(env!("CARGO_BIN_EXE_asphodel"))
+        .env_clear()
+        .stdin(Stdio::null())
+        .arg("restore")
+        .arg(backup)
+        .arg("--data-dir")
+        .arg(data))
+}
+
+/// The names in `dir`, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether the file at `path` is a SQLite database.
+fn is_sqlite(path: &Path) -> bool {
+    fs::read(path).is_ok_and(|bytes| bytes.starts_with(SQLITE_MAGIC))
+}
+
+/// What a running daemon keeps in its data dir: the database, its WAL
+/// files and the lock.
+const LIVE_FILES: &[&str] = &["asphodel.db", "asphodel.db-shm", "asphodel.db-wal", "lock"];
+
+#[test]
+#[ignore = "needs TIM-114: POST /v1/backup"]
+fn backup_streams_a_checked_copy_with_its_hash_and_length() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).bind();
+    daemon.wait_ready();
+    daemon.create_bank("main");
+
+    // The copy is the whole store, so it needs the token like every route
+    // but health.
+    for token in [None, Some("wrong-token")] {
+        let reply = request_raw(&daemon.addr, "POST", "/v1/backup", token);
+        assert_eq!(reply.status, 401, "with {token:?}");
+    }
+
+    let backup = request_raw(&daemon.addr, "POST", "/v1/backup", Some(TOKEN));
+    assert_eq!(
+        backup.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&backup.body)
+    );
+    assert!(backup.body.starts_with(SQLITE_MAGIC), "not a SQLite file");
+    let length = backup.body.len().to_string();
+    assert_eq!(backup.header(LENGTH_HEADER), Some(length.as_str()));
+    let hash = sha256(&backup.body);
+    assert_eq!(backup.header(SHA256_HEADER), Some(hash.as_str()));
+
+    // The temporary file the online backup wrote is gone once it's sent.
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        let left: Vec<String> = names(&daemon.data_dir)
+            .into_iter()
+            .filter(|name| !LIVE_FILES.contains(&name.as_str()))
+            .collect();
+        if left.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "left in the data dir: {left:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "needs TIM-114: asphodel backup and restore"]
+fn a_backup_restores_offline_and_writes_a_restored_edit_row() {
+    use asphodel_core::store::{OpenOptions, Store};
+    use asphodel_core::{Clock, SystemClock};
+    use std::sync::Arc;
+
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir)
+        .script(&[json!({"reply": auckland_reply()})])
+        .ready();
+    daemon.create_bank("main");
+    daemon.ingest_notes("main", "notes.md");
+    let id = daemon.wait_for_memory("main");
+    daemon.wait_extracted("main");
+
+    let file = dir.path("backup.db");
+    let out = succeeded(run(cli(&daemon).arg("backup").arg("--out").arg(&file)));
+    assert!(is_sqlite(&file), "{out}");
+    let piped = run(cli(&daemon).args(["backup", "--out", "-"]));
+    assert!(piped.status.success(), "{}", stderr(&piped));
+    assert!(piped.stdout.starts_with(SQLITE_MAGIC), "not a SQLite file");
+
+    // Forgotten after the backup, so a restore brings it back (ADR 0010,
+    // "Consequences"). SIGKILL leaves the forget in the WAL: the restore
+    // has to move the WAL aside with the database, or SQLite would replay
+    // the old store's frames onto the restored one.
+    let forgotten = daemon.ok(daemon.post("/v1/banks/main/forget", &json!({"ids": [id]})));
+    assert_eq!(forgotten["forgotten"], json!([id]));
+    let data = daemon.data_dir.clone();
+    drop(daemon);
+
+    let before = names(&data);
+    let output = restore(&file, &data);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    // The old database is moved aside, not deleted.
+    let aside: Vec<String> = names(&data)
+        .into_iter()
+        .filter(|name| !LIVE_FILES.contains(&name.as_str()) && !before.contains(name))
+        .collect();
+    assert!(
+        aside.iter().any(|name| is_sqlite(&data.join(name))),
+        "no old database kept in {:?}",
+        names(&data)
+    );
+
+    let mut daemon = Serve::new(&dir).ready();
+    let recall = daemon.recall("main", "where does Tim live? Auckland");
+    assert_eq!(recall["results"][0]["id"], id.as_str(), "{recall}");
+    assert_eq!(recall["results"][0]["sentence"], SENTENCE);
+    daemon.sigterm();
+    assert!(daemon.wait_exit().success(), "{}", daemon.log);
+    drop(daemon);
+
+    // One daemon-wide `restored` row, with the backup time, the restore time
+    // and the binary version.
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let store = Store::open(&data, OpenOptions::default(), clock).unwrap();
+    let rows: Vec<String> = {
+        let conn = store.connection();
+        let mut statement = conn
+            .prepare("SELECT details FROM edits WHERE kind = 'restored' AND bank_id IS NULL")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let details: Value = serde_json::from_str(&rows[0]).unwrap();
+    assert_eq!(details["binary_version"], env!("CARGO_PKG_VERSION"));
+    assert!(!details["backed_up_at"].is_null(), "{details}");
+    assert!(!details["restored_at"].is_null(), "{details}");
+}
+
+#[test]
+#[ignore = "needs TIM-114: asphodel restore"]
+fn restore_refuses_while_the_lock_is_held_and_a_newer_schema() {
+    let dir = TestDir::new();
+    let daemon = Serve::new(&dir).ready();
+    daemon.create_bank("main");
+    let file = dir.path("backup.db");
+    succeeded(run(cli(&daemon).arg("backup").arg("--out").arg(&file)));
+
+    // The daemon holds the data-dir lock, so the restore can't run beside it.
+    let before = names(&daemon.data_dir);
+    let output = restore(&file, &daemon.data_dir);
+    assert!(!output.status.success(), "restored under a running daemon");
+    assert!(stderr(&output).contains("locked"), "{}", stderr(&output));
+    assert_eq!(names(&daemon.data_dir), before);
+    assert_eq!(daemon.get("/v1/health").status, 200);
+    let data = daemon.data_dir.clone();
+    drop(daemon);
+
+    // A copy from a newer binary is refused before anything moves.
+    // `user_version` is the big-endian u32 at offset 60 of the header.
+    let mut bytes = fs::read(&file).unwrap();
+    let newer = asphodel_core::store::SCHEMA_VERSION + 1;
+    bytes[60..64].copy_from_slice(&newer.to_be_bytes());
+    let newer_file = dir.path("newer.db");
+    fs::write(&newer_file, bytes).unwrap();
+    let before = names(&data);
+    let output = restore(&newer_file, &data);
+    assert!(!output.status.success(), "restored a newer schema");
+    assert!(
+        stderr(&output).contains("schema version"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(names(&data), before);
+}
+
+#[test]
+#[ignore = "needs TIM-114: POST /v1/backup and asphodel backup"]
+fn the_cli_rejects_a_truncated_or_damaged_backup_stream() {
+    let dir = TestDir::new();
+    let daemon = Serve::new(&dir).ready();
+    daemon.create_bank("main");
+    let backup = request_raw(&daemon.addr, "POST", "/v1/backup", None);
+    assert_eq!(backup.status, 200);
+    let full = backup.body.clone();
+    let half = full[..full.len() / 2].to_vec();
+
+    let backup_to = |url: &str, out: &str| run(cli_at(url).args(["backup", "--out", out]));
+    let out = dir.path("out.db");
+    let out_arg = out.to_str().unwrap();
+
+    // The control: the daemon's own reply, replayed, is accepted, so the
+    // failures below come from what was changed and not from the fake.
+    let url = serve_once(backup_head(&backup, &[], full.len()), full.clone());
+    succeeded(backup_to(&url, out_arg));
+    assert_eq!(fs::read(&out).unwrap(), full);
+    fs::remove_file(&out).unwrap();
+
+    let mut flipped = full.clone();
+    let middle = flipped.len() / 2;
+    flipped[middle] ^= 0xff;
+    let cases = [
+        (
+            "the connection closes part way through",
+            backup_head(&backup, &[], full.len()),
+            half.clone(),
+        ),
+        (
+            "a complete-looking reply shorter than its length header",
+            backup_head(&backup, &[], half.len()),
+            half.clone(),
+        ),
+        (
+            "a byte that doesn't match the hash",
+            backup_head(&backup, &[], full.len()),
+            flipped,
+        ),
+        (
+            // The headers match the body, so only the integrity check of a
+            // file target can catch it.
+            "a cut-short copy whose headers match it",
+            backup_head(
+                &backup,
+                &[
+                    (SHA256_HEADER, sha256(&half)),
+                    (LENGTH_HEADER, half.len().to_string()),
+                ],
+                half.len(),
+            ),
+            half.clone(),
+        ),
+    ];
+    for (case, head, body) in cases {
+        let url = serve_once(head, body);
+        let output = backup_to(&url, out_arg);
+        assert!(!output.status.success(), "accepted {case}");
+        assert!(!out.exists(), "left a file behind after {case}");
+    }
+
+    // Writing to stdout, a short stream fails the command too, so a pipe
+    // into storage can tell.
+    let url = serve_once(backup_head(&backup, &[], half.len()), half);
+    let output = backup_to(&url, "-");
+    assert!(
+        !output.status.success(),
+        "accepted a short stream on stdout"
+    );
+}
+
+#[test]
+#[ignore = "needs TIM-114: GET /v1/status and asphodel status"]
+fn status_needs_attention_while_a_chunk_has_failed() {
+    let dir = TestDir::new();
+    let mut steps = vec![json!({"fail": "no_content"}); 5];
+    steps.push(json!({"reply": auckland_reply()}));
+    let mut daemon = Serve::new(&dir).script(&steps).ready();
+    daemon.create_bank("main");
+
+    let status = daemon.ok(daemon.get("/v1/status"));
+    assert_eq!(status["attention"], json!([]), "{status}");
+    assert_eq!(status["last_backup_at"], Value::Null, "{status}");
+    assert_eq!(status["last_sweep"], Value::Null, "{status}");
+    assert_eq!(status["pre_migration_copy"], Value::Null, "{status}");
+    assert_eq!(status["banks"]["main"]["queued"], 0, "{status}");
+    assert_eq!(status["banks"]["main"]["failed_chunks"], 0, "{status}");
+    assert_eq!(status["banks"]["main"]["failed_refreshes"], 0, "{status}");
+    succeeded(run(cli(&daemon).arg("status")));
+
+    // A completed backup is reported.
+    succeeded(run(cli(&daemon)
+        .arg("backup")
+        .arg("--out")
+        .arg(dir.path("backup.db"))));
+    let status = daemon.ok(daemon.get("/v1/status"));
+    assert!(status["last_backup_at"].is_string(), "{status}");
+
+    daemon.ingest_notes("main", "notes.md");
+    daemon.wait_until(
+        "a failed chunk",
+        |daemon| daemon.chunks("main"),
+        |chunks| chunks["failed"].as_array().is_some_and(|f| f.len() == 1),
+    );
+    let status = daemon.ok(daemon.get("/v1/status"));
+    assert_eq!(status["banks"]["main"]["failed_chunks"], 1, "{status}");
+    assert_ne!(status["attention"], json!([]), "{status}");
+    let output = run(cli(&daemon).arg("status"));
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(stdout(&output).contains("failed"), "{}", stdout(&output));
+    let output = run(cli(&daemon).args(["status", "--json"]));
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let printed: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_ne!(printed["attention"], json!([]), "{printed}");
+
+    succeeded(run(
+        cli(&daemon).args(["chunks", "--bank", "main", "--failed", "--retry"])
+    ));
+    daemon.wait_for_memory("main");
+    daemon.wait_extracted("main");
+    succeeded(run(cli(&daemon).arg("status")));
+}
+
+#[test]
+#[ignore = "needs TIM-114: GET /v1/status and asphodel status"]
+fn status_needs_attention_while_purge_is_paused_and_shows_both_hashes() {
+    let dir = TestDir::new();
+    let mut first = Serve::new(&dir).ready();
+    first.create_bank("main");
+    let stored = first.ok(first.get("/v1/config"))["deletion_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    succeeded(run(cli(&first).arg("status")));
+    first.sigterm();
+    assert!(first.wait_exit().success());
+    drop(first);
+
+    let second = Serve::new(&dir).tuning("[purge]\ndelta = 0.5\n").ready();
+    let current = second.ok(second.get("/v1/config"))["deletion_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(current, stored);
+
+    let status = second.ok(second.get("/v1/status"));
+    assert_ne!(status["attention"], json!([]), "{status}");
+    let body = status.to_string();
+    assert!(
+        body.contains(&stored) && body.contains(&current),
+        "{status}"
+    );
+    let output = run(cli(&second).arg("status"));
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let out = stdout(&output);
+    assert!(out.contains("paused"), "{out}");
+    assert!(out.contains(&stored) && out.contains(&current), "{out}");
+
+    succeeded(run(cli(&second).args(["purge", "ack", "--hash", &current])));
+    succeeded(run(cli(&second).arg("status")));
+}
+
+#[test]
+#[ignore = "needs TIM-114: the purges, forgets, sweeps and recalls lists"]
+fn the_audit_lists_hold_no_content_except_recalls() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir)
+        .script(&[json!({"reply": auckland_reply()})])
+        .ready();
+    daemon.create_bank("main");
+    daemon.ingest_notes("main", "notes.md");
+    let id = daemon.wait_for_memory("main");
+    daemon.wait_extracted("main");
+
+    // `wait_for_memory` recalled with this query, and recalls keep theirs.
+    let query = "where does Tim live? Auckland";
+    let recalls = daemon.ok(daemon.get("/v1/banks/main/recalls"));
+    assert!(
+        recalls["recalls"].as_array().is_some_and(|r| !r.is_empty()),
+        "{recalls}"
+    );
+    assert!(recalls.to_string().contains(query), "{recalls}");
+    let out = succeeded(run(cli(&daemon).args(["recalls", "--bank", "main"])));
+    assert!(out.contains(query), "{out}");
+
+    daemon.ok(daemon.post("/v1/banks/main/forget", &json!({"ids": [id]})));
+    let forgets = daemon.ok(daemon.get("/v1/banks/main/forgets"));
+    assert_eq!(
+        forgets["forgets"].as_array().map(Vec::len),
+        Some(1),
+        "{forgets}"
+    );
+    let out = succeeded(run(cli(&daemon).args(["forgets", "--bank", "main"])));
+    for listed in [forgets.to_string(), out] {
+        assert!(listed.contains(&id), "{listed}");
+        assert!(
+            !listed.contains("Auckland") && !listed.contains(SENTENCE),
+            "{listed}"
+        );
+    }
+
+    let purges = daemon.ok(daemon.get("/v1/banks/main/purges"));
+    assert_eq!(purges["purges"], json!([]), "{purges}");
+    let sweeps = daemon.ok(daemon.get("/v1/banks/main/sweeps"));
+    assert!(sweeps["sweeps"].is_array(), "{sweeps}");
+    for list in ["purges", "sweeps"] {
+        succeeded(run(cli(&daemon).args([list, "--bank", "main"])));
+    }
+    let unknown = daemon.get("/v1/banks/nobody/forgets");
+    assert_eq!(unknown.status, 404, "{}", unknown.body);
 }
