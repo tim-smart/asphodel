@@ -1,4 +1,4 @@
-//! The recall log (TIM-90): one `recalls` row per recall, with the query,
+//! The recall log: one `recalls` row per recall, with the query,
 //! the memories that came back, whether each was injected, the latency, the
 //! session and the bank's turn counter. It's for detecting `used`, for the
 //! replay harness and for "why did it bring that up?". Nothing here writes
@@ -15,7 +15,7 @@ use crate::store::micros;
 pub(super) enum RecallKind {
     Prefetch,
     Tool,
-    /// A mental model's refresh retrieval (TIM-95, decision 3).
+    /// A mental model's refresh retrieval.
     Refresh,
 }
 
@@ -33,7 +33,7 @@ impl RecallKind {
 pub(super) struct Logged {
     pub memory_id: i64,
     /// The final score, or `None` when the reranker was skipped. It's not
-    /// the reranker's logit: calibrating the gate floor (TIM-93, decision 9)
+    /// the reranker's logit: calibrating the gate floor
     /// recomputes logits from the logged query and memories, which the
     /// deterministic reranker reproduces exactly. Add a logit column only if
     /// calibration finds that impractical.

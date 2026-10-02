@@ -1,9 +1,9 @@
-//! `asphodel report diff A B`: the A/B diff of two replay reports (TIM-96,
-//! decision 6). It refuses runs on a different corpus or cassette unless
-//! `--force`, compares numbers with a tolerance (the last float digits can
-//! differ across machines), and names the memories that faded or were
-//! purged in one run and not the other. The diff is printed as JSON; it
-//! holds ids and numbers, and the reports stay where they are.
+//! `asphodel report diff A B`: the A/B diff of two replay reports. It refuses
+//! runs on a different corpus or cassette unless `--force`, compares numbers
+//! with a tolerance (the last float digits can differ across machines), and
+//! names the memories that faded or were purged in one run and not the other.
+//! The diff is printed as JSON; it holds ids and numbers, and the reports stay
+//! where they are.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

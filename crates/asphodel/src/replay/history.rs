@@ -1,5 +1,5 @@
 //! Real-history replay: `asphodel replay --corpus <file> --mode
-//! live|replay|fast` (TIM-96, decisions 1, 3, 4, 6, 7 and 8; TIM-117).
+//! live|replay|fast`.
 //!
 //! The corpus, the cassette, the probes file and the report all live under
 //! the private dir, and are refused anywhere else. The LLM for `live` and

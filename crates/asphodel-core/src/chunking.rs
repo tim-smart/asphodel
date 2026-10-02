@@ -1,5 +1,4 @@
-//! Splitting sources into chunks, the unit extraction runs on (TIM-92,
-//! documents and chunks).
+//! Splitting sources into chunks, the unit extraction runs on.
 //!
 //! A turn is one chunk. A document is one chunk per section, a section
 //! running from an ATX heading to the next heading of any level, and a
@@ -8,7 +7,7 @@
 //! whitespace, and at a hard cut only as a last resort. Small sections are
 //! never merged, so editing one section never changes another's hash.
 //!
-//! Offsets are in characters, not bytes ("What is a memory record?", TIM-90).
+//! Offsets are in characters, not bytes.
 //! A chunk drops the blank lines before and after it, so a section's hash
 //! doesn't depend on the blank lines that follow it or on whether it's last.
 
@@ -50,7 +49,7 @@ pub fn split_document(text: &str) -> Vec<DocumentChunk> {
 
 /// A chunk's identity: a hash of its text and its heading path, fixed at
 /// ingest and never recomputed. It's the forget tombstone, not an integrity
-/// check (TIM-92). Every part is length-prefixed, so different paths never
+/// check. Every part is length-prefixed, so different paths never
 /// collide however their headings are spelled.
 pub fn chunk_hash(heading_path: &[String], text: &str) -> String {
     let mut hash = Sha256::new();

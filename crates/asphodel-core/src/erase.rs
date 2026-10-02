@@ -1,6 +1,5 @@
-//! Forget, and the one erase path forget and purge share ("Deletion
-//! policy", TIM-97, decisions 2 and 5; ADR 0008; ADR 0010, "Forgetting";
-//! "Erase path, forget, purge and the nightly sweep", TIM-112).
+//! Forget, and the one erase path forget and purge share (ADR 0008; ADR 0010,
+//! "Forgetting").
 //!
 //! **Chains.** Both act on whole supersession chains: every memory joined
 //! along `superseded_by`, whichever version was named. `ended_by` isn't a
@@ -35,7 +34,7 @@
 //! character, so the spans of other memories in the same chunk still hold.
 //! The source keeps its key and content hash, and the chunk its hash, so
 //! sending the same turn or document again is a duplicate and a later
-//! version can't bring the passage back for extraction (ADR 0002, TIM-92).
+//! version can't bring the passage back for extraction (ADR 0002).
 //! A document's other versions hold the passage in their own text, so it's
 //! masked wherever it appears verbatim in them, and the masks are recorded
 //! in `chunk_redactions` for a version ingested later to apply to its text.
@@ -68,8 +67,8 @@ pub const EDIT_PURGED: &str = "purged";
 /// for character keeps every other span in the chunk where it was.
 pub const REDACTION_MASK: char = '\u{2588}';
 
-/// What `memory_forget` and `POST /v1/banks/{bank}/forget` take (TIM-94,
-/// decision 9). `session_id` is the Hermes session whose `sync_turn` will
+/// What `memory_forget` and `POST /v1/banks/{bank}/forget` take. `session_id`
+/// is the Hermes session whose `sync_turn` will
 /// carry the request turn, so the audit row can be linked to it (ADR 0010);
 /// the CLI sends none.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -79,7 +78,7 @@ pub struct ForgetRequest {
     pub session_id: Option<String>,
 }
 
-/// What `forget` returns (TIM-94, decision 9, as amended by TIM-97).
+/// What `forget` returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Forgotten {
     /// Every memory the erase will remove: the whole chain of each named
@@ -454,8 +453,8 @@ fn passages(conn: &Connection, members: &BTreeSet<i64>) -> Result<Vec<Passage>, 
 }
 
 /// Deletes the model entries citing any of `members` and returns their
-/// models: code drops an entry when a memory it cites goes (TIM-95,
-/// decision 6), and the model refreshes.
+/// models: code drops an entry when a memory it cites goes, and the model
+/// refreshes.
 fn drop_entries(
     conn: &Connection,
     members: &BTreeSet<i64>,
@@ -576,7 +575,7 @@ struct Redacted {
 /// Masks every passage the chain rests on or was restated in: the members'
 /// own spans and their recorded mention passages. A mention from before
 /// version 7 has no span, so its source is masked more widely rather than
-/// not at all (the TIM-112 review): a turn except what surviving memories
+/// not at all: a turn except what surviving memories
 /// rest on, and a document at the chain's own passages wherever they appear
 /// verbatim, or else whole, again except surviving passages.
 fn redact_chain(
@@ -752,7 +751,7 @@ fn slice(text: &str, start: usize, end: usize) -> String {
 /// Where `needle` appears in `text`, in characters, overlapping included.
 /// A mask on either side matches any character: an earlier forget masked
 /// part of the same passage there, or in the text the needle was read from,
-/// and that mustn't hide the rest of it (the re-review of 4c5d9e1). At
+/// and that mustn't hide the rest of it. At
 /// least one character that isn't a mask or whitespace has to match, so a
 /// run of masks finds nothing. Matching only ever widens what's masked.
 fn occurrences(text: &str, needle: &str) -> Vec<(usize, usize)> {
@@ -810,7 +809,7 @@ struct Masks {
 /// appears in them too ([`occurrences`]).
 ///
 /// Every target is read before anything is masked, and each is masked once
-/// with the union of its spans (the re-review of 4c5d9e1). Masking one
+/// with the union of its spans. Masking one
 /// passage first would hide a longer one that contains it from the search
 /// in the other versions.
 fn redact(
@@ -1029,7 +1028,7 @@ pub(crate) fn mask(text: &str, spans: &[(usize, usize)]) -> String {
 /// Deletes those of `entities` nothing rests on any more, with their
 /// aliases. Kept: the seeded `user` and `assistant`, a merge tombstone
 /// (`merged_into` set) and an entity another was merged into, one a mental
-/// model's filter names (TIM-97, decision 4), and a speaker, whose platform
+/// model's filter names, and a speaker, whose platform
 /// id resolves to it.
 fn delete_orphans(conn: &Connection, entities: &BTreeSet<i64>) -> Result<(), rusqlite::Error> {
     let mut orphan = conn.prepare_cached(
@@ -1090,7 +1089,7 @@ impl From<rusqlite::Error> for BankDeleteError {
     }
 }
 
-/// Deletes a bank (TIM-99, decision 10; ADR 0010). Every memory goes
+/// Deletes a bank (ADR 0010). Every memory goes
 /// through the erase path as one purge, which drops the model entries
 /// citing them and their vectors; then everything else the bank holds goes
 /// too, its tombstones, edit rows and session mappings included, and one

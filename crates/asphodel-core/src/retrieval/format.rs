@@ -1,4 +1,4 @@
-//! The injection's text (TIM-93, decision 10).
+//! The injection's text.
 //!
 //! Hermes replays an injection verbatim on every later turn, so nothing in
 //! it is relative to the moment it was made except the header's own time:
@@ -8,7 +8,8 @@
 //!
 //! ```text
 //! Recalled Wed 1 Oct 10:42
-//! - Tim has a dentist appointment on 3 October 2026 at 15:00. [upcoming Thu 3 Oct 15:00]
+//! - Tim has a dentist appointment on 3 October 2026 at 15:00. [upcoming Thu 3
+//! Oct 15:00]
 //! - Tim is in Lisbon. [observed 4 days ago, Sat 27 Sep]
 //! ```
 
@@ -90,8 +91,8 @@ fn annotations(candidate: &Candidate, now: Timestamp) -> Vec<String> {
 }
 
 /// `observed 4 days ago, Sat 27 Sep` for a state whose confidence is below
-/// [`STATE_AGE_SHOWN_BELOW`] (TIM-91, decision 8), and `None` otherwise. A
-/// mental model entry citing such a state shows it too (TIM-95, decision 5).
+/// [`STATE_AGE_SHOWN_BELOW`], and `None` otherwise. A
+/// mental model entry citing such a state shows it too.
 pub(crate) fn state_age(candidate: &Candidate, now: Timestamp) -> Option<String> {
     if candidate.window.kind != Kind::State || candidate.state_confidence >= STATE_AGE_SHOWN_BELOW {
         return None;
@@ -112,7 +113,7 @@ pub(crate) fn state_age(candidate: &Candidate, now: Timestamp) -> Option<String>
 }
 
 /// A stored time as its precision allows: `Thu 3 Oct 15:00`, `Sat 12 Sep`,
-/// `Oct 2027`, `2027`. A day always carries its weekday (decision 10), and
+/// `Oct 2027`, `2027`. A day always carries its weekday, and
 /// its year when it isn't the current one.
 fn date(time: WorldTime, tz: &TimeZone, now: Timestamp) -> String {
     let zoned = time.at.to_zoned(tz.clone());

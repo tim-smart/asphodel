@@ -1,4 +1,4 @@
-"""The turn spool (TIM-94, decision 6).
+"""The turn spool.
 
 When the daemon is down, ``sync_turn`` writes one JSON file per turn, the
 exact ``POST /v1/banks/{bank}/turns`` body, under

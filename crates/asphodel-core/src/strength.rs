@@ -2,8 +2,7 @@
 //!
 //! Everything here is computed from stored facts and a `now` the caller
 //! passes in. Nothing reads a clock or the store, and nothing computed here is
-//! ever stored ("Strength model: decay, reinforcement and significance",
-//! TIM-91):
+//! ever stored:
 //!
 //! ```text
 //! strength      = S·significance + max(recent_use, lasting_floor)
@@ -53,7 +52,7 @@ pub enum AccessKind {
 }
 
 impl AccessKind {
-    /// The weight of this kind in recent use (TIM-91, decision 6).
+    /// The weight of this kind in recent use.
     pub const fn weight(self) -> f64 {
         match self {
             AccessKind::Created => WEIGHT_CREATED,

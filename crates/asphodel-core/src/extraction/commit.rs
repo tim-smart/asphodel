@@ -1,5 +1,5 @@
 //! Committing a checked reply: one transaction for everything the chunk
-//! produced and its `extracted_at` (TIM-92).
+//! produced and its `extracted_at`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -59,7 +59,7 @@ pub(super) fn commit(
                 low_confidence,
             } => Some((*by, *until, *low_confidence)),
         };
-        // TIM-96 decision 4: keyed by the source and the claim's ordinal,
+        // Keyed by the source and the claim's ordinal,
         // written with the chunk's position so a document's chunks can't
         // collide.
         let uuid = store.derived_id(
@@ -72,7 +72,7 @@ pub(super) fn commit(
             Written {
                 id: memory_id,
                 // Where a neighbour this claim ends, or a memory whose ender
-                // it replaces, ends (TIM-92).
+                // it replaces, ends.
                 end: match memory.valid_from {
                     Some(stamp) => (stamp, memory.low_confidence),
                     None => end_at(None, input.observed_at, &unit.tz),
@@ -91,7 +91,7 @@ pub(super) fn commit(
                 }
             })?;
         link_entities(tx, store, unit, memory_id, &memory.links, &proposed)?;
-        // TIM-92: the created access carries the source's ingested_at, never
+        // The created access carries the source's ingested_at, never
         // the time extraction ran.
         insert_access(tx, unit, memory_id, "created")?;
         memories.push(uuid);
@@ -137,7 +137,7 @@ pub(super) fn commit(
                     &format!("{{\"superseded_by\":{}}}", by.id),
                 )?;
                 reopen(tx, store, unit, neighbour, by, false)?;
-                // TIM-95 decision 6: a citation of a refined memory moves to
+                // A citation of a refined memory moves to
                 // the head of its chain, where its accesses are inherited.
                 tx.execute(
                     "UPDATE OR IGNORE mental_model_citations SET memory_id = ?2
@@ -150,8 +150,8 @@ pub(super) fn commit(
                 )?;
             }
         }
-        // A model citing it refreshes (TIM-95, "refreshes follow
-        // conversations"): the service reads this edit back and triggers
+        // A model citing it refreshes: the service reads this edit back and
+        // triggers
         // it, with the bank's debounce ([`crate::mental_models::effects`]).
 
         // A new version of a forgotten memory joins a chain waiting to be
@@ -207,7 +207,7 @@ pub(super) fn commit(
     }
 
     // At most one access per memory per turn and source, keeping the
-    // strongest (TIM-90). `used` weighs least, so an access already in this
+    // strongest. `used` weighs least, so an access already in this
     // turn always stays.
     for (memory_id, _) in &checked.used {
         insert_access(tx, unit, *memory_id, "used")?;
@@ -229,7 +229,7 @@ pub(super) fn commit(
 /// entity. At commit, code repeats the exact alias lookup and links to an
 /// entity created after call 1's input was read. It never links to one that
 /// existed before, whether call 1 saw it and chose not to use it or never
-/// compared it at all, such as one the candidate cap left out (TIM-92).
+/// compared it at all, such as one the candidate cap left out.
 fn resolve_proposals(
     tx: &Transaction<'_>,
     store: &Store,
@@ -298,7 +298,7 @@ fn created_meanwhile(
 }
 
 /// Creates an entity keyed by its creating source, chunk position and the
-/// exact dedup key from `resolve_proposals` (TIM-96, amended by TIM-116).
+/// exact dedup key from `resolve_proposals`.
 /// The proposed name is already NFC and trimmed; the key lowercases it.
 /// No second normalization or lookup of existing ids affects replay ids.
 fn create_entity(
@@ -325,7 +325,7 @@ fn create_entity(
 
 /// Inserts a new memory. `ended` is the newer neighbour that already ends
 /// it, with where it ends and whether that's a guess: an older claim
-/// arriving after a newer one (TIM-92).
+/// arriving after a newer one.
 fn insert_memory(
     tx: &Transaction<'_>,
     store: &Store,
@@ -383,8 +383,8 @@ fn insert_memory(
 }
 
 /// Links a memory to its entities, keeping each link's surface form. A new
-/// surface form becomes an alias in a logged edit, so a mislink can be undone
-/// (TIM-92); a pronoun never does. A known entity merged into another since
+/// surface form becomes an alias in a logged edit, so a mislink can be
+/// undone; a pronoun never does. A known entity merged into another since
 /// call 1 read its input is linked as the entity that survived (ADR 0010).
 fn link_entities(
     tx: &Transaction<'_>,
@@ -432,7 +432,7 @@ fn has_alias(tx: &Transaction<'_>, entity_id: i64, alias: &str) -> Result<bool, 
 
 /// An access at the source's ingested_at and turn number, keeping the
 /// strongest kind: an access already there stays unless this one weighs
-/// more. A memory has at most one access per turn (TIM-90), and one per
+/// more. A memory has at most one access per turn, and one per
 /// document: a document carries the number of the turn before it, and its
 /// mention is a separate, independent one (CONTEXT.md, "Mentioned again").
 fn insert_access(
@@ -441,7 +441,7 @@ fn insert_access(
     memory_id: i64,
     kind: &str,
 ) -> Result<(), rusqlite::Error> {
-    // TIM-97 decision 4: a memory erased since the chunk's input was read
+    // A memory erased since the chunk's input was read
     // (purged, or forgotten from a live in-context set) takes no access.
     if !exists(tx, memory_id)? {
         return Ok(());
@@ -529,7 +529,7 @@ fn weight(kind: &str) -> f64 {
 }
 
 /// Ends `neighbour` by `by`: `valid_until` where `by` starts, or the day it
-/// was said with low confidence (TIM-92). A guessed end lowers the ended
+/// was said with low confidence. A guessed end lowers the ended
 /// memory's window confidence. The edit is logged as `kind`.
 fn end(
     tx: &Transaction<'_>,
@@ -568,8 +568,7 @@ fn end(
     )
 }
 
-/// The memories `superseded` had ended, now that a claim supersedes it
-/// (TIM-92, "Reopening", as amended by TIM-108). After a `retracts` or
+/// The memories `superseded` had ended, now that a claim supersedes it. After a `retracts` or
 /// `refines` their end follows the successor, which still ended them. After
 /// a `denies` (`denied`) the ending never happened, so they're open again.
 /// The label decides, never the kinds. Either way the edit is logged.

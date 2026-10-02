@@ -7,14 +7,13 @@
 //! change and an ADR.
 //!
 //! Durations on bank time are in bank days, and durations on world time are
-//! in world days, matching the formula in "Strength model: decay,
-//! reinforcement and significance" (TIM-91).
+//! in world days, matching the strength formula.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-// Strength (TIM-91):
+// Strength:
 //
 //   strength      = S·significance + max(recent_use, lasting_floor)
 //   recent_use    = ln Σ w_j · age_j^(−d_j)
@@ -74,8 +73,8 @@ pub const WEIGHT_WINDOW_CLOSE: f64 = 1.0;
 pub const FULL_SPEED_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// World days after its window closes that a memory is recently past rather
-/// than long past. It's the end of the ramp in "Retrieval and ranking"
-/// (TIM-93, decision 6) after which the full phase penalty applies. Only
+/// than long past. It's the end of the phase ramp after which the full
+/// phase penalty applies. Only
 /// rendering and the phase label use it; ranking works from the days since
 /// the close.
 pub const RECENTLY_PAST_DAYS: f64 = 30.0;
@@ -157,13 +156,13 @@ impl Volatility {
 }
 
 /// The reranker deadline in prefetch and recall. Past it, the reranker is
-/// skipped: explicit recall uses RRF order and prefetch injects nothing
-/// (TIM-93, decision 8, as amended by TIM-109). It's the first link in a
+/// skipped: explicit recall uses RRF order and prefetch injects nothing.
+/// It's the first link in a
 /// chain of timeouts: 1.5 s in the daemon, 3 s in the plugin and 8 s in
 /// Hermes.
 pub const RERANKER_DEADLINE: Duration = Duration::from_millis(1500);
 
-// Retrieval (TIM-93, placed in code by TIM-98):
+// Retrieval:
 
 /// Reciprocal rank fusion's constant: a hit at rank r scores 1 / (k + r).
 /// Recall and reconciliation fuse with the same step.
@@ -182,7 +181,7 @@ pub const RERANKED: usize = 40;
 pub const SHORT_FOLLOW_UP_WORDS: usize = 8;
 
 /// The confidence term's floor, `max(−3, ln(state_confidence))`, so a stale
-/// state is demoted and never gated (TIM-93, decision 5).
+/// state is demoted and never gated.
 pub const CONFIDENCE_TERM_MIN: f64 = -3.0;
 
 /// An upcoming memory's bonus grows over the last this many world days
@@ -205,11 +204,11 @@ pub const ENDED_GRACE_DAYS: f64 = 7.0;
 pub const STATE_AGE_SHOWN_BELOW: f64 = 0.9;
 
 /// The `limit` of an explicit recall when the caller gives none, and the
-/// most it can ask for (TIM-94, decision 9).
+/// most it can ask for.
 pub const RECALL_LIMIT_DEFAULT: usize = 10;
 pub const RECALL_LIMIT_MAX: usize = 30;
 
-// Extraction (TIM-92, TIM-98):
+// Extraction:
 
 /// The size a document section is split down to when it's too long, in
 /// characters ("at about 3,000 characters").

@@ -12,5 +12,3 @@ A memory's strength comes only from accesses of four kinds: `created`, `used`, `
 - Each extraction call has to receive every memory injected earlier in the session that's still in the context window, because Hermes replays injections on every later turn.
 - Only one access per memory per turn is written, so the same use isn't counted twice.
 - If the assistant repeats an injected memory, that counts as `used`, never as `mentioned_again`.
-
-Decided in "What is a memory record?" (TIM-90) on 2026-09-30.

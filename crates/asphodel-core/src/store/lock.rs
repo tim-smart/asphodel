@@ -1,4 +1,4 @@
-//! The exclusive lock on the data dir (TIM-94, decision 4).
+//! The exclusive lock on the data dir.
 //!
 //! It is an advisory `flock` on [`LOCK_FILE`](super::LOCK_FILE), so the
 //! kernel releases it when the holder exits however it exits. A crashed

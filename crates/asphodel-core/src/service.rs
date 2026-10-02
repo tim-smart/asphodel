@@ -1,7 +1,7 @@
 //! The service layer the HTTP handlers and the replay harness both call.
 //!
 //! Handlers stay thin: anything that would be skipped by replay if it lived
-//! in a handler belongs here instead (TIM-96, decision 3).
+//! in a handler belongs here instead.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -68,9 +68,8 @@ pub struct Service {
     /// The reranker deadline: [`RERANKER_DEADLINE`], fixed in code
     /// (ADR 0009), unless [`Service::with_reranker_deadline`] set another.
     reranker_deadline: Duration,
-    /// Each bank's last refresh trigger and last daily sweep (TIM-95
-    /// amendment, decision 1). In memory; the requests themselves are in
-    /// the store.
+    /// Each bank's last refresh trigger and last daily sweep. In memory;
+    /// the requests themselves are in the store.
     schedule: Schedule,
     /// Each bank's system prompt block, rebuilt lazily once cleared.
     blocks: Blocks,
@@ -150,7 +149,7 @@ impl Service {
     /// exact id, or the service doesn't open: a missing gate floor would
     /// flood injection, and a missing reconcile floor would skip
     /// reconciliation (ADR 0009). The check lives here, not in `serve`, so
-    /// the replay harness gets the same refusal (TIM-96, decision 3).
+    /// the replay harness gets the same refusal.
     pub fn with_models(
         clock: Arc<dyn Clock>,
         store: Store,
@@ -299,7 +298,7 @@ impl Service {
         self.models.as_ref()
     }
 
-    /// Creates a bank or merges `identity` into it (TIM-94, decision 7),
+    /// Creates a bank or merges `identity` into it,
     /// recording `models` on creation. Retained for existing callers;
     /// [`Service::ensure_bank_with_models`] records the loaded models.
     pub fn ensure_bank(
@@ -318,9 +317,9 @@ impl Service {
     }
 
     /// Creates a bank or merges `identity` into it. A new bank records the
-    /// ids of the models this service was built with (TIM-94, decision 4);
+    /// ids of the models this service was built with;
     /// a merge leaves the recorded ids alone, since a change goes through
-    /// `asphodel reembed` (TIM-99).
+    /// `asphodel reembed`.
     pub fn ensure_bank_with_models(
         &self,
         name: &str,
@@ -335,11 +334,11 @@ impl Service {
     /// asked to forget ([`crate::ingest`]).
     ///
     /// A new turn also settles its prefetch: echoing a pending injection's
-    /// `recall_id` commits it to the session's in-context set (TIM-94,
-    /// decision 6). The set as the turn leaves it is stored with the turn,
+    /// `recall_id` commits it to the session's in-context set. The set as the
+    /// turn leaves it is stored with the turn,
     /// in the same transaction, and extraction reads it from there rather
     /// than from the session, which may since have been cleared, added to
-    /// or lost to a restart (TIM-110 review). A duplicate, such as a resend
+    /// or lost to a restart. A duplicate, such as a resend
     /// from the plugin's spool, settles nothing, since the turn it repeats
     /// already did.
     pub fn ingest_turn(&self, bank: &str, turn: &Turn) -> Result<Ingested, IngestError> {
@@ -467,8 +466,7 @@ impl Service {
     }
 
     /// [`Service::extract_chunk`] with the entries of the block the turn's
-    /// session held, which call 1 is shown with the memories they cite
-    /// (TIM-95, decision 4).
+    /// session held, which call 1 is shown with the memories they cite.
     fn extract_with_entries(
         &self,
         lease: Lease,
@@ -506,7 +504,7 @@ impl Service {
 
     /// [`Service::prefetch`], also returning what the gate was shown: the
     /// query and every reranked candidate with its logit, for replay's
-    /// labelling material (TIM-96, decision 6).
+    /// labelling material.
     pub fn scored_prefetch(
         &self,
         bank: &str,
@@ -599,10 +597,10 @@ impl Service {
 
     /// Takes the head of `bank`'s queue and extracts it with `llm`, giving
     /// call 1 the in-context set stored with the turn when it was ingested,
-    /// never the session's set now (TIM-110 review). `Ok(None)` when the
+    /// never the session's set now. `Ok(None)` when the
     /// queue is empty or the bank's worker already holds a lease. This is
     /// the step the daemon's per-bank worker repeats, and the replay harness
-    /// runs it the same way (TIM-96, decision 3).
+    /// runs it the same way.
     pub fn extract_next(
         &self,
         bank: &str,
@@ -623,9 +621,8 @@ impl Service {
     /// The first half of [`Service::extract_next`]: claims the head of
     /// `bank`'s queue and reads the in-context set and block entries stored
     /// with it. The replay harness takes the lease from here so it can
-    /// script the LLM's replies against what call 1 and call 2 are shown
-    /// (TIM-96, decisions 2 and 3), then finishes with
-    /// [`Service::extract_leased`].
+    /// script the LLM's replies against what call 1 and call 2 are shown,
+    /// then finishes with [`Service::extract_leased`].
     pub fn next_extraction(&self, bank: &str) -> Result<Option<Claimed>, ExtractError> {
         let Some(lease) = self.claim_chunk(bank)? else {
             return Ok(None);
@@ -677,7 +674,7 @@ impl Service {
     /// The first half of [`Service::extract_leased`]: runs the LLM calls
     /// and plans the chunk, holding its lease, without writing anything.
     /// Replay runs it when the worker claims the chunk and
-    /// [`Service::commit_extraction`] a latency later (TIM-96, decision 3).
+    /// [`Service::commit_extraction`] a latency later.
     pub fn prepare_extraction(
         &self,
         lease: Lease,
@@ -700,8 +697,8 @@ impl Service {
     }
 
     /// The candidate lists call 2 was shown for a prepared chunk, with each
-    /// neighbour's similarity to its claim, for replay's labelling material
-    /// (TIM-96, decision 6). Reads only.
+    /// neighbour's similarity to its claim, for replay's labelling material.
+    /// Reads only.
     pub fn call2_lists(
         &self,
         prepared: &crate::extraction::Prepared,
@@ -750,7 +747,7 @@ impl Service {
     }
 
     /// Keeps the memories `ids` names in `bank`, so they never fade
-    /// (`memory_keep`, TIM-94, decision 9).
+    /// (`memory_keep`).
     pub fn keep(&self, bank: &str, ids: &[String]) -> Result<Kept, KeepError> {
         let watermark = self.watermark_for(bank)?;
         let kept = crate::keep::keep(&self.store, bank, ids)?;
@@ -772,14 +769,14 @@ impl Service {
     }
 
     /// Checkpoints the WAL into the database file, as the daemon does on
-    /// SIGTERM once the chunk in flight is done (TIM-94, decision 3).
+    /// SIGTERM once the chunk in flight is done.
     pub fn checkpoint(&self) -> Result<(), StoreError> {
         self.store.checkpoint()
     }
 
     /// The periodic store upkeep. `serve` calls it on a timer and the replay
     /// harness after advancing its clock, so it runs on this service's clock
-    /// either way (TIM-96, decision 3). It runs whether or not purge is
+    /// either way. It runs whether or not purge is
     /// paused: deleting an expired pre-migration copy is ADR 0010's bound on
     /// how long forgotten content survives, not a purge.
     ///
@@ -811,8 +808,7 @@ impl Service {
     }
 }
 
-/// Backup, status and the audit lists ("Operations: backup, restore,
-/// status and audit lists", TIM-114; ADR 0010). Restore is offline, under
+/// Backup, status and the audit lists (ADR 0010). Restore is offline, under
 /// the data-dir lock, so it isn't here: [`crate::operations::restore`].
 impl Service {
     /// `POST /v1/backup`: an online backup of the store, checked, in a file
@@ -853,8 +849,7 @@ impl Service {
     }
 }
 
-/// Inspection and correction ("Operations: inspection, entity correction,
-/// re-embedding and bank deletion", TIM-115; ADR 0010). The views read
+/// Inspection and correction (ADR 0010). The views read
 /// only; each correction is one logged edit, and refreshes the models it
 /// changes what they see.
 impl Service {
@@ -883,7 +878,7 @@ impl Service {
     /// The first instant the memory's strength fell below τ, from its
     /// access log and the bank's clock as they stand now, to the minute.
     /// `None` when it hasn't faded yet. It's what a replay's `faded_at`
-    /// probe reads (TIM-96, decision 5).
+    /// probe reads.
     pub fn faded_at(&self, bank: &str, id: Uuid) -> Result<Option<Timestamp>, InspectError> {
         crate::inspect::faded_at(&self.store, &self.tuning, bank, id)
     }
@@ -980,7 +975,7 @@ impl Service {
 }
 
 /// Re-embedding and bank deletion, the daemon jobs that change a bank at
-/// scale (TIM-99, decision 10; ADR 0010).
+/// scale (ADR 0010).
 impl Service {
     /// How long a re-embed's swap or a bank deletion waits for the bank's
     /// chunk in flight: longer than any one extraction takes.
@@ -1106,8 +1101,7 @@ impl Service {
     }
 }
 
-/// Forget, the erase path and the nightly sweep ("Erase path, forget, purge
-/// and the nightly sweep", TIM-112; ADRs 0008, 0009 and 0010).
+/// Forget, the erase path and the nightly sweep (ADRs 0008, 0009 and 0010).
 impl Service {
     /// `memory_forget`: hides each named memory's whole chain at once and
     /// queues its erase behind the chunks already queued
@@ -1293,10 +1287,9 @@ impl Service {
     }
 }
 
-/// Mental models, the agenda and the system prompt block ("Agenda, mental
-/// models and the system prompt block", TIM-111; ADR 0007).
+/// Mental models, the agenda and the system prompt block (ADR 0007).
 impl Service {
-    /// The model surface, `model create` (TIM-95, decision 2). The enabled
+    /// The model surface, `model create`. The enabled
     /// models' `max_tokens` must fit `mental_models.budget`. A new enabled
     /// model is refreshed after the debounce, like any owner edit.
     pub fn create_model(&self, bank: &str, spec: &ModelSpec) -> Result<Model, ModelError> {
@@ -1359,7 +1352,7 @@ impl Service {
 
     /// One refresh now, outside the schedule (`model refresh [--force]`).
     /// Without `force` it's skipped when the fingerprint matches the last
-    /// completed refresh's (TIM-95, decision 7).
+    /// completed refresh's.
     pub fn refresh_model(
         &self,
         bank: &str,
@@ -1380,8 +1373,8 @@ impl Service {
     /// Runs every refresh due now, across banks, and says when the next is
     /// due: a model whose debounce or retry has come round, and every
     /// enabled model of a bank whose daily sweep has. `serve` calls it from
-    /// a timer and the replay harness after advancing its clock (TIM-96,
-    /// decision 3). A model that fails to refresh doesn't stop the rest.
+    /// a timer and the replay harness after advancing its clock. A model that
+    /// fails to refresh doesn't stop the rest.
     pub fn run_refreshes(&self, llm: &dyn LlmClient) -> Result<Refreshes, ModelError> {
         let _refreshing = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.now();
@@ -1471,7 +1464,7 @@ impl Service {
         Ok(next)
     }
 
-    /// The bank's agenda now (TIM-93, decision 7, as amended by TIM-95).
+    /// The bank's agenda now.
     pub fn agenda(&self, bank: &str) -> Result<Agenda, ModelError> {
         let (bank_id, tz) = self.model_bank(bank)?;
         let conn = self.store.connection();
@@ -1483,7 +1476,7 @@ impl Service {
     /// model's entries as of its last completed refresh. It never calls the
     /// LLM. With a session id, the daemon records which block the session
     /// holds, and what the block lists or cites joins the session's
-    /// in-context set (TIM-95, decision 4).
+    /// in-context set.
     pub fn system_prompt(&self, bank: &str, session: Option<&str>) -> Result<Block, ModelError> {
         let (bank_id, tz) = self.model_bank(bank)?;
         let now = self.now();
@@ -1665,7 +1658,7 @@ pub struct Housekeeping {
 }
 
 /// The health response. The plugin compares `version`'s major against the
-/// one it was written for and warns on a mismatch (TIM-94, decision 2).
+/// one it was written for and warns on a mismatch.
 #[derive(Debug, Clone, Serialize)]
 pub struct Health {
     pub version: &'static str,

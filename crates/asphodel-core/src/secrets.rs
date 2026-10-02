@@ -1,7 +1,6 @@
 //! The secret scan that runs before anything is stored (ADR 0002).
 //!
-//! "Extraction: significance, validity windows and supersession" (TIM-92,
-//! other decision 1): when a pattern matches, the matched span is redacted in
+//! When a pattern matches, the matched span is redacted in
 //! place with a marker that names the pattern kind, the redacted text is
 //! stored and extracted, and the kinds that fired are recorded on the source.
 //!

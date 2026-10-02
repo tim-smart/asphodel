@@ -1,4 +1,4 @@
-"""The HTTP/JSON client of the daemon (TIM-94, decisions 2 and 10).
+"""The HTTP/JSON client of the daemon.
 
 Standard library only. ``url`` is ``http://host:port`` or ``unix:/path``,
 the two forms the daemon's ``--listen`` takes. A bearer token, when set, goes

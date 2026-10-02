@@ -2,8 +2,8 @@
 //!
 //! Loopback TCP is the default and needs no token. Any other address, with
 //! `0.0.0.0` included, needs a bearer token, and the daemon refuses to start
-//! without one (TIM-94, decision 2). A Unix socket is kept as an option and
-//! is treated like loopback.
+//! without one. A Unix socket is kept as an option and is treated like
+//! loopback.
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};

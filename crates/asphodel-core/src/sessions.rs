@@ -1,12 +1,12 @@
-//! Per-session state for injection ("API surface and Hermes transport",
-//! TIM-94, decision 6). It lives in daemon memory, keyed by bank and Hermes
+//! Per-session state for injection. It lives in daemon memory, keyed by bank
+//! and Hermes
 //! session, so a restart loses it; the worst case is one repeated
 //! injection.
 //!
 //! - **Pending injections.** `prefetch` holds what it injected under its
 //!   `recall_id`, and the turn that echoes that id commits that set to the
 //!   session's in-context set. A turn's sync can arrive after the next
-//!   prefetch (TIM-99), so several can be pending at once, and a turn with
+//!   prefetch, so several can be pending at once, and a turn with
 //!   a missing or unknown id changes nothing: it can't be matched to any of
 //!   them. A set no turn acknowledges never enters the in-context set, which
 //!   covers a prefetch Hermes timed out on; it waits until

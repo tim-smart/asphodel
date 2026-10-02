@@ -1,10 +1,10 @@
 //! The embedded store: one SQLite database under the data dir.
 //!
-//! "Rust storage and search stack" (TIM-89) chose rusqlite in WAL mode,
+//! The store uses rusqlite in WAL mode,
 //! FTS5 for text and sqlite-vec's flat vec0 tables for vectors, all in one
-//! file so records, text index and vectors commit together. "API surface and
-//! Hermes transport" (TIM-94, decision 4) adds the data-dir lock and the
-//! network-filesystem refusal. [`Store::open`] does, in order:
+//! file so records, text index and vectors commit together. The data-dir
+//! lock and network-filesystem refusal protect this store. [`Store::open`]
+//! does, in order:
 //!
 //! 1. check the data dir is a directory, creating it when it is missing;
 //! 2. refuse a network filesystem unless [`OpenOptions::allow_network_fs`];
@@ -17,7 +17,7 @@
 //! the deadline [`Store::next_copy_expiry`] gives.
 //!
 //! Every timestamp written here comes from the [`Clock`] the store was
-//! opened with; no SQL reads SQLite's clock (TIM-90).
+//! opened with; no SQL reads SQLite's clock.
 
 pub mod bank;
 pub mod fs;
@@ -69,8 +69,8 @@ pub struct OpenOptions {
     /// `--allow-network-fs`: run on NFS, SMB/CIFS, CephFS or FUSE anyway.
     pub allow_network_fs: bool,
     /// Mint public ids from their parents and a counter rather than from
-    /// the clock, so a replay gets the same ids on every run (TIM-96,
-    /// decision 4). Only `asphodel replay` sets it.
+    /// the clock, so a replay gets the same ids on every run. Only `asphodel
+    /// replay` sets it.
     pub deterministic_ids: bool,
 }
 
@@ -262,7 +262,7 @@ impl Store {
     /// `name` among the parent's rows. In production it's a fresh UUIDv7
     /// like [`Store::new_id`]; a store opened with deterministic ids derives
     /// it as UUIDv5 of the parent and name, so a replay mints the same
-    /// memory and entity ids on every run (TIM-96, decision 4).
+    /// memory and entity ids on every run.
     pub fn derived_id(&self, parent: Uuid, name: &str) -> Uuid {
         self.ids.derived(parent, name, self.clock.now())
     }
@@ -372,7 +372,7 @@ impl Store {
     }
 
     /// Checkpoints the WAL into the database file, as the daemon does on
-    /// SIGTERM (TIM-94, decision 3).
+    /// SIGTERM.
     pub fn checkpoint(&self) -> Result<(), StoreError> {
         self.connection()
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -434,7 +434,7 @@ pub(crate) fn prepare_dir(dir: &Path) -> Result<(), StoreError> {
 }
 
 /// Registers sqlite-vec with SQLite once, before any connection opens, so
-/// every connection has `vec0` (TIM-89).
+/// every connection has `vec0`.
 pub(crate) fn register_extensions() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -455,7 +455,7 @@ pub(crate) fn register_extensions() {
     });
 }
 
-/// Per-connection settings: WAL with `synchronous=NORMAL` (TIM-89), foreign
+/// Per-connection settings: WAL with `synchronous=NORMAL`, foreign
 /// keys on, and a busy timeout so a checkpoint never fails a request.
 ///
 /// `secure_delete` zeroes deleted content instead of leaving it in free

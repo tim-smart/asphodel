@@ -1,6 +1,5 @@
-"""Shaping a Hermes turn into the daemon's ``Turn`` body: the backfill strip
-(TIM-96 amendment to TIM-94), the ``memory_forget`` scan (ADR 0010) and the
-message time (TIM-88)."""
+"""Shaping a Hermes turn into the daemon's ``Turn`` body: the backfill strip,
+the ``memory_forget`` scan (ADR 0010) and the message time."""
 
 from __future__ import annotations
 

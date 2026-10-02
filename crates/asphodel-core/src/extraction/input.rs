@@ -1,5 +1,4 @@
-//! Assembling call 1's input for a leased chunk (TIM-92, "Inputs" and
-//! "Entity resolution").
+//! Assembling call 1's input for a leased chunk.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,7 +30,7 @@ pub(super) struct Unit {
     pub tz: TimeZone,
     pub ingested_at: Timestamp,
     /// The document's id, for a document chunk: a neighbour from an earlier
-    /// version of the same document isn't mentioned again (TIM-92).
+    /// version of the same document isn't mentioned again.
     pub document_id: Option<String>,
     /// The turn number accesses from this chunk carry: for a turn, the
     /// bank's counter just after it was counted; for a document, the
@@ -39,7 +38,7 @@ pub(super) struct Unit {
     pub turn: i64,
     /// The highest entity rowid when the input was assembled. Rowids are
     /// never reused, so an entity above it was created after call 1's input
-    /// was read (TIM-92: commit reuses only those).
+    /// was read (commit reuses only those).
     pub entity_boundary: i64,
     /// Whether the speaker is the owner. False for a document.
     pub owner_speaking: bool,
@@ -53,7 +52,7 @@ pub(super) struct Unit {
 
 impl Unit {
     /// The entities call 1 was shown, which a proposed new entity never
-    /// overrides (TIM-92).
+    /// overrides.
     pub fn seen(&self) -> BTreeSet<i64> {
         self.candidates.values().copied().collect()
     }
@@ -219,7 +218,7 @@ pub(super) fn assemble(
     }
 
     // An entry is shown only when every memory it cites is: one citing a
-    // memory forgotten since can't be credited (TIM-95, decision 6).
+    // memory forgotten since can't be credited.
     let mut in_context_entries = Vec::new();
     let mut entry_handles = BTreeMap::new();
     if is_turn {
@@ -379,7 +378,7 @@ fn seeded(conn: &Connection, bank_id: i64, which: &str) -> Result<i64, rusqlite:
     )
 }
 
-/// The turn's speaker, resolved as ingest resolved it (TIM-94, decision 1):
+/// The turn's speaker, resolved as ingest resolved it:
 /// no author is the owner, anyone else through `speaker_ids`.
 fn speaker_entity(
     conn: &Connection,
@@ -474,8 +473,7 @@ fn found_entities(
 /// The entities of `bank_id` with an alias that appears whole in any of
 /// `passages`, matched with the alias FTS's own tokenizer, each resolved to
 /// the entity it was merged into and leaving out `exclude`. Retrieval's
-/// entity arm and the recall tool's `entity` parameter use this too
-/// ("Retrieval and ranking", TIM-93, decision 1).
+/// entity arm and the recall tool's `entity` parameter use this too.
 pub(crate) fn entities_named(
     conn: &Connection,
     bank_id: i64,
@@ -586,7 +584,7 @@ fn candidate(
 
 /// The sentences of up to [`CANDIDATE_MEMORIES`] memories linked to the
 /// entity, strongest now first, leaving out hidden and retracted ones.
-/// Strength is the full TIM-91 strength, inherited accesses and window
+/// Strength is the full strength, inherited accesses and window
 /// closes included ([`StrengthLoader`]); ties go to the older memory.
 fn strongest_memories(
     conn: &Connection,

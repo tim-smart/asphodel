@@ -3,7 +3,7 @@
 ## Schema version 2: send each bank's config again
 
 Schema version 2 adds `speaker_ids`, the only mapping a turn's speaker is
-resolved through ("API surface and Hermes transport", TIM-94, decision 1).
+resolved through.
 The migration from version 1 fails closed. It carries over the speakers
 ingest created, whose platform ids version 1 recorded, but **not the owner's
 platform ids**. Version 1 kept those only as aliases of the `user` entity,
@@ -24,7 +24,7 @@ platform ids, before Hermes ingests more turns:
   from its config. Plugin instances that were already running don't call it
   again on their own.
 - Or call `PUT /v1/banks/{bank}` with `owner_platform_ids` yourself, or
-  `asphodel bank config`, once the HTTP API and CLI land (TIM-110).
+  `asphodel bank config`.
 
 The daemon logs a warning when it migrates a store from version 1, as a
 reminder.
@@ -34,8 +34,7 @@ reminder.
 Extraction searches the alias index with its passages in Unicode NFC, so
 aliases have to be stored composed too. Outside Latin script the alias
 index doesn't fold a combining accent away, and an alias stored decomposed
-(a letter followed by a combining accent) would never be found
-("Extraction call 1", the TIM-107 review). From version 3, every alias and
+(a letter followed by a combining accent) would never be found. From version 3, every alias and
 entity name is written in NFC.
 
 The migration composes what earlier versions stored. No action is needed.
@@ -54,7 +53,7 @@ As with every migration, the daemon copies the database before it runs.
 ## Schema version 4: a document's access has its own key
 
 Reconciliation writes an access when a document restates something
-already remembered ("Reconciliation", TIM-108). A document carries the
+already remembered. A document carries the
 turn number of the turn before it, and version 1 allowed one access per
 memory per turn, so a second document ingested with no turn in between
 couldn't record its mention of a memory the first one created. From
@@ -70,8 +69,7 @@ were. No action is needed.
 Extraction credits a turn with `used` accesses on the memories the agent
 could see when it wrote the reply. Before version 5 the worker read the
 session's in-context set when it reached the turn, so a session cleared
-on compaction, a later recall, or a restart in between changed the credit
-(the TIM-110 review). From version 5, ingest stores the set with the turn
+on compaction, a later recall, or a restart in between changed the credit. From version 5, ingest stores the set with the turn
 in `turn_in_context`, and the row goes once the turn is extracted.
 
 The migration only adds the table. Turns already queued when you upgrade
@@ -98,8 +96,8 @@ pause is acknowledged.
 ## Schema version 8: mention passages, and what a forget masked
 
 Version 7 kept a mention's span on its access, but a later version of the
-same document repeating a memory isn't an access (TIM-92), so its passage
-went unrecorded and survived a forget (the TIM-112 review). From version 8,
+same document repeating a memory isn't an access, so its passage
+went unrecorded and survived a forget. From version 8,
 `mention_passages` records every passage that restated a memory without
 becoming one, credited or not, and forget masks them. The migration copies
 the spans version 7 stored, and `accesses.spans` is no longer written.

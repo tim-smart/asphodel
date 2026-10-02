@@ -1,9 +1,8 @@
-//! Re-embedding a bank ("Operations: backup, inspection, correction and
-//! forgetting", TIM-99, decision 10; ADR 0010, "Consequences").
+//! Re-embedding a bank (ADR 0010, "Consequences").
 //!
-//! A bank records the embedding model it was created under (TIM-94,
-//! decision 4), and is served with that model, not the daemon's, until a
-//! re-embed swaps it. So the daemon carries both models during a change
+//! A bank records the embedding model it was created under, and is served
+//! with that model, not the daemon's, until a re-embed swaps it. So the daemon
+//! carries both models during a change
 //! ([`Service::with_previous_embedder`]).
 //!
 //! `asphodel reembed --bank` is a daemon job. It embeds the bank's

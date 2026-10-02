@@ -1,13 +1,13 @@
 //! Loading what the strength model needs about a memory, so every caller
 //! computes the same strength the pure functions in [`crate::strength`]
-//! define ("Strength model: decay, reinforcement and significance", TIM-91).
+//! define.
 //!
 //! A memory's strength takes:
 //!
 //! - its significance: the owner's setting when there is one (kept is
 //!   [`SIGNIFICANCE_KEPT`]), otherwise the level extraction gave;
 //! - its own accesses and those it inherits along `superseded_by`, never
-//!   along `ended_by` (decision 3, [`inherits_from`]);
+//!   along `ended_by` ([`inherits_from`]);
 //! - its window's close, when it has one, with the end known at the
 //!   `observed_at` of the `ended_by` memory or else its own (ADR 0003);
 //! - the bank's clock ([`BankTime`]), from the bank's turns.

@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use super::manifest::ModelSpec;
 
-/// The model dir (TIM-94, decision 4). `ASPHODEL_MODEL_DIR` overrides it,
+/// The model dir. `ASPHODEL_MODEL_DIR` overrides it,
 /// and the default is the XDG cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDir {
@@ -82,7 +82,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Why the models couldn't be found, loaded or run. No variant carries
-/// text that was embedded or reranked (TIM-96, decision 8).
+/// text that was embedded or reranked.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
     #[error("no model dir: set ASPHODEL_MODEL_DIR, XDG_CACHE_HOME or HOME")]

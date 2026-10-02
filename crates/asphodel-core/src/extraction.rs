@@ -7,8 +7,7 @@
 //!    context (up to [`CONTEXT_TURNS`] earlier turns of the session, or the
 //!    text before a document chunk), the reference date and a calendar strip
 //!    in the source's timezone, the speaker, the entity candidates found
-//!    through the alias FTS, and the in-context memories ("Extraction:
-//!    significance, validity windows and supersession", TIM-92).
+//!    through the alias FTS, and the in-context memories.
 //! 2. **Call 1.** One structured-output call ([`call1_request`]) returns the
 //!    claims and the `used` verdicts.
 //! 3. **Checks in code.** A claim whose quote isn't in the chunk is dropped.
@@ -16,18 +15,18 @@
 //!    timezone, fields that don't belong to a kind are dropped, a named
 //!    weekday that doesn't match the date lowers window confidence, an RRULE
 //!    is kept only when it parses and recurs, and remember-this keeps a
-//!    memory only from the owner's own message (TIM-92, TIM-94 decision 1).
+//!    memory only from the owner's own message.
 //! 4. **Reconciliation.** Code finds each claim's nearest stored memories,
 //!    and when one clears the floor or a claim signals a change, call 2
 //!    ([`call2_request`]) labels the claims against them
-//!    ([`reconcile`](self::reconcile), TIM-92, ADR 0005). Call 1's reply is
+//!    ([`reconcile`](self::reconcile), ADR 0005). Call 1's reply is
 //!    saved on the chunk first, so a failed call 2 is retried from it.
 //! 5. **Commit.** One transaction writes the new memories and their
 //!    vectors, entity links, new entities and aliases as logged edits, the
 //!    neighbours ended, retracted or refined and their logged edits, the
 //!    `created`, `mentioned_again`, `confirmed` and `used` accesses, and
-//!    marks the chunk extracted, dropping call 1's saved reply (TIM-90,
-//!    ADR 0001, ADR 0008).
+//!    marks the chunk extracted, dropping call 1's saved reply (ADR 0001,
+//!    ADR 0008).
 //!
 //! A failure anywhere before the commit writes nothing but the queue's
 //! count of the failed attempt and call 1's saved reply, so the chunk is
@@ -86,28 +85,24 @@ pub use call2::call2_request;
 pub(crate) use input::{entities_named, phrase, survivor};
 pub use prompt::call1_request;
 
-/// Call 1's template name and version, which replay's cassette keys include
-/// (TIM-96, decision 4).
+/// Call 1's template name and version, which replay's cassette keys include.
 pub const CALL1_TEMPLATE: &str = "extract_claims";
 pub const CALL1_VERSION: u32 = 2;
 
-/// Call 2's template name and version, which replay's cassette keys include
-/// (TIM-96, decision 4).
+/// Call 2's template name and version, which replay's cassette keys include.
 pub const CALL2_TEMPLATE: &str = "reconcile_claims";
 pub const CALL2_VERSION: u32 = 2;
 
-/// Neighbours kept per claim after fusing vector search and BM25 (TIM-92,
-/// "top 5 per claim, fused"). A flagged claim's entity-linked open tasks and
-/// current states come on top.
+/// The top five neighbours per claim after fusing vector search and BM25.
+/// A flagged claim's entity-linked open tasks and current states come on top.
 pub const NEIGHBOURS_PER_CLAIM: usize = 5;
 
-/// Neighbours shown for the whole chunk, at most (TIM-92, "capped at about
-/// 40 per unit").
+/// Neighbours shown for the whole chunk, capped at 40.
 pub const NEIGHBOUR_CAP: usize = 40;
 
 /// The edit log kinds reconciliation writes, each on the row of the memory
 /// it changed (`edits.memory_id`), with ids and times in `details` and never
-/// content (TIM-90, "every edit logged").
+/// content.
 pub const EDIT_ENDED: &str = "memory_ended";
 pub const EDIT_RETRACTED: &str = "memory_retracted";
 pub const EDIT_REFINED: &str = "memory_refined";
@@ -115,40 +110,35 @@ pub const EDIT_SIGNIFICANCE_RAISED: &str = "significance_raised";
 /// A remember-this on a neighbour sets the owner's significance to kept.
 pub const EDIT_KEPT: &str = "memory_kept";
 /// The memory that ended another was retracted or refined, so the ended
-/// memory's `ended_by` and `valid_until` follow the successor (TIM-92,
-/// "Reopening", as amended by TIM-108).
+/// memory's `ended_by` and `valid_until` follow the successor.
 pub const EDIT_END_REPOINTED: &str = "end_repointed";
 /// The memory that ended another was denied, so the ended memory is open
-/// again: its `valid_until` and `ended_by` are cleared (TIM-92, "Reopening",
-/// as amended by TIM-108).
+/// again: its `valid_until` and `ended_by` are cleared.
 pub const EDIT_END_CLEARED: &str = "end_cleared";
 
-/// Earlier clean turns of the session given as context (TIM-92, "up to 3
-/// previous clean turns").
+/// Up to three earlier clean turns of the session given as context.
 pub const CONTEXT_TURNS: usize = 3;
 
 /// The context turns' total size in characters. Over it, they're clipped
 /// oldest first: characters come off the start of the oldest turn, and a turn
-/// clipped to nothing is left out (TIM-92).
+/// clipped to nothing is left out.
 pub const CONTEXT_CHARS: usize = 6_000;
 
-/// How much of the document before a chunk it gets as context, in characters
-/// (TIM-92, "the last few hundred characters of the previous chunk"). It's
-/// taken from the source text, so a chunk skipped as seen in an earlier
+/// How much of the document before a chunk it gets as context, in characters.
+/// It includes the last few hundred characters before the chunk, taken from
+/// the source text, so a chunk skipped as seen in an earlier
 /// version of the document still provides it.
 pub const PREVIOUS_CHUNK_CHARS: usize = 400;
 
-/// Entity candidates found by alias search, at most (TIM-92, "capped at about
-/// 30 per unit, ranked by how many memories link to them"). `user`,
-/// `assistant` and the speaker come on top, since search never has to find
-/// them.
+/// Up to 30 entity candidates found by alias search, ranked by how many
+/// memories link to them. `user`, `assistant` and the speaker come on top,
+/// since search never has to find them.
 pub const ENTITY_CANDIDATE_CAP: usize = 30;
 
 /// Linked memory sentences shown with a candidate, strongest first.
 pub const CANDIDATE_MEMORIES: usize = 3;
 
-/// The calendar strip: the reference date and this many days either side
-/// (TIM-92, "three weeks either side").
+/// The calendar strip: the reference date and three weeks either side.
 pub const CALENDAR_DAYS: i64 = 21;
 
 /// Everything call 1 is given for one chunk. Handles are short ids local to
@@ -173,14 +163,14 @@ pub struct Call1Input {
     /// The local date relative times resolve against: the message time's
     /// date in the source's timezone, or a document's reference date. `None`
     /// for a document whose reference date isn't exact, whose relative dates
-    /// aren't resolved (TIM-92).
+    /// aren't resolved.
     pub reference_date: Option<Date>,
     /// The reference date and [`CALENDAR_DAYS`] either side, in order. The
     /// prompt renders each as `YYYY-MM-DD Weekday`. Empty when
     /// `reference_date` is `None`.
     pub calendar: Vec<Date>,
     /// Whose words the user message is; `None` for a document. "I" and "me"
-    /// resolve to them (TIM-94, decision 1).
+    /// resolve to them.
     pub speaker: Option<SpeakerRef>,
     /// Context only, oldest first: never quoted from, never extracted from on
     /// its own.
@@ -193,7 +183,7 @@ pub struct Call1Input {
     pub in_context: Vec<InContextMemory>,
     /// The mental model entries of the block the turn's session held, each
     /// with the in-context memories it cites. A reply that relied on one is
-    /// `used` on every memory it cites (TIM-95, decision 4). Always empty
+    /// `used` on every memory it cites. Always empty
     /// for a document.
     pub entries: Vec<InContextEntry>,
 }
@@ -271,11 +261,10 @@ pub struct InContextEntry {
     pub cites: Vec<String>,
 }
 
-/// What a claim does to a neighbour (TIM-92, CONTEXT.md "Reconciliation").
+/// What a claim does to a neighbour (CONTEXT.md "Reconciliation").
 /// `Retracts` is a corrected version of the neighbour, such as a reschedule;
 /// `Denies` says the neighbour didn't happen or isn't true. Both retract it,
-/// and differ only in what happens to anything it had ended (the TIM-92
-/// amendment from TIM-108).
+/// and differ only in what happens to anything it had ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Label {
@@ -343,7 +332,7 @@ pub struct ReconcileClaim {
 
 /// A stored memory shown to call 2. Faded and ended memories are shown,
 /// retracted ones aren't, and a hit on a superseded memory shows the head of
-/// its chain instead (TIM-92).
+/// its chain instead.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NeighbourMemory {
     pub handle: String,
@@ -380,13 +369,12 @@ pub struct Dropped {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
     /// The quote is empty or isn't in the chunk's text. A passage that's
-    /// only in the context doesn't count (TIM-92).
+    /// only in the context doesn't count.
     QuoteNotFound,
     /// The content is empty after trimming.
     EmptyContent,
     /// A task quoted from the assistant's reply with neither a due date nor
-    /// an until-event (TIM-92: the assistant's task has "a due date or an
-    /// until-event beyond the current turn").
+    /// an until-event (beyond the current turn).
     AssistantTaskUndated,
 }
 
@@ -550,7 +538,7 @@ pub(crate) fn call2_input(
 ///
 /// Production runs the two halves back to back. Replay runs the first
 /// when the worker claims the chunk, so the LLM calls are measured, and
-/// the second a latency later (TIM-96, decision 3).
+/// the second a latency later.
 pub struct Prepared {
     lease: Lease,
     input: Call1Input,
@@ -570,7 +558,7 @@ impl Prepared {
 }
 
 /// A claim and the neighbours call 2 was shown for it, for replay's
-/// labelling material (TIM-96, decision 6).
+/// labelling material.
 /// Flagged claims bypass the vector floor, and BM25 neighbours are not
 /// filtered by it, so these lists may include below-floor candidates.
 /// Thresholding their scores does not predict what another reconcile
@@ -652,7 +640,7 @@ pub(crate) fn prepare(
     };
 
     // A saved reply means call 2 failed last time: resume from it, with the
-    // handles call 1 was given, rather than pay for call 1 again (TIM-92).
+    // handles call 1 was given, rather than pay for call 1 again.
     let saved = saved.and_then(|saved| restore(&saved, &mut unit));
     let resumed = saved.is_some();
     let reply = match saved {
@@ -754,7 +742,7 @@ pub(crate) fn prepare(
 ///
 /// The check, the replanning and the writes share one hold on the store
 /// and one transaction, so a sweep or an erase on another thread can't
-/// delete a neighbour between the check and the writes (TIM-117 review).
+/// delete a neighbour between the check and the writes.
 pub(crate) fn commit_prepared(
     store: &Store,
     leases: &Leases,

@@ -1,11 +1,10 @@
-//! The JSON report (TIM-96, decision 7; `docs/replay.md`). A plain serde
-//! value with keys in struct order and nothing from the wall clock, so two
-//! runs of the same scenario compare byte for byte.
+//! The JSON report (`docs/replay.md`). A plain serde value with keys in struct
+//! order and nothing from the wall clock, so two runs of the same scenario
+//! compare byte for byte.
 //!
-//! [`Aggregate`] is the one thing that leaves the private directory
-//! (TIM-96, decision 8; TIM-117's done-when): its only string values are
-//! probe ids. Everything else is a number, a boolean or null, and the
-//! hashes travel as byte arrays.
+//! [`Aggregate`] is the one thing that leaves the private directory: its only
+//! string values are probe ids. Everything else is a number, a boolean or null,
+//! and the hashes travel as byte arrays.
 
 use std::collections::BTreeMap;
 
@@ -112,9 +111,8 @@ pub struct WeekBands {
     pub faded: u64,
 }
 
-/// The shadow table's verdict (TIM-97, decision 7): purged rows, memories
-/// created after a purge whose nearest shadow row is at or above the
-/// reconcile floor, and the ratio.
+/// The shadow table's verdict: purged rows, memories created after a purge
+/// whose nearest shadow row is at or above the reconcile floor, and the ratio.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReMentioned {
     pub purged: u64,
@@ -161,8 +159,8 @@ pub fn percentile(values: &[u64], p: f64) -> u64 {
     values[index.min(values.len() - 1)]
 }
 
-/// Injected tokens (TIM-93, TIM-96 decision 7): per turn session, per
-/// turn, and cron prefetches apart so they don't skew the percentiles.
+/// Injected tokens: per turn session, per turn, and cron prefetches apart so
+/// they don't skew the percentiles.
 #[derive(Debug, Default, Serialize)]
 pub struct InjectedTokens {
     /// Every session with at least one synced turn, in session id order.
@@ -219,8 +217,8 @@ pub struct LlmCounts {
     pub latency_ms: Percentiles,
 }
 
-/// Where each `used` verdict came from (TIM-96, decision 4): the recording,
-/// a top-up call, the live call that judged the whole chunk, or nowhere.
+/// Where each `used` verdict came from: the recording, a top-up call, the live
+/// call that judged the whole chunk, or nowhere.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct UsedVerdicts {
     pub recorded: u64,
@@ -231,9 +229,9 @@ pub struct UsedVerdicts {
 
 // The aggregate export.
 
-/// What may leave the private directory: probe ids and numbers (TIM-96,
-/// decision 8; TIM-117). No field is a string but a probe's id; dates are
-/// days since the epoch and weeks are two integers; hashes are byte arrays.
+/// What may leave the private directory: probe ids and numbers. No field is a
+/// string but a probe's id; dates are days since the epoch and weeks are two
+/// integers; hashes are byte arrays.
 #[derive(Debug, Serialize)]
 pub struct Aggregate {
     pub mode: Mode,

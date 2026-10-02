@@ -26,9 +26,8 @@ kind and the HTTP status, never the response.
 **Panic messages carry ids only.** A panic that names a memory, entity or
 source names it by id. `expect` and `assert!` messages follow the same rule.
 
-The rule is decided in ADR 0010, "Operations are daemon jobs and HTTP clients",
-and comes from the privacy requirement in "Replay harness: simulated-clock
-replay of recorded sessions" (TIM-96): everything derived from Tim's history
+The rule is documented in ADR 0010, "Operations are daemon jobs and HTTP clients".
+Everything derived from Tim's history
 stays in one private directory, and a log line that quotes a sentence would
 leak it.
 

@@ -3,9 +3,7 @@
 `asphodel replay` runs the service layer in-process as a discrete-event
 simulation on a simulated clock, so decay can be watched over years in
 seconds. This page is the contract for the scripted side of it: the scenario
-file, the command, the report and the probes. It comes from "Replay harness:
-simulated-clock replay of recorded sessions" (TIM-96) and its amendments
-from TIM-97, TIM-98 and TIM-116, and from ADRs 0004 and 0008. Real-history
+file, the command, the report and the probes. See also ADRs 0004 and 0008. Real-history
 replay (the `state.db` importer, cassettes, `fast` mode, `bench`, the
 A/B diff, the HTML page, and the labelling material and precision curve)
 builds on the same engine and is under "Real history" below.
@@ -202,7 +200,7 @@ Reconciliation has no replay-only branch.
 | `reconcile` | The claim's outcomes against existing memories, below. |
 
 Entity links aren't scripted in the first set; every claim links no
-entities. That's open, with the deterministic entity ids of TIM-96.
+entities. Scripted entity links remain open; entity ids are deterministic.
 
 #### Reconcile outcomes
 
@@ -247,8 +245,7 @@ claim label. The prefetch and recall probes run on sessions named
 | `injects`, `not_injects` | `memory`, `query` | A prefetch for `query` on a session no turn uses injects, or doesn't inject, the memory. Group `models` only. |
 | `profile_has`, `profile_lacks` | `model`, `memory` | The mental model has, or lacks, an entry citing the memory. Not in the first set: scripted refresh replies are open. |
 
-`agenda_lacks` and `recall_lacks` aren't in TIM-96's list. They're the
-negatives of `agenda_has` and `recall_finds`, the way `not_injects`
+`agenda_lacks` and `recall_lacks` are the negatives of `agenda_has` and `recall_finds`, the way `not_injects`
 negates `injects`, and the rescheduled appointment and Maya to Mia need
 them. Exact strength values are unit tests on the pure function, not
 probes.
@@ -298,10 +295,10 @@ A probe naming a label no claim defines is refused before the run.
 - **Wall-clock timeouts.** The reranker deadline is off, so the reranker is
   never skipped. The in-context idle timeout and the mapping expiry run on
   the simulated clock.
-- **Ids are deterministic** (TIM-96, decision 4). A memory id is UUIDv5
+- **Ids are deterministic**. A memory id is UUIDv5
   of its source's id and its claim ordinal, written `<chunk
   position>:<index in call 1's reply>` so a document's chunks can't
-  collide. Under the TIM-116 amendment, an entity id is UUIDv5 of (creating
+  collide. An entity id is UUIDv5 of (creating
   source id, `entity:<chunk position>:<name>`), where the proposed name is
   composed to NFC, trimmed and lowercased: the exact key
   `resolve_proposals` dedups on within a commit. ID generation uses that
@@ -356,7 +353,7 @@ history. `observed` holds what the probe saw, in a shape per probe kind:
 `faded_at` gives the instant or null; `band` the band and strength;
 `exists` and `absent` the memory's id and the fields `exists` can check;
 the agenda probes the ids listed; the recall and inject probes the ids
-returned. The other TIM-96 report fields (injected and profile tokens,
+returned. The other report fields (injected and profile tokens,
 refresh calls per day, the call-2 rate, agenda lines per day, the
 histograms, probe results) sit beside these and aren't pinned by the
 scripted tests. The report is a plain serde value with keys in struct
@@ -366,7 +363,7 @@ order, so two runs compare byte for byte.
 
 | Scenario | What it checks |
 |---|---|
-| `lifetimes` | TIM-91's lifetimes table: one mention at each level fades at 15 days, 2 months, 9 months, 3 years and 12 years of bank time, within 5%. |
+| `lifetimes` | The lifetimes table: one mention at each level fades at 15 days, 2 months, 9 months, 3 years and 12 years of bank time, within 5%. |
 | `purge-table` | ADR 0008: one trivial, minor or notable mention is purged at 9 months, 3 years and 12.5 years; trivial mentioned on 4 occasions, minor on 3, notable on 2 and anything major never is; a claim stated again after its memory was purged comes back as a new memory and the shadow table counts it. |
 | `maya-to-mia` | Correcting Maya to Mia retracts Maya, makes Mia the head, hides Maya from recall, and Mia inherits Maya's accesses: she's still in recall 100 days on, where a fresh minor memory would have faded, and fades at the day the inherited log gives. |
 | `rescheduled-appointment` | A reschedule retracts the old slot, the agenda lists the new one and not the old, and the appointment is recently past once it has happened. |
@@ -379,8 +376,7 @@ purges for the nightly sweep.
 
 ## Real history
 
-Tim's whole Hermes history replays privately (TIM-96, decisions 1, 3, 4, 6,
-7 and 8; TIM-117). Everything derived from it lives under
+Tim's whole Hermes history replays privately. Everything derived from it lives under
 `ASPHODEL_REPLAY_DIR` and is refused anywhere else: the `state.db` copy, the
 manifest, the corpus, the cassettes, the replayed store with its recall
 log, the probes file, the reports and their pages, and the labelling
@@ -422,8 +418,7 @@ against the versions it was written against (31, hermes-agent
 column, a column declared with another type, or another version.
 
 It reads only rows with `active = 1 OR compacted = 1`, the predicate
-Hermes uses for search, in `timestamp` order, not row id (Tim's decision
-on TIM-117). Then, per primary session in `started_at` order:
+Hermes uses for search, in `timestamp` order, not row id. Then, per primary session in `started_at` order:
 
 - a turn is a `user` row and the final `assistant` row before the next
   `user` row; assistant rows that only call tools, and `tool` rows, are
@@ -474,7 +469,7 @@ asphodel replay --corpus <file> --mode live|replay|fast \
     [--onnx-threads N] [--token-dir DIR]
 ```
 
-- **Modes** (TIM-96, decision 4). Every LLM call is keyed by SHA-256 of
+- **Modes**. Every LLM call is keyed by SHA-256 of
   the model id, the template name and version, and the whole request.
   `live` answers from the cassette and calls and records on a miss;
   `--no-cache` empties the cassette when the run opens it and records
@@ -494,8 +489,8 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   each stood for, and a substituted reply is carried over by identity: a
   handle goes to the memory it meant, then to that memory's handle now.
   An operation whose entry or any cited memory isn't in this run's input
-  is dropped whole, which is the citation check TIM-96 asks for, by
-  identity rather than by name. A refresh recorded before identities were
+  is dropped whole. Citations are checked by identity rather than by name.
+  A refresh recorded before identities were
   kept carries nothing over. Triggers are counted
   by code in every mode. The mental models to refresh are the manifest's
   `[[model]]` tables, carried in the corpus header.
@@ -507,7 +502,7 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   the simulated time, and for extraction calls the chunk and the handles
   with a hash of each sentence. The report embeds its SHA-256 as it stood
   when the run started.
-- **Latency** (TIM-96, decision 3). `--latency` sets every chunk's.
+- **Latency**. `--latency` sets every chunk's.
   Without it, a chunk's calls run when the worker claims it, and it
   completes after the latency of the responses that answered them: the
   recorded latency of each record served, and the measured round trip of
@@ -541,8 +536,7 @@ whether it was purged), and `llm` with `cache`, `top_up`, `live`, `misses`,
 `used_verdicts` by source and `latency_ms`. A `live` run and the `replay`
 of its cassette differ only in `kind`, `flags`, `llm` and `cassette_hash`.
 
-`--aggregate <file>` writes the one thing that may leave the private dir
-(TIM-117). Its type has no string field but a probe's id: the run's kind
+`--aggregate <file>` writes the one thing that may leave the private dir. Its type has no string field but a probe's id: the run's kind
 is a set of booleans, days are days since the epoch, weeks are two
 integers, and the hashes and the git SHA are byte arrays. It carries the
 probe results, the purge, fade and band series, the token, lag and call
@@ -560,7 +554,7 @@ id.
 asphodel report html <report> [--out <file>]
 ```
 
-writes one static page from a JSON report (TIM-96, decision 7): its
+writes one static page from a JSON report: its
 identity (kind, corpus and cassette hashes, git SHA), the probe results,
 and every number the report holds, from injected tokens to the histograms
 and where the LLM replies came from. Styles and any charts are inline, and
@@ -572,9 +566,8 @@ dir, and neither may be a symlink.
 
 ### Labelling and the precision curve
 
-The two calibrated floors, the reranker gate floor (TIM-93) and the
-reconcile similarity floor (TIM-92), are set from Tim's labels, not by eye
-(TIM-96, decision 6). `asphodel replay --corpus ... --labelling <file>`
+The two calibrated floors, the reranker gate floor and the
+reconcile similarity floor, are set from Tim's labels, not by eye. `asphodel replay --corpus ... --labelling <file>`
 writes the material to label, inside the private dir. Writing it changes
 nothing the run simulates, and the same run writes the same bytes.
 

@@ -1,5 +1,5 @@
 //! The three retrievers, each a ranked list of memory rowids within one
-//! bank, best first (TIM-93, decision 1). They find; cleaning up the hits is
+//! bank, best first. They find; cleaning up the hits is
 //! [`super::candidates`].
 
 use std::collections::BTreeSet;

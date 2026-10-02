@@ -1,5 +1,4 @@
-//! The ChatGPT/Codex subscription mode of the LLM client (TIM-105 scope
-//! addition, comment `01a0f6c8`).
+//! The ChatGPT/Codex subscription mode of the LLM client.
 //!
 //! A subscription authenticates with ChatGPT OAuth tokens and talks to the
 //! Codex backend's Responses API, streamed. The protocol was read from

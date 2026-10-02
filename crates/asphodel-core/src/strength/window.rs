@@ -1,5 +1,5 @@
 //! Validity windows, time precision and phase, on world time in the source's
-//! timezone ("What is a memory record?", TIM-90).
+//! timezone.
 
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Span, Timestamp, ToSpan};

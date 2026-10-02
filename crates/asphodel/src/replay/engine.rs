@@ -1,5 +1,4 @@
-//! The discrete-event simulation (TIM-96, decision 3; `docs/replay.md`,
-//! "The simulation").
+//! The discrete-event simulation (`docs/replay.md`, "The simulation").
 //!
 //! One queue holds prefetches, syncs, extraction completions, the
 //! housekeeping timer (sweeps and refreshes) and probes, ordered by
@@ -21,16 +20,15 @@
 //! ingest time, as in production. The run ends at the latest of the last
 //! event, `--until` and the last completion.
 //!
-//! The LLM is answered one of two ways. For a scenario, from its claims:
-//! call 1's reply is built from them, and call 2's from their outcomes
-//! against the neighbours the real reconciliation found, so nothing in
-//! reconciliation is replay-only. Where the scenario says something
-//! production wouldn't do (an outcome against a memory call 2 isn't shown,
-//! a `used` memory that isn't in context, a label on a claim its outcomes
-//! absorb), the run stops with a scenario error rather than guessing. For
-//! real history, through the cassette [`Recorder`] (TIM-96, decision 4),
-//! with `fast` mode's call 1 composed from the recording and the rest
-//! answered by request.
+//! The LLM is answered one of two ways. For a scenario, from its claims: call
+//! 1's reply is built from them, and call 2's from their outcomes against the
+//! neighbours the real reconciliation found, so nothing in reconciliation is
+//! replay-only. Where the scenario says something production wouldn't do (an
+//! outcome against a memory call 2 isn't shown, a `used` memory that isn't in
+//! context, a label on a claim its outcomes absorb), the run stops with a
+//! scenario error rather than guessing. For real history, through the cassette
+//! [`Recorder`], with `fast` mode's call 1 composed from the recording and the
+//! rest answered by request.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -111,12 +109,11 @@ pub struct Settings {
     /// The simulated extraction latency, when it isn't taken from the
     /// cassette.
     pub latency: SignedDuration,
-    /// Take each chunk's latency from how long the calls that answered it
-    /// took (TIM-96, decision 3): recorded for a record, measured for a
-    /// live call. Otherwise `latency`.
+    /// Take each chunk's latency from how long the calls that answered it took:
+    /// recorded for a record, measured for a live call. Otherwise `latency`.
     pub latency_from_cassette: bool,
     pub until: Option<Timestamp>,
-    /// Collect the labelling material (TIM-96, decision 6).
+    /// Collect the labelling material.
     pub labelling: bool,
 }
 
@@ -668,10 +665,9 @@ impl<'a> Engine<'a> {
     }
 
     /// Prepares one claimed chunk: its call 1 and call 2 run now, with the
-    /// scripted replies or through the cassette, and the latency it
-    /// completes after is the settings' constant, or, when it's taken from
-    /// the recording, how long the calls that answered took (TIM-96,
-    /// decision 3).
+    /// scripted replies or through the cassette, and the latency it completes
+    /// after is the settings' constant, or, when it's taken from the recording,
+    /// how long the calls that answered took.
     fn prepare_chunk(&mut self, claimed: Claimed) -> Result<Ready, Failure> {
         let Claimed {
             lease,
@@ -796,9 +792,9 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Prepares a chunk through the cassette (TIM-96, decision 4), with
-    /// how long the calls that answered took. In `fast` mode call 1 is
-    /// composed from the recording when the chunk has one.
+    /// Prepares a chunk through the cassette, with how long the calls that
+    /// answered took. In `fast` mode call 1 is composed from the recording when
+    /// the chunk has one.
     fn prepare_recorded(
         &mut self,
         recorder: &Recorder,

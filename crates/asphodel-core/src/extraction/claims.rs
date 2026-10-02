@@ -1,4 +1,4 @@
-//! Call 1's reply, parsed and checked in code (TIM-92).
+//! Call 1's reply, parsed and checked in code.
 //!
 //! The reply must fit the schema: anything else, such as a significance
 //! above `critical`, is an invalid reply and the chunk is retried. Within a
@@ -133,7 +133,7 @@ impl Precision {
 }
 
 /// A stored time: the instant at the start of its unit in the source's
-/// timezone, and its precision (TIM-90).
+/// timezone, and its precision.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Stamp {
     pub at: Timestamp,
@@ -162,7 +162,7 @@ pub(super) struct NewMemory {
     /// The claim's index in call 1's reply.
     pub claim: usize,
     /// `changes_something` or `remember_this`, from anyone: the claim gets
-    /// reconciliation's wider candidate set and always runs call 2 (TIM-92).
+    /// reconciliation's wider candidate set and always runs call 2.
     pub flagged: bool,
     pub content: String,
     pub kind: Kind,
@@ -218,8 +218,8 @@ pub(super) fn check(
     let mut seen = BTreeSet::new();
     for handle in &reply.used_injected_ids {
         let handle = handle.trim();
-        // An entry the reply relied on is used on every memory it cites
-        // (TIM-95, decision 4), once each however it's named.
+        // An entry the reply relied on is used on every memory it cites, once
+        // each however it's named.
         let memories = match unit.in_context.get(handle) {
             Some(memory) => std::slice::from_ref(memory),
             None => unit.entries.get(handle).map_or(&[][..], Vec::as_slice),
@@ -279,7 +279,7 @@ fn check_claim(
     let mut recurrence_text = non_empty(claim.recurrence_text);
     let mut recurrence_rrule = non_empty(claim.recurrence_rrule);
 
-    // Each kind keeps only its own fields (TIM-90, TIM-92).
+    // Each kind keeps only its own fields.
     if claim.kind != Kind::State {
         volatility = None;
     }
@@ -307,7 +307,7 @@ fn check_claim(
     }
 
     if claim.kind == Kind::Recurring {
-        // TIM-92: the RRULE is kept only when it parses and recurs in the
+        // The RRULE is kept only when it parses and recurs in the
         // year after the reference date, from a first occurrence.
         let recurs = match (&recurrence_rrule, recurrence_start) {
             (Some(rule), Some(start)) => {
@@ -329,7 +329,7 @@ fn check_claim(
     }
 
     if claim.kind == Kind::Event && valid_from.is_none() {
-        // TIM-92: an event with no stated time starts on the day it was said,
+        // An event with no stated time starts on the day it was said,
         // with low confidence.
         valid_from = start_of_day(input.observed_at, tz).map(|at| Stamp {
             at,
@@ -338,7 +338,7 @@ fn check_claim(
         low = true;
     }
 
-    // TIM-92 other decision 3 and TIM-94 decision 1: only the owner's own
+    // Only the owner's own
     // message keeps a memory. Anyone else, a document or the reply keeps the
     // level call 1 gave, which is at most critical. A quote that's also in
     // the reply, or runs into it, can't be shown to be the owner's, so it
@@ -510,8 +510,8 @@ const WEEKDAYS: [(&str, Weekday); 7] = [
 ];
 
 /// Whether the quote names a weekday that none of the claim's dates at day
-/// precision or finer falls on (TIM-92: a mismatch lowers window confidence
-/// rather than dropping the window). Every named weekday must match a date,
+/// precision or finer falls on (a mismatch lowers window confidence rather
+/// than dropping the window). Every named weekday must match a date,
 /// so one that matches can't hide another that doesn't.
 fn weekday_mismatch(quote: &str, dates: &[Option<Stamp>], tz: &TimeZone) -> bool {
     let quote = quote.to_lowercase();

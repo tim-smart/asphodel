@@ -1,5 +1,5 @@
-//! Supersession chains: which accesses a memory inherits (TIM-91, decision
-//! 3) and what a purge or forget takes (ADR 0008).
+//! Supersession chains: which accesses a memory inherits and what a purge or
+//! forget takes (ADR 0008).
 //!
 //! A chain is every memory connected along `superseded_by`. It's a tree,
 //! because two memories can be refined into one, and its head is the one

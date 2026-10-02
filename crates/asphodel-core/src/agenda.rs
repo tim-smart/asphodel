@@ -1,5 +1,4 @@
-//! The agenda ("Retrieval and ranking", TIM-93, decision 7, as amended by
-//! "Mental models", TIM-95, decision 1 and its amendment).
+//! The agenda.
 //!
 //! Three groups, built by query with no LLM, and judged by bank-local date
 //! so the clock alone changes them only at midnight:
@@ -20,7 +19,8 @@
 //!
 //! Only current heads count: nothing retracted, forgotten, refined into a
 //! newer version, or ended ([`has_ended`]: a stated end holds through its
-//! unit, and an ending still ahead hasn't ended anything). Building it never writes an access, and its
+//! unit, and an ending still ahead hasn't ended anything). Building it never
+//! writes an access, and its
 //! items count as in context once a session's block lists them.
 
 use chrono::TimeZone as _;
@@ -330,7 +330,7 @@ fn period_within_a_week(rule: &str) -> Option<bool> {
 }
 
 /// The first occurrence of a recurring memory at or after `from`, in its
-/// source's timezone, as extraction checked it (TIM-92).
+/// source's timezone, as extraction checked it.
 fn next_occurrence(row: &Row, from: Timestamp) -> Option<Timestamp> {
     let rule = row.rrule.as_deref()?.trim();
     let rule = rule.strip_prefix("RRULE:").unwrap_or(rule);

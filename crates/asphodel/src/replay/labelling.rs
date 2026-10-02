@@ -1,17 +1,16 @@
-//! The labelling material and the precision curve (TIM-96, decision 6;
-//! `docs/replay.md`, "Labelling and the precision curve").
+//! The labelling material and the precision curve (`docs/replay.md`, "Labelling
+//! and the precision curve").
 //!
-//! The reranker gate floor (TIM-93) and the reconcile similarity floor
-//! (TIM-92) are set from Tim's labels. `asphodel replay --labelling FILE`
-//! writes the material to label: recall candidates at [`SAMPLED_TURNS`]
-//! turns, scored with the reranker logit the gate compares and including
-//! those it turned away, and every candidate list call 2 was shown, scored
-//! with cosine similarity. Call 2's lists hold only what call 2 was shown.
-//! Flagged claims bypass the vector floor, and BM25 neighbours are not
-//! filtered by it, so candidates can score below the reconcile floor.
-//! The call-2 curve is precision by score threshold over observed
-//! candidates, not a prediction of what a raised or lowered reconcile
-//! floor would retain.
+//! The reranker gate floor and the reconcile similarity floor are set from
+//! Tim's labels. `asphodel replay --labelling FILE` writes the material to
+//! label: recall candidates at [`SAMPLED_TURNS`] turns, scored with the
+//! reranker logit the gate compares and including those it turned away, and
+//! every candidate list call 2 was shown, scored with cosine similarity. Call
+//! 2's lists hold only what call 2 was shown. Flagged claims bypass the vector
+//! floor, and BM25 neighbours are not filtered by it, so candidates can score
+//! below the reconcile floor. The call-2 curve is precision by score threshold
+//! over observed candidates, not a prediction of what a raised or lowered
+//! reconcile floor would retain.
 //!
 //! `asphodel report precision --labels L --material M` reads a TOML table
 //! of candidate id to relevance and prints the curve: at each labelled

@@ -2,9 +2,9 @@
 //! subcommand but `serve`, `models fetch`, `llm login` and `replay` goes
 //! through it, so nothing but the daemon opens the database.
 //!
-//! `--url` takes `http://host:port` or `unix:/path`, the two forms
-//! `--listen` takes. There's no TLS: the daemon serves plain HTTP, on
-//! loopback or behind `kubectl port-forward` (TIM-94, decision 10).
+//! `--url` takes `http://host:port` or `unix:/path`, the two forms `--listen`
+//! takes. There's no TLS: the daemon serves plain HTTP, on loopback or behind
+//! `kubectl port-forward`.
 
 use std::path::PathBuf;
 use std::time::Duration;

@@ -1,5 +1,5 @@
-//! Public ids: UUIDv7, timed by the store's clock (TIM-90), or derived
-//! UUIDv5s for a replay (TIM-96, decision 4).
+//! Public ids: UUIDv7, timed by the store's clock, or derived
+//! UUIDv5s for a replay.
 //!
 //! `uuid::Uuid::now_v7` reads the system clock, which ADR 0004 forbids, so
 //! timed ids are built from a [`Timestamp`] the caller took from the

@@ -1,5 +1,4 @@
-//! Mental models (ADR 0007; "Mental models: synthesized documents over
-//! memories", TIM-95, as amended by "refreshes follow conversations").
+//! Mental models (ADR 0007).
 //!
 //! A model answers a standing question, such as "who is the user?", with
 //! entries: one sentence each, citing the memories it rests on. Only the
@@ -14,7 +13,7 @@
 //! per bank, at most every [`MIN_REFRESH_INTERVAL`] per model, and once a
 //! day besides at `mental_models.sweep_time` bank-local ([`schedule`]). It
 //! never runs inside a request. Nothing here ever writes an access, embeds
-//! an entry or ingests one (decision 10).
+//! an entry or ingests one.
 
 mod refresh;
 pub(crate) mod schedule;
@@ -36,16 +35,16 @@ pub(crate) use refresh::{refresh, refresh_input};
 pub(crate) use schedule::Schedule;
 
 /// The refresh call's template name and version, which replay's cassette
-/// keys include (TIM-96, decision 4).
+/// keys include.
 pub const REFRESH_TEMPLATE: &str = "refresh_model";
 pub const REFRESH_VERSION: u32 = 1;
 
 /// The least time between two refreshes of one model, and the wait before
-/// a failed refresh is tried again (TIM-95 amendment, decision 1). Fixed
+/// a failed refresh is tried again. Fixed
 /// in code until the replay harness says otherwise.
 pub const MIN_REFRESH_INTERVAL: SignedDuration = SignedDuration::from_mins(30);
 
-/// What `model create` takes (TIM-95, decision 2).
+/// What `model create` takes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub name: String,
@@ -113,8 +112,7 @@ pub struct Model {
     pub max_tokens: u32,
     pub enabled: bool,
     /// In position order, as stored. An entry citing an ended or retracted
-    /// memory stays stored until the next refresh; only rendering drops it
-    /// (TIM-95, decision 6).
+    /// memory stays stored until the next refresh; only rendering drops it.
     pub entries: Vec<Entry>,
     pub last_refreshed_at: Option<Timestamp>,
     pub last_error: Option<FailureKind>,
@@ -122,7 +120,7 @@ pub struct Model {
 }
 
 /// One sentence citing the memories it rests on. Code assigns `id`, and it
-/// survives edits (TIM-95, decision 5).
+/// survives edits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
     pub id: Uuid,
@@ -138,13 +136,13 @@ pub struct Entry {
 pub struct RefreshInput {
     pub question: String,
     pub max_tokens: u32,
-    /// The selection (TIM-95, decision 3).
+    /// The selection.
     pub memories: Vec<InputMemory>,
     /// The entries whose citations are all in the selection. The others
     /// are dropped by the refresh before the call.
     pub entries: Vec<InputEntry>,
     /// The hash of the selection, the question, the filters and
-    /// `max_tokens` (TIM-95, decision 7).
+    /// `max_tokens`.
     pub fingerprint: String,
 }
 
@@ -265,8 +263,7 @@ pub enum ModelError {
     UnknownModel,
     #[error("a model with that name exists")]
     DuplicateName,
-    /// The enabled models' `max_tokens` would sum to `requested`
-    /// (TIM-95, decision 8).
+    /// The enabled models' `max_tokens` would sum to `requested`.
     #[error("{requested} tokens is over the {budget}-token budget for mental models")]
     OverBudget { requested: u32, budget: u32 },
     #[error("no entity matches")]
@@ -600,7 +597,7 @@ pub(crate) fn create(
 pub(crate) struct Edited {
     pub row: ModelRow,
     /// The question, filters or `max_tokens` changed, or the model was
-    /// enabled: a triggering write (TIM-95 amendment, decision 1).
+    /// enabled: a triggering write.
     pub triggers: bool,
 }
 
@@ -736,8 +733,7 @@ fn agenda_kind(kind: Kind) -> bool {
 
 /// The effects of everything written to `bank_id` since the edit log's
 /// `watermark`, plus `created`, the memories extraction just wrote. The
-/// check is code only, with no LLM call and no retrieval (TIM-95
-/// amendment, decision 1):
+/// check is code only, with no LLM call and no retrieval:
 ///
 /// - a new memory, or one whose significance went up, at `trigger_level`
 ///   or above that passes a model's filters triggers that model;

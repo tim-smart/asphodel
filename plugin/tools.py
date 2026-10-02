@@ -1,4 +1,4 @@
-"""The four model tools (TIM-94, decision 9) and the owner check (decision 1).
+"""The four model tools and the owner check.
 
 ``memory_recall`` is open to every speaker. ``memory_forget``, ``memory_keep``
 and ``memory_unkeep`` are owner-only: on a non-owner's turn, a bot's turn or

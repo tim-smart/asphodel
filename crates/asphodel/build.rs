@@ -1,5 +1,5 @@
 //! Records the git SHA the binary was built from, so every replay report can
-//! embed it (TIM-96, decision 6). `ASPHODEL_GIT_SHA` in the build
+//! embed it. `ASPHODEL_GIT_SHA` in the build
 //! environment wins, so a build outside a checkout can still say what it is;
 //! otherwise `git rev-parse HEAD` in the crate's checkout. Without either the
 //! report's `git_sha` is null.

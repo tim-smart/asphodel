@@ -1,5 +1,5 @@
-//! `asphodel report html R`: one static page from a JSON report (TIM-96,
-//! decision 7; `docs/replay.md`, "The HTML page").
+//! `asphodel report html R`: one static page from a JSON report
+//! (`docs/replay.md`, "The HTML page").
 //!
 //! The page inlines its one style sheet and has no script, image or link,
 //! so a page full of Tim's history never fetches anything. It shows the

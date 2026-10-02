@@ -1,5 +1,4 @@
-//! The cassette of recorded LLM calls and the modes that read it (TIM-96,
-//! decision 4).
+//! The cassette of recorded LLM calls and the modes that read it.
 //!
 //! The cassette is JSON lines under the private dir, one record per call:
 //! the request, the reply, the measured latency, the simulated time, and
@@ -41,8 +40,7 @@ use super::corpus::{hex, sha256};
 use super::report::{LlmCounts, Percentiles, UsedVerdicts};
 use crate::cli::{RefreshMode, ReplayMode};
 
-/// The top-up call's template (TIM-96, decision 4): the reply and the new
-/// sentences only.
+/// The top-up call's template: the reply and the new sentences only.
 pub const JUDGE_TEMPLATE: &str = "judge_used";
 pub const JUDGE_VERSION: u32 = 1;
 
@@ -340,12 +338,11 @@ impl Recorder {
         *lock(&self.chunk) = None;
     }
 
-    /// How long the calls for the chunk since [`Recorder::enter`] took
-    /// (TIM-96, decision 3): the recorded latency of each record that
-    /// answered, and the measured latency of each live call, which is what
-    /// its record will say. Only the responses actually served count, so
-    /// older recordings of the chunk, other models' and top-ups that
-    /// weren't needed never do.
+    /// How long the calls for the chunk since [`Recorder::enter`] took: the
+    /// recorded latency of each record that answered, and the measured latency
+    /// of each live call, which is what its record will say. Only the responses
+    /// actually served count, so older recordings of the chunk, other models'
+    /// and top-ups that weren't needed never do.
     pub fn served_latency(&self) -> Duration {
         Duration::from_millis(*lock(&self.served_ms))
     }
@@ -379,10 +376,10 @@ impl Recorder {
         }
     }
 
-    /// `fast` mode's call 1 (TIM-96, decision 4): the chunk's recorded
-    /// claims, the `used` verdicts the pair cache holds, and one top-up for
-    /// the pairs it doesn't. `None` when the chunk has no record, which is
-    /// a miss the caller answers by request key.
+    /// `fast` mode's call 1: the chunk's recorded claims, the `used` verdicts
+    /// the pair cache holds, and one top-up for the pairs it doesn't. `None`
+    /// when the chunk has no record, which is a miss the caller answers by
+    /// request key.
     pub fn compose_call1(&self, context: &ChunkContext) -> Result<Option<Value>, LlmError> {
         let (claims, mut used, unknown) = {
             let index = lock(&self.index);

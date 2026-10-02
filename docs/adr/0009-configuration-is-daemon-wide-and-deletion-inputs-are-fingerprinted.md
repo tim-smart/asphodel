@@ -54,9 +54,7 @@ If the hash at startup differs from the stored one, purge and the sweep of sourc
 - The acknowledgement mechanism, and whether the sweep reports a dry-run count first, are decided with operations.
 - The timeouts and the spool and breaker settings in the plugin are fixed, and its config schema stays as ADR 0006 left it.
 
-Decided in "Configuration surface: which settings are exposed and where" (TIM-98) on 2026-10-01.
-
-## Amendment: the LLM's auth mode (2026-10-01, TIM-105)
+## Amendment: the LLM's auth mode (2026-10-01)
 
 The LLM can be reached with an API key or with a ChatGPT subscription.
 This adds one tuning key and one file; the decision above stands.

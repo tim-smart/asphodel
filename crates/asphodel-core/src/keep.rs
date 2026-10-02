@@ -1,9 +1,9 @@
-//! Keep and unkeep: the owner's significance setting (TIM-94, decision 9).
+//! Keep and unkeep: the owner's significance setting.
 //!
 //! Keeping a memory sets its `owner_significance` to `kept`, as high as
 //! significance goes, so it never fades. Unkeeping hands it back to the
-//! significance extraction gave it. Both take memory ids only, never text
-//! (TIM-93), and write the same field `memory significance` will (ADR 0010).
+//! significance extraction gave it. Both take memory ids only, never text,
+//! and write the same field `memory significance` will (ADR 0010).
 //! Each change is a logged edit with ids and levels, never content.
 //!
 //! An id that isn't a memory of the bank, or names one that's been
@@ -19,7 +19,7 @@ use crate::ingest::find_bank;
 use crate::store::bank::log_memory_edit;
 use crate::store::{Store, StoreError, micros};
 
-/// The most ids one call takes (TIM-94, decision 9).
+/// The most ids one call takes.
 pub const MAX_IDS: usize = 50;
 
 /// The edit kind unkeep writes.
@@ -110,8 +110,8 @@ pub(crate) fn unkeep(store: &Store, bank: &str, ids: &[String]) -> Result<Unkept
 }
 
 /// Sets the owner's significance on one memory, or clears it with `None`,
-/// handing the memory back to the level extraction gave (TIM-99, decision
-/// 5). The same field keep and unkeep write; a change is a logged edit of
+/// handing the memory back to the level extraction gave. The same field keep
+/// and unkeep write; a change is a logged edit of
 /// levels only.
 pub(crate) fn set_significance(
     store: &Store,

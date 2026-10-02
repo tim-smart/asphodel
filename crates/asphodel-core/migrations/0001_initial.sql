@@ -3,14 +3,14 @@
 -- Every `*_at` column is an INTEGER of microseconds since the Unix epoch, in
 -- UTC, written from the service's Clock. No column defaults to SQLite's own
 -- clock, so a replay on a simulated clock writes the same rows as production
--- (ADR 0004; "What is a memory record?", TIM-90). Timezone-dependent
--- rendering happens in code, from the source's timezone.
+-- (ADR 0004). Timezone-dependent rendering happens in code, from the source's
+-- timezone.
 --
--- Rowids are AUTOINCREMENT so they are never reused: sqlite-vec keys vectors
--- by rowid, and a reused id would attach an old vector to a new memory. The
--- `uuid` columns are the public UUIDv7 ids the API and plugin see (TIM-90).
--- Nothing refers across banks: every row that belongs to a bank carries its
--- `bank_id`, and joins never leave it.
+-- Rowids are AUTOINCREMENT so they are never reused: sqlite-vec keys vectors by
+-- rowid, and a reused id would attach an old vector to a new memory. The `uuid`
+-- columns are the public UUIDv7 ids the API and plugin see. Nothing refers
+-- across banks: every row that belongs to a bank carries its `bank_id`, and
+-- joins never leave it.
 
 -- Daemon-wide facts: the stored deletion fingerprint (ADR 0009), the time
 -- the last backup completed (ADR 0010).
@@ -32,9 +32,9 @@ CREATE TABLE migrations (
   completed_at   INTEGER NOT NULL
 );
 
--- Banks: identity, timezone and the recorded model ids (TIM-94, decisions 4
--- and 7). `turns` is the per-bank monotonic turn counter and `last_turn_at`
--- is where bank time's full-speed window starts (ADR 0004).
+-- Banks: identity, timezone and the recorded model ids. `turns` is the per-bank
+-- monotonic turn counter and `last_turn_at` is where bank time's full-speed
+-- window starts (ADR 0004).
 CREATE TABLE banks (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid            TEXT NOT NULL UNIQUE,
@@ -50,9 +50,9 @@ CREATE TABLE banks (
   updated_at      INTEGER NOT NULL
 );
 
--- Entities are first-class but there is no graph (TIM-90). `seeded` marks
--- the `user` and `assistant` every bank starts with; they can only ever be
--- merge targets. A merge keeps the row and sets `merged_into` (ADR 0010).
+-- Entities are first-class but there is no graph. `seeded` marks the `user` and
+-- `assistant` every bank starts with; they can only ever be merge targets. A
+-- merge keeps the row and sets `merged_into` (ADR 0010).
 CREATE TABLE entities (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid        TEXT NOT NULL UNIQUE,
@@ -69,8 +69,8 @@ CREATE UNIQUE INDEX entities_seeded ON entities(bank_id, seeded) WHERE seeded IS
 CREATE INDEX entities_bank ON entities(bank_id);
 CREATE INDEX entities_merged_into ON entities(merged_into) WHERE merged_into IS NOT NULL;
 
--- Aliases get their own table so full-text search can match them (TIM-90).
--- The owner's platform ids (`discord:<id>`) are aliases of `user` (TIM-94).
+-- Aliases get their own table so full-text search can match them. The owner's
+-- platform ids (`discord:<id>`) are aliases of `user`.
 CREATE TABLE entity_aliases (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   bank_id    INTEGER NOT NULL REFERENCES banks(id),
@@ -133,8 +133,8 @@ CREATE TABLE sources (
   CHECK (kind != 'turn' OR (session_id IS NOT NULL AND message_at IS NOT NULL)),
   CHECK (kind != 'document' OR document_id IS NOT NULL)
 );
--- The idempotency keys (TIM-90): bank, session, message time and content
--- hash for a turn; bank, document id and content hash for a document.
+-- The idempotency keys: bank, session, message time and content hash for a
+-- turn; bank, document id and content hash for a document.
 CREATE UNIQUE INDEX sources_turn_key
   ON sources(bank_id, session_id, message_at, content_hash) WHERE kind = 'turn';
 CREATE UNIQUE INDEX sources_document_key
@@ -142,11 +142,11 @@ CREATE UNIQUE INDEX sources_document_key
 CREATE INDEX sources_bank_ingested ON sources(bank_id, ingested_at);
 CREATE INDEX sources_bank_session ON sources(bank_id, session_id) WHERE kind = 'turn';
 
--- The chunk is the extraction unit (TIM-92). `content_hash` is fixed at
--- ingest and never recomputed: it is the forget tombstone, not an integrity
--- check. `call1_output` is dropped when the chunk commits (ADR 0008).
--- Offsets are into the source text. A chunk whose extraction is pending or
--- failed is never swept.
+-- The chunk is the extraction unit. `content_hash` is fixed at ingest and never
+-- recomputed: it is the forget tombstone, not an integrity check.
+-- `call1_output` is dropped when the chunk commits (ADR 0008). Offsets are into
+-- the source text. A chunk whose extraction is pending or failed is never
+-- swept.
 CREATE TABLE chunks (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid              TEXT NOT NULL UNIQUE,
@@ -170,9 +170,9 @@ CREATE TABLE chunks (
 CREATE INDEX chunks_bank_hash ON chunks(bank_id, content_hash);
 CREATE INDEX chunks_failed ON chunks(bank_id, failed_at) WHERE failed_at IS NOT NULL;
 
--- The extraction queue, in SQLite so nothing queued is lost on SIGTERM
--- (TIM-94). Chunks run in `observed_at` order with turns ahead of document
--- chunks; an erase job waits behind the chunks queued before it (ADR 0010).
+-- The extraction queue, in SQLite so nothing queued is lost on SIGTERM. Chunks
+-- run in `observed_at` order with turns ahead of document chunks; an erase job
+-- waits behind the chunks queued before it (ADR 0010).
 CREATE TABLE extraction_queue (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   bank_id     INTEGER NOT NULL REFERENCES banks(id),
@@ -189,13 +189,13 @@ CREATE TABLE extraction_queue (
 );
 CREATE INDEX extraction_queue_order ON extraction_queue(bank_id, priority, observed_at, id);
 
--- Memories (TIM-90, TIM-91, TIM-92). Content and kind never change: a
--- different claim is a new memory. `significance` is the level extraction
--- gave; `owner_significance` is the owner's setting, which keep, unkeep and
--- `memory significance` write (ADR 0010). Strength is never stored. Times
--- in the validity window are UTC instants at the start of their unit, each
--- with its precision. `hidden_at` is set the moment forget is called, before
--- the erase runs behind the queue (ADR 0010).
+-- Memories. Content and kind never change: a different claim is a new memory.
+-- `significance` is the level extraction gave; `owner_significance` is the
+-- owner's setting, which keep, unkeep and `memory significance` write (ADR
+-- 0010). Strength is never stored. Times in the validity window are UTC
+-- instants at the start of their unit, each with its precision. `hidden_at` is
+-- set the moment forget is called, before the erase runs behind the queue (ADR
+-- 0010).
 CREATE TABLE memories (
   id                         INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid                       TEXT NOT NULL UNIQUE,
@@ -246,8 +246,8 @@ CREATE TRIGGER memories_content_is_fixed BEFORE UPDATE OF content, kind ON memor
   SELECT RAISE(ABORT, 'a memory''s content and kind never change; a different claim is a new memory');
 END;
 
--- FTS5 over memory content, as an external-content table so the sentence
--- lives in `memories` only (TIM-89).
+-- FTS5 over memory content, as an external-content table so the sentence lives
+-- in `memories` only.
 CREATE VIRTUAL TABLE memories_fts USING fts5(
   content,
   content = 'memories',
@@ -261,17 +261,17 @@ CREATE TRIGGER memories_fts_delete AFTER DELETE ON memories BEGIN
   INSERT INTO memories_fts (memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
 END;
 
--- Memory vectors: a flat sqlite-vec table, one per memory, partitioned by
--- bank so a KNN never crosses banks (TIM-89). bge-small-en-v1.5 vectors
--- are unit length, so cosine is the metric reconcile's floor is set in.
+-- Memory vectors: a flat sqlite-vec table, one per memory, partitioned by bank
+-- so a KNN never crosses banks. bge-small-en-v1.5 vectors are unit length, so
+-- cosine is the metric reconcile's floor is set in.
 CREATE VIRTUAL TABLE memory_vectors USING vec0(
   memory_id INTEGER PRIMARY KEY,
   bank_id   INTEGER PARTITION KEY,
   embedding FLOAT[384] distance_metric=cosine
 );
 
--- The memory-entity join (TIM-90). `surface_form` is how the text named
--- the entity, kept so a mislink can be undone.
+-- The memory-entity join. `surface_form` is how the text named the entity, kept
+-- so a mislink can be undone.
 CREATE TABLE memory_entities (
   memory_id    INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
   entity_id    INTEGER NOT NULL REFERENCES entities(id),
@@ -280,10 +280,10 @@ CREATE TABLE memory_entities (
 );
 CREATE INDEX memory_entities_entity ON memory_entities(entity_id);
 
--- The access log: append-only, and only the events that count towards
--- strength (ADR 0001). `at` is world time; `turn` is the bank's turn
--- counter at the time, kept for replay and the recall log (TIM-91). At most
--- one access per memory per turn, keeping the strongest kind (TIM-90).
+-- The access log: append-only, and only the events that count towards strength
+-- (ADR 0001). `at` is world time; `turn` is the bank's turn counter at the
+-- time, kept for replay and the recall log. At most one access per memory per
+-- turn, keeping the strongest kind.
 CREATE TABLE accesses (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
   bank_id   INTEGER NOT NULL REFERENCES banks(id),
@@ -296,9 +296,9 @@ CREATE TABLE accesses (
 );
 CREATE INDEX accesses_memory_at ON accesses(memory_id, at);
 
--- The recall log (TIM-90): one row per recall, with what came back. It
--- stores the query, which is the user's message, so rows are swept at the
--- 90-day horizon (ADR 0008). Being recalled never counts as an access.
+-- The recall log: one row per recall, with what came back. It stores the query,
+-- which is the user's message, so rows are swept at the 90-day horizon (ADR
+-- 0008). Being recalled never counts as an access.
 CREATE TABLE recalls (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid       TEXT NOT NULL UNIQUE,
@@ -325,9 +325,9 @@ CREATE TABLE recall_results (
 CREATE INDEX recall_results_memory ON recall_results(memory_id);
 
 -- The edit log: every metadata edit, merge, forget, purge, restore,
--- acknowledgement and bank deletion (TIM-90, ADR 0010). `details` is JSON
--- of ids, times, spans and counts, never content. `bank_id` is NULL for
--- daemon-wide rows such as `restored` and `bank_deleted`.
+-- acknowledgement and bank deletion (ADR 0010). `details` is JSON of ids,
+-- times, spans and counts, never content. `bank_id` is NULL for daemon-wide
+-- rows such as `restored` and `bank_deleted`.
 CREATE TABLE edits (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid       TEXT NOT NULL UNIQUE,
@@ -343,9 +343,9 @@ CREATE INDEX edits_bank_kind ON edits(bank_id, kind);
 CREATE INDEX edits_memory ON edits(memory_id) WHERE memory_id IS NOT NULL;
 CREATE INDEX edits_entity ON edits(entity_id) WHERE entity_id IS NOT NULL;
 
--- Mental models (ADR 0007, TIM-95): a question, filters, a token budget,
--- and entries that each cite the memories they rest on. The `inject` flag
--- is gone: every enabled model is injected.
+-- Mental models (ADR 0007): a question, filters, a token budget, and entries
+-- that each cite the memories they rest on. The `inject` flag is gone: every
+-- enabled model is injected.
 CREATE TABLE mental_models (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid                  TEXT NOT NULL UNIQUE,
@@ -378,8 +378,8 @@ CREATE TABLE mental_model_entries (
 );
 CREATE INDEX mental_model_entries_model ON mental_model_entries(model_id, position);
 
--- An entry goes when any memory it cites goes (TIM-95, decision 6): the
--- cascade here removes the citation, and code drops the entry.
+-- An entry goes when any memory it cites goes: the cascade here removes the
+-- citation, and code drops the entry.
 CREATE TABLE mental_model_citations (
   entry_id  INTEGER NOT NULL REFERENCES mental_model_entries(id) ON DELETE CASCADE,
   memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -387,10 +387,9 @@ CREATE TABLE mental_model_citations (
 );
 CREATE INDEX mental_model_citations_memory ON mental_model_citations(memory_id);
 
--- The daemon persists each Hermes session's block id and the memory ids
--- the block's entries cite, so a reply that relies on an entry is credited
--- as `used` (TIM-95, decision 4). Mappings expire after
--- `sessions.mapping_expiry_days` without a turn.
+-- The daemon persists each Hermes session's block id and the memory ids the
+-- block's entries cite, so a reply that relies on an entry is credited as
+-- `used`. Mappings expire after `sessions.mapping_expiry_days` without a turn.
 CREATE TABLE session_blocks (
   bank_id      INTEGER NOT NULL REFERENCES banks(id),
   session_id   TEXT NOT NULL,

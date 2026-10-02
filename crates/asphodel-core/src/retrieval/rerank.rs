@@ -1,5 +1,4 @@
-//! Running the reranker under the deadline (TIM-93, decision 8, as amended
-//! by TIM-109).
+//! Running the reranker under the deadline.
 //!
 //! The deadline is real latency, not world or bank time, so it's measured
 //! with [`Instant`] rather than the service's clock: a replay that runs

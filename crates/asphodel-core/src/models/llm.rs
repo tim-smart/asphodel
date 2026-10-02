@@ -1,8 +1,8 @@
 //! The LLM client: one trait, an OpenAI-compatible implementation and a
 //! deterministic fake.
 //!
-//! The trait is synchronous. The extraction worker is a thread per bank
-//! (TIM-92), and replay's cassette wrapper needs no runtime. The daemon
+//! The trait is synchronous. The extraction worker is a thread per bank, and
+//! replay's cassette wrapper needs no runtime. The daemon
 //! calls it from `spawn_blocking`.
 
 use std::collections::VecDeque;
@@ -91,7 +91,7 @@ impl LlmSettings {
 
 /// Which prompt built a request, and its version. Replay's cache keys
 /// include it next to the model id, so editing a prompt never hits a stale
-/// recording (TIM-96, decision 4).
+/// recording.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Template {
     pub name: String,
@@ -119,7 +119,7 @@ pub struct LlmUsage {
 }
 
 /// A reply that parsed as JSON. `latency` is the measured round trip, which
-/// replay records in `live` mode (TIM-96, decision 3).
+/// replay records in `live` mode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub json: Value,
@@ -129,7 +129,7 @@ pub struct LlmResponse {
 }
 
 /// Why a call failed. No variant carries the prompt or the reply: only
-/// sizes and statuses (TIM-96, decision 8).
+/// sizes and statuses.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
     #[error("the LLM isn't configured: {missing} is not set")]
@@ -201,7 +201,7 @@ impl LlmError {
 }
 
 /// The boundary extraction, reconciliation and refresh call through, and
-/// that replay's recording and cassette modes wrap (TIM-96, decision 4).
+/// that replay's recording and cassette modes wrap.
 pub trait LlmClient: Send + Sync {
     /// The model string sent with every request.
     fn model(&self) -> &str;
@@ -212,8 +212,8 @@ pub trait LlmClient: Send + Sync {
     /// stand for the memories and entries `identities` names. Handles are
     /// positional, so only the identities say which memory a recorded
     /// reply meant: replay's cassette keeps them, to carry a recorded
-    /// refresh over to a run where the handles name other memories
-    /// (TIM-96, decision 4). Every other client ignores them.
+    /// refresh over to a run where the handles name other memories. Every other
+    /// client ignores them.
     fn complete_identified(
         &self,
         request: &LlmRequest,

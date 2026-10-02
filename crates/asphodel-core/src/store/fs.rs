@@ -3,7 +3,7 @@
 //! SQLite's locking and WAL need a local filesystem: `flock` and shared
 //! memory are unreliable over NFS and SMB, and FUSE mounts make no promises.
 //! So the daemon calls `statfs` at startup and refuses NFS, SMB/CIFS, CephFS
-//! and FUSE unless given `--allow-network-fs` (TIM-94, decision 4).
+//! and FUSE unless given `--allow-network-fs`.
 //!
 //! [`classify`] is a pure function of the filesystem magic, and
 //! [`apply_policy`] of the kind it gives, so the refusal can be tested

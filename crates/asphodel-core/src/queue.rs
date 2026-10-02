@@ -1,10 +1,10 @@
 //! The durable extraction queue, in the `extraction_queue` table so nothing
-//! queued is lost on SIGTERM or a crash (TIM-94, decision 3).
+//! queued is lost on SIGTERM or a crash.
 //!
-//! Each bank has one worker (TIM-92): while a bank has a [`Lease`] out, it
+//! Each bank has one worker: while a bank has a [`Lease`] out, it
 //! hands out no other. Chunks run with turns ahead of document chunks, then
 //! in `observed_at` order, ties broken by the later `ingested_at` and then by
-//! rowid (TIM-92). A failed attempt is counted on the chunk and the chunk is
+//! rowid. A failed attempt is counted on the chunk and the chunk is
 //! retried in place, so nothing behind it overtakes it; at
 //! [`CHUNK_RETRY_CAP`] it's marked failed, leaves the queue and is surfaced
 //! instead of retried.
@@ -282,7 +282,7 @@ pub(crate) fn complete(store: &Store, leases: &Leases, lease: Lease) -> Result<(
 }
 
 /// [`complete`]'s writes, inside the caller's transaction, so extraction
-/// commits its memories together with `extracted_at` (TIM-92). A turn's
+/// commits its memories together with `extracted_at`. A turn's
 /// stored in-context set goes too: it was only kept for this extraction.
 /// The caller has checked the lease is held.
 pub(crate) fn finish(

@@ -1,13 +1,12 @@
 -- Asphodel schema, version 2: speaker identities.
 --
 -- A turn's speaker is attributed by platform id (`discord:<id>`), never by
--- display name ("API surface and Hermes transport", TIM-94, decision 1).
--- Entity aliases are free text: display names, renames, and the surface
--- forms extraction finds. Resolving speakers through them let a display
--- name shaped like a platform id capture that id, the owner's included
--- (TIM-106 review). This table holds the only mappings a speaker is
--- resolved through. Bank config writes the owner's platform ids here, and
--- ingest writes one when it meets a new speaker.
+-- display name. Entity aliases are free text: display names, renames, and the
+-- surface forms extraction finds. Resolving speakers through them let a display
+-- name shaped like a platform id capture that id, the owner's included. This
+-- table holds the only mappings a speaker is resolved through. Bank config
+-- writes the owner's platform ids here, and ingest writes one when it meets a
+-- new speaker.
 CREATE TABLE speaker_ids (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   bank_id     INTEGER NOT NULL REFERENCES banks(id),

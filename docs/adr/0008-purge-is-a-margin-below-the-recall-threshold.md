@@ -18,5 +18,3 @@ A purge takes the whole supersession chain, and the strength and guards are read
 - **Dates still ahead hold a memory back.** A memory whose head has a `valid_from` or `valid_until` whose unit hasn't ended yet isn't purged, so a day-precision appointment is held until that day ends in the source's timezone. Neither is a task until 30 days past the end of its due date's unit (the agenda's overdue window, the same boundary the agenda uses). Otherwise a far-off appointment would be gone before it happens. Events need nothing more, because their window closes at a known time (`valid_until`'s unit end, or `valid_from`'s for a point event) and the recency boost from ADR 0003 gives them a fresh run then.
 - **This amends ADR 0002.** Sources are kept verbatim only while a memory rests on them or for 90 days after ingest. Re-extraction, when it's built, reaches only those sources, and it has to skip the recorded spans of purged memories.
 - Call 1's saved output is dropped when its chunk commits, so the claim text doesn't survive in the chunk row after a purge or forget.
-
-Decided in "Deletion policy: when faded memories are purged" (TIM-97) on 2026-10-01.

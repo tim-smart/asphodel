@@ -1,5 +1,5 @@
 //! One refresh: one retrieval for the model's question, then one LLM call
-//! that returns edits to its entries (TIM-95, decisions 3, 5 and 7).
+//! that returns edits to its entries.
 //!
 //! 1. **Selection.** The question runs through the recall pipeline with
 //!    injection's weighting over current memories at or above τ that pass
@@ -599,7 +599,7 @@ fn write(
     let tx = conn.transaction()?;
     // The LLM answered from a selection made before its call. A memory
     // forgotten or erased since can't be cited again, and an entry a forget
-    // dropped meanwhile can't be edited back (the TIM-112 review): such a
+    // dropped meanwhile can't be edited back: such a
     // draft goes, as one failing the citation check does.
     let drafts: Vec<&Draft> = {
         let mut standing = Vec::with_capacity(drafts.len());

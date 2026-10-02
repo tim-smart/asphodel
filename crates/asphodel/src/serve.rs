@@ -1,11 +1,10 @@
 //! `asphodel serve`: the daemon.
 //!
-//! It binds the listen address first, so `/v1/health` can answer 503 while
-//! the store opens and migrates and the models load, then builds the service
-//! layer on the system clock and serves the HTTP API under `/v1` ([`api`]).
-//! The handlers stay thin and call the same service functions the replay
-//! harness does (TIM-96, decision 3). Each bank's chunks are extracted by a
-//! worker of its own ([`worker`]).
+//! It binds the listen address first, so `/v1/health` can answer 503 while the
+//! store opens and migrates and the models load, then builds the service layer
+//! on the system clock and serves the HTTP API under `/v1` ([`api`]). The
+//! handlers stay thin and call the same service functions the replay harness
+//! does. Each bank's chunks are extracted by a worker of its own ([`worker`]).
 
 use std::{
     fs::{self, Metadata},
@@ -59,9 +58,9 @@ mod tests;
 
 pub(crate) type Shared = Arc<App>;
 
-/// What the HTTP handlers share. The service only exists once the store is
-/// open and the models are loaded; until then `/v1/health` answers 503 and
-/// every other route refuses (TIM-94, decision 3).
+/// What the HTTP handlers share. The service only exists once the store is open
+/// and the models are loaded; until then `/v1/health` answers 503 and every
+/// other route refuses.
 pub(crate) struct App {
     /// The clock `/v1/health` reads before the service exists.
     clock: Arc<dyn Clock>,
@@ -124,9 +123,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 }
 
 /// The daemon under a caller's stop signal, telling `bound` the address it
-/// listens on once it does. `run` adds the signal handlers; `asphodel
-/// bench` runs this on a copy of a replayed store and stops it itself
-/// (TIM-96, decision 3).
+/// listens on once it does. `run` adds the signal handlers; `asphodel bench`
+/// runs this on a copy of a replayed store and stops it itself.
 pub(crate) async fn run_with(
     args: ServeArgs,
     stop_tx: watch::Sender<bool>,
@@ -184,10 +182,9 @@ pub(crate) async fn run_with(
         ),
     };
 
-    // The store opens, migrates and loads its models while the listener
-    // answers 503: the lock, the filesystem check, the migrations and the
-    // floors all have to pass before the daemon is ready (TIM-94,
-    // decisions 3 and 4; ADR 0010).
+    // The store opens, migrates and loads its models while the listener answers
+    // 503: the lock, the filesystem check, the migrations and the floors all
+    // have to pass before the daemon is ready (ADR 0010).
     let started = {
         let clock = Arc::clone(&clock);
         let stop = stop.clone();
@@ -246,9 +243,9 @@ pub(crate) async fn run_with(
         Err(error) => warn!(%error, "listing the re-embeds to resume failed"),
     }
 
-    // SIGTERM: ingest is refused and the listener stops; each worker
-    // finishes its chunk in flight; then the WAL is checkpointed (TIM-94,
-    // decision 3). The queue is in SQLite, so nothing waiting is lost.
+    // SIGTERM: ingest is refused and the listener stops; each worker finishes
+    // its chunk in flight; then the WAL is checkpointed. The queue is in
+    // SQLite, so nothing waiting is lost.
     let served = server.await;
     let _ = stop_tx.send(true);
     if let Some(workers) = &workers {
@@ -711,9 +708,8 @@ fn sweep(service: &Service) -> Option<jiff::Timestamp> {
 
 /// Runs [`Service::run_refreshes`] at each pass's `next_due`, or after
 /// [`REFRESH_INTERVAL`] if that comes first, until the daemon stops or the
-/// service is dropped (TIM-95 amendment, decision 1). Refreshes run here,
-/// never inside a request. Like [`housekeeping`], it holds the service
-/// weakly and never across a wait.
+/// service is dropped. Refreshes run here, never inside a request. Like
+/// [`housekeeping`], it holds the service weakly and never across a wait.
 async fn refreshes(service: Weak<Service>, llm: Arc<dyn LlmClient>, stop: watch::Receiver<bool>) {
     loop {
         if *stop.borrow() {
@@ -724,7 +720,7 @@ async fn refreshes(service: Weak<Service>, llm: Arc<dyn LlmClient>, stop: watch:
         };
         let llm = Arc::clone(&llm);
         let pass = tokio::task::spawn_blocking(move || {
-            // The night's purge runs before its refreshes (TIM-97, decision 6).
+            // The night's purge runs before its refreshes.
             sweep(&service);
             let result = service.run_refreshes(llm.as_ref());
             (result, service.now())

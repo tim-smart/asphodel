@@ -1,22 +1,21 @@
 //! `asphodel import`: a copy of Hermes' `state.db` and the private manifest
-//! into a corpus (TIM-96, decision 1, and its facts; TIM-117).
+//! into a corpus.
 //!
 //! It reads only the rows and columns it needs, checks the schema it was
-//! written against and fails loudly on a mismatch, and never selects the
-//! system prompt or `api_content` (decision 8). Each turn becomes a
-//! prefetch at the user message's time and a `sync_turn` at the final
-//! assistant reply's time, with tool rows skipped.
-//!
-//! Only rows with `active = 1 OR compacted = 1` are read, the predicate
-//! Hermes uses for search, in timestamp order (Tim's decision on TIM-117).
-//! So compacted turns replay, while rows with `active=0, compacted=0` (the
-//! originals of a tail a compaction carried forward, which have a live
-//! clone, and turns a rewind discarded) never do. Carried-tail clones keep
-//! their original timestamps under later ids, so timestamp order replays
-//! them when they were said. Hermes' summary row (`_compressed_summary=1`)
-//! is skipped, and a clear is emitted at its time. Cron sessions get
-//! prefetch only, and subagent sessions (`parent_session_id` set) are
+//! written against and fails loudly on a mismatch, and never selects the system
+//! prompt or `api_content`. Each turn becomes a prefetch at the user message's
+//! time and a `sync_turn` at the final assistant reply's time, with tool rows
 //! skipped.
+//!
+//! Only rows with `active = 1 OR compacted = 1` are read, the predicate Hermes
+//! uses for search, in timestamp order. So compacted turns replay, while rows
+//! with `active=0, compacted=0` (the originals of a tail a compaction carried
+//! forward, which have a live clone, and turns a rewind discarded) never do.
+//! Carried-tail clones keep their original timestamps under later ids, so
+//! timestamp order replays them when they were said. Hermes' summary row
+//! (`_compressed_summary=1`) is skipped, and a clear is emitted at its time.
+//! Cron sessions get prefetch only, and subagent sessions (`parent_session_id`
+//! set) are skipped.
 
 use std::path::Path;
 
@@ -65,8 +64,8 @@ const REQUIRED_COLUMNS: [(&str, &[(&str, &str)]); 3] = [
     ("schema_version", &[("version", "INTEGER")]),
 ];
 
-/// The gateway puts a channel's recent history and this marker in front of
-/// the user text on backfill (TIM-96, "Changes to earlier tickets").
+/// The gateway puts a channel's recent history and this marker in front of the
+/// user text on backfill.
 const NEW_MESSAGE_MARKER: &str = "[New message]";
 
 /// How Hermes stores multimodal content: this prefix and a JSON parts
@@ -89,8 +88,8 @@ pub fn run(args: ImportArgs) -> anyhow::Result<()> {
 
 fn execute(args: &ImportArgs) -> anyhow::Result<()> {
     let dir = super::private_dir(args.replay_dir.as_deref())?;
-    // Both inputs are real history, so both stay inside the private dir
-    // (TIM-96, decision 8), checked before either is read.
+    // Both inputs are real history, so both stay inside the private dir,
+    // checked before either is read.
     let manifest_path = super::inside_private(&dir, &args.manifest, "the manifest")?;
     let state_db = super::inside_private(&dir, &args.state_db, "the state.db copy")?;
     let manifest = super::manifest::load(&manifest_path)?;
@@ -138,9 +137,9 @@ fn open_read_only(path: &Path) -> anyhow::Result<Connection> {
     .with_context(|| format!("opening {} read-only", path.display()))
 }
 
-/// The schema the importer was written against (TIM-117): every column it
-/// reads must be there with the type it was declared with, and the schema
-/// version must be one it knows. Everything wrong is listed at once.
+/// The schema the importer was written against: every column it reads must be
+/// there with the type it was declared with, and the schema version must be one
+/// it knows. Everything wrong is listed at once.
 fn check_schema(conn: &Connection, path: &Path) -> anyhow::Result<i64> {
     let mut problems = Vec::new();
     for (table, columns) in REQUIRED_COLUMNS {
@@ -447,10 +446,9 @@ fn has_tool_calls(tool_calls: Option<&str>) -> bool {
     }
 }
 
-/// The user message as `sync_turn` would send it (TIM-96, decision 1):
-/// multimodal content reduced to its text with the memory block cut out,
-/// backfill stripped, and the speaker picked from the `[Name] ` prefix,
-/// which stays in the text.
+/// The user message as `sync_turn` would send it: multimodal content reduced to
+/// its text with the memory block cut out, backfill stripped, and the speaker
+/// picked from the `[Name] ` prefix, which stays in the text.
 fn user_text(
     content: &str,
     manifest: &Manifest,

@@ -1,6 +1,4 @@
-//! Retrieval: prefetch's injection and the recall tool ("Retrieval and
-//! ranking", TIM-93, with "API surface and Hermes transport", TIM-94, and
-//! the TIM-99 amendment on the previous message).
+//! Retrieval: prefetch's injection and the recall tool.
 //!
 //! Both run one pipeline:
 //!
@@ -19,7 +17,7 @@
 //!    from the start of the request. Past it, explicit recall keeps RRF
 //!    order and prefetch injects nothing: without the logit there's no
 //!    relevance to gate on, and a wrong injection is replayed for the rest
-//!    of the session (TIM-93, decision 8, as amended by TIM-109).
+//!    of the session.
 //! 5. **Score.** [`score`]: relevance (the reranker logit), plus w_s times
 //!    strength, plus the clamped log of state confidence, plus the phase
 //!    term. w_s is `ranking.w_s_inject` or `ranking.w_s_recall`, and the
@@ -65,7 +63,7 @@ use log::{Entry, Logged, RecallKind};
 
 const MICROS_PER_DAY: f64 = 24.0 * 60.0 * 60.0 * 1_000_000.0;
 
-/// What `prefetch` sends (TIM-94, decision 5, as amended by TIM-99).
+/// What `prefetch` sends.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PrefetchRequest {
     pub session_id: String,
@@ -78,7 +76,7 @@ pub struct PrefetchRequest {
     /// The block `system_prompt_block()` returned, when Hermes gave no
     /// session id then. The plugin sends it with the session's first
     /// prefetch, and the daemon maps the session to that block unless it
-    /// already holds one (TIM-95, decision 4).
+    /// already holds one.
     #[serde(default)]
     pub block_id: Option<Uuid>,
 }
@@ -99,7 +97,7 @@ pub struct Prefetch {
     pub reranked: bool,
 }
 
-/// What a `happened`/`said` range applies to (TIM-93, decision 4).
+/// What a `happened`/`said` range applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum On {
@@ -136,7 +134,7 @@ impl PhaseFilter {
     }
 }
 
-/// `memory_recall`'s parameters (TIM-94, decision 9), plus the session
+/// `memory_recall`'s parameters, plus the session
 /// whose in-context set the results join.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RecallRequest {
@@ -200,7 +198,7 @@ pub struct RecalledWindow {
     pub uncertain: bool,
 }
 
-/// A strength band (TIM-93, decision 13): faded below τ, fading up to
+/// A strength band: faded below τ, fading up to
 /// `recall.strong_cutoff`, strong above it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -288,7 +286,7 @@ pub fn fuse(lists: &[&[i64]]) -> Vec<i64> {
     fused.into_iter().map(|(id, _)| id).collect()
 }
 
-/// The retrieval score (TIM-93, decision 5):
+/// The retrieval score:
 ///
 /// ```text
 /// relevance + w_s·strength + max(−3, ln(state_confidence)) + phase_term
@@ -305,7 +303,7 @@ pub fn score(
     relevance + w_s * strength + state_confidence.ln().max(CONFIDENCE_TERM_MIN) + phase_term
 }
 
-/// The phase term at `now` (TIM-93, decision 6), on world time in the
+/// The phase term at `now`, on world time in the
 /// window's timezone. It never excludes anything.
 ///
 /// | Phase | Term |
@@ -373,7 +371,7 @@ pub fn phase_term(
 /// The query prefetch runs: the message itself, or, when it's a short
 /// follow-up of fewer than [`SHORT_FOLLOW_UP_WORDS`] words split on
 /// whitespace ("yes, book it"), the previous prefetch query and then the
-/// message, on two lines (TIM-93, decision 8, as amended by TIM-99). The
+/// message, on two lines. The
 /// recall log stores this query.
 pub fn effective_query(message: &str, previous: Option<&str>) -> String {
     let message = message.trim();
@@ -463,8 +461,7 @@ impl Context<'_> {
 
 /// A prefetch's candidate as the gate saw it, before the gate: the
 /// reranker logit the floor compares, or `None` when the reranker missed
-/// its deadline. Replay's labelling material lists these (TIM-96,
-/// decision 6).
+/// its deadline. Replay's labelling material lists these.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GateCandidate {
     pub memory: Uuid,
@@ -544,7 +541,7 @@ pub(crate) fn scored_prefetch(
     for item in &ranked {
         // Past the deadline, or when the reranker fails, there's no logit,
         // so nothing passes the gate and nothing is injected; the candidates
-        // are still logged (TIM-93, decision 8, as amended by TIM-109).
+        // are still logged.
         let passes = item.logit.is_some_and(|logit| logit >= floor);
         let mut take = false;
         if passes && injected.len() < cap {
@@ -747,7 +744,7 @@ pub(crate) fn recall(
 }
 
 /// How long a refresh waits for the reranker. A refresh is a daemon job
-/// and never runs inside a request (TIM-95, decision 7), so it can wait its
+/// and never runs inside a request, so it can wait its
 /// turn behind prefetch; past this it scores on strength alone.
 const REFRESH_RERANK_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -757,7 +754,7 @@ pub(crate) struct Selected {
     pub score: f64,
 }
 
-/// A refresh's selection (TIM-95, decision 3): the model's question runs
+/// A refresh's selection: the model's question runs
 /// through the pipeline with injection's weighting, over the memories
 /// `keep` admits. Every fused candidate is reranked and scored, the best
 /// `budget` are taken, and then the memories in `cited` that `keep` still
@@ -1104,8 +1101,8 @@ fn entity_memories(store: &Store, bank_id: i64, name: &str) -> Result<BTreeSet<i
     Ok(ids)
 }
 
-/// Whether `candidate` falls in the request's `from`/`to` range (TIM-93,
-/// decision 4). With no range, everything does.
+/// Whether `candidate` falls in the request's `from`/`to` range. With no range,
+/// everything does.
 fn in_range(candidate: &Candidate, request: &RecallRequest) -> bool {
     if request.from.is_none() && request.to.is_none() {
         return true;

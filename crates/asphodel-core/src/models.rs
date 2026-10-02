@@ -3,20 +3,17 @@
 //! Three boundaries, each a trait so tests and the replay harness can stand
 //! in for it:
 //!
-//! - [`Embedder`] over bge-small-en-v1.5 int8 ("Rust storage and search
-//!   stack", TIM-89);
-//! - [`Reranker`] over jina-reranker-v1-turbo-en int8 ("Retrieval and
-//!   ranking", TIM-93, decision 3);
+//! - [`Embedder`] over bge-small-en-v1.5 int8;
+//! - [`Reranker`] over jina-reranker-v1-turbo-en int8;
 //! - [`LlmClient`] over any OpenAI-compatible endpoint, with structured JSON
-//!   output. Replay's recording and cassette modes wrap it ("Replay
-//!   harness", TIM-96, decision 4).
+//!   output. Replay's recording and cassette modes wrap it.
 //!
 //! The ONNX models load from a [`ModelDir`] that `asphodel models fetch`
 //! fills from the [`manifest`]. Nothing downloads at runtime, and a missing
-//! or corrupt file fails before ONNX Runtime is touched ("API surface and
-//! Hermes transport", TIM-94, decision 4). The fakes are deterministic and
-//! live here rather than in tests, because the scripted replay scenarios
-//! run on them under `cargo test` (TIM-96, decision 2).
+//! or corrupt file fails before ONNX Runtime is touched. The fakes are
+//! deterministic and live here rather than in tests, because the scripted
+//! replay scenarios
+//! run on them under `cargo test`.
 
 mod chatgpt;
 mod dir;
@@ -54,7 +51,7 @@ pub use onnx::{OnnxEmbedder, OnnxReranker};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ModelOptions {
     /// Intra-op threads for ONNX Runtime. `None` leaves it to the runtime;
-    /// replay pins it (TIM-96, decision 3) through `--onnx-threads` /
+    /// replay pins it through `--onnx-threads` /
     /// `ASPHODEL_ONNX_THREADS`.
     pub threads: Option<NonZeroUsize>,
 }
@@ -82,7 +79,7 @@ pub trait Reranker: Send + Sync {
 
     /// One relevance logit per document, in the documents' order (not
     /// sorted: the caller keeps its ids). Higher is more relevant, and the
-    /// injection gate is a floor on this value (TIM-93, decision 9). An
+    /// injection gate is a floor on this value. An
     /// empty slice gives an empty vec.
     fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, ModelError>;
 }

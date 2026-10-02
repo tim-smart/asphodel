@@ -6,10 +6,7 @@ this file names ``MemoryProvider`` and ``register_memory_provider``, loads it
 under a synthetic package name, and calls :func:`register`. Every submodule
 is imported relatively for that reason.
 
-The hook contract is "API surface and Hermes transport" (TIM-94) decision 5,
-amended by TIM-95, TIM-96 and TIM-99; the Hermes side is
-``agent/memory_provider.py`` as read in "Hermes MemoryProvider contract in
-detail" (TIM-88).
+The Hermes hook contract is defined in ``agent/memory_provider.py``.
 """
 
 from __future__ import annotations

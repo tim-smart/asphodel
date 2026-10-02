@@ -1,6 +1,6 @@
-//! `asphodel bench`: concurrent prefetches over HTTP against a daemon
-//! started on a copy of the replayed store, to see how the reranker
-//! deadline behaves under contention (TIM-96, decision 3; TIM-117).
+//! `asphodel bench`: concurrent prefetches over HTTP against a daemon started
+//! on a copy of the replayed store, to see how the reranker deadline behaves
+//! under contention.
 //!
 //! It never runs against the production daemon, because prefetch writes
 //! the recall log and pending sets: the store is copied from

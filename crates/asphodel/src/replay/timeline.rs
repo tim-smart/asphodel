@@ -1,8 +1,7 @@
 //! The timeline the engine runs: turns, documents, clears and probes in
-//! simulated time, built from a scripted scenario (`docs/replay.md`) or
-//! from a corpus `asphodel import` wrote (TIM-96, decision 1). The engine
-//! reads only this, so nothing in it knows whether the history is scripted
-//! or real.
+//! simulated time, built from a scripted scenario (`docs/replay.md`) or from a
+//! corpus `asphodel import` wrote. The engine reads only this, so nothing in it
+//! knows whether the history is scripted or real.
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -10,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::corpus::{Corpus, Event};
 use super::scenario::{Author, Claim, Clear, Document, Probe, Scenario, duration};
 
-/// A session's class (TIM-96, decision 1): cron sessions get prefetch only
-/// and are reported apart.
+/// A session's class: cron sessions get prefetch only and are reported apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionClass {
@@ -43,8 +41,8 @@ pub struct Turn {
     pub used: Vec<String>,
 }
 
-/// How a probe's `memory` names a memory: a claim label in a scenario, or
-/// a regex over sentences in real history (TIM-96, decision 5).
+/// How a probe's `memory` names a memory: a claim label in a scenario, or a
+/// regex over sentences in real history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Matching {
     Label,
@@ -115,9 +113,9 @@ impl Timeline {
         })
     }
 
-    /// A corpus's events (TIM-96, decision 1): a prefetch and its sync
-    /// make one turn, a prefetch on its own a prefetch-only turn, and a
-    /// clear a clear. Probes come from the private probes file.
+    /// A corpus's events: a prefetch and its sync make one turn, a prefetch on
+    /// its own a prefetch-only turn, and a clear a clear. Probes come from the
+    /// private probes file.
     pub fn from_corpus(corpus: &Corpus, probes: Vec<Probe>) -> Result<Self, String> {
         let mut turns: Vec<Turn> = Vec::new();
         let mut clears = Vec::new();

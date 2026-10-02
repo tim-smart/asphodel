@@ -1,4 +1,4 @@
-//! State confidence (TIM-91, decision 8).
+//! State confidence.
 
 use jiff::Timestamp;
 

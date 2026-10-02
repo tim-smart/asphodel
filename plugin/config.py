@@ -1,7 +1,7 @@
-"""Plugin configuration (TIM-94, decision 7).
+"""Plugin configuration.
 
 The file is ``$HERMES_HOME/asphodel/config.json``. ``ASPHODEL_URL`` in the
-environment overrides ``url`` (decision 2), and the token comes only from
+environment overrides ``url``, and the token comes only from
 ``ASPHODEL_TOKEN``, which Hermes writes to ``.env`` from the ``secret`` field.
 """
 
@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-#: Where the daemon listens by default (TIM-94, decision 2).
+#: Where the daemon listens by default.
 DEFAULT_URL = "http://127.0.0.1:7720"
 #: Environment variables the plugin reads.
 URL_ENV_VAR = "ASPHODEL_URL"
@@ -33,7 +33,7 @@ class PluginConfig:
     token: Optional[str] = None
     bank: Optional[str] = None
     owner_name: Optional[str] = None
-    #: Speaker ids of the owner, ``<platform>:<id>`` (TIM-94, decision 1).
+    #: Speaker ids of the owner, ``<platform>:<id>``.
     owner_platform_ids: List[str] = field(default_factory=list)
     assistant_name: Optional[str] = None
     timezone: Optional[str] = None

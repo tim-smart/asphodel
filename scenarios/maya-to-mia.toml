@@ -1,11 +1,10 @@
-# Maya corrected to Mia (TIM-91, decision 3; TIM-97, decision 2). The
-# wrong name is mentioned on three separate occasions, then corrected.
-# The correction retracts Maya, makes Mia the head of the chain, hides
-# Maya from recall, and Mia inherits Maya's accesses: created on day 0,
-# mentioned again on days 4 and 8, plus her own creation on day 12. On
-# those four accesses she's still in recall 100 days on (strength 0.10,
-# fading), where a fresh minor memory from day 12 would have faded on day
-# 75, and she fades on day 547, with 5% either side.
+# Maya corrected to Mia. The wrong name is mentioned on three separate
+# occasions, then corrected. The correction retracts Maya, makes Mia the head of
+# the chain, hides Maya from recall, and Mia inherits Maya's accesses: created
+# on day 0, mentioned again on days 4 and 8, plus her own creation on day 12. On
+# those four accesses she's still in recall 100 days on (strength 0.10, fading),
+# where a fresh minor memory from day 12 would have faded on day 75, and she
+# fades on day 547, with 5% either side.
 
 name = "maya-to-mia"
 group = "ci"

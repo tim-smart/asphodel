@@ -4,7 +4,7 @@
 //! already verified, with fastembed's Hugging Face download feature
 //! compiled out. ONNX Runtime itself is loaded at runtime from
 //! `ORT_DYLIB_PATH` (ort's `load-dynamic`), which the nix shell and the
-//! image point at nixpkgs' library (TIM-89).
+//! image point at nixpkgs' library.
 
 use std::sync::Mutex;
 

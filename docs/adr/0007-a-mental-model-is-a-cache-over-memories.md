@@ -6,10 +6,10 @@ Hindsight, which Asphodel borrows from, does it the other way round: free-form m
 
 ## Considered Options
 
-- **A profile built by code from strength-ranked memories, with no LLM.** No paraphrase and nothing to drift. Tim rejected it in "Strength model: decay, reinforcement and significance" (TIM-91), because models should answer any standing question, not only "who is the user?". The agenda does take this route for routines and undated tasks: they're lists, and a query beats a synthesis that's up to a day stale and can misstate a date.
+- **A profile built by code from strength-ranked memories, with no LLM.** No paraphrase and nothing to drift. Models should answer any standing question, not only "who is the user?", so a code-built profile is too limited. The agenda does take this route for routines and undated tasks: they're lists, and a query beats a synthesis that's up to a day stale and can misstate a date.
 - **Full rewrites on every refresh.** A simpler prompt. Hindsight moved away from it because each rewrite paraphrased the last one and the document drifted from the memories.
 - **An agentic reflect loop per refresh**, as Hindsight does. Their evals report 90,000-token prompts that missed deadlines. A refresh here is one retrieval and one synthesis call, and it's skipped when the fingerprint of the selected memories hasn't changed.
-- **Refreshing once a day only.** The first version of this decision ran the refresh at 04:00 and nothing else. Tim rejected it: something important said in one conversation should reach the next one, not tomorrow's. A refresh on every change to the fingerprint was rejected too, because nearly every new fact about the user ranks into the input set, which would mean an LLM call per conversation for trivia. So was an hourly timer, which spends calls when nothing has changed and still lags by up to an hour.
+- **Refreshing once a day only.** A refresh at 04:00 and nothing else means something important said in one conversation won't reach the next one until tomorrow. A refresh on every change to the fingerprint was rejected too, because nearly every new fact about the user ranks into the input set, which would mean an LLM call per conversation for trivia. So was an hourly timer, which spends calls when nothing has changed and still lags by up to an hour.
 - **Letting a model keep its cited memories alive.** This is the retrieval loop of ADR 0001 in another form. Instead, cited memories join the session's in-context set, so a reply that uses one is credited and a reply that doesn't isn't.
 
 ## Consequences
@@ -23,5 +23,3 @@ Hindsight, which Asphodel borrows from, does it the other way round: free-form m
 - The daemon persists which block each session holds, so the cited memories stay in that session's in-context set across plugin restarts.
 - Refresh prompts and responses are never written to disk, or forget would have something to scrub after all.
 - The profile takes facts and states of volatility weeks or slower. Faster states are injection's job: a model lags a conversation by minutes, then is frozen for the whole of a Discord thread.
-
-Decided in "Mental models: synthesized documents over memories" (TIM-95) on 2026-10-01. Amended the same day, when Tim asked for refreshes to follow conversations rather than the clock; the amendment also drops the once-a-day prompt block from "Retrieval and ranking" (TIM-93) and "API surface and Hermes transport" (TIM-94).

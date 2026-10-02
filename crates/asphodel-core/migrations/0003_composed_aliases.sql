@@ -1,13 +1,12 @@
 -- Asphodel schema, version 3: aliases and entity names in NFC.
 --
--- Extraction searches its passages in Unicode NFC, so the alias index has
--- to hold aliases in NFC too: a decomposed alias (a letter followed by a
--- combining accent) indexes differently from the composed passage, and
--- outside Latin script the alias FTS doesn't fold the difference away
--- (TIM-107 re-review). From this version every write stores aliases and
--- entity names composed; this migration composes what earlier versions
--- stored. `asphodel_nfc` is a deterministic SQL function the store
--- registers on its connection before migrations run.
+-- Extraction searches its passages in Unicode NFC, so the alias index has to
+-- hold aliases in NFC too: a decomposed alias (a letter followed by a combining
+-- accent) indexes differently from the composed passage, and outside Latin
+-- script the alias FTS doesn't fold the difference away. From this version
+-- every write stores aliases and entity names composed; this migration composes
+-- what earlier versions stored. `asphodel_nfc` is a deterministic SQL function
+-- the store registers on its connection before migrations run.
 --
 -- Two aliases of one entity that are canonically the same become one row,
 -- as `UNIQUE (entity_id, alias)` requires: the oldest stays. Each

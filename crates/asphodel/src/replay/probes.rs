@@ -1,7 +1,7 @@
-//! The real-history probes file (TIM-96, decision 5): the same kinds as a
-//! scenario's probes, with opaque ids and `memory` a regex over sentences,
-//! since there are no claim labels in real history. Tim writes it after
-//! reading a private report, and it lives under the private dir.
+//! The real-history probes file: the same kinds as a scenario's probes, with
+//! opaque ids and `memory` a regex over sentences, since there are no claim
+//! labels in real history. Tim writes it after reading a private report, and it
+//! lives under the private dir.
 
 use std::collections::BTreeSet;
 use std::path::Path;

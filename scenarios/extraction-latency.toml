@@ -1,9 +1,8 @@
-# Extraction latency in simulated time (TIM-96, decision 3). With a
-# ten-minute latency, a turn synced at 09:00 has its memories from 09:10,
-# and a second turn synced at 09:02 waits for the bank's one extraction
-# worker: its completion is the later of its sync and the previous
-# completion, plus the latency, so 09:20. A probe between a sync and its
-# completion sees the store without that turn's memories.
+# Extraction latency in simulated time. With a ten-minute latency, a turn synced
+# at 09:00 has its memories from 09:10, and a second turn synced at 09:02 waits
+# for the bank's one extraction worker: its completion is the later of its sync
+# and the previous completion, plus the latency, so 09:20. A probe between a
+# sync and its completion sees the store without that turn's memories.
 #
 # `--latency` overrides the scenario's latency; the test runs it with `0s`
 # to see the first probe fail. Bank time runs at world speed so the same

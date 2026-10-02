@@ -142,7 +142,7 @@ and no temperature (the GPT-5 family rejects it). The protocol was read
 from `openai/codex` at `6b4daaf`; it is undocumented and OpenAI can change
 it, which is why `api_key` stays the default.
 
-Subscription usage windows will throttle the real-history import in TIM-117.
+Subscription usage windows will throttle the real-history import.
 A large backfill could take days. Keep `llm.model` pinned and calibrate
 against that exact model; subscription mode does not change ADR 0009's
 single-model calibration requirement.

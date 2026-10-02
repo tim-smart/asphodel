@@ -1,6 +1,5 @@
-//! What `memory show`, `entity show` and `model show` print ("Operations:
-//! backup, inspection, correction and forgetting", TIM-99, decision 4; ADR
-//! 0010, "Inspection and correction").
+//! What `memory show`, `entity show` and `model show` print (ADR 0010,
+//! "Inspection and correction").
 //!
 //! These are for the operator, through the CLI; the agent gets no new tool.
 //! They read only. A view holds content, since showing it is the point, so
@@ -831,8 +830,7 @@ pub struct EntryView {
     pub text: String,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-    /// Whether the block shows it: every memory it cites is current
-    /// (TIM-95, decision 6).
+    /// Whether the block shows it: every memory it cites is current.
     pub renders: bool,
     pub cites: Vec<CitedMemory>,
 }

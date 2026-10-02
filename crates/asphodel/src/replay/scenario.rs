@@ -1,5 +1,4 @@
-//! The scenario file, as `docs/replay.md` gives it (TIM-96, decisions 2 and
-//! 5).
+//! The scenario file, as `docs/replay.md` gives it.
 //!
 //! The enums for kinds, significance, outcomes, bands and phases are the
 //! production ones, so the file's words are exactly the API's. Only the

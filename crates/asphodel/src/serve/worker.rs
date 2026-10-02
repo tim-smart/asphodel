@@ -1,5 +1,5 @@
 //! The extraction workers: one per bank, so each bank's chunks run one at a
-//! time in queue order (TIM-92), and banks don't wait on each other.
+//! time in queue order, and banks don't wait on each other.
 //!
 //! A worker takes the head of its bank's queue, extracts it on a blocking
 //! thread and moves on to the next. When the queue is empty it sleeps until
@@ -11,9 +11,8 @@
 //! A forget's erase waits on the same queue, behind the chunks queued
 //! before it (ADR 0010), so each step runs a due erase first.
 //!
-//! On shutdown a worker finishes the chunk in flight and stops before
-//! claiming another (TIM-94, decision 3). Nothing queued is lost, since the
-//! queue is in SQLite.
+//! On shutdown a worker finishes the chunk in flight and stops before claiming
+//! another. Nothing queued is lost, since the queue is in SQLite.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

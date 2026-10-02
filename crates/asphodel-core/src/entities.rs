@@ -1,5 +1,4 @@
-//! Entity correction ("Operations: backup, inspection, correction and
-//! forgetting", TIM-99, decision 5; ADR 0010, "Inspection and correction").
+//! Entity correction (ADR 0010, "Inspection and correction").
 //!
 //! **Merges keep the entity row.** `entity merge <from> <into>` sets
 //! `from.merged_into` and moves `from`'s aliases and links to `into` in one

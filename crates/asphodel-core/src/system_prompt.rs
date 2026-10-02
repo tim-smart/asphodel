@@ -1,6 +1,4 @@
-//! The block `system_prompt_block()` returns ("Mental models", TIM-95,
-//! decisions 4, 6 and 8 and the amendment's decision 2; "API surface and
-//! Hermes transport", TIM-94, decision 8, as amended).
+//! The block `system_prompt_block()` returns.
 //!
 //! It holds the agenda, every enabled model's entries, and one pointer line
 //! with the build time. Building it costs queries only, never an LLM call,
@@ -84,7 +82,7 @@ impl Block {
 
 /// A rendered entry as the block held it, with the memories it cites. It's
 /// what call 1 is shown, by handle, for a turn in a session holding the
-/// block (TIM-95, decision 4).
+/// block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockEntry {
     pub entry: Uuid,
@@ -135,9 +133,8 @@ impl Blocks {
     }
 }
 
-/// The pointer line, with the build time (TIM-94, decision 8; TIM-95,
-/// decision 8 and the amendment). Sessions are frozen, so it says how to
-/// reach anything added since.
+/// The pointer line, with the build time. Sessions are frozen, so it says
+/// how to reach anything added since.
 fn pointer(now: Timestamp, tz: &TimeZone) -> String {
     format!(
         "Built {}; memories win: use memory_recall for history and detail, and for anything \
@@ -234,7 +231,7 @@ pub(crate) fn build(
                 cites: entry.cites.iter().map(|(_, uuid)| *uuid).collect(),
             });
         }
-        // An empty model renders nothing, not even a header (decision 5).
+        // An empty model renders nothing, not even a header.
         if !lines.is_empty() {
             sections.push(format!("{}\n{}", model.name, lines.join("\n")));
         }
@@ -329,7 +326,7 @@ impl Shown {
 }
 
 /// An entry's line, or `None` when any memory it cites is retracted,
-/// forgotten, ended or gone (decision 6).
+/// forgotten, ended or gone.
 fn entry_line(
     conn: &Connection,
     tuning: &Tuning,
@@ -429,7 +426,7 @@ pub(crate) fn mapped(
     Ok(Some(serde_json::from_str(&ids).unwrap_or_default()))
 }
 
-/// The block-id fallback (TIM-95, decision 4): when Hermes gave no session
+/// The block-id fallback: when Hermes gave no session
 /// id at `system_prompt_block()` time, the plugin sends the block's id with
 /// its first prefetch, and the session is mapped to that block then. Only a
 /// block of the same bank counts, an unknown id maps nothing, and a session

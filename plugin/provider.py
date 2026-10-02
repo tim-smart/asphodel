@@ -1,6 +1,6 @@
-"""The ``MemoryProvider`` implementation: TIM-94 decision 5's hook table.
+"""The ``MemoryProvider`` hook implementation.
 
-Threading and budgets follow TIM-88: ``prefetch`` is the only hook on the
+``prefetch`` is the only hook on the
 reply path and Hermes cuts it off at 8 s, so the plugin's own budget is 3 s.
 ``system_prompt_block`` runs at session start with a 2 s budget and one
 retry. ``sync_turn`` already runs on Hermes' single background worker, so it
@@ -35,14 +35,14 @@ PROVIDER_NAME = "asphodel"
 #: Shown on the "🧠 recalled N memories" status line.
 PROVIDER_LABEL = "Asphodel"
 #: The daemon major version this plugin was written for. ``initialize`` warns
-#: when the health response's major differs (TIM-94, decision 2).
+#: when the health response's major differs.
 DAEMON_MAJOR_VERSION = 0
 #: Python's logging has no TRACE; this is the level content may be logged at.
 TRACE = 5
 #: Hermes' ``agent_context`` value for a user-facing agent. Only these ingest.
 PRIMARY_CONTEXT = "primary"
 #: Hermes' built-in memory flags that ``post_setup`` turns off and
-#: ``initialize`` warns about (TIM-94, round 1 item 5).
+#: ``initialize`` warns about.
 BUILTIN_MEMORY_FLAGS = ("memory_enabled", "user_profile_enabled")
 #: Hermes' ``utils.TRUTHY_STRINGS``: how it reads a string flag.
 HERMES_TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
@@ -52,7 +52,7 @@ PENDING_RECALLS_PER_SESSION = 4
 
 @dataclass(frozen=True)
 class Timeouts:
-    """Client timeouts in seconds, one per hook (TIM-94, decisions 5 and 8).
+    """Client timeouts in seconds, one per hook.
     Tests shorten them; production uses the defaults."""
 
     health: float = 2.0
@@ -90,20 +90,20 @@ class AsphodelMemoryProvider(MemoryProvider):
         self._platform: Optional[str] = None
         self._agent_context: Optional[str] = None
         self._profile: Optional[str] = None
-        # Decision 1: the current turn's author, from on_turn_start.
+        # The current turn's author, from on_turn_start.
         self._author_id: Optional[str] = None
         self._author_name: Optional[str] = None
         self._author_is_bot: bool = False
-        # Decision 6: the (query, recall_id) of each prefetch whose turn
+        # The (query, recall_id) of each prefetch whose turn
         # hasn't synced yet, oldest first. Hermes syncs on a background worker,
         # so the next turn's prefetch can come before this turn's sync
-        # (TIM-99), and sync_turn matches its own by the user text. TIM-99
-        # also: the last prefetch query, sent as the previous message and
+        # and sync_turn matches its own by the user text. The last prefetch
+        # query is sent as the previous message and
         # dropped on memory_forget.
         self._pending_recalls: Dict[str, List[Tuple[str, str]]] = {}
         self._last_query: Dict[str, str] = {}
         self._last_injected: int = 0
-        # TIM-95 decision 4: a block fetched before the session id was known.
+        # A block fetched before the session id was known.
         self._pending_block_id: Optional[str] = None
         # Whether a PUT has set the bank up. Until one does, every bank
         # operation retries it first.
@@ -116,7 +116,7 @@ class AsphodelMemoryProvider(MemoryProvider):
         return PROVIDER_NAME
 
     def is_available(self) -> bool:
-        """Config only (TIM-94, decision 3): True when a URL resolves from
+        """Config only: True when a URL resolves from
         ``ASPHODEL_URL`` or ``config.json`` under the active ``HERMES_HOME``.
         Never touches the network; a dead daemon never drops the provider."""
         try:
@@ -246,7 +246,7 @@ class AsphodelMemoryProvider(MemoryProvider):
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Records ``author_id``, ``author_name`` and ``author_is_bot`` for the
-        owner check (decision 1)."""
+        owner check."""
         author_id = kwargs.get("author_id")
         self._author_id = str(author_id) if author_id not in (None, "") else None
         author_name = kwargs.get("author_name")
@@ -291,7 +291,7 @@ class AsphodelMemoryProvider(MemoryProvider):
         """Nothing to drain: the plugin owns no threads."""
 
     def backup_paths(self) -> List[str]:
-        """``[]``: the data lives in the daemon's container (decision 5)."""
+        """``[]``: the data lives in the daemon's container."""
         return []
 
     # -- the reply path ------------------------------------------------------

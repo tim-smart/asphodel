@@ -2,22 +2,22 @@
 //!
 //! Ingest scans the input for secrets, stores it as a source, splits it into
 //! chunks and queues the chunks. It never calls a model; extraction takes
-//! chunks off the queue ([`crate::queue`]). The decisions it implements:
+//! chunks off the queue ([`crate::queue`]). Its invariants:
 //!
 //! - **Sources are kept verbatim** after the secret scan (ADR 0002). The
 //!   stored text is the clean turn, never Hermes' `api_content`.
-//! - **Ingest is idempotent** ("What is a memory record?", TIM-90). The key
+//! - **Ingest is idempotent**. The key
 //!   is bank, session, message time and content hash for a turn, and bank,
 //!   document id and content hash for a document. A conflicting ingest does
 //!   nothing. The hash is taken after redaction, so nothing stored is
 //!   derived from a secret.
 //! - **Edited documents** are matched by chunk hash: a chunk seen in any
 //!   earlier version of the same document id is skipped, even once its text
-//!   has been swept or erased, because the hash is the tombstone (TIM-92).
+//!   has been swept or erased, because the hash is the tombstone.
 //! - **The turn that asks to forget** is stored as a tombstone only: its key
 //!   and nothing else. It's never chunked or queued, and its recall row is
 //!   deleted (ADR 0010).
-//! - **Speakers** (TIM-94, decision 1) are resolved by `<platform>:<id>`
+//! - **Speakers** are resolved by `<platform>:<id>`
 //!   through `speaker_ids`, never through aliases. The owner's platform ids
 //!   map to the seeded `user`, a turn with no author is the owner's, and
 //!   anyone else becomes a `person` entity with a speaker id of their own.
@@ -41,7 +41,7 @@ use crate::store::bank::{add_alias, log_edit, set_speaker_id};
 use crate::store::{Store, StoreError, micros, nfc};
 use crate::system_prompt::BlockEntry;
 
-/// Hermes' `turn_author` (TIM-94, decision 1).
+/// Hermes' `turn_author`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnAuthor {
     /// The platform's id for the speaker, such as a Discord user id. The
@@ -53,8 +53,8 @@ pub struct TurnAuthor {
     pub is_bot: bool,
 }
 
-/// What `sync_turn` sends (TIM-94, decision 5 as amended by TIM-96 and
-/// TIM-99). The plugin has already stripped any backfilled channel history
+/// What `sync_turn` sends. The plugin has already stripped any backfilled
+/// channel history
 /// before `[New message]`; the `[Name] ` prefix in shared threads stays and
 /// is stored as sent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,7 +88,7 @@ pub struct Document {
     /// `--date`. The document's `observed_at` is the start of this day in
     /// its timezone.
     pub reference_date: Date,
-    /// `false` with `--inexact` (TIM-92).
+    /// `false` with `--inexact`.
     pub reference_date_exact: bool,
     /// The bank's default when absent.
     pub timezone: Option<String>,
@@ -162,7 +162,7 @@ impl From<rusqlite::Error> for IngestError {
     }
 }
 
-/// Queue priorities: turns go ahead of document chunks (TIM-92).
+/// Queue priorities: turns go ahead of document chunks.
 pub(crate) const PRIORITY_TURN: i64 = 0;
 pub(crate) const PRIORITY_DOCUMENT: i64 = 1;
 
@@ -176,13 +176,13 @@ pub const TURN_SEPARATOR: &str = "\n\n";
 /// `in_context` is the session's in-context set as this turn's sync leaves
 /// it, the memories the agent could see when it wrote the reply. It's
 /// stored with the turn in the same transaction, and extraction judges the
-/// turn's `used` verdicts against it alone (ADR 0001, TIM-110 review). A
+/// turn's `used` verdicts against it alone (ADR 0001). A
 /// duplicate or a tombstone stores none.
 ///
 /// `entries` are the mental model entries of the block the session holds.
 /// Those whose cited memories are all in `in_context` are stored with it,
 /// and call 1 is shown them, so a reply relying on one is `used` on every
-/// memory it cites (TIM-95, decision 4).
+/// memory it cites.
 pub fn ingest_turn(
     store: &Store,
     bank: &str,
@@ -350,7 +350,7 @@ pub fn ingest_document(
     let (bank_id, bank_timezone) = find_bank(&tx, bank)?.ok_or(IngestError::UnknownBank)?;
     let timezone = resolve_timezone(document.timezone.as_deref(), &bank_timezone)?;
     let zone = TimeZone::get(&timezone).map_err(|_| IngestError::InvalidTimezone)?;
-    // TIM-90: a time is stored as the start of its unit in the source's
+    // A time is stored as the start of its unit in the source's
     // timezone, so the reference date is that day's midnight there.
     let observed_at = micros(
         document
@@ -549,7 +549,7 @@ fn count_turn(tx: &Transaction<'_>, bank_id: i64, message_at: i64) -> Result<(),
 /// Whether a chunk with this hash was stored for an earlier version of the
 /// document, whatever has happened to its text since. The version being
 /// ingested (`source_id`) doesn't count, so a section repeated within it is
-/// stored and queued each time (TIM-92 skips earlier versions only).
+/// stored and queued each time.
 fn seen_before(
     tx: &Transaction<'_>,
     bank_id: i64,

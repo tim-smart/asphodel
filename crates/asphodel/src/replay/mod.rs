@@ -1,7 +1,5 @@
 //! `asphodel replay`: a scripted scenario or a real-history corpus on a
-//! simulated clock ("Replay harness: simulated-clock replay of recorded
-//! sessions", TIM-96, with its TIM-97, TIM-98 and TIM-116 amendments;
-//! `docs/replay.md`).
+//! simulated clock (`docs/replay.md`).
 //!
 //! The command opens its own store under the private replay dir with
 //! deterministic ids, builds the service layer on the fake models or the
@@ -21,8 +19,8 @@
 //! refused. Everything derived from real history is refused outside the
 //! private dir; only the `--aggregate` export may leave it.
 //!
-//! `--self-test` runs the simulation twice under the one lock and requires
-//! the two reports to be byte-identical (TIM-96, decision 3).
+//! `--self-test` runs the simulation twice under the one lock and requires the
+//! two reports to be byte-identical.
 //!
 //! Exit 0 when every probe passed; 1 when one failed, with the report
 //! written; 2 when the arguments or the scenario were refused, or the run
@@ -82,7 +80,7 @@ pub(crate) const STORE_MARKER: &str = "replay-store";
 /// The shadow table under the replay dir.
 pub(crate) const SHADOW_FILE: &str = "shadow.db";
 
-/// Replay never skips the reranker (TIM-96, decision 3).
+/// Replay never skips the reranker.
 pub(crate) const NO_DEADLINE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Runs the command and exits with the documented code.
@@ -186,7 +184,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         let clock = Arc::new(SimulatedClock::new(start));
         let store = open_store(&dir, Arc::clone(&clock) as Arc<dyn Clock>)?;
         // Replay records the fingerprint on its own store and never pauses
-        // purge (TIM-98 amendment).
+        // purge.
         store.check_fingerprint(&tuning.deletion_fingerprint())?;
         let service = Service::with_models(
             Arc::clone(&clock) as Arc<dyn Clock>,
@@ -253,8 +251,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
     })
 }
 
-/// Writes the shadow table and computes the purged-then-re-mentioned rate
-/// (TIM-97, decision 7).
+/// Writes the shadow table and computes the purged-then-re-mentioned rate.
 pub(crate) fn write_shadow(
     service: &Service,
     tuning: &Tuning,
@@ -329,7 +326,7 @@ pub(crate) fn failure(failure: Failure) -> anyhow::Error {
     }
 }
 
-/// The real models, with the pinned thread count (TIM-96, decision 3).
+/// The real models, with the pinned thread count.
 pub(crate) fn load_models(
     model_dir: Option<&Path>,
     threads: Option<NonZeroUsize>,
@@ -346,8 +343,8 @@ pub(crate) fn clone_models(models: &Models) -> Models {
     }
 }
 
-/// The private directory (TIM-96, decision 8): given, not in a git working
-/// tree, and not a `serve` data dir.
+/// The private directory: given, not in a git working tree, and not a `serve`
+/// data dir.
 pub(crate) fn private_dir(given: Option<&Path>) -> anyhow::Result<PathBuf> {
     let Some(dir) = given else {
         bail!("replay needs a private directory: set ASPHODEL_REPLAY_DIR or pass --replay-dir");
@@ -439,8 +436,8 @@ fn is_reserved(dir: &Path, path: &Path) -> bool {
         .any(|name| path == dir.join(name))
 }
 
-/// A file derived from real history (TIM-96, decision 8): it must be
-/// under the private dir, and not one of replay's own files.
+/// A file derived from real history: it must be under the private dir, and not
+/// one of replay's own files.
 pub(crate) fn inside_private(dir: &Path, path: &Path, what: &str) -> anyhow::Result<PathBuf> {
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         bail!(
@@ -506,11 +503,11 @@ pub(crate) fn json_error(
     )
 }
 
-/// Where the report goes, checked before the run (TIM-96, decision 8):
-/// `--report`, or `<replay dir>/reports/<name>.json`. A scripted report
-/// may go outside the private dir, since it derives from a checked-in
-/// fixture, but never inside a git working tree, through a symlink, or
-/// over replay's private directory, lock, shadow table or store.
+/// Where the report goes, checked before the run: `--report`, or `<replay
+/// dir>/reports/<name>.json`. A scripted report may go outside the private dir,
+/// since it derives from a checked-in fixture, but never inside a git working
+/// tree, through a symlink, or over replay's private directory, lock, shadow
+/// table or store.
 fn report_path(given: Option<&Path>, dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
     let path = match given {
         Some(path) => path.to_owned(),
@@ -671,7 +668,7 @@ fn reset_store(store_dir: &Path) -> anyhow::Result<bool> {
 }
 
 /// Code defaults, the fake floors (on the fakes), `--config`, a scenario's
-/// `[tuning]`, then `--overrides` (TIM-98 amendment).
+/// `[tuning]`, then `--overrides`.
 pub(crate) fn layered_tuning(
     args: &ReplayArgs,
     scenario_tuning: Option<&toml::Table>,

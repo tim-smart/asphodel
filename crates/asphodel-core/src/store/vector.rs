@@ -1,17 +1,17 @@
 //! Vector search behind a trait, with a flat sqlite-vec implementation.
 //!
-//! "Rust storage and search stack" (TIM-89) picked sqlite-vec's exact,
+//! The implementation uses sqlite-vec's exact,
 //! brute-force `vec0` tables: at tens to hundreds of thousands of memories a
 //! scan is tens of milliseconds, and the table commits and rolls back with
-//! the enclosing transaction. The trait is the hedge the same decision asked
-//! for: if sqlite-vec goes unmaintained, a scan over a BLOB column replaces
-//! it without touching callers. Every operation takes the connection it
+//! the enclosing transaction. The trait provides a fallback: if sqlite-vec
+//! goes unmaintained, a scan over a BLOB column replaces it without touching
+//! callers. Every operation takes the connection it
 //! should run on, so a vector write is part of the memory's transaction.
 
 use rusqlite::Connection;
 
-/// bge-small-en-v1.5's output size, and the width of the `vec0` table
-/// (TIM-89). Changing models means a re-embed and a migration.
+/// bge-small-en-v1.5's output size, and the width of the `vec0` table. Changing
+/// models means a re-embed and a migration.
 pub const EMBEDDING_DIMENSIONS: usize = 384;
 
 /// The most neighbours sqlite-vec 0.1.9 returns from one KNN query
@@ -132,7 +132,7 @@ impl VectorIndex for SqliteVec {
             return Ok(Vec::new());
         }
         // Past sqlite-vec's KNN limit, an exact scan of the bank's vectors
-        // in the same metric (the TIM-108 re-review). It's the brute force
+        // in the same metric. It's the brute force
         // the KNN query does anyway, without the cap.
         let sql = if k <= KNN_K_MAX {
             "SELECT memory_id, distance FROM memory_vectors

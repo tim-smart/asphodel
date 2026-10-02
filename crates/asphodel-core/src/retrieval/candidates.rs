@@ -1,4 +1,4 @@
-//! Cleaning up the retrievers' hits before fusion (TIM-93, decision 1).
+//! Cleaning up the retrievers' hits before fusion.
 //!
 //! - A retracted or hidden hit is dropped. Retracted memories are kept for
 //!   audit only, and a hidden one is waiting to be erased (ADR 0010).

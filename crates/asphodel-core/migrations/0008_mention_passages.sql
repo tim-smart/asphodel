@@ -1,16 +1,16 @@
 -- Asphodel schema, version 8: where a forgotten memory was said.
 --
--- The TIM-112 review found two ways forgotten text outlived the erase.
+-- Forgotten text could outlive the erase in two ways.
 --
--- Version 7 kept a mention's span on its access. A later version of the
--- same document repeating a memory isn't credited (TIM-92), so it left no
--- access and its passage had nowhere to be recorded. Where a memory was
--- restated is provenance for the erase, not strength, so it moves to a
--- table of its own: one row per claim that mentioned, confirmed, or (as an
--- older claim) retracted or refined the memory without becoming a memory
--- itself. `start_offset` and `end_offset` are characters into the chunk's
--- text, as `memories.source_start` and `source_end` are. The spans version
--- 7 stored are copied across, and `accesses.spans` is no longer written.
+-- Version 7 kept a mention's span on its access. A later version of the same
+-- document repeating a memory isn't credited, so it left no access and its
+-- passage had nowhere to be recorded. Where a memory was restated is provenance
+-- for the erase, not strength, so it moves to a table of its own: one row per
+-- claim that mentioned, confirmed, or (as an older claim) retracted or refined
+-- the memory without becoming a memory itself. `start_offset` and `end_offset`
+-- are characters into the chunk's text, as `memories.source_start` and
+-- `source_end` are. The spans version 7 stored are copied across, and
+-- `accesses.spans` is no longer written.
 --
 -- A chunk a document version shares with an earlier one gets no row of its
 -- own, but the version's source text holds it again. `chunk_redactions`

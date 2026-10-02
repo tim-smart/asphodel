@@ -70,8 +70,7 @@ impl Default for PurgeTuning {
     }
 }
 
-/// `[ranking]`: the weights in the retrieval score (TIM-93, decisions 5 and
-/// 6; placed in tuning by TIM-98):
+/// `[ranking]`: the weights in the retrieval score:
 ///
 /// ```text
 /// score = relevance + w_s·strength + max(−3, ln(state_confidence)) + phase_term
@@ -247,7 +246,7 @@ pub struct SessionsTuning {
     /// clock. It's garbage collection only: compaction, reset and rewind
     /// already clear the set, and a thread resumed days later is the same
     /// Hermes session, so expiring early would re-inject what Hermes still
-    /// holds (TIM-93, amended by TIM-109).
+    /// holds.
     pub in_context_idle_days: u32,
 }
 

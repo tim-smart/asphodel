@@ -1,10 +1,9 @@
-//! The private manifest (TIM-96, decision 1): what `state.db` doesn't hold.
-//! The timezone, the owner's platform ids, the owner's and assistant's
-//! names, and the names of the other speakers. Its `[[model]]` tables,
-//! in a scenario's shape, are the mental models a corpus run creates
-//! before the first event, since `state.db` holds none. It lives under the
-//! private dir and nothing in it is ever written anywhere but the corpus
-//! header.
+//! The private manifest: what `state.db` doesn't hold. The timezone, the
+//! owner's platform ids, the owner's and assistant's names, and the names of
+//! the other speakers. Its `[[model]]` tables, in a scenario's shape, are the
+//! mental models a corpus run creates before the first event, since `state.db`
+//! holds none. It lives under the private dir and nothing in it is ever written
+//! anywhere but the corpus header.
 
 use std::path::Path;
 

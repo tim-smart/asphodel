@@ -1,8 +1,8 @@
-# TIM-91's lifetimes table through the store: one mention at each
-# significance level, and how long it stays in recall. Bank time runs at
-# world speed here, so the table's bank days read as days. The ranges are
-# 5% either side of the closed-form crossing, e^((S·σ − τ) / a) days after
-# the mention: 15.09, 62.98, 262.8, 1096.6 and 4576 days.
+# The lifetimes table through the store: one mention at each significance level,
+# and how long it stays in recall. Bank time runs at world speed here, so the
+# table's bank days read as days. The ranges are 5% either side of the
+# closed-form crossing, e^((S·σ − τ) / a) days after the mention: 15.09, 62.98,
+# 262.8, 1096.6 and 4576 days.
 
 name = "lifetimes"
 group = "ci"

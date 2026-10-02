@@ -1,8 +1,7 @@
-//! Call 1's request: the rules, the rendered input and the reply schema
-//! (TIM-92, "Call 1 output", "Significance", "Kinds" and "Time").
+//! Call 1's request: the rules, the rendered input and the reply schema.
 //!
 //! The system prompt is the same for every chunk, so a provider can cache
-//! it; everything about the chunk goes in the user prompt (TIM-87, item 12).
+//! it; everything about the chunk goes in the user prompt.
 
 use std::fmt::Write as _;
 

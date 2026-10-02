@@ -1,12 +1,11 @@
 -- Asphodel schema, version 7: where a mention was said.
 --
--- Forget erases a chain behind the chunks queued before it, and those
--- chunks reconcile against the hidden memory (ADR 0010). A claim that's a
--- new version of the memory joins its chain with a span of its own, but a
--- claim that's only `mentioned_again` or `confirmed` leaves an access, and
--- an access recorded only its source. The erase couldn't tell which part of
--- the turn or document restated the forgotten memory ("Erase path, forget,
--- purge and the nightly sweep", TIM-112).
+-- Forget erases a chain behind the chunks queued before it, and those chunks
+-- reconcile against the hidden memory (ADR 0010). A claim that's a new version
+-- of the memory joins its chain with a span of its own, but a claim that's only
+-- `mentioned_again` or `confirmed` leaves an access, and an access recorded
+-- only its source. The erase couldn't tell which part of the turn or document
+-- restated the forgotten memory.
 --
 -- `spans` is a JSON array of `[chunk, start, end]`: the chunk's rowid and
 -- character offsets into its text, the same units as

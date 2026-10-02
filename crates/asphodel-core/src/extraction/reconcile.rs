@@ -1,5 +1,5 @@
 //! Reconciliation: finding each claim's nearest stored memories and
-//! turning call 2's labels into a plan for the commit (TIM-92, ADR 0005).
+//! turning call 2's labels into a plan for the commit (ADR 0005).
 //!
 //! **Neighbours.** Each claim is searched two ways within its bank: vector
 //! search on its embedding and BM25 over memory content. The two ranked
@@ -51,7 +51,7 @@ use crate::strength::{Chains, Kind, Link as ChainLink};
 /// Hits each retriever takes at first. Superseded versions collapse into
 /// their chain's head and retracted memories drop out, so when fewer than
 /// [`NEIGHBOURS_PER_CLAIM`] distinct memories are left, the retriever asks
-/// for twice as many, until it has them or runs out (the TIM-108 review).
+/// for twice as many, until it has them or runs out.
 const HITS_PER_RETRIEVER: usize = NEIGHBOURS_PER_CLAIM * 4;
 
 /// A neighbour as the plan needs it.
@@ -62,7 +62,7 @@ pub(super) struct Neighbour {
     pub content: String,
     pub kind: Kind,
     pub observed_at: Timestamp,
-    /// Who said it later wins a tie on `observed_at` (TIM-92).
+    /// Who said it later wins a tie on `observed_at`.
     pub ingested_at: Timestamp,
     pub source_id: i64,
     /// The document it came from, if it came from one.
@@ -230,7 +230,7 @@ pub(super) fn search(
 
 /// Each claim call 2 was shown, with its neighbours and the cosine
 /// similarity of the claim to each, the value the reconcile floor
-/// compares, in the metric the search used (TIM-96, decision 6). A
+/// compares, in the metric the search used. A
 /// neighbour whose vector is gone has no similarity.
 pub(super) fn shown_lists(
     conn: &Connection,
@@ -312,7 +312,7 @@ fn nearest(
 }
 
 /// The open tasks and current states linked to the claim's known
-/// entities, newest first (TIM-92, the flagged claim's wider set).
+/// entities, newest first.
 fn linked_open(
     conn: &Connection,
     bank_id: i64,
@@ -436,7 +436,7 @@ pub(super) enum Fate {
     /// A new memory.
     New,
     /// A new memory that's already ended: an older claim that a newer
-    /// neighbour ends (TIM-92).
+    /// neighbour ends.
     NewEnded {
         by: i64,
         until: Stamp,
@@ -589,7 +589,7 @@ pub(super) fn plan(
 
         for &(n, label) in &mentions {
             let neighbour = &search.neighbours[n];
-            // TIM-92: a later version of the same document repeating itself
+            // A later version of the same document repeating itself
             // isn't an independent mention.
             // Its passage is recorded either way: it restated the memory.
             plan.add_passage(neighbour.id, (memory.start, memory.end));
@@ -631,7 +631,7 @@ pub(super) fn plan(
         } else {
             Fate::New
         };
-        // TIM-92: remember-this goes on the neighbour when the claim is
+        // Remember-this goes on the neighbour when the claim is
         // only a mention, and on the new memory otherwise.
         if fate == Fate::Absorbed && memory.kept {
             plan.keeps
@@ -643,8 +643,8 @@ pub(super) fn plan(
 }
 
 /// Where a memory ends when another ends it: the ending memory's start, or,
-/// with none, the day it was said with low confidence (TIM-92, "in both
-/// directions"). The day is the start of that day in the source's timezone,
+/// with none, the day it was said with low confidence. The day is the start
+/// of that day in the source's timezone,
 /// at day precision, as for an event with no stated time.
 pub(super) fn end_at(
     valid_from: Option<Stamp>,

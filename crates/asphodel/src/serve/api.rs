@@ -1,7 +1,6 @@
-//! The HTTP API under `/v1` (TIM-94, decision 10). JSON bodies are the
-//! service layer's own types, and every handler is a thin call into
-//! [`Service`] on a blocking thread, the same calls the replay harness makes
-//! (TIM-96, decision 3).
+//! The HTTP API under `/v1`. JSON bodies are the service layer's own types, and
+//! every handler is a thin call into [`Service`] on a blocking thread, the same
+//! calls the replay harness makes.
 //!
 //! `/v1/health` answers before the daemon is ready, with 503, so a
 //! supervisor can gate readiness on it. Every other route answers 503 until
@@ -385,7 +384,7 @@ impl App {
             .map_err(ApiError::internal)?
     }
 
-    /// Refuses ingest once SIGTERM has arrived (TIM-94, decision 3).
+    /// Refuses ingest once SIGTERM has arrived.
     fn accepting_ingest(&self) -> Result<(), ApiError> {
         if self.draining() {
             Err(ApiError::draining())
@@ -402,9 +401,8 @@ impl App {
     }
 }
 
-/// Checks the bearer token, when the daemon has one. Off loopback it always
-/// has one (TIM-94, decision 2); on loopback it's optional, and checked
-/// when set.
+/// Checks the bearer token, when the daemon has one. Off loopback it always has
+/// one; on loopback it's optional, and checked when set.
 async fn authorize(
     State(app): State<Shared>,
     request: Request,
@@ -552,7 +550,7 @@ struct ListQuery {
     limit: Option<usize>,
 }
 
-/// One audit list of a bank (TIM-99, decision 7).
+/// One audit list of a bank.
 async fn audit(
     app: Shared,
     bank: String,
@@ -603,8 +601,8 @@ async fn recalls(
     audit(app, bank, query, AuditList::Recalls).await
 }
 
-/// `PUT /v1/banks/{bank}`: creates the bank or merges the identity into it
-/// (TIM-94, decision 7). 201 when it created the bank.
+/// `PUT /v1/banks/{bank}`: creates the bank or merges the identity into it. 201
+/// when it created the bank.
 async fn put_bank(
     State(app): State<Shared>,
     Path(bank): Path<String>,
@@ -783,9 +781,9 @@ async fn retry_chunks(
 
 #[derive(Debug, Default, Deserialize)]
 struct SystemPromptQuery {
-    /// The Hermes session the block is for. The daemon records which block
-    /// the session holds, and what it lists or cites joins the session's
-    /// in-context set (TIM-95, decision 4).
+    /// The Hermes session the block is for. The daemon records which block the
+    /// session holds, and what it lists or cites joins the session's in-context
+    /// set.
     #[serde(default)]
     session_id: Option<String>,
 }

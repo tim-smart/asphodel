@@ -1,13 +1,13 @@
-//! Bank create-or-merge (TIM-94, decision 7).
+//! Bank create-or-merge.
 //!
 //! `PUT /v1/banks/{bank}` and `asphodel bank create|config` both land here.
 //! Fields present are set, aliases are added, and absent fields are left
 //! alone, so many Hermes instances calling it can't undo a change made
 //! through the CLI. Renaming adds an alias and never removes one. Creating a
 //! bank seeds the `user` and `assistant` entities with the names as their
-//! first aliases (TIM-92), and the "User profile" mental model; the merge
+//! first aliases, and the "User profile" mental model; the merge
 //! path never seeds, so an owner who deletes the profile doesn't get it back
-//! on the next Hermes start (TIM-95, decision 2).
+//! on the next Hermes start.
 
 use jiff::tz::TimeZone;
 use rusqlite::{OptionalExtension, Transaction};
@@ -19,12 +19,12 @@ use super::{Store, StoreError, micros, nfc};
 /// The timezone a bank gets when none was given at creation.
 pub const DEFAULT_TIMEZONE: &str = "UTC";
 
-/// The seeded profile's question (TIM-95, decision 2).
+/// The seeded profile's question.
 pub const PROFILE_NAME: &str = "User profile";
 pub const PROFILE_QUESTION: &str = "Who is the user: their preferences, important people, work and home, \
      the platforms they use, and how they like to be helped. Not upcoming events, tasks or routines.";
 
-/// The seeded profile's filters (TIM-95, decision 3): facts, plus states of
+/// The seeded profile's filters: facts, plus states of
 /// volatility weeks or slower. A memory with no volatility passes, and there
 /// is no entity filter, since the profile is about the whole bank.
 pub const PROFILE_FILTER_KINDS: &str = r#"["fact","state"]"#;
@@ -39,15 +39,15 @@ pub struct BankIdentity {
     pub owner_name: Option<String>,
     /// Platform ids of the owner, such as `discord:1234`. Each becomes the
     /// `user` entity's speaker id, the only thing a turn's speaker is
-    /// resolved through, and an alias of it (TIM-94, decision 1).
+    /// resolved through, and an alias of it.
     pub owner_platform_ids: Vec<String>,
     pub assistant_name: Option<String>,
     /// An IANA timezone name, the default for sources without one.
     pub timezone: Option<String>,
 }
 
-/// The models a bank is served with, recorded at creation (TIM-94,
-/// decision 4). A later change goes through `asphodel reembed`.
+/// The models a bank is served with, recorded at creation. A later change goes
+/// through `asphodel reembed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelIds {
     pub embedding: String,
@@ -323,8 +323,8 @@ fn rename_entity(
     Ok(add_alias(tx, store, bank_id, entity_id, name)?)
 }
 
-/// Adds an alias, logging it as an edit so a mislink can be undone
-/// (TIM-92). An alias the entity already has is left alone and not logged.
+/// Adds an alias, logging it as an edit so a mislink can be undone. An alias
+/// the entity already has is left alone and not logged.
 pub(crate) fn add_alias(
     tx: &Transaction<'_>,
     store: &Store,
@@ -421,7 +421,7 @@ pub(crate) fn log_edit(
     Ok(())
 }
 
-/// Logs an edit to a memory's metadata (TIM-90, "every edit logged").
+/// Logs an edit to a memory's metadata.
 /// `details` holds ids, times and levels, never content.
 pub(crate) fn log_memory_edit(
     tx: &Transaction<'_>,

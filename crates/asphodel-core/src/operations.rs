@@ -1,6 +1,4 @@
-//! Backup, restore, status and the audit lists ("Operations: backup,
-//! restore, status and audit lists", TIM-114; TIM-99, decisions 1, 6 and 7;
-//! ADR 0010).
+//! Backup, restore, status and the audit lists (ADR 0010).
 //!
 //! - **Backup** takes SQLite's online backup into a temporary file in the
 //!   data dir, writes the backup time into the copy, checks it with
@@ -638,7 +636,7 @@ impl From<rusqlite::Error> for AuditError {
     }
 }
 
-/// The audit lists (TIM-99, decision 7).
+/// The audit lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditList {

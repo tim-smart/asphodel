@@ -1,7 +1,5 @@
-//! The nightly sweep, and acknowledging a purge pause ("Deletion policy",
-//! TIM-97, decisions 1, 3, 4 and 6, as amended by TIM-99; ADR 0008; ADR
-//! 0009; ADR 0010, "Sweeps, pauses and failures"; "Erase path, forget,
-//! purge and the nightly sweep", TIM-112).
+//! The nightly sweep, and acknowledging a purge pause (ADR 0008; ADR 0009; ADR
+//! 0010, "Sweeps, pauses and failures").
 //!
 //! **When.** Each bank's sweep runs at `mental_models.sweep_time` bank-local
 //! (04:00), on the service's clock, once a day. The daemon runs it before
@@ -377,8 +375,8 @@ fn is_eligible(
 
 /// Purge's second phase, in one transaction: re-reads the chain `head` is
 /// in now, whether any of it is hidden, its head's strength and both
-/// guards, and purges the chain only if it's still eligible (the TIM-112
-/// review). Between the phases a keep, a mention or a new successor can
+/// guards, and purges the chain only if it's still eligible. Between the phases
+/// a keep, a mention or a new successor can
 /// make it ineligible, and a forget can hide it, which leaves it to the
 /// forget's erase, the one that redacts. `None` when nothing was purged.
 pub(crate) fn purge_chain(

@@ -1,8 +1,7 @@
-# A rescheduled appointment (TIM-91, decision 3; TIM-97, decisions 2 and
-# 3). The new slot retracts the old one and becomes the head of the chain.
-# The dated agenda, judged by bank-local date, lists the new slot once it's
-# within the seven-day horizon and never the retracted one, and drops the
-# appointment once it has happened, when the memory is recently past.
+# A rescheduled appointment. The new slot retracts the old one and becomes the
+# head of the chain. The dated agenda, judged by bank-local date, lists the new
+# slot once it's within the seven-day horizon and never the retracted one, and
+# drops the appointment once it has happened, when the memory is recently past.
 #
 # Times are given in UTC; the bank is in Auckland (UTC+13 in February), so
 # 2026-02-02T20:00Z is 09:00 on 3 February bank-local.

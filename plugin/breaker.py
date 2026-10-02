@@ -1,4 +1,4 @@
-"""The circuit breaker (TIM-94, decision 6): after three consecutive
+"""The circuit breaker: after three consecutive
 connection failures the plugin skips the network for 30 s, so a sidecar
 restart doesn't cost every turn a timeout."""
 

@@ -1,16 +1,12 @@
-//! The subcommand tree from "API surface and Hermes transport" (TIM-94,
-//! decision 10), plus `replay` and `bench` from the replay harness decision
-//! (TIM-96). `serve` runs the daemon; `ingest`, `bank`, `chunks`, `recall`,
-//! `forget`, `keep`, `unkeep`, `memory`, `entity`, `model`, `reembed`,
-//! `purge`, `backup`, `status` and the audit lists are HTTP clients of it
-//! ([`crate::client`]); `models fetch`
-//! and `llm login` work on files, and `restore` works on the data dir
-//! offline (ADR 0010).
-//! `replay` runs scripted scenarios and real-history corpora, `import`
-//! writes those corpora, `report diff` compares runs, `report html` renders
-//! one, `report precision` turns labelled material into a precision curve,
-//! and `bench` drives a daemon on a copy of a replayed store (TIM-96,
-//! TIM-117, TIM-121).
+//! The daemon and replay subcommands. `serve` runs the daemon; `ingest`,
+//! `bank`, `chunks`, `recall`, `forget`, `keep`, `unkeep`, `memory`, `entity`,
+//! `model`, `reembed`, `purge`, `backup`, `status` and the audit lists are HTTP
+//! clients of it ([`crate::client`]); `models fetch` and `llm login` work on
+//! files, and `restore` works on the data dir offline (ADR 0010). `replay` runs
+//! scripted scenarios and real-history corpora, `import` writes those corpora,
+//! `report diff` compares runs, `report html` renders one, `report precision`
+//! turns labelled material into a precision curve, and `bench` drives a daemon
+//! on a copy of a replayed store.
 
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -259,7 +255,7 @@ pub enum BankCommand {
     },
 }
 
-/// A bank's identity (TIM-94, decision 7), as `PUT /v1/banks/{bank}` takes it.
+/// A bank's identity, as `PUT /v1/banks/{bank}` takes it.
 #[derive(Debug, Args)]
 pub struct IdentityArgs {
     /// The owner's name, an alias of the `user` entity.
@@ -432,7 +428,7 @@ pub struct StatusArgs {
     pub client: ClientArgs,
 }
 
-/// The audit lists (TIM-99, decision 7).
+/// The audit lists.
 #[derive(Debug, Args)]
 pub struct ListArgs {
     #[command(flatten)]
@@ -447,8 +443,7 @@ pub struct ListArgs {
     pub limit: Option<usize>,
 }
 
-/// `asphodel model`: only the owner defines models, through here or the
-/// API (TIM-95, decision 2).
+/// `asphodel model`: only the owner defines models, through here or the API.
 #[derive(Debug, Subcommand)]
 pub enum ModelCommand {
     /// Define a model: a standing question its entries answer.
@@ -727,9 +722,9 @@ pub enum LlmCommand {
     },
 }
 
-/// `asphodel replay`: a scripted scenario on a simulated clock (TIM-96;
-/// `docs/replay.md`). Exit 0 when every probe passed, 1 when one failed
-/// (the report is still written), 2 when the run was refused or failed.
+/// `asphodel replay`: a scripted scenario on a simulated clock
+/// (`docs/replay.md`). Exit 0 when every probe passed, 1 when one failed (the
+/// report is still written), 2 when the run was refused or failed.
 #[derive(Debug, Args)]
 pub struct ReplayArgs {
     /// The private directory holding the replayed store, the shadow table
@@ -816,8 +811,7 @@ pub struct ReplayArgs {
     pub token_dir: Option<PathBuf>,
 }
 
-/// Where a real-history replay's LLM replies come from (TIM-96, decision
-/// 4).
+/// Where a real-history replay's LLM replies come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ReplayMode {
     /// Use the cassette, and call and record on a miss.
@@ -837,8 +831,8 @@ pub enum RefreshMode {
     Off,
 }
 
-/// `asphodel import`: a copy of Hermes' `state.db` and the private
-/// manifest into a replay corpus (TIM-96, decision 1).
+/// `asphodel import`: a copy of Hermes' `state.db` and the private manifest
+/// into a replay corpus.
 #[derive(Debug, Args)]
 pub struct ImportArgs {
     /// The private directory the corpus goes under.
@@ -875,8 +869,8 @@ pub enum ReportCommand {
     Precision(PrecisionArgs),
 }
 
-/// `asphodel report html`: the page goes beside the report unless `--out`
-/// says otherwise; both stay under the private dir (TIM-96, decision 7).
+/// `asphodel report html`: the page goes beside the report unless `--out` says
+/// otherwise; both stay under the private dir.
 #[derive(Debug, Args)]
 pub struct HtmlArgs {
     /// The private directory the report and the page are in.
@@ -892,7 +886,7 @@ pub struct HtmlArgs {
     pub out: Option<PathBuf>,
 }
 
-/// `asphodel report precision`: the curve on stdout (TIM-96, decision 6).
+/// `asphodel report precision`: the curve on stdout.
 #[derive(Debug, Args)]
 pub struct PrecisionArgs {
     /// The private directory the labels and the material are in.
@@ -918,8 +912,8 @@ pub struct DiffArgs {
     pub force: bool,
 }
 
-/// `asphodel bench`: concurrent prefetches over HTTP against a daemon
-/// started on a copy of the replayed store (TIM-96, decision 3).
+/// `asphodel bench`: concurrent prefetches over HTTP against a daemon started
+/// on a copy of the replayed store.
 #[derive(Debug, Args)]
 pub struct BenchArgs {
     /// The private directory whose replayed store is copied.
@@ -1017,7 +1011,7 @@ pub(crate) fn resolve_model_dir(
 }
 
 /// `asphodel models fetch`: fills the model dir from the manifest, skipping
-/// files already present with the right checksum (TIM-94, decision 4).
+/// files already present with the right checksum.
 fn models_fetch(model_dir: Option<PathBuf>) -> anyhow::Result<()> {
     let dir = resolve_model_dir(model_dir.as_deref())?;
     let report = fetch_models(&dir, &manifest(), &HttpFetcher::new())

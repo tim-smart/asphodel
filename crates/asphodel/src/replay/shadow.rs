@@ -1,8 +1,8 @@
-//! The shadow table of purged rows (TIM-97, decision 7). Replay keeps the
-//! content and embedding of every memory purge removed, only inside
-//! `ASPHODEL_REPLAY_DIR`, and counts after the run how many memories
-//! created later would have reconciled against one: the purged-then-re-
-//! mentioned rate, which sets δ before the first production purge.
+//! The shadow table of purged rows. Replay keeps the content and embedding of
+//! every memory purge removed, only inside `ASPHODEL_REPLAY_DIR`, and counts
+//! after the run how many memories created later would have reconciled against
+//! one: the purged-then-re-mentioned rate, which sets δ before the first
+//! production purge.
 
 use std::path::Path;
 

@@ -9,12 +9,12 @@
 //!
 //! [`Models::load`]: super::Models::load
 
-/// bge-small-en-v1.5, int8, 384 dimensions (TIM-89). The exact string,
+/// bge-small-en-v1.5, int8, 384 dimensions. The exact string,
 /// quantisation included, keys the reconcile floor and is what a bank
-/// records: int8 and fp32 give different scores (TIM-98).
+/// records: int8 and fp32 give different scores.
 pub const EMBEDDING_MODEL_ID: &str = "bge-small-en-v1.5:int8";
 
-/// jina-reranker-v1-turbo-en, int8 (TIM-93, decision 3). Keys the gate
+/// jina-reranker-v1-turbo-en, int8. Keys the gate
 /// floor.
 pub const RERANKER_MODEL_ID: &str = "jina-reranker-v1-turbo-en:int8";
 

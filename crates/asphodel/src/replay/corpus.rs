@@ -1,12 +1,11 @@
 //! The corpus: what `asphodel import` writes and real-history `replay` and
-//! `bench` read (TIM-96, decision 1). JSON lines under the private dir: a
-//! header, then one event per line in time order. Its SHA-256 is the
-//! corpus hash every report embeds (decision 6), so the same history
-//! always writes the same bytes.
+//! `bench` read. JSON lines under the private dir: a header, then one event per
+//! line in time order. Its SHA-256 is the corpus hash every report embeds, so
+//! the same history always writes the same bytes.
 //!
 //! The corpus carries the turns' text, so it never leaves
-//! `ASPHODEL_REPLAY_DIR`. It never carries the system prompt or
-//! `api_content`, which the importer doesn't read (decision 8).
+//! `ASPHODEL_REPLAY_DIR`. It never carries the system prompt or `api_content`,
+//! which the importer doesn't read.
 
 use std::fs;
 use std::path::Path;

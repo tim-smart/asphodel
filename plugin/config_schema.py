@@ -1,5 +1,6 @@
-"""The dashboard's view of the plugin config (TIM-88, "Config and the setup
-wizard"). Hermes loads this file by path and never imports the package, so it
+"""The dashboard's view of the plugin config.
+
+Hermes loads this file by path and never imports the package, so it
 may import only ``plugins.memory.config_schema``. Keep it in step with
 ``config.config_schema()``."""
 
