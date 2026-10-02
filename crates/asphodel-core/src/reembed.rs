@@ -15,7 +15,9 @@
 //! lease, so no chunk is in flight, embeds whatever the job hasn't reached
 //! yet, and in one transaction replaces the bank's vectors with the side
 //! table's, records the new model, and deletes the job and its side rows.
-//! A memory erased during the job is left out: its side row is skipped.
+//! A memory erased during the job takes its staged vector with it in the
+//! erase's transaction, and a batch embedded while its memories were
+//! erased, or its bank deleted, stages only what's still there.
 //!
 //! The job and its side table are the schema's version 10 migration.
 //!
@@ -243,6 +245,13 @@ pub(crate) fn step(
     let vectors = embed(store, embedder, &batch)?;
     let mut conn = store.connection();
     let tx = conn.transaction()?;
+    // The store wasn't held while the model ran: a bank deletion may have
+    // removed the job, and an erase the memories. A batch whose job is gone
+    // is dropped, and only memories still in the bank are staged.
+    let still_running = job(&tx, bank_id)?.is_some_and(|job| job.model == embedder.model_id());
+    if !still_running {
+        return Ok(0);
+    }
     for ((memory_id, _), vector) in batch.iter().zip(&vectors) {
         stage(&tx, bank_id, *memory_id, vector)?;
     }
@@ -307,8 +316,11 @@ fn stage(
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
+    // Only a memory still in the bank: one erased while the model ran
+    // leaves nothing staged behind.
     conn.execute(
-        "INSERT INTO reembed_vectors (bank_id, memory_id, embedding) VALUES (?1, ?2, ?3)
+        "INSERT INTO reembed_vectors (bank_id, memory_id, embedding)
+         SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM memories WHERE id = ?2 AND bank_id = ?1)
          ON CONFLICT (memory_id) DO UPDATE SET embedding = excluded.embedding",
         (bank_id, memory_id, bytes),
     )?;
@@ -355,6 +367,9 @@ pub(crate) fn swap(
 
     let mut conn = store.connection();
     let tx = conn.transaction()?;
+    if !job(&tx, bank_id)?.is_some_and(|job| job.model == embedder.model_id()) {
+        return Ok(None);
+    }
     for ((memory_id, _), vector) in tail.iter().zip(&tail_vectors) {
         stage(&tx, bank_id, *memory_id, vector)?;
     }

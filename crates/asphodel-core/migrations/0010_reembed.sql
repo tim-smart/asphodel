@@ -7,9 +7,9 @@
 -- records the model in `banks.embedding_model` and deletes both rows in one
 -- transaction. Until then the bank is served with its recorded model.
 --
--- The side table has no foreign key to `memories`: an erase during the job
--- leaves its rows behind, and the swap takes only rows whose memory is
--- still there.
+-- The side table has no foreign key to `memories`: the erase deletes a
+-- memory's staged row in its own transaction, staging checks the memory
+-- is still there, and the swap takes only rows whose memory is.
 --
 -- IF NOT EXISTS, so running it again over a store that has it is harmless,
 -- including one an earlier build created these tables in at open.

@@ -30,7 +30,9 @@ use crate::ingest::find_bank;
 use crate::mental_models::{Model, find_model, model};
 use crate::store::strength::{StrengthLoader, window, world_time};
 use crate::store::{Store, StoreError, timestamp};
-use crate::strength::{Phase, WorldTime, chain, chain_head, projected_below, unit_end};
+use crate::strength::{
+    Phase, WorldTime, chain, chain_head, projected_below, projected_below_after, unit_end,
+};
 
 /// The most linked memories `entity show` lists, newest first.
 pub const ENTITY_MEMORIES: usize = 100;
@@ -435,23 +437,24 @@ pub(crate) fn memory(
     if line.is_some_and(|line| head_strength >= line) {
         guards.push(Guard::Strength);
     }
+    // The first time the guards have cleared and the head is below the
+    // line together: a window closing as its date guard clears restarts
+    // recent use, so the head can be below the line now and above it then.
     let purge = match line {
         Some(line) if !hidden => {
             let head_inputs = loader.inputs(&conn, head)?;
-            projected_below(
+            projected_below_after(
                 head_inputs.significance,
                 &head_inputs.accesses,
                 head_inputs.close,
                 loader.bank_time(),
                 now,
+                held_until.map_or(now, |held| held.max(now)),
                 line,
             )
-            .map(|days| {
-                let at = later(now, days);
-                Projected {
-                    bank_days: days,
-                    earliest_at: held_until.map_or(at, |held| held.max(at)),
-                }
+            .map(|days| Projected {
+                bank_days: days,
+                earliest_at: later(now, days),
             })
         }
         _ => None,

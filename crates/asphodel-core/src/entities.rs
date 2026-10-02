@@ -693,11 +693,23 @@ pub(crate) fn edit_link(
             (memory_id, entity.id),
         )?
     } else {
+        // The entity and every entity merged into it, however many merges
+        // back: a merge keeps a link `into` already had on `from`, so after
+        // two merges a link can sit two hops from the survivor. Bounded like
+        // `survivor()`.
         tx.execute(
             "DELETE FROM memory_entities
              WHERE memory_id = ?1
-               AND (entity_id = ?2
-                    OR entity_id IN (SELECT id FROM entities WHERE merged_into = ?2))",
+               AND entity_id IN (
+                 WITH RECURSIVE merged (id, depth) AS (
+                   SELECT ?2, 0
+                   UNION
+                   SELECT e.id, m.depth + 1 FROM entities e
+                   JOIN merged m ON e.merged_into = m.id
+                   WHERE m.depth < 64
+                 )
+                 SELECT id FROM merged
+               )",
             (memory_id, entity.id),
         )?
     } > 0;

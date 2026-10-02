@@ -38,7 +38,7 @@ mod log;
 mod rerank;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
 use jiff::tz::TimeZone;
@@ -246,6 +246,12 @@ pub enum RecallError {
     )]
     ModelUnavailable { model: String },
 
+    /// A re-embed swapped the bank's model while the query was embedded,
+    /// and again while it was embedded once more with the new model. The
+    /// query was never searched against vectors of another model.
+    #[error("the bank's embedding model changed while the query was embedded; try again")]
+    ModelChanged,
+
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -409,20 +415,49 @@ pub(crate) struct Context<'a> {
     pub deadline: Duration,
 }
 
+/// How many times a query is embedded before a recall gives up on a bank
+/// whose model keeps changing under it: once, and once more after a swap.
+const QUERY_EMBED_ATTEMPTS: usize = 2;
+
 impl Context<'_> {
-    /// The embedder `bank_id` is served with: the model it recorded, until
-    /// a re-embed swaps it (ADR 0010). Refused when the daemon doesn't
-    /// carry that model.
-    pub(crate) fn embedder(
+    /// Embeds `query` with the model `bank_id` is served with, and returns
+    /// the vector together with the store's connection, held, under which
+    /// that model is still the one the bank records (ADR 0010). The model
+    /// isn't run under the connection, so a re-embed's swap can land while
+    /// it runs. That's caught when the connection is taken back, and the
+    /// query embedded again with the new model, up to
+    /// [`QUERY_EMBED_ATTEMPTS`]. A swap writes through the same connection,
+    /// so none can come between the check and the vector search the caller
+    /// runs on it. Refused when the daemon doesn't carry the bank's model.
+    pub(crate) fn embed_query(
         &self,
         bank_id: i64,
-    ) -> Result<&dyn crate::models::Embedder, RecallError> {
-        let recorded = {
+        query: &str,
+    ) -> Result<(Vec<f32>, MutexGuard<'_, Connection>), RecallError> {
+        for _ in 0..QUERY_EMBED_ATTEMPTS {
+            let recorded = {
+                let conn = self.store.connection();
+                crate::reembed::recorded_model(&conn, bank_id)?
+            };
+            let embedder = crate::models::serving(self.models, self.previous, &recorded)
+                .ok_or_else(|| RecallError::ModelUnavailable {
+                    model: recorded.clone(),
+                })?;
+            let vector = embedder
+                .embed(&[query])
+                .map_err(|error| RecallError::Model { error })?
+                .pop()
+                .unwrap_or_default();
             let conn = self.store.connection();
-            crate::reembed::recorded_model(&conn, bank_id)?
-        };
-        crate::models::serving(self.models, self.previous, &recorded)
-            .ok_or(RecallError::ModelUnavailable { model: recorded })
+            if crate::reembed::recorded_model(&conn, bank_id)? == recorded {
+                return Ok((vector, conn));
+            }
+            tracing::debug!(
+                bank_id,
+                "a re-embed swapped the bank while its query was embedded"
+            );
+        }
+        Err(RecallError::ModelChanged)
     }
 }
 
@@ -715,19 +750,16 @@ pub(crate) fn select(
     let started = Instant::now();
     let now = cx.store.now();
     let query = question.trim();
-    let vector = if query.is_empty() {
-        None
+    // The vector search runs on the connection the query's model was
+    // checked under, so a re-embed's swap can't come between them.
+    let (vector, conn) = if query.is_empty() {
+        (None, cx.store.connection())
     } else {
-        Some(
-            cx.embedder(bank_id)?
-                .embed(&[query])
-                .map_err(|error| RecallError::Model { error })?
-                .pop()
-                .unwrap_or_default(),
-        )
+        let (vector, conn) = cx.embed_query(bank_id, query)?;
+        (Some(vector), conn)
     };
     let (found, cited) = {
-        let conn = cx.store.connection();
+        let conn = conn;
         let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning.clock.quiet_rate, now, keep)?;
         let mut ids = match &vector {
             Some(vector) => {
@@ -943,13 +975,9 @@ fn gather(
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    let vector = cx
-        .embedder(bank_id)?
-        .embed(&[query])
-        .map_err(|error| RecallError::Model { error })?
-        .pop()
-        .unwrap_or_default();
-    let conn = cx.store.connection();
+    // The vector search runs on the connection the query's model was
+    // checked under, so a re-embed's swap can't come between them.
+    let (vector, conn) = cx.embed_query(bank_id, query)?;
     let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning.clock.quiet_rate, now, keep)?;
     let vector_hits = arms::vector(&conn, bank_id, &vector, CANDIDATES_PER_ARM)?;
     let bm25_hits = arms::bm25(&conn, bank_id, query, CANDIDATES_PER_ARM)?;

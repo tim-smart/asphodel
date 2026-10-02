@@ -227,6 +227,31 @@ pub fn projected_below(
     now: Timestamp,
     threshold: f64,
 ) -> Option<f64> {
+    projected_below_after(
+        significance,
+        accesses,
+        close,
+        bank_time,
+        now,
+        now,
+        threshold,
+    )
+}
+
+/// [`projected_below`], but the first time at or after `after` that
+/// strength is below `threshold`: purge's projection, which can't come
+/// before its guards clear, and must still find strength below the line
+/// then, after any window close that restarted recent use. Still in bank
+/// days from `now`.
+pub fn projected_below_after(
+    significance: f64,
+    accesses: &[Access],
+    close: Option<WindowClose>,
+    bank_time: &BankTime,
+    now: Timestamp,
+    after: Timestamp,
+    threshold: f64,
+) -> Option<f64> {
     let clock = bank_time.at_full_speed_from(now);
     let at = |days: f64| {
         now.checked_add(jiff::SignedDuration::from_secs_f64(days * 86_400.0))
@@ -234,8 +259,9 @@ pub fn projected_below(
     };
     let value = |days: f64| strength(significance, accesses, close, &clock, at(days)).value;
     let below = |days: f64| value(days) < threshold;
-    if below(0.0) {
-        return Some(0.0);
+    let start = world_days(now, after).max(0.0);
+    if below(start) {
+        return Some(start);
     }
     // Precise to about a minute.
     const PRECISION: f64 = 1.0 / 1440.0;
@@ -250,14 +276,14 @@ pub fn projected_below(
         }
         high
     };
-    let mut from = 0.0;
+    let mut from = start;
     if let Some(close) = close {
         let restart = close.closes_at.max(close.known_at);
-        if restart > now {
-            let until = world_days(now, restart);
-            let before = (until - PRECISION).max(0.0);
+        let until = world_days(now, restart);
+        if until > start {
+            let before = (until - PRECISION).max(start);
             if below(before) {
-                return Some(search(0.0, before));
+                return Some(search(start, before));
             }
             from = until;
         }

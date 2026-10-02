@@ -224,7 +224,7 @@ impl From<RecallError> for ApiError {
             RecallError::InvertedRange => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
             RecallError::NoModels => Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
             RecallError::Model { .. } => Self::internal(error),
-            RecallError::ModelUnavailable { .. } => {
+            RecallError::ModelUnavailable { .. } | RecallError::ModelChanged => {
                 Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
             }
             RecallError::Store(error) => error.into(),

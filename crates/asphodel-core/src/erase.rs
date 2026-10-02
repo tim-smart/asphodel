@@ -360,6 +360,8 @@ pub(crate) fn erase_chain(
             other => rusqlite::Error::ToSqlConversionFailure(Box::new(other)),
         })?;
         tx.execute("DELETE FROM memories WHERE id = ?1", [member])?;
+        // A re-embed may have staged its vector too (ADR 0010).
+        tx.execute("DELETE FROM reembed_vectors WHERE memory_id = ?1", [member])?;
     }
     delete_orphans(tx, &entities)?;
 
