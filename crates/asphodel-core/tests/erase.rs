@@ -46,6 +46,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use asphodel_core::erase::{EraseReason, Forgotten};
+use asphodel_core::operations::AuditList;
 use asphodel_core::sweep::{PurgeError, Sweeps};
 
 // Fixtures
@@ -971,6 +972,59 @@ fn the_sweep_purges_a_faded_chain_at_four_bank_local_without_redacting() {
 
     // Purge never redacts: the source still holds the passage.
     assert_eq!(h.source_text(h.source), FIXTURE);
+
+    // The audit lists and status read it back: ids and counts, never
+    // content, and only the bank's own (TIM-99, decision 7; TIM-114).
+    h.service
+        .ensure_bank_with_models(
+            "other",
+            &BankIdentity {
+                timezone: Some(TZ.into()),
+                ..BankIdentity::default()
+            },
+        )
+        .unwrap();
+    let list = |bank: &str, list: AuditList, limit: Option<usize>| {
+        serde_json::to_value(h.service.audit(bank, list, limit).unwrap()).unwrap()
+    };
+    let purges = list(BANK, AuditList::Purges, None);
+    let rows = purges["purges"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{purges}");
+    let listed: BTreeSet<Uuid> = rows[0]["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(listed, BTreeSet::from([maya, mia]));
+    assert!(!purges.to_string().contains("Maya") && !purges.to_string().contains("Mia"));
+    assert_eq!(list("other", AuditList::Purges, None)["purges"], json!([]));
+    let last = h.service.status().unwrap().last_sweep.unwrap();
+    assert_eq!((last.bank.as_str(), last.purged_memories), (BANK, 2));
+
+    // A second night: newest first, and a limit keeps the newest.
+    h.set(at(SWEEP) + days(1));
+    h.sweep();
+    let sweeps = list(BANK, AuditList::Sweeps, None);
+    let purged: Vec<&Value> = sweeps["sweeps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| &run["purged_memories"])
+        .collect();
+    assert_eq!(purged, [&json!(0), &json!(2)], "{sweeps}");
+    let newest = list(BANK, AuditList::Sweeps, Some(1));
+    assert_eq!(newest["sweeps"].as_array().unwrap().len(), 1);
+    assert_eq!(newest["sweeps"][0]["purged_memories"], 0);
+    let other = list("other", AuditList::Sweeps, None);
+    assert!(
+        other["sweeps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|run| run["bank"] == "other"),
+        "{other}"
+    );
 }
 
 #[test]

@@ -114,6 +114,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jiff",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

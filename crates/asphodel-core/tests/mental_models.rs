@@ -878,6 +878,15 @@ fn a_failed_refresh_is_retried_after_thirty_minutes_not_at_the_next_trigger() {
     assert_eq!(profile.last_error, Some(FailureKind::Llm));
     assert_eq!(profile.last_error_at, Some(failed_at));
     assert_eq!(profile.last_refreshed_at, None);
+    // `status` counts it and says it needs attention (TIM-114).
+    let status = h.service.status().unwrap();
+    assert_eq!(status.banks[BANK].failed_refreshes, 1);
+    assert_eq!(status.attention.len(), 1, "{:?}", status.attention);
+    assert!(
+        status.attention[0].contains("refresh"),
+        "{:?}",
+        status.attention
+    );
 
     h.advance(minutes(1));
     h.says(notable("Tim keeps bees."));
@@ -892,6 +901,9 @@ fn a_failed_refresh_is_retried_after_thirty_minutes_not_at_the_next_trigger() {
     let profile = h.profile();
     assert_eq!(profile.last_error, None);
     assert_eq!(profile.last_refreshed_at, Some(failed_at + minutes(30)));
+    let status = h.service.status().unwrap();
+    assert_eq!(status.banks[BANK].failed_refreshes, 0);
+    assert_eq!(status.attention, Vec::<String>::new());
 }
 
 #[test]

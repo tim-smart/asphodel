@@ -661,6 +661,12 @@ fn off_loopback_every_route_but_health_needs_the_bearer_token() {
                 "/v1/banks/main/recall",
                 Some(json!({"query": "anything"})),
             ),
+            ("POST", "/v1/backup", None),
+            ("GET", "/v1/status", None),
+            ("GET", "/v1/banks/main/purges", None),
+            ("GET", "/v1/banks/main/forgets", None),
+            ("GET", "/v1/banks/main/sweeps", None),
+            ("GET", "/v1/banks/main/recalls", None),
         ] {
             let reply = request(&addr, method, path, token, body.as_ref()).unwrap();
             assert_eq!(reply.status, 401, "{method} {path} with {token:?}");
@@ -2026,8 +2032,25 @@ fn a_backup_restores_offline_and_writes_a_restored_edit_row() {
     assert!(!details["restored_at"].is_null(), "{details}");
 }
 
+/// Every file in `dir` with its bytes, sorted by name. The lock file's
+/// bytes are left out: they're the pid of whoever last took the lock, a
+/// courtesy for operators that a refused restore rewrites too.
+fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    names(dir)
+        .into_iter()
+        .map(|name| {
+            let bytes = if name == "lock" {
+                Vec::new()
+            } else {
+                fs::read(dir.join(&name)).unwrap()
+            };
+            (name, bytes)
+        })
+        .collect()
+}
+
 #[test]
-fn restore_refuses_while_the_lock_is_held_and_a_newer_schema() {
+fn restore_refuses_while_the_lock_is_held_and_a_damaged_newer_or_foreign_copy() {
     let dir = TestDir::new();
     let daemon = Serve::new(&dir).ready();
     daemon.create_bank("main");
@@ -2042,24 +2065,47 @@ fn restore_refuses_while_the_lock_is_held_and_a_newer_schema() {
     assert_eq!(names(&daemon.data_dir), before);
     assert_eq!(daemon.get("/v1/health").status, 200);
     let data = daemon.data_dir.clone();
+    // SIGKILL leaves the WAL as it was, so the snapshot holds a live WAL.
     drop(daemon);
 
-    // A copy from a newer binary is refused before anything moves.
+    // Each copy is refused before anything in the data dir moves or
+    // changes, and no staged or moved-aside file is left.
+    let full = fs::read(&file).unwrap();
     // `user_version` is the big-endian u32 at offset 60 of the header.
-    let mut bytes = fs::read(&file).unwrap();
-    let newer = asphodel_core::store::SCHEMA_VERSION + 1;
-    bytes[60..64].copy_from_slice(&newer.to_be_bytes());
-    let newer_file = dir.path("newer.db");
-    fs::write(&newer_file, bytes).unwrap();
-    let before = names(&data);
-    let output = restore(&newer_file, &data);
-    assert!(!output.status.success(), "restored a newer schema");
-    assert!(
-        stderr(&output).contains("schema version"),
-        "{}",
-        stderr(&output)
-    );
-    assert_eq!(names(&data), before);
+    let mut newer = full.clone();
+    let version = asphodel_core::store::SCHEMA_VERSION + 1;
+    newer[60..64].copy_from_slice(&version.to_be_bytes());
+    let cases = [
+        ("a newer schema", newer, "schema version"),
+        (
+            "a cut-short copy",
+            full[..full.len() / 2].to_vec(),
+            "integrity check",
+        ),
+        // An empty file is a valid, empty SQLite database.
+        (
+            "a database that isn't a store",
+            Vec::new(),
+            "isn't an Asphodel store",
+        ),
+    ];
+    let before = snapshot(&data);
+    for (case, bytes, message) in cases {
+        let copy = dir.path("copy.db");
+        fs::write(&copy, bytes).unwrap();
+        let output = restore(&copy, &data);
+        assert!(!output.status.success(), "restored {case}");
+        assert!(
+            stderr(&output).contains(message),
+            "{case}: {}",
+            stderr(&output)
+        );
+        assert!(
+            snapshot(&data) == before,
+            "{case} changed {:?}",
+            names(&data)
+        );
+    }
 }
 
 #[test]
@@ -2270,4 +2316,136 @@ fn the_audit_lists_hold_no_content_except_recalls() {
     }
     let unknown = daemon.get("/v1/banks/nobody/forgets");
     assert_eq!(unknown.status, 404, "{}", unknown.body);
+}
+
+#[test]
+fn a_restored_store_keeps_its_fingerprint_and_pauses_purge_under_another() {
+    // The stored fingerprint travels in the copy: a backup taken under
+    // `purge.delta = 0.5`, restored over a store whose fingerprint matches
+    // this daemon's, pauses purge at the next start (ADR 0009, ADR 0010).
+    let source = TestDir::new();
+    let delta = Serve::new(&source).tuning("[purge]\ndelta = 0.5\n").ready();
+    delta.create_bank("main");
+    let backed_up = delta.ok(delta.get("/v1/config"))["deletion_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let file = source.path("backup.db");
+    succeeded(run(cli(&delta).arg("backup").arg("--out").arg(&file)));
+    drop(delta);
+
+    let dir = TestDir::new();
+    let mut first = Serve::new(&dir).ready();
+    let current = first.ok(first.get("/v1/config"))["deletion_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(current, backed_up);
+    assert_eq!(first.ok(first.get("/v1/status"))["attention"], json!([]));
+    first.sigterm();
+    assert!(first.wait_exit().success());
+    let data = first.data_dir.clone();
+    drop(first);
+
+    let output = restore(&file, &data);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let second = Serve::new(&dir).ready();
+    let status = second.ok(second.get("/v1/status"));
+    assert_eq!(
+        status["purge"],
+        json!({"state": "paused", "stored": backed_up}),
+        "{status}"
+    );
+    assert_eq!(status["deletion_fingerprint"], current.as_str());
+    assert_ne!(status["attention"], json!([]), "{status}");
+    let output = run(cli(&second).arg("status"));
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let out = stdout(&output);
+    assert!(out.contains(&backed_up) && out.contains(&current), "{out}");
+}
+
+#[test]
+fn an_older_backup_restores_into_a_new_data_dir_and_migrates_with_a_copy() {
+    use asphodel_core::store::{OpenOptions, SCHEMA_VERSION, Store};
+    use asphodel_core::{Clock, SystemClock};
+    use std::sync::Arc;
+
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir)
+        .script(&[json!({"reply": auckland_reply()})])
+        .ready();
+    daemon.create_bank("main");
+    daemon.ingest_notes("main", "notes.md");
+    let id = daemon.wait_for_memory("main");
+    daemon.wait_extracted("main");
+    let file = dir.path("backup.db");
+    succeeded(run(cli(&daemon).arg("backup").arg("--out").arg(&file)));
+    drop(daemon);
+
+    // The copy put back to schema version 8, as that binary would have
+    // left a fresh store: no `sweep_progress`, which version 9 adds, and
+    // one migration row from 0 to 8.
+    let older = SCHEMA_VERSION - 1;
+    assert_eq!(older, 8, "this downgrade undoes version 9 only");
+    let older_file = dir.path("older.db");
+    fs::copy(&file, &older_file).unwrap();
+    rusqlite::Connection::open(&older_file)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE sweep_progress;
+             UPDATE migrations SET to_version = 8 WHERE to_version = 9;
+             PRAGMA user_version = 8;",
+        )
+        .unwrap();
+
+    // The data dir doesn't exist yet, nor does its parent.
+    let data = dir.path("volume").join("data");
+    let output = restore(&older_file, &data);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("migrates"), "{}", stdout(&output));
+
+    let mut serve = Serve::new(&dir);
+    serve.data_dir = data.clone();
+    let mut daemon = serve.ready();
+    let recall = daemon.recall("main", "where does Tim live? Auckland");
+    assert_eq!(recall["results"][0]["id"], id.as_str(), "{recall}");
+
+    // The migration took a pre-migration copy, which status reports and
+    // which needs no attention.
+    let status = daemon.ok(daemon.get("/v1/status"));
+    let copy = &status["pre_migration_copy"];
+    assert_eq!(copy["from_version"], older, "{status}");
+    assert_eq!(
+        copy["path"],
+        json!(data.join(format!("asphodel.db.pre-migration-v{older}"))),
+        "{status}"
+    );
+    assert!(copy["expires_at"].is_string(), "{status}");
+    assert_eq!(status["attention"], json!([]), "{status}");
+    let out = succeeded(run(cli(&daemon).arg("status")));
+    assert!(
+        out.contains(&format!("pre-migration copy: from schema version {older}")),
+        "{out}"
+    );
+    daemon.sigterm();
+    assert!(daemon.wait_exit().success(), "{}", daemon.log);
+    drop(daemon);
+
+    // The `restored` row survived the migration, once.
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let store = Store::open(&data, OpenOptions::default(), clock).unwrap();
+    let rows: Vec<String> = {
+        let conn = store.connection();
+        let mut statement = conn
+            .prepare("SELECT details FROM edits WHERE kind = 'restored' AND bank_id IS NULL")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let details: Value = serde_json::from_str(&rows[0]).unwrap();
+    assert_eq!(details["schema_version"], older);
 }
