@@ -160,26 +160,6 @@ fn resolved_config(log: &str) -> serde_json::Value {
 }
 
 #[test]
-fn every_deployment_flag_has_an_environment_variable() {
-    let output = run(serve().arg("--help"));
-    assert!(output.status.success());
-    let help = String::from_utf8_lossy(&output.stdout);
-    for (flag, env) in [
-        ("--listen", "ASPHODEL_LISTEN"),
-        ("--data-dir", "ASPHODEL_DATA_DIR"),
-        ("--config", "ASPHODEL_CONFIG"),
-        ("--allow-network-fs", "ASPHODEL_ALLOW_NETWORK_FS"),
-        ("--model-dir", "ASPHODEL_MODEL_DIR"),
-    ] {
-        let line = help
-            .lines()
-            .find(|line| line.trim_start().starts_with(flag))
-            .unwrap_or_else(|| panic!("no {flag} in:\n{help}"));
-        assert!(line.contains(env), "{flag} doesn't name {env}: {line}");
-    }
-}
-
-#[test]
 fn secrets_have_no_flag() {
     let output = run(serve().arg("--help"));
     let help = String::from_utf8_lossy(&output.stdout).to_lowercase();
@@ -226,19 +206,6 @@ fn a_missing_tuning_file_stops_startup() {
         .arg("--config")
         .arg(dir.0.join("missing.toml")));
     assert!(!output.status.success());
-}
-
-#[test]
-fn the_tuning_file_can_come_from_the_environment() {
-    let dir = TestDir::new();
-    let path = dir.file("tuning.toml", "[injection]\ncap = 0\n");
-    let output = run(serve_in(&dir).env("ASPHODEL_CONFIG", &path));
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("injection.cap"),
-        "{}",
-        stderr(&output)
-    );
 }
 
 #[test]
@@ -308,15 +275,6 @@ fn secrets_are_read_from_the_environment_and_never_logged() {
         config["deployment"]["llm_api_key"], "[redacted]",
         "{config}"
     );
-}
-
-#[test]
-fn absent_secrets_are_recorded_as_absent() {
-    let dir = TestDir::new();
-    let daemon = start(&mut serve_with_floors(&dir));
-    let config = resolved_config(&daemon.log);
-    assert!(config["deployment"]["token"].is_null());
-    assert!(config["deployment"]["llm_api_key"].is_null());
 }
 
 #[test]

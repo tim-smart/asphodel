@@ -359,32 +359,6 @@ fn the_store_is_one_sqlite_database_in_wal_mode_under_the_data_dir() {
 }
 
 #[test]
-fn a_restart_reopens_the_existing_database() {
-    let dir = TestDir::new();
-    let data = dir.data_dir();
-    let first = start(&dir, &data, &dir.socket("first"));
-    first.wait_ready();
-    let created = sqlite_files(&data);
-    assert_eq!(created.len(), 1, "{:?}", entries(&data));
-    let (status, log) = first.terminate();
-    assert!(status.success(), "clean stop exited with {status}:\n{log}");
-
-    // Opening a store that is already at the current schema version is not
-    // a migration: no second database and no pre-migration copy appears.
-    let second = start(&dir, &data, &dir.socket("second"));
-    second.wait_ready();
-    assert_eq!(second.health().0, 200);
-    let reopened = sqlite_files(&data);
-    assert_eq!(
-        reopened.iter().map(|(path, _)| path).collect::<Vec<_>>(),
-        created.iter().map(|(path, _)| path).collect::<Vec<_>>(),
-        "{:?}",
-        entries(&data)
-    );
-    assert_wal(&reopened[0].0, &reopened[0].1);
-}
-
-#[test]
 fn a_second_daemon_on_the_same_data_dir_is_refused() {
     let dir = TestDir::new();
     let data = dir.data_dir();

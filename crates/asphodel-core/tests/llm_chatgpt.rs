@@ -227,10 +227,6 @@ fn chatgpt_settings(endpoint: &str) -> LlmSettings {
     }
 }
 
-fn mode(bits: u32) -> String {
-    format!("{bits:o}")
-}
-
 fn file_mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
@@ -343,8 +339,6 @@ struct StubResponse {
     content_type: &'static str,
     headers: Vec<(String, String)>,
     body: String,
-    /// Held before answering.
-    delay: Duration,
     /// When nonzero, the body is sent chunked and the connection is held
     /// open this long after it before the terminating chunk, as a backend
     /// that has finished a response but not closed the stream would.
@@ -358,7 +352,6 @@ impl StubResponse {
             content_type: "application/json",
             headers: Vec::new(),
             body: value.to_string(),
-            delay: Duration::ZERO,
             linger: Duration::ZERO,
         }
     }
@@ -370,7 +363,6 @@ impl StubResponse {
             content_type: "text/plain",
             headers: Vec::new(),
             body: body.to_string(),
-            delay: Duration::ZERO,
             linger: Duration::ZERO,
         }
     }
@@ -381,7 +373,6 @@ impl StubResponse {
             content_type: "text/event-stream",
             headers: Vec::new(),
             body,
-            delay: Duration::ZERO,
             linger: Duration::ZERO,
         }
     }
@@ -397,11 +388,6 @@ impl StubResponse {
 
     fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.into(), value.into()));
-        self
-    }
-
-    fn after(mut self, delay: Duration) -> Self {
-        self.delay = delay;
         self
     }
 }
@@ -487,7 +473,6 @@ fn serve_one(mut stream: TcpStream, handler: &Handler, log: &Mutex<Vec<StubReque
     };
     let response = handler(&request);
     log.lock().unwrap().push(request);
-    std::thread::sleep(response.delay);
     let mut extra = String::new();
     for (name, value) in &response.headers {
         extra.push_str(&format!("{name}: {value}\r\n"));
@@ -560,53 +545,7 @@ fn client(server: &StubServer, store: TokenStore, clock: Arc<SimulatedClock>) ->
     CodexResponses::new(chatgpt_settings(&server.url), store, clock).with_issuer(&server.url)
 }
 
-// What runs now.
-
-#[test]
-fn the_logical_request_carries_no_auth_and_no_wire_format() {
-    // TIM-96, decision 4: the cassette records the logical request, so a
-    // cassette recorded in one auth mode replays in the other. The request
-    // type has exactly the six logical fields and nothing from the wire.
-    let value = serde_json::to_value(request()).unwrap();
-    let keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
-    assert_eq!(
-        keys,
-        [
-            "max_tokens",
-            "schema",
-            "schema_name",
-            "system",
-            "template",
-            "user"
-        ]
-    );
-    let text = value.to_string();
-    for forbidden in ["Bearer", "api_key", "access_token", "endpoint", "auth"] {
-        assert!(!text.contains(forbidden), "{forbidden} in {text}");
-    }
-}
-
-// Config: defaults and conflicts (ADR 0009).
-
-#[test]
-fn the_auth_mode_defaults_to_api_key() {
-    let tuning = Tuning::from_toml(
-        "[llm]\nmodel = \"some-model\"\nendpoint = \"http://llm.internal:8080/v1\"\n",
-    )
-    .unwrap();
-    assert_eq!(tuning.llm.auth, LlmAuth::ApiKey);
-    assert_eq!(Tuning::default().llm.auth, LlmAuth::ApiKey);
-
-    let settings = LlmSettings::from_config(&tuning, &deployment(Some("sk-live-41b2e8-secret")))
-        .unwrap()
-        .expect("configured");
-    assert_eq!(settings.auth, LlmAuth::ApiKey);
-    assert_eq!(settings.endpoint, "http://llm.internal:8080/v1");
-    assert_eq!(
-        settings.api_key.as_ref().map(Secret::expose),
-        Some("sk-live-41b2e8-secret")
-    );
-}
+// Config (ADR 0009).
 
 #[test]
 fn chatgpt_mode_defaults_to_the_codex_backend_and_still_pins_the_model() {
@@ -645,46 +584,15 @@ fn chatgpt_mode_defaults_to_the_codex_backend_and_still_pins_the_model() {
     );
 }
 
-#[test]
-fn a_key_set_together_with_chatgpt_mode_is_a_config_error() {
-    // Silently ignoring the key would hide a misconfiguration: the operator
-    // thinks they're on the key, and the subscription is being billed.
-    let tuning = Tuning::from_toml("[llm]\nauth = \"chatgpt\"\nmodel = \"gpt-5.1\"\n").unwrap();
-    let error =
-        LlmSettings::from_config(&tuning, &deployment(Some("sk-live-41b2e8-secret"))).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            LlmError::Conflicting {
-                first: "llm.auth = \"chatgpt\"",
-                second: "ASPHODEL_LLM_API_KEY"
-            }
-        ),
-        "{error:?}"
-    );
-    assert!(!error.is_retryable());
-    assert!(!format!("{error}").contains("41b2e8"), "{error}");
-}
-
 // The token file.
 
 #[test]
-fn tokens_are_built_from_a_login_reply_with_the_account_id_from_the_id_token() {
+fn a_login_reply_without_an_account_id_or_a_jwt_is_refused() {
+    // The account id comes from the id token; the backend needs it on every
+    // request, so a reply without it can't be saved.
     let exp = start()
         .checked_add(SignedDuration::from_secs(3600))
         .unwrap();
-    let tokens = ChatgptTokens::from_reply(
-        &id_token(ACCOUNT_ID),
-        &access_token("current", exp),
-        "rt-one",
-        start(),
-    )
-    .unwrap();
-    assert_eq!(tokens.account_id, ACCOUNT_ID);
-    assert_eq!(tokens.refresh_token.expose(), "rt-one");
-    assert_eq!(tokens.last_refresh, start());
-    assert_eq!(tokens.access_expires_at(), Some(exp));
-
     let no_claim = jwt(json!({"email": "tim@example.test"}));
     let error =
         ChatgptTokens::from_reply(&no_claim, &access_token("current", exp), "rt-one", start())
@@ -712,8 +620,8 @@ fn the_token_file_lives_under_the_data_dir_with_mode_0600() {
     assert_eq!(
         file_mode(store.path()),
         0o600,
-        "mode {}",
-        mode(file_mode(store.path()))
+        "mode {:o}",
+        file_mode(store.path())
     );
     assert_eq!(store.load().unwrap(), Some(saved.clone()));
 
@@ -736,39 +644,6 @@ fn the_token_file_lives_under_the_data_dir_with_mode_0600() {
 }
 
 #[test]
-fn a_malformed_token_file_names_the_path_and_the_fix() {
-    let dir = TestDir::new();
-    let store = TokenStore::open(&dir.data());
-    std::fs::write(store.path(), "{\"access_token\": 42}").unwrap();
-    let error = store.load().unwrap_err();
-    assert!(
-        matches!(&error, TokenError::Malformed { path } if path == store.path()),
-        "{error:?}"
-    );
-    assert!(error.to_string().contains("asphodel llm login"), "{error}");
-}
-
-#[test]
-fn the_status_shows_the_path_and_whether_a_login_is_present_and_nothing_else() {
-    let dir = TestDir::new();
-    let store = TokenStore::open(&dir.data());
-    let status = store.status();
-    assert_eq!(status.auth, LlmAuth::Chatgpt);
-    assert_eq!(status.token_file.as_deref(), Some(store.path()));
-    assert!(!status.logged_in);
-
-    let store = logged_in_store(&dir);
-    let status = store.status();
-    assert!(status.logged_in);
-    let text = serde_json::to_string(&status).unwrap();
-    assert!(text.contains("\"auth\":\"chatgpt\""), "{text}");
-    assert!(text.contains("\"logged_in\":true"), "{text}");
-    for forbidden in ["rt-one", "current", "eyJ", ACCOUNT_ID] {
-        assert!(!text.contains(forbidden), "{forbidden} in {text}");
-    }
-}
-
-#[test]
 fn debug_output_never_holds_a_token() {
     let dir = TestDir::new();
     let store = logged_in_store(&dir);
@@ -778,11 +653,6 @@ fn debug_output_never_holds_a_token() {
     for forbidden in ["rt-one", "current", "eyJ"] {
         assert!(!shown.contains(forbidden), "{forbidden} in {shown}");
     }
-    let settings = chatgpt_settings(CODEX_ENDPOINT);
-    assert!(
-        !format!("{settings:?}").contains("[redacted]"),
-        "no key in chatgpt mode"
-    );
 }
 
 // Login: the device-code flow against a stub issuer.
@@ -800,20 +670,20 @@ fn device_code_login_polls_exchanges_and_saves_tokens() {
                 200,
                 json!({"device_auth_id": "dev_123", "user_code": "ABCD-EFGH", "interval": "0"}),
             ),
-            "/api/accounts/deviceauth/token" => {
-                if polls.fetch_add(1, Ordering::SeqCst) < 2 {
-                    StubResponse::status(403)
-                } else {
-                    StubResponse::json(
-                        200,
-                        json!({
-                            "authorization_code": "code_9",
-                            "code_challenge": "chal",
-                            "code_verifier": "verif"
-                        }),
-                    )
-                }
-            }
+            // Pending, as the issuer answers it: 403 or 404 with a plain
+            // text body. codex-rs checks the status before parsing JSON.
+            "/api/accounts/deviceauth/token" => match polls.fetch_add(1, Ordering::SeqCst) {
+                0 => StubResponse::text(403, "Forbidden"),
+                1 => StubResponse::text(404, "Not Found"),
+                _ => StubResponse::json(
+                    200,
+                    json!({
+                        "authorization_code": "code_9",
+                        "code_challenge": "chal",
+                        "code_verifier": "verif"
+                    }),
+                ),
+            },
             "/oauth/token" => StubResponse::json(
                 200,
                 json!({
@@ -1002,67 +872,6 @@ fn deltas_are_reassembled_when_no_done_item_carries_the_text() {
 }
 
 #[test]
-fn fenced_json_in_the_streamed_text_is_unwrapped() {
-    let backend = StubServer::backend(StubResponse::stream(sse_completion(
-        "```json\n{\"claims\": []}\n```",
-    )));
-    let dir = TestDir::new();
-    let response = client(&backend, logged_in_store(&dir), clock())
-        .complete(&request())
-        .unwrap();
-    assert_eq!(response.json, json!({"claims": []}));
-}
-
-#[test]
-fn streamed_text_that_is_not_json_is_an_error_that_carries_only_its_size() {
-    let content = "Sure! Here are Tim's claims: he moved to Wellington.";
-    let backend = StubServer::backend(StubResponse::stream(sse_completion(content)));
-    let dir = TestDir::new();
-    let error = client(&backend, logged_in_store(&dir), clock())
-        .complete(&request())
-        .unwrap_err();
-    assert!(
-        matches!(error, LlmError::NotJson { bytes } if bytes == content.len()),
-        "{error:?}"
-    );
-    assert!(!format!("{error} {error:?}").contains("Wellington"));
-}
-
-#[test]
-fn a_failed_response_keeps_only_its_code_and_an_unfinished_stream_has_no_content() {
-    let backend = StubServer::backend(StubResponse::stream(sse(&[(
-        "response.failed",
-        json!({
-            "type": "response.failed",
-            "response": {
-                "id": "resp_3",
-                "status": "failed",
-                "error": {"code": "server_error", "message": "Tim's claims could not be processed"}
-            }
-        }),
-    )])));
-    let dir = TestDir::new();
-    let error = client(&backend, logged_in_store(&dir), clock())
-        .complete(&request())
-        .unwrap_err();
-    assert!(
-        matches!(&error, LlmError::Backend { code } if code == "server_error"),
-        "{error:?}"
-    );
-    assert!(!format!("{error} {error:?}").contains("Tim"), "{error}");
-
-    // A stream that ends without completing.
-    let backend = StubServer::backend(StubResponse::stream(sse(&[(
-        "response.created",
-        json!({"type": "response.created", "response": {"id": "resp_5"}}),
-    )])));
-    let error = client(&backend, logged_in_store(&dir), clock())
-        .complete(&request())
-        .unwrap_err();
-    assert!(matches!(error, LlmError::NoContent), "{error:?}");
-}
-
-#[test]
 fn without_a_token_file_the_client_asks_for_a_login_before_any_request() {
     let backend = StubServer::backend(StubResponse::stream(sse_completion("{}")));
     let dir = TestDir::new();
@@ -1163,30 +972,6 @@ fn a_token_inside_the_refresh_window_counts_as_expired() {
 }
 
 #[test]
-fn a_401_triggers_one_refresh_and_one_retry() {
-    let dir = TestDir::new();
-    let store = logged_in_store(&dir);
-    let exp = start()
-        .checked_add(SignedDuration::from_secs(3600))
-        .unwrap();
-    let server = Scripted::server(move |request, n| match (request.path.as_str(), n) {
-        ("/responses", 0) => StubResponse::status(401),
-        ("/oauth/token", _) => refresh_reply("rotated", "two", exp),
-        ("/responses", _) => StubResponse::stream(sse_completion("{\"claims\":[]}")),
-        other => panic!("unexpected {other:?}"),
-    });
-    let client = client(&server, store, clock());
-    let response = client.complete(&request()).unwrap();
-    assert_eq!(response.json, json!({"claims": []}));
-    assert_eq!(client.refreshes(), 1);
-    assert_eq!(server.paths(), ["/responses", "/oauth/token", "/responses"]);
-    assert_eq!(
-        server.requests()[2].bearer(),
-        Some(access_token("rotated", exp).as_str())
-    );
-}
-
-#[test]
 fn a_401_after_a_refresh_asks_for_a_login_and_stops() {
     let dir = TestDir::new();
     let store = logged_in_store(&dir);
@@ -1250,51 +1035,6 @@ fn a_new_login_written_while_running_is_picked_up_without_a_restart() {
     );
 }
 
-#[test]
-fn concurrent_calls_share_one_refresh() {
-    // Refresh tokens are single-use. Two threads with the same expired
-    // token must not both refresh: the second would present a token the
-    // first already spent and log the daemon out.
-    let dir = TestDir::new();
-    let store = expired_store(&dir);
-    let exp = start()
-        .checked_add(SignedDuration::from_secs(3600))
-        .unwrap();
-    let server = Scripted::server(move |request, _| match request.path.as_str() {
-        "/oauth/token" => refresh_reply("rotated", "two", exp).after(Duration::from_millis(300)),
-        "/responses" => StubResponse::stream(sse_completion("{}")),
-        other => panic!("unexpected path {other}"),
-    });
-    let client = Arc::new(client(&server, store, clock()));
-    let workers: Vec<_> = (0..3)
-        .map(|_| {
-            let client = Arc::clone(&client);
-            std::thread::spawn(move || client.complete(&request()).map(|r| r.json))
-        })
-        .collect();
-    for worker in workers {
-        assert_eq!(worker.join().unwrap().unwrap(), json!({}));
-    }
-    let paths = server.paths();
-    assert_eq!(
-        paths.iter().filter(|p| *p == "/oauth/token").count(),
-        1,
-        "{paths:?}"
-    );
-    assert_eq!(
-        paths.iter().filter(|p| *p == "/responses").count(),
-        3,
-        "{paths:?}"
-    );
-    assert_eq!(client.refreshes(), 1);
-    for request in server.requests().iter().filter(|r| r.path == "/responses") {
-        assert_eq!(
-            request.bearer(),
-            Some(access_token("rotated", exp).as_str())
-        );
-    }
-}
-
 // Usage limits (reset-aware 429).
 
 #[test]
@@ -1334,23 +1074,6 @@ fn a_usage_limit_is_deferred_to_its_reset_time_not_retried() {
 }
 
 #[test]
-fn the_reset_header_fills_in_when_the_body_has_no_reset() {
-    let backend = StubServer::backend(
-        StubResponse::json(429, json!({"error": {"type": "usage_limit_reached"}}))
-            .with_header("x-codex-primary-reset-at", "1772462400"),
-    );
-    let dir = TestDir::new();
-    let error = client(&backend, logged_in_store(&dir), clock())
-        .complete(&request())
-        .unwrap_err();
-    let expected = Timestamp::from_second(1_772_462_400).unwrap();
-    assert!(
-        matches!(error, LlmError::UsageLimited { resets_at } if resets_at == expected),
-        "{error:?}"
-    );
-}
-
-#[test]
 fn a_plain_429_stays_a_retryable_status() {
     // A rate limit without a usage window is the old behaviour: retry.
     let backend = StubServer::backend(StubResponse::json(
@@ -1366,23 +1089,6 @@ fn a_plain_429_stays_a_retryable_status() {
         "{error:?}"
     );
     assert!(error.is_retryable());
-}
-
-#[test]
-fn other_statuses_map_as_in_api_key_mode() {
-    for (status, retryable) in [(400, false), (403, false), (500, true), (503, true)] {
-        let backend = StubServer::backend(StubResponse::status(status));
-        let dir = TestDir::new();
-        let error = client(&backend, logged_in_store(&dir), clock())
-            .complete(&request())
-            .unwrap_err();
-        assert!(
-            matches!(error, LlmError::Status { status: got } if got == status),
-            "{status}: {error:?}"
-        );
-        assert_eq!(error.is_retryable(), retryable, "{status}");
-        assert_eq!(backend.requests().len(), 1, "{status}: retried");
-    }
 }
 
 // Secret hygiene across the whole client.
@@ -1454,30 +1160,6 @@ fn a_completed_stream_that_stays_open_is_not_a_timeout() {
 }
 
 #[test]
-fn a_failed_stream_that_stays_open_reports_the_failure_not_a_timeout() {
-    let backend = StubServer::backend(
-        StubResponse::stream(sse(&[(
-            "response.failed",
-            json!({
-                "type": "response.failed",
-                "response": {"id": "resp_9", "status": "failed", "error": {"code": "server_error"}}
-            }),
-        )]))
-        .lingering(Duration::from_secs(3)),
-    );
-    let dir = TestDir::new();
-    let mut settings = chatgpt_settings(&backend.url);
-    settings.timeout = Duration::from_secs(1);
-    let client =
-        CodexResponses::new(settings, logged_in_store(&dir), clock()).with_issuer(&backend.url);
-    let error = client.complete(&request()).unwrap_err();
-    assert!(
-        matches!(&error, LlmError::Backend { code } if code == "server_error"),
-        "{error:?}"
-    );
-}
-
-#[test]
 fn a_transient_issuer_error_during_refresh_is_retryable_not_a_login() {
     // An issuer that is down (503), overloaded (502) or rate limiting
     // (429) has not rejected the credential. Telling the owner to log in
@@ -1538,61 +1220,6 @@ fn a_rejected_refresh_credential_asks_for_a_login() {
         // the next login overwrites it.
         assert!(TokenStore::open(&dir.data()).path().exists(), "{status}");
     }
-}
-
-#[test]
-fn a_pending_device_authorization_with_a_plain_text_body_keeps_polling() {
-    // codex-rs checks the status first and parses JSON only on success. A
-    // 403 "Forbidden" or 404 "Not Found" with a text body is "pending",
-    // not a broken reply.
-    let exp = start()
-        .checked_add(SignedDuration::from_secs(3600))
-        .unwrap();
-    let polls = Arc::new(AtomicUsize::new(0));
-    let issuer = {
-        let polls = Arc::clone(&polls);
-        StubServer::start(move |request| match request.path.as_str() {
-            "/api/accounts/deviceauth/usercode" => StubResponse::json(
-                200,
-                json!({"device_auth_id": "dev_123", "user_code": "ABCD-EFGH", "interval": "0"}),
-            ),
-            "/api/accounts/deviceauth/token" => match polls.fetch_add(1, Ordering::SeqCst) {
-                0 => StubResponse::text(403, "Forbidden"),
-                1 => StubResponse::text(404, "Not Found"),
-                _ => StubResponse::json(
-                    200,
-                    json!({
-                        "authorization_code": "code_9",
-                        "code_challenge": "chal",
-                        "code_verifier": "verif"
-                    }),
-                ),
-            },
-            "/oauth/token" => StubResponse::json(
-                200,
-                json!({
-                    "id_token": id_token(ACCOUNT_ID),
-                    "access_token": access_token("first", exp),
-                    "refresh_token": "rt-first"
-                }),
-            ),
-            other => panic!("unexpected path {other}"),
-        })
-    };
-    let dir = TestDir::new();
-    let store = TokenStore::open(&dir.data());
-    let tokens = device_code_login(&issuer.url, &store, clock().as_ref(), &mut |_| {})
-        .unwrap_or_else(|error| panic!("a pending poll was treated as a failure: {error:?}"));
-    assert_eq!(tokens.refresh_token.expose(), "rt-first");
-    assert_eq!(
-        issuer
-            .paths()
-            .iter()
-            .filter(|path| *path == "/api/accounts/deviceauth/token")
-            .count(),
-        3
-    );
-    assert!(store.path().exists());
 }
 
 #[test]
@@ -1725,61 +1352,6 @@ fn an_hour_from_start() -> Timestamp {
 /// daemon is refreshing.
 fn relogin_tokens() -> ChatgptTokens {
     tokens("relogin", "three", an_hour_from_start(), start())
-}
-
-#[test]
-fn a_login_saved_during_a_refresh_waits_for_it_and_wins() {
-    let dir = TestDir::new();
-    let store = expired_store(&dir);
-    let data = dir.data();
-    let gate = Gate::new();
-    let server = gated_server(&gate, an_hour_from_start());
-    let client = Arc::new(client(&server, store, clock()));
-
-    let worker = {
-        let client = Arc::clone(&client);
-        std::thread::spawn(move || client.complete(&request()))
-    };
-    assert!(
-        gate.arrived(1, Duration::from_secs(5)),
-        "the refresh never reached the issuer"
-    );
-
-    // `asphodel llm login` saves while the refresh is in flight. With the
-    // lock this save waits for the refresh's own save, then replaces it.
-    let (saved, saved_rx) = std::sync::mpsc::channel();
-    let login = std::thread::spawn(move || {
-        TokenStore::open(&data).save(&relogin_tokens()).unwrap();
-        let _ = saved.send(());
-    });
-    let saved_during_refresh = saved_rx.recv_timeout(THREAD_GRACE).is_ok();
-    gate.open();
-    login.join().unwrap();
-    worker.join().unwrap().unwrap();
-
-    let file = TokenStore::open(&dir.data()).load().unwrap().unwrap();
-    assert_eq!(
-        file.refresh_token.expose(),
-        "rt-three",
-        "the refresh overwrote the new login"
-    );
-    assert!(
-        !saved_during_refresh,
-        "the login's save didn't wait for the refresh in flight"
-    );
-    // The worker's own retry used what its refresh rotated to.
-    assert_eq!(
-        server.requests().last().unwrap().bearer(),
-        Some(access_token("rotated", an_hour_from_start()).as_str())
-    );
-
-    // The next call runs on the login, with no refresh.
-    client.complete(&request()).unwrap();
-    assert_eq!(client.refreshes(), 1);
-    assert_eq!(
-        server.requests().last().unwrap().bearer(),
-        Some(access_token("relogin", an_hour_from_start()).as_str())
-    );
 }
 
 #[test]

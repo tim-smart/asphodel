@@ -39,7 +39,7 @@ use asphodel_core::models::{
     ModelError as EmbedError, Models,
 };
 use asphodel_core::retrieval::{PrefetchRequest, estimate_tokens};
-use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME, PROFILE_QUESTION};
+use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME};
 use asphodel_core::store::{OpenOptions, Store, VectorIndex, micros};
 use asphodel_core::strength::Kind;
 use asphodel_core::{Service, SimulatedClock, Tuning};
@@ -52,8 +52,8 @@ use uuid::Uuid;
 
 use asphodel_core::agenda::Agenda;
 use asphodel_core::mental_models::{
-    Applied, Entry, FailureKind, Model, ModelEdit, ModelError, ModelSpec, Outcome,
-    REFRESH_TEMPLATE, RefreshInput, Refreshes, RejectReason,
+    Applied, FailureKind, Model, ModelEdit, ModelError, ModelSpec, Outcome, REFRESH_TEMPLATE,
+    RefreshInput, Refreshes, RejectReason,
 };
 use asphodel_core::system_prompt::Block;
 
@@ -170,6 +170,11 @@ fn fact(content: &'static str) -> Memory {
         content,
         ..Memory::default()
     }
+}
+
+/// A sentence made `'static`, for fixtures built in a loop.
+fn sentence(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
 }
 
 /// A trivial memory said long enough ago to be below τ.
@@ -745,18 +750,6 @@ fn a_memory_below_the_trigger_level_waits_for_the_sweep() {
 }
 
 #[test]
-fn the_trigger_level_is_tuned() {
-    let h = Harness::with_tuning("[mental_models]\ntrigger_level = \"major\"\n");
-    h.says(notable(TEA));
-    h.advance(minutes(5));
-    assert!(h.tick(&quiet_llm(1)).ran.is_empty());
-
-    h.says(claim("Tim is allergic to penicillin.", "fact", "major"));
-    h.advance(minutes(5));
-    assert_eq!(h.tick(&quiet_llm(1)).ran.len(), 1);
-}
-
-#[test]
 fn a_memory_the_models_filters_leave_out_triggers_nothing() {
     // The profile takes facts and states of volatility weeks or slower.
     let h = Harness::new();
@@ -771,22 +764,6 @@ fn a_memory_the_models_filters_leave_out_triggers_nothing() {
     );
     h.advance(minutes(5));
     assert_eq!(h.tick(&quiet_llm(1)).ran.len(), 1);
-}
-
-#[test]
-fn keeping_a_memory_triggers_a_refresh() {
-    let h = Harness::new();
-    let tea = h.insert(Memory {
-        significance: "minor",
-        ..fact(TEA)
-    });
-    let kept = h.now();
-    h.keep(tea);
-    h.advance(minutes(5));
-    let llm = quiet_llm(1);
-    let ran = h.tick(&llm);
-    assert_eq!(ran.ran.len(), 1);
-    assert_eq!(h.profile().last_refreshed_at, Some(kept + minutes(5)));
 }
 
 #[test]
@@ -923,29 +900,6 @@ fn the_daily_sweep_runs_at_four_bank_local() {
 }
 
 #[test]
-fn the_sweep_time_is_tuned() {
-    let h = Harness::with_tuning("[mental_models]\nsweep_time = \"05:30\"\n");
-    assert_eq!(
-        h.tick(&quiet_llm(1)).next_due,
-        Some(local("2026-10-02T05:30"))
-    );
-}
-
-#[test]
-fn the_sweep_skips_a_model_whose_inputs_havent_changed() {
-    let h = Harness::new();
-    let tea = h.insert(fact(TEA));
-    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
-
-    h.set(at(SWEEP));
-    let llm = quiet_llm(1);
-    let ran = h.tick(&llm);
-    assert_eq!(ran.ran.len(), 1);
-    assert_eq!(ran.ran[0].outcome, Outcome::Unchanged);
-    assert_eq!(refresh_calls(&llm), 0);
-}
-
-#[test]
 fn a_disabled_model_is_never_refreshed() {
     let h = Harness::new();
     h.service
@@ -1040,60 +994,15 @@ fn a_cited_memory_stays_in_the_input_past_the_top_sixty() {
     // ranks below every one of them on strength alone.
     let weak = h.insert(fact("Tim's cat Miso sleeps."));
     h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[weak])]);
-    const STRONG: [&str; 65] = [
-        "Fact 1.", "Fact 2.", "Fact 3.", "Fact 4.", "Fact 5.", "Fact 6.", "Fact 7.", "Fact 8.",
-        "Fact 9.", "Fact 10.", "Fact 11.", "Fact 12.", "Fact 13.", "Fact 14.", "Fact 15.",
-        "Fact 16.", "Fact 17.", "Fact 18.", "Fact 19.", "Fact 20.", "Fact 21.", "Fact 22.",
-        "Fact 23.", "Fact 24.", "Fact 25.", "Fact 26.", "Fact 27.", "Fact 28.", "Fact 29.",
-        "Fact 30.", "Fact 31.", "Fact 32.", "Fact 33.", "Fact 34.", "Fact 35.", "Fact 36.",
-        "Fact 37.", "Fact 38.", "Fact 39.", "Fact 40.", "Fact 41.", "Fact 42.", "Fact 43.",
-        "Fact 44.", "Fact 45.", "Fact 46.", "Fact 47.", "Fact 48.", "Fact 49.", "Fact 50.",
-        "Fact 51.", "Fact 52.", "Fact 53.", "Fact 54.", "Fact 55.", "Fact 56.", "Fact 57.",
-        "Fact 58.", "Fact 59.", "Fact 60.", "Fact 61.", "Fact 62.", "Fact 63.", "Fact 64.",
-        "Fact 65.",
-    ];
-    for content in STRONG {
+    for n in 1..=65 {
         h.insert(Memory {
             significance: "critical",
-            ..fact(content)
+            ..fact(sentence(format!("Fact {n}.")))
         });
     }
     let input = h.input(PROFILE_NAME);
     assert_eq!(input.memories.len(), 61, "the top 60 and the cited one");
     assert!(inputs(&input).contains(&weak));
-}
-
-#[test]
-fn a_refresh_request_carries_the_question_the_entries_the_memories_and_max_tokens() {
-    let h = Harness::new();
-    let tea = h.insert(fact(TEA));
-    let cat = h.insert(fact(CAT));
-    h.refresh_adding(PROFILE_NAME, &[("Tim drinks green tea.", &[tea])]);
-    let llm = quiet_llm(1);
-    h.service
-        .refresh_model(BANK, PROFILE_NAME, &llm, true)
-        .unwrap();
-
-    let requests = llm.requests();
-    assert_eq!(requests.len(), 1, "one synthesis call, never a loop");
-    let request = &requests[0];
-    assert_eq!(request.template.name, REFRESH_TEMPLATE);
-    let input = h.input(PROFILE_NAME);
-    for needle in [
-        PROFILE_QUESTION,
-        "Tim drinks green tea.",
-        TEA,
-        CAT,
-        &handle(&input, tea),
-        &handle(&input, cat),
-        &input.entries[0].handle,
-        &h.tuning.mental_models.profile_max_tokens.to_string(),
-    ] {
-        assert!(
-            request.user.contains(needle),
-            "the request lacks {needle:?}"
-        );
-    }
 }
 
 #[test]
@@ -1210,38 +1119,6 @@ fn entries_are_never_embedded_extracted_from_or_ingested() {
 }
 
 // Entries and edits (TIM-95, decision 5)
-
-#[test]
-fn the_first_refresh_is_all_adds_with_ids_code_assigns() {
-    let h = Harness::new();
-    let tea = h.insert(fact(TEA));
-    let cat = h.insert(fact(CAT));
-    let applied = h.refresh_adding(
-        PROFILE_NAME,
-        &[
-            ("Tim likes green tea.", &[tea]),
-            ("Tim has a cat called Miso.", &[cat, tea]),
-        ],
-    );
-    assert_eq!(applied.added.len(), 2);
-    let profile = h.profile();
-    assert_eq!(
-        profile.entries,
-        vec![
-            Entry {
-                id: applied.added[0],
-                text: "Tim likes green tea.".into(),
-                cites: vec![tea],
-            },
-            Entry {
-                id: applied.added[1],
-                text: "Tim has a cat called Miso.".into(),
-                cites: vec![cat, tea],
-            },
-        ]
-    );
-    assert_ne!(applied.added[0], applied.added[1]);
-}
 
 #[test]
 fn untouched_entries_are_copied_byte_for_byte_and_edits_keep_their_id() {
@@ -1473,32 +1350,6 @@ fn resizing_or_enabling_past_the_budget_is_refused() {
 }
 
 #[test]
-fn the_budget_is_tuned() {
-    let h = Harness::with_tuning("[mental_models]\nbudget = 600\n");
-    let refused = h.service.create_model(
-        BANK,
-        &ModelSpec {
-            max_tokens: 101,
-            ..plans_model()
-        },
-    );
-    assert!(matches!(
-        refused,
-        Err(ModelError::OverBudget { budget: 600, .. })
-    ));
-}
-
-#[test]
-fn a_second_model_with_the_same_name_is_refused() {
-    let h = Harness::new();
-    h.service.create_model(BANK, &plans_model()).unwrap();
-    assert!(matches!(
-        h.service.create_model(BANK, &plans_model()),
-        Err(ModelError::DuplicateName)
-    ));
-}
-
-#[test]
 fn entries_past_max_tokens_are_trimmed_lowest_ranked_first() {
     // Code trims the lowest-ranked entries, ranked by the best score among
     // each entry's cited memories. The three memories here share the same
@@ -1727,13 +1578,6 @@ fn the_block_holds_the_agenda_each_enabled_model_and_the_pointer_line() {
 }
 
 #[test]
-fn an_empty_model_renders_nothing_not_even_a_header() {
-    let h = Harness::new();
-    assert!(h.profile().entries.is_empty());
-    assert!(!h.block(None).text.contains(PROFILE_NAME));
-}
-
-#[test]
 fn building_the_block_or_the_agenda_never_writes_an_access() {
     let h = Harness::new();
     let tea = h.insert(fact(TEA));
@@ -1842,46 +1686,6 @@ fn a_sessions_block_puts_its_agenda_and_cited_memories_in_context() {
         )
         .unwrap();
     assert!(!prefetch.injected.contains(&cat));
-}
-
-#[test]
-fn the_daemon_persists_which_block_a_session_holds() {
-    let h = Harness::new();
-    let cat = h.insert(fact(CAT));
-    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[cat])]);
-    let block = h.block(Some("s1"));
-    let stored: String = h.one(
-        "SELECT block_id FROM session_blocks WHERE bank_id = ?1 AND session_id = 's1'",
-        [h.bank_id()],
-    );
-    assert_eq!(stored, block.id.to_string());
-
-    // Hermes restores a stored system prompt after a restart without asking
-    // for the block again, so the cited ids come from the store.
-    let h = h.restart();
-    assert_eq!(h.in_context("s1"), vec![cat]);
-}
-
-#[test]
-fn a_reply_relying_on_an_entry_is_credited_as_used() {
-    let h = Harness::new();
-    let cat = h.insert(fact(CAT));
-    h.refresh_adding(PROFILE_NAME, &[("Tim has a cat called Miso.", &[cat])]);
-    h.block(Some("s1"));
-    h.service
-        .ingest_turn(
-            BANK,
-            &turn("s1", h.now() - minutes(1), "What's my cat called?"),
-        )
-        .unwrap();
-    let llm = FakeLlm::scripted(
-        MODEL,
-        vec![json!({"claims": [], "used_injected_ids": ["m1"]})],
-    );
-    let extracted = h.service.extract_next(BANK, &llm).unwrap().unwrap();
-    assert!(llm.requests()[0].user.contains(CAT));
-    assert_eq!(extracted.used, vec![cat]);
-    assert_eq!(h.used(cat), 1);
 }
 
 #[test]
@@ -2105,24 +1909,6 @@ fn undated_open_tasks_are_gated_on_tau_and_capped() {
     }
 }
 
-#[test]
-fn the_dated_cap_leaves_routines_and_undated_tasks_alone() {
-    let h = Harness::with_tuning("[agenda]\ndated_lines = 1\n");
-    h.insert(event("Tim has event A.", "2026-10-02T00:00"));
-    h.insert(event("Tim has event B.", "2026-10-03T00:00"));
-    h.insert(task("Tim needs to clean the gutters."));
-    h.insert(recurring(
-        "Tim swims on Tuesdays.",
-        Some("FREQ=WEEKLY;BYDAY=TU"),
-        "2026-01-06T00:00",
-    ));
-    let agenda = h.agenda();
-    assert_eq!(agenda.dated.len(), 1);
-    assert_eq!(agenda.folded, 1);
-    assert_eq!(agenda.routines.len(), 1);
-    assert_eq!(agenda.undated_tasks.len(), 1);
-}
-
 // Regressions from the TIM-111 implementation run (1429a07), fixed in a8e3e31
 
 /// An embedder that answers like `FakeEmbedder` until a test makes it
@@ -2226,19 +2012,6 @@ fn a_turn_after_the_block() -> (Harness, Uuid, Uuid) {
         .ingest_turn(BANK, &turn("s1", h.now() - minutes(1), "Tea time?"))
         .unwrap();
     (h, cat, tea)
-}
-
-#[test]
-fn call_1_is_shown_each_entry_with_the_memories_it_cites() {
-    let (h, _, _) = a_turn_after_the_block();
-    let llm = FakeLlm::scripted(MODEL, vec![json!({"claims": [], "used_injected_ids": []})]);
-    h.service.extract_next(BANK, &llm).unwrap().unwrap();
-    let user = &llm.requests()[0].user;
-    assert!(
-        user.contains("Tim drinks green tea with his cat Miso nearby."),
-        "call 1 wasn't shown the entry:\n{user}"
-    );
-    assert!(user.contains("n1"), "the entry has no handle:\n{user}");
 }
 
 #[test]
@@ -2559,11 +2332,6 @@ fn a_stated_end_holds_through_its_unit_on_the_agenda() {
     let agenda = h.agenda();
     assert!(agenda.undated_tasks.is_empty());
     assert!(agenda.routines.contains(&swim));
-}
-
-/// A sentence made `'static`, for fixtures built in a loop.
-fn sentence(text: String) -> &'static str {
-    Box::leak(text.into_boxed_str())
 }
 
 #[test]

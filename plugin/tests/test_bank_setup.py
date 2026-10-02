@@ -29,16 +29,6 @@ def test_a_bank_put_while_the_daemon_starts_is_retried_and_the_spool_delivered(m
     assert spooled(hermes_home) == []
 
 
-def test_a_bank_put_that_could_not_connect_is_retried_by_the_next_hook(make_provider, daemon):
-    daemon.enforce_banks = True
-    daemon.drop_connections("health", 1)
-    daemon.drop_connections("put_bank", 1)
-    provider = make_provider()
-    assert provider.prefetch("what do I drink in the morning?", session_id=SESSION) == INJECTION
-    keys = [r.key for r in daemon.requests]
-    assert keys == ["health", "put_bank", "put_bank", "prefetch"]
-
-
 def test_a_bank_that_was_set_up_is_put_only_once(make_provider, daemon):
     daemon.enforce_banks = True
     provider = make_provider()

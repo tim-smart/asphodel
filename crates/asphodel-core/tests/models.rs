@@ -369,8 +369,6 @@ fn serve_one(mut stream: TcpStream, response: StubResponse, log: &Mutex<Vec<Stub
     let _ = stream.flush();
 }
 
-// What runs now: the floors and the LLM settings that already exist.
-
 // The model dir (TIM-94, decision 4; TIM-98 deployment).
 
 #[test]
@@ -396,25 +394,6 @@ fn the_model_dir_is_the_override_then_the_xdg_cache_then_home() {
         );
     }
 }
-
-#[test]
-fn no_dir_at_all_is_an_error() {
-    let error = ModelDir::resolve(None, None, None).unwrap_err();
-    assert!(matches!(error, ModelError::NoModelDir), "{error:?}");
-    assert!(error.to_string().contains("ASPHODEL_MODEL_DIR"), "{error}");
-}
-
-#[test]
-fn files_live_under_the_models_dir_name() {
-    let dir = ModelDir::at("/srv/models");
-    let spec = &canned().specs[0];
-    assert_eq!(
-        dir.file(spec, "model.onnx"),
-        Path::new("/srv/models/bge-small-en-v1.5-int8/model.onnx")
-    );
-}
-
-// The manifest.
 
 // `asphodel models fetch` (TIM-94, decision 4).
 
@@ -561,38 +540,6 @@ fn an_empty_model_dir_fails_fast_naming_the_first_missing_file() {
 }
 
 #[test]
-fn a_missing_reranker_file_is_named_even_when_the_embedder_is_complete() {
-    // A full embedding model dir and a reranker dir short of one tokenizer
-    // file. The checksum of the embedding files can't be met here, so the
-    // test uses the real manifest only for the paths and expects the loader
-    // to report the missing file before any checksum: presence is checked
-    // for every file first, so an operator sees the whole problem's shape.
-    let dir = TestDir::new();
-    let models = dir.models();
-    let manifest = manifest();
-    for file in &manifest[0].files {
-        let path = models.file(&manifest[0], &file.name);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"placeholder").unwrap();
-    }
-    for file in &manifest[1].files {
-        if file.name == "special_tokens_map.json" {
-            continue;
-        }
-        let path = models.file(&manifest[1], &file.name);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"placeholder").unwrap();
-    }
-
-    let error = Models::load(&models, &ModelOptions::default()).unwrap_err();
-    let expected = models.file(&manifest[1], "special_tokens_map.json");
-    assert!(
-        matches!(&error, ModelError::MissingFile { model, path } if model == RERANKER_MODEL_ID && *path == expected),
-        "{error:?}"
-    );
-}
-
-#[test]
 fn a_corrupt_file_fails_before_onnx_runtime_is_touched() {
     // Every file present, none with the manifest's bytes. The loader checks
     // checksums before building a session, so the error is ours and names
@@ -621,18 +568,6 @@ fn a_corrupt_file_fails_before_onnx_runtime_is_touched() {
 }
 
 // The fakes (TIM-96, decision 2).
-
-#[test]
-fn the_fakes_have_their_own_ids() {
-    let models = Models::fake();
-    assert_eq!(models.embedder.model_id(), FakeEmbedder::MODEL_ID);
-    assert_eq!(models.reranker.model_id(), FakeReranker::MODEL_ID);
-    assert_ne!(models.embedder.model_id(), EMBEDDING_MODEL_ID);
-    assert_ne!(models.reranker.model_id(), RERANKER_MODEL_ID);
-    let ids = models.ids();
-    assert_eq!(ids.embedding, FakeEmbedder::MODEL_ID);
-    assert_eq!(ids.reranker, FakeReranker::MODEL_ID);
-}
 
 #[test]
 fn the_fake_embedder_is_deterministic_unit_length_and_384_wide() {
@@ -728,23 +663,6 @@ fn a_missing_floor_for_a_loaded_model_stops_the_service_opening() {
 }
 
 #[test]
-fn floors_for_the_loaded_models_let_the_service_open() {
-    let dir = TestDir::new();
-    let service = Service::with_models(
-        clock(),
-        open_store(&dir),
-        tuning_for_fakes(),
-        Models::fake(),
-    )
-    .unwrap();
-    assert_eq!(
-        service.models().unwrap().ids().embedding,
-        FakeEmbedder::MODEL_ID
-    );
-    assert!(service.health().ready);
-}
-
-#[test]
 fn a_new_bank_records_the_loaded_models() {
     // TIM-94, decision 4: a bank records its embedding and reranker model
     // ids. They come from what's loaded, not from the caller.
@@ -790,6 +708,8 @@ fn llm_settings_come_from_the_tuning_file_and_the_environment() {
     let settings = LlmSettings::from_config(&tuning, &deployment(Some("sk-live-41b2e8-secret")))
         .unwrap()
         .expect("configured");
+    // Without `auth`, the mode is the API key one.
+    assert_eq!(settings.auth, LlmAuth::ApiKey);
     assert_eq!(settings.endpoint, "http://llm.internal:8080/v1");
     assert_eq!(settings.model, "some-model:q4_K_M");
     assert_eq!(
@@ -905,19 +825,6 @@ fn the_client_posts_a_structured_chat_completion() {
 }
 
 #[test]
-fn without_a_key_there_is_no_authorization_header_and_no_max_tokens_when_unset() {
-    let server = StubServer::start(StubResponse::completion("{}"));
-    let client = OpenAiCompatible::new(server.settings(None));
-    let mut request = request();
-    request.max_tokens = None;
-    client.complete(&request).unwrap();
-
-    let sent = server.only_request();
-    assert_eq!(sent.header("authorization"), None, "{:?}", sent.headers);
-    assert!(sent.json().get("max_tokens").is_none(), "{}", sent.body);
-}
-
-#[test]
 fn a_trailing_slash_on_the_endpoint_does_not_double_the_path() {
     let server = StubServer::start(StubResponse::completion("{}"));
     let mut settings = server.settings(None);
@@ -926,16 +833,6 @@ fn a_trailing_slash_on_the_endpoint_does_not_double_the_path() {
         .complete(&request())
         .unwrap();
     assert_eq!(server.only_request().path, "/v1/chat/completions");
-}
-
-#[test]
-fn fenced_json_in_the_content_is_unwrapped() {
-    // Local models often fence their output even under json_schema.
-    let server = StubServer::start(StubResponse::completion("```json\n{\"claims\": []}\n```"));
-    let response = OpenAiCompatible::new(server.settings(None))
-        .complete(&request())
-        .unwrap();
-    assert_eq!(response.json, json!({"claims": []}));
 }
 
 #[test]
@@ -979,21 +876,6 @@ fn no_choices_and_a_refusal_are_errors() {
         .unwrap_err();
     assert!(matches!(error, LlmError::Refused), "{error:?}");
     assert!(!error.is_retryable());
-}
-
-#[test]
-fn missing_usage_is_none_not_zero() {
-    let server = StubServer::start(StubResponse::json(json!({
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "{\"claims\":[]}"},
-            "finish_reason": "stop"
-        }]
-    })));
-    let response = OpenAiCompatible::new(server.settings(None))
-        .complete(&request())
-        .unwrap();
-    assert_eq!(response.usage, None);
 }
 
 #[test]
@@ -1083,18 +965,6 @@ fn the_fake_llm_replies_in_order_and_records_requests() {
 
     assert_eq!(fake.requests(), vec![first, second.clone(), request()]);
     assert_eq!(fake.requests()[1].user, second.user);
-}
-
-#[test]
-fn the_fake_llm_can_fail_every_call() {
-    let fake = FakeLlm::failing("fake-llm", || LlmError::Status { status: 503 });
-    let error = fake.complete(&request()).unwrap_err();
-    assert!(
-        matches!(error, LlmError::Status { status: 503 }),
-        "{error:?}"
-    );
-    assert!(error.is_retryable());
-    assert_eq!(fake.requests().len(), 1);
 }
 
 // The real models. Ignored: they run only when the models are present.

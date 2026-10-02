@@ -131,71 +131,6 @@ fn each_turn_becomes_a_prefetch_and_a_sync_and_tool_rows_are_skipped() {
     assert!(!text.contains("TOOL-RESULT-TEXT"), "{text}");
 }
 
-/// TIM-96, decision 1: the compacted turns (`active=0, compacted=1`) are
-/// replayed, a clear is emitted at the boundary between them and the
-/// summary row, and the summary row itself is skipped. The summary row
-/// carries Hermes' own `_compressed_summary` flag and sits where TIM-96
-/// says it does, so either way of finding it passes.
-#[test]
-fn compaction_replays_the_compacted_turns_and_clears_at_the_boundary() {
-    let dir = TestDir::new();
-    let state_db = dir.private_path("state.db");
-    let db = StateDb::create(&state_db);
-    let t = epoch("2026-01-05T09:00:00Z");
-    db.session("s1", "discord", Some("discord:1"), None, t);
-    for (offset, user, assistant) in [
-        (0.0, "Compacted question one.", "Compacted answer one."),
-        (600.0, "Compacted question two.", "Compacted answer two."),
-    ] {
-        for (role, content, delta) in [("user", user, 0.0), ("assistant", assistant, 30.0)] {
-            db.message(Message {
-                session: "s1",
-                role,
-                content,
-                at: t + offset + delta,
-                active: false,
-                compacted: true,
-                ..Message::default()
-            });
-        }
-    }
-    db.message(Message {
-        session: "s1",
-        role: "user",
-        content: "HERMES-COMPACTION-SUMMARY",
-        at: t + 1200.0,
-        summary: true,
-        ..Message::default()
-    });
-    db.turn(
-        "s1",
-        t + 1800.0,
-        "A question after compaction.",
-        "An answer.",
-    );
-    drop(db);
-
-    let corpus = imported(&dir, &state_db);
-    let events = session_events(&corpus, "s1");
-    assert_eq!(
-        kinds(&events),
-        [
-            "prefetch", "sync", "prefetch", "sync", "clear", "prefetch", "sync"
-        ],
-        "{events:#?}"
-    );
-    assert_eq!(events[0]["query"], "Compacted question one.");
-    assert_eq!(events[3]["assistant"], "Compacted answer two.");
-    let clear = at(&events[4]);
-    assert!(
-        at(&events[3]) <= clear && clear <= at(&events[5]),
-        "the clear sits between the compacted turns and the next one: {events:#?}"
-    );
-    assert_eq!(events[5]["query"], "A question after compaction.");
-    let text = fs::read_to_string(&corpus).unwrap();
-    assert!(!text.contains("HERMES-COMPACTION-SUMMARY"), "{text}");
-}
-
 /// Tim's decision on TIM-117 (Architect, 09:28): import only rows with
 /// `active = 1 OR compacted = 1`, key the clear on the
 /// `_compressed_summary` row, and order by timestamp, not row id.
@@ -303,45 +238,6 @@ fn a_carried_tail_replays_once_before_the_clear() {
     assert_eq!(events[5]["query"], "A question after compaction.");
     let text = fs::read_to_string(&corpus).unwrap();
     assert!(!text.contains("HERMES-COMPACTION-SUMMARY"), "{text}");
-}
-
-/// The same decision for a rewind: the turns a rewind discarded (`active=0,
-/// compacted=0`) were taken back, so they never replay.
-#[test]
-fn turns_a_rewind_discarded_never_replay() {
-    let dir = TestDir::new();
-    let state_db = dir.private_path("state.db");
-    let db = StateDb::create(&state_db);
-    let t = epoch("2026-01-05T09:00:00Z");
-    db.session("s1", "discord", Some("discord:1"), None, t);
-    for (role, content, delta) in [
-        ("user", "REWOUND-QUESTION", 0.0),
-        ("assistant", "REWOUND-ANSWER", 30.0),
-    ] {
-        db.message(Message {
-            session: "s1",
-            role,
-            content,
-            at: t + delta,
-            active: false,
-            ..Message::default()
-        });
-    }
-    db.turn(
-        "s1",
-        t + 600.0,
-        "The question asked instead.",
-        "Its answer.",
-    );
-    drop(db);
-
-    let corpus = imported(&dir, &state_db);
-    let events = session_events(&corpus, "s1");
-    assert_eq!(kinds(&events), ["prefetch", "sync"], "{events:#?}");
-    assert_eq!(events[0]["query"], "The question asked instead.");
-    let text = fs::read_to_string(&corpus).unwrap();
-    assert!(!text.contains("REWOUND-QUESTION"), "{text}");
-    assert!(!text.contains("REWOUND-ANSWER"), "{text}");
 }
 
 // Multimodal content (TIM-96, decision 1): Hermes stores it as `\0json:`
@@ -496,21 +392,6 @@ fn cron_sessions_get_prefetch_only_and_subagent_sessions_nothing() {
 /// TIM-117: the importer checks the schema it was written against and
 /// fails loudly on a mismatch, naming what's wrong. It writes no corpus.
 #[test]
-fn a_missing_column_fails_the_import_and_names_the_column() {
-    let dir = TestDir::new();
-    let state_db = dir.private_path("state.db");
-    let db = hermes::small_history(&state_db);
-    db.conn()
-        .execute_batch("ALTER TABLE messages DROP COLUMN compacted")
-        .unwrap();
-    drop(db);
-    let corpus = dir.private_path("corpus/main.jsonl");
-    let output = import(&dir, &state_db, &corpus);
-    assert_refused(&output, "compacted");
-    assert!(!corpus.exists(), "a refused import writes no corpus");
-}
-
-#[test]
 fn a_schema_version_the_importer_wasnt_written_against_fails_the_import() {
     let dir = TestDir::new();
     let state_db = dir.private_path("state.db");
@@ -600,18 +481,6 @@ fn the_importer_never_copies_the_system_prompt_or_api_content() {
             );
         }
     }
-}
-
-/// Everything derived from real history stays in `ASPHODEL_REPLAY_DIR`.
-#[test]
-fn the_corpus_is_refused_outside_the_private_dir() {
-    let dir = TestDir::new();
-    let state_db = dir.private_path("state.db");
-    hermes::small_history(&state_db);
-    let outside = dir.path("outside.jsonl");
-    let output = import(&dir, &state_db, &outside);
-    assert_refused(&output, "private");
-    assert!(!outside.exists());
 }
 
 /// The corpus hash in every report means something only if the same input

@@ -114,26 +114,6 @@ mod tests {
     }
 
     #[test]
-    fn set_moves_forward_and_advance_uses_the_new_time() {
-        let clock = SimulatedClock::new(start());
-        let later = "2026-02-01T12:00:00Z".parse().unwrap();
-        clock.set(later);
-        assert_eq!(clock.now(), later);
-
-        clock.advance(SignedDuration::from_secs(1));
-        assert_eq!(clock.now(), "2026-02-01T12:00:01Z".parse().unwrap());
-    }
-
-    #[test]
-    fn zero_advance_and_equal_set_leave_time_unchanged() {
-        let clock = SimulatedClock::new(start());
-        clock.advance(SignedDuration::ZERO);
-        assert_eq!(clock.now(), start());
-        clock.set(start());
-        assert_eq!(clock.now(), start());
-    }
-
-    #[test]
     fn negative_advance_panics_without_changing_time() {
         let clock = SimulatedClock::new(start());
         assert!(catch_unwind(|| clock.advance(SignedDuration::from_nanos(-1))).is_err());

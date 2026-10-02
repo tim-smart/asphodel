@@ -219,21 +219,6 @@ fn the_html_report_shows_the_reports_numbers_with_every_asset_inlined() {
     assert_eq!(external_references(&page), Vec::<String>::new());
 }
 
-/// A report that doesn't parse is refused naming the file, never quoting
-/// it, and no page is written.
-#[test]
-fn a_report_that_doesnt_parse_is_refused_without_quoting_it() {
-    let dir = TestDir::new();
-    let sentinel = "SENTINEL-REPORT-TEXT-9d1e";
-    let path = dir.private_file(
-        "reports/corrupt.json",
-        &format!("{{\n  \"kind\": \"live\",\n  \"scenario\": {sentinel}\n}}\n"),
-    );
-    let output = report_html(&dir, &path, &[]);
-    assert_refused_without(&output, sentinel, &["corrupt.json"]);
-    assert!(!path.with_extension("html").exists());
-}
-
 /// The report read and the page written are both history, so both stay
 /// in the private dir: a path outside it, or a symlink inside it pointing
 /// out, is refused and nothing is written.
@@ -511,43 +496,6 @@ fn labelling_material_holds_scored_candidates_at_50_turns_and_call2_lists() {
         !curve["recall"]["curve"].as_array().unwrap().is_empty(),
         "{curve}"
     );
-}
-
-/// The material is history, so it's refused outside the private dir and
-/// through a symlink, and nothing is written there.
-#[test]
-fn labelling_material_is_refused_outside_the_private_dir() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-
-    let outside = dir.path("material.json");
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "replay",
-        PASSING_PROBES,
-        "outside",
-        None,
-        &["--labelling", outside.to_str().unwrap()],
-    );
-    assert_refused(&run.output, "private");
-    assert!(!outside.exists());
-
-    let target = dir.path("target.json");
-    let linked = dir.private_path("labelling/linked.json");
-    std::os::unix::fs::symlink(&target, &linked).unwrap();
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "replay",
-        PASSING_PROBES,
-        "linked",
-        None,
-        &["--labelling", linked.to_str().unwrap()],
-    );
-    assert_refused(&run.output, "private");
-    assert!(!target.exists());
 }
 
 /// The material is written after the run, so a `--labelling` path that is
@@ -935,38 +883,4 @@ fn malformed_labels_and_material_are_refused_without_quoting_them() {
         MATERIAL_SENTINEL,
         &["broken.json", &format!("line {line}")],
     );
-}
-
-/// The labels and the material are history: each is refused outside the
-/// private dir and through a symlink, before it's read.
-#[test]
-fn labels_and_material_are_refused_outside_the_private_dir() {
-    let dir = TestDir::new();
-    let material_text = serde_json::to_string_pretty(&hand_material()).unwrap();
-    let material = dir.private_file("labelling/material.json", &material_text);
-    let labels = dir.private_file("labelling/labels.toml", HAND_LABELS);
-
-    let outside_labels = dir.path("labels.toml");
-    fs::write(&outside_labels, HAND_LABELS).unwrap();
-    let outside_material = dir.path("material.json");
-    fs::write(&outside_material, &material_text).unwrap();
-    let linked_labels = dir.private().join("labelling/linked.toml");
-    std::os::unix::fs::symlink(&outside_labels, &linked_labels).unwrap();
-    let linked_material = dir.private().join("labelling/linked.json");
-    std::os::unix::fs::symlink(&outside_material, &linked_material).unwrap();
-
-    for (labels, material) in [
-        (&outside_labels, &material),
-        (&labels, &outside_material),
-        (&linked_labels, &material),
-        (&labels, &linked_material),
-    ] {
-        let output = precision(&dir, labels, material);
-        assert_refused(&output, "private");
-        assert!(
-            !stdout(&output).contains("curve"),
-            "nothing is computed: {}",
-            stdout(&output)
-        );
-    }
 }

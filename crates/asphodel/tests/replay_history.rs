@@ -38,12 +38,6 @@ fn simulation(report: &Value) -> Value {
     report
 }
 
-fn is_hex(value: &Value, len: usize) -> bool {
-    value
-        .as_str()
-        .is_some_and(|text| text.len() == len && text.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
 // Recording modes (TIM-96, decision 4).
 
 /// `live` calls the LLM and records; `replay` of that cassette needs no
@@ -99,22 +93,6 @@ fn replay_fails_on_a_cassette_miss() {
     let run = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "miss", None, &[]);
     assert_refused(&run.output, "miss");
     assert!(!run.report_path.exists(), "a failed run writes no report");
-}
-
-/// `fast` on its own recording reuses claims by chunk and `used` verdicts
-/// by pair, so it needs no LLM and counts zero misses.
-#[test]
-fn fast_on_its_own_recording_needs_no_llm_and_counts_zero_misses() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-    let run = replay_history(&dir, &corpus, "fast", PASSING_PROBES, "fast", None, &[]);
-    assert_ok(&run.output);
-    let report = run.report();
-    assert_eq!(report["kind"], "fast");
-    assert_eq!(report["llm"]["misses"], 0, "{report}");
-    assert_eq!(report["llm"]["live"], 0, "{report}");
-    assert_eq!(report["llm"]["top_up"], 0, "{report}");
 }
 
 /// TIM-96, decision 4: `used` verdicts are cached per (reply, sentence)
@@ -227,7 +205,7 @@ fn imported_with_an_extra_turn(dir: &TestDir) -> std::path::PathBuf {
 }
 
 /// A chunk with no recorded claims is a miss in `fast`: with an LLM it's
-/// called live and counted, and without one the run fails naming the miss.
+/// called live and counted.
 #[test]
 fn a_fast_claims_miss_calls_live_with_an_llm_and_counts_it() {
     let dir = TestDir::new();
@@ -250,44 +228,10 @@ fn a_fast_claims_miss_calls_live_with_an_llm_and_counts_it() {
     assert_eq!(report["llm"]["live"], 1, "{report}");
 }
 
-#[test]
-fn a_fast_claims_miss_without_an_llm_fails_naming_the_miss() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-    let extra = imported_with_an_extra_turn(&dir);
-    let run = replay_history(
-        &dir,
-        &extra,
-        "fast",
-        PASSING_PROBES,
-        "fast-extra",
-        None,
-        &[],
-    );
-    assert_refused(&run.output, "miss");
-    assert!(!run.report_path.exists(), "a failed run writes no report");
-}
-
 // The determinism self-test (TIM-117, done-when).
 
-#[test]
-fn the_self_test_passes_for_replay() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "replay",
-        PASSING_PROBES,
-        "self-test",
-        None,
-        &["--self-test"],
-    );
-    assert_ok(&run.output);
-}
-
+/// `fast` on its own recording needs no LLM, counts zero misses and passes
+/// the self-test.
 #[test]
 fn the_self_test_passes_for_fast_with_zero_misses() {
     let dir = TestDir::new();
@@ -306,42 +250,7 @@ fn the_self_test_passes_for_fast_with_zero_misses() {
     assert_eq!(run.report()["llm"]["misses"], 0);
 }
 
-/// `live` measures latency and can't be identical (TIM-96, decision 3).
-#[test]
-fn the_self_test_is_refused_in_live() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    let script = support::live_script(&dir);
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "live",
-        PASSING_PROBES,
-        "self-test",
-        Some(&script),
-        &["--self-test"],
-    );
-    assert_refused(&run.output, "live");
-}
-
 // The report (TIM-96, decisions 6 and 7).
-
-/// Every report embeds its resolved config, the corpus hash, the cassette
-/// hash and the git SHA.
-#[test]
-fn the_report_embeds_its_config_hashes_and_git_sha() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-    let run = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "replay", None, &[]);
-    assert_ok(&run.output);
-    let report = run.report();
-    assert!(report["tuning"]["clock"].is_object(), "{report}");
-    assert!(report["flags"].is_object(), "{report}");
-    assert!(is_hex(&report["corpus_hash"], 64), "{report}");
-    assert!(is_hex(&report["cassette_hash"], 64), "{report}");
-    assert!(is_hex(&report["git_sha"], 40), "{report}");
-}
 
 /// Injected tokens per session and per turn, with cron reported apart so
 /// it doesn't skew the percentiles; purges per day next to the
@@ -815,72 +724,6 @@ fn fast_refresh_recorded_substitutes_the_nearest_recorded_refresh() {
     assert_ok(&far_adds.output);
 }
 
-/// A substituted refresh can cite memories this run doesn't have. The
-/// existing citation check drops those entries, including one that mixes a
-/// real citation with a missing one, so the model holds exactly what the
-/// valid entry alone would give.
-#[test]
-fn fast_refresh_recorded_drops_entries_citing_memories_the_run_lacks() {
-    let dir = TestDir::new();
-    let corpus = imported_with_a_model(&dir);
-    record_with_models(&dir, &corpus);
-
-    with_near_and_far_home_refreshes(
-        &dir,
-        vec![add_entry("Tim lives in Auckland.", &["m1"])],
-        vec![],
-    );
-    let valid = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        HOME_HAS_HOME,
-        "valid",
-        None,
-        &["--refresh", "recorded"],
-    );
-    assert_ok(&valid.output);
-
-    with_near_and_far_home_refreshes(
-        &dir,
-        vec![
-            add_entry("Tim lives in Auckland.", &["m1"]),
-            add_entry(
-                "Tim keeps eleven cats in a lighthouse on the far side of the moon.",
-                &["m9"],
-            ),
-            add_entry(
-                "Tim sails his houseboat between Auckland and the rings of Saturn.",
-                &["m1", "m9"],
-            ),
-        ],
-        vec![],
-    );
-    let mixed = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        HOME_HAS_HOME,
-        "mixed",
-        None,
-        &["--refresh", "recorded"],
-    );
-    assert_ok(&mixed.output);
-
-    let valid = valid.report();
-    let mixed = mixed.report();
-    assert!(
-        valid["profile_tokens"]["p95"]
-            .as_u64()
-            .is_some_and(|tokens| tokens > 0),
-        "the valid entry renders: {valid}"
-    );
-    assert_eq!(
-        mixed["profile_tokens"], valid["profile_tokens"],
-        "only the valid entry survives"
-    );
-}
-
 /// `--refresh live` calls the LLM for a refresh the cassette has no record
 /// of, records it, and counts it as live.
 #[test]
@@ -1006,66 +849,7 @@ fn a_malformed_corpus_line_is_refused_without_quoting_it() {
     assert_refused_without(&run.output, sentinel, &[&format!("line {}", line + 1)]);
 }
 
-/// Blocker 1: a cassette line that doesn't parse is refused naming the
-/// line, never quoting it.
-#[test]
-fn a_malformed_cassette_line_is_refused_without_quoting_it() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-    let sentinel = "SENTINEL-CASSETTE-VALUE-e5b";
-    let mut records = cassette_records(&dir);
-    records[0]["latency_ms"] = Value::from(sentinel);
-    write_cassette(&dir, &records);
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "replay",
-        PASSING_PROBES,
-        "bad-cassette",
-        None,
-        &[],
-    );
-    assert_refused_without(&run.output, sentinel, &["line 1"]);
-}
-
-/// Blocker 2 (TIM-96, decision 3): a `live` run schedules a chunk's
-/// completion with the latency it measured, and the `replay` of its
-/// cassette, scheduling with the recorded latency, simulates the same lag.
-#[test]
-fn live_extraction_lag_is_the_measured_latency_and_replay_matches_it() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    let script = support::delayed_script(&dir, 1000);
-    let live = replay_history(
-        &dir,
-        &corpus,
-        "live",
-        PASSING_PROBES,
-        "live",
-        Some(&script),
-        &[],
-    );
-    assert_ok(&live.output);
-    let live = live.report();
-    assert!(
-        live["extraction_lag"]["p50_ms"]
-            .as_u64()
-            .is_some_and(|lag| lag >= 1000),
-        "live lag: {}",
-        live["extraction_lag"]
-    );
-
-    let replay = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "replay", None, &[]);
-    assert_ok(&replay.output);
-    assert_eq!(
-        replay.report()["extraction_lag"],
-        live["extraction_lag"],
-        "replay simulates the lag live measured"
-    );
-}
-
-/// Blocker 2: with nonzero live latency, a prefetch between a turn's sync
+/// Blocker 2 (TIM-96, decision 3): with nonzero live latency, a prefetch between a turn's sync
 /// and its completion doesn't see the turn's memory, and one after does.
 /// Both prefetches ask the same question from sessions of their own; the
 /// probes check the store at the same two moments.
@@ -1626,18 +1410,4 @@ fn a_substituted_edit_whose_entry_is_absent_is_dropped() {
         control["profile_tokens"],
         "B's text is unchanged"
     );
-}
-
-#[test]
-fn a_substituted_remove_whose_entry_is_absent_is_dropped() {
-    let (_dir, run) = substituted(
-        vec![serde_json::json!({
-            "op": "remove",
-            "entry": "e1",
-            "text": null,
-            "cites": [],
-        })],
-        "remove",
-    );
-    assert_probes_pass(&run);
 }

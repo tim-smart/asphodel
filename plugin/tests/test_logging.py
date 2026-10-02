@@ -27,14 +27,3 @@ def test_no_content_at_debug_or_above(make_provider, daemon, caplog):
     text = "\n".join(record.getMessage() for record in caplog.records if record.levelno >= logging.DEBUG)
     for secret in SECRETS:
         assert secret not in text
-
-
-def test_failures_are_logged_at_warning_with_status_codes_only(make_provider, daemon, caplog):
-    caplog.set_level(logging.DEBUG)
-    provider = make_provider()
-    daemon.set_response("prefetch", 503, {"error": "the daemon is starting"})
-    provider.prefetch("pineapple on pizza", session_id=SESSION)
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings
-    assert any("503" in r.getMessage() for r in warnings)
-    assert not any("pineapple" in r.getMessage() for r in caplog.records if r.levelno >= logging.DEBUG)

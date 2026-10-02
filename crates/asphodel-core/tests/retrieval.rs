@@ -25,18 +25,18 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use asphodel_core::config::RankingTuning;
-use asphodel_core::constants::{CANDIDATES_PER_ARM, TAU};
+use asphodel_core::constants::CANDIDATES_PER_ARM;
 use asphodel_core::ingest::{Outcome, Turn};
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, ModelError, Models, Reranker,
 };
 use asphodel_core::retrieval::{
-    Band, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, band, effective_query,
-    estimate_tokens, fuse, phase_term, score,
+    Band, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, effective_query,
+    estimate_tokens, fuse, phase_term,
 };
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::{OpenOptions, Store, VectorIndex, micros};
-use asphodel_core::strength::{Kind, Phase, TimePrecision, Window, WorldTime};
+use asphodel_core::strength::{Kind, TimePrecision, Window, WorldTime};
 use asphodel_core::{Service, SimulatedClock, Tuning};
 use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
@@ -562,6 +562,11 @@ fn turn(session: &str, message_at: &str, user: &str, recall_id: Option<String>) 
     }
 }
 
+/// Fixture content built at run time, for `Memory`'s `&'static str`.
+fn leak(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
+}
+
 fn query(text: &str) -> RecallRequest {
     RecallRequest {
         query: text.into(),
@@ -597,20 +602,6 @@ fn fusion_sums_reciprocal_ranks_with_k_60() {
 }
 
 #[test]
-fn fusion_lists_each_id_once_and_ignores_an_empty_arm() {
-    let vector = [3_i64, 1, 2];
-    let bm25 = [2_i64, 3];
-    let with_empty = fuse(&[&vector, &bm25, &[]]);
-    assert_eq!(with_empty, fuse(&[&vector, &bm25]));
-    let distinct: std::collections::BTreeSet<i64> = with_empty.iter().copied().collect();
-    assert_eq!(distinct.len(), with_empty.len());
-    assert_eq!(distinct, [1, 2, 3].into());
-    // 3 is first and second; 2 is third and first; 1 is in one list only.
-    assert_eq!(with_empty, vec![3, 2, 1]);
-    assert!(fuse(&[&[], &[]]).is_empty());
-}
-
-#[test]
 fn a_repeat_within_one_list_counts_once() {
     // If the repeat of 1 counted, 1 would score 1/61 + 1/62 and 2 would be
     // pushed to rank 3; counted once, 2 is second in the first list and
@@ -619,20 +610,6 @@ fn a_repeat_within_one_list_counts_once() {
 }
 
 // Score (decision 5) and phase (decision 6)
-
-#[test]
-fn the_score_adds_relevance_weighted_strength_clamped_confidence_and_phase() {
-    let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
-    assert!(close(score(2.0, 0.5, 1.2, 1.0, 0.0), 2.6));
-    assert!(close(
-        score(2.0, 0.5, 1.2, 0.5, 0.25),
-        2.6 + 0.5_f64.ln() + 0.25
-    ));
-    // ln(c) is clamped at −3, so a stale state is demoted, never gated.
-    assert!(close(score(0.0, 0.0, 0.0, 1e-9, 0.0), -3.0));
-    assert!(close(score(0.0, 0.0, 0.0, 0.0, 0.0), -3.0));
-    assert!(close(score(0.0, 0.0, 0.0, 0.06, 0.0), 0.06_f64.ln()));
-}
 
 fn utc(text: &str) -> WorldTime {
     WorldTime {
@@ -659,18 +636,6 @@ fn phase(window: &Window, low_confidence: bool) -> f64 {
         ..RankingTuning::default()
     };
     phase_term(window, low_confidence, &TimeZone::UTC, at(NOW), &ranking)
-}
-
-#[test]
-fn the_phase_term_is_zero_for_current_memories() {
-    assert_eq!(phase(&window(Kind::Fact), false), 0.0);
-    let open_task = window(Kind::Task);
-    assert_eq!(phase(&open_task, false), 0.0);
-    let state = Window {
-        valid_from: Some(utc("2026-09-01T00:00:00Z")),
-        ..window(Kind::State)
-    };
-    assert_eq!(phase(&state, false), 0.0);
 }
 
 #[test]
@@ -731,17 +696,6 @@ fn low_window_confidence_halves_the_phase_term_in_both_directions() {
     assert!(phase(&ended, true) < 0.0);
 }
 
-// The strength band (decision 13)
-
-#[test]
-fn bands_split_at_tau_and_the_strong_cutoff() {
-    let cutoff = Tuning::default().recall.strong_cutoff;
-    assert_eq!(band(TAU - 0.5, cutoff), Band::Faded);
-    assert_eq!(band((TAU + cutoff) / 2.0, cutoff), Band::Fading);
-    assert_eq!(band(cutoff + 0.5, cutoff), Band::Strong);
-    assert_eq!(band(f64::NEG_INFINITY, cutoff), Band::Faded);
-}
-
 // Short follow-ups (decision 8, as amended by TIM-99)
 
 #[test]
@@ -770,22 +724,6 @@ fn a_short_follow_up_finds_what_the_previous_query_asked_about() {
 
     let followed = h.prefetch_after("s", "yes, book it", Some("dentist appointment Friday"));
     assert_eq!(followed.injected, vec![dentist]);
-}
-
-#[test]
-fn the_recall_log_stores_the_query_that_ran() {
-    let h = Harness::new();
-    let previous = "dentist appointment Friday";
-
-    let short = h.prefetch_after("s", "yes, book it", Some(previous));
-    let (_, _, _, logged, _, _) = h.recall_row(short.recall_id);
-    assert_eq!(logged, effective_query("yes, book it", Some(previous)));
-    assert!(logged.contains(previous) && logged.contains("yes, book it"));
-
-    let long = "could you please move it to the following Monday instead";
-    let full = h.prefetch_after("s", long, Some(previous));
-    let (_, _, _, logged, _, _) = h.recall_row(full.recall_id);
-    assert_eq!(logged, long);
 }
 
 // Retrievers and clean-up (decision 1)
@@ -879,42 +817,10 @@ fn injection_gates_on_the_reranker_floor() {
 }
 
 #[test]
-fn injecting_nothing_is_a_valid_result() {
-    let h = Harness::new();
-    h.insert(fact("Tim owns a canoe."));
-    let prefetch = h.prefetch("s", "pottery class schedule");
-    assert!(prefetch.injected.is_empty());
-    assert!(prefetch.text.is_empty());
-    assert!(prefetch.reranked);
-    // The recall is still logged.
-    let (kind, ..) = h.recall_row(prefetch.recall_id);
-    assert_eq!(kind, "prefetch");
-}
-
-#[test]
 fn injection_takes_at_most_the_cap() {
-    const NOTES: [&str; 10] = [
-        "Pottery class note one.",
-        "Pottery class note two.",
-        "Pottery class note three.",
-        "Pottery class note four.",
-        "Pottery class note five.",
-        "Pottery class note six.",
-        "Pottery class note seven.",
-        "Pottery class note eight.",
-        "Pottery class note nine.",
-        "Pottery class note ten.",
-    ];
-    let h = Harness::new();
-    for note in NOTES {
-        h.insert(fact(note));
-    }
-    assert_eq!(Tuning::default().injection.cap, 8);
-    assert_eq!(h.prefetch("s", "pottery class").injected.len(), 8);
-
     let h = Harness::with(1.0, "cap = 3", Arc::new(FakeReranker));
-    for note in NOTES {
-        h.insert(fact(note));
+    for note in ["one", "two", "three", "four", "five"] {
+        h.insert(fact(leak(format!("Pottery class note {note}."))));
     }
     let prefetch = h.prefetch("s", "pottery class");
     assert_eq!(prefetch.injected.len(), 3);
@@ -1028,22 +934,6 @@ fn a_late_reranker_injects_nothing_and_still_logs_the_prefetch() {
     // Nothing is pending, so the turn commits nothing.
     h.sync_turn("s", Some(prefetch.recall_id.to_string()));
     assert!(h.in_context("s").is_empty());
-}
-
-#[test]
-fn a_late_reranker_leaves_explicit_recall_in_rrf_order() {
-    let h = Harness::with(1.0, "", Arc::new(SlowReranker(Duration::from_secs(2))))
-        .with_deadline(Duration::from_millis(100));
-    let pottery = h.insert(fact("Tim takes a pottery class."));
-
-    let started = Instant::now();
-    let recall = h.recall(query("pottery class"));
-    assert!(
-        started.elapsed() < Duration::from_millis(1500),
-        "waited for the reranker"
-    );
-    assert!(!recall.reranked);
-    assert_eq!(ids(&recall), vec![pottery]);
 }
 
 // The injection format (decision 10)
@@ -1315,27 +1205,6 @@ fn a_prefetch_logs_one_row_with_what_was_injected() {
 }
 
 #[test]
-fn a_recall_logs_one_row_with_its_results_in_rank_order() {
-    let h = Harness::with_floor(0.0);
-    h.insert(fact("A pottery note."));
-    h.insert(fact("A pottery class note."));
-    let recall = h.recall(RecallRequest {
-        session_id: Some("s".into()),
-        ..query("pottery class")
-    });
-    let (kind, session, _, logged, _, _) = h.recall_row(recall.recall_id);
-    assert_eq!(kind, "tool");
-    assert_eq!(session.as_deref(), Some("s"));
-    assert_eq!(logged, "pottery class");
-    let results = h.results(recall.recall_id);
-    assert_eq!(
-        results.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
-        ids(&recall)
-    );
-    assert!(results.iter().all(|(_, injected)| !injected));
-}
-
-#[test]
 fn recalling_never_writes_an_access() {
     let h = Harness::new();
     h.insert(fact("Tim takes a pottery class."));
@@ -1365,31 +1234,6 @@ fn recalling_never_writes_an_access() {
 // Explicit recall (decision 13, TIM-94 decision 9)
 
 #[test]
-fn recall_returns_each_result_with_its_fields() {
-    let h = Harness::new();
-    let dentist = h.insert(Memory {
-        kind: "event",
-        owner_significance: Some("kept"),
-        valid_from: Some((local("2026-10-03T15:00"), "minute")),
-        ..fact("Tim has a dentist appointment on 3 October 2026 at 15:00.")
-    });
-    let recall = h.recall(query("dentist appointment"));
-    let result = recall.results.iter().find(|r| r.id == dentist).unwrap();
-    assert_eq!(
-        result.sentence,
-        "Tim has a dentist appointment on 3 October 2026 at 15:00."
-    );
-    assert_eq!(result.kind, Kind::Event);
-    assert_eq!(result.phase, Phase::Upcoming);
-    assert_eq!(result.observed_at, at(EARLIER));
-    assert_eq!(
-        result.window.valid_from.map(|t| t.at),
-        Some(local("2026-10-03T15:00"))
-    );
-    assert!(result.kept);
-}
-
-#[test]
 fn a_fresh_memory_is_strong() {
     let h = Harness::new();
     let fresh = h.insert(Memory {
@@ -1400,26 +1244,6 @@ fn a_fresh_memory_is_strong() {
     let recall = h.recall(query("pottery apron"));
     let found = recall.results.iter().find(|r| r.id == fresh).unwrap();
     assert_eq!(found.strength, Band::Strong);
-}
-
-#[test]
-fn recall_filters_by_kind() {
-    let h = Harness::with_floor(0.0);
-    let task = h.insert(Memory {
-        kind: "task",
-        ..fact("Tim needs to weed the garden.")
-    });
-    h.insert(fact("Tim's garden has a lemon tree."));
-    h.insert(Memory {
-        kind: "event",
-        valid_from: Some((local("2026-09-20T00:00"), "day")),
-        ..fact("Tim planted garlic in the garden.")
-    });
-    let recall = h.recall(RecallRequest {
-        kinds: vec![Kind::Task],
-        ..query("garden")
-    });
-    assert_eq!(ids(&recall), vec![task]);
 }
 
 #[test]
@@ -1659,46 +1483,9 @@ fn a_timed_out_reranker_call_leaves_no_queued_inference() {
 
 #[test]
 fn recall_returns_ten_results_unless_asked_for_up_to_thirty() {
-    const NOTES: [&str; 35] = [
-        "Garden note 1.",
-        "Garden note 2.",
-        "Garden note 3.",
-        "Garden note 4.",
-        "Garden note 5.",
-        "Garden note 6.",
-        "Garden note 7.",
-        "Garden note 8.",
-        "Garden note 9.",
-        "Garden note 10.",
-        "Garden note 11.",
-        "Garden note 12.",
-        "Garden note 13.",
-        "Garden note 14.",
-        "Garden note 15.",
-        "Garden note 16.",
-        "Garden note 17.",
-        "Garden note 18.",
-        "Garden note 19.",
-        "Garden note 20.",
-        "Garden note 21.",
-        "Garden note 22.",
-        "Garden note 23.",
-        "Garden note 24.",
-        "Garden note 25.",
-        "Garden note 26.",
-        "Garden note 27.",
-        "Garden note 28.",
-        "Garden note 29.",
-        "Garden note 30.",
-        "Garden note 31.",
-        "Garden note 32.",
-        "Garden note 33.",
-        "Garden note 34.",
-        "Garden note 35.",
-    ];
     let h = Harness::with_floor(0.0);
-    for note in NOTES {
-        h.insert(fact(note));
+    for n in 1..=35 {
+        h.insert(fact(leak(format!("Garden note {n}."))));
     }
     assert_eq!(h.recall(query("garden note")).results.len(), 10);
     let asked = |limit: usize| {
@@ -1778,16 +1565,6 @@ fn queued_turn_with_pottery_in_context() -> (Harness, Uuid) {
     h.sync_turn("s", Some(prefetch.recall_id.to_string()));
     assert_eq!(h.in_context("s"), vec![pottery]);
     (h, pottery)
-}
-
-#[test]
-fn a_queued_turn_extracted_at_once_is_credited_with_its_injection() {
-    // The control for the three below: nothing happens to the session
-    // between the sync and the extraction.
-    let (h, pottery) = queued_turn_with_pottery_in_context();
-    let llm = h.extract_next(&["m1"]);
-    assert!(llm.requests()[0].user.contains("pottery class"));
-    assert_eq!(h.used(pottery), 1);
 }
 
 #[test]

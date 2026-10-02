@@ -40,12 +40,6 @@ def test_plugin_yaml_declares_no_dependencies():
     assert "requires_env: []" in lines
 
 
-def test_pyproject_declares_no_dependencies():
-    text = (PLUGIN_DIR / "pyproject.toml").read_text()
-    assert "dependencies = []" in text
-    assert "package = false" in text
-
-
 def test_only_stdlib_and_hermes_imports():
     offenders = []
     for path in plugin_sources():

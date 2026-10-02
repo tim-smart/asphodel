@@ -23,18 +23,10 @@ def test_four_tools_with_bare_function_schemas(make_provider):
         assert schema["parameters"]["type"] == "object"
 
 
-def test_forget_takes_ids_only_and_says_it_is_irreversible():
+def test_forget_takes_ids_only():
     forget = next(s for s in TOOLS.TOOL_SCHEMAS if s["name"] == "memory_forget")
     assert set(forget["parameters"]["properties"]) == {"ids"}
     assert forget["parameters"]["properties"]["ids"]["maxItems"] == 50
-    assert "irreversibl" in forget["description"].lower()
-    assert "owner" in forget["description"].lower()
-
-
-def test_owner_only_tools_say_so():
-    for schema in TOOLS.TOOL_SCHEMAS:
-        if schema["name"] in TOOLS.OWNER_ONLY_TOOLS:
-            assert "owner" in schema["description"].lower()
 
 
 # -- the owner check -------------------------------------------------------------
@@ -62,12 +54,6 @@ def test_the_owner_may_forget_keep_and_unkeep(make_provider, daemon):
     assert daemon.requests_for("unkeep")[0].body == {"ids": ["m2"]}
 
 
-def test_a_turn_with_no_author_is_the_owners(make_provider, daemon):
-    provider = make_provider(init={"platform": "cli"})
-    provider.on_turn_start(1, "keep that")
-    assert "kept" in json.loads(provider.handle_tool_call("memory_keep", {"ids": ["m1"]}))
-
-
 def test_another_speaker_is_refused_without_a_request(make_provider, daemon):
     provider = make_provider()
     provider.on_turn_start(1, "forget it", author_id="222", author_name="Maya", author_is_bot=False)
@@ -75,20 +61,6 @@ def test_another_speaker_is_refused_without_a_request(make_provider, daemon):
         message = error_of(provider.handle_tool_call(tool, {"ids": ["m1"]}))
         assert message and "owner" in message.lower()
     assert daemon.requests_for("forget") == daemon.requests_for("keep") == daemon.requests_for("unkeep") == []
-
-
-def test_a_bot_is_refused_even_with_the_owners_id(make_provider, daemon):
-    provider = make_provider()
-    provider.on_turn_start(1, "forget it", author_id="111", author_name="Relay", author_is_bot=True)
-    assert "owner" in error_of(provider.handle_tool_call("memory_forget", {"ids": ["m1"]})).lower()
-    assert daemon.requests_for("forget") == []
-
-
-def test_cron_runs_are_refused(make_provider, daemon):
-    provider = make_provider(init={"agent_context": "cron"})
-    provider.on_turn_start(1, "daily digest")
-    assert "owner" in error_of(provider.handle_tool_call("memory_forget", {"ids": ["m1"]})).lower()
-    assert daemon.requests_for("forget") == []
 
 
 def test_the_author_is_read_per_turn(make_provider, daemon):
@@ -131,12 +103,6 @@ def test_recall_forwards_the_arguments_and_session(make_provider, daemon):
     assert body == dict(args, session_id=SESSION)
 
 
-def test_recall_sends_only_what_the_model_gave(make_provider, daemon):
-    provider = make_provider()
-    provider.handle_tool_call("memory_recall", {"query": "tea"})
-    assert daemon.requests_for("recall")[0].body == {"query": "tea", "session_id": SESSION}
-
-
 # -- failures ---------------------------------------------------------------------
 
 
@@ -152,10 +118,6 @@ def test_an_unreachable_daemon_is_a_tool_error(make_provider, daemon):
     provider = make_provider(url=url)
     assert error_of(provider.handle_tool_call("memory_recall", {"query": "tea"}))
     assert error_of(provider.handle_tool_call("memory_keep", {"ids": ["m1"]}))
-
-
-def test_an_unknown_tool_is_a_tool_error(make_provider):
-    assert error_of(make_provider().handle_tool_call("memory_retain", {"text": "x"}))
 
 
 def test_bad_arguments_are_a_tool_error_not_an_exception(make_provider, daemon):

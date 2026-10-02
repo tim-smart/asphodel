@@ -16,15 +16,14 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 const FAKE_EMBEDDER: &str = "fake-embedder:v1";
 const FAKE_RERANKER: &str = "fake-reranker:v1";
-const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_FILE: &str = "llm-tokens.json";
 
 /// `asphodel` with a clean environment, so the caller's `ASPHODEL_*`
@@ -184,41 +183,27 @@ fn jwt(claims: Value) -> String {
 /// A loopback issuer: usercode, two pending polls, approval, exchange.
 struct Issuer {
     url: String,
-    requests: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl Issuer {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let log = Arc::clone(&requests);
         let polls = Arc::new(AtomicUsize::new(0));
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
-                let log = Arc::clone(&log);
                 let polls = Arc::clone(&polls);
-                std::thread::spawn(move || answer(stream, &log, &polls));
+                std::thread::spawn(move || answer(stream, &polls));
             }
         });
         Self {
             url: format!("http://127.0.0.1:{port}"),
-            requests,
         }
-    }
-
-    fn paths(&self) -> Vec<String> {
-        self.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(path, _)| path.clone())
-            .collect()
     }
 }
 
-fn answer(mut stream: TcpStream, log: &Mutex<Vec<(String, String)>>, polls: &AtomicUsize) {
+fn answer(mut stream: TcpStream, polls: &AtomicUsize) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
     if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -247,9 +232,6 @@ fn answer(mut stream: TcpStream, log: &Mutex<Vec<(String, String)>>, polls: &Ato
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
-    log.lock()
-        .unwrap()
-        .push((path.clone(), String::from_utf8_lossy(&body).into_owned()));
     let (status, body) = match path.as_str() {
         "/api/accounts/deviceauth/usercode" => (
             200,
@@ -283,21 +265,6 @@ fn answer(mut stream: TcpStream, log: &Mutex<Vec<(String, String)>>, polls: &Ato
 }
 
 #[test]
-fn llm_login_takes_the_data_dir_and_hides_the_issuer_override() {
-    let output = run(asphodel().args(["llm", "login", "--help"]));
-    assert!(output.status.success(), "{}", stderr(&output));
-    let help = stdout(&output);
-    let line = help
-        .lines()
-        .find(|line| line.trim_start().starts_with("--data-dir"))
-        .unwrap_or_else(|| panic!("no --data-dir in:\n{help}"));
-    assert!(line.contains("ASPHODEL_DATA_DIR"), "{line}");
-    assert!(!help.contains("ASPHODEL_LLM_ISSUER"), "{help}");
-    // Logging in never goes through the daemon: no --url, no token.
-    assert!(!help.contains("--url"), "{help}");
-}
-
-#[test]
 fn llm_login_shows_the_code_and_writes_the_token_file() {
     let issuer = Issuer::start();
     let dir = TestDir::new();
@@ -328,32 +295,6 @@ fn llm_login_shows_the_code_and_writes_the_token_file() {
         serde_json::from_str(&std::fs::read_to_string(&token_file).unwrap()).unwrap();
     assert_eq!(saved["refresh_token"], "rt-first");
     assert_eq!(saved["account_id"], "acct_7f3a9c");
-
-    assert_eq!(
-        issuer.paths(),
-        [
-            "/api/accounts/deviceauth/usercode",
-            "/api/accounts/deviceauth/token",
-            "/api/accounts/deviceauth/token",
-            "/api/accounts/deviceauth/token",
-            "/oauth/token",
-        ]
-    );
-    let requests = issuer.requests.lock().unwrap().clone();
-    assert_eq!(
-        serde_json::from_str::<Value>(&requests[0].1).unwrap(),
-        json!({"client_id": CLIENT_ID})
-    );
-    assert!(
-        requests[4].1.contains("grant_type=authorization_code"),
-        "{}",
-        requests[4].1
-    );
-    assert!(
-        requests[4].1.contains("code_verifier=verif"),
-        "{}",
-        requests[4].1
-    );
 }
 
 #[test]

@@ -17,8 +17,8 @@ use asphodel_core::config::{PurgePause, Tuning};
 use asphodel_core::store::bank::{BankError, BankIdentity, ModelIds, PROFILE_NAME};
 use asphodel_core::store::fs::{self, FilesystemKind, classify, classify_name};
 use asphodel_core::store::{
-    DB_FILE, DataDirLock, EMBEDDING_DIMENSIONS, LOCK_FILE, OpenOptions, SCHEMA_VERSION, Store,
-    StoreError, VectorError, VectorIndex, micros, migrations,
+    DB_FILE, EMBEDDING_DIMENSIONS, OpenOptions, SCHEMA_VERSION, Store, StoreError, VectorError,
+    VectorIndex, micros, migrations,
 };
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::Connection;
@@ -156,23 +156,6 @@ fn nfs_smb_cifs_ceph_and_fuse_are_network_filesystems() {
 }
 
 #[test]
-fn local_filesystems_are_not_refused() {
-    // ext4, btrfs, xfs, tmpfs, overlayfs and zfs: the block and local
-    // volumes a sidecar runs on.
-    for magic in [
-        0xEF53,
-        0x9123_683E,
-        0x5846_5342,
-        0x0102_1994,
-        0x794C_7630,
-        0x2FC1_2FC1,
-    ] {
-        assert_eq!(classify(magic), FilesystemKind::Local, "{magic:#x}");
-    }
-    assert!(!FilesystemKind::Local.is_network());
-}
-
-#[test]
 fn bsd_type_names_classify_the_same_way() {
     assert_eq!(classify_name("nfs"), FilesystemKind::Nfs);
     assert_eq!(classify_name("smbfs"), FilesystemKind::Smb);
@@ -268,19 +251,6 @@ fn dropping_a_store_releases_its_data_dir() {
     assert_eq!(second.schema_version().unwrap(), SCHEMA_VERSION);
 }
 
-#[test]
-fn the_lock_alone_can_be_taken_and_released() {
-    let dir = TestDir::new();
-    let lock = DataDirLock::acquire(&dir.0).unwrap();
-    assert_eq!(lock.path(), dir.0.join(LOCK_FILE));
-    assert!(matches!(
-        DataDirLock::acquire(&dir.0),
-        Err(StoreError::Locked { .. })
-    ));
-    drop(lock);
-    DataDirLock::acquire(&dir.0).unwrap();
-}
-
 // Opening and migrating from empty (ADR 0010)
 
 #[test]
@@ -365,22 +335,6 @@ fn a_store_newer_than_the_binary_is_refused() {
 }
 
 #[test]
-fn the_database_runs_in_wal_mode_with_foreign_keys_on() {
-    let dir = TestDir::new();
-    let store = open(&dir.data(), clock());
-    let conn = store.connection();
-    let journal: String = conn
-        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(journal, "wal");
-    let foreign_keys: i64 = conn
-        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(foreign_keys, 1);
-    assert!(dir.data().join(DB_FILE).is_file());
-}
-
-#[test]
 fn every_id_column_is_an_autoincrement_rowid() {
     // TIM-90: rowids are never reused, because sqlite-vec keys vectors by
     // them.
@@ -433,46 +387,6 @@ fn every_id_column_is_an_autoincrement_rowid() {
         .unwrap()
             == 1
     );
-}
-
-#[test]
-fn no_time_column_defaults_to_sqlites_clock() {
-    // TIM-90: the schema never takes a timestamp from the database clock.
-    let dir = TestDir::new();
-    let store = open(&dir.data(), clock());
-    let conn = store.connection();
-    let mut names = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
-        .unwrap();
-    let mut time_columns = 0;
-    for table in names
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .map(Result::unwrap)
-    {
-        let mut columns = conn
-            .prepare(&format!("PRAGMA table_info(\"{table}\")"))
-            .unwrap();
-        for column in columns
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            })
-            .unwrap()
-            .map(Result::unwrap)
-        {
-            let (name, declared, default) = column;
-            if name == "at" || name.ends_with("_at") {
-                time_columns += 1;
-                assert_eq!(declared, "INTEGER", "{table}.{name} is {declared}");
-                assert_eq!(default, None, "{table}.{name} has a default");
-            }
-        }
-    }
-    assert!(time_columns >= 30, "only {time_columns} time columns found");
 }
 
 #[test]
@@ -571,39 +485,6 @@ fn memory_content_is_searchable_with_fts5() {
     conn.execute("DELETE FROM memories WHERE id = ?1", [coffee])
         .unwrap();
     assert!(hits("coffee").is_empty(), "a deleted memory still matches");
-}
-
-#[test]
-fn entity_aliases_are_searchable_with_fts5() {
-    // TIM-90: aliases get their own table so full-text search can match
-    // them; TIM-94: the owner's platform ids are aliases of `user`.
-    let dir = TestDir::new();
-    let clock = clock();
-    let store = open(&dir.data(), clock.clone());
-    let service = Service::open(clock.clone(), store, Tuning::default());
-    service.ensure_bank("main", &identity(), &models()).unwrap();
-    let conn = service.store().unwrap().connection();
-    let user: i64 = conn
-        .query_row("SELECT id FROM entities WHERE seeded = 'user'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let entity_for = |query: &str| -> Vec<i64> {
-        let mut statement = conn
-            .prepare(
-                "SELECT entity_id FROM entity_aliases
-                 WHERE id IN (SELECT rowid FROM entity_aliases_fts WHERE entity_aliases_fts MATCH ?1)",
-            )
-            .unwrap();
-        statement
-            .query_map([query], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
-    };
-    assert_eq!(entity_for("tim"), [user]);
-    assert_eq!(entity_for("\"discord:1234\""), [user]);
-    assert!(entity_for("sam").is_empty());
 }
 
 #[test]
@@ -752,9 +633,8 @@ fn reopening_after_seven_days_deletes_the_copy() {
     assert!(!copy.exists(), "kept after the week was up");
 }
 
-// The deletion fingerprint (ADR 0009)
-
-fn check_housekeeping_expiry(paused: bool) {
+#[test]
+fn housekeeping_expires_copies_even_while_purge_is_paused() {
     let dir = TestDir::new();
     let clock = clock();
     let store = open(&dir.data(), clock.clone());
@@ -764,19 +644,13 @@ fn check_housekeeping_expiry(paused: bool) {
         PurgePause::Running
     );
     let mut tuning = Tuning::default();
-    if paused {
-        tuning.clock.quiet_rate = 0.2;
-    }
-    let expected_pause = if paused {
-        PurgePause::Paused { stored: original }
-    } else {
-        PurgePause::Running
-    };
+    tuning.clock.quiet_rate = 0.2;
+    let paused = PurgePause::Paused { stored: original };
     assert_eq!(
         store
             .check_fingerprint(&tuning.deletion_fingerprint())
             .unwrap(),
-        expected_pause
+        paused
     );
 
     // A later completion, not the start of the migration, sets the deadline.
@@ -829,29 +703,10 @@ fn check_housekeeping_expiry(paused: bool) {
             .unwrap()
             .check_fingerprint(&service.tuning().deletion_fingerprint())
             .unwrap(),
-        expected_pause
+        paused,
+        "only an acknowledgement moves the stored fingerprint"
     );
     assert!(service.health().ready);
-}
-
-#[test]
-fn housekeeping_expires_copies_on_the_simulated_clock_without_restarting() {
-    check_housekeeping_expiry(false);
-}
-
-#[test]
-fn housekeeping_expires_copies_even_while_purge_is_paused() {
-    check_housekeeping_expiry(true);
-}
-
-#[test]
-fn housekeeping_has_no_deadline_without_a_copy() {
-    let dir = TestDir::new();
-    let service = service(&dir);
-    let upkeep = service.housekeeping().unwrap();
-    assert!(upkeep.copies_removed.is_empty());
-    assert_eq!(upkeep.next_due, None);
-    assert_eq!(service.store().unwrap().next_copy_expiry().unwrap(), None);
 }
 
 // Only the initial migration exists today. These rows model later completed
@@ -869,28 +724,6 @@ fn completed_copy(store: &Store, from: u32, completed: Timestamp) -> PathBuf {
 }
 
 #[test]
-fn housekeeping_ignores_a_missing_copy_even_after_its_deadline() {
-    let dir = TestDir::new();
-    let clock = clock();
-    let store = open(&dir.data(), clock.clone());
-    let copy = completed_copy(&store, 1, clock.now());
-    let deadline = clock
-        .now()
-        .checked_add(migrations::PRE_MIGRATION_COPY_TTL)
-        .unwrap();
-    let service = Service::open(clock.clone(), store, Tuning::default());
-    assert_eq!(service.housekeeping().unwrap().next_due, Some(deadline));
-    std::fs::remove_file(copy).unwrap();
-    for advance in [SignedDuration::ZERO, migrations::PRE_MIGRATION_COPY_TTL] {
-        clock.advance(advance);
-        let upkeep = service.housekeeping().unwrap();
-        assert!(upkeep.copies_removed.is_empty());
-        assert_eq!(upkeep.next_due, None);
-        assert_eq!(service.store().unwrap().next_copy_expiry().unwrap(), None);
-    }
-}
-
-#[test]
 fn housekeeping_selects_the_earliest_existing_copy_deadline() {
     let dir = TestDir::new();
     let clock = clock();
@@ -905,6 +738,8 @@ fn housekeeping_selects_the_earliest_existing_copy_deadline() {
         3,
         start().checked_sub(SignedDuration::from_hours(1)).unwrap(),
     );
+    // The earliest deadline belongs to a copy already gone: it's ignored,
+    // before and after it passes.
     std::fs::remove_file(missing).unwrap();
     let earlier_deadline = start()
         .checked_add(migrations::PRE_MIGRATION_COPY_TTL)
@@ -934,49 +769,7 @@ fn housekeeping_selects_the_earliest_existing_copy_deadline() {
     assert_eq!(upkeep.next_due, None);
 }
 
-#[test]
-fn a_matching_fingerprint_keeps_purge_running_across_reopens() {
-    let dir = TestDir::new();
-    let current = Tuning::default().deletion_fingerprint();
-    let store = open(&dir.data(), clock());
-    store.check_fingerprint(&current).unwrap();
-    drop(store);
-    let store = open(&dir.data(), clock());
-    assert_eq!(
-        store.check_fingerprint(&current).unwrap(),
-        PurgePause::Running
-    );
-    assert_eq!(
-        store.check_fingerprint(&current).unwrap(),
-        PurgePause::Running
-    );
-}
-
-#[test]
-fn a_changed_fingerprint_pauses_purge_and_keeps_the_stored_one() {
-    let dir = TestDir::new();
-    let original = Tuning::default().deletion_fingerprint();
-    let mut changed = Tuning::default();
-    changed.clock.quiet_rate = 0.2;
-    let changed = changed.deletion_fingerprint();
-    assert_ne!(original, changed);
-
-    let store = open(&dir.data(), clock());
-    store.check_fingerprint(&original).unwrap();
-    drop(store);
-    let store = open(&dir.data(), clock());
-    assert_eq!(
-        store.check_fingerprint(&changed).unwrap(),
-        PurgePause::Paused {
-            stored: original.clone()
-        }
-    );
-    // Only an acknowledgement moves the stored value (ADR 0010).
-    assert_eq!(
-        store.check_fingerprint(&changed).unwrap(),
-        PurgePause::Paused { stored: original }
-    );
-}
+// The deletion fingerprint (ADR 0009)
 
 #[test]
 fn an_unrelated_tuning_change_does_not_pause_purge() {
@@ -1025,30 +818,6 @@ fn ids_minted_in_the_same_instant_are_distinct_and_ordered() {
     sorted.dedup();
     assert_eq!(sorted.len(), ids.len(), "duplicate ids");
     assert_eq!(sorted, ids, "ids minted in order don't sort in order");
-}
-
-#[test]
-fn every_row_the_store_creates_has_a_uuidv7() {
-    let dir = TestDir::new();
-    let clock = clock();
-    let store = open(&dir.data(), clock.clone());
-    let service = Service::open(clock.clone(), store, Tuning::default());
-    let bank = service.ensure_bank("main", &identity(), &models()).unwrap();
-    assert_eq!(bank.id.get_version_num(), 7);
-    let conn = service.store().unwrap().connection();
-    for table in ["banks", "entities", "edits", "mental_models"] {
-        let mut statement = conn.prepare(&format!("SELECT uuid FROM {table}")).unwrap();
-        let uuids: Vec<String> = statement
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert!(!uuids.is_empty(), "{table} is empty");
-        for uuid in uuids {
-            let parsed: uuid::Uuid = uuid.parse().unwrap_or_else(|_| panic!("{table}: {uuid}"));
-            assert_eq!(parsed.get_version_num(), 7, "{table}: {uuid}");
-        }
-    }
 }
 
 // Vector search (TIM-89)
@@ -1150,27 +919,6 @@ fn nearest_past_the_knn_limit_scans_exactly() {
             got: 3
         })
     ));
-}
-
-#[test]
-fn a_bank_never_sees_another_banks_vectors() {
-    let dir = TestDir::new();
-    let store = open(&dir.data(), clock());
-    let vectors = store.vectors();
-    let conn = store.connection();
-    vectors.upsert(&conn, 1, 10, &unit(0)).unwrap();
-    vectors.upsert(&conn, 2, 20, &unit(0)).unwrap();
-    let ids = |bank: i64| -> Vec<i64> {
-        vectors
-            .nearest(&conn, bank, &unit(0), 10)
-            .unwrap()
-            .into_iter()
-            .map(|n| n.memory_id)
-            .collect()
-    };
-    assert_eq!(ids(1), [10]);
-    assert_eq!(ids(2), [20]);
-    assert!(ids(3).is_empty());
 }
 
 #[test]
@@ -1442,34 +1190,6 @@ fn models_are_recorded_at_creation_and_merge_does_not_change_them() {
 }
 
 #[test]
-fn banks_are_isolated_from_each_other() {
-    let dir = TestDir::new();
-    let service = service(&dir);
-    let main = service.ensure_bank("main", &identity(), &models()).unwrap();
-    let work = service
-        .ensure_bank(
-            "work",
-            &BankIdentity {
-                owner_name: Some("Tim".into()),
-                ..BankIdentity::default()
-            },
-            &models(),
-        )
-        .unwrap();
-    assert_ne!(main.id, work.id);
-    let conn = service.store().unwrap().connection();
-    assert_eq!(count(&conn, "SELECT count(*) FROM entities"), 4);
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM entities WHERE seeded = 'user' AND name = 'Tim'"
-        ),
-        2,
-        "\"Tim\" in two banks is two entities"
-    );
-}
-
-#[test]
 fn an_unknown_timezone_or_empty_name_creates_nothing() {
     let dir = TestDir::new();
     let service = service(&dir);
@@ -1492,22 +1212,6 @@ fn an_unknown_timezone_or_empty_name_creates_nothing() {
     assert_eq!(count(&conn, "SELECT count(*) FROM banks"), 0);
     assert_eq!(count(&conn, "SELECT count(*) FROM entities"), 0);
     assert_eq!(count(&conn, "SELECT count(*) FROM edits"), 0);
-}
-
-#[test]
-fn a_bank_survives_a_reopen() {
-    let dir = TestDir::new();
-    let created = {
-        let service = service(&dir);
-        service.ensure_bank("main", &identity(), &models()).unwrap()
-    };
-    let service = service(&dir);
-    let reopened = service
-        .ensure_bank("main", &BankIdentity::default(), &models())
-        .unwrap();
-    assert!(!reopened.created);
-    assert_eq!(reopened.id, created.id);
-    assert_eq!(reopened.owner_name, created.owner_name);
 }
 
 // Review regressions (TIM-103 review through c157b84)

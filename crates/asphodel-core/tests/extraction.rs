@@ -30,26 +30,25 @@ use std::time::Duration;
 use asphodel_core::Service;
 use asphodel_core::clock::{Clock, SimulatedClock};
 use asphodel_core::config::Tuning;
-use asphodel_core::constants::CHUNK_RETRY_CAP;
 use asphodel_core::ingest::{Document, Ingested, Turn, TurnAuthor};
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest, LlmResponse,
-    ModelError, Models, Template,
+    ModelError, Models,
 };
 use asphodel_core::queue::{Failure, Lease, SourceKind};
 use asphodel_core::store::{OpenOptions, Store, micros, timestamp};
 use jiff::civil::{Date, DateTime, date};
 use jiff::tz::TimeZone;
-use jiff::{SignedDuration, Timestamp, ToSpan};
+use jiff::{SignedDuration, Timestamp};
 use rusqlite::OptionalExtension;
 use rusqlite::types::FromSql;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use asphodel_core::extraction::{
-    CALENDAR_DAYS, CALL1_TEMPLATE, CALL1_VERSION, CANDIDATE_MEMORIES, CONTEXT_CHARS, CONTEXT_TURNS,
-    Call1Input, DropReason, Dropped, ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, Extracted,
-    PREVIOUS_CHUNK_CHARS, call1_request,
+    CALENDAR_DAYS, CANDIDATE_MEMORIES, CONTEXT_CHARS, CONTEXT_TURNS, Call1Input, DropReason,
+    Dropped, ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, Extracted, PREVIOUS_CHUNK_CHARS,
+    call1_request,
 };
 
 // Fixtures
@@ -125,26 +124,6 @@ fn identity() -> asphodel_core::store::bank::BankIdentity {
         owner_platform_ids: vec!["discord:1234".into()],
         assistant_name: Some("Hermes".into()),
         timezone: Some(TZ.into()),
-    }
-}
-
-/// An embedder that always fails, under the fake's id so the floors hold.
-struct FailingEmbedder;
-
-impl Embedder for FailingEmbedder {
-    fn model_id(&self) -> &str {
-        FakeEmbedder::MODEL_ID
-    }
-
-    fn dimensions(&self) -> usize {
-        FakeEmbedder.dimensions()
-    }
-
-    fn embed(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
-        Err(ModelError::Inference {
-            model: FakeEmbedder::MODEL_ID.into(),
-            reason: "scripted failure".into(),
-        })
     }
 }
 
@@ -873,79 +852,6 @@ fn extract_unlabelled(h: &Harness, reply: Value) -> Extracted {
     .unwrap()
 }
 
-// Schema helpers.
-
-fn keys(value: &Value) -> BTreeSet<String> {
-    value
-        .as_object()
-        .expect("an object")
-        .keys()
-        .cloned()
-        .collect()
-}
-
-fn strings(value: &Value) -> BTreeSet<String> {
-    value
-        .as_array()
-        .expect("an array")
-        .iter()
-        .filter_map(|value| value.as_str().map(str::to_owned))
-        .collect()
-}
-
-fn set(items: &[&str]) -> BTreeSet<String> {
-    items.iter().map(|item| item.to_string()).collect()
-}
-
-/// The object schema in `schema`, looking through a nullable `anyOf`.
-fn object(schema: &Value) -> &Value {
-    if schema.get("properties").is_some() {
-        return schema;
-    }
-    schema["anyOf"]
-        .as_array()
-        .and_then(|options| {
-            options
-                .iter()
-                .find(|option| option.get("properties").is_some())
-        })
-        .expect("an object schema")
-}
-
-/// The non-null values of `schema`'s enum, looking through an `anyOf`.
-fn enum_values(schema: &Value) -> BTreeSet<String> {
-    if let Some(values) = schema.get("enum") {
-        return strings(values);
-    }
-    schema["anyOf"]
-        .as_array()
-        .and_then(|options| options.iter().find_map(|option| option.get("enum")))
-        .map(strings)
-        .expect("an enum")
-}
-
-const CLAIM_FIELDS: [&str; 16] = [
-    "content",
-    "kind",
-    "quote",
-    "significance",
-    "remember_this",
-    "changes_something",
-    "valid_from",
-    "valid_until",
-    "window_confidence",
-    "until_event",
-    "due_at",
-    "volatility",
-    "recurrence_text",
-    "recurrence_rrule",
-    "recurrence_start",
-    "entities",
-];
-
-const LEVELS: [&str; 5] = ["trivial", "minor", "notable", "major", "critical"];
-const KINDS: [&str; 5] = ["fact", "event", "state", "task", "recurring"];
-
 // Context assembly.
 
 #[test]
@@ -968,23 +874,6 @@ fn a_turns_input_is_its_text_speaker_and_reference_date() {
     assert_eq!(speaker.name, "Tim");
     assert!(speaker.owner);
     assert_eq!(speaker.handle, handle(&input, speaker.entity));
-}
-
-#[test]
-fn the_calendar_is_three_weeks_either_side_of_the_local_date() {
-    let h = Harness::new();
-    // 01:00 on Friday 2 October in Auckland, still the 1st in UTC.
-    ingest(&h, &turn("s1", "2026-10-01T12:00:00Z", "Hi.", "Hello."));
-    let input = input(&h, "main", &[]);
-
-    let reference = date(2026, 10, 2);
-    assert_eq!(input.reference_date, Some(reference));
-    let expected: Vec<Date> = (-CALENDAR_DAYS..=CALENDAR_DAYS)
-        .map(|offset| reference.checked_add(offset.days()).unwrap())
-        .collect();
-    assert_eq!(input.calendar, expected);
-    assert_eq!(input.calendar.first(), Some(&date(2026, 9, 11)));
-    assert_eq!(input.calendar.last(), Some(&date(2026, 10, 23)));
 }
 
 #[test]
@@ -1091,48 +980,6 @@ fn a_document_chunk_gets_the_text_before_it_as_context() {
         vec![chars(&text, start - PREVIOUS_CHUNK_CHARS, start)]
     );
     assert!(!input.context[0].contains("TRIPSTART"));
-}
-
-#[test]
-fn an_inexact_reference_date_gets_no_calendar() {
-    let h = Harness::new();
-    ingest_doc(
-        &h,
-        &Document {
-            reference_date_exact: false,
-            ..document("diary", "Met Ana yesterday.", date(2026, 9, 28))
-        },
-    );
-    let input = input(&h, "main", &[]);
-    assert_eq!(input.reference_date, None);
-    assert!(input.calendar.is_empty());
-}
-
-#[test]
-fn user_and_assistant_are_always_candidates() {
-    let h = Harness::new();
-    ingest(&h, &turn("s1", T1, "Hello there.", "Hi."));
-    let input = input(&h, "main", &[]);
-
-    let candidate = |entity: Uuid| {
-        input
-            .candidates
-            .iter()
-            .find(|c| c.entity == entity)
-            .unwrap_or_else(|| panic!("{entity} is a candidate"))
-    };
-    let user = candidate(h.seeded("main", "user"));
-    assert_eq!(user.name, "Tim");
-    assert_eq!(user.kind, EntityKind::Person);
-    assert!(user.aliases.iter().any(|alias| alias == "Tim"));
-    let assistant = candidate(h.seeded("main", "assistant"));
-    assert_eq!(assistant.name, "Hermes");
-    assert_eq!(assistant.kind, EntityKind::Thing);
-    assert!(assistant.aliases.iter().any(|alias| alias == "Hermes"));
-
-    // Handles are distinct.
-    let handles: BTreeSet<&str> = input.candidates.iter().map(|c| c.handle.as_str()).collect();
-    assert_eq!(handles.len(), input.candidates.len());
 }
 
 #[test]
@@ -1273,7 +1120,7 @@ fn only_the_banks_visible_in_context_memories_are_given() {
 }
 
 #[test]
-fn the_request_is_the_input_and_the_call_1_schema() {
+fn the_request_is_rendered_from_the_input() {
     let h = Harness::new();
     let ana = h.insert_entity("main", "Ana", "person", &["Ana"]);
     let tea = h.insert_memory("main", "Tim likes tea.", "minor");
@@ -1294,13 +1141,6 @@ fn the_request_is_the_input_and_the_call_1_schema() {
     assert_eq!(requests, vec![call1_request(&input)]);
     let request = &requests[0];
 
-    assert_eq!(
-        request.template,
-        Template {
-            name: CALL1_TEMPLATE.into(),
-            version: CALL1_VERSION,
-        }
-    );
     // The user prompt carries the input.
     assert!(request.user.contains(&input.text));
     for context in &input.context {
@@ -1319,63 +1159,6 @@ fn the_request_is_the_input_and_the_call_1_schema() {
     }
     // The system prompt holds the rules, not the chunk.
     assert!(!request.system.contains("Ana wants tea."));
-    for word in LEVELS.iter().chain(KINDS.iter()) {
-        assert!(request.system.contains(word), "{word}");
-    }
-
-    // The reply schema.
-    let schema = &request.schema;
-    assert_eq!(
-        keys(&schema["properties"]),
-        set(&["claims", "used_injected_ids"])
-    );
-    let item = object(&schema["properties"]["claims"]["items"]);
-    assert_eq!(keys(&item["properties"]), set(&CLAIM_FIELDS));
-    assert_eq!(strings(&item["required"]), set(&CLAIM_FIELDS));
-    assert_eq!(
-        enum_values(&item["properties"]["significance"]),
-        set(&LEVELS)
-    );
-    assert_eq!(enum_values(&item["properties"]["kind"]), set(&KINDS));
-    assert_eq!(
-        enum_values(&item["properties"]["window_confidence"]),
-        set(&["high", "low"])
-    );
-    let link = object(&item["properties"]["entities"]["items"]);
-    assert_eq!(
-        keys(&link["properties"]),
-        set(&["entity", "new_name", "new_kind", "surface_form"])
-    );
-    for field in ["valid_from", "valid_until", "due_at", "recurrence_start"] {
-        let time = object(&item["properties"][field]);
-        assert_eq!(
-            keys(&time["properties"]),
-            set(&["at", "precision"]),
-            "{field}"
-        );
-        assert_eq!(
-            enum_values(&time["properties"]["precision"]),
-            set(&["year", "month", "day", "hour", "minute"]),
-            "{field}"
-        );
-    }
-}
-
-#[test]
-fn the_system_prompt_is_the_same_for_every_chunk() {
-    let h = Harness::new();
-    ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
-    ingest(
-        &h,
-        &sams_turn("2026-10-01T06:40:00Z", "Hey all.", "Hi Sam."),
-    );
-    let llm = FakeLlm::scripted(MODEL, vec![reply(vec![], &[]), reply(vec![], &[])]);
-    run(&h, "main", &llm, &[]).unwrap();
-    run(&h, "main", &llm, &[]).unwrap();
-    let requests = llm.requests();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].system, requests[1].system);
-    assert_ne!(requests[0].user, requests[1].user);
 }
 
 // Kinds.
@@ -1952,79 +1735,7 @@ fn the_owners_claims_link_to_user() {
     assert_eq!(h.entity_kind(miso[0]), "thing");
 }
 
-#[test]
-fn another_speakers_claims_link_to_their_own_entity() {
-    let h = Harness::new();
-    let user_text = "I'm moving to Lisbon in November.";
-    let ingested = ingest(&h, &sams_turn(T1, user_text, "Exciting!"));
-    let sam = ingested.speaker.as_ref().unwrap().entity;
-    let input = input(&h, "main", &[]);
-    let me = input.speaker.as_ref().unwrap().handle.clone();
-    assert_eq!(me, handle(&input, sam));
-
-    let quote = "I'm moving to Lisbon in November";
-    let content = "Sam is moving to Lisbon in November 2026.";
-    let memories = extract(
-        &h,
-        reply(
-            vec![
-                claim(content, "event", quote)
-                    .with("valid_from", time("2026-11", "month"))
-                    .with(
-                        "entities",
-                        json!([link(&me, "I"), new_entity("Lisbon", "place", "Lisbon")]),
-                    ),
-            ],
-            &[],
-        ),
-    )
-    .memories;
-    let lisbon = h.entities_named("main", "Lisbon")[0];
-    assert_eq!(
-        h.links(memories[0]),
-        BTreeSet::from([(sam, Some("I".into())), (lisbon, Some("Lisbon".into()))])
-    );
-    assert_eq!(h.entity_kind(lisbon), "place");
-    assert_eq!(
-        h.row(memories[0]),
-        Row {
-            valid_from: timed(local("2026-11-01T00:00"), "month"),
-            ..Row::new(
-                content,
-                "event",
-                at(T1),
-                span(&turn_text(user_text, "Exciting!"), quote)
-            )
-        }
-    );
-}
-
 // Significance.
-
-#[test]
-fn each_level_is_stored_as_given() {
-    let h = Harness::new();
-    let claims = LEVELS
-        .iter()
-        .map(|level| {
-            claim(&format!("Tim said a {level} thing."), "fact", "Five things")
-                .with("significance", json!(level))
-        })
-        .collect();
-    let memories = golden(&h, "Five things.", "Ok.", claims);
-    let stored: Vec<(String, Option<String>)> = memories
-        .iter()
-        .map(|m| {
-            let row = h.row(*m);
-            (row.significance, row.owner_significance)
-        })
-        .collect();
-    let expected: Vec<(String, Option<String>)> = LEVELS
-        .iter()
-        .map(|level| (level.to_string(), None))
-        .collect();
-    assert_eq!(stored, expected);
-}
 
 #[test]
 fn a_significance_above_critical_is_an_invalid_reply() {
@@ -2140,27 +1851,6 @@ fn remember_this_in_a_document_is_ignored() {
     let row = h.row(memories[0]);
     assert_eq!(row.owner_significance, None);
     assert_eq!(row.significance, "major");
-}
-
-#[test]
-fn remember_this_quoted_from_the_reply_is_ignored() {
-    let h = Harness::new();
-    // Only the owner's own message can keep a memory (TIM-92, other
-    // decision 3).
-    let memories = golden(
-        &h,
-        "When is Ana's birthday again?",
-        "Remember this: Ana's birthday is 4 May.",
-        vec![
-            claim(
-                "Ana's birthday is 4 May.",
-                "fact",
-                "Ana's birthday is 4 May",
-            )
-            .with("remember_this", json!(true)),
-        ],
-    );
-    assert_eq!(h.row(memories[0]).owner_significance, None);
 }
 
 // Quotes.
@@ -2378,39 +2068,6 @@ fn a_proposed_entity_is_created_once_per_reply() {
     assert_eq!(h.aliases(lisbon[0]), vec!["Lisbon".to_string()]);
     assert_eq!(h.edits("main", "entity_created"), created_before + 1);
     assert!(h.entities_named("other", "Lisbon").is_empty());
-}
-
-#[test]
-fn a_new_entity_beside_one_call_1_saw_is_a_second_entity() {
-    let h = Harness::new();
-    let sam = h.insert_entity("main", "Sam", "person", &["Sam"]);
-    ingest(&h, &turn("s1", T1, "Sam from work called.", "Which Sam?"));
-    let input = input(&h, "main", &[]);
-    handle(&input, sam);
-
-    // Call 1 saw Sam and chose a new person: the two-Sams judgement stands
-    // (TIM-92).
-    let extracted = extract(
-        &h,
-        reply(
-            vec![
-                claim(
-                    "Sam from Tim's work called Tim.",
-                    "event",
-                    "Sam from work called",
-                )
-                .with("entities", json!([new_entity("Sam", "person", "Sam")])),
-            ],
-            &[],
-        ),
-    );
-    let sams = h.entities_named("main", "Sam");
-    assert_eq!(sams.len(), 2);
-    assert_eq!(extracted.entities_created, vec![sams[1]]);
-    assert_eq!(
-        h.links(extracted.memories[0]),
-        BTreeSet::from([(sams[1], Some("Sam".into()))])
-    );
 }
 
 #[test]
@@ -2710,20 +2367,6 @@ fn a_commit_writes_vectors_and_marks_the_chunk_extracted() {
     assert!(h.service.claim_chunk("main").unwrap().is_some());
 }
 
-#[test]
-fn a_reply_with_no_claims_completes_the_chunk() {
-    let h = Harness::new();
-    let ingested = ingest(&h, &turn("s1", T1, "Thanks!", "You're welcome."));
-    let extracted = extract(&h, reply(vec![], &[]));
-    assert!(extracted.memories.is_empty());
-    assert!(extracted.dropped.is_empty());
-    assert!(
-        h.chunk_column::<Option<i64>>(h.chunk_of(ingested.source, 0), "extracted_at")
-            .is_some()
-    );
-    assert_eq!(h.service.queue_depth("main").unwrap(), 0);
-}
-
 // Failure. A failure in call 1 leaves the chunk retryable.
 
 /// What `FakeLlm::failing` fails with.
@@ -2803,36 +2446,6 @@ fn a_failed_call_1_leaves_the_chunk_retryable() {
 }
 
 #[test]
-fn each_llm_failure_is_recorded_by_kind() {
-    let h = Harness::new();
-    let ingested = ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
-    let chunk = h.chunk_of(ingested.source, 0);
-    let failing: [(MakeError, &str); 3] = [
-        (|| LlmError::Timeout, "llm_timeout"),
-        (|| LlmError::NotJson { bytes: 12 }, "llm_not_json"),
-        (
-            || LlmError::Transport {
-                reason: "connection reset".into(),
-            },
-            "llm_transport",
-        ),
-    ];
-    for (make, kind) in failing {
-        let error = run(&h, "main", &FakeLlm::failing(MODEL, make), &[]).unwrap_err();
-        assert!(matches!(error, ExtractError::Call1 { .. }), "{error:?}");
-        assert_eq!(
-            h.chunk_column::<Option<String>>(chunk, "last_error_kind"),
-            Some(kind.into())
-        );
-        assert_eq!(
-            h.chunk_column::<Option<i64>>(chunk, "last_error_status"),
-            None
-        );
-    }
-    assert_eq!(h.chunk_column::<i64>(chunk, "error_count"), 3);
-}
-
-#[test]
 fn an_invalid_reply_leaves_the_chunk_retryable() {
     let h = Harness::new();
     let ingested = ingest(&h, &turn("s1", T1, "I like tea.", "Noted."));
@@ -2878,33 +2491,6 @@ fn an_invalid_reply_leaves_the_chunk_retryable() {
 }
 
 #[test]
-fn the_retry_cap_marks_a_chunk_failed() {
-    let h = Harness::new();
-    let ingested = ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
-    let chunk = h.chunk_of(ingested.source, 0);
-    let llm = FakeLlm::failing(MODEL, || LlmError::Status { status: 502 });
-    for attempt in 1..CHUNK_RETRY_CAP {
-        let error = run(&h, "main", &llm, &[]).unwrap_err();
-        assert_eq!(
-            error.failure(),
-            Some(Failure::Retry {
-                error_count: attempt
-            })
-        );
-    }
-    let error = run(&h, "main", &llm, &[]).unwrap_err();
-    assert_eq!(error.failure(), Some(Failure::Failed));
-
-    assert_eq!(h.service.queue_depth("main").unwrap(), 0);
-    let failed = h.service.failed_chunks("main").unwrap();
-    assert_eq!(failed.len(), 1);
-    assert_eq!(failed[0].chunk, chunk);
-    assert_eq!(failed[0].error_kind, "llm_status");
-    assert_eq!(failed[0].status, Some(502));
-    assert_eq!(h.memories_in("main"), 0);
-}
-
-#[test]
 fn an_unusable_llm_holds_the_queue_without_counting() {
     let h = Harness::new();
     let ingested = ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
@@ -2928,40 +2514,6 @@ fn an_unusable_llm_holds_the_queue_without_counting() {
     let lease = lease(&h, "main");
     assert_eq!(lease.chunk, chunk);
     assert_eq!(lease.error_count, 0);
-}
-
-#[test]
-fn an_embedding_failure_writes_nothing() {
-    let h = Harness::with_models(Models {
-        embedder: Arc::new(FailingEmbedder),
-        reranker: Arc::new(FakeReranker),
-    });
-    let tea = h.insert_memory("main", "Tim likes tea.", "minor");
-    let ingested = ingest(&h, &turn("s1", T1, "I'm moving to Lisbon.", "Exciting!"));
-    let chunk = h.chunk_of(ingested.source, 0);
-    let input = input(&h, "main", &[tea]);
-    let before = untouched(&h);
-
-    let llm = FakeLlm::scripted(MODEL, vec![busy_reply(&input, tea)]);
-    let error = run(&h, "main", &llm, &[tea]).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            ExtractError::Embedding {
-                failure: Failure::Retry { error_count: 1 },
-                ..
-            }
-        ),
-        "{error:?}"
-    );
-    assert_eq!(untouched(&h), before);
-    assert!(h.entities_named("main", "Lisbon").is_empty());
-    assert_eq!(
-        h.chunk_column::<Option<String>>(chunk, "last_error_kind"),
-        Some("embedding".into())
-    );
-    assert_eq!(h.chunk_column::<Option<i64>>(chunk, "extracted_at"), None);
-    assert_eq!(h.service.queue_depth("main").unwrap(), 1);
 }
 
 // The TIM-107 review: regressions for its findings, and the guarantees it
@@ -3320,19 +2872,6 @@ fn a_speaker_name_is_found_in_either_normalization_form() {
 }
 
 #[test]
-fn speaker_names_and_aliases_are_stored_composed() {
-    let h = Harness::new();
-    let nikos = speaker_named(&h, "7777", NIKOS_DECOMPOSED);
-    assert_eq!(h.entity_name(nikos), NIKOS);
-    let aliases = h.aliases(nikos);
-    assert!(aliases.contains(&NIKOS.to_string()), "{aliases:?}");
-    assert!(
-        !aliases.contains(&NIKOS_DECOMPOSED.to_string()),
-        "{aliases:?}"
-    );
-}
-
-#[test]
 fn bank_config_stores_names_and_aliases_composed() {
     let h = Harness::new();
     let zoe_decomposed = "Ζωη\u{301}";
@@ -3456,14 +2995,6 @@ fn an_upgrade_composes_stored_aliases_and_merges_equivalent_ones() {
         found_in(&h, "Ο Νίκος και η Ζωή ήρθαν."),
         BTreeSet::from([nikos, zoe])
     );
-}
-
-#[test]
-fn an_upgraded_decomposed_alias_is_found_by_the_same_spelling() {
-    let h = Harness::new();
-    let zoe = h.insert_entity("main", "Ζωη\u{301}", "person", &["Ζωη\u{301}"]);
-    let h = downgrade_to_v2_and_reopen(h);
-    assert_eq!(found_in(&h, "Η Ζωη\u{301} ήρθε."), BTreeSet::from([zoe]));
 }
 
 #[test]

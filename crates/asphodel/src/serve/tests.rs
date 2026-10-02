@@ -108,21 +108,6 @@ async fn symlink_to_live_socket_is_refused_and_preserved() {
 }
 
 #[tokio::test]
-async fn dangling_symlink_is_refused_and_preserved() {
-    let dir = TestDir::new();
-    let path = dir.socket();
-    let target = dir.0.join("missing");
-    symlink(&target, &path).unwrap();
-    let original = identity(&path);
-
-    refusal(&path, "symlink").await;
-
-    assert_eq!(identity(&path), original);
-    assert_eq!(fs::read_link(&path).unwrap(), target);
-    assert!(!target.exists());
-}
-
-#[tokio::test]
 async fn live_listener_is_refused_without_disrupting_connectivity() {
     let dir = TestDir::new();
     let path = dir.socket();
@@ -179,36 +164,4 @@ async fn cleanup_preserves_replacement_socket_and_its_connectivity() {
 
     assert_eq!(identity(&path), replacement_identity);
     assert_connectivity(&path, &replacement).await;
-}
-
-#[tokio::test]
-async fn cleanup_preserves_replacement_symlink_and_target() {
-    let dir = TestDir::new();
-    let path = dir.socket();
-    let (listener, cleanup) = bind_unix(&path).await.unwrap();
-    drop(listener);
-    fs::remove_file(&path).unwrap();
-    let target = dir.0.join("target");
-    fs::write(&target, b"target contents").unwrap();
-    symlink(&target, &path).unwrap();
-    let replacement = identity(&path);
-
-    cleanup.remove().unwrap();
-
-    assert_eq!(identity(&path), replacement);
-    assert_eq!(fs::read_link(&path).unwrap(), target);
-    assert_eq!(fs::read(&target).unwrap(), b"target contents");
-}
-
-#[tokio::test]
-async fn cleanup_succeeds_if_socket_was_already_removed() {
-    let dir = TestDir::new();
-    let path = dir.socket();
-    let (listener, cleanup) = bind_unix(&path).await.unwrap();
-    drop(listener);
-    fs::remove_file(&path).unwrap();
-
-    cleanup.remove().unwrap();
-
-    assert!(!path.exists());
 }

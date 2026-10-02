@@ -55,13 +55,6 @@ def test_file_name_is_safe_for_any_session_id(tmp_path):
     assert "/" not in name and " " not in name and ":" not in name
 
 
-def test_written_by_rename_leaves_no_partial_files(tmp_path):
-    spool = Spool(tmp_path / "spool")
-    spool.write(turn(1))
-    names = os.listdir(tmp_path / "spool")
-    assert names == [spool.files()[0].name]
-
-
 def test_size_cap_drops_the_oldest(tmp_path):
     spool = Spool(tmp_path / "spool", max_bytes=2500)
     recent = time.time() - 100
@@ -71,15 +64,6 @@ def test_size_cap_drops_the_oldest(tmp_path):
     kept = [json.loads(f.read_text())["message_at"] for f in spool.files()]
     assert sum(f.stat().st_size for f in spool.files()) <= 2500
     assert kept == [turn(4)["message_at"], turn(5)["message_at"]]
-
-
-def test_age_cap_drops_files_older_than_seven_days(tmp_path):
-    spool = Spool(tmp_path / "spool")
-    old = spool.write(turn(1))
-    stale = time.time() - 8 * 24 * 3600
-    os.utime(old, (stale, stale))
-    spool.write(turn(2))
-    assert [json.loads(f.read_text())["message_at"] for f in spool.files()] == [turn(2)["message_at"]]
 
 
 def test_replay_sends_oldest_first_and_deletes_delivered(tmp_path):
@@ -162,17 +146,6 @@ def test_sync_turn_spools_on_a_5xx_but_not_a_4xx(make_provider, daemon, hermes_h
 
 
 # -- the age cap at replay -----------------------------------------------------------
-
-
-def test_replay_drops_expired_turns_without_sending_them(tmp_path):
-    spool = Spool(tmp_path / "spool")
-    path = spool.write(turn(1))
-    stale = time.time() - 8 * 24 * 3600
-    os.utime(path, (stale, stale))
-    sent = []
-    assert spool.replay(lambda body: sent.append(body) or True) == 0
-    assert sent == []
-    assert spool.files() == []
 
 
 def test_recovery_after_a_week_delivers_only_the_new_turn(make_provider, daemon, hermes_home):

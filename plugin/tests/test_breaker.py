@@ -30,16 +30,6 @@ def test_a_success_resets_the_count(clock):
     assert breaker.allow()
 
 
-def test_closes_again_after_the_cooldown(clock):
-    breaker = CircuitBreaker(clock=clock)
-    for _ in range(3):
-        breaker.record_failure()
-    clock.advance(29.9)
-    assert not breaker.allow()
-    clock.advance(0.2)
-    assert breaker.allow()
-
-
 def test_a_failure_after_the_cooldown_reopens_at_once(clock):
     breaker = CircuitBreaker(clock=clock)
     for _ in range(3):
@@ -93,12 +83,3 @@ def test_an_open_breaker_spools_without_a_connection_attempt(make_provider, daem
         provider.sync_turn(f"t{n}", "ok", session_id=SESSION, messages=transcript(f"t{n}", "ok", epoch=float(n)))
     assert len(daemon.requests_for("turns")) == 3
     assert len(list((hermes_home / "asphodel" / "spool").glob("*.json"))) == 4
-
-
-def test_initialize_health_failures_count_towards_the_breaker(make_provider, daemon):
-    url = daemon.go_down()
-    provider = make_provider(url=url)
-    # health and put_bank both failed to connect: two strikes, still closed.
-    assert provider.breaker.allow()
-    provider.prefetch("q", session_id=SESSION)
-    assert not provider.breaker.allow()

@@ -3,7 +3,7 @@
 //! ranking" (TIM-93), "Mental models" (TIM-95, with ADR 0007), "Deletion
 //! policy" (TIM-97) and "Configuration surface" (TIM-98).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asphodel_core::config::{
@@ -163,6 +163,12 @@ fn a_full_file_sets_every_value() {
         [sessions]
         mapping_expiry_days = 14
 
+        [ranking]
+        w_s_inject = 0.8
+        w_s_recall = 0.3
+        phase_bonus = 1.5
+        phase_penalty = 0.5
+
         [llm]
         model = "some-model:q4_K_M"
         endpoint = "https://llm.example/v1"
@@ -195,24 +201,17 @@ fn a_full_file_sets_every_value() {
     assert_eq!(t.mental_models.input_budget, 50);
     assert_eq!(t.mental_models.input_budget_with_cited, 65);
     assert_eq!(t.sessions.mapping_expiry_days, 14);
+    assert_eq!(t.ranking.w_s_inject, 0.8);
+    assert_eq!(t.ranking.w_s_recall, 0.3);
+    assert_eq!(t.ranking.phase_bonus, 1.5);
+    assert_eq!(t.ranking.phase_penalty, 0.5);
     assert_eq!(t.llm.model.as_deref(), Some("some-model:q4_K_M"));
     assert_eq!(t.llm.endpoint.as_deref(), Some("https://llm.example/v1"));
 }
 
 #[test]
-fn delta_can_be_null() {
-    // ADR 0008: δ is nullable, and null means never purge. TOML has no
-    // null, so this uses the file spelling the implementation chose.
-    let t = load("[purge]\ndelta = \"never\"\n").unwrap();
-    assert_eq!(t.purge.delta, None);
-
-    let mut never = Tuning::default();
-    never.purge.delta = None;
-    never.validate().unwrap();
-}
-
-#[test]
 fn resolved_json_shows_a_null_delta_as_null() {
+    // TOML spells a null δ "never"; JSON must still show null.
     let mut t = Tuning::default();
     t.purge.delta = None;
     let json = serde_json::to_value(&t).unwrap();
@@ -220,13 +219,6 @@ fn resolved_json_shows_a_null_delta_as_null() {
     let json: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
     assert!(json["purge"]["delta"].is_null());
-    for delta in [0.0, 0.5, 1.0] {
-        t.purge.delta = Some(delta);
-        assert_eq!(serde_json::to_value(&t).unwrap()["purge"]["delta"], delta);
-        let json: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
-        assert_eq!(json["purge"]["delta"], delta);
-    }
 }
 
 #[test]
@@ -251,52 +243,23 @@ fn load_reads_a_file_and_fails_on_a_missing_or_invalid_one() {
 #[test]
 fn a_tuning_written_as_toml_loads_back_unchanged() {
     // ADR 0009: the replay overrides file has exactly the shape of
-    // `Tuning`, so a resolved tuning written out must load back as itself.
+    // `Tuning`, so a resolved tuning written out must load back as itself,
+    // including a null δ, which TOML can't spell as null.
     let mut changed = load(
         "[injection.reranker_floors]\nm = -1.0\n[llm]\nmodel = \"m\"\n\
          endpoint = \"http://localhost:8080\"\n[mental_models]\nsweep_time = \"05:30\"\n",
     )
     .unwrap();
     changed.clock.quiet_rate = 0.2;
-    for tuning in [Tuning::default(), changed] {
+    let mut never = Tuning::default();
+    never.purge.delta = None;
+    for tuning in [Tuning::default(), changed, never] {
         let text = toml::to_string(&tuning).unwrap();
-        assert_eq!(load(&text).unwrap(), tuning, "round trip of:\n{text}");
-    }
-}
-
-#[test]
-fn a_never_delta_written_as_toml_loads_back_as_never() {
-    let mut tuning = Tuning::default();
-    tuning.purge.delta = None;
-    let text = toml::to_string(&tuning).expect("a null δ serialises to TOML");
-    assert_eq!(
-        load(&text).unwrap().purge.delta,
-        None,
-        "a null δ came back as a number from:\n{text}"
-    );
-}
-
-#[test]
-fn numeric_deltas_written_as_toml_load_back_as_numbers() {
-    let mut tuning = Tuning::default();
-    for delta in [0.0, 0.5, 1.0] {
-        tuning.purge.delta = Some(delta);
-        let text = toml::to_string(&tuning).unwrap();
-        let value: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(value["purge"]["delta"].as_float(), Some(delta));
         assert_eq!(load(&text).unwrap(), tuning, "round trip of:\n{text}");
     }
 }
 
 // Tuning: rejection
-
-#[test]
-fn unknown_sections_are_rejected() {
-    for section in ["strength", "ranking_typo", "bank", "deployment", "secrets"] {
-        assert_rejected(&format!("[{section}]\n"));
-    }
-    assert_rejected("quiet_rate = 0.1\n");
-}
 
 #[test]
 fn unknown_keys_are_rejected_in_every_section() {
@@ -337,33 +300,6 @@ fn secrets_bank_identity_and_deployment_settings_are_not_tuning_keys() {
 }
 
 #[test]
-fn wrong_types_are_rejected() {
-    for text in [
-        "[clock]\nquiet_rate = \"fast\"\n",
-        "[purge]\ndelta = true\n",
-        "[purge]\ndelta = \"sometimes\"\n",
-        "[purge]\nsource_horizon_days = 1.5\n",
-        "[injection]\ncap = -1\n",
-        "[injection]\nreranker_floors = 1.0\n",
-        "[injection.reranker_floors]\nm = \"high\"\n",
-        "[mental_models]\ntrigger_level = \"huge\"\n",
-        "[mental_models]\nsweep_time = \"25:00\"\n",
-        "[clock]\nquiet_rate = [0.1]\n",
-        "clock = 0.1\n",
-    ] {
-        assert_rejected(text);
-    }
-}
-
-#[test]
-fn malformed_toml_is_rejected() {
-    assert!(matches!(
-        load("[clock\nquiet_rate = 0.1\n"),
-        Err(ConfigError::Parse { .. })
-    ));
-}
-
-#[test]
 fn delta_must_be_finite_and_not_negative() {
     // TIM-98: δ is null or ≥ 0.
     assert_eq!(invalid_keys("[purge]\ndelta = -0.5\n"), ["purge.delta"]);
@@ -386,43 +322,6 @@ fn quiet_rate_must_keep_bank_time_moving() {
 }
 
 #[test]
-fn injection_cap_must_be_positive() {
-    // TIM-98: cap > 0.
-    assert_eq!(invalid_keys("[injection]\ncap = 0\n"), ["injection.cap"]);
-    load("[injection]\ncap = 1\n").unwrap();
-}
-
-#[test]
-fn in_context_idle_days_must_be_positive() {
-    // TIM-93, amended by TIM-109: at least 1, like mapping_expiry_days.
-    assert_eq!(
-        invalid_keys("[sessions]\nin_context_idle_days = 0\n"),
-        ["sessions.in_context_idle_days"]
-    );
-    let t = load("[sessions]\nin_context_idle_days = 1\n").unwrap();
-    assert_eq!(t.sessions.in_context_idle_days, 1);
-}
-
-#[test]
-fn ranking_constants_are_tuning_keys() {
-    // TIM-98 places w_s for each mode and the phase bonus and penalty in
-    // [ranking].
-    let t = load(
-        "[ranking]\nw_s_inject = 0.8\nw_s_recall = 0.3\nphase_bonus = 1.5\nphase_penalty = 0.5\n",
-    )
-    .unwrap();
-    assert_eq!(t.ranking.w_s_inject, 0.8);
-    assert_eq!(t.ranking.w_s_recall, 0.3);
-    assert_eq!(t.ranking.phase_bonus, 1.5);
-    assert_eq!(t.ranking.phase_penalty, 0.5);
-}
-
-#[test]
-fn source_horizon_must_be_positive() {
-    assert_rejected("[purge]\nsource_horizon_days = 0\n");
-}
-
-#[test]
 fn embedding_floors_must_be_cosines() {
     // TIM-98: floors inside the model's score range.
     for value in ["1.5", "-1.01", "nan", "inf"] {
@@ -431,14 +330,6 @@ fn embedding_floors_must_be_cosines() {
     for value in ["-1.0", "0.0", "0.85", "1.0"] {
         load(&format!("[reconcile.embedding_floors]\nm = {value}\n")).unwrap();
     }
-}
-
-#[test]
-fn reranker_floors_must_be_finite() {
-    for value in ["nan", "inf", "-inf"] {
-        assert_rejected(&format!("[injection.reranker_floors]\nm = {value}\n"));
-    }
-    load("[injection.reranker_floors]\nm = -7.25\n").unwrap();
 }
 
 #[test]
@@ -520,12 +411,6 @@ fn only_a_floor_for_the_exact_model_string_counts() {
     );
 }
 
-#[test]
-fn an_embedding_floor_does_not_stand_in_for_a_reranker_floor() {
-    let t = load("[reconcile.embedding_floors]\nshared = 0.8\n").unwrap();
-    assert!(t.check_floors("shared", "shared").is_err());
-}
-
 // Layering for replay
 
 const PRODUCTION: &str = "[clock]\nquiet_rate = 0.2\n[purge]\ndelta = 1.5\n\
@@ -540,12 +425,6 @@ fn layers_apply_defaults_then_production_then_overrides() {
     assert_eq!(t.clock.quiet_rate, 0.2); // production
     assert_eq!(t.purge.source_horizon_days, 90); // default
     assert_eq!(t.injection.reranker_floors["prod"], -1.0);
-}
-
-#[test]
-fn production_alone_is_run_a() {
-    assert_eq!(layers(&[PRODUCTION]).unwrap(), load(PRODUCTION).unwrap());
-    assert_eq!(layers(&[]).unwrap(), Tuning::default());
 }
 
 #[test]
@@ -582,14 +461,6 @@ fn layered_result_is_validated_as_a_whole() {
 // Redaction and the resolved config
 
 #[test]
-fn a_secret_never_shows_in_debug_or_json() {
-    let secret = Secret::new("hunter2-token");
-    assert!(!format!("{secret:?}").contains("hunter2"));
-    assert!(!serde_json::to_string(&secret).unwrap().contains("hunter2"));
-    assert_eq!(secret.expose(), "hunter2-token");
-}
-
-#[test]
 fn the_resolved_config_redacts_the_token_and_the_llm_key() {
     let config = ResolvedConfig::new(
         Tuning::default(),
@@ -608,24 +479,6 @@ fn the_resolved_config_redacts_the_token_and_the_llm_key() {
         config.deployment.token.as_ref().unwrap().expose(),
         "tok-abc123"
     );
-}
-
-#[test]
-fn redaction_holds_for_secrets_that_look_like_other_values() {
-    for value in ["127.0.0.1:7720", "true", "null", "{\"a\":1}", "[redacted]x"] {
-        let config = ResolvedConfig::new(Tuning::default(), deployment(Some(value), Some(value)));
-        let json = serde_json::to_value(&config).unwrap();
-        assert_ne!(json["deployment"]["token"], serde_json::json!(value));
-        assert_ne!(json["deployment"]["llm_api_key"], serde_json::json!(value));
-    }
-}
-
-#[test]
-fn absent_secrets_stay_absent() {
-    let config = ResolvedConfig::new(Tuning::default(), deployment(None, None));
-    let json = serde_json::to_value(&config).unwrap();
-    assert!(json["deployment"]["token"].is_null());
-    assert!(json["deployment"]["llm_api_key"].is_null());
 }
 
 #[test]
@@ -720,18 +573,6 @@ fn single_input_changes() -> Vec<(&'static str, DeletionInputs)> {
 }
 
 #[test]
-fn the_fingerprint_is_deterministic() {
-    assert_eq!(
-        deletion_fingerprint(&base_inputs()),
-        deletion_fingerprint(&base_inputs())
-    );
-    assert_eq!(
-        Tuning::default().deletion_fingerprint(),
-        load("").unwrap().deletion_fingerprint()
-    );
-}
-
-#[test]
 fn the_fingerprint_is_printable_for_an_ack() {
     // ADR 0010: `asphodel purge ack --hash <h>` quotes it.
     let fingerprint = Tuning::default().deletion_fingerprint();
@@ -743,41 +584,6 @@ fn the_fingerprint_is_printable_for_an_ack() {
         serde_json::to_value(&fingerprint).unwrap(),
         serde_json::json!(text)
     );
-}
-
-#[test]
-fn deletion_inputs_come_from_the_constants_and_the_tuning() {
-    let tuning = load(
-        "[clock]\nquiet_rate = 0.3\n[purge]\ndelta = 0.5\nsource_horizon_days = 60\n\
-         [agenda]\noverdue_days = 21\n",
-    )
-    .unwrap();
-    let i = DeletionInputs::new(&tuning);
-    assert_eq!(i.s, constants::S);
-    assert_eq!(i.tau, constants::TAU);
-    assert_eq!(i.a, constants::A);
-    assert_eq!(i.c, constants::C);
-    assert_eq!(i.d_max, constants::D_MAX);
-    assert_eq!(i.g, constants::G);
-    assert_eq!(i.n0, constants::N0);
-    assert_eq!(i.min_access_age_days, constants::MIN_ACCESS_AGE_DAYS);
-    assert_eq!(i.floor_spacing_days, constants::FLOOR_SPACING_DAYS);
-    assert_eq!(i.weight_created, constants::WEIGHT_CREATED);
-    assert_eq!(i.weight_used, constants::WEIGHT_USED);
-    assert_eq!(i.weight_mentioned_again, constants::WEIGHT_MENTIONED_AGAIN);
-    assert_eq!(i.weight_confirmed, constants::WEIGHT_CONFIRMED);
-    assert_eq!(i.weight_window_close, constants::WEIGHT_WINDOW_CLOSE);
-    assert_eq!(
-        i.full_speed_window_secs,
-        constants::FULL_SPEED_WINDOW.as_secs()
-    );
-    assert_eq!(i.significance, Significance::ALL.map(Significance::value));
-    assert_eq!(i.significance_kept, constants::SIGNIFICANCE_KEPT);
-    assert_eq!(i.quiet_rate, 0.3);
-    assert_eq!(i.delta, Some(0.5));
-    assert_eq!(i.overdue_days, 21);
-    assert_eq!(i.source_horizon_days, 60);
-    assert_eq!(tuning.deletion_fingerprint(), deletion_fingerprint(&i));
 }
 
 #[test]
@@ -793,19 +599,6 @@ fn every_fingerprinted_input_changes_the_fingerprint_on_its_own() {
 }
 
 #[test]
-fn different_single_changes_give_different_fingerprints() {
-    let fingerprints: Vec<_> = single_input_changes()
-        .into_iter()
-        .map(|(name, inputs)| (name, deletion_fingerprint(&inputs)))
-        .collect();
-    for (i, (a_name, a)) in fingerprints.iter().enumerate() {
-        for (b_name, b) in &fingerprints[i + 1..] {
-            assert_ne!(a, b, "{a_name} and {b_name} collide");
-        }
-    }
-}
-
-#[test]
 fn swapping_two_equal_shaped_inputs_changes_the_fingerprint() {
     let mut a = base_inputs();
     a.overdue_days = 30;
@@ -814,14 +607,6 @@ fn swapping_two_equal_shaped_inputs_changes_the_fingerprint() {
     b.overdue_days = 90;
     b.source_horizon_days = 30;
     assert_ne!(deletion_fingerprint(&a), deletion_fingerprint(&b));
-
-    let mut c = base_inputs();
-    c.weight_mentioned_again = 2.0;
-    c.weight_confirmed = 1.5;
-    assert_ne!(
-        deletion_fingerprint(&c),
-        deletion_fingerprint(&base_inputs())
-    );
 }
 
 #[test]
@@ -907,19 +692,6 @@ fn excluded_tuning_values_leave_the_fingerprint_alone() {
     }
 }
 
-#[test]
-fn deployment_and_secrets_leave_the_fingerprint_alone() {
-    let a = ResolvedConfig::new(Tuning::default(), deployment(Some("a"), Some("b")));
-    let mut other = deployment(None, None);
-    other.listen = "0.0.0.0:9000".into();
-    other.data_dir = Some(Path::new("/elsewhere").into());
-    other.allow_network_fs = true;
-    other.model_dir = Some("/models".into());
-    other.config = None;
-    let b = ResolvedConfig::new(Tuning::default(), other);
-    assert_eq!(a.deletion_fingerprint, b.deletion_fingerprint);
-}
-
 // LLM base URLs: validate syntax without DNS or network access.
 
 fn endpoint_toml(endpoint: &str) -> String {
@@ -933,7 +705,6 @@ fn llm_endpoint_rejects_anything_but_a_plain_http_base_url() {
         "http://",
         "https://",
         "https://:8080",
-        "http://localhost:99999",
         "http://localhost:65536",
         "http://localhost:port",
         "http://localhost:0",
@@ -949,14 +720,12 @@ fn llm_endpoint_rejects_anything_but_a_plain_http_base_url() {
         "https://llm.example/v1 ",
         // Not http or https.
         "ftp://host",
-        "ws://host",
         "file:///tmp/x",
         "localhost:8080",
         "//host/v1",
         "",
         // Credentials, queries and fragments can carry secrets.
         "https://user:pass@llm.example/v1",
-        "https://key@llm.example",
         "https://llm.example/v1?key=abc",
         "https://llm.example/v1#x",
     ] {

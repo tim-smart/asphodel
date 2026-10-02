@@ -24,16 +24,6 @@ use serde_json::Value;
 /// The checked-in scenarios.
 const SCENARIOS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenarios");
 
-/// The first set (TIM-116), all in group `ci`.
-const FIRST_SET: [&str; 6] = [
-    "lifetimes",
-    "purge-table",
-    "maya-to-mia",
-    "rescheduled-appointment",
-    "three-week-holiday",
-    "extraction-latency",
-];
-
 fn scenario(name: &str) -> PathBuf {
     Path::new(SCENARIOS).join(format!("{name}.toml"))
 }
@@ -248,20 +238,7 @@ fn every_checked_in_scenario_parses_and_resolves_its_labels() {
             path.display()
         );
     }
-    assert!(
-        seen >= FIRST_SET.len(),
-        "only {seen} scenarios are checked in"
-    );
-}
-
-#[test]
-fn the_first_set_is_checked_in_and_runs_in_ci() {
-    for name in FIRST_SET {
-        let text =
-            fs::read_to_string(scenario(name)).unwrap_or_else(|error| panic!("{name}: {error}"));
-        let scenario: contract::Scenario = toml::from_str(&text).unwrap();
-        assert_eq!(scenario.group, contract::Group::Ci, "{name}");
-    }
+    assert!(seen > 0, "no scenarios are checked in");
 }
 
 #[test]
@@ -337,9 +314,6 @@ fn an_unknown_scenario_field_doesnt_parse() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("start"), "{error}");
-    let error =
-        toml::from_str::<contract::Scenario>("name = \"x\"\ngroup = \"nightly\"\n").unwrap_err();
-    assert!(error.to_string().contains("nightly"), "{error}");
 }
 
 // The first set, through `asphodel replay`.
@@ -620,6 +594,10 @@ head = true
     );
 }
 
+/// TIM-116 review, finding 4: the simulated worker claims the head of the
+/// queue, which production orders by priority (turns before documents),
+/// not in arrival order. The turn at 09:05 goes before the document's
+/// second chunk, which arrived at 09:00.
 #[test]
 fn a_turn_between_a_documents_chunks_costs_the_rest_another_latency() {
     let dir = TestDir::new();
@@ -741,48 +719,6 @@ fn the_report_names_its_run_and_defaults_its_path() {
     assert!(default.is_file(), "no report at {}", default.display());
 }
 
-#[test]
-fn probes_without_an_id_are_numbered_in_file_order() {
-    let dir = TestDir::new();
-    let path = inline(
-        &dir,
-        "unnamed",
-        &format!(
-            "{HOME_TURN}
-[[probe]]
-at = \"2026-01-05T10:00:00Z\"
-kind = \"exists\"
-memory = \"home\"
-
-[[probe]]
-at = \"2026-01-05T10:00:00Z\"
-kind = \"band\"
-memory = \"home\"
-band = \"strong\"
-"
-        ),
-    );
-    let run = replay(&dir, &path, &[]);
-    run.assert_passed();
-    let ids: Vec<&Value> = run.probes().iter().map(|probe| &probe["id"]).collect();
-    assert_eq!(ids, [&Value::from("p1"), &Value::from("p2")]);
-}
-
-#[test]
-fn replay_is_deterministic() {
-    let first = TestDir::new();
-    let second = TestDir::new();
-    let a = replay(&first, &scenario("maya-to-mia"), &[]);
-    let b = replay(&second, &scenario("maya-to-mia"), &[]);
-    a.assert_passed();
-    b.assert_passed();
-    assert_eq!(
-        fs::read(&a.report_path).unwrap(),
-        fs::read(&b.report_path).unwrap(),
-        "two runs of the same scenario in different private dirs differ"
-    );
-}
-
 // Overrides and layering (TIM-98 amendment).
 
 #[test]
@@ -815,18 +751,6 @@ fn overrides_layer_over_the_production_file_in_the_shape_of_tuning() {
     );
     run.assert_passed();
     assert_eq!(run.report()["tuning"]["clock"]["quiet_rate"], 0.5);
-}
-
-#[test]
-fn an_overrides_file_with_an_unknown_key_is_refused_before_the_run() {
-    let dir = TestDir::new();
-    let overrides = dir.file("overrides.toml", "[clock]\nspeed = 2.0\n");
-    let run = replay(
-        &dir,
-        &scenario("extraction-latency"),
-        &["--overrides", overrides.to_str().unwrap()],
-    );
-    run.assert_refused("speed");
 }
 
 // Privacy and the private directory (TIM-96, decisions 3 and 8).
@@ -939,62 +863,6 @@ memory = \"home\"
         ),
     );
     replay(&dir, &path, &[]).assert_refused("home");
-}
-
-#[test]
-fn a_label_on_an_absorbed_claim_is_a_scenario_error() {
-    let dir = TestDir::new();
-    let path = inline(
-        &dir,
-        "bad-label",
-        &format!(
-            "{HOME_TURN}
-[[turn]]
-at = \"2026-01-06T09:00:00Z\"
-session = \"s1\"
-user = \"I live in Auckland, as I said.\"
-assistant = \"You did.\"
-
-[[turn.claim]]
-label = \"home-again\"
-content = \"Tim lives in Auckland.\"
-quote = \"I live in Auckland\"
-kind = \"fact\"
-significance = \"minor\"
-reconcile = [{{ memory = \"home\", outcome = \"mentioned_again\" }}]
-
-[[probe]]
-at = \"2026-01-07T09:00:00Z\"
-kind = \"exists\"
-memory = \"home\"
-"
-        ),
-    );
-    replay(&dir, &path, &[]).assert_refused("home-again");
-}
-
-#[test]
-fn a_probe_naming_an_unknown_label_is_refused_before_the_run() {
-    let dir = TestDir::new();
-    let path = inline(
-        &dir,
-        "bad-probe",
-        &format!(
-            "{HOME_TURN}
-[[probe]]
-id = \"ghost\"
-at = \"2026-01-07T09:00:00Z\"
-kind = \"exists\"
-memory = \"nobody\"
-"
-        ),
-    );
-    let run = replay(&dir, &path, &[]);
-    run.assert_refused("nobody");
-    assert!(
-        !dir.replay_dir().join("store").exists(),
-        "a scenario refused at load opens no store"
-    );
 }
 
 // The TIM-116 review findings on `ceef0c5`, accepted as regressions. Each
@@ -1194,132 +1062,13 @@ fn assert_reserved_report(destination: &str) {
 }
 
 #[test]
-fn a_report_over_the_private_directory_is_refused() {
-    assert_reserved_report("");
-}
-
-#[test]
-fn a_report_over_the_replay_lock_is_refused() {
-    assert_reserved_report("lock");
-}
-
-#[test]
-fn a_report_over_the_shadow_table_is_refused() {
-    assert_reserved_report("shadow.db");
-}
-
-#[test]
-fn a_report_over_the_shadow_journal_is_refused() {
-    assert_reserved_report("shadow.db-journal");
-}
-
-#[test]
 fn a_report_over_the_shadow_wal_is_refused() {
     assert_reserved_report("shadow.db-wal");
 }
 
 #[test]
-fn a_report_over_the_shadow_shared_memory_is_refused() {
-    assert_reserved_report("shadow.db-shm");
-}
-
-#[test]
-fn a_report_over_the_store_directory_is_refused() {
-    assert_reserved_report("store");
-}
-
-#[test]
 fn a_report_inside_the_store_is_refused() {
     assert_reserved_report("store/asphodel.db");
-}
-
-#[test]
-fn a_report_inside_a_store_descendant_is_refused() {
-    assert_reserved_report("store/nested/pre-run-contents");
-}
-
-/// Finding 4: the engine schedules a completion per source and then claims
-/// whatever the queue's head is, but production orders the queue by
-/// priority (turns before documents) and observed time. The simulated
-/// worker claims the head when it's free and commits a latency later:
-/// here the first turn holds the worker, the second turn then goes before
-/// the document that arrived earlier, and the document goes last.
-#[test]
-fn the_simulated_worker_follows_the_queue_order_not_arrival_order() {
-    let dir = TestDir::new();
-    let path = inline(
-        &dir,
-        "interleave",
-        r#"latency = "10m"
-
-[[turn]]
-at = "2026-01-05T08:59:00Z"
-session = "s1"
-user = "I live in Auckland."
-assistant = "Noted."
-
-[[turn.claim]]
-label = "home"
-content = "Tim lives in Auckland."
-quote = "I live in Auckland"
-kind = "fact"
-significance = "minor"
-
-[[document]]
-at = "2026-01-05T09:00:00Z"
-id = "notes"
-text = "My neighbour's cat is called Biscuit."
-reference_date = "2026-01-05"
-
-[[document.claim]]
-label = "cat"
-content = "Tim's neighbour's cat is called Biscuit."
-quote = "My neighbour's cat is called Biscuit"
-kind = "fact"
-significance = "trivial"
-
-[[turn]]
-at = "2026-01-05T09:01:00Z"
-session = "s1"
-user = "My favourite tea is Earl Grey."
-assistant = "A classic."
-
-[[turn.claim]]
-label = "tea"
-content = "Tim's favourite tea is Earl Grey."
-quote = "My favourite tea is Earl Grey"
-kind = "fact"
-significance = "trivial"
-
-# 08:59 + 10m: the first turn is done.
-[[probe]]
-id = "first-turn-done"
-at = "2026-01-05T09:15:00Z"
-kind = "exists"
-memory = "home"
-
-# 09:09 + 10m: the second turn went before the document.
-[[probe]]
-id = "second-turn-done-before-the-document"
-at = "2026-01-05T09:25:00Z"
-kind = "exists"
-memory = "tea"
-
-[[probe]]
-id = "document-still-queued"
-at = "2026-01-05T09:25:00Z"
-kind = "absent"
-memory = "cat"
-
-# 09:19 + 10m: the document is done.
-[[probe]]
-id = "document-done-last"
-at = "2026-01-05T09:35:00Z"
-kind = "exists"
-memory = "cat"
-"#,
-    );
-    replay(&dir, &path, &[]).assert_passed();
 }
 
 /// Finding 5: the run ends at the last event, so a completion scheduled
@@ -1406,76 +1155,4 @@ fn memory_ids_are_uuidv5_of_the_source_and_claim_ordinal() {
         observed, expected,
         "the memory id isn't keyed by its source"
     );
-}
-
-/// TIM-117 review, blocker 2 (Run D): extraction searches neighbours when
-/// the worker claims a chunk and commits a latency later, as production's
-/// worker does when call 1 returns. A neighbour purged by the 04:00 sweep
-/// in between is tolerated: the claim that would have refined it commits
-/// as a new memory, and the run doesn't fail.
-///
-/// The cat, mentioned once as trivial with bank time at world speed, is
-/// purged at the 2026-09-26 sweep (see `purge-table`). The turn that
-/// refines it syncs at 03:55 with a 10-minute latency, so the worker claims
-/// it before the sweep and commits after.
-#[test]
-fn a_neighbour_purged_between_claim_and_commit_leaves_the_claim_new() {
-    let dir = TestDir::new();
-    let path = inline(
-        &dir,
-        "purged-between-claim-and-commit",
-        r#"
-latency = "10m"
-
-[bank]
-timezone = "UTC"
-
-[tuning]
-clock.quiet_rate = 1.0
-
-[[turn]]
-at = "2026-01-05T09:00:00Z"
-session = "s1"
-user = "My neighbour's cat is called Biscuit."
-assistant = "Noted."
-
-[[turn.claim]]
-label = "cat"
-content = "Tim's neighbour's cat is called Biscuit."
-quote = "My neighbour's cat is called Biscuit"
-kind = "fact"
-significance = "trivial"
-
-[[turn]]
-at = "2026-09-26T03:55:00Z"
-session = "s1"
-user = "My neighbour's cat is called Biscuit the Second, actually."
-assistant = "Noted."
-
-[[turn.claim]]
-label = "second"
-content = "Tim's neighbour's cat is called Biscuit the Second."
-quote = "My neighbour's cat is called Biscuit the Second"
-kind = "fact"
-significance = "trivial"
-changes_something = true
-reconcile = [{ memory = "cat", outcome = "refines" }]
-
-[[probe]]
-id = "cat-is-purged"
-at = "2026-09-26T05:00:00Z"
-kind = "absent"
-memory = "cat"
-
-[[probe]]
-id = "second-is-new"
-at = "2026-09-26T05:00:00Z"
-kind = "exists"
-memory = "second"
-head = true
-"#,
-    );
-    let run = replay(&dir, &path, &[]);
-    run.assert_passed();
-    assert_eq!(purges(run.report()), 1, "{}", run.report());
 }

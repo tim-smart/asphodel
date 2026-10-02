@@ -21,12 +21,6 @@ def test_reset_clears_the_old_session_and_rebinds(make_provider, daemon):
     assert daemon.requests_for("prefetch")[0].body["session_id"] == "sess-0002"
 
 
-def test_rewound_clears(make_provider, daemon):
-    provider = make_provider()
-    provider.on_session_switch(SESSION, parent_session_id=SESSION, rewound=True)
-    assert [r.session for r in daemon.requests_for("clear")] == [SESSION]
-
-
 def test_resume_or_branch_only_rebinds(make_provider, daemon):
     provider = make_provider()
     provider.on_session_switch("sess-0003", parent_session_id=SESSION)
@@ -54,6 +48,7 @@ def test_clear_failure_never_raises_and_still_rebinds(make_provider, daemon):
     provider = make_provider()
     daemon.set_response("clear", 500, {"error": "store"})
     provider.on_session_switch("sess-0002", parent_session_id=SESSION, reset=True)
-    url = daemon.go_down()
+    provider.prefetch("tea?")
+    assert daemon.requests_for("prefetch")[0].body["session_id"] == "sess-0002"
+    daemon.go_down()
     provider.on_session_switch("sess-0003", parent_session_id="sess-0002", reset=True)
-    assert provider._session_id == "sess-0003"

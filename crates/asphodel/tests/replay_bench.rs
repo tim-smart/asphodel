@@ -61,16 +61,13 @@ fn bench_runs_on_a_copy_of_the_replayed_store() {
     }
 }
 
-/// The bench daemon listens on loopback only (TIM-96, decision 3).
+/// The bench daemon listens on loopback only (TIM-96, decision 3). The
+/// address is checked before anything else, so no store is needed.
 #[test]
 fn bench_refuses_a_listen_address_off_loopback() {
     let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
     let output = asphodel(&dir)
         .arg("bench")
-        .arg("--corpus")
-        .arg(&corpus)
         .args(["--listen", "0.0.0.0:0"])
         .output()
         .unwrap();

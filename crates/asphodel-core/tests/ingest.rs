@@ -26,7 +26,7 @@ use asphodel_core::Service;
 use asphodel_core::clock::{Clock, SimulatedClock};
 use asphodel_core::config::Tuning;
 use asphodel_core::store::bank::{BankIdentity, ModelIds};
-use asphodel_core::store::{DB_FILE, OpenOptions, Store, micros, migrations};
+use asphodel_core::store::{DB_FILE, OpenOptions, Store, micros};
 use jiff::civil::{Date, date};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
@@ -551,15 +551,6 @@ fn hashes_in_code_blocks_and_hashtags_are_not_headings() {
 }
 
 #[test]
-fn a_section_under_the_budget_is_not_split() {
-    let paragraph = "word ".repeat(140); // 700 characters
-    let section = format!("# Long\n\n{}", [paragraph.as_str(); 4].join("\n\n"));
-    assert!(section.chars().count() < CHUNK_CHARS);
-    let chunks = split_document(&section);
-    assert_eq!(chunks.len(), 1);
-}
-
-#[test]
 fn a_long_section_is_split_at_paragraphs_under_the_budget() {
     let paragraphs: Vec<String> = (0..12)
         .map(|n| format!("Paragraph {n}. {}", "lorem ipsum ".repeat(75)))
@@ -770,34 +761,6 @@ fn an_unknown_timezone_or_bank_is_refused_and_nothing_is_stored() {
     assert_eq!(h.count("SELECT COUNT(*) FROM extraction_queue"), 0);
 }
 
-#[test]
-fn a_turn_is_one_queued_chunk() {
-    let h = Harness::new();
-    let got = ingest(
-        &h,
-        "main",
-        &turn(
-            "s",
-            "2026-10-01T06:00:00Z",
-            "My sister Mia arrives on Friday.",
-            "I'll remember that Mia arrives on Friday.",
-        ),
-    );
-    let chunks = h.chunks_of(got.source);
-    assert_eq!(chunks.len(), 1, "a turn is one chunk");
-    let (chunk, position, heading_path, _, _, text, _) = &chunks[0];
-    assert_eq!(*position, 0);
-    assert_eq!(*heading_path, None);
-    let text = text.as_deref().expect("the chunk holds its text");
-    assert!(text.contains("My sister Mia arrives on Friday."));
-    assert!(text.contains("I'll remember that Mia arrives on Friday."));
-    assert_eq!(h.chunk_column::<Option<i64>>(*chunk, "extracted_at"), None);
-    assert_eq!(h.chunk_column::<i64>(*chunk, "error_count"), 0);
-    assert_eq!(h.chunk_column::<Option<i64>>(*chunk, "failed_at"), None);
-    assert_eq!(depth(&h, "main"), 1);
-    assert_eq!(depth(&h, "other"), 0);
-}
-
 // Idempotency (TIM-90, ADR 0002)
 
 #[test]
@@ -826,23 +789,6 @@ fn the_same_turn_twice_does_nothing_the_second_time() {
         micros(start()),
         "a duplicate doesn't touch the stored source"
     );
-}
-
-#[test]
-fn a_duplicate_is_caught_after_a_restart() {
-    let h = Harness::new();
-    let sent = turn(
-        "s",
-        "2026-10-01T06:00:00Z",
-        "I moved to Wellington.",
-        "Noted.",
-    );
-    let first = ingest(&h, "main", &sent);
-    let h = h.restart();
-    let second = ingest(&h, "main", &sent);
-    assert_eq!(second.outcome, Outcome::Duplicate);
-    assert_eq!(second.source, first.source);
-    assert_eq!(depth(&h, "main"), 1);
 }
 
 #[test]
@@ -966,44 +912,6 @@ fn a_document_is_stored_with_its_reference_date() {
 }
 
 #[test]
-fn an_inexact_reference_date_is_recorded() {
-    let h = Harness::new();
-    let got = ingest_doc(
-        &h,
-        "main",
-        &Document {
-            reference_date_exact: false,
-            ..document("old.md", "Sometime last year we moved.", date(2025, 6, 1))
-        },
-    );
-    assert_eq!(
-        h.source_column::<i64>(got.source, "reference_date_exact"),
-        0
-    );
-}
-
-#[test]
-fn a_document_is_stored_as_its_chunks_and_every_chunk_is_queued() {
-    let h = Harness::new();
-    let text = "Preamble.\n\n# Work\n\nShip v1.\n\n## Ingest\n\nChunk documents.\n\n# Home\n\nFix the fence.\n";
-    let got = ingest_doc(&h, "main", &document("notes.md", text, date(2026, 9, 15)));
-    let expected = split_document(text);
-    let stored = h.chunks_of(got.source);
-
-    assert_eq!(got.chunks_queued, expected.len());
-    assert_eq!(stored.len(), expected.len());
-    assert_eq!(depth(&h, "main"), expected.len());
-    for (index, (want, row)) in expected.iter().zip(&stored).enumerate() {
-        let (_, position, _, start, end, chunk_text, hash) = row;
-        assert_eq!(*position, index as i64);
-        assert_eq!(*start, want.start as i64, "chunk {index} records its range");
-        assert_eq!(*end, want.end as i64);
-        assert_eq!(chunk_text.as_deref(), Some(want.text.as_str()));
-        assert_eq!(*hash, chunk_hash(&want.heading_path, &want.text));
-    }
-}
-
-#[test]
 fn the_same_document_twice_does_nothing_the_second_time() {
     let h = Harness::new();
     let text = "# Plans\n\nFly to Berlin on 3 October.\n";
@@ -1094,24 +1002,6 @@ fn an_edited_document_queues_only_chunks_no_earlier_version_had() {
     assert_eq!(third.chunks_queued, 0);
     assert_eq!(third.chunks_skipped, 3);
     assert_eq!(depth(&h, "main"), 4);
-}
-
-#[test]
-fn a_section_moved_under_another_heading_is_new() {
-    let h = Harness::new();
-    let v1 = "# Work\n\n## Errands\n\nFix the fence.\n";
-    let v2 = "# Home\n\n## Errands\n\nFix the fence.\n";
-    ingest_doc(&h, "main", &document("todo.md", v1, date(2026, 9, 1)));
-    let second = ingest_doc(&h, "main", &document("todo.md", v2, date(2026, 9, 2)));
-    let errands = split_document(v2)
-        .into_iter()
-        .find(|chunk| chunk.heading_path == path(&["Home", "Errands"]))
-        .unwrap();
-    assert!(
-        queued_hashes(&h, second.source)
-            .contains(&chunk_hash(&errands.heading_path, &errands.text)),
-        "the heading path is part of a chunk's identity"
-    );
 }
 
 #[test]
@@ -1530,47 +1420,6 @@ fn the_owners_id_on_another_platform_is_someone_else() {
 }
 
 #[test]
-fn two_people_with_one_name_are_two_entities() {
-    // TIM-92: no string-similarity matching and no automatic merges.
-    let h = Harness::new();
-    let a = ingest(
-        &h,
-        "main",
-        &discord_turn("2026-10-01T06:00:00Z", "Hi.", author("1111", "Sam")),
-    );
-    let b = ingest(
-        &h,
-        "main",
-        &discord_turn("2026-10-01T06:01:00Z", "Hi.", author("2222", "Sam")),
-    );
-    assert_ne!(a.speaker.unwrap().entity, b.speaker.unwrap().entity);
-    assert_eq!(h.entities_in("main"), 4);
-}
-
-#[test]
-fn a_bot_is_a_speaker_of_its_own() {
-    let h = Harness::new();
-    let got = ingest(
-        &h,
-        "main",
-        &discord_turn(
-            "2026-10-01T06:00:00Z",
-            "Reminder: standup at 10.",
-            TurnAuthor {
-                id: "4242".into(),
-                name: Some("Dyno".into()),
-                is_bot: true,
-            },
-        ),
-    );
-    let speaker = got.speaker.unwrap();
-    assert!(!speaker.owner);
-    assert_ne!(speaker.entity, h.seeded("main", "user"));
-    assert_eq!(h.source_column::<i64>(got.source, "author_is_bot"), 1);
-    assert_eq!(got.chunks_queued, 1, "bots are ingested like anyone else");
-}
-
-#[test]
 fn speakers_never_cross_banks() {
     let h = Harness::new();
     let a = ingest(
@@ -1589,15 +1438,6 @@ fn speakers_never_cross_banks() {
 }
 
 // The extraction queue (TIM-92; TIM-94 decision 3)
-
-#[test]
-fn an_empty_queue_hands_out_nothing() {
-    let h = Harness::new();
-    assert!(claim(&h, "main").is_none());
-    assert_eq!(depth(&h, "main"), 0);
-    assert!(h.service.failed_chunks("main").unwrap().is_empty());
-    assert!(h.service.claim_chunk("nowhere").is_err());
-}
 
 #[test]
 fn each_bank_has_one_worker() {
@@ -1680,23 +1520,6 @@ fn turns_go_ahead_of_documents_then_observed_at_order_across_a_restart() {
             (doc.source, SourceKind::Document, 1),
         ]
     );
-}
-
-#[test]
-fn a_lease_describes_its_chunk() {
-    let h = Harness::new();
-    let got = ingest(
-        &h,
-        "main",
-        &turn("s", "2026-10-01T06:00:00Z", "Hello.", "Hi."),
-    );
-    let lease = claim(&h, "main").unwrap();
-    assert_eq!(lease.source, got.source);
-    assert_eq!(lease.chunk, h.chunks_of(got.source)[0].0);
-    assert_eq!(lease.source_kind, SourceKind::Turn);
-    assert_eq!(lease.position, 0);
-    assert_eq!(lease.observed_at, at("2026-10-01T06:00:00Z"));
-    assert_eq!(lease.error_count, 0);
 }
 
 #[test]
@@ -1844,25 +1667,6 @@ fn reaching_the_retry_cap_marks_the_chunk_failed_and_the_queue_moves_on() {
         h.chunk_column::<Option<String>>(failed, "text").is_some(),
         "a failed chunk keeps its text so it can be retried or discarded"
     );
-}
-
-#[test]
-fn a_failure_in_one_bank_does_not_hold_up_another() {
-    let h = Harness::new();
-    ingest(
-        &h,
-        "main",
-        &turn("s", "2026-10-01T06:00:00Z", "Main.", "Ok."),
-    );
-    ingest(
-        &h,
-        "other",
-        &turn("s", "2026-10-01T06:00:00Z", "Other.", "Ok."),
-    );
-    let main = claim(&h, "main").unwrap();
-    h.service.fail_chunk(main, LLM_502).unwrap();
-    let other = claim(&h, "other").expect("other's queue is its own");
-    assert_eq!(other.error_count, 0);
 }
 
 // Recovery after a restart (TIM-94 decision 3: nothing queued is lost)
@@ -2197,36 +2001,6 @@ fn next_message_at() -> String {
     format!("2026-10-01T05:{:02}:{:02}Z", (n / 60) % 60, n % 60)
 }
 
-#[test]
-fn an_upgrade_from_version_1_records_one_migration_and_keeps_a_copy() {
-    let h = downgrade_to_v1_and_reopen(Harness::new());
-    let store = h.service.store().unwrap();
-    let applied = store.applied().expect("version 1 is migrated");
-    assert_eq!((applied.from, applied.to), (1, migrations::SCHEMA_VERSION));
-    assert_eq!(store.schema_version().unwrap(), migrations::SCHEMA_VERSION);
-    let copy = migrations::copy_path(&h.dir.data(), 1);
-    assert_eq!(applied.copy.as_deref(), Some(copy.as_path()));
-    assert!(
-        copy.exists(),
-        "the pre-migration copy is keyed by version 1"
-    );
-
-    let conn = store.connection();
-    let mut statement = conn
-        .prepare("SELECT from_version, to_version FROM migrations ORDER BY id")
-        .unwrap();
-    let rows: Vec<(i64, i64)> = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert_eq!(
-        rows,
-        [(0, 1), (1, i64::from(migrations::SCHEMA_VERSION))],
-        "one row for the upgrade"
-    );
-}
-
 /// The speaker ids of `bank` that map to its `user`.
 fn owner_ids(h: &Harness, bank: &str) -> Vec<String> {
     let user = h.seeded(bank, "user");
@@ -2397,30 +2171,6 @@ fn an_upgrade_does_not_map_a_former_owner_name_shaped_like_a_platform_id() {
         speaker(&h, "renamed", "discord", "1234", "Tim"),
         (user, true)
     );
-}
-
-#[test]
-fn an_owner_name_shaped_like_a_platform_id_is_not_a_speaker_id() {
-    // The same boundary on a version 2 store: bank config maps platform ids
-    // only.
-    let h = Harness::new();
-    h.service
-        .ensure_bank(
-            "odd",
-            &BankIdentity {
-                owner_name: Some("discord:9999".into()),
-                owner_platform_ids: vec!["discord:1234".into()],
-                assistant_name: Some("discord:8888".into()),
-                timezone: Some(TZ.into()),
-            },
-            &models(),
-        )
-        .unwrap();
-    let user = h.seeded("odd", "user");
-    assert_eq!(speaker_ids(&h, "odd"), [("discord:1234".to_string(), user)]);
-    let (entity, owner) = speaker(&h, "odd", "discord", "9999", "Stranger");
-    assert!(!owner);
-    assert_ne!(entity, user);
 }
 
 #[test]

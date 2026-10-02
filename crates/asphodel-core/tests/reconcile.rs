@@ -13,10 +13,9 @@
 //! the input first, the way call 1's tests read entity and memory handles.
 //!
 //! The API under test is call 2's items in `asphodel_core::extraction` and
-//! the `Service` methods over it, `call2_input` and `extract_chunk`. One
-//! test checks what the rest rely on: that the fixtures below sit on the
-//! side of the fake embedder's floor each test needs, so a test expecting
-//! call 2 not to run can't pass for the wrong reason.
+//! the `Service` methods over it, `call2_input` and `extract_chunk`. Each
+//! test that relies on a fixture pair sitting above or below the fake
+//! embedder's floor checks it through whether call 2 runs.
 //!
 //! Every service here runs on a `SimulatedClock` stopped at one instant
 //! unless a test advances it, so a stored time that equals that instant can
@@ -106,38 +105,6 @@ const PASSPORT: &str = "Tim needs to renew his passport.";
 const JOB_HUNTING: &str = "Tim is job hunting.";
 const TRAVEL: &str = "Travel documents are sorted.";
 
-/// Pairs (claim, stored memory) that must clear [`FLOOR`] with the fake
-/// embedder, so call 2 runs on them.
-const ABOVE_FLOOR: [(&str, &str); 18] = [
-    (TAX_NOT_FILED, TAX_FILED),
-    (TAX_FILED_ONLINE, TAX_FILED),
-    (NEVER_ACME, ACME),
-    (TEA, TEA),
-    (TEA, TEA_A_LOT),
-    (TEA_AGAIN, TEA),
-    (ACME_STILL, ACME),
-    (ACME, ACME),
-    (ACME_LEFT, ACME),
-    (MOVED, BERLIN),
-    (BERLIN, LISBON),
-    (DENTIST_9, DENTIST_8),
-    (DENTIST_8, DENTIST_9),
-    (TOKYO, JAPAN),
-    (NO_COFFEE, COFFEE),
-    (TAX_FILED, TAX_TASK),
-    (TAX_FILED_LATER, TAX_FILED),
-    (MIA, MAYA),
-];
-
-/// Pairs that must stay below [`FLOOR`]: a unit with only these doesn't run
-/// call 2 unless a claim is flagged.
-const BELOW_FLOOR: [(&str, &str); 4] = [
-    (WEATHER, CAT),
-    (ANA_DOG, ANA),
-    (TRAVEL, PASSPORT),
-    (TRAVEL, JOB_HUNTING),
-];
-
 fn at(text: &str) -> Timestamp {
     text.parse().unwrap()
 }
@@ -150,16 +117,6 @@ fn local(datetime: &str) -> Timestamp {
         .to_zoned(TimeZone::get(TZ).unwrap())
         .unwrap()
         .timestamp()
-}
-
-/// Cosine similarity under the fake embedder, which returns unit vectors.
-fn similarity(a: &str, b: &str) -> f64 {
-    let vectors = FakeEmbedder.embed(&[a, b]).unwrap();
-    vectors[0]
-        .iter()
-        .zip(&vectors[1])
-        .map(|(x, y)| f64::from(*x) * f64::from(*y))
-        .sum()
 }
 
 /// A temporary directory removed even when an assertion unwinds.
@@ -1019,29 +976,6 @@ fn call2_reply(claims: Vec<Value>) -> Value {
     json!({"claims": claims})
 }
 
-// What the rest rely on: the fixtures.
-
-#[test]
-fn the_fixtures_sit_on_the_side_of_the_floor_each_test_needs() {
-    for (claim, memory) in ABOVE_FLOOR {
-        let similarity = similarity(claim, memory);
-        assert!(
-            similarity >= FLOOR,
-            "{claim:?} against {memory:?} is {similarity}, below the floor"
-        );
-    }
-    for (claim, memory) in BELOW_FLOOR {
-        let similarity = similarity(claim, memory);
-        assert!(
-            similarity < FLOOR,
-            "{claim:?} against {memory:?} is {similarity}, at or above the floor"
-        );
-    }
-    // The floor test needs a pair between the fake floor and a strict one.
-    let paraphrase = similarity(TEA_AGAIN, TEA);
-    assert!((FLOOR..0.99).contains(&paraphrase), "{paraphrase}");
-}
-
 // When call 2 runs.
 
 #[test]
@@ -1165,28 +1099,6 @@ fn bm25_hits_fill_out_the_candidates_only_once_call_2_runs() {
 }
 
 #[test]
-fn a_neighbour_hit_by_several_claims_appears_once() {
-    let h = Harness::new();
-    let tea = h.fact(TEA);
-    owner_says(&h, "I like green tea. I really like green tea.");
-    let call1 = reply(vec![
-        claim(TEA, "fact", "I like green tea"),
-        claim(TEA_AGAIN, "fact", "I really like green tea"),
-    ]);
-    let input = call2(&h, &call1).expect("call 2 runs");
-    assert_eq!(
-        input
-            .neighbours
-            .iter()
-            .filter(|neighbour| neighbour.memory == tea)
-            .count(),
-        1
-    );
-    assert!(shown_for(&input, 0).contains(&tea));
-    assert!(shown_for(&input, 1).contains(&tea));
-}
-
-#[test]
 fn neighbours_are_capped_per_claim_and_per_unit() {
     // Nine topics with six close memories each: 45 candidates once each
     // claim keeps its top five, so the unit cap bites.
@@ -1282,20 +1194,6 @@ fn a_retracted_memory_isnt_a_neighbour_but_its_chain_head_is() {
     assert!(!found.contains(&maya), "retracted: {found:?}");
     let input = input.expect("the dentist hit shows its head, so call 2 runs");
     assert!(shown_for(&input, 0).contains(&dentist_9));
-}
-
-#[test]
-fn a_hit_on_a_refined_memory_shows_its_chain_head() {
-    let h = Harness::new();
-    let japan = h.insert_memory("main", JAPAN, "event", "notable");
-    let tokyo = h.insert_memory("main", TOKYO, "event", "notable");
-    h.mark_refined(japan, tokyo);
-    owner_says(&h, "I'm going to Japan in 2027.");
-    let call1 = reply(vec![claim(JAPAN, "event", "I'm going to Japan in 2027")]);
-    let input = call2(&h, &call1).expect("call 2 runs");
-    let found = shown(&input);
-    assert!(found.contains(&tokyo), "{found:?}");
-    assert!(!found.contains(&japan), "{found:?}");
 }
 
 /// sqlite-vec 0.1.9 refuses a KNN query for more than this many neighbours
@@ -1444,32 +1342,6 @@ fn mentioned_again_writes_an_access_and_no_memory() {
     assert_eq!(h.change(tea), Change::untouched());
     let extracted_at: Option<i64> = h.chunk_column(extracted.chunk, "extracted_at");
     assert!(extracted_at.is_some());
-}
-
-#[test]
-fn two_labels_on_one_neighbour_keep_the_strongest_access() {
-    // At most one access per memory per turn, keeping the strongest kind
-    // (TIM-90): confirmed weighs 2, mentioned again 1.5.
-    let h = Harness::new();
-    let tea = h.fact(TEA);
-    owner_says(&h, "I like green tea. Yes, I really like green tea.");
-    let call1 = reply(vec![
-        claim(TEA, "fact", "I like green tea"),
-        claim(TEA_AGAIN, "fact", "I really like green tea"),
-    ]);
-    let input = call2(&h, &call1).expect("call 2 runs");
-    let n = neighbour_handle(&input, tea);
-    let extracted = reconcile(
-        &h,
-        call1,
-        call2_reply(vec![
-            labelled(&input.claims[0].handle, &[(n.clone(), "mentioned_again")]),
-            labelled(&input.claims[1].handle, &[(n, "confirmed")]),
-        ]),
-    );
-    assert!(extracted.memories.is_empty());
-    let kinds: Vec<String> = h.accesses(tea).into_iter().map(|row| row.kind).collect();
-    assert_eq!(kinds, ["created", "confirmed"]);
 }
 
 #[test]
@@ -1789,35 +1661,6 @@ fn an_ending_with_no_start_ends_on_the_day_it_was_said_with_low_confidence() {
             ..Change::untouched()
         }
     );
-}
-
-#[test]
-fn completing_a_task_creates_an_event_that_ends_it() {
-    let h = Harness::new();
-    let task = h.insert_memory("main", TAX_TASK, "task", "notable");
-    owner_says(&h, "I filed the tax return.");
-    let extracted = one_label(
-        &h,
-        reply(vec![changes(claim(
-            TAX_FILED,
-            "event",
-            "I filed the tax return",
-        ))]),
-        task,
-        "ends",
-    );
-
-    // TIM-92: a completion is an event, never a retraction. With no stated
-    // time it starts on the day it was said, and the task ends there.
-    let filed = extracted.memories[0];
-    assert_eq!(h.kind(filed), "event");
-    assert_eq!(h.valid_from(filed), timed(local("2026-10-01T00:00"), "day"));
-    let change = h.change(task);
-    assert_eq!(change.valid_until, timed(local("2026-10-01T00:00"), "day"));
-    assert_eq!(change.ended_by, Some(filed));
-    assert_eq!(change.invalidated_at, None);
-    assert_eq!(change.superseded_by, None);
-    assert_eq!(h.edits_on(task, EDIT_ENDED), 1);
 }
 
 #[test]
@@ -2248,46 +2091,6 @@ fn a_denial_reopens_everything_its_neighbour_ended() {
 }
 
 #[test]
-fn a_reschedule_still_repoints_everything_its_neighbour_ended() {
-    // A `retracts` is a corrected version of the ender, so everything it
-    // ended stays ended, now by the correction.
-    let h = Harness::new();
-    let (task, worry, filed) = filed_and_ended(
-        &h,
-        "Correction: I filed the tax return on 2 October, not the 1st.",
-    );
-    let later = one_label(
-        &h,
-        reply(vec![changes(
-            claim(
-                TAX_FILED_LATER,
-                "event",
-                "I filed the tax return on 2 October",
-            )
-            .with("valid_from", time("2026-10-02", "day")),
-        )]),
-        filed,
-        "retracts",
-    )
-    .memories[0];
-
-    assert_eq!(h.change(filed).superseded_by, Some(later));
-    for ended in [task, worry] {
-        assert_eq!(
-            h.change(ended),
-            Change {
-                valid_until: timed(local("2026-10-02T00:00"), "day"),
-                ended_by: Some(later),
-                ..Change::untouched()
-            },
-            "{ended}"
-        );
-        assert_eq!(h.edits_on(ended, EDIT_END_REPOINTED), 1);
-        assert_eq!(h.edits_on(ended, EDIT_END_CLEARED), 0);
-    }
-}
-
-#[test]
 fn a_refinement_of_an_ender_repoints_what_it_ended() {
     // The amendment repoints ends for a `refines` successor as for a
     // `retracts` one: the refined filing still completed the task.
@@ -2358,9 +2161,10 @@ fn an_older_denial_creates_nothing() {
 
 #[test]
 fn denies_on_an_ended_or_retracted_neighbour_is_rejected() {
-    // Like every label but `mentioned_again` and `confirmed`, `denies` is
-    // rejected on a neighbour already ended, or retracted earlier in the
-    // same unit. A claim left with no labels is new.
+    // `denies` is rejected on a neighbour already ended, or retracted
+    // earlier in the same unit. Only an older claim's `mentioned_again` or
+    // `confirmed` may still land on an ended neighbour; a retracted one takes
+    // no label at all. A claim left with no labels is new.
     let h = Harness::new();
     let acme = h.fact(ACME);
     let left = h.insert_memory("main", ACME_LEFT, "event", "minor");

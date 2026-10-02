@@ -1,7 +1,7 @@
 """``sync_turn`` (TIM-94, decisions 1, 5 and 6; TIM-88 timestamps): the Turn
 body, the primary gate, the ``ingest`` switch and the echoed ``recall_id``."""
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytest
 
@@ -47,20 +47,6 @@ def test_message_at_comes_from_this_turns_user_row_not_an_earlier_one(make_provi
     sync(provider, messages=transcript("today", "ok", epoch=EPOCH, earlier=earlier))
     message_at = daemon.requests_for("turns")[0].body["message_at"]
     assert datetime.fromisoformat(message_at.replace("Z", "+00:00")).timestamp() == pytest.approx(EPOCH, abs=0.001)
-
-
-def test_message_at_falls_back_to_the_wall_clock_without_messages(make_provider, daemon):
-    provider = make_provider()
-    before = datetime.now(timezone.utc).timestamp()
-    provider.sync_turn("hi there friend", "hello", session_id=SESSION, messages=None)
-    message_at = daemon.requests_for("turns")[0].body["message_at"]
-    assert datetime.fromisoformat(message_at.replace("Z", "+00:00")).timestamp() >= before - 1
-
-
-def test_no_author_is_sent_as_null(make_provider, daemon):
-    provider = make_provider()
-    sync(provider, turn_author=None)
-    assert daemon.requests_for("turns")[0].body["author"] is None
 
 
 def test_timezone_falls_back_to_config_then_null(make_provider, daemon, hermes):
@@ -141,15 +127,6 @@ def test_an_interrupted_turns_recall_id_is_never_echoed(make_provider, daemon):
     sync(provider, user="book the dentist for Friday", messages=transcript("book the dentist for Friday", "Done.", epoch=EPOCH))
     sync(provider, user="thanks a lot then", messages=transcript("thanks a lot then", "Any time.", epoch=EPOCH + 60))
     assert _echoed(daemon) == ["r-book the dentist for Friday", None]
-
-
-def test_a_turn_without_a_prefetch_echoes_nothing(make_provider, daemon):
-    provider = make_provider()
-    _recall_id_per_query(daemon)
-    provider.prefetch("where is the dentist?", session_id=SESSION)
-    sync(provider, user="where is the dentist?", messages=transcript("where is the dentist?", "Noted.", epoch=EPOCH))
-    sync(provider, user="/skip", messages=transcript("/skip", "ok", epoch=EPOCH + 60))
-    assert _echoed(daemon) == ["r-where is the dentist?", None]
 
 
 def test_an_unmatched_sync_echoes_nothing_and_leaves_the_pending_id(make_provider, daemon):

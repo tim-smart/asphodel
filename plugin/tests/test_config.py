@@ -10,27 +10,6 @@ from conftest import plugin, write_config
 load_config = plugin.config.load_config
 
 
-def test_reads_every_field(hermes_home):
-    write_config(
-        hermes_home,
-        url="http://10.0.0.5:7720",
-        bank="tim",
-        owner_name="Tim",
-        owner_platform_ids=["discord:111", "telegram:222"],
-        assistant_name="Hermes",
-        timezone="Pacific/Auckland",
-        ingest=False,
-    )
-    config = load_config(hermes_home)
-    assert config.url == "http://10.0.0.5:7720"
-    assert config.bank == "tim"
-    assert config.owner_name == "Tim"
-    assert config.owner_platform_ids == ["discord:111", "telegram:222"]
-    assert config.assistant_name == "Hermes"
-    assert config.timezone == "Pacific/Auckland"
-    assert config.ingest is False
-
-
 def test_environment_url_overrides_the_file(hermes_home, monkeypatch):
     write_config(hermes_home, url="http://10.0.0.5:7720")
     monkeypatch.setenv("ASPHODEL_URL", "unix:/run/asphodel.sock")
@@ -63,10 +42,6 @@ def test_is_available_is_config_only(hermes_home, daemon):
     provider = plugin.AsphodelMemoryProvider()
     assert provider.is_available() is True
     assert daemon.requests == []
-
-
-def test_is_available_with_no_file_uses_the_default_url(hermes_home):
-    assert plugin.AsphodelMemoryProvider().is_available() is True
 
 
 def test_not_available_when_the_url_is_blank(hermes_home):

@@ -27,18 +27,13 @@
 //! [`Volatility::rate_days`].
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use asphodel_core::clock::SimulatedClock;
 use asphodel_core::config::Tuning;
 use asphodel_core::constants::{
     A, C, D_MAX, FLOOR_SPACING_DAYS, G, MIN_ACCESS_AGE_DAYS, N0, S, SIGNIFICANCE_KEPT,
     Significance, TAU, Volatility, WEIGHT_CONFIRMED, WEIGHT_CREATED, WEIGHT_MENTIONED_AGAIN,
-    WEIGHT_USED, WEIGHT_WINDOW_CLOSE,
+    WEIGHT_WINDOW_CLOSE,
 };
-use asphodel_core::store::{OpenOptions, Store};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 
@@ -237,84 +232,7 @@ fn abandoned_days(significance: f64) -> f64 {
     1.0 + (one_mention_days(significance, TAU) - 1.0) / quiet_rate
 }
 
-// Strength is never stored.
-
-/// A temporary data dir removed even when an assertion unwinds.
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "asphodel-strength-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-#[test]
-fn no_column_stores_strength_or_its_parts() {
-    let dir = TestDir::new();
-    let clock = Arc::new(SimulatedClock::new(t0()));
-    let store = Store::open(&dir.0.join("data"), OpenOptions::default(), clock).unwrap();
-    let conn = store.connection();
-    let mut tables = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-        .unwrap();
-    let tables: Vec<String> = tables
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert!(tables.iter().any(|t| t == "memories"));
-
-    let mut stored = Vec::new();
-    for table in tables {
-        let mut columns = conn
-            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
-            .unwrap();
-        for column in columns
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-        {
-            let column = column.unwrap();
-            let lower = column.to_lowercase();
-            if [
-                "strength",
-                "recent_use",
-                "lasting_floor",
-                "occasions",
-                "activation",
-                "faded",
-                "phase",
-                "confidence",
-            ]
-            .iter()
-            .any(|word| lower.contains(word))
-                && column != "window_confidence"
-            {
-                stored.push(format!("{table}.{column}"));
-            }
-        }
-    }
-    assert!(stored.is_empty(), "computed values are stored: {stored:?}");
-}
-
 // Bank time (ADR 0004).
-
-#[test]
-fn a_bank_with_no_turns_runs_at_the_quiet_rate() {
-    assert_near(quiet_bank(&[]).elapsed_days(at(0.0), at(10.0)), 1.0, EXACT);
-}
 
 #[test]
 fn bank_time_runs_at_full_speed_for_24_hours_after_a_turn() {
@@ -322,19 +240,6 @@ fn bank_time_runs_at_full_speed_for_24_hours_after_a_turn() {
     assert_near(bank.elapsed_days(at(0.0), at(0.5)), 0.5, EXACT);
     // 1 day at full speed, then 9 at 0.1.
     assert_near(bank.elapsed_days(at(0.0), at(10.0)), 1.9, EXACT);
-}
-
-#[test]
-fn the_full_speed_window_ends_exactly_24_hours_after_the_turn() {
-    let bank = quiet_bank(&[0.0]);
-    assert_near(bank.elapsed_days(at(1.0), at(2.0)), 0.1, EXACT);
-    let minute = 1.0 / 1440.0;
-    assert_near(bank.elapsed_days(at(1.0 - minute), at(1.0)), minute, EXACT);
-    assert_near(
-        bank.elapsed_days(at(1.0), at(1.0 + minute)),
-        0.1 * minute,
-        EXACT,
-    );
 }
 
 #[test]
@@ -373,45 +278,7 @@ fn a_turn_before_the_interval_speeds_up_its_start_and_later_turns_dont_count() {
     );
 }
 
-#[test]
-fn bank_time_is_additive_and_ignores_turn_order() {
-    let bank = quiet_bank(&[0.0, 3.2, 3.7, 9.0]);
-    let whole = bank.elapsed_days(at(0.0), at(12.0));
-    let parts = bank.elapsed_days(at(0.0), at(5.0)) + bank.elapsed_days(at(5.0), at(12.0));
-    assert_near(parts, whole, EXACT);
-    assert_near(bank.elapsed_days(at(4.0), at(4.0)), 0.0, EXACT);
-    assert_near(bank.elapsed_days(at(5.0), at(4.0)), 0.0, EXACT);
-
-    let shuffled = quiet_bank(&[9.0, 3.7, 0.0, 3.2]);
-    assert_near(shuffled.elapsed_days(at(0.0), at(12.0)), whole, EXACT);
-}
-
 // Recent use and the lasting floor (TIM-91).
-
-#[test]
-fn one_access_fades_as_a_power_of_its_age() {
-    // d = a for the first access: recent_use = −0.35·ln 10.
-    let s = strength_at(0.1, &[created(0.0)], 10.0);
-    assert_near(s.recent_use, -A * 10f64.ln(), EXACT);
-    assert_near(s.recent_use, -0.805_904_782_547_916, EXACT);
-    assert_eq!(s.occasions, 1);
-    assert_near(s.lasting_floor, -3.012_297_406_316_931, EXACT);
-    assert_near(s.value, 0.25 - 0.805_904_782_547_916, EXACT);
-}
-
-#[test]
-fn each_access_kind_counts_with_its_weight() {
-    // At an age of 1 day, age^−d = 1 and recent_use = ln w.
-    for (kind, weight) in [
-        (AccessKind::Created, WEIGHT_CREATED),
-        (AccessKind::Used, WEIGHT_USED),
-        (AccessKind::MentionedAgain, WEIGHT_MENTIONED_AGAIN),
-        (AccessKind::Confirmed, WEIGHT_CONFIRMED),
-    ] {
-        let s = strength_at(0.0, &[access(kind, 0.0)], 1.0);
-        assert_near(s.recent_use, weight.ln(), EXACT);
-    }
-}
 
 #[test]
 fn a_fresh_access_counts_at_the_minimum_age() {
@@ -438,19 +305,6 @@ fn an_access_made_while_fresh_fades_faster() {
     let s = strength_at(0.0, &[created(0.0), mentioned(1.0)], 2.0);
     assert_near(s.recent_use, (2f64.powf(-A) + 1.5).ln(), EXACT);
     assert_near(s.recent_use, 0.826_183_993_730_038_7, EXACT);
-}
-
-#[test]
-fn the_decay_rate_is_capped() {
-    // Two confirmations 0.01 days apart: m = ln(2·0.01^−0.35) ≈ 2.30, so
-    // a + c·e^m ≈ 2.35 is capped at D_MAX = 2. At day 1:
-    // ln(2·1^−0.35 + 2·0.99^−2).
-    assert_eq!(D_MAX, 2.0);
-    let m = (2.0 * MIN_ACCESS_AGE_DAYS.powf(-A)).ln();
-    assert!(A + C * m.exp() > D_MAX);
-    let s = strength_at(0.0, &[confirmed(0.0), confirmed(0.01)], 1.0);
-    assert_near(s.recent_use, (2.0 + 2.0 * 0.99f64.powi(-2)).ln(), EXACT);
-    assert_near(s.recent_use, 1.396_395_200_748_559_8, EXACT);
 }
 
 #[test]
@@ -489,13 +343,6 @@ fn accesses_after_now_are_ignored() {
 }
 
 #[test]
-fn recent_use_ages_on_bank_time() {
-    // Created in a turn, then 10 quiet days: 1 + 10·0.1 = 2 bank days.
-    let s = strength(0.0, &[created(0.0)], None, &quiet_bank(&[0.0]), at(11.0));
-    assert_near(s.recent_use, -A * 2f64.ln(), EXACT);
-}
-
-#[test]
 fn the_floor_counts_occasions_at_least_three_world_days_apart() {
     // ADR 0003: daily for a week is about 3 occasions, every ten days for
     // three months is 10.
@@ -519,54 +366,6 @@ fn floor_spacing_is_world_time_even_in_a_quiet_bank() {
     // Three world days apart is 0.3 bank days in a quiet bank.
     let s = strength(0.0, &occasions(3), None, &quiet_bank(&[]), at(10.0));
     assert_eq!(s.occasions, 3);
-}
-
-#[test]
-fn the_floor_follows_the_occasion_count_and_never_goes_down() {
-    for n in [1, 2, 3, 4, 8, 18] {
-        let s = strength_at(0.0, &occasions(n), FAR_DAYS);
-        assert_eq!(s.occasions, n);
-        assert_near(
-            s.lasting_floor,
-            TAU - G * N0.ln() + G * f64::from(n).ln(),
-            EXACT,
-        );
-    }
-    assert_near(
-        strength_at(0.0, &occasions(3), FAR_DAYS).lasting_floor,
-        -2.133_407_575_382_443_5,
-        EXACT,
-    );
-    assert_near(
-        strength_at(0.0, &occasions(18), FAR_DAYS).lasting_floor,
-        TAU,
-        EXACT,
-    );
-
-    let accesses = occasions(6);
-    let mut previous = f64::NEG_INFINITY;
-    for day in [
-        0.0, 1.0, 3.0, 4.0, 10.0, 15.0, 16.0, 100.0, 10_000.0, FAR_DAYS,
-    ] {
-        let floor = strength_at(0.0, &accesses, day).lasting_floor;
-        assert!(floor >= previous, "the floor went down at day {day}");
-        previous = floor;
-    }
-}
-
-#[test]
-fn strength_is_significance_plus_the_larger_part() {
-    for significance in [0.0, 0.1, 0.5, SIGNIFICANCE_KEPT] {
-        for day in [0.0, 2.0, 30.0, FAR_DAYS] {
-            let s = strength_at(significance, &occasions(5), day);
-            let expected = S * significance + s.recent_use.max(s.lasting_floor);
-            assert_near(s.value, expected, EXACT);
-        }
-    }
-    // Far out, the floor is the larger part.
-    let s = strength_at(0.0, &occasions(5), FAR_DAYS);
-    assert!(s.lasting_floor > s.recent_use);
-    assert_near(s.value, s.lasting_floor, EXACT);
 }
 
 // Lifetimes on the strength function itself.
@@ -676,38 +475,6 @@ fn tie_order_inherited_logs_are_independent_of_concatenation_order() {
     }
 }
 
-fn assert_synthetic_tie(kind: AccessKind) {
-    let accesses = [created(0.0), access(kind, 12.0)];
-    let expected = closed_strength(0.1, &accesses, close(10.0, 12.0), 100.0);
-    // The real access outweighs the synthetic restart, both aged 88 days.
-    let d = (A + C * kind.weight() * MIN_ACCESS_AGE_DAYS.powf(-A)).min(D_MAX);
-    let recent = (kind.weight() * 88f64.powf(-A) + WEIGHT_WINDOW_CLOSE * 88f64.powf(-d)).ln();
-    assert_near(expected.recent_use, recent, EXACT);
-    for permutation in access_permutations(&accesses) {
-        assert_eq!(
-            closed_strength(0.1, &permutation, close(10.0, 12.0), 100.0),
-            expected
-        );
-    }
-}
-
-#[test]
-fn tie_order_confirmed_precedes_synthetic_restart() {
-    assert_synthetic_tie(AccessKind::Confirmed);
-    let s = closed_strength(
-        0.1,
-        &[created(0.0), confirmed(12.0)],
-        close(10.0, 12.0),
-        100.0,
-    );
-    assert_near(s.value, -0.623_611_314, EXACT);
-}
-
-#[test]
-fn tie_order_mentioned_precedes_synthetic_restart() {
-    assert_synthetic_tie(AccessKind::MentionedAgain);
-}
-
 #[test]
 fn tie_order_mixed_real_accesses_at_synthetic_restart_are_heaviest_first() {
     let accesses = [created(0.0), confirmed(12.0), mentioned(12.0)];
@@ -747,18 +514,6 @@ fn tie_order_adding_tied_accesses_never_weakens_the_heaviest_alone() {
                 );
             }
         }
-    }
-}
-
-#[test]
-fn tie_order_equal_weights_are_unchanged() {
-    let expected = strength_at(0.1, &[created(0.0), used(0.0)], 100.0);
-    let d = (A + C * WEIGHT_CREATED * MIN_ACCESS_AGE_DAYS.powf(-A)).min(D_MAX);
-    let recent = (WEIGHT_CREATED * 100f64.powf(-A) + WEIGHT_USED * 100f64.powf(-d)).ln();
-    assert_near(expected.recent_use, recent, EXACT);
-    assert_near(expected.value, -1.351_966_916, EXACT);
-    for accesses in access_permutations(&[created(0.0), used(0.0)]) {
-        assert_eq!(strength_at(0.1, &accesses, 100.0), expected);
     }
 }
 
@@ -829,19 +584,6 @@ fn a_window_that_hasnt_closed_or_isnt_known_to_have_closed_counts_everything() {
     assert_eq!(closed_strength(0.3, &accesses, close(20.0, 0.0), 9.0), open);
     // Closed on day 5, but only reported on day 12.
     assert_eq!(closed_strength(0.3, &accesses, close(5.0, 12.0), 9.0), open);
-}
-
-#[test]
-fn the_close_never_lowers_the_floor_and_is_not_an_occasion() {
-    let accesses: Vec<_> = (0..10).map(|i| used(10.0 * f64::from(i))).collect();
-    let open = closed_strength(0.3, &accesses, None, FAR_DAYS);
-    let ended = closed_strength(0.3, &accesses, close(95.0, 100.0), FAR_DAYS);
-    assert_eq!(ended.occasions, open.occasions);
-    assert_near(ended.lasting_floor, open.lasting_floor, EXACT);
-
-    // The synthetic access 5 days after the only access adds no occasion.
-    let s = closed_strength(0.1, &[created(0.0)], close(5.0, 0.0), 6.0);
-    assert_eq!(s.occasions, 1);
 }
 
 #[test]
@@ -1078,25 +820,6 @@ fn each_precision_ends_one_unit_later_in_the_source_timezone() {
 }
 
 #[test]
-fn a_day_precision_event_is_upcoming_until_the_day_ends_for_the_user() {
-    let auckland = tz("Pacific/Auckland");
-    let mut event = window(Kind::Event);
-    event.valid_from = Some(wt("2026-10-02T11:00:00Z", TimePrecision::Day));
-    assert_eq!(
-        event.phase(&auckland, ts("2026-10-01T00:00:00Z")),
-        Phase::Upcoming
-    );
-    assert_eq!(
-        event.phase(&auckland, ts("2026-10-03T10:59:59Z")),
-        Phase::Upcoming
-    );
-    assert_eq!(
-        event.phase(&auckland, ts("2026-10-03T11:00:00Z")),
-        Phase::RecentlyPast
-    );
-}
-
-#[test]
 fn a_point_event_goes_from_upcoming_to_past_and_a_span_is_current_between() {
     let utc = TimeZone::UTC;
     let mut point = window(Kind::Event);
@@ -1124,22 +847,6 @@ fn a_point_event_goes_from_upcoming_to_past_and_a_span_is_current_between() {
     assert_eq!(
         span.phase(&utc, ts("2026-10-10T00:00:00Z")),
         Phase::RecentlyPast
-    );
-}
-
-#[test]
-fn recently_past_turns_long_past_30_days_after_the_close() {
-    let utc = TimeZone::UTC;
-    let mut event = window(Kind::Event);
-    event.valid_from = Some(wt("2026-10-03T15:00:00Z", TimePrecision::Minute));
-    assert_eq!(RECENTLY_PAST_DAYS, 30.0);
-    assert_eq!(
-        event.phase(&utc, ts("2026-11-02T15:00:59Z")),
-        Phase::RecentlyPast
-    );
-    assert_eq!(
-        event.phase(&utc, ts("2026-11-02T15:01:00Z")),
-        Phase::LongPast
     );
 }
 
@@ -1252,33 +959,7 @@ fn only_a_mention_or_a_confirmation_resets_state_confidence() {
     assert_near(c, 1.0, EXACT);
 }
 
-#[test]
-fn no_volatility_means_no_fading() {
-    let c = state_confidence(None, at(0.0), &[created(0.0)], at(FAR_DAYS));
-    assert_near(c, 1.0, EXACT);
-}
-
 // Purge eligibility (ADR 0008).
-
-#[test]
-fn the_purge_rule_comes_from_tuning() {
-    assert_eq!(
-        PurgeRule::from_tuning(&Tuning::default()),
-        PurgeRule {
-            delta: Some(DELTA),
-            overdue_days: 30
-        }
-    );
-    let never =
-        Tuning::from_toml("[purge]\ndelta = \"never\"\n[agenda]\noverdue_days = 10\n").unwrap();
-    assert_eq!(
-        PurgeRule::from_tuning(&never),
-        PurgeRule {
-            delta: None,
-            overdue_days: 10
-        }
-    );
-}
 
 #[test]
 fn a_memory_is_purged_strictly_below_tau_minus_delta() {

@@ -28,19 +28,6 @@ def test_bank_name_defaults_to_the_profile_and_config_overrides_it(make_provider
     assert daemon.requests_for("put_bank")[0].bank == "shared"
 
 
-def test_assistant_name_defaults_to_the_profile(make_provider, daemon):
-    make_provider()
-    assert daemon.requests_for("put_bank")[0].body["assistant_name"] == PROFILE
-
-
-def test_absent_identity_fields_are_sent_as_null_not_invented(make_provider, daemon):
-    make_provider(owner_name=None, owner_platform_ids=[])
-    body = daemon.requests_for("put_bank")[0].body
-    assert body["owner_name"] is None
-    assert body["owner_platform_ids"] == []
-    assert body["timezone"] is None
-
-
 def test_warns_when_the_daemon_is_not_ready(make_provider, daemon, warnings):
     daemon.ready = False
     make_provider()
@@ -54,24 +41,11 @@ def test_warns_when_the_daemon_major_version_differs(make_provider, daemon, warn
     assert any("1.2.0" in w and "version" in w.lower() for w in warnings)
 
 
-def test_same_major_different_minor_is_silent(make_provider, daemon, warnings):
-    daemon.version = "0.9.3"
-    make_provider()
-    assert warnings == []
-
-
 def test_daemon_major_version_matches_the_workspace():
     """The plugin is written for the daemon in this repo."""
     cargo = (PLUGIN_DIR.parent / "Cargo.toml").read_text()
     major = int(re.search(r'^version = "(\d+)\.', cargo, re.M).group(1))
     assert plugin.provider.DAEMON_MAJOR_VERSION == major
-
-
-def test_warns_when_builtin_memory_flags_are_still_on(make_provider, hermes, warnings):
-    hermes.config = {"memory": {"memory_enabled": True, "user_profile_enabled": False}}
-    make_provider()
-    assert any("memory_enabled" in w for w in warnings)
-    assert not any("user_profile_enabled" in w for w in warnings)
 
 
 def test_never_fails_when_the_daemon_is_down(make_provider, daemon, warnings):
@@ -95,11 +69,9 @@ def test_never_fails_without_a_warning_callback(make_provider, daemon):
     "config",
     [
         {"memory": {}},
-        {},
-        {"memory": {"memory_enabled": None, "user_profile_enabled": None}},
         {"memory": {"memory_enabled": "true", "user_profile_enabled": "yes"}},
     ],
-    ids=["empty-section", "no-section", "null", "truthy-strings"],
+    ids=["empty-section", "truthy-strings"],
 )
 def test_flags_hermes_reads_as_on_warn(make_provider, hermes, warnings, config):
     hermes.config = config

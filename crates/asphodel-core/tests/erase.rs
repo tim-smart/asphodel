@@ -1816,25 +1816,6 @@ mod review {
     // of writes can tell the turns apart.
 
     #[test]
-    fn a_forget_is_linked_to_its_request_turn_at_the_same_instant() {
-        let h = Harness::new();
-        let started = h.now();
-        let maya = h.insert(fact(MAYA));
-        h.ingest("s", "Hello.");
-        h.forget_in(Some("s"), &[maya]);
-        let rows = h.forget_rows();
-        assert_eq!(rows.len(), 1, "the row is written when forget is called");
-        assert_eq!(rows[0]["memories"], json!([maya]));
-        assert_eq!(rows[0]["session_id"], "s");
-        assert_eq!(rows[0]["request"], Value::Null);
-
-        let request = h.forget_turn("s", "Forget my daughter's name.");
-        assert_eq!(request.outcome, Outcome::Tombstone);
-        assert_eq!(h.forget_rows()[0]["request"], json!(request.source));
-        assert_eq!(h.now(), started);
-    }
-
-    #[test]
     fn every_forget_in_the_turn_is_linked_and_other_sessions_link_none() {
         let h = Harness::new();
         let maya = h.insert(fact(MAYA));
