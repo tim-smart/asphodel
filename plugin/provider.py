@@ -308,8 +308,12 @@ class AsphodelMemoryProvider(MemoryProvider):
             block = None
             for attempt in range(1 + max(0, self.timeouts.system_prompt_retries)):
                 try:
+                    deadline = time.monotonic() + self.timeouts.system_prompt
                     self._ensure_bank(self.timeouts.system_prompt)
-                    block = self.client.system_prompt(self.bank, session, timeout=self.timeouts.system_prompt)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise DaemonUnavailable("system prompt budget exhausted")
+                    block = self.client.system_prompt(self.bank, session, timeout=remaining)
                     break
                 except DaemonUnavailable as error:
                     log.debug("system prompt attempt %d: daemon unreachable (%s)", attempt + 1, error)
@@ -337,6 +341,7 @@ class AsphodelMemoryProvider(MemoryProvider):
         for ``recall_status``. "" on any failure."""
         self._last_injected = 0
         try:
+            deadline = time.monotonic() + self.timeouts.prefetch
             if self.client is None or not self.bank:
                 return ""
             session = session_id or self._session_id
@@ -350,8 +355,14 @@ class AsphodelMemoryProvider(MemoryProvider):
             if block_id:
                 request["block_id"] = block_id
             log.log(TRACE, "prefetch query: %s", query)
-            self._ensure_bank(self.timeouts.prefetch)
-            result = self.client.prefetch(self.bank, request, timeout=self.timeouts.prefetch)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DaemonUnavailable("prefetch budget exhausted")
+            self._ensure_bank(remaining)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DaemonUnavailable("prefetch budget exhausted")
+            result = self.client.prefetch(self.bank, request, timeout=remaining)
         except DaemonUnavailable as error:
             log.warning("prefetch: daemon unreachable (%s)", error)
             return ""
