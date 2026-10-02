@@ -40,6 +40,36 @@ mod input;
 mod prompt;
 mod reconcile;
 
+#[cfg(test)]
+mod gap_tests;
+
+/// A test's hook into [`commit_prepared`] at the last moment before the
+/// commit takes the store for its writes: whatever it does to the store,
+/// the commit must see (TIM-117 review, the lock gap). Test builds only.
+#[cfg(test)]
+pub(crate) mod gap {
+    use std::cell::RefCell;
+
+    use crate::store::Store;
+
+    type Hook = Box<dyn FnOnce(&Store)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `hook` once, at the next commit on this thread.
+    pub(crate) fn set(hook: impl FnOnce(&Store) + 'static) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run(store: &Store) {
+        if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(store);
+        }
+    }
+}
+
 use jiff::Timestamp;
 use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
@@ -685,6 +715,10 @@ pub(crate) fn prepare(
 /// that went between the halves, purged or forgotten, is planned without:
 /// call 2's labels on it are dropped, so a claim that would have ended,
 /// refined or restated it is new instead, as if it had never been stored.
+///
+/// The check, the replanning and the writes share one hold on the store
+/// and one transaction, so a sweep or an erase on another thread can't
+/// delete a neighbour between the check and the writes (TIM-117 review).
 pub(crate) fn commit_prepared(
     store: &Store,
     leases: &Leases,
@@ -698,52 +732,43 @@ pub(crate) fn commit_prepared(
         vectors,
         search,
         labels,
-        mut plan,
+        plan,
     } = prepared;
     queue::check_held(leases, &lease)?;
-    if let Some(search) = &search {
-        let gone = vanished(store, &search.neighbours)?;
-        if !gone.is_empty() {
-            let gone_handles: std::collections::BTreeSet<&str> = search
-                .input
-                .neighbours
-                .iter()
-                .zip(&search.neighbours)
-                .filter(|(_, neighbour)| gone.contains(&neighbour.id))
-                .map(|(shown, _)| shown.handle.as_str())
-                .collect();
-            let kept: Vec<call2::ClaimLabels> = labels
-                .iter()
-                .map(|(claim, claim_labels)| {
-                    let still: Vec<_> = claim_labels
-                        .iter()
-                        .filter(|(neighbour, _)| !gone_handles.contains(neighbour.as_str()))
-                        .cloned()
-                        .collect();
-                    (claim.clone(), still)
-                })
-                .collect();
-            tracing::info!(
-                chunk = %input.chunk,
-                neighbours = gone.len(),
-                "neighbours went between call 2 and the commit; their labels are dropped"
-            );
-            plan = reconcile::plan(search, &input, &unit, &checked, &kept);
-        }
-    }
 
-    let neighbours = search.as_ref().map(|search| search.neighbours.as_slice());
-    match commit::commit(
-        store,
-        &lease,
-        &input,
-        &unit,
-        &checked,
-        &vectors,
-        &plan,
-        neighbours.unwrap_or_default(),
-    ) {
-        Ok(extracted) => {
+    // The last moment before the commit takes the store, where a test can
+    // change it (TIM-117 review, the lock gap).
+    #[cfg(test)]
+    gap::run(store);
+
+    let committed = {
+        let mut conn = store.connection();
+        (|| -> Result<(Extracted, reconcile::Plan), StoreError> {
+            let tx = conn.transaction()?;
+            let plan = match &search {
+                Some(search) => {
+                    without_vanished(&tx, search, &input, &unit, &checked, &labels)?.unwrap_or(plan)
+                }
+                None => plan,
+            };
+            let neighbours = search.as_ref().map(|search| search.neighbours.as_slice());
+            let extracted = commit::commit(
+                &tx,
+                store,
+                &lease,
+                &input,
+                &unit,
+                &checked,
+                &vectors,
+                &plan,
+                neighbours.unwrap_or_default(),
+            )?;
+            tx.commit()?;
+            Ok((extracted, plan))
+        })()
+    };
+    match committed {
+        Ok((extracted, plan)) => {
             tracing::info!(
                 chunk = %extracted.chunk,
                 memories = extracted.memories.len(),
@@ -759,16 +784,61 @@ pub(crate) fn commit_prepared(
         }
         Err(error) => {
             // A commit that fails every time must still reach the retry cap
-            // rather than hold the bank's queue for ever.
+            // rather than hold the bank's queue for ever. The store's hold
+            // was released above, so the failure can be counted.
             let failure = queue::fail(store, leases, lease, COMMIT)?;
             Err(ExtractError::Commit { error, failure })
         }
     }
 }
 
+/// The plan again without call 2's labels on neighbours that are no longer
+/// in the store, read through the commit's transaction; `None` when every
+/// neighbour is still there.
+fn without_vanished(
+    conn: &rusqlite::Connection,
+    search: &reconcile::Search,
+    input: &Call1Input,
+    unit: &input::Unit,
+    checked: &claims::Checked,
+    labels: &[call2::ClaimLabels],
+) -> Result<Option<reconcile::Plan>, StoreError> {
+    let gone = vanished(conn, &search.neighbours)?;
+    if gone.is_empty() {
+        return Ok(None);
+    }
+    let gone_handles: std::collections::BTreeSet<&str> = search
+        .input
+        .neighbours
+        .iter()
+        .zip(&search.neighbours)
+        .filter(|(_, neighbour)| gone.contains(&neighbour.id))
+        .map(|(shown, _)| shown.handle.as_str())
+        .collect();
+    let kept: Vec<call2::ClaimLabels> = labels
+        .iter()
+        .map(|(claim, claim_labels)| {
+            let still: Vec<_> = claim_labels
+                .iter()
+                .filter(|(neighbour, _)| !gone_handles.contains(neighbour.as_str()))
+                .cloned()
+                .collect();
+            (claim.clone(), still)
+        })
+        .collect();
+    tracing::info!(
+        chunk = %input.chunk,
+        neighbours = gone.len(),
+        "neighbours went between call 2 and the commit; their labels are dropped"
+    );
+    Ok(Some(reconcile::plan(search, input, unit, checked, &kept)))
+}
+
 /// The ids among `neighbours` that are no longer in the store.
-fn vanished(store: &Store, neighbours: &[reconcile::Neighbour]) -> Result<Vec<i64>, StoreError> {
-    let conn = store.connection();
+fn vanished(
+    conn: &rusqlite::Connection,
+    neighbours: &[reconcile::Neighbour],
+) -> Result<Vec<i64>, StoreError> {
     let mut statement = conn.prepare("SELECT 1 FROM memories WHERE id = ?1")?;
     let mut gone = Vec::new();
     for neighbour in neighbours {

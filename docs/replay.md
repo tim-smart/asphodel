@@ -269,7 +269,10 @@ A probe naming a label no claim defines is refused before the run.
   production's worker does when it claims, and commits that chunk a
   latency later. A neighbour that a sweep purged in between is planned
   without: call 2's labels on it are dropped, so a claim that would have
-  ended, refined or restated it commits as new. At the completion the
+  ended, refined or restated it commits as new. The check runs inside the
+  commit's transaction, under the same hold on the store as its writes,
+  so in `serve`, where the sweep and erases run on another thread, a
+  neighbour can't go between the check and the writes either. At the completion the
   worker also prepares and commits the same source's next chunks, for as
   long as each is the queue's head. Once another source is at the head, for example a
   turn synced in the meantime, the worker claims that instead. The rest

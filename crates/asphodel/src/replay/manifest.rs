@@ -93,8 +93,13 @@ pub fn load(path: &Path) -> anyhow::Result<Manifest> {
         .with_context(|| format!("reading the manifest {}", path.display()))?;
     let manifest: Manifest =
         toml::from_str(&text).map_err(|error| super::toml_error(path, &text, &error))?;
-    TimeZone::get(&manifest.timezone)
-        .with_context(|| format!("the manifest's timezone {:?}", manifest.timezone))?;
+    // The zone names a place, and the lookup's error repeats it, so only
+    // `trace` sees either: nothing in the manifest leaves except into the
+    // corpus header.
+    TimeZone::get(&manifest.timezone).map_err(|error| {
+        tracing::trace!(%error, "the manifest's timezone isn't known");
+        anyhow::anyhow!("the manifest's timezone isn't one this build knows")
+    })?;
     if manifest.bank.is_empty() {
         bail!("the manifest's bank name is empty");
     }
@@ -116,7 +121,7 @@ pub fn load(path: &Path) -> anyhow::Result<Manifest> {
             bail!("a manifest model has an empty name or question");
         }
         if !models.insert(model.name.as_str()) {
-            bail!("the manifest lists the model {:?} twice", model.name);
+            bail!("the manifest lists one model's name twice");
         }
     }
     if let Some(block) = &manifest.memory_block

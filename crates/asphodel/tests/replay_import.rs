@@ -863,3 +863,41 @@ fn import_inputs_outside_the_private_dir_are_refused() {
         );
     }
 }
+
+/// TIM-117 re-review, blocker 1: a manifest that parses but repeats a
+/// model's name is refused without naming it. A model name is the
+/// manifest's, and nothing in the manifest leaves except into the corpus
+/// header.
+#[test]
+fn a_duplicate_manifest_model_is_refused_without_naming_it() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    hermes::small_history(&state_db);
+    let sentinel = "SENTINEL-MODEL-NAME-6b3";
+    let model = format!(
+        "\n[[model]]\nname = \"{sentinel}\"\nquestion = \"Where does the user live?\"\nmax_tokens = 100\n"
+    );
+    let text = format!("{}{model}{model}", hermes::MANIFEST);
+    let corpus = dir.private_path("corpus/main.jsonl");
+    let output = import_with(&dir, &state_db, &corpus, &text, &[]);
+    assert_refused_without(&output, sentinel, &["model"]);
+    assert!(!corpus.exists());
+}
+
+/// The same for a timezone that isn't one: refused without echoing it.
+#[test]
+fn an_unknown_manifest_timezone_is_refused_without_naming_it() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    hermes::small_history(&state_db);
+    let sentinel = "SENTINEL/Zone-0d8";
+    let text = hermes::MANIFEST.replace(
+        "timezone = \"Pacific/Auckland\"",
+        &format!("timezone = \"{sentinel}\""),
+    );
+    assert!(text.contains(sentinel), "the fixture replaced the timezone");
+    let corpus = dir.private_path("corpus/main.jsonl");
+    let output = import_with(&dir, &state_db, &corpus, &text, &[]);
+    assert_refused_without(&output, sentinel, &["timezone"]);
+    assert!(!corpus.exists());
+}

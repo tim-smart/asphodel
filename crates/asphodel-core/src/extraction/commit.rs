@@ -28,6 +28,7 @@ struct Written {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn commit(
+    tx: &Transaction<'_>,
     store: &Store,
     lease: &Lease,
     input: &Call1Input,
@@ -38,10 +39,7 @@ pub(super) fn commit(
     neighbours: &[Neighbour],
 ) -> Result<Extracted, StoreError> {
     let now = store.now();
-    let mut conn = store.connection();
-    let tx = conn.transaction()?;
-
-    let (proposed, entities_created) = resolve_proposals(&tx, store, lease, unit, checked, plan)?;
+    let (proposed, entities_created) = resolve_proposals(tx, store, lease, unit, checked, plan)?;
 
     let mut memories = Vec::with_capacity(checked.memories.len());
     let mut written: BTreeMap<usize, Written> = BTreeMap::new();
@@ -68,7 +66,7 @@ pub(super) fn commit(
             lease.source,
             &format!("{}:{}", lease.position, memory.claim),
         );
-        let memory_id = insert_memory(&tx, store, unit, input, memory, uuid, ended)?;
+        let memory_id = insert_memory(tx, store, unit, input, memory, uuid, ended)?;
         written.insert(
             index,
             Written {
@@ -85,17 +83,17 @@ pub(super) fn commit(
         // here.
         store
             .vectors()
-            .upsert(&tx, unit.bank_id, memory_id, vector)
+            .upsert(tx, unit.bank_id, memory_id, vector)
             .map_err(|error| match error {
                 VectorError::Sqlite(error) => StoreError::Sqlite(error),
                 other => {
                     StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(other)))
                 }
             })?;
-        link_entities(&tx, store, unit, memory_id, &memory.links, &proposed)?;
+        link_entities(tx, store, unit, memory_id, &memory.links, &proposed)?;
         // TIM-92: the created access carries the source's ingested_at, never
         // the time extraction ran.
-        insert_access(&tx, unit, memory_id, "created")?;
+        insert_access(tx, unit, memory_id, "created")?;
         memories.push(uuid);
     }
 
@@ -103,7 +101,7 @@ pub(super) fn commit(
     for &(index, neighbour, edit) in &plan.edits {
         let by = &written[&index];
         match edit {
-            Edit::Ends => end(&tx, store, unit, neighbour, by.id, by.end, EDIT_ENDED)?,
+            Edit::Ends => end(tx, store, unit, neighbour, by.id, by.end, EDIT_ENDED)?,
             Edit::Retracts | Edit::Denies => {
                 tx.execute(
                     "UPDATE memories SET invalidated_at = ?2, superseded_by = ?3, updated_at = ?4
@@ -111,7 +109,7 @@ pub(super) fn commit(
                     (neighbour, micros(input.observed_at), by.id, micros(now)),
                 )?;
                 log_memory_edit(
-                    &tx,
+                    tx,
                     store,
                     unit.bank_id,
                     EDIT_RETRACTED,
@@ -123,7 +121,7 @@ pub(super) fn commit(
                         edit == Edit::Denies
                     ),
                 )?;
-                reopen(&tx, store, unit, neighbour, by, edit == Edit::Denies)?;
+                reopen(tx, store, unit, neighbour, by, edit == Edit::Denies)?;
             }
             Edit::Refines => {
                 tx.execute(
@@ -131,14 +129,14 @@ pub(super) fn commit(
                     (neighbour, by.id, micros(now)),
                 )?;
                 log_memory_edit(
-                    &tx,
+                    tx,
                     store,
                     unit.bank_id,
                     EDIT_REFINED,
                     neighbour,
                     &format!("{{\"superseded_by\":{}}}", by.id),
                 )?;
-                reopen(&tx, store, unit, neighbour, by, false)?;
+                reopen(tx, store, unit, neighbour, by, false)?;
                 // TIM-95 decision 6: a citation of a refined memory moves to
                 // the head of its chain, where its accesses are inherited.
                 tx.execute(
@@ -171,10 +169,10 @@ pub(super) fn commit(
     }
 
     for (&neighbour, &label) in &plan.accesses {
-        insert_access(&tx, unit, neighbour, label.as_str())?;
+        insert_access(tx, unit, neighbour, label.as_str())?;
     }
     for (&neighbour, spans) in &plan.mention_spans {
-        record_passages(&tx, unit, neighbour, spans)?;
+        record_passages(tx, unit, neighbour, spans)?;
     }
     for (&neighbour, &significance) in &plan.raises {
         let raised = tx.execute(
@@ -184,7 +182,7 @@ pub(super) fn commit(
         )?;
         if raised > 0 {
             log_memory_edit(
-                &tx,
+                tx,
                 store,
                 unit.bank_id,
                 EDIT_SIGNIFICANCE_RAISED,
@@ -204,7 +202,7 @@ pub(super) fn commit(
             (neighbour, micros(now)),
         )?;
         if kept > 0 {
-            log_memory_edit(&tx, store, unit.bank_id, EDIT_KEPT, neighbour, "{}")?;
+            log_memory_edit(tx, store, unit.bank_id, EDIT_KEPT, neighbour, "{}")?;
         }
     }
 
@@ -212,11 +210,10 @@ pub(super) fn commit(
     // strongest (TIM-90). `used` weighs least, so an access already in this
     // turn always stays.
     for (memory_id, _) in &checked.used {
-        insert_access(&tx, unit, *memory_id, "used")?;
+        insert_access(tx, unit, *memory_id, "used")?;
     }
 
-    queue::finish(&tx, now, lease)?;
-    tx.commit()?;
+    queue::finish(tx, now, lease)?;
 
     Ok(Extracted {
         chunk: input.chunk,
