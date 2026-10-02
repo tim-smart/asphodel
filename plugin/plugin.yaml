@@ -1,0 +1,7 @@
+name: asphodel
+version: 0.1.0
+description: "Asphodel: brain-like memory for Hermes. A thin client of the Asphodel daemon (ADR 0006)."
+# The plugin has no Python dependencies: it talks HTTP/JSON to the daemon with
+# the standard library only, so it survives Hermes updates in $HERMES_HOME/plugins.
+pip_dependencies: []
+requires_env: []
