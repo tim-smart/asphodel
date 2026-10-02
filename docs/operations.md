@@ -299,7 +299,9 @@ the right checksum and resumes after a failure (`docs/models.md`).
 
 `asphodel import`, `replay`, `report` and `bench` belong to the replay
 harness, which runs on its own store under `ASPHODEL_REPLAY_DIR` and never
-touches a `serve` data dir. `docs/replay.md` covers them.
+touches a `serve` data dir. `docs/replay.md` covers them, and
+`docs/hermes-data-evaluation.md` walks through an evaluation on real
+history.
 
 ## Backup
 

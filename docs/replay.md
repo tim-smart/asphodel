@@ -391,6 +391,9 @@ workspaces tree.
 A `live` run sends the history to the LLM endpoint `--config` names, as
 production already does. A hosted endpoint sees it.
 
+`docs/hermes-data-evaluation.md` is the step-by-step handoff for running
+this on Tim's history, with what to measure and how to report it.
+
 Errors hold no content (ADR 0010, "Logging"). A manifest, probes file,
 corpus or cassette that doesn't parse is named with the line and column,
 never quoted; a probe whose regex doesn't compile is named by its id, not
