@@ -842,7 +842,8 @@ pub struct ImportArgs {
     #[arg(long)]
     pub state_db: PathBuf,
 
-    /// The private manifest: timezone, owner, assistant and speakers.
+    /// The private manifest: timezone, owner, assistant, speakers and the
+    /// mental models to replay with.
     #[arg(long)]
     pub manifest: PathBuf,
 
@@ -850,25 +851,9 @@ pub struct ImportArgs {
     #[arg(long)]
     pub out: Option<PathBuf>,
 
-    /// What to do with rows that have `active=0` and `compacted=0`: the
-    /// verbatim tail a compaction carried forward, or turns a rewind
-    /// discarded. Required when the history has any; the choice is still
-    /// open on TIM-117.
-    #[arg(long, value_enum)]
-    pub inactive_rows: Option<InactiveRows>,
-
     /// Check the history and print the counts, writing nothing.
     #[arg(long)]
     pub dry_run: bool,
-}
-
-/// How `asphodel import` treats `active=0, compacted=0` rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum InactiveRows {
-    /// Leave them out.
-    Skip,
-    /// Replay them like any other row.
-    Replay,
 }
 
 #[derive(Debug, Subcommand)]

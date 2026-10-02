@@ -153,6 +153,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         )?
         .with_reranker_deadline(NO_DEADLINE);
         service.ensure_bank_with_models(&header.bank, &identity)?;
+        super::create_models(&service, &header.bank, &header.models)?;
         let recorder = Recorder::open(
             &cassette_path,
             mode,

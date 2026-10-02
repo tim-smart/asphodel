@@ -106,7 +106,19 @@ pub fn assert_refused(output: &Output, word: &str) {
 /// `asphodel import` of `state_db` with the test manifest, the corpus to
 /// `out` under the private dir.
 pub fn import(dir: &TestDir, state_db: &Path, out: &Path) -> Output {
-    let manifest = dir.private_file("manifest.toml", hermes::MANIFEST);
+    import_with(dir, state_db, out, hermes::MANIFEST, &[])
+}
+
+/// `asphodel import` with `manifest` as the manifest's text and `extra`
+/// after the other flags.
+pub fn import_with(
+    dir: &TestDir,
+    state_db: &Path,
+    out: &Path,
+    manifest: &str,
+    extra: &[&str],
+) -> Output {
+    let manifest = dir.private_file("manifest.toml", manifest);
     asphodel(dir)
         .arg("import")
         .arg("--state-db")
@@ -115,6 +127,7 @@ pub fn import(dir: &TestDir, state_db: &Path, out: &Path) -> Output {
         .arg(manifest)
         .arg("--out")
         .arg(out)
+        .args(extra)
         .output()
         .unwrap()
 }
@@ -159,6 +172,27 @@ pub fn live_script(dir: &TestDir) -> PathBuf {
     let path = dir.path("llm-script.json");
     fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
     path
+}
+
+/// A script for the `judge_used` top-up (TIM-96, decision 4): every step
+/// judges that the reply relied on nothing.
+pub fn judge_script(dir: &TestDir) -> PathBuf {
+    let steps: Vec<Value> = (0..32)
+        .map(|_| json!({ "reply": { "used": [] } }))
+        .collect();
+    let path = dir.path("judge-script.json");
+    fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
+    path
+}
+
+/// The cassette's records, in file order.
+pub fn cassette_records(dir: &TestDir) -> Vec<Value> {
+    fs::read_to_string(dir.private_path("cassettes/main.jsonl"))
+        .expect("a cassette was recorded")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("every cassette line is JSON"))
+        .collect()
 }
 
 /// Real-history probes (TIM-96, decision 5): opaque ids, memories matched

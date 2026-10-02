@@ -93,8 +93,10 @@ pub struct BankSection {
 
 /// A mental model to create before the run. The scripted LLM answers its
 /// refreshes with no edits, so its entries stay empty; the schedule, the
-/// triggers and the calls per day are what a scenario can watch.
-#[derive(Debug, Deserialize)]
+/// triggers and the calls per day are what a scenario can watch. A
+/// real-history manifest's `[[model]]` has the same shape, and the corpus
+/// header carries it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSection {
     pub name: String,

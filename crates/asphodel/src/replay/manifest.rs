@@ -1,13 +1,18 @@
 //! The private manifest (TIM-96, decision 1): what `state.db` doesn't hold.
 //! The timezone, the owner's platform ids, the owner's and assistant's
-//! names, and the names of the other speakers. It lives under the private
-//! dir and nothing in it is ever written anywhere but the corpus header.
+//! names, and the names of the other speakers. Its `[[model]]` tables,
+//! in a scenario's shape, are the mental models a corpus run creates
+//! before the first event, since `state.db` holds none. It lives under the
+//! private dir and nothing in it is ever written anywhere but the corpus
+//! header.
 
 use std::path::Path;
 
 use anyhow::{Context as _, bail};
 use jiff::tz::TimeZone;
 use serde::Deserialize;
+
+use super::scenario::ModelSection;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +33,9 @@ pub struct Manifest {
     /// Defaults to `<memory-context>` and `</memory-context>`.
     #[serde(default)]
     pub memory_block: Option<MemoryBlock>,
+    /// The mental models to create in the bank before the first event.
+    #[serde(default, rename = "model")]
+    pub models: Vec<ModelSection>,
 }
 
 fn default_bank() -> String {
@@ -103,6 +111,15 @@ pub fn load(path: &Path) -> anyhow::Result<Manifest> {
                 "the manifest lists the owner {:?} as a speaker too",
                 speaker.name
             );
+        }
+    }
+    let mut models = std::collections::BTreeSet::new();
+    for model in &manifest.models {
+        if model.name.trim().is_empty() || model.question.trim().is_empty() {
+            bail!("a manifest model has an empty name or question");
+        }
+        if !models.insert(model.name.as_str()) {
+            bail!("the manifest lists the model {:?} twice", model.name);
         }
     }
     if let Some(block) = &manifest.memory_block

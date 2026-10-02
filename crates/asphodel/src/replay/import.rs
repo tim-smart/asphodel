@@ -5,17 +5,18 @@
 //! written against and fails loudly on a mismatch, and never selects the
 //! system prompt or `api_content` (decision 8). Each turn becomes a
 //! prefetch at the user message's time and a `sync_turn` at the final
-//! assistant reply's time, with tool rows skipped. Compacted turns
-//! (`active=0, compacted=1`) are replayed, a clear is emitted where the
-//! compacted run ends, and Hermes' summary row (`_compressed_summary=1`)
-//! is skipped. Cron sessions get prefetch only, and subagent sessions
-//! (`parent_session_id` set) are skipped.
+//! assistant reply's time, with tool rows skipped.
 //!
-//! Rows with `active=0, compacted=0` are what a compaction carried forward
-//! verbatim or a rewind discarded. Whether they replay is Tim's decision,
-//! still open on TIM-117: the import refuses a history that has them until
-//! `--inactive-rows skip|replay` says, so neither reading is silently
-//! chosen.
+//! Only rows with `active = 1 OR compacted = 1` are read, the predicate
+//! Hermes uses for search, in timestamp order (Tim's decision on TIM-117).
+//! So compacted turns replay, while rows with `active=0, compacted=0` (the
+//! originals of a tail a compaction carried forward, which have a live
+//! clone, and turns a rewind discarded) never do. Carried-tail clones keep
+//! their original timestamps under later ids, so timestamp order replays
+//! them when they were said. Hermes' summary row (`_compressed_summary=1`)
+//! is skipped, and a clear is emitted at its time. Cron sessions get
+//! prefetch only, and subagent sessions (`parent_session_id` set) are
+//! skipped.
 
 use std::path::Path;
 
@@ -29,33 +30,39 @@ use super::corpus::{self, Counts, Event, Header, Owner};
 use super::manifest::{Manifest, MemoryBlock};
 use super::scenario::Author;
 use super::timeline::SessionClass;
-use crate::cli::{ImportArgs, InactiveRows};
+use crate::cli::ImportArgs;
 
 /// The Hermes schema versions the importer was written against. A
 /// `state.db` at any other version is refused rather than guessed at.
 pub const HERMES_SCHEMA_VERSIONS: [i64; 1] = [31];
 
-/// The columns the importer reads, and nothing else, per table.
-const REQUIRED_COLUMNS: [(&str, &[&str]); 3] = [
+/// The columns the importer reads, and nothing else, per table, with the
+/// type each is declared with in Hermes' DDL.
+const REQUIRED_COLUMNS: [(&str, &[(&str, &str)]); 3] = [
     (
         "sessions",
-        &["id", "source", "parent_session_id", "started_at"],
+        &[
+            ("id", "TEXT"),
+            ("source", "TEXT"),
+            ("parent_session_id", "TEXT"),
+            ("started_at", "REAL"),
+        ],
     ),
     (
         "messages",
         &[
-            "id",
-            "session_id",
-            "role",
-            "content",
-            "timestamp",
-            "active",
-            "compacted",
-            "_compressed_summary",
-            "tool_calls",
+            ("id", "INTEGER"),
+            ("session_id", "TEXT"),
+            ("role", "TEXT"),
+            ("content", "TEXT"),
+            ("timestamp", "REAL"),
+            ("active", "INTEGER"),
+            ("compacted", "INTEGER"),
+            ("_compressed_summary", "INTEGER"),
+            ("tool_calls", "TEXT"),
         ],
     ),
-    ("schema_version", &["version"]),
+    ("schema_version", &[("version", "INTEGER")]),
 ];
 
 /// The gateway puts a channel's recent history and this marker in front of
@@ -103,7 +110,7 @@ fn execute(args: &ImportArgs) -> anyhow::Result<()> {
 
     let conn = open_read_only(&args.state_db)?;
     let schema_version = check_schema(&conn, &args.state_db)?;
-    let (header, events, counts) = import(&conn, &manifest, schema_version, args.inactive_rows)?;
+    let (header, events, counts) = import(&conn, &manifest, schema_version)?;
     if args.dry_run {
         println!("{}", serde_json::to_string_pretty(&counts)?);
         return Ok(());
@@ -128,27 +135,34 @@ fn open_read_only(path: &Path) -> anyhow::Result<Connection> {
 }
 
 /// The schema the importer was written against (TIM-117): every column it
-/// reads must be there, and the schema version must be one it knows.
-/// Everything wrong is listed at once.
+/// reads must be there with the type it was declared with, and the schema
+/// version must be one it knows. Everything wrong is listed at once.
 fn check_schema(conn: &Connection, path: &Path) -> anyhow::Result<i64> {
     let mut problems = Vec::new();
     for (table, columns) in REQUIRED_COLUMNS {
-        let present: Vec<String> = match conn.prepare(&format!("PRAGMA table_info({table})")) {
-            Ok(mut statement) => statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<_, _>>()?,
-            Err(error) => {
-                problems.push(format!("the table {table} can't be read: {error}"));
-                continue;
-            }
-        };
+        let present: Vec<(String, String)> =
+            match conn.prepare(&format!("PRAGMA table_info({table})")) {
+                Ok(mut statement) => statement
+                    .query_map([], |row| Ok((row.get(1)?, row.get(2)?)))?
+                    .collect::<Result<_, _>>()?,
+                Err(error) => {
+                    problems.push(format!("the table {table} can't be read: {error}"));
+                    continue;
+                }
+            };
         if present.is_empty() {
             problems.push(format!("the table {table} is missing"));
             continue;
         }
-        for column in columns {
-            if !present.iter().any(|name| name == column) {
-                problems.push(format!("the column {table}.{column} is missing"));
+        for (column, declared) in columns {
+            match present.iter().find(|(name, _)| name == column) {
+                None => problems.push(format!("the column {table}.{column} is missing")),
+                Some((_, found)) if !found.eq_ignore_ascii_case(declared) => {
+                    problems.push(format!(
+                        "the column {table}.{column} is declared {found:?}; the importer was written against {declared}"
+                    ));
+                }
+                Some(_) => {}
             }
         }
     }
@@ -199,8 +213,6 @@ struct MessageRow {
     role: String,
     content: Option<String>,
     at: f64,
-    active: bool,
-    compacted: bool,
     summary: bool,
     tool_calls: Option<String>,
 }
@@ -224,7 +236,6 @@ fn import(
     conn: &Connection,
     manifest: &Manifest,
     schema_version: i64,
-    inactive: Option<InactiveRows>,
 ) -> anyhow::Result<(Header, Vec<Event>, Counts)> {
     let prefix = Regex::new(r"^\[([^\]\n]+)\] ").expect("the prefix regex parses");
     let block = manifest.memory_block();
@@ -243,22 +254,13 @@ fn import(
         })?
         .collect::<Result<_, _>>()?;
 
-    let inactive_rows: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE active = 0 AND compacted = 0 AND _compressed_summary = 0",
-        [],
-        |row| row.get(0),
+    let mut skipped = conn.prepare(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND active = 0 AND compacted = 0",
     )?;
-    let inactive = match (inactive_rows, inactive) {
-        (0, _) => InactiveRows::Skip,
-        (_, Some(policy)) => policy,
-        (n, None) => bail!(
-            "{n} message row(s) have active=0 and compacted=0: a verbatim tail a compaction carried forward, or turns a rewind discarded. Whether they replay is still Tim's decision on TIM-117; pass --inactive-rows skip or --inactive-rows replay to say"
-        ),
-    };
-
     let mut statement = conn.prepare(
-        "SELECT role, content, timestamp, active, compacted, _compressed_summary, tool_calls
-         FROM messages WHERE session_id = ?1 ORDER BY id",
+        "SELECT role, content, timestamp, _compressed_summary, tool_calls
+         FROM messages WHERE session_id = ?1 AND (active = 1 OR compacted = 1)
+         ORDER BY timestamp, id",
     )?;
     for session in &sessions {
         if session.parent.is_some() {
@@ -272,22 +274,21 @@ fn import(
             counts.primary_sessions += 1;
             SessionClass::Primary
         };
+        let inactive: i64 = skipped.query_row([&session.id], |row| row.get(0))?;
+        counts.inactive_rows_skipped += u64::try_from(inactive).unwrap_or_default();
         let rows: Vec<MessageRow> = statement
             .query_map([&session.id], |row| {
                 Ok(MessageRow {
                     role: row.get(0)?,
                     content: row.get(1)?,
                     at: row.get(2)?,
-                    active: row.get::<_, i64>(3)? != 0,
-                    compacted: row.get::<_, i64>(4)? != 0,
-                    summary: row.get::<_, i64>(5)? != 0,
-                    tool_calls: row.get(6)?,
+                    summary: row.get::<_, i64>(3)? != 0,
+                    tool_calls: row.get(4)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
 
         let mut open: Option<Open> = None;
-        let mut in_compacted_run = false;
         let mut previous_query: Option<String> = None;
         let emit = |open: Option<Open>,
                     counts: &mut Counts,
@@ -351,9 +352,9 @@ fn import(
         };
 
         for row in rows {
-            if in_compacted_run && !row.compacted {
-                // The compacted turns end here: Hermes replaced them with a
-                // summary, and the session's context started over.
+            if row.summary {
+                // Hermes replaced the turns before here with this summary,
+                // and the session's context started over.
                 emit(
                     open.take(),
                     &mut counts,
@@ -372,22 +373,8 @@ fn import(
                         session: session.id.clone(),
                     },
                 });
-                in_compacted_run = false;
-            }
-            if row.summary {
                 counts.summary_rows_skipped += 1;
                 continue;
-            }
-            if row.compacted {
-                in_compacted_run = true;
-            } else if !row.active {
-                match inactive {
-                    InactiveRows::Skip => {
-                        counts.inactive_rows_skipped += 1;
-                        continue;
-                    }
-                    InactiveRows::Replay => counts.inactive_rows_replayed += 1,
-                }
             }
             match row.role.as_str() {
                 "user" => {
@@ -435,6 +422,7 @@ fn import(
             platform_ids: manifest.owner.platform_ids.clone(),
         },
         assistant: manifest.assistant.clone(),
+        models: manifest.models.clone(),
         hermes_schema_version: schema_version,
         counts: counts.clone(),
     };

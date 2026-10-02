@@ -16,7 +16,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::scenario::Author;
+use super::scenario::{Author, ModelSection};
 use super::timeline::SessionClass;
 
 /// The format version in the header.
@@ -30,6 +30,11 @@ pub struct Header {
     pub timezone: String,
     pub owner: Owner,
     pub assistant: Option<String>,
+    /// The manifest's mental models, created in the bank before the first
+    /// event. In the header so the corpus hash covers them; left out when
+    /// there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelSection>,
     /// The Hermes schema version the importer checked.
     pub hermes_schema_version: i64,
     pub counts: Counts,
@@ -54,7 +59,6 @@ pub struct Counts {
     pub compactions: u64,
     pub summary_rows_skipped: u64,
     pub tool_rows_skipped: u64,
-    pub inactive_rows_replayed: u64,
     pub inactive_rows_skipped: u64,
     pub multimodal_rows: u64,
     pub memory_blocks_stripped: u64,

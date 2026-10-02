@@ -386,29 +386,35 @@ production already does. A hosted endpoint sees it.
 
 ```
 asphodel import --state-db <copy of state.db> --manifest <file> \
-    [--out <replay dir>/corpus/<name>.jsonl] [--inactive-rows skip|replay] [--dry-run]
+    [--out <replay dir>/corpus/<name>.jsonl] [--dry-run]
 ```
 
 The importer reads only `sessions(id, source, parent_session_id,
 started_at)` and `messages(role, content, timestamp, active, compacted,
 _compressed_summary, tool_calls)`, and never the system prompt or
-`api_content`. It checks `PRAGMA table_info` for each of those columns and
-the `schema_version` table against the versions it was written against
-(31, hermes-agent `bfc71526`), and refuses the file naming everything
-wrong. Then, per primary session in `started_at` order:
+`api_content`. It checks `PRAGMA table_info` for each of those columns,
+with the type Hermes declares it with, and the `schema_version` table
+against the versions it was written against (31, hermes-agent
+`bfc71526`), and refuses the file naming everything wrong: a missing
+column, a column declared with another type, or another version.
+
+It reads only rows with `active = 1 OR compacted = 1`, the predicate
+Hermes uses for search, in `timestamp` order, not row id (Tim's decision
+on TIM-117). Then, per primary session in `started_at` order:
 
 - a turn is a `user` row and the final `assistant` row before the next
   `user` row; assistant rows that only call tools, and `tool` rows, are
   skipped. The turn is a `prefetch` event at the user row's time and a
   `sync` event at the reply's time, with the previous user message as the
   prefetch's `previous_query`;
-- compacted rows (`active=0, compacted=1`) are replayed, a `clear` is
-  emitted at the row that ends the compacted run, and Hermes' summary row
-  (`_compressed_summary=1`) is skipped;
-- rows with `active=0, compacted=0` (a verbatim tail a compaction carried
-  forward, or turns a rewind discarded) are refused until
-  `--inactive-rows` says what to do with them. Which is right is still open
-  on TIM-117;
+- compacted rows (`active=0, compacted=1`) are replayed. Hermes' summary
+  row (`_compressed_summary=1`) is skipped, and a `clear` is emitted at its
+  time;
+- rows with `active=0, compacted=0` never replay. They are the originals of
+  a tail a compaction carried forward, which has a live clone, and turns a
+  rewind took back. The clones keep the originals' timestamps under later
+  ids, so timestamp order replays a carried turn once, when it was said,
+  before the clear;
 - the user text is shaped as `sync_turn` shapes it: multimodal content
   (`\0json:` and a parts list) keeps its text parts, the memory block
   (`<memory-context>…</memory-context>`, or the manifest's
@@ -419,12 +425,19 @@ wrong. Then, per primary session in `started_at` order:
   subagent sessions (`parent_session_id` set) produce nothing.
 
 The manifest is TOML: `timezone`, `bank` (default `main`), `assistant`,
-`[owner] name, platform_ids`, `[[speaker]] name, id` and an optional
-`[memory_block] start, end`.
+`[owner] name, platform_ids`, `[[speaker]] name, id`, an optional
+`[memory_block] start, end`, and optional `[[model]]` tables in a
+scenario's shape (`name`, `question`, `max_tokens`, `kinds`; see
+"Models" above). `state.db` holds no mental models, so these are the ones
+a corpus run creates in the bank before the first event, beside the
+"User profile" every bank is seeded with (ADR 0007). They share the
+bank's mental model token budget with it, as `model create` does, so a
+run whose models don't fit is refused.
 
 The corpus is JSON lines: a header (version, bank identity, timezone, the
-Hermes schema version and the import's counts) then one event per line in
-time order. Its SHA-256 is the `corpus_hash` every report embeds. The same
+manifest's models when there are any, the Hermes schema version and the
+import's counts) then one event per line in time order. The models are in
+the header, so the corpus hash covers them. Its SHA-256 is the `corpus_hash` every report embeds. The same
 history always imports to the same bytes. `--dry-run` prints the counts and
 writes nothing; the counts hold no text, so they can be shared.
 
@@ -451,8 +464,8 @@ asphodel replay --corpus <file> --mode live|replay|fast \
 - **Refreshes in `fast`**: `--refresh recorded` (the default) substitutes
   the recorded refresh of the same model nearest in simulated time, `live`
   calls on a miss, and `off` answers with no edits. Triggers are counted
-  by code in every mode. Real history holds no mental models, so there is
-  nothing to refresh until a way to define them for a corpus exists.
+  by code in every mode. The mental models to refresh are the manifest's
+  `[[model]]` tables, carried in the corpus header.
 - **The LLM** for `live` and `fast` is built as `serve` builds its own:
   `[llm]` in `--config` with `ASPHODEL_LLM_API_KEY`, or the ChatGPT login
   under `--token-dir` (the private dir by default). `replay` refuses one.

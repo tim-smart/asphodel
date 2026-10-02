@@ -194,20 +194,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         )?
         .with_reranker_deadline(NO_DEADLINE);
         service.ensure_bank_with_models(&bank_name, &identity)?;
-        for model in &scenario.models {
-            service.create_model(
-                &bank_name,
-                &asphodel_core::mental_models::ModelSpec {
-                    name: model.name.clone(),
-                    question: model.question.clone(),
-                    kinds: model.kinds.clone(),
-                    entity: None,
-                    min_volatility: None,
-                    max_tokens: model.max_tokens,
-                    enabled: true,
-                },
-            )?;
-        }
+        create_models(&service, &bank_name, &scenario.models)?;
         let settings = Settings {
             bank: bank_name.clone(),
             timezone: timezone.clone(),
@@ -534,6 +521,30 @@ pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// earlier run's store is reset first: only one carrying replay's marker,
 /// and under the store's own lock, whose file is kept so its inode still
 /// excludes anyone who opened it.
+/// Creates a scenario's or a corpus's mental models in the bank, enabled
+/// and with no entity filter, before the first event.
+fn create_models(
+    service: &Service,
+    bank: &str,
+    models: &[scenario::ModelSection],
+) -> anyhow::Result<()> {
+    for model in models {
+        service.create_model(
+            bank,
+            &asphodel_core::mental_models::ModelSpec {
+                name: model.name.clone(),
+                question: model.question.clone(),
+                kinds: model.kinds.clone(),
+                entity: None,
+                min_volatility: None,
+                max_tokens: model.max_tokens,
+                enabled: true,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn open_store(dir: &Path, clock: Arc<dyn Clock>) -> anyhow::Result<Store> {
     let store_dir = dir.join("store");
     refuse_symlink(&store_dir)?;

@@ -22,7 +22,7 @@ use support::hermes::{
     self, API_CONTENT_SENTINEL, Message, PROMPT_TABLE_SENTINEL, SYSTEM_PROMPT_SENTINEL, StateDb,
     epoch,
 };
-use support::{TestDir, assert_ok, assert_refused, import, stderr, stdout};
+use support::{TestDir, assert_ok, assert_refused, import, import_with, stderr, stdout};
 
 /// The corpus's event lines, in file order.
 fn events(corpus: &Path) -> Vec<Value> {
@@ -195,6 +195,224 @@ fn compaction_replays_the_compacted_turns_and_clears_at_the_boundary() {
     assert!(!text.contains("HERMES-COMPACTION-SUMMARY"), "{text}");
 }
 
+/// Tim's decision on TIM-117 (Architect, 09:28): import only rows with
+/// `active = 1 OR compacted = 1`, key the clear on the
+/// `_compressed_summary` row, and order by timestamp, not row id.
+///
+/// This is the shape Hermes `bfc71526` writes when a compaction carries a
+/// verbatim tail: the turn before the tail is archived (`active=0,
+/// compacted=1`), the tail's originals get rewind flags (`active=0,
+/// compacted=0`), and the summary and the tail's clones are inserted as
+/// fresh active rows, the clones with later ids but their original
+/// timestamps. The carried turn replays once, when it was said, before the
+/// clear; the clear sits at the summary row's time.
+#[test]
+fn a_carried_tail_replays_once_before_the_clear() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    let db = StateDb::create(&state_db);
+    let t = epoch("2026-01-05T09:00:00Z");
+    db.session("s1", "discord", Some("discord:1"), None, t);
+    let row = |role, content, at, active, compacted, summary| Message {
+        session: "s1",
+        role,
+        content,
+        at,
+        active,
+        compacted,
+        summary,
+        ..Message::default()
+    };
+    // Rows in id order, as the compaction leaves them.
+    db.message(row("user", "Archived question.", t, false, true, false));
+    db.message(row(
+        "assistant",
+        "Archived answer.",
+        t + 30.0,
+        false,
+        true,
+        false,
+    ));
+    db.message(row(
+        "user",
+        "Carried question.",
+        t + 600.0,
+        false,
+        false,
+        false,
+    ));
+    db.message(row(
+        "assistant",
+        "Carried answer.",
+        t + 630.0,
+        false,
+        false,
+        false,
+    ));
+    db.message(row(
+        "user",
+        "HERMES-COMPACTION-SUMMARY",
+        t + 1200.0,
+        true,
+        false,
+        true,
+    ));
+    db.message(row(
+        "user",
+        "Carried question.",
+        t + 600.0,
+        true,
+        false,
+        false,
+    ));
+    db.message(row(
+        "assistant",
+        "Carried answer.",
+        t + 630.0,
+        true,
+        false,
+        false,
+    ));
+    db.turn(
+        "s1",
+        t + 1800.0,
+        "A question after compaction.",
+        "An answer.",
+    );
+    drop(db);
+
+    let corpus = imported(&dir, &state_db);
+    let events = session_events(&corpus, "s1");
+    assert_eq!(
+        kinds(&events),
+        [
+            "prefetch", "sync", "prefetch", "sync", "clear", "prefetch", "sync"
+        ],
+        "{events:#?}"
+    );
+    assert_eq!(events[0]["query"], "Archived question.");
+    assert_eq!(events[2]["query"], "Carried question.");
+    assert_eq!(at(&events[2]), ts("2026-01-05T09:10:00Z"));
+    assert_eq!(events[3]["assistant"], "Carried answer.");
+    assert_eq!(
+        at(&events[4]),
+        ts("2026-01-05T09:20:00Z"),
+        "the clear is at the summary row"
+    );
+    assert_eq!(events[5]["query"], "A question after compaction.");
+    let text = fs::read_to_string(&corpus).unwrap();
+    assert!(!text.contains("HERMES-COMPACTION-SUMMARY"), "{text}");
+}
+
+/// The same decision for a rewind: the turns a rewind discarded (`active=0,
+/// compacted=0`) were taken back, so they never replay.
+#[test]
+fn turns_a_rewind_discarded_never_replay() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    let db = StateDb::create(&state_db);
+    let t = epoch("2026-01-05T09:00:00Z");
+    db.session("s1", "discord", Some("discord:1"), None, t);
+    for (role, content, delta) in [
+        ("user", "REWOUND-QUESTION", 0.0),
+        ("assistant", "REWOUND-ANSWER", 30.0),
+    ] {
+        db.message(Message {
+            session: "s1",
+            role,
+            content,
+            at: t + delta,
+            active: false,
+            ..Message::default()
+        });
+    }
+    db.turn(
+        "s1",
+        t + 600.0,
+        "The question asked instead.",
+        "Its answer.",
+    );
+    drop(db);
+
+    let corpus = imported(&dir, &state_db);
+    let events = session_events(&corpus, "s1");
+    assert_eq!(kinds(&events), ["prefetch", "sync"], "{events:#?}");
+    assert_eq!(events[0]["query"], "The question asked instead.");
+    let text = fs::read_to_string(&corpus).unwrap();
+    assert!(!text.contains("REWOUND-QUESTION"), "{text}");
+    assert!(!text.contains("REWOUND-ANSWER"), "{text}");
+}
+
+// Multimodal content (TIM-96, decision 1): Hermes stores it as `\0json:`
+// and a parts list, with the injected memory block inside a text part.
+
+/// A multimodal user row in Hermes' encoding: `parts` after the prefix.
+fn multimodal(parts: Value) -> String {
+    format!("\u{0}json:{parts}")
+}
+
+/// Text parts are kept, image parts dropped, and the memory block in its
+/// default `<memory-context>` fence is cut out, so injected memory never
+/// becomes source text (ADR 0002).
+#[test]
+fn multimodal_content_keeps_its_text_and_loses_images_and_the_memory_block() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    let db = StateDb::create(&state_db);
+    let t = epoch("2026-01-05T09:00:00Z");
+    db.session("s1", "discord", Some("discord:1"), None, t);
+    let content = multimodal(serde_json::json!([
+        {"type": "text", "text": "<memory-context>INJECTED-MEMORY-TEXT</memory-context>\nLook at my garden."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,IMAGE-BYTES-SENTINEL"}}
+    ]));
+    db.turn("s1", t, &content, "Lovely roses.");
+    drop(db);
+
+    let corpus = imported(&dir, &state_db);
+    let events = session_events(&corpus, "s1");
+    assert_eq!(kinds(&events), ["prefetch", "sync"], "{events:#?}");
+    assert_eq!(events[0]["query"], "Look at my garden.");
+    assert_eq!(events[1]["user"], "Look at my garden.");
+    let text = fs::read_to_string(&corpus).unwrap();
+    for leaked in [
+        "INJECTED-MEMORY-TEXT",
+        "IMAGE-BYTES-SENTINEL",
+        "memory-context",
+        "json:",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "the corpus holds {leaked:?}: {text}"
+        );
+    }
+}
+
+/// The manifest's `[memory_block]` overrides the default fence.
+#[test]
+fn the_manifest_memory_block_overrides_the_default_fence() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    let db = StateDb::create(&state_db);
+    let t = epoch("2026-01-05T09:00:00Z");
+    db.session("s1", "discord", Some("discord:1"), None, t);
+    let content = multimodal(serde_json::json!([
+        {"type": "text", "text": "<<MEM>>INJECTED-MEMORY-TEXT<</MEM>>\nLook at my garden."}
+    ]));
+    db.turn("s1", t, &content, "Lovely roses.");
+    drop(db);
+
+    let manifest = format!(
+        "{}\n[memory_block]\nstart = \"<<MEM>>\"\nend = \"<</MEM>>\"\n",
+        hermes::MANIFEST
+    );
+    let corpus = dir.private_path("corpus/main.jsonl");
+    assert_ok(&import_with(&dir, &state_db, &corpus, &manifest, &[]));
+    let events = session_events(&corpus, "s1");
+    assert_eq!(events[1]["user"], "Look at my garden.", "{events:#?}");
+    let text = fs::read_to_string(&corpus).unwrap();
+    assert!(!text.contains("INJECTED-MEMORY-TEXT"), "{text}");
+}
+
 /// TIM-96, decision 1: the `[Name] ` prefix stays in the text and only picks
 /// the speaker, which is the owner unless the name is a non-owner speaker
 /// in the manifest. Backfilled history before `[New message]` is stripped
@@ -306,6 +524,32 @@ fn a_schema_version_the_importer_wasnt_written_against_fails_the_import() {
     assert!(!corpus.exists(), "a refused import writes no corpus");
 }
 
+/// A column with the right name and the wrong declared type is a changed
+/// column: refused, naming the column and the type expected.
+#[test]
+fn a_retyped_column_fails_the_import_and_names_the_column() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    let db = hermes::small_history(&state_db);
+    db.conn()
+        .execute_batch(
+            "ALTER TABLE messages RENAME COLUMN timestamp TO old_ts;
+             ALTER TABLE messages ADD COLUMN timestamp TEXT;
+             UPDATE messages SET timestamp = CAST(old_ts AS TEXT);",
+        )
+        .unwrap();
+    drop(db);
+    let corpus = dir.private_path("corpus/main.jsonl");
+    let output = import(&dir, &state_db, &corpus);
+    assert_refused(&output, "messages.timestamp");
+    assert!(
+        stderr(&output).contains("REAL"),
+        "the refusal names the type expected: {}",
+        stderr(&output)
+    );
+    assert!(!corpus.exists(), "a refused import writes no corpus");
+}
+
 // Privacy (TIM-96, decision 8).
 
 /// The importer never copies the system prompt or `api_content`: not into
@@ -381,4 +625,56 @@ fn importing_the_same_history_twice_writes_the_same_corpus() {
     assert_ok(&import(&dir, &state_db, &first));
     assert_ok(&import(&dir, &state_db, &second));
     assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+}
+
+/// `--dry-run` prints the import's counts and writes nothing. The counts
+/// hold no text, so they can be shared to check the importer's
+/// assumptions against a real `state.db` (docs/replay.md).
+#[test]
+fn a_dry_run_prints_counts_without_text_and_writes_nothing() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    hermes::small_history(&state_db);
+    let corpus = dir.private_path("corpus/main.jsonl");
+    let output = import_with(&dir, &state_db, &corpus, hermes::MANIFEST, &["--dry-run"]);
+    assert_ok(&output);
+    assert!(!corpus.exists(), "a dry run writes no corpus");
+    let written: Vec<String> = fs::read_dir(dir.private())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "state.db" && name != "manifest.toml" && name != "corpus")
+        .collect();
+    assert!(written.is_empty(), "a dry run wrote {written:?}");
+    assert!(
+        fs::read_dir(dir.private().join("corpus"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "a dry run wrote into corpus/"
+    );
+
+    let printed = stdout(&output);
+    assert!(
+        printed.chars().any(|c| c.is_ascii_digit()),
+        "the counts: {printed}"
+    );
+    for text in [
+        hermes::HOME_QUOTE,
+        "harbour",
+        "curry",
+        "winter",
+        "weekend",
+        "Daily digest",
+        "Subagent",
+        "Noted.",
+        SYSTEM_PROMPT_SENTINEL,
+        PROMPT_TABLE_SENTINEL,
+        API_CONTENT_SENTINEL,
+    ] {
+        assert!(!printed.contains(text), "the dry run printed {text:?}");
+        assert!(
+            !stderr(&output).contains(text),
+            "the dry run logged {text:?}"
+        );
+    }
 }

@@ -20,7 +20,8 @@ use sha2::{Digest, Sha256};
 use support::hermes::{self, StateDb, epoch};
 use support::{
     PASSING_PROBES, PROBES_WITH_A_FAILURE, TestDir, asphodel, assert_ok, assert_refused,
-    imported_small_history, record, replay_history, stderr,
+    cassette_records, imported_small_history, judge_script, live_script, record, replay_history,
+    stderr,
 };
 
 /// What a run simulated, without what identifies the run: the mode
@@ -114,6 +115,158 @@ fn fast_on_its_own_recording_needs_no_llm_and_counts_zero_misses() {
     assert_eq!(report["llm"]["misses"], 0, "{report}");
     assert_eq!(report["llm"]["live"], 0, "{report}");
     assert_eq!(report["llm"]["top_up"], 0, "{report}");
+}
+
+/// TIM-96, decision 4: `used` verdicts are cached per (reply, sentence)
+/// pair, and in `fast` the pairs nobody has judged get one short top-up
+/// call per chunk, recorded like any other call, so the next `fast` run
+/// needs none.
+///
+/// The recording is made with the reranker gate shut, so nothing is
+/// injected and no pair is judged. `fast` then runs with the gate open, so
+/// the home memory is injected into later turns as a pair nobody has
+/// judged.
+#[test]
+fn fast_tops_up_unjudged_pairs_once_per_chunk_and_records_them() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let shut = dir.private_file(
+        "shut-gate.toml",
+        "[injection.reranker_floors]\n\"fake-reranker:v1\" = 1000000.0\n",
+    );
+    let script = live_script(&dir);
+    let live = replay_history(
+        &dir,
+        &corpus,
+        "live",
+        PASSING_PROBES,
+        "live",
+        Some(&script),
+        &["--overrides", shut.to_str().unwrap()],
+    );
+    assert_ok(&live.output);
+    let judged = |records: &[Value]| -> Vec<Value> {
+        records
+            .iter()
+            .filter(|record| record["template"]["name"] == "judge_used")
+            .cloned()
+            .collect()
+    };
+    assert!(judged(&cassette_records(&dir)).is_empty());
+
+    let judge = judge_script(&dir);
+    let first = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "fast-first",
+        Some(&judge),
+        &[],
+    );
+    assert_ok(&first.output);
+    let report = first.report();
+    let top_ups = judged(&cassette_records(&dir));
+    assert!(
+        !top_ups.is_empty(),
+        "an injected memory nobody judged gets a top-up: {report}"
+    );
+    assert_eq!(report["llm"]["top_up"], top_ups.len(), "{report}");
+    let chunks: BTreeSet<String> = top_ups
+        .iter()
+        .map(|record| record["chunk"].to_string())
+        .collect();
+    assert_eq!(
+        chunks.len(),
+        top_ups.len(),
+        "one top-up per chunk: {top_ups:#?}"
+    );
+    assert!(
+        report["llm"]["used_verdicts"]["top_up"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "{report}"
+    );
+
+    let cassette = fs::read(dir.private_path("cassettes/main.jsonl")).unwrap();
+    let second = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "fast-second",
+        None,
+        &[],
+    );
+    assert_ok(&second.output);
+    let report = second.report();
+    assert_eq!(report["llm"]["top_up"], 0, "{report}");
+    assert_eq!(report["llm"]["misses"], 0, "{report}");
+    assert_eq!(
+        fs::read(dir.private_path("cassettes/main.jsonl")).unwrap(),
+        cassette,
+        "a fast run with nothing to judge records nothing"
+    );
+}
+
+/// The small history with one more turn at the end, imported to
+/// `corpus/extra.jsonl` beside the original.
+fn imported_with_an_extra_turn(dir: &TestDir) -> std::path::PathBuf {
+    let state_db = dir.private_path("state-extra.db");
+    let db: StateDb = hermes::small_history(&state_db);
+    db.turn(
+        "s-later",
+        epoch("2026-01-11T09:00:00Z"),
+        "One more question.",
+        "One more answer.",
+    );
+    drop(db);
+    let corpus = dir.private_path("corpus/extra.jsonl");
+    assert_ok(&support::import(dir, &state_db, &corpus));
+    corpus
+}
+
+/// A chunk with no recorded claims is a miss in `fast`: with an LLM it's
+/// called live and counted, and without one the run fails naming the miss.
+#[test]
+fn a_fast_claims_miss_calls_live_with_an_llm_and_counts_it() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    record(&dir, &corpus);
+    let extra = imported_with_an_extra_turn(&dir);
+    let script = live_script(&dir);
+    let run = replay_history(
+        &dir,
+        &extra,
+        "fast",
+        PASSING_PROBES,
+        "fast-extra",
+        Some(&script),
+        &[],
+    );
+    assert_ok(&run.output);
+    let report = run.report();
+    assert_eq!(report["llm"]["misses"], 1, "{report}");
+    assert_eq!(report["llm"]["live"], 1, "{report}");
+}
+
+#[test]
+fn a_fast_claims_miss_without_an_llm_fails_naming_the_miss() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    record(&dir, &corpus);
+    let extra = imported_with_an_extra_turn(&dir);
+    let run = replay_history(
+        &dir,
+        &extra,
+        "fast",
+        PASSING_PROBES,
+        "fast-extra",
+        None,
+        &[],
+    );
+    assert_refused(&run.output, "miss");
+    assert!(!run.report_path.exists(), "a failed run writes no report");
 }
 
 // The determinism self-test (TIM-117, done-when).
@@ -393,4 +546,67 @@ fn the_diff_refuses_runs_on_different_corpora_unless_forced() {
 
 fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The diff lists a memory that faded in one run and not the other by id,
+/// and numbers that differ beyond the tolerance by path, leaving out those
+/// within it (TIM-96, decision 6). The two reports are one run's report
+/// edited by hand, so the corpus and cassette match and only the edited
+/// values differ.
+#[test]
+fn the_diff_lists_fates_by_id_and_numbers_beyond_the_tolerance_by_path() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    record(&dir, &corpus);
+    let run = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "replay", None, &[]);
+    assert_ok(&run.output);
+    let report = run.report();
+    let id = report["memories"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the report lists each memory by id: {report}"))
+        .to_string();
+
+    let mut a = report.clone();
+    let mut b = report;
+    a["memories"][0]["faded_at"] = Value::from("2026-03-01T00:00:00Z");
+    b["memories"][0]["faded_at"] = Value::Null;
+    a["memories"][0]["purged_at"] = Value::Null;
+    b["memories"][0]["purged_at"] = Value::Null;
+    a["injected_tokens"]["per_turn"]["p50"] = Value::from(100.0);
+    b["injected_tokens"]["per_turn"]["p50"] = Value::from(100.000_000_01);
+    a["injected_tokens"]["per_turn"]["p95"] = Value::from(100.0);
+    b["injected_tokens"]["per_turn"]["p95"] = Value::from(150.0);
+    let a_path = dir.private_file("reports/a.json", &a.to_string());
+    let b_path = dir.private_file("reports/b.json", &b.to_string());
+
+    let output = asphodel(&dir)
+        .arg("report")
+        .arg("diff")
+        .arg(&a_path)
+        .arg(&b_path)
+        .output()
+        .unwrap();
+    assert_ok(&output);
+    let diff: Value = serde_json::from_slice(&output.stdout).expect("the diff is JSON");
+    assert_eq!(
+        diff["memories"]["faded_only_in_a"],
+        serde_json::json!([id]),
+        "{diff:#}"
+    );
+    assert_eq!(
+        diff["memories"]["faded_only_in_b"],
+        serde_json::json!([]),
+        "{diff:#}"
+    );
+    let paths: Vec<&str> = diff["numbers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the numbers that differ: {diff:#}"))
+        .iter()
+        .map(|number| number["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"injected_tokens.per_turn.p95"), "{paths:?}");
+    assert!(
+        !paths.contains(&"injected_tokens.per_turn.p50"),
+        "a difference within the tolerance isn't listed: {paths:?}"
+    );
 }
