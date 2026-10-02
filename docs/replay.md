@@ -262,16 +262,18 @@ A probe naming a label no claim defines is refused before the run.
   prefetches, then syncs, then probes, and within a kind the order they
   were scheduled in. So a probe at a turn's `at` sees that turn's prefetch
   and, with zero latency, its memories.
-- **Extraction** is queued at a source's sync. The bank's one simulated
-  worker claims the head of the production queue (turns before documents,
-  then by observed time) as soon as it's free, at the sync or at its
-  previous completion, and commits what it claimed a latency later. So a
-  completion is for whatever the worker took, not for whichever source
-  arrived first. A probe or prefetch before the completion sees the store
-  without those memories. Accesses are stamped with the source's ingest
-  time, as in production. The run ends at the latest of the last event,
-  `--until` and the last completion, so accepted work is always
-  extracted.
+- **Extraction** is queued at a source's sync. Each bank has one simulated
+  worker. Whenever it's free, at a sync or at its previous completion, it
+  claims the head of the production queue (turns before documents, then
+  observed time) and commits that chunk a latency later. At that moment
+  it also commits the same source's next chunks, for as long as each is
+  the queue's head. Once another source is at the head, for example a
+  turn synced in the meantime, the worker claims that instead. The rest
+  of the document then waits behind it and is charged another latency
+  when its turn comes. A probe or prefetch before a completion sees the
+  store without those memories. Accesses are stamped with the source's
+  ingest time, as in production. The run ends at the latest of the last
+  event, `--until` and the last completion.
 - **Sweeps** run at `mental_models.sweep_time` bank-local (04:00) on the
   simulated clock, purge first, then the source and recall-log sweep, and
   then the refreshes due. Replay records the deletion fingerprint on its

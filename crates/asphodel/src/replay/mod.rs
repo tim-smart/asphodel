@@ -303,7 +303,8 @@ fn lock_private_dir(dir: &Path) -> anyhow::Result<DataDirLock> {
 /// Where the report goes, checked before the run (TIM-96, decision 8):
 /// `--report`, or `<replay dir>/reports/<name>.json`. A scripted report
 /// may go outside the private dir, since it derives from a checked-in
-/// fixture, but never inside a git working tree or through a symlink.
+/// fixture, but never inside a git working tree, through a symlink, or
+/// over replay's private directory, lock, shadow table or store.
 fn report_path(given: Option<&Path>, dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
     let path = match given {
         Some(path) => path.to_owned(),
@@ -326,7 +327,25 @@ fn report_path(given: Option<&Path>, dir: &Path, name: &str) -> anyhow::Result<P
     let parent = fs::canonicalize(parent)
         .with_context(|| format!("resolving the report's directory {}", parent.display()))?;
     refuse_git_tree(&parent)?;
-    Ok(parent.join(file_name))
+    let path = parent.join(file_name);
+    if path == dir
+        || path == dir.join(LOCK_FILE)
+        || path.starts_with(dir.join("store"))
+        || [
+            SHADOW_FILE,
+            "shadow.db-journal",
+            "shadow.db-wal",
+            "shadow.db-shm",
+        ]
+        .iter()
+        .any(|name| path == dir.join(name))
+    {
+        bail!(
+            "--report {} is a reserved replay destination",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 /// Writes the report through a fresh file in the same directory and

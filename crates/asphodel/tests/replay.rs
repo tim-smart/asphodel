@@ -1194,55 +1194,46 @@ fn assert_reserved_report(destination: &str) {
 }
 
 #[test]
-#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
 fn a_report_over_the_private_directory_is_refused() {
     assert_reserved_report("");
 }
 
 #[test]
-#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
 fn a_report_over_the_replay_lock_is_refused() {
     assert_reserved_report("lock");
 }
 
 #[test]
-#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
 fn a_report_over_the_shadow_table_is_refused() {
     assert_reserved_report("shadow.db");
 }
 
 #[test]
-#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
 fn a_report_over_the_shadow_journal_is_refused() {
     assert_reserved_report("shadow.db-journal");
 }
 
 #[test]
-#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
 fn a_report_over_the_shadow_wal_is_refused() {
     assert_reserved_report("shadow.db-wal");
 }
 
 #[test]
-#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
 fn a_report_over_the_shadow_shared_memory_is_refused() {
     assert_reserved_report("shadow.db-shm");
 }
 
 #[test]
-#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
 fn a_report_over_the_store_directory_is_refused() {
     assert_reserved_report("store");
 }
 
 #[test]
-#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
 fn a_report_inside_the_store_is_refused() {
     assert_reserved_report("store/asphodel.db");
 }
 
 #[test]
-#[ignore = "needs TIM-116: refuse reserved report destinations before resetting the store"]
 fn a_report_inside_a_store_descendant_is_refused() {
     assert_reserved_report("store/nested/pre-run-contents");
 }

@@ -8,15 +8,18 @@
 //! scheduled. The clock is set to each event's time before it runs, so
 //! every store write carries the simulated time.
 //!
-//! A source's extraction is queued at its sync. The bank's one simulated
-//! worker claims the head of the production queue whenever it's free, at
-//! a sync or at its previous completion, and commits what it claimed a
-//! latency later, so the queue's order (turns before documents, then
-//! observed time) decides what is extracted when. The latency is per
-//! source: the source's later chunks commit with the first while they are
-//! the queue's head. The run ends at the
-//! latest of the last event, `--until` and the last completion, so
-//! accepted work is always extracted.
+//! Extraction is queued at a source's sync. Each bank has one simulated
+//! worker. Whenever it's free, at a sync or at its previous completion, it
+//! claims the head of the production queue (turns before documents, then
+//! observed time) and commits that chunk a latency later. At that moment
+//! it also commits the same source's next chunks, for as long as each is
+//! the queue's head. Once another source is at the head, for example a
+//! turn synced in the meantime, the worker claims that instead. The rest
+//! of the document then waits behind it and is charged another latency
+//! when its turn comes. A probe or prefetch before a completion sees the
+//! store without those memories. Accesses are stamped with the source's
+//! ingest time, as in production. The run ends at the latest of the last
+//! event, `--until` and the last completion.
 //! The LLM is answered from the scenario's claims: call 1's reply is built
 //! from them, and call 2's from their outcomes against the neighbours the
 //! real reconciliation found, so nothing in reconciliation is replay-only.
