@@ -168,9 +168,24 @@ impl Harness {
     }
 
     fn with_models(models: Models) -> Self {
+        Self::with_options(models, OpenOptions::default())
+    }
+
+    /// A store with replay's deterministic ids (TIM-96, decision 4).
+    fn deterministic() -> Self {
+        Self::with_options(
+            Models::fake(),
+            OpenOptions {
+                deterministic_ids: true,
+                ..OpenOptions::default()
+            },
+        )
+    }
+
+    fn with_options(models: Models, options: OpenOptions) -> Self {
         let dir = TestDir::new();
         let clock = Arc::new(SimulatedClock::new(at(START)));
-        let store = Store::open(&dir.data(), OpenOptions::default(), clock.clone()).unwrap();
+        let store = Store::open(&dir.data(), options, clock.clone()).unwrap();
         let service =
             Service::with_models(clock.clone(), store, tuning_for_fakes(), models).unwrap();
         service
@@ -3671,4 +3686,161 @@ fn the_prompts_state_the_extraction_rules() {
     let user = call1_request(&input(&h, "main", &[])).user;
     assert!(user.contains("Reference date: unknown"), "{user}");
     assert!(user.contains("Don't resolve relative times."), "{user}");
+}
+
+// Deterministic entity ids (TIM-116's review of TIM-96 decision 4, as
+// amended): in replay an entity id is UUIDv5 of the creating source's id
+// and `entity:<chunk position>:<name>`, where `<name>` is the key commit
+// dedups proposals on, the proposed name composed to NFC, trimmed and
+// lowercased. Neither the surface form nor anything else in the store
+// enters the key.
+
+/// The id the amended rule gives an entity `key` proposed in chunk
+/// `position` of `source`. `key` is written out already normalized.
+fn entity_id(source: Uuid, position: u32, key: &str) -> Uuid {
+    asphodel_core::store::ids::derived(source, &format!("entity:{position}:{key}"))
+}
+
+#[test]
+#[ignore = "needs TIM-116: entity ids under the amended TIM-96 decision 4"]
+fn deterministic_entity_ids_key_the_proposal_not_the_surface_form() {
+    let h = Harness::deterministic();
+    let ingested = ingest(
+        &h,
+        &turn(
+            "s1",
+            T1,
+            "Anna from work and Anna from school came over.",
+            "Lovely.",
+        ),
+    );
+    // Two people proposed under one surface form in one chunk.
+    let extracted = extract(
+        &h,
+        reply(
+            vec![
+                claim("Anna from work came over.", "event", "Anna from work").with(
+                    "entities",
+                    json!([new_entity("Anna Smith", "person", "Anna")]),
+                ),
+                claim("Anna from school came over.", "event", "Anna from school").with(
+                    "entities",
+                    json!([new_entity("Anna Jones", "person", "Anna")]),
+                ),
+            ],
+            &[],
+        ),
+    );
+    assert_eq!(extracted.memories.len(), 2);
+    assert_eq!(
+        h.entities_named("main", "Anna Smith"),
+        vec![entity_id(ingested.source, 0, "anna smith")]
+    );
+    assert_eq!(
+        h.entities_named("main", "Anna Jones"),
+        vec![entity_id(ingested.source, 0, "anna jones")]
+    );
+}
+
+#[test]
+#[ignore = "needs TIM-116: entity ids under the amended TIM-96 decision 4"]
+fn deterministic_entity_ids_are_independent_of_existing_entities() {
+    let h = Harness::deterministic();
+    let ingested = ingest_doc(
+        &h,
+        &document(
+            "notes",
+            "# Work\nAnna runs the team.\n\n# School\nAnna teaches maths.",
+            date(2026, 9, 28),
+        ),
+    );
+    assert_eq!(ingested.chunks_queued, 2);
+    // Each chunk proposes a new "Anna". The second chunk's call 1 may be
+    // shown the first's, which commit never reuses (TIM-92), so it creates
+    // a second entity whose id mustn't depend on the first existing.
+    let first = extract(
+        &h,
+        reply(
+            vec![
+                claim("Anna runs the team.", "fact", "Anna runs the team")
+                    .with("entities", json!([new_entity("Anna", "person", "Anna")])),
+            ],
+            &[],
+        ),
+    );
+    assert_eq!(first.chunk, h.chunk_of(ingested.source, 0));
+    let second = extract_unlabelled(
+        &h,
+        reply(
+            vec![
+                claim("Anna teaches maths.", "fact", "Anna teaches maths")
+                    .with("entities", json!([new_entity("Anna", "person", "Anna")])),
+            ],
+            &[],
+        ),
+    );
+    assert_eq!(second.chunk, h.chunk_of(ingested.source, 1));
+    assert_eq!(
+        h.entities_named("main", "Anna"),
+        vec![
+            entity_id(ingested.source, 0, "anna"),
+            entity_id(ingested.source, 1, "anna"),
+        ]
+    );
+}
+
+#[test]
+#[ignore = "needs TIM-116: entity ids under the amended TIM-96 decision 4"]
+fn deterministic_entity_ids_use_the_normalized_dedup_key() {
+    // "Zélie" composed, decomposed, padded and in capitals: one key, so one
+    // id, written here already normalized.
+    let variants = ["Zélie", "Ze\u{301}lie", "  Zélie\t", " ZE\u{301}LIE "];
+    let user = "Zélie is my neighbour.";
+    let mut ids = BTreeSet::new();
+    for name in variants {
+        let h = Harness::deterministic();
+        let ingested = ingest(&h, &turn("s1", T1, user, "Nice."));
+        let extracted = extract(
+            &h,
+            reply(
+                vec![
+                    claim("Tim's neighbour is Zélie.", "fact", user)
+                        .with("entities", json!([new_entity(name, "person", "Zélie")])),
+                ],
+                &[],
+            ),
+        );
+        assert_eq!(
+            extracted.entities_created,
+            vec![entity_id(ingested.source, 0, "zélie")],
+            "{name:?}"
+        );
+        ids.insert(extracted.entities_created[0]);
+    }
+    assert_eq!(ids.len(), 1, "every variant has the same source and key");
+
+    // Within one reply the variants dedup to one entity, with that id.
+    let h = Harness::deterministic();
+    let ingested = ingest(
+        &h,
+        &turn("s1", T1, "Zélie is my neighbour. Zélie bakes.", "Nice."),
+    );
+    let extracted = extract(
+        &h,
+        reply(
+            vec![
+                claim("Tim's neighbour is Zélie.", "fact", "Zélie is my neighbour")
+                    .with("entities", json!([new_entity("Zélie", "person", "Zélie")])),
+                claim("Zélie bakes.", "fact", "Zélie bakes").with(
+                    "entities",
+                    json!([new_entity(" Ze\u{301}lie ", "person", "Zélie")]),
+                ),
+            ],
+            &[],
+        ),
+    );
+    assert_eq!(
+        extracted.entities_created,
+        vec![entity_id(ingested.source, 0, "zélie")]
+    );
 }
