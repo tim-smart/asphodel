@@ -571,6 +571,10 @@ impl Prepared {
 
 /// A claim and the neighbours call 2 was shown for it, for replay's
 /// labelling material (TIM-96, decision 6).
+/// Flagged claims bypass the vector floor, and BM25 neighbours are not
+/// filtered by it, so these lists may include below-floor candidates.
+/// Thresholding their scores does not predict what another reconcile
+/// floor would retain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call2List {
     /// The claim's sentence.

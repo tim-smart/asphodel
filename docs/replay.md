@@ -603,11 +603,12 @@ The material is one JSON object:
   scored against, after a short follow-up borrowed the previous message.
 - `call2` holds every candidate list call 2 was shown, one per claim:
   the claim and its neighbours, scored with the cosine similarity of the
-  claim to each, which the reconcile floor compares. Only what call 2
-  was shown is here. Neighbours below the floor never reach call 2, so the
-  material says what raising the reconcile floor would drop, but not what
-  lowering it would add; calibrating it downward would need those hits
-  too, and is outside this material.
+  claim to each. Only what call 2 was shown is here. Flagged claims bypass
+  the vector floor, and BM25 neighbours are not filtered by it, so call 2
+  can see neighbours below the reconcile floor. The curve measures
+  precision by score threshold over these observed candidates; it does
+  not predict what raising or lowering the reconcile floor would retain.
+  Unobserved candidates are outside this material.
 - A candidate's `id` is unique in the file and is what a label names;
   `memory` is the memory's id in the replayed store.
 
@@ -630,9 +631,11 @@ asphodel report precision --labels <file> --material <file>
 prints the curve as JSON: for `recall` and for `call2`, `labelled`,
 `unlabelled` and `curve`, one point per distinct score among the labelled
 candidates in ascending order. At each point's `floor`, `kept` counts the
-labelled candidates scoring at or above it, as the gate and call 2 keep
-one, `relevant` counts those labelled `true`, and `precision` is
-`relevant / kept`. The curve is numbers only. A label naming no candidate
+labelled candidates scoring at or above it, `relevant` counts those
+labelled `true`, and `precision` is `relevant / kept`. For recall this
+matches the gate's logit comparison. For call 2 it is a score-threshold
+curve over observed candidates, not a prediction for another reconcile
+floor. The curve is numbers only. A label naming no candidate
 in the material is refused. Both files must be inside the private dir, and
 an error names the file and line, never the text.
 

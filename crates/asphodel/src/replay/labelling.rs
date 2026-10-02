@@ -6,9 +6,12 @@
 //! writes the material to label: recall candidates at [`SAMPLED_TURNS`]
 //! turns, scored with the reranker logit the gate compares and including
 //! those it turned away, and every candidate list call 2 was shown, scored
-//! with the similarity the reconcile floor compares. Call 2's lists hold
-//! only what call 2 was shown, so they say what raising the reconcile
-//! floor would drop, not what lowering it would add.
+//! with cosine similarity. Call 2's lists hold only what call 2 was shown.
+//! Flagged claims bypass the vector floor, and BM25 neighbours are not
+//! filtered by it, so candidates can score below the reconcile floor.
+//! The call-2 curve is precision by score threshold over observed
+//! candidates, not a prediction of what a raised or lowered reconcile
+//! floor would retain.
 //!
 //! `asphodel report precision --labels L --material M` reads a TOML table
 //! of candidate id to relevance and prints the curve: at each labelled
@@ -276,7 +279,9 @@ fn load_material(path: &Path) -> anyhow::Result<Material> {
 
 /// One point per distinct score among the labelled candidates, in
 /// ascending order. A candidate is kept at a floor when it scores at or
-/// above it, as the gate and call 2 keep one.
+/// above it. For recall this matches the gate comparison; for call 2 it
+/// is only a score threshold over observed candidates, not a prediction
+/// of retention under another reconcile floor.
 fn curve<'a>(
     candidates: impl Iterator<Item = &'a Candidate>,
     labels: &BTreeMap<String, bool>,

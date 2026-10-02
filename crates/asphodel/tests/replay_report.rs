@@ -550,6 +550,162 @@ fn labelling_material_is_refused_outside_the_private_dir() {
     assert!(!target.exists());
 }
 
+/// The material is written after the run, so a `--labelling` path that is
+/// also one of the run's inputs or outputs would replace that file with
+/// material: a paid cassette, the corpus, the probes, the report or the
+/// aggregate export. Each is refused before the run, naming the flag, and
+/// the file keeps its bytes. The cassette is also given by another
+/// spelling of its path, which resolves to the same file.
+#[test]
+fn labelling_material_is_refused_over_the_runs_own_files() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    record(&dir, &corpus);
+    let cassette = dir.private_path("cassettes/main.jsonl");
+    let probes = dir.private_path("probes.toml");
+    let report = dir.private_file("reports/collide.json", "prior report\n");
+    let aggregate = dir.private_file("exports/aggregate.json", "prior aggregate\n");
+    let cassette_alias = dir.private_path("labelling/../cassettes/main.jsonl");
+
+    let cases: [(&str, &Path); 6] = [
+        ("the corpus", &corpus),
+        ("the cassette", &cassette),
+        ("the cassette by another spelling", &cassette_alias),
+        ("the probes file", &probes),
+        ("the report", &report),
+        ("the aggregate export", &aggregate),
+    ];
+    for (what, path) in cases {
+        let before: Vec<(PathBuf, Vec<u8>)> = [&corpus, &cassette, &report, &aggregate]
+            .into_iter()
+            .map(|file| (file.clone(), fs::read(file).unwrap()))
+            .collect();
+        let run = replay_history(
+            &dir,
+            &corpus,
+            "replay",
+            PASSING_PROBES,
+            "collide",
+            None,
+            &[
+                "--aggregate",
+                aggregate.to_str().unwrap(),
+                "--labelling",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            run.output.status.code(),
+            Some(2),
+            "--labelling over {what} is refused: {}",
+            stderr(&run.output)
+        );
+        assert!(
+            stderr(&run.output).contains("--labelling")
+                || stderr(&run.output).contains("labelling material"),
+            "the refusal of {what} names the labelling flag: {}",
+            stderr(&run.output)
+        );
+        for (file, bytes) in before {
+            assert_eq!(
+                fs::read(&file).unwrap(),
+                bytes,
+                "--labelling over {what} left {} as it was",
+                file.display()
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&probes).unwrap(),
+            PASSING_PROBES,
+            "--labelling over {what} left the probes as they were"
+        );
+    }
+}
+
+/// A claim that changes something is shown its nearest memories whatever
+/// their similarity (TIM-92, the flagged claim's wider set), and BM25
+/// neighbours are never held to the vector floor at all. So call 2's lists
+/// can hold candidates scoring below the reconcile floor, and the material
+/// keeps them as shown, with their real similarity: the curve is precision
+/// over what call 2 saw, not a prediction of what another floor keeps.
+#[test]
+fn call2_material_keeps_a_flagged_claims_neighbour_below_the_floor() {
+    let dir = TestDir::new();
+    let state_db = dir.private_path("state.db");
+    let db = StateDb::create(&state_db);
+    let start = epoch("2026-01-05T09:00:00Z");
+    let cat_quote = "we adopted a kitten called Miso";
+    db.session("s1", "discord", Some("discord:1"), None, start);
+    db.turn(
+        "s1",
+        start,
+        &format!("{}, near the harbour.", hermes::HOME_QUOTE),
+        "Noted.",
+    );
+    db.session("s2", "discord", Some("discord:1"), None, start + 3600.0);
+    db.turn(
+        "s2",
+        start + 3600.0,
+        &format!("Big news: {cat_quote} yesterday."),
+        "Congratulations.",
+    );
+    drop(db);
+    let corpus = dir.private_path("corpus/main.jsonl");
+    assert_ok(&support::import(&dir, &state_db, &corpus));
+
+    // One reply for every call: each claim survives only in the turn that
+    // quotes it, the kitten changes something, and call 2 labels nothing.
+    let mut home = claim(hermes::HOME_SENTENCE, hermes::HOME_QUOTE, "fact");
+    home["claim"] = json!("c1");
+    home["labels"] = json!([]);
+    let mut cat = claim("Tim adopted a kitten called Miso.", cat_quote, "fact");
+    cat["changes_something"] = json!(true);
+    cat["claim"] = json!("c1");
+    cat["labels"] = json!([]);
+    let reply = json!({ "claims": [home, cat], "used_injected_ids": [], "operations": [] });
+    let steps: Vec<Value> = (0..64).map(|_| json!({ "reply": reply })).collect();
+    let script = dir.path("flagged-script.json");
+    fs::write(&script, serde_json::to_vec(&steps).unwrap()).unwrap();
+
+    let material_path = dir.private_path("labelling/material.json");
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "live",
+        PASSING_PROBES,
+        "live",
+        Some(&script),
+        &["--labelling", material_path.to_str().unwrap()],
+    );
+    assert_ok(&run.output);
+    let report = run.report();
+    let floors = report["tuning"]["reconcile"]["embedding_floors"]
+        .as_object()
+        .expect("the report embeds the reconcile floors");
+    assert_eq!(floors.len(), 1, "{floors:?}");
+    let floor = floors.values().next().unwrap().as_f64().unwrap();
+    let home_memory = report["memories"][0]["id"].as_str().unwrap().to_string();
+
+    let material: Value =
+        serde_json::from_slice(&fs::read(&material_path).expect("the material is written"))
+            .unwrap();
+    let flagged = material["call2"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|sample| sample["claim"] == "Tim adopted a kitten called Miso.")
+        .expect("the flagged claim's call 2 list is in the material");
+    let neighbour = candidates(flagged)
+        .iter()
+        .find(|candidate| candidate["memory"] == home_memory.as_str())
+        .expect("call 2 was shown the home memory for the flagged claim");
+    let score = neighbour["score"].as_f64().unwrap();
+    assert!(
+        score < floor,
+        "the shown neighbour scores {score}, below the reconcile floor {floor}"
+    );
+}
+
 // The precision curve (TIM-96, decision 6).
 
 fn precision(dir: &TestDir, labels: &Path, material: &Path) -> Output {

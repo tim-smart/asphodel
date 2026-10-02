@@ -86,6 +86,26 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         .as_deref()
         .map(|path| super::inside_private(&dir, path, "the labelling material"))
         .transpose()?;
+    let probes_path = args
+        .probes
+        .as_deref()
+        .map(|path| super::inside_private(&dir, path, "the probes file"))
+        .transpose()?;
+    if let Some(path) = &labelling_path {
+        let occupied = [
+            Some(&corpus_path),
+            Some(&cassette_path),
+            probes_path.as_ref(),
+            Some(&report_path),
+            aggregate_path.as_ref(),
+        ];
+        if occupied.into_iter().flatten().any(|other| path == other) {
+            bail!(
+                "--labelling {} collides with an input or output of this run",
+                path.display()
+            );
+        }
+    }
     let shadow_path = dir.join(SHADOW_FILE);
     super::refuse_symlink(&shadow_path)?;
 
@@ -98,11 +118,8 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             .context("a real-history replay needs the real models in ASPHODEL_MODEL_DIR")?
     };
     let group = if fake { Group::Ci } else { Group::Models };
-    let probes = match &args.probes {
-        Some(path) => {
-            let path = super::inside_private(&dir, path, "the probes file")?;
-            super::probes::load(&path, group)?
-        }
+    let probes = match &probes_path {
+        Some(path) => super::probes::load(path, group)?,
         None => Vec::new(),
     };
     let tuning = super::layered_tuning(args, None, &stem, fake)?;
