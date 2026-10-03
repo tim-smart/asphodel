@@ -44,6 +44,7 @@
           pkgs.openssl
           pkgs.sqlite
           pkgs.onnxruntime
+          pkgs.nodejs
           python
         ];
 
