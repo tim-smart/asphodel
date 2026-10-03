@@ -93,3 +93,43 @@ fn bench_refuses_a_private_dir_without_a_replayed_store() {
         stderr(&output)
     );
 }
+
+#[test]
+fn bench_accepts_explicit_config_without_environment_config() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    record(&dir, &corpus);
+    let config = dir.private_file("bench.toml", "[purge]\ndelta = \"never\"\n");
+    let output = asphodel(&dir)
+        .arg("bench")
+        .arg("--corpus")
+        .arg(&corpus)
+        .arg("--config")
+        .arg(&config)
+        .args(["--requests", "1", "--concurrency", "1"])
+        .output()
+        .unwrap();
+    assert_ok(&output);
+}
+
+#[test]
+fn bench_reports_the_daemon_error_after_binding() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    record(&dir, &corpus);
+    // The replay marker is still present, but opening the copied store must
+    // fail after serve has bound its listener, before health becomes ready.
+    fs::write(
+        dir.private().join("store/asphodel.db"),
+        b"not a SQLite database",
+    )
+    .unwrap();
+    let output = asphodel(&dir)
+        .arg("bench")
+        .arg("--corpus")
+        .arg(&corpus)
+        .args(["--requests", "1", "--concurrency", "1"])
+        .output()
+        .unwrap();
+    assert_refused(&output, "file is not a database");
+}
