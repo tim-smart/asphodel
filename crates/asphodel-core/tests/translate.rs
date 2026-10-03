@@ -6,8 +6,10 @@
 //! is synthetic, inserted directly.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use asphodel_core::Service;
 use asphodel_core::clock::SimulatedClock;
@@ -16,11 +18,12 @@ use asphodel_core::extraction::EDIT_REFINED;
 use asphodel_core::ingest::Turn;
 use asphodel_core::inspect::MemoryView;
 use asphodel_core::models::{
-    FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest, LlmResponse, Models,
+    Embedder, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest,
+    LlmResponse, ModelError, Models,
 };
 use asphodel_core::retrieval::RecallRequest;
 use asphodel_core::store::bank::BankIdentity;
-use asphodel_core::store::{DB_FILE, OpenOptions, Store, micros};
+use asphodel_core::store::{DB_FILE, OpenOptions, Store, VectorIndex, micros};
 use asphodel_core::translate::{TranslateError, Translation};
 use jiff::Timestamp;
 use rusqlite::types::FromSql;
@@ -72,9 +75,10 @@ impl Drop for TestDir {
 fn tuning(language: Option<&str>) -> Tuning {
     let mut toml = format!(
         "[injection.reranker_floors]\n\"{}\" = 0.0\n\
-         [reconcile.embedding_floors]\n\"{}\" = 0.5\n",
+         [reconcile.embedding_floors]\n\"{}\" = 0.5\n\"{}\" = 0.5\n",
         FakeReranker::MODEL_ID,
         FakeEmbedder::MODEL_ID,
+        FakeEmbedderV2::MODEL_ID,
     );
     if let Some(language) = language {
         toml.push_str(&format!("[llm]\nlanguage = \"{language}\"\n"));
@@ -118,6 +122,36 @@ impl Harness {
             Service::with_models(clock.clone(), store, tuning(language), Models::fake()).unwrap();
         service
             .ensure_bank_with_models("main", &identity())
+            .unwrap();
+        Self {
+            service,
+            clock,
+            dir,
+        }
+    }
+
+    /// A daemon restart on `current`, carrying `previous` for the banks
+    /// recorded under it.
+    fn restart_with(
+        self,
+        language: Option<&str>,
+        current: Arc<dyn Embedder>,
+        previous: Arc<dyn Embedder>,
+    ) -> Self {
+        let Harness {
+            service,
+            clock,
+            dir,
+        } = self;
+        drop(service);
+        let store = Store::open(&dir.data(), OpenOptions::default(), clock.clone()).unwrap();
+        let models = Models {
+            embedder: current,
+            reranker: Arc::new(FakeReranker),
+        };
+        let service = Service::with_models(clock.clone(), store, tuning(language), models)
+            .unwrap()
+            .with_previous_embedder(previous)
             .unwrap();
         Self {
             service,
@@ -513,4 +547,318 @@ fn a_memory_superseded_while_the_llm_answers_is_left_to_its_new_head() {
     assert_eq!(h.memories(), memories);
     assert_eq!(h.edits(EDIT_REFINED), 0);
     assert_eq!(h.show(refinement).chain.head, refinement);
+}
+
+// Concurrency with the bank's other writers
+
+/// Whether a translation has committed: its `memory_refined` edit says so.
+fn translation_committed(h: &Harness) -> bool {
+    h.one::<bool, _>(
+        "SELECT EXISTS (SELECT 1 FROM edits
+                        WHERE kind = ?1 AND json_extract(details, '$.translated_to') IS NOT NULL)",
+        [EDIT_REFINED],
+    )
+}
+
+/// Waits up to two seconds for a translation running on another thread to
+/// commit. A translation that has to wait for the bank never does, so the
+/// caller carries on either way.
+fn give_translation_a_chance(h: &Harness) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !translation_committed(h) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn rowid(h: &Harness, memory: Uuid) -> i64 {
+    h.one(
+        "SELECT id FROM memories WHERE uuid = ?1",
+        [memory.to_string()],
+    )
+}
+
+/// The stored vector of `memory`, as the index holds it.
+fn stored_vector(h: &Harness, memory: Uuid) -> Vec<u8> {
+    h.one(
+        "SELECT embedding FROM memory_vectors WHERE memory_id = ?1",
+        [rowid(h, memory)],
+    )
+}
+
+/// Which fake model made the stored vector of `memory`, embedding `text`.
+fn vector_model(h: &Harness, memory: Uuid, text: &str) -> &'static str {
+    let stored = stored_vector(h, memory);
+    if stored == vector_bytes(&FakeEmbedderV2, text) {
+        FakeEmbedderV2::MODEL_ID
+    } else if stored == vector_bytes(&FakeEmbedder, text) {
+        FakeEmbedder::MODEL_ID
+    } else {
+        "neither"
+    }
+}
+
+fn vector_bytes(embedder: &dyn Embedder, text: &str) -> Vec<u8> {
+    embedder.embed(&[text]).unwrap()[0]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+/// [`FakeEmbedderV2`] behind a gate, for a re-embed. Its first call is the
+/// job's step: while it runs, a memory is inserted below the job's cursor,
+/// so the step never reaches it and the swap has a tail to embed. The
+/// second call is the swap's tail, embedded after the swap has read what's
+/// unstaged and before its transaction: it says so and waits to be let go.
+struct Gate {
+    db: PathBuf,
+    calls: AtomicUsize,
+    paused: Mutex<Option<Sender<()>>>,
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+/// The rowid the tail memory takes, below the job's cursor.
+const TAIL_ROWID: i64 = 50;
+
+/// A rowid above every other memory, where the job's cursor ends up.
+const HIGH_ROWID: i64 = 100;
+
+impl Gate {
+    fn new(db: PathBuf) -> (Arc<Self>, Receiver<()>) {
+        let (paused, receiver) = mpsc::channel();
+        let gate = Arc::new(Self {
+            db,
+            calls: AtomicUsize::new(0),
+            paused: Mutex::new(Some(paused)),
+            open: Mutex::new(false),
+            opened: Condvar::new(),
+        });
+        (gate, receiver)
+    }
+
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+impl Embedder for Gate {
+    fn model_id(&self) -> &str {
+        FakeEmbedderV2.model_id()
+    }
+
+    fn dimensions(&self) -> usize {
+        FakeEmbedderV2.dimensions()
+    }
+
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                let conn = rusqlite::Connection::open(&self.db).unwrap();
+                conn.execute(
+                    "INSERT INTO memories (id, uuid, bank_id, content, kind, significance,
+                                           chunk_id, source_start, source_end, observed_at,
+                                           window_confidence, created_at, updated_at)
+                     SELECT ?1, ?2, bank_id, 'Sam walks to work.', kind, significance,
+                            chunk_id, source_start, source_end, observed_at,
+                            window_confidence, created_at, updated_at
+                     FROM memories WHERE id = ?3",
+                    (TAIL_ROWID, next_uuid().to_string(), HIGH_ROWID),
+                )
+                .unwrap();
+            }
+            1 => {
+                if let Some(paused) = self.paused.lock().unwrap().take() {
+                    let _ = paused.send(());
+                }
+                let mut open = self.open.lock().unwrap();
+                while !*open {
+                    open = self.opened.wait(open).unwrap();
+                }
+            }
+            _ => {}
+        }
+        FakeEmbedderV2.embed(texts)
+    }
+}
+
+#[test]
+fn a_translation_during_a_reembed_swap_is_embedded_with_the_new_model() {
+    // The swap embeds its tail outside the store lock, between reading what's
+    // unstaged and its transaction. A translation committed in that gap is in
+    // neither, so it has to wait for the swap and be embedded with the model
+    // the bank has after it, not keep the old model's vector.
+    let h = Harness::new(Some("English"));
+    let chunk = h.fixture_chunk();
+    let original = h.memory(chunk, RUSSIAN);
+    h.execute(
+        "INSERT INTO memories (id, uuid, bank_id, content, kind, significance, chunk_id,
+                               source_start, source_end, observed_at, window_confidence,
+                               created_at, updated_at)
+         SELECT ?2, ?3, bank_id, 'Sam reads before bed.', kind, significance, chunk_id,
+                source_start, source_end, observed_at, window_confidence,
+                created_at, updated_at
+         FROM memories WHERE uuid = ?1",
+        (original.to_string(), HIGH_ROWID, next_uuid().to_string()),
+    );
+    let (gate, paused) = Gate::new(h.dir.data().join(DB_FILE));
+    let h = h.restart_with(Some("English"), gate.clone(), Arc::new(FakeEmbedder));
+    h.service.start_reembed("main").unwrap();
+
+    let (outcome, reembedded) = std::thread::scope(|scope| {
+        let reembed = scope.spawn(|| h.service.run_reembed("main"));
+        paused
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the swap reaches its tail");
+        let translate = scope.spawn(|| {
+            h.translate(
+                original,
+                &FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]),
+            )
+        });
+        give_translation_a_chance(&h);
+        gate.open();
+        let reembedded = reembed.join().unwrap();
+        (translate.join().unwrap(), reembedded)
+    });
+
+    reembedded.unwrap();
+    let head = translated(outcome.unwrap());
+    assert_eq!(
+        h.one::<String, _>("SELECT embedding_model FROM banks WHERE name = 'main'", []),
+        FakeEmbedderV2::MODEL_ID
+    );
+    assert_eq!(
+        vector_model(&h, head, ENGLISH),
+        FakeEmbedderV2::MODEL_ID,
+        "the translation's vector is the bank's model's"
+    );
+}
+
+#[test]
+fn an_extraction_prepared_before_a_translation_cant_split_the_chain() {
+    // Extraction plans a refinement of the memory, then a translation of the
+    // same memory arrives before the plan commits. Whichever writes second
+    // has to see the first: the memory ends up with one successor and its
+    // chain with one head.
+    let h = Harness::new(Some("English"));
+    let chunk = h.fixture_chunk();
+    let before_work = "Sam drinks tea every morning before work.";
+    let original = h.memory(chunk, before_work);
+    let vector = FakeEmbedder.embed(&[before_work]).unwrap().remove(0);
+    let (bank_id, memory_id) = (h.bank_id(), rowid(&h, original));
+    let store = h.service.store().unwrap();
+    store
+        .vectors()
+        .upsert(&store.connection(), bank_id, memory_id, &vector)
+        .unwrap();
+
+    let green = "Sam drinks green tea every morning before work.";
+    h.service
+        .ingest_turn(
+            "main",
+            &Turn {
+                session_id: "s1".into(),
+                message_at: at("2026-10-01T06:30:00Z"),
+                timezone: Some(TZ.into()),
+                user_text: green.into(),
+                assistant_text: "Noted.".into(),
+                author: None,
+                platform: Some("cli".into()),
+                recall_id: None,
+                forget_requested: false,
+            },
+        )
+        .unwrap();
+    let call1 = json!({
+        "claims": [{
+            "content": green,
+            "kind": "fact",
+            "quote": "Sam drinks green tea every morning before work",
+            "significance": "minor",
+            "remember_this": false,
+            "changes_something": false,
+            "valid_from": null,
+            "valid_until": null,
+            "window_confidence": "high",
+            "until_event": null,
+            "due_at": null,
+            "volatility": null,
+            "recurrence_text": null,
+            "recurrence_rrule": null,
+            "recurrence_start": null,
+            "entities": [],
+        }],
+        "used_injected_ids": [],
+    });
+    let claimed = h
+        .service
+        .next_extraction("main")
+        .unwrap()
+        .expect("the turn is queued");
+    let input = h
+        .service
+        .call2_input(&claimed.lease, &call1, &claimed.in_context)
+        .unwrap()
+        .expect("the memory is a neighbour, so call 2 runs");
+    let neighbour = input
+        .neighbours
+        .iter()
+        .find(|neighbour| neighbour.memory == original)
+        .expect("the memory is a neighbour")
+        .handle
+        .clone();
+    let call2 = json!({"claims": [{
+        "claim": input.claims[0].handle,
+        "labels": [{"neighbour": neighbour, "label": "refines"}],
+    }]});
+    let prepared = h
+        .service
+        .prepare_extraction(
+            claimed.lease,
+            &FakeLlm::scripted("fake-llm", vec![call1, call2]),
+            &claimed.in_context,
+            &claimed.entries,
+        )
+        .unwrap();
+
+    let (outcome, extracted) = std::thread::scope(|scope| {
+        let translate = scope.spawn(|| {
+            h.translate(
+                original,
+                &FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]),
+            )
+        });
+        give_translation_a_chance(&h);
+        let extracted = h.service.commit_extraction(prepared);
+        (translate.join().unwrap(), extracted)
+    });
+
+    let refinement = extracted.unwrap().memories[0];
+    let heads: Vec<Uuid> = [
+        Some(refinement),
+        match &outcome {
+            Ok(Translation::Translated { to, .. }) => Some(*to),
+            _ => None,
+        },
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|memory| h.show(*memory).chain.head == *memory)
+    .collect();
+    assert_eq!(
+        heads.len(),
+        1,
+        "one head, not {heads:?}; translation {outcome:?}"
+    );
+    let head = heads[0];
+    assert_eq!(h.show(original).chain.head, head);
+    assert!(
+        h.show(head)
+            .chain
+            .members
+            .iter()
+            .any(|member| member.id == original),
+        "the head inherits the memory's accesses"
+    );
 }
