@@ -118,10 +118,10 @@ endpoint = "https://api.openai.com/v1"    # or: auth = "chatgpt" and no endpoint
 "bge-small-en-v1.5:int8" = 0.8
 
 [injection.reranker_floors]
-"jina-reranker-v1-turbo-en:int8" = 0.0
+"ms-marco-MiniLM-L-6-v2:int8" = 3.0
 
 [ranking.relevance_scales]
-"jina-reranker-v1-turbo-en:int8" = 1.0
+"ms-marco-MiniLM-L-6-v2:int8" = 3.564211
 ```
 
 **Stop here and get approval.** Then one of:

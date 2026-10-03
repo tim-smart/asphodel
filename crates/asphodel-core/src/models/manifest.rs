@@ -4,8 +4,8 @@
 //!
 //! Both models are pinned to a Hugging Face revision, so a repository
 //! update can't change what the daemon runs, and every file carries the
-//! SHA-256 of its bytes, verified on 2026-10-01 against the repositories'
-//! LFS metadata and a download.
+//! SHA-256 of its bytes, verified against the repositories' LFS metadata
+//! and a download: bge-small on 2026-10-01, the reranker on 2026-10-03.
 //!
 //! [`Models::load`]: super::Models::load
 
@@ -14,9 +14,9 @@
 /// records: int8 and fp32 give different scores.
 pub const EMBEDDING_MODEL_ID: &str = "bge-small-en-v1.5:int8";
 
-/// jina-reranker-v1-turbo-en, int8. Keys the gate
-/// floor.
-pub const RERANKER_MODEL_ID: &str = "jina-reranker-v1-turbo-en:int8";
+/// ms-marco-MiniLM-L-6-v2, int8. Keys the gate floor and the relevance
+/// scale.
+pub const RERANKER_MODEL_ID: &str = "ms-marco-MiniLM-L-6-v2:int8";
 
 /// The files every model needs: the ONNX graph and the four tokenizer
 /// files fastembed loads a user-defined model from.
@@ -32,10 +32,12 @@ pub const MODEL_FILES: [&str; 5] = [
 const EMBEDDING_REPO: &str = "Xenova/bge-small-en-v1.5";
 const EMBEDDING_REVISION: &str = "ea104dacec62c0de699686887e3f920caeb4f3e3";
 
-/// `jinaai/jina-reranker-v1-turbo-en`. Its `onnx/model_int8.onnx` and
-/// `onnx/model_quantized.onnx` are the same bytes.
-const RERANKER_REPO: &str = "jinaai/jina-reranker-v1-turbo-en";
-const RERANKER_REVISION: &str = "b8c14f4e723d9e0aab4732a7b7b93741eeeb77c2";
+/// `Xenova/ms-marco-MiniLM-L-6-v2`, the ONNX export of
+/// `cross-encoder/ms-marco-MiniLM-L-6-v2`. Its tokenizer is bge-small's, so
+/// `tokenizer.json` and `special_tokens_map.json` share bge-small's
+/// checksums.
+const RERANKER_REPO: &str = "Xenova/ms-marco-MiniLM-L-6-v2";
+const RERANKER_REVISION: &str = "a09144355adeed5f58c8ed011d209bf8ee5a1fec";
 
 /// One file of a model: where it goes under the model's directory, where
 /// `models fetch` gets it, and the SHA-256 of its bytes.
@@ -75,16 +77,16 @@ pub fn manifest() -> Vec<ModelSpec> {
         ),
         spec(
             RERANKER_MODEL_ID,
-            "jina-reranker-v1-turbo-en-int8",
+            "ms-marco-MiniLM-L-6-v2-int8",
             RERANKER_REPO,
             RERANKER_REVISION,
             [
-                // 38,295,104 bytes: int8 (`model_quantized.onnx`).
-                "3defdef1ae34e119bd704216087743e79665934c96aebabcb6077c239dc3ae66",
-                "0046da43cc8c424b317f56b092b0512aaaa65c4f925d2f16af9d9eeb4d0ef902",
-                "e050ff6a15ae9295e84882fa0e98051bd8754856cd5201395ebf00ce9f2d609b",
-                "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
-                "d291c6652d96d56ffdbcf1ea19d9bae5ed79003f7648c627e725a619227ce8fa",
+                // 23,143,499 bytes: dynamic int8 (`model_quantized.onnx`).
+                "e9d8ebf845c413e981c175bfe49a3bfa9b3dcce2a3ba54875ee5df5a58639fbe",
+                "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+                "d827779a72d27ae68cf878a6fc2e954542663fe21ca515d9f4783fc96be2d37e",
+                "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+                "0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53",
             ],
         ),
     ]

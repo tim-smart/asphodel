@@ -101,15 +101,20 @@ The tuning file is TOML, and every key in it is optional except three kinds:
   one model.
 - A floor for each local model the daemon runs:
   `reconcile.embedding_floors."bge-small-en-v1.5:int8"` and
-  `injection.reranker_floors."jina-reranker-v1-turbo-en:int8"`. They're set
+  `injection.reranker_floors."ms-marco-MiniLM-L-6-v2:int8"`. They're set
   in replay from labelled history (`docs/replay.md`, "Labelling and the
   precision curve"), and the daemon refuses to start without them.
 - A relevance scale for the reranker:
-  `ranking.relevance_scales."jina-reranker-v1-turbo-en:int8" = 1.0`. The
+  `ranking.relevance_scales."ms-marco-MiniLM-L-6-v2:int8" = 3.564211`. The
   score divides the reranker's logit by it, so a reranker with a wider
   logit range doesn't drown out strength, state confidence and phase,
-  whose weights were sized for jina. The gate floor still compares the raw
-  logit. The daemon refuses to start without one for the loaded reranker.
+  whose weights were sized for jina-reranker-v1-turbo-en int8. The scale
+  is the standard deviation of the new reranker's logits divided by
+  jina's, both taken over every candidate in the same pools. 3.564211 was
+  measured on the 69-query eval pools; the replay labelling pools give a
+  different ratio (2.17), so a re-measure states which pools it used. The
+  gate floor still compares the raw logit. The daemon refuses to start
+  without one for the loaded reranker.
   Like the floors, the relevance scale is keyed by the exact model string,
   quantisation included, with no fallback.
 
