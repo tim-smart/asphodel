@@ -256,8 +256,15 @@ fn the_html_report_is_refused_outside_the_private_dir() {
 /// say where Tim lives, so the second's claim lands on the first's memory
 /// and call 2 runs. The rest ask a question that either shares a word with
 /// that memory ("Auckland") or none, so the material holds candidates on
-/// both sides of the fake reranker's gate floor (0.0).
+/// both sides of the fake reranker's gate floor (0.0). The questions come
+/// as Hermes hands them over in a shared Discord thread: with the speaker's
+/// `[Name] ` prefix, and every other one after the message-id note.
 const TURNS: usize = 60;
+
+/// The note Hermes' Discord gateway puts in front of a turn's message, with
+/// a synthetic message id.
+const DISCORD_NOTE: &str = "[Triggering message id: `100000000000000001` \u{2014} use as \
+                            `message_id` for reply/react/pin via the discord tools.]";
 
 fn labelling_history(dir: &TestDir) -> PathBuf {
     let state_db = dir.private_path("state.db");
@@ -270,8 +277,8 @@ fn labelling_history(dir: &TestDir) -> PathBuf {
         let user = match turn {
             0 => format!("{}, near the harbour.", hermes::HOME_QUOTE),
             1 => format!("{} still.", hermes::HOME_QUOTE),
-            n if n % 2 == 0 => format!("Is Auckland sunny today, question {n}?"),
-            n => format!("What is on the radio, question {n}?"),
+            n if n % 2 == 0 => format!("[Sam] Is Auckland sunny today, question {n}?"),
+            n => format!("{DISCORD_NOTE}\n\n[Sam] What is on the radio, question {n}?"),
         };
         db.turn(&session, at, &user, "Noted.");
     }
@@ -338,8 +345,9 @@ fn assert_candidate_shape(candidate: &Value, ids: &mut BTreeSet<String>) {
 /// candidates are scored with the reranker logit the gate floor compares,
 /// including those the gate turned away, since a floor can't be calibrated
 /// from what it already let through; call 2's with the similarity the
-/// reconcile floor compares. Writing it doesn't change the run, the same
-/// run writes the same bytes, and `report precision` reads it.
+/// reconcile floor compares. Each sample shows the raw query and the
+/// cleaned one the reranker scored. Writing it doesn't change the run, the
+/// same run writes the same bytes, and `report precision` reads it.
 #[test]
 fn labelling_material_holds_scored_candidates_at_50_turns_and_call2_lists() {
     let dir = TestDir::new();
@@ -418,8 +426,17 @@ fn labelling_material_holds_scored_candidates_at_50_turns_and_call2_lists() {
     assert_eq!(turns.len(), 50, "each sample is a different turn");
     let mut below_floor = 0;
     let mut on_home = 0;
+    let mut noted = 0;
     for sample in recall {
         let query = sample["query"].as_str().expect("a sample's query");
+        let raw = sample["raw_query"].as_str().expect("a sample's raw query");
+        if raw.starts_with("[Sam] ") || raw.starts_with(DISCORD_NOTE) {
+            let message = raw.rsplit_once("[Sam] ").unwrap().1;
+            assert_eq!(query, message, "the cleaned query for {raw:?}");
+            noted += usize::from(raw.starts_with(DISCORD_NOTE));
+        } else {
+            assert_eq!(query, raw, "a turn with no prefix is its own query");
+        }
         for candidate in candidates(sample) {
             assert_candidate_shape(candidate, &mut ids);
             let sentence = candidate["sentence"].as_str().unwrap();
@@ -438,6 +455,7 @@ fn labelling_material_holds_scored_candidates_at_50_turns_and_call2_lists() {
             }
         }
     }
+    assert!(noted > 0, "a sampled turn carries the message-id note");
     assert!(on_home > 0, "the home memory is a recall candidate");
     assert!(
         below_floor > 0,
