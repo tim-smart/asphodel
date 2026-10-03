@@ -676,6 +676,24 @@ for the token and sends it on every `/v1` call it makes, which need it like
 any other client. Browsing never goes through recall, so looking at a
 memory doesn't strengthen it or log a recall.
 
+It also shows each bank's counts, the `attention` lines from `status` as a
+banner, failed chunks with retry, and the purge pause with its
+acknowledgement. Retract, forget, document removal and the purge
+acknowledgement each ask first and say what will go.
+
+A daemon on loopback without a token is browsed without asking. Otherwise
+the dashboard asks once per browser tab, keeps the token in that tab's
+session storage, and asks again if the daemon rejects it. "Sign out" drops
+it. The page sends a Content-Security-Policy that allows nothing from
+outside the daemon.
+
+The dashboard is plain ES modules and CSS under
+`crates/asphodel/assets/dashboard/`, embedded in the binary as they are:
+there is no build step and nothing to install. Its serif is Source Serif 4,
+Adobe's woff2 release files unmodified, served from the daemon under the SIL
+Open Font License (`OFL.txt` beside them, also at `/dashboard/OFL.txt`). Node runs its tests only:
+`cd tests/dashboard && nix develop ../.. -c sh -c 'npm ci && npm test'`.
+
 ## Deleting a bank
 
 `asphodel bank delete <bank> --confirm <bank>` erases everything in the bank

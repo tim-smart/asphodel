@@ -1,0 +1,11 @@
+{
+  "name": "asphodel-dashboard-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "jsdom": "^30.1.1"
+  }
+}

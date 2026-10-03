@@ -131,6 +131,7 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/v1/health", get(health))
         .route("/dashboard", get(super::dashboard::page))
         .route("/dashboard/", get(super::dashboard::page))
+        .route("/dashboard/{file}", get(super::dashboard::asset))
         .merge(authorized)
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))

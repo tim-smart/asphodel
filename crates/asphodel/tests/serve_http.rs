@@ -2511,6 +2511,16 @@ fn an_older_backup_restores_into_a_new_data_dir_and_migrates_with_a_copy() {
 // is no `DELETE` route for documents.
 // - `GET /dashboard` is served without the token, since the page holds
 // nothing; every route it calls needs the token like any other.
+// - The page's module script, and every module it imports as "./name.js",
+// is served without the token from `/dashboard/`, as JavaScript, byte for
+// byte as it is in `assets/dashboard/`: there is no build step. One of
+// them is `app.js`, the module `tests/dashboard` drives.
+// - The serif is self-hosted: the page's stylesheet declares at least one
+// `@font-face`, used by a `font-family` stack, whose every `url()` is a
+// woff2 file served from `/dashboard/` without the token, byte for byte,
+// with an `OFL.txt` beside it in the repo. The page's CSP allows fonts from
+// the daemon and nowhere else, and keeps `default-src 'none'` and
+// `script-src 'self'`.
 
 impl Daemon {
     /// `POST /v1/banks/{bank}/documents/remove` for `document`.
@@ -2673,6 +2683,202 @@ fn off_loopback_the_dashboard_page_is_open_and_its_routes_need_the_token() {
             );
         }
     }
+}
+
+#[test]
+fn the_dashboard_scripts_are_served_unbuilt_without_the_token() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).bind();
+    daemon.wait_ready();
+    let addr = daemon.addr.clone();
+
+    let page = request(&addr, "GET", "/dashboard", None, None).unwrap();
+    let script = module_script(&page.body)
+        .unwrap_or_else(|| panic!("no <script type=\"module\" src=...>: {}", page.body));
+    assert!(
+        script.starts_with("/dashboard/"),
+        "{script} must resolve the same from /dashboard and /dashboard/"
+    );
+
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let mut pending = vec![script];
+    let mut served = Vec::new();
+    while let Some(path) = pending.pop() {
+        if served.contains(&path) {
+            continue;
+        }
+        let reply = request(&addr, "GET", &path, None, None).unwrap();
+        assert_eq!(reply.status, 200, "{path}: {}", reply.body);
+        assert!(
+            reply.headers.contains("content-type: text/javascript"),
+            "{path}: {}",
+            reply.headers
+        );
+        let file = assets.join(path.trim_start_matches('/'));
+        let on_disk = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("{path} isn't {}: {error}", file.display()));
+        assert!(
+            reply.body == on_disk,
+            "{path} differs from {}",
+            file.display()
+        );
+        let base = &path[..=path.rfind('/').unwrap()];
+        pending.extend(relative_imports(&reply.body).map(|import| format!("{base}{import}")));
+        served.push(path);
+    }
+    assert!(
+        served.iter().any(|path| path == "/dashboard/app.js"),
+        "{served:?}"
+    );
+}
+
+/// The `src` of the page's first `<script type="module">`.
+fn module_script(html: &str) -> Option<String> {
+    let tag = html
+        .split("<script")
+        .skip(1)
+        .map(|rest| &rest[..rest.find('>').unwrap_or(rest.len())])
+        .find(|tag| tag.contains("type=\"module\""))?;
+    let src = &tag[tag.find("src=\"")? + 5..];
+    Some(src[..src.find('"')?].to_string())
+}
+
+/// The `./name.js` modules a module imports, by name.
+fn relative_imports(module: &str) -> impl Iterator<Item = String> + '_ {
+    module.match_indices("\"./").filter_map(|(at, _)| {
+        let rest = &module[at + 3..];
+        let name = &rest[..rest.find('"')?];
+        name.ends_with(".js").then(|| name.to_string())
+    })
+}
+
+#[test]
+fn the_dashboard_serif_is_self_hosted_under_a_strict_font_policy() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).bind();
+    daemon.wait_ready();
+    let addr = daemon.addr.clone();
+
+    let page = request(&addr, "GET", "/dashboard", None, None).unwrap();
+    let policy = page
+        .headers
+        .lines()
+        .find_map(|line| line.strip_prefix("content-security-policy:"))
+        .unwrap_or_else(|| panic!("no CSP on the page: {}", page.headers))
+        .trim();
+    let directive = |name: &str| {
+        policy
+            .split(';')
+            .map(str::trim)
+            .find_map(|part| part.strip_prefix(name))
+            .map(str::trim)
+    };
+    assert_eq!(directive("default-src "), Some("'none'"), "{policy}");
+    assert_eq!(directive("script-src "), Some("'self'"), "{policy}");
+    assert_eq!(directive("font-src "), Some("'self'"), "{policy}");
+
+    let sheet = stylesheet(&page.body)
+        .unwrap_or_else(|| panic!("no <link rel=\"stylesheet\" href=...>: {}", page.body));
+    let css = request(&addr, "GET", &sheet, None, None).unwrap();
+    assert_eq!(css.status, 200, "{sheet}: {}", css.body);
+    let (faces, rest) = font_faces(&css.body);
+    assert!(
+        !faces.is_empty(),
+        "{sheet} declares no @font-face: the serif must be self-hosted"
+    );
+
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    for (family, urls) in &faces {
+        assert!(!urls.is_empty(), "@font-face {family} has no url()");
+        assert!(
+            rest.contains(family.as_str()),
+            "{family} is declared but no font-family uses it"
+        );
+        for url in urls {
+            assert!(!url.contains(".."), "{url} climbs out of /dashboard/");
+            let path = if url.starts_with('/') {
+                url.clone()
+            } else {
+                let base = &sheet[..=sheet.rfind('/').unwrap()];
+                format!("{base}{}", url.trim_start_matches("./"))
+            };
+            assert!(
+                path.starts_with("/dashboard/"),
+                "{url} isn't served by the daemon"
+            );
+            let reply = request_raw(&addr, "GET", &path);
+            assert_eq!(reply.status, 200, "{path}");
+            assert!(
+                reply.headers.contains("content-type: font/woff2"),
+                "{path}: {}",
+                reply.headers
+            );
+            let file = assets.join(path.trim_start_matches('/'));
+            let on_disk = fs::read(&file)
+                .unwrap_or_else(|error| panic!("{path} isn't {}: {error}", file.display()));
+            assert!(
+                reply.body == on_disk,
+                "{path} differs from {}",
+                file.display()
+            );
+            let license = file.with_file_name("OFL.txt");
+            let text = fs::read_to_string(&license)
+                .unwrap_or_else(|error| panic!("no license at {}: {error}", license.display()));
+            assert!(
+                text.contains("SIL OPEN FONT LICENSE"),
+                "{} isn't the OFL",
+                license.display()
+            );
+        }
+    }
+}
+
+/// The `href` of the page's first `<link rel="stylesheet">`.
+fn stylesheet(html: &str) -> Option<String> {
+    let tag = html
+        .split("<link")
+        .skip(1)
+        .map(|rest| &rest[..rest.find('>').unwrap_or(rest.len())])
+        .find(|tag| tag.contains("rel=\"stylesheet\""))?;
+    let href = &tag[tag.find("href=\"")? + 6..];
+    Some(href[..href.find('"')?].to_string())
+}
+
+/// Each `@font-face` in `css` as its family and `url()`s, and the rest of
+/// the sheet with the faces taken out.
+fn font_faces(css: &str) -> (Vec<(String, Vec<String>)>, String) {
+    let mut faces = Vec::new();
+    let mut rest = String::new();
+    let mut remaining = css;
+    while let Some(at) = remaining.find("@font-face") {
+        rest.push_str(&remaining[..at]);
+        let block = &remaining[at..];
+        let end = block.find('}').map_or(block.len(), |end| end + 1);
+        let face = &block[..end];
+        let family = face
+            .split_once("font-family:")
+            .map(|(_, value)| value[..value.find(';').unwrap_or(value.len())].trim())
+            .unwrap_or_default()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string();
+        let urls = face
+            .match_indices("url(")
+            .filter_map(|(at, _)| {
+                let inner = &face[at + 4..];
+                let inner = &inner[..inner.find(')')?];
+                Some(
+                    inner
+                        .trim()
+                        .trim_matches(|c| c == '"' || c == '\'')
+                        .to_string(),
+                )
+            })
+            .collect();
+        faces.push((family, urls));
+        remaining = &block[end..];
+    }
+    rest.push_str(remaining);
+    (faces, rest)
 }
 
 #[test]
