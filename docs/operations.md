@@ -110,6 +110,8 @@ The tuning file is TOML, and every key in it is optional except three kinds:
   logit range doesn't drown out strength, state confidence and phase,
   whose weights were sized for jina. The gate floor still compares the raw
   logit. The daemon refuses to start without one for the loaded reranker.
+  Like the floors, the relevance scale is keyed by the exact model string,
+  quantisation included, with no fallback.
 
 `[llm] concurrency` (default 1) is how many LLM calls may be in flight at
 once across the daemon, refreshes included, and how many chunks each bank
