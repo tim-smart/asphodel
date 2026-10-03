@@ -21,10 +21,18 @@
   --lethe: #4d6382;
   --lethe-soft: #e2e8f1;
 
-  /* The ink of a memory, by how close it is to fading. */
+  /* Pill text, a step darker than the accents so small type keeps its
+     contrast on the tinted backgrounds. */
+  --stem-ink: #345c48;
+  --lethe-ink: #3e536f;
+  --pollen-ink: #6e4c00;
+  --vein-ink: #7d3249;
+
+  /* The ink of a memory, by how close it is to fading. Each step stays at
+     AA on the paper. */
   --ink-far: var(--ink);
-  --ink-near: #34413a;
-  --ink-soon: #4a5750;
+  --ink-near: var(--ink-2);
+  --ink-soon: var(--ink-3);
   --ink-faded: #5f6b72;
 
   --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "TeX Gyre Pagella", "URW Palladio L", P052, "Book Antiqua", Georgia, "Noto Serif", "DejaVu Serif", serif;
@@ -43,7 +51,7 @@
     --ink: #e3e9e5;
     --ink-2: #bcc6c0;
     --ink-3: #96a29c;
-    --rule: #2e3833;
+    --rule: #3a4540;
     --stem: #82bb9d;
     --stem-soft: #213129;
     --vein: #e597ab;
@@ -52,8 +60,10 @@
     --pollen-soft: #352b12;
     --lethe: #9ab0cf;
     --lethe-soft: #1f2936;
-    --ink-near: #ccd5d0;
-    --ink-soon: #b1bcb6;
+    --stem-ink: var(--stem);
+    --lethe-ink: var(--lethe);
+    --pollen-ink: var(--pollen);
+    --vein-ink: var(--vein);
     --ink-faded: #98a4ab;
   }
 }
@@ -134,6 +144,10 @@ code,
 time,
 .num {
   font-variant-numeric: tabular-nums;
+}
+
+time {
+  white-space: nowrap;
 }
 
 button {
@@ -281,12 +295,12 @@ label {
   display: inline-flex;
   gap: 0.75rem;
   color: var(--ink-3);
-  font-family: var(--mono);
   font-size: 0.95rem;
 }
 
 .bank-name {
   color: var(--ink);
+  font-weight: 600;
 }
 
 .sign-out {
@@ -424,13 +438,13 @@ label {
 
 .pill {
   display: inline-block;
-  font: 600 0.72rem/1.5 var(--sans);
+  font: 600 0.75rem/1.5 var(--sans);
   letter-spacing: 0.03em;
   text-transform: lowercase;
   padding: 0.05rem 0.5rem;
   border-radius: 999px;
   background: var(--stem-soft);
-  color: var(--stem);
+  color: var(--stem-ink);
   white-space: nowrap;
 }
 
@@ -439,7 +453,7 @@ label {
 .pill[data-tone="failed"],
 .pill[data-tone="gone"] {
   background: var(--vein-soft);
-  color: var(--vein);
+  color: var(--vein-ink);
 }
 
 .pill[data-tone="superseded"],
@@ -447,13 +461,13 @@ label {
 .pill[data-tone="dropped"],
 .pill[data-tone="kind"] {
   background: var(--lethe-soft);
-  color: var(--lethe);
+  color: var(--lethe-ink);
 }
 
 .pill[data-tone="queued"],
 .pill[data-tone="in_flight"] {
   background: var(--pollen-soft);
-  color: var(--pollen);
+  color: var(--pollen-ink);
 }
 
 .meta {
@@ -554,7 +568,7 @@ label {
 
 .bank-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 22rem), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 26rem), 1fr));
   gap: var(--gap);
 }
 
@@ -564,7 +578,7 @@ label {
 }
 
 .bank h2 {
-  font: 600 1.35rem var(--mono);
+  font: 650 1.3rem var(--sans);
   letter-spacing: -0.01em;
 }
 
@@ -591,7 +605,7 @@ label {
 .count-group dl {
   margin: 0.35rem 0 0;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(5.25rem, 1fr));
   gap: 0.5rem 1rem;
 }
 
@@ -638,7 +652,7 @@ label {
 }
 
 .daemon {
-  max-width: 28rem;
+  max-width: 26rem;
 }
 
 /* The memory list */
@@ -652,6 +666,20 @@ label {
 
 .toolbar select {
   width: 100%;
+}
+
+/* The search and each select share one shape, so their labels line up. */
+.toolbar .field,
+.toolbar .search {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.25rem;
+  align-content: end;
+  min-width: 0;
+}
+
+.toolbar label {
+  margin: 0;
 }
 
 .search-row {
@@ -706,7 +734,7 @@ label {
 
 .memory {
   display: grid;
-  grid-template-columns: 1fr minmax(15rem, auto);
+  grid-template-columns: minmax(0, 1fr) 22rem;
   grid-template-areas:
     "sentence fade"
     "meta fade";
@@ -731,10 +759,11 @@ label {
   grid-area: meta;
 }
 
+/* A fixed, left-aligned column, so the gauges stack in one line. */
 .memory .fade {
   grid-area: fade;
   align-self: center;
-  justify-self: end;
+  justify-self: start;
 }
 
 /* The ink pales as the memory nears its fade. */
@@ -917,7 +946,7 @@ details.panel > summary {
 
 .source-text {
   margin: 0;
-  font: 0.9rem/1.6 var(--mono);
+  font: 1rem/1.6 var(--sans);
   white-space: pre-wrap;
   word-break: break-word;
   max-height: 32rem;

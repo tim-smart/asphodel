@@ -134,7 +134,7 @@ async function banks(ctx) {
           "button",
           {
             type: "button",
-            class: "danger",
+            class: "danger-outline",
             onclick: async () => {
               const confirmed = await ctx.confirm({
                 title: "Resume purge?",
@@ -410,11 +410,7 @@ async function memories(ctx) {
             filtered ? ["No memories match these filters. ", h("a", { href: bankHash(bank, "memories") }, "Clear the filters")] : "This bank has no memories yet.",
           ),
       cursor ? more : null,
-      h(
-        "p",
-        { class: "footnote" },
-        "Fade dates assume a memory isn't used again. Bank time only moves while the bank is in use, so each date is the soonest it can come.",
-      ),
+      h("p", { class: "footnote" }, FADE_BASIS),
     ],
   };
 }
@@ -423,8 +419,25 @@ const GUARDS = {
   purge_disabled: "Purge is turned off (no δ is set).",
   purge_paused: "Purge is paused until the new deletion settings are acknowledged.",
   forgotten: "It's being forgotten; the erase removes it instead.",
-  strength: "The chain's head is still above the purge line.",
+  strength: "Its strength is above the purge line.",
 };
+
+/// What the fade and purge dates mean, wherever they're shown.
+const FADE_BASIS =
+  "Fade dates assume a memory isn't used again. Bank time only moves while the bank is in use, so each date is the soonest it can come.";
+
+/// A strength figure, with a real minus sign.
+function figure(value) {
+  return value === null || value === undefined ? "—" : value.toFixed(2).replace("-", "−");
+}
+
+/// A date-only value such as "2026-09-30", formatted without shifting it
+/// through the reader's time zone.
+const dayFormat = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
+function day(value) {
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T00:00:00Z`) : null;
+  return date && !Number.isNaN(date.getTime()) ? dayFormat.format(date) : value;
+}
 
 function guardText(ui, guard) {
   if (guard.guard === "date_ahead") return ["Its start or end date hasn't passed yet (", ui.time(guard.until), ")."];
@@ -614,7 +627,7 @@ async function memory(ctx) {
           !view.projection.purge && view.purge.guards.length
             ? h("ul", { class: "guards" }, view.purge.guards.map((g) => h("li", {}, guardText(ui, g))))
             : null,
-          h("p", { class: "footnote" }, `${capitalize(view.projection.basis)}.`),
+          h("p", { class: "footnote" }, FADE_BASIS),
         ),
       ),
       h(
@@ -669,8 +682,8 @@ async function memory(ctx) {
             h(
               "dl",
               { class: "facts" },
-              h("div", {}, h("dt", {}, "Now"), h("dd", {}, strength.value === null ? "—" : strength.value.toFixed(2))),
-              h("div", {}, h("dt", {}, "Recall finds it below"), h("dd", {}, strength.threshold.toFixed(2))),
+              h("div", {}, h("dt", {}, "Now"), h("dd", {}, figure(strength.value))),
+              h("div", {}, h("dt", {}, "Recall threshold"), h("dd", {}, figure(strength.threshold))),
               h("div", {}, h("dt", {}, "Recallable"), h("dd", {}, strength.recallable ? "Yes" : "No")),
               h("div", {}, h("dt", {}, "Occasions used"), h("dd", {}, String(strength.occasions))),
               h("div", {}, h("dt", {}, "Observed"), h("dd", {}, time(view.observed_at, { withTime: true }))),
@@ -905,7 +918,7 @@ async function source(ctx) {
             h("span", {}, "ingested ", time(s.ingested_at, { withTime: true })),
             s.platform ? h("span", {}, s.platform) : null,
             s.author_name ? h("span", {}, s.author_name) : null,
-            s.reference_date ? h("span", {}, `dated ${s.reference_date}`) : null,
+            s.reference_date ? h("span", {}, `dated ${day(s.reference_date)}`) : null,
           ]),
         ),
       ),

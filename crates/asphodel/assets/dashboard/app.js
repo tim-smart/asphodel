@@ -98,6 +98,12 @@ export function mount(root, { fetch }) {
     root.replaceChildren(h("div", { class: "shell" }, skip, header, banner, main));
   }
 
+  /// The daemon writes commands in its attention lines between backticks;
+  /// they're shown as code, without the backticks.
+  function codeSpans(line) {
+    return line.split("`").map((part, i) => (i % 2 ? h("code", {}, part) : part));
+  }
+
   function flower() {
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", "-12 -12 24 24");
@@ -127,7 +133,7 @@ export function mount(root, { fetch }) {
             "section",
             { class: "attention", role: "status", "aria-label": "Needs attention" },
             h("p", { class: "attention-title" }, "Needs attention"),
-            h("ul", {}, lines.map((line) => h("li", {}, line))),
+            h("ul", {}, lines.map((line) => h("li", {}, codeSpans(line)))),
           )
         : "",
     );
