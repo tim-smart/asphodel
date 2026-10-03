@@ -1,0 +1,52 @@
+name = "dated-event-reminder"
+group = "ci"
+description = "A reminder expires when its dated event passes; an undated task stays on the agenda."
+
+[bank]
+timezone = "UTC"
+
+[[turn]]
+at = "2026-02-09T09:00:00Z"
+session = "reminders"
+user = "Remind me to bring my insurance card to the dentist appointment on 10 February at 2pm. I also need to organise the garage, with no deadline."
+assistant = "Noted both tasks."
+
+[[turn.claim]]
+label = "dentist-reminder"
+content = "Tim needs to bring his insurance card to the dentist appointment on 2026-02-10 at 14:00."
+quote = "Remind me to bring my insurance card to the dentist appointment on 10 February at 2pm"
+kind = "task"
+significance = "minor"
+due_at = { at = "2026-02-10T14:00", precision = "minute" }
+valid_until = { at = "2026-02-10T14:00", precision = "minute" }
+
+[[turn.claim]]
+label = "garage-task"
+content = "Tim needs to organise the garage, with no deadline."
+quote = "I also need to organise the garage, with no deadline"
+kind = "task"
+significance = "minor"
+
+[[probe]]
+id = "dated-reminder-before-event"
+at = "2026-02-10T13:59:00Z"
+kind = "agenda_has"
+memory = "dentist-reminder"
+
+[[probe]]
+id = "undated-task-before-event"
+at = "2026-02-10T13:59:00Z"
+kind = "agenda_has"
+memory = "garage-task"
+
+[[probe]]
+id = "dated-reminder-expires-after-event"
+at = "2026-02-10T14:01:00Z"
+kind = "agenda_lacks"
+memory = "dentist-reminder"
+
+[[probe]]
+id = "undated-task-after-event"
+at = "2026-02-10T14:01:00Z"
+kind = "agenda_has"
+memory = "garage-task"
