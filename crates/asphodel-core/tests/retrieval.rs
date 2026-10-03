@@ -26,8 +26,8 @@ use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, ModelError, Models, Reranker,
 };
 use asphodel_core::retrieval::{
-    Band, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, effective_query,
-    estimate_tokens, fuse, phase_term,
+    Band, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, clean_query,
+    effective_query, estimate_tokens, fuse, phase_term,
 };
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::{OpenOptions, Store, VectorIndex, micros};
@@ -241,12 +241,23 @@ impl Harness {
     }
 
     /// `injection` is extra keys for `[injection]`, and `rest` extra
-    /// sections.
+    /// sections. The relevance scale is 1.0.
     fn with(floor: f64, extra: &str, reranker: Arc<dyn Reranker>) -> Self {
+        Self::with_scaled(floor, 1.0, extra, reranker)
+    }
+
+    /// A gate floor of `floor` and a relevance scale of `scale` for the
+    /// fake reranker.
+    fn with_scale(floor: f64, scale: f64) -> Self {
+        Self::with_scaled(floor, scale, "", Arc::new(FakeReranker))
+    }
+
+    fn with_scaled(floor: f64, scale: f64, extra: &str, reranker: Arc<dyn Reranker>) -> Self {
         let (injection, rest) = extra.split_once("\n---\n").unwrap_or((extra, ""));
         let tuning = Tuning::from_toml(&format!(
             "[injection]\n{injection}\n\
              [injection.reranker_floors]\n\"{}\" = {floor:?}\n\
+             [ranking.relevance_scales]\n\"{0}\" = {scale:?}\n\
              [reconcile.embedding_floors]\n\"{}\" = 0.5\n{rest}",
             FakeReranker::MODEL_ID,
             FakeEmbedder::MODEL_ID,
@@ -522,6 +533,20 @@ impl Harness {
             .unwrap()
     }
 
+    /// A recall row's cleaned query and the raw query it was cleaned from.
+    fn recall_queries(&self, recall_id: Uuid) -> (String, Option<String>) {
+        self.service
+            .store()
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT query, raw_query FROM recalls WHERE uuid = ?1",
+                [recall_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
     /// A recall's results, best rank first: memory and whether injected.
     fn results(&self, recall_id: Uuid) -> Vec<(Uuid, bool)> {
         let store = self.service.store().unwrap();
@@ -540,6 +565,17 @@ impl Harness {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    /// The score a recall logged for `memory`.
+    fn score(&self, recall_id: Uuid, memory: Uuid) -> f64 {
+        self.one::<Option<f64>, _>(
+            "SELECT r.score FROM recall_results r
+             JOIN recalls c ON c.id = r.recall_id JOIN memories m ON m.id = r.memory_id
+             WHERE c.uuid = ?1 AND m.uuid = ?2",
+            [recall_id.to_string(), memory.to_string()],
+        )
+        .unwrap()
     }
 }
 
@@ -574,6 +610,49 @@ fn ids(recall: &Recall) -> Vec<Uuid> {
 }
 
 // Fusion
+
+#[test]
+fn relevance_is_the_logit_divided_by_the_relevance_scale() {
+    // At scale 1.0 relevance is the raw logit, so scores are what they
+    // were before the scale; any other scale divides it, in prefetch and
+    // in recall alike. Nothing else in the score depends on the scale.
+    let scores = |scale: f64| {
+        let h = Harness::with_scale(0.0, scale);
+        let pottery = h.insert(fact("Tim takes a pottery class."));
+        let prefetch = h.prefetch("s", "pottery class schedule");
+        let recall = h.recall(query("pottery class schedule"));
+        (
+            h.score(prefetch.recall_id, pottery),
+            h.score(recall.recall_id, pottery),
+        )
+    };
+    let (prefetch_raw, recall_raw) = scores(1.0);
+    let (prefetch_scaled, recall_scaled) = scores(4.0);
+    let tuning = Tuning::default();
+    let strength = asphodel_core::strength::strength(
+        asphodel_core::constants::Significance::Notable.value(),
+        &[asphodel_core::strength::Access {
+            kind: asphodel_core::strength::AccessKind::Created,
+            at: at(EARLIER),
+        }],
+        None,
+        &asphodel_core::strength::BankTime::new(&[at(EARLIER)], tuning.clock.quiet_rate),
+        at(START),
+    )
+    .value;
+    // A fact without volatility or a window has zero confidence/phase terms.
+    // Pin the original formula as well as the scale-dependent difference.
+    assert!((prefetch_raw - (1.5 + 0.5 * strength)).abs() < 1e-9);
+    assert!((recall_raw - (1.5 + 0.2 * strength)).abs() < 1e-9);
+    // Two shared words: a logit of 1.5, so relevance 1.5 and then 0.375.
+    let expected = 1.5 - 1.5 / 4.0;
+    for (raw, scaled) in [(prefetch_raw, prefetch_scaled), (recall_raw, recall_scaled)] {
+        assert!(
+            (raw - scaled - expected).abs() < 1e-9,
+            "{raw} - {scaled} isn't {expected}"
+        );
+    }
+}
 
 #[test]
 fn fusion_sums_reciprocal_ranks_with_k_60() {
@@ -719,6 +798,59 @@ fn a_short_follow_up_finds_what_the_previous_query_asked_about() {
 
     let followed = h.prefetch_after("s", "yes, book it", Some("dentist appointment Friday"));
     assert_eq!(followed.injected, vec![dentist]);
+}
+
+// Cleaning the query
+
+/// The note Hermes' Discord gateway puts in front of a turn's message, with
+/// a synthetic message id.
+const DISCORD_NOTE: &str = "[Triggering message id: `100000000000000001` \u{2014} use as \
+                            `message_id` for reply/react/pin via the discord tools.]";
+
+#[test]
+fn each_format_cleans_to_the_message() {
+    let message = "what time is the ferry on Saturday?";
+    for (raw, cleaned) in [
+        (format!("[Sam] {message}"), message),
+        (format!("{DISCORD_NOTE}\n\n{message}"), message),
+        (format!("{DISCORD_NOTE}\n\n[Sam] {message}"), message),
+        // Only a leading prefix is a speaker's.
+        (
+            "remind me to pack [the blue bag] tomorrow".to_owned(),
+            "remind me to pack [the blue bag] tomorrow",
+        ),
+    ] {
+        assert_eq!(clean_query(&raw), cleaned, "{raw:?}");
+    }
+}
+
+#[test]
+fn a_message_of_only_the_note_and_prefix_cleans_to_nothing() {
+    for raw in [
+        "[Sam] ".to_owned(),
+        DISCORD_NOTE.to_owned(),
+        format!("{DISCORD_NOTE}\n\n[Sam] "),
+    ] {
+        assert_eq!(clean_query(&raw), "", "{raw:?}");
+    }
+}
+
+/// Prefetch recalls for the cleaned message, so the note's words don't make
+/// a short follow-up long, and the log keeps the raw query beside it.
+#[test]
+fn a_prefetch_recalls_for_the_cleaned_query_and_logs_both() {
+    let h = Harness::new();
+    let dentist = h.insert(fact("Tim's dentist appointment is on Friday."));
+    let raw = format!("{DISCORD_NOTE}\n\n[Sam] yes, book it");
+    let prefetch = h.prefetch_after("s", &raw, Some("[Sam] dentist appointment Friday"));
+    assert_eq!(prefetch.injected, vec![dentist]);
+    assert_eq!(
+        h.recall_queries(prefetch.recall_id),
+        (
+            "dentist appointment Friday\nyes, book it".to_owned(),
+            Some(raw)
+        )
+    );
 }
 
 // Retrievers and clean-up
@@ -895,6 +1027,96 @@ fn injected_memories_are_in_score_order() {
             "- A pottery note.",
         ]
     );
+}
+
+// The relevance scale
+
+#[test]
+fn the_floor_gates_on_the_raw_logit_whatever_the_relevance_scale() {
+    // At 4.0, a gate on relevance would stop the two-word memory
+    // (1.5 / 4 < 1.0), and at 0.25 it would pass the one-word one
+    // (0.5 / 0.25 >= 1.0).
+    for scale in [0.25, 4.0] {
+        let h = Harness::with_scale(1.0, scale);
+        let pottery = h.insert(fact("Tim takes a pottery class."));
+        let one_word = h.insert(fact("The class was cancelled."));
+        let scored = h
+            .service
+            .scored_prefetch(
+                BANK,
+                &PrefetchRequest {
+                    session_id: "s".into(),
+                    query: "pottery class schedule".into(),
+                    previous_query: None,
+                    block_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(scored.prefetch.injected, vec![pottery], "scale {scale}");
+        // The labelling material shows the raw logit too.
+        let logit = |memory: Uuid| {
+            scored
+                .candidates
+                .iter()
+                .find(|c| c.memory == memory)
+                .unwrap()
+                .logit
+        };
+        assert_eq!(logit(pottery), Some(1.5), "scale {scale}");
+        assert_eq!(logit(one_word), Some(0.5), "scale {scale}");
+    }
+}
+
+#[test]
+fn the_relevance_scale_leaves_the_phase_term_alone_in_injection() {
+    // A long-past memory sharing four query words, against a current one
+    // sharing two. At scale 1.0 the extra words outweigh the full phase
+    // penalty (3.5 - 1.0 > 1.5). At 10.0 they don't (0.35 - 1.0 < 0.15),
+    // unless the penalty were scaled too.
+    let order = |scale: f64| {
+        let h = Harness::with_scale(0.0, scale);
+        let past = h.insert(Memory {
+            kind: "event",
+            valid_from: Some((local("2026-07-20T00:00"), "day")),
+            valid_until: Some((local("2026-08-01T00:00"), "day")),
+            ..fact("Tim's pottery class schedule changed at the studio.")
+        });
+        let current = h.insert(fact("Tim's pottery class meets weekly."));
+        let injected = h.prefetch("s", "pottery class schedule studio").injected;
+        (injected, past, current)
+    };
+    let (injected, past, current) = order(1.0);
+    assert_eq!(injected, vec![past, current]);
+    let (injected, past, current) = order(10.0);
+    assert_eq!(injected, vec![current, past]);
+}
+
+#[test]
+fn the_relevance_scale_leaves_the_strength_term_alone_in_recall() {
+    // A faded memory sharing three query words, against a fresh one sharing
+    // two. At scale 1.0 the extra word outweighs w_s_recall·strength; at
+    // 100.0 strength decides, unless it were scaled too.
+    let order = |scale: f64| {
+        let h = Harness::with_scale(1.0, scale);
+        let faded = h.insert(Memory {
+            significance: "trivial",
+            observed_at: at("2021-01-01T00:00:00Z"),
+            ..fact("Tim's pottery class schedule note.")
+        });
+        let fresh = h.insert(Memory {
+            observed_at: h.service.now(),
+            ..fact("Tim's pottery class note.")
+        });
+        (
+            ids(&h.recall(query("pottery class schedule"))),
+            faded,
+            fresh,
+        )
+    };
+    let (ranked, faded, fresh) = order(1.0);
+    assert_eq!(ranked[..2], [faded, fresh]);
+    let (ranked, faded, fresh) = order(100.0);
+    assert_eq!(ranked[..2], [fresh, faded]);
 }
 
 // The reranker deadline

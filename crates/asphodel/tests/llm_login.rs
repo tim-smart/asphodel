@@ -80,6 +80,7 @@ impl TestDir {
             &format!(
                 "[llm]\nauth = \"chatgpt\"\nmodel = \"gpt-5.1\"\n\
                  [injection.reranker_floors]\n\"{FAKE_RERANKER}\" = 0.0\n\
+                 [ranking.relevance_scales]\n\"{FAKE_RERANKER}\" = 1.0\n\
                  [reconcile.embedding_floors]\n\"{FAKE_EMBEDDER}\" = 0.5\n"
             ),
         )

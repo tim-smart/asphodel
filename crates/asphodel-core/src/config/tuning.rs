@@ -26,6 +26,7 @@ pub struct Tuning {
     pub recall: RecallTuning,
     pub injection: InjectionTuning,
     pub reconcile: ReconcileTuning,
+    pub extraction: ExtractionTuning,
     pub agenda: AgendaTuning,
     pub mental_models: MentalModelsTuning,
     pub sessions: SessionsTuning,
@@ -75,6 +76,7 @@ impl Default for PurgeTuning {
 ///
 /// ```text
 /// score = relevance + w_s·strength + max(−3, ln(state_confidence)) + phase_term
+/// relevance = logit / relevance_scale
 /// ```
 ///
 /// The defaults are opening values, to be tuned on the replay harness.
@@ -94,6 +96,13 @@ pub struct RankingTuning {
     /// The full phase penalty, for something ended a month or more ago. It's
     /// subtracted, so it's given as a positive number.
     pub phase_penalty: f64,
+
+    /// What the reranker logit is divided by to give relevance, keyed by the
+    /// exact reranker model string, quantisation included. It keeps the
+    /// other terms at the weight they were sized for when a reranker with a
+    /// wider logit range is swapped in. The gate floor still compares the
+    /// raw logit.
+    pub relevance_scales: BTreeMap<String, f64>,
 }
 
 impl Default for RankingTuning {
@@ -103,6 +112,7 @@ impl Default for RankingTuning {
             w_s_recall: 0.2,
             phase_bonus: 1.0,
             phase_penalty: 1.0,
+            relevance_scales: BTreeMap::new(),
         }
     }
 }
@@ -154,6 +164,17 @@ pub struct ReconcileTuning {
     /// The cosine floor that decides whether call 2 runs, keyed by the exact
     /// embedding model string, quantisation included.
     pub embedding_floors: BTreeMap<String, f64>,
+}
+
+/// `[extraction]`: what call 1 is told beyond its fixed rules.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExtractionTuning {
+    /// The owner's guidance on what's worth remembering, added after call
+    /// 1's fixed prompt, which it leaves as is. Its hash is part of call 1's
+    /// template, so replay's cassettes and reports are keyed to the exact
+    /// prompt. Unset sends the fixed prompt alone.
+    pub guidance: Option<String>,
 }
 
 /// `[agenda]`: the list in `system_prompt_block()` chosen by world time.
@@ -467,6 +488,16 @@ impl Tuning {
                 ),
             );
         }
+        for (model, scale) in &ranking.relevance_scales {
+            if model.is_empty() {
+                fail("ranking.relevance_scales", "has an empty model key".into());
+            } else if !(scale.is_finite() && *scale > 0.0) {
+                fail(
+                    &format!("ranking.relevance_scales.\"{model}\""),
+                    format!("must be a number above 0, got {scale}"),
+                );
+            }
+        }
 
         let strong_cutoff = self.recall.strong_cutoff;
         if !(strong_cutoff.is_finite() && strong_cutoff > TAU) {
@@ -584,6 +615,11 @@ impl Tuning {
         {
             fail("llm.language", "must not be empty".into());
         }
+        if let Some(guidance) = &self.extraction.guidance
+            && guidance.trim().is_empty()
+        {
+            fail("extraction.guidance", "must not be empty".into());
+        }
         if let Some(endpoint) = &self.llm.endpoint {
             // Keep the raw spelling: URL parsing silently repairs missing
             // slashes and surrounding whitespace. Validation must not do so.
@@ -616,10 +652,11 @@ impl Tuning {
         }
     }
 
-    /// Checks there's a floor for each model the daemon runs. Floors are
-    /// keyed by the exact model string, and there's no fallback: a missing
-    /// gate floor would flood injection, and a missing reconcile floor would
-    /// skip reconciliation.
+    /// Checks there's a floor for each model the daemon runs, and a
+    /// relevance scale for its reranker. Both are keyed by the exact model
+    /// string, and there's no fallback: a missing gate floor would flood
+    /// injection, a missing reconcile floor would skip reconciliation, and
+    /// a missing scale would silently reweigh the other ranking terms.
     pub fn check_floors(
         &self,
         embedding_model: &str,
@@ -639,6 +676,12 @@ impl Tuning {
         if !self.injection.reranker_floors.contains_key(reranker_model) {
             errors.push(InvalidValue {
                 key: format!("injection.reranker_floors.\"{reranker_model}\""),
+                reason: "is missing for the configured reranker model".into(),
+            });
+        }
+        if !self.ranking.relevance_scales.contains_key(reranker_model) {
+            errors.push(InvalidValue {
+                key: format!("ranking.relevance_scales.\"{reranker_model}\""),
                 reason: "is missing for the configured reranker model".into(),
             });
         }

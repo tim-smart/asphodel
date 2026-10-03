@@ -18,6 +18,7 @@ const LLM_KEY: &str = "sk-live-41b2e8-secret";
 /// ready and refuses a model without floors, so every daemon
 /// here that is meant to start runs on the fakes with these.
 const FLOORS_FOR_FAKES: &str = "[injection.reranker_floors]\n\"fake-reranker:v1\" = 0.0\n\
+                                [ranking.relevance_scales]\n\"fake-reranker:v1\" = 1.0\n\
                                 [reconcile.embedding_floors]\n\"fake-embedder:v1\" = 0.5\n";
 
 /// `asphodel serve` with a clean environment, so the caller's `ASPHODEL_*`

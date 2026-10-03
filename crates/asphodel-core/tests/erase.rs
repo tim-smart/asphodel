@@ -230,6 +230,7 @@ impl Harness {
         let tuning = Tuning::from_toml(&format!(
             "[clock]\nquiet_rate = 1.0\n\
              [injection.reranker_floors]\n\"{}\" = 1.0\n\
+             [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
              [reconcile.embedding_floors]\n\"{}\" = 0.5\n{extra}",
             FakeReranker::MODEL_ID,
             FakeEmbedder::MODEL_ID,
@@ -1210,6 +1211,9 @@ fn the_sweep_deletes_text_past_the_horizon_and_keeps_the_keys() {
     h.extracted_with_nothing(young);
     let young_recall = h.recall_row(h.now(), tea);
 
+    // A prefetch logs the raw query beside the cleaned one.
+    h.execute("UPDATE recalls SET raw_query = '[Sam] ' || query", []);
+
     h.set(at(PAST_HORIZON));
     let swept = h.sweep();
     let run = &swept.ran[0];
@@ -1260,6 +1264,17 @@ fn the_sweep_deletes_text_past_the_horizon_and_keeps_the_keys() {
     assert_eq!(
         h.recall_tombstone(young_recall),
         Some((Some("what tea does Tim like?".to_string()), None, 1))
+    );
+    let raw_query = |recall: Uuid| -> Option<String> {
+        h.one(
+            "SELECT raw_query FROM recalls WHERE uuid = ?1",
+            [recall.to_string()],
+        )
+    };
+    assert_eq!(raw_query(old_recall), None, "the raw query goes too");
+    assert_eq!(
+        raw_query(young_recall).as_deref(),
+        Some("[Sam] what tea does Tim like?")
     );
 }
 

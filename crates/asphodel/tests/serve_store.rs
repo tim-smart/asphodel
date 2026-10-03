@@ -67,6 +67,7 @@ impl TestDir {
         fs::write(
             &path,
             "[injection.reranker_floors]\n\"fake-reranker:v1\" = 0.0\n\
+             [ranking.relevance_scales]\n\"fake-reranker:v1\" = 1.0\n\
              [reconcile.embedding_floors]\n\"fake-embedder:v1\" = 0.5\n",
         )
         .unwrap();

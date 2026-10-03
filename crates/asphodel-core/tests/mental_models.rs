@@ -29,10 +29,10 @@ use std::time::Duration;
 use asphodel_core::ingest::Turn;
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmGate, LlmRequest,
-    LlmResponse, ModelError as EmbedError, Models, Template,
+    LlmResponse, ModelError as EmbedError, Models, Reranker, Template,
 };
 use asphodel_core::retrieval::{PrefetchRequest, estimate_tokens};
-use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME};
+use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME, PROFILE_QUESTION};
 use asphodel_core::store::{OpenOptions, Store, VectorIndex, micros};
 use asphodel_core::strength::Kind;
 use asphodel_core::{Service, SimulatedClock, Tuning};
@@ -235,17 +235,24 @@ impl Harness {
 
     /// `extra` is more tuning TOML, appended to the floors the fakes need.
     fn with_tuning(extra: &str) -> Self {
-        Self::build(extra, Models::fake())
+        Self::build(1.0, extra, Models::fake())
+    }
+
+    /// [`Harness::with_tuning`] with a relevance scale of `scale` for the
+    /// fake reranker.
+    fn with_scale(scale: f64, extra: &str) -> Self {
+        Self::build(scale, extra, Models::fake())
     }
 
     /// Default tuning on `models`.
     fn with_models(models: Models) -> Self {
-        Self::build("", models)
+        Self::build(1.0, "", models)
     }
 
-    fn build(extra: &str, models: Models) -> Self {
+    fn build(scale: f64, extra: &str, models: Models) -> Self {
         let tuning = Tuning::from_toml(&format!(
             "[injection.reranker_floors]\n\"{}\" = 1.0\n\
+             [ranking.relevance_scales]\n\"{0}\" = {scale:?}\n\
              [reconcile.embedding_floors]\n\"{}\" = 0.5\n{extra}",
             FakeReranker::MODEL_ID,
             FakeEmbedder::MODEL_ID,
@@ -671,6 +678,45 @@ fn plans_model() -> ModelSpec {
 // Refresh triggers and scheduling
 
 #[test]
+fn a_refresh_scores_relevance_as_the_logit_divided_by_the_relevance_scale() {
+    // The refresh's selection scores like prefetch and recall: at scale 1.0
+    // relevance is the raw logit, and any other scale divides it.
+    let score = |scale: f64| -> f64 {
+        let h = Harness::with_scale(scale, "");
+        let tea = h.insert(fact(TEA));
+        h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+        h.one::<Option<f64>, _>(
+            "SELECT r.score FROM recall_results r
+             JOIN recalls c ON c.id = r.recall_id JOIN memories m ON m.id = r.memory_id
+             WHERE c.kind = 'refresh' AND m.uuid = ?1",
+            [tea.to_string()],
+        )
+        .unwrap()
+    };
+    let logit = f64::from(FakeReranker.rerank(PROFILE_QUESTION, &[TEA]).unwrap()[0]);
+    let (raw, scaled) = (score(1.0), score(4.0));
+    let tuning = Tuning::default();
+    let strength = asphodel_core::strength::strength(
+        asphodel_core::constants::Significance::Notable.value(),
+        &[asphodel_core::strength::Access {
+            kind: asphodel_core::strength::AccessKind::Created,
+            at: at(EARLIER),
+        }],
+        None,
+        &asphodel_core::strength::BankTime::new(&[at(EARLIER)], tuning.clock.quiet_rate),
+        at(START),
+    )
+    .value;
+    // A fact without volatility or a window has zero confidence/phase terms.
+    assert!((raw - (logit + 0.5 * strength)).abs() < 1e-9);
+    let expected = logit - logit / 4.0;
+    assert!(
+        (raw - scaled - expected).abs() < 1e-9,
+        "{raw} - {scaled} isn't {expected}"
+    );
+}
+
+#[test]
 fn a_notable_memory_triggers_a_refresh_five_minutes_later() {
     let h = Harness::new();
     let said = h.now();
@@ -891,6 +937,7 @@ fn a_refresh_held_by_the_gate_waits_for_the_hold_not_thirty_minutes(
         template: Template {
             name: "extract_claims".into(),
             version: 2,
+            guidance: None,
         },
         system: String::new(),
         user: String::new(),
@@ -1069,6 +1116,34 @@ fn a_cited_memory_stays_in_the_input_past_the_top_sixty() {
     let input = h.input(PROFILE_NAME);
     assert_eq!(input.memories.len(), 61, "the top 60 and the cited one");
     assert!(inputs(&input).contains(&weak));
+}
+
+#[test]
+fn the_relevance_scale_leaves_the_strength_term_alone_in_a_refresh() {
+    // With room for one memory: a weak one sharing five words with the
+    // profile question, against a strong one sharing none. At scale 1.0 the
+    // shared words outweigh w_s_inject·strength; at 100.0 strength decides,
+    // unless it were scaled too.
+    let selected = |scale: f64| {
+        let h = Harness::with_scale(
+            scale,
+            "[mental_models]\ninput_budget = 1\ninput_budget_with_cited = 1\n",
+        );
+        let weak = h.insert(Memory {
+            significance: "trivial",
+            ..fact("The user likes work and home life.")
+        });
+        let strong = h.insert(Memory {
+            significance: "critical",
+            observed_at: h.service.now(),
+            ..fact("Tim cooks dinner.")
+        });
+        (inputs(&h.input(PROFILE_NAME)), weak, strong)
+    };
+    let (input, weak, _) = selected(1.0);
+    assert_eq!(input, BTreeSet::from([weak]));
+    let (input, _, strong) = selected(100.0);
+    assert_eq!(input, BTreeSet::from([strong]));
 }
 
 #[test]

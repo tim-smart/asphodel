@@ -58,17 +58,20 @@ use tracing::{info, trace};
 
 use crate::cli::ReplayArgs;
 use engine::{Engine, Failure, Llm, Settings};
-use report::{Aggregate, Flags, Report};
+use report::{Aggregate, Call1, Flags, Report};
 use scenario::Group;
 use timeline::Timeline;
 
 /// Floors for the deterministic fakes, the layer group `ci` runs under: the
-/// reranker gate open, the reconcile floor where the unit tests put it.
+/// reranker gate open, the reranker's logit taken as relevance unscaled,
+/// and the reconcile floor where the unit tests put it.
 pub(crate) fn fake_floors() -> String {
     format!(
-        "[injection.reranker_floors]\n{:?} = 0.0\n[reconcile.embedding_floors]\n{:?} = 0.5\n",
-        FakeReranker::MODEL_ID,
-        FakeEmbedder::MODEL_ID
+        "[injection.reranker_floors]\n{reranker:?} = 0.0\n\
+         [ranking.relevance_scales]\n{reranker:?} = 1.0\n\
+         [reconcile.embedding_floors]\n{embedder:?} = 0.5\n",
+        reranker = FakeReranker::MODEL_ID,
+        embedder = FakeEmbedder::MODEL_ID,
     )
 }
 
@@ -222,6 +225,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             corpus_hash: None,
             cassette_hash: None,
             tuning: tuning.clone(),
+            call1: Call1::of(&tuning),
             flags: Flags {
                 latency_ms: u64::try_from(latency.as_millis()).unwrap_or(0),
                 until: args.until,

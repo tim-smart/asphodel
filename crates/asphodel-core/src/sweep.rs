@@ -493,7 +493,7 @@ fn sweep_sources(
         (bank_id, horizon),
     )?;
     let swept_recalls = tx.execute(
-        "UPDATE recalls SET query = NULL, swept_at = ?3
+        "UPDATE recalls SET query = NULL, raw_query = NULL, swept_at = ?3
          WHERE bank_id = ?1 AND at < ?2 AND swept_at IS NULL",
         (bank_id, horizon, now),
     )?;

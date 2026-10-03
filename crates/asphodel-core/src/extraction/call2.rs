@@ -42,6 +42,7 @@ pub fn call2_request(input: &Call2Input) -> LlmRequest {
         template: Template {
             name: CALL2_TEMPLATE.into(),
             version: CALL2_VERSION,
+            guidance: None,
         },
         system: SYSTEM.into(),
         user: render(input),

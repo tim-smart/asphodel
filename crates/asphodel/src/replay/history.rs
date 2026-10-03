@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow, bail};
 use asphodel_core::config::{Deployment, LLM_API_KEY_ENV, LlmAuth, Secret};
+use asphodel_core::extraction::guidance_hash;
 use asphodel_core::models::{
     CodexResponses, FakeLlm, LlmClient, LlmSettings, OpenAiCompatible, TokenStore,
 };
@@ -24,7 +25,7 @@ use jiff::tz::TimeZone;
 
 use super::cassette::Recorder;
 use super::engine::{Engine, Llm, Settings};
-use super::report::{Flags, Report};
+use super::report::{Call1, Flags, Report};
 use super::scenario::Group;
 use super::timeline::Timeline;
 use super::{Finished, NO_DEADLINE, SHADOW_FILE, failure};
@@ -185,7 +186,8 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             live.clone(),
             tuning.llm.language.clone(),
             Arc::clone(&clock),
-        )?;
+        )?
+        .with_guidance(guidance_hash(tuning.extraction.guidance.as_deref()));
         let settings = Settings {
             bank: header.bank.clone(),
             timezone: timezone.clone(),
@@ -216,6 +218,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             corpus_hash: Some(corpus.hash.clone()),
             cassette_hash: Some(recorder.hash.clone()),
             tuning: tuning.clone(),
+            call1: Call1::of(&tuning),
             flags: Flags {
                 latency_ms: latency
                     .map(|latency| u64::try_from(latency.as_millis()).unwrap_or(0))

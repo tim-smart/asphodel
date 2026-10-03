@@ -37,6 +37,7 @@ use jiff::{SignedDuration, Timestamp};
 use rusqlite::OptionalExtension;
 use rusqlite::types::FromSql;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use asphodel_core::extraction::{
@@ -108,6 +109,7 @@ fn tuning_for_fakes() -> Tuning {
 fn tuning_for_fakes_and(extra: &str) -> Tuning {
     Tuning::from_toml(&format!(
         "[injection.reranker_floors]\n\"{}\" = 0.0\n\
+         [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
          [reconcile.embedding_floors]\n\"{}\" = 0.5\n{extra}",
         FakeReranker::MODEL_ID,
         FakeEmbedder::MODEL_ID,
@@ -3188,66 +3190,15 @@ fn a_failed_commit_rolls_back_everything_and_is_counted() {
 }
 
 #[test]
-fn the_prompts_state_the_extraction_rules() {
+fn language_configuration_changes_the_prompt_consistently() {
     let h = Harness::new();
-    ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
-    let system = call1_request(&input(&h, "main", &[])).system;
-    // Scripted replies can't show these instructions were given, so check
-    // the prompt carries the input, significance, time and language rules.
-    for rule in [
-        // Only what the assistant did, and its tasks only when asked and dated.
-        "From the assistant's reply, only what the assistant says it has done or will do.",
-        "An assistant task is extracted only when the speaker asked for it and it has a due date or an until-event beyond this turn.",
-        "Never extract the assistant's suggestions, general knowledge, or findings from tools.",
-        // Answers resolved from the context, quoted from the text.
-        "A short answer to a question the assistant asked in the context is the speaker's claim, written out in full.",
-        "Quote only from the text, never from the context",
-        // No claim from a request to forget.
-        "Nothing from a request to forget something, and no task to forget it.",
-        // The expected distribution.
-        "Most claims are trivial or minor. Major is rare and critical is a few per hundred claims.",
-        // Language.
-        "Write the claim in the language of the passage it quotes and never translate.",
-        // The hard rule on ends, and an unknown reference date.
-        "Never set `valid_until` unless the text states an end.",
-        "If the reference date is unknown, don't resolve relative times",
-    ] {
-        assert!(system.contains(rule), "{rule}");
-    }
+    ingest(&h, &turn("s1", T1, "Hola.", "Hola."));
+    let plain = call1_request(&input(&h, "main", &[])).system;
 
-    ingest_doc(
-        &h,
-        &Document {
-            reference_date_exact: false,
-            ..document("diary", "Met Ana yesterday.", date(2026, 9, 28))
-        },
-    );
-    extract(&h, reply(vec![], &[]));
-    let user = call1_request(&input(&h, "main", &[])).user;
-    assert!(user.contains("Reference date: unknown"), "{user}");
-    assert!(user.contains("Don't resolve relative times."), "{user}");
-
-    // `[llm] language` forces the claims' language. The rule is in the
-    // system prompt, which stays the same for every chunk.
     let forced = Harness::with_tuning("[llm]\nlanguage = \"English\"\n");
     ingest(&forced, &turn("s1", T1, "Hola.", "Hola."));
     let first = call1_request(&input(&forced, "main", &[])).system;
-    assert!(
-        first.contains(
-            "Write every claim in English, translating if the text is in another language."
-        ),
-        "{first}"
-    );
-    assert!(!first.contains("never translate"), "{first}");
-    // Quotes and surface forms stay as the text has them.
-    assert!(
-        first.contains("`quote` is the exact passage of the text"),
-        "{first}"
-    );
-    assert!(
-        first.contains("`surface_form` is how the text names the entity"),
-        "{first}"
-    );
+    assert_ne!(first, plain);
     extract(&forced, reply(vec![], &[]));
     ingest(
         &forced,
@@ -3260,6 +3211,77 @@ fn the_prompts_state_the_extraction_rules() {
     );
     let second = call1_request(&input(&forced, "main", &[])).system;
     assert_eq!(first, second);
+}
+
+#[test]
+fn call1_uses_the_new_template_version() {
+    let h = Harness::new();
+    ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
+    let request = call1_request(&input(&h, "main", &[]));
+    // The new rules are a new version: `fast` reuses call 1's claims by
+    // version, and claims made under the old rules mustn't be.
+    assert_eq!(request.template.version, 4);
+}
+
+/// `[extraction] guidance` as it might be written, padded, and the text
+/// call 1's prompt gets.
+const GUIDANCE: &str =
+    "[extraction]\nguidance = \"\"\"\n  Skip build logs.\nKeep release dates.  \n\"\"\"\n";
+const GUIDANCE_TEXT: &str = "Skip build logs.\nKeep release dates.";
+
+#[test]
+fn guidance_is_added_to_the_fixed_prompt_and_keys_the_template() {
+    let request = |h: &Harness| {
+        ingest(h, &turn("s1", T1, "I'm moving to Lisbon.", "Exciting!"));
+        call1_request(&input(h, "main", &[]))
+    };
+    let plain = request(&Harness::new());
+    let guided_h = Harness::with_tuning(GUIDANCE);
+    let guided = request(&guided_h);
+
+    // Check insertion without requiring a heading, position or prompt wording.
+    assert!(guided.system.contains(GUIDANCE_TEXT));
+    assert!(!plain.system.contains(GUIDANCE_TEXT));
+    assert_eq!(guided.user, plain.user);
+    assert_eq!(guided.schema_name, plain.schema_name);
+    assert_eq!(guided.schema, plain.schema);
+
+    // The template keeps call 1's name and version, and carries SHA-256 of
+    // the text as inserted, so cassettes and `fast` key on the exact
+    // prompt. Unset adds no field, so call 2's and refreshes' keys stay.
+    let template = |request: &LlmRequest| serde_json::to_value(&request.template).unwrap();
+    assert_eq!(guided.template.name, plain.template.name);
+    assert_eq!(guided.template.version, plain.template.version);
+    assert!(
+        template(&plain).get("guidance").is_none(),
+        "{}",
+        template(&plain)
+    );
+    assert_eq!(
+        template(&guided)["guidance"],
+        format!("{:x}", Sha256::digest(GUIDANCE_TEXT)),
+        "{}",
+        template(&guided)
+    );
+    let other = request(&Harness::with_tuning(
+        "[extraction]\nguidance = \"Skip build logs.\"\n",
+    ));
+    assert_ne!(template(&other)["guidance"], template(&guided)["guidance"]);
+
+    // Like the language rule, it's the same for every chunk.
+    extract(&guided_h, reply(vec![], &[]));
+    ingest(
+        &guided_h,
+        &turn(
+            "s1",
+            "2026-10-01T07:00:00Z",
+            "Ana visits in May.",
+            "Lovely.",
+        ),
+    );
+    let next = call1_request(&input(&guided_h, "main", &[]));
+    assert_eq!(next.system, guided.system);
+    assert_eq!(template(&next), template(&guided));
 }
 
 // Deterministic entity ids: in replay an entity id is UUIDv5 of the

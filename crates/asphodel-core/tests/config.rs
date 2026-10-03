@@ -168,6 +168,7 @@ fn a_full_file_sets_every_value() {
         w_s_recall = 0.3
         phase_bonus = 1.5
         phase_penalty = 0.5
+        relevance_scales = { "jina-reranker-v1-turbo-en:int8" = 1.0 }
 
         [llm]
         model = "some-model:q4_K_M"
@@ -205,6 +206,10 @@ fn a_full_file_sets_every_value() {
     assert_eq!(t.ranking.w_s_recall, 0.3);
     assert_eq!(t.ranking.phase_bonus, 1.5);
     assert_eq!(t.ranking.phase_penalty, 0.5);
+    assert_eq!(
+        t.ranking.relevance_scales["jina-reranker-v1-turbo-en:int8"],
+        1.0
+    );
     assert_eq!(t.llm.model.as_deref(), Some("some-model:q4_K_M"));
     assert_eq!(t.llm.endpoint.as_deref(), Some("https://llm.example/v1"));
 }
@@ -355,6 +360,42 @@ fn llm_language_is_unset_by_default_and_must_not_be_empty() {
 }
 
 #[test]
+fn extraction_guidance_is_unset_by_default_and_must_not_be_empty() {
+    let guidance =
+        |tuning: &Tuning| serde_json::to_value(tuning).unwrap()["extraction"]["guidance"].clone();
+    // Unset, call 1's prompt is the fixed one.
+    assert!(guidance(&Tuning::default()).is_null());
+    // Set, it can run over several lines.
+    let tuning =
+        load("[extraction]\nguidance = \"\"\"\nSkip build logs.\nKeep release dates.\n\"\"\"\n")
+            .unwrap();
+    assert_eq!(guidance(&tuning), "Skip build logs.\nKeep release dates.\n");
+    // `GET /v1/config` shows the resolved value.
+    let config = ResolvedConfig::new(tuning, deployment(None, None));
+    let json = serde_json::to_value(&config).unwrap();
+    assert_eq!(
+        json["tuning"]["extraction"]["guidance"],
+        "Skip build logs.\nKeep release dates.\n"
+    );
+    // The overrides file replaces it, as replay's A/B runs need.
+    let layered = layers(&[
+        "[extraction]\nguidance = \"Skip build logs.\"\n",
+        "[extraction]\nguidance = \"Keep release dates.\"\n",
+    ])
+    .unwrap();
+    assert_eq!(guidance(&layered), "Keep release dates.");
+
+    for value in ["\"\"", "\"  \"", "\"\\n\\t\""] {
+        assert_eq!(
+            invalid_keys(&format!("[extraction]\nguidance = {value}\n")),
+            ["extraction.guidance"],
+            "{value}"
+        );
+    }
+    assert_rejected("[extraction]\nprompt = \"Skip build logs.\"\n");
+}
+
+#[test]
 fn embedding_floors_must_be_cosines() {
     // floors inside the model's score range.
     for value in ["1.5", "-1.01", "nan", "inf"] {
@@ -363,6 +404,31 @@ fn embedding_floors_must_be_cosines() {
     for value in ["-1.0", "0.0", "0.85", "1.0"] {
         load(&format!("[reconcile.embedding_floors]\nm = {value}\n")).unwrap();
     }
+}
+
+#[test]
+fn relevance_scales_must_be_positive_and_finite() {
+    // The scale divides the reranker logit into relevance, so zero, a
+    // negative or a non-finite one is rejected.
+    assert!(Tuning::default().ranking.relevance_scales.is_empty());
+    for value in ["0.0", "-0.0", "-1.0", "nan", "inf", "-inf"] {
+        assert_eq!(
+            invalid_keys(&format!("[ranking.relevance_scales]\nm = {value}\n")),
+            ["ranking.relevance_scales.\"m\""],
+            "{value}"
+        );
+    }
+    for value in ["0.25", "1.0", "3.2"] {
+        let t = load(&format!("[ranking.relevance_scales]\nm = {value}\n")).unwrap();
+        assert_eq!(
+            t.ranking.relevance_scales["m"],
+            value.parse::<f64>().unwrap()
+        );
+    }
+    assert_eq!(
+        invalid_keys("[ranking.relevance_scales]\n\"\" = 1.0\n"),
+        ["ranking.relevance_scales"]
+    );
 }
 
 #[test]
@@ -421,7 +487,8 @@ fn only_a_floor_for_the_exact_model_string_counts() {
     // Int8 and fp32 give different scores, so there's no fallback.
     let t = load(
         "[reconcile.embedding_floors]\n\"bge-small-en-v1.5:int8\" = 0.8\n\
-         [injection.reranker_floors]\n\"jina-reranker-v1-turbo-en:int8\" = -1.0\n",
+         [injection.reranker_floors]\n\"jina-reranker-v1-turbo-en:int8\" = -1.0\n\
+         [ranking.relevance_scales]\n\"jina-reranker-v1-turbo-en:int8\" = 1.0\n",
     )
     .unwrap();
     t.check_floors("bge-small-en-v1.5:int8", "jina-reranker-v1-turbo-en:int8")

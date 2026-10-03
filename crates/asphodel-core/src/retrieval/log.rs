@@ -1,6 +1,7 @@
-//! The recall log: one `recalls` row per recall, with the query,
-//! the memories that came back, whether each was injected, the latency, the
-//! session and the bank's turn counter. It's for detecting `used`, for the
+//! The recall log: one `recalls` row per recall, with the query and, for a
+//! prefetch, the raw message it was cleaned from, the memories that came
+//! back, whether each was injected, the latency, the session and the bank's
+//! turn counter. It's for detecting `used`, for the
 //! replay harness and for "why did it bring that up?". Nothing here writes
 //! an access: being recalled never counts towards strength.
 
@@ -47,8 +48,12 @@ pub(super) struct Entry<'a> {
     pub bank_id: i64,
     pub kind: RecallKind,
     pub session_id: Option<&'a str>,
-    /// The query that ran, a short follow-up's borrowed context included.
+    /// The query that ran, cleaned, a short follow-up's borrowed context
+    /// included.
     pub query: &'a str,
+    /// A prefetch's message as it was sent, before cleaning. Labelling
+    /// material shows it beside the query; calibration uses the query.
+    pub raw_query: Option<&'a str>,
     pub latency_ms: u64,
     pub at: Timestamp,
     pub results: &'a [Logged],
@@ -62,8 +67,9 @@ pub(super) fn write(conn: &mut Connection, entry: &Entry<'_>) -> Result<(), rusq
         |row| row.get(0),
     )?;
     tx.execute(
-        "INSERT INTO recalls (uuid, bank_id, kind, session_id, turn, query, latency_ms, at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO recalls (uuid, bank_id, kind, session_id, turn, query, raw_query,
+                              latency_ms, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         (
             entry.uuid.to_string(),
             entry.bank_id,
@@ -71,6 +77,7 @@ pub(super) fn write(conn: &mut Connection, entry: &Entry<'_>) -> Result<(), rusq
             entry.session_id,
             turn,
             entry.query,
+            entry.raw_query,
             i64::try_from(entry.latency_ms).unwrap_or(i64::MAX),
             micros(entry.at),
         ),

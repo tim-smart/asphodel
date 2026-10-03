@@ -110,6 +110,7 @@ fn a_floor_for_the_real_models_does_not_cover_the_fakes() {
     let tuning = dir.file(
         "tuning.toml",
         "[injection.reranker_floors]\n\"jina-reranker-v1-turbo-en:int8\" = -1.5\n\
+         [ranking.relevance_scales]\n\"jina-reranker-v1-turbo-en:int8\" = 1.0\n\
          [reconcile.embedding_floors]\n\"bge-small-en-v1.5:int8\" = 0.82\n",
     );
     let output = run(serve_in(&dir)
@@ -125,6 +126,10 @@ fn a_floor_for_the_real_models_does_not_cover_the_fakes() {
     );
     assert!(
         stderr.contains(&format!("injection.reranker_floors.\"{FAKE_RERANKER}\"")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("ranking.relevance_scales.\"{FAKE_RERANKER}\"")),
         "{stderr}"
     );
 }

@@ -101,6 +101,11 @@ impl LlmSettings {
 pub struct Template {
     pub name: String,
     pub version: u32,
+    /// Lower-case hex SHA-256 of the `[extraction] guidance` call 1's
+    /// prompt carries, as inserted. Absent when there's none, and on every
+    /// other template, so their keys and older records stay as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
 }
 
 /// One structured-output call: a system and a user message, and the JSON

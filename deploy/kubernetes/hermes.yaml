@@ -33,6 +33,11 @@ data:
 
     [injection.reranker_floors]
     "jina-reranker-v1-turbo-en:int8" = 0.0
+
+    # The reranker logit is divided by this before it's added to the other
+    # ranking terms. jina is the reference, at 1.0.
+    [ranking.relevance_scales]
+    "jina-reranker-v1-turbo-en:int8" = 1.0
 ---
 # Only the backup CronJob uses this. Hermes reaches the daemon on loopback.
 apiVersion: v1

@@ -333,9 +333,10 @@ A probe naming a label no claim defines is refused before the run.
   no wall-clock time. Every sort that reaches ranking or the report breaks
   ties by id.
 - **The fake floors.** Group `ci` runs on the deterministic fake embedder
-  and reranker, which need floors like any model. The engine layers
-  `reconcile.embedding_floors."fake-embedder:v1" = 0.5` and
-  `injection.reranker_floors."fake-reranker:v1" = 0.0` above the code
+  and reranker, which need floors and a relevance scale like any model. The
+  engine layers `reconcile.embedding_floors."fake-embedder:v1" = 0.5`,
+  `injection.reranker_floors."fake-reranker:v1" = 0.0` and
+  `ranking.relevance_scales."fake-reranker:v1" = 1.0` above the code
   defaults; a scenario's `[tuning]` can change them.
 - **The shadow table.** Every purged chain's rows (content and embedding)
   are copied to a table in the replay store, never anywhere else. After
@@ -491,15 +492,17 @@ asphodel replay --corpus <file> --mode live|replay|fast \
 ```
 
 - **Modes**. Every LLM call is keyed by SHA-256 of
-  the model id, the template name and version, and the whole request.
+  the model id, the template (name, version and, for call 1, the hash of
+  any `[extraction] guidance`), and the whole request.
   `live` answers from the cassette and calls and records on a miss;
   `--no-cache` empties the cassette when the run opens it and records
   afresh, so a re-recording leaves one record per call, and the report's
   cassette hash is of the empty cassette it started from. `replay` answers from
   the cassette and fails on a miss, with exit 2 and no report. `fast`
-  reuses call 1's claims by chunk (source id and chunk position) and
-  `[llm] language`, so claims recorded in one language never answer a run
-  set to another, and `used` verdicts by (reply hash, sentence hash) pair, judges the pairs nobody has
+  reuses call 1's claims by chunk (source id and chunk position), template
+  version, guidance hash and `[llm] language`, so claims recorded under
+  another prompt or in another language never answer this run, and `used`
+  verdicts by (reply hash, sentence hash) pair, judges the pairs nobody has
   judged with one short `judge_used` call, and answers call 2 and refreshes
   by request key, calling the LLM on a miss when one is configured. The
   report counts every miss, so "fast with zero misses" is a number.
@@ -549,7 +552,9 @@ asphodel replay --corpus <file> --mode live|replay|fast \
 ### The report and the aggregate
 
 A real-history report has `kind` `live`, `replay` or `fast`, `group`
-`models` or `fake`, `corpus_hash` and `cassette_hash`, and beside the
+`models` or `fake`, `corpus_hash` and `cassette_hash`, `call1` with call
+1's template `version` and the `guidance_hash` of `[extraction] guidance`
+(null without it), and beside the
 scripted fields: `injected_tokens` (per session with a synced turn, the
 per-turn p50 and p95, and cron apart), `profile_tokens` (sampled daily),
 `call2_rate`, `agenda_lines_per_day`, `significance_histogram`,
@@ -560,8 +565,8 @@ of its cassette differ only in `kind`, `flags`, `llm` and `cassette_hash`.
 
 `--aggregate <file>` writes the one thing that may leave the private dir. Its type has no string field but a probe's id: the run's kind
 is a set of booleans, days are days since the epoch, weeks are two
-integers, and the hashes and the git SHA are byte arrays. It carries the
-probe results, the purge, fade and band series, the token, lag and call
+integers, and the hashes and the git SHA are byte arrays. It carries
+`call1` as the report has it, the probe results, the purge, fade and band series, the token, lag and call
 counts, and the histograms.
 
 `asphodel report diff A B [--force]` compares two reports: it refuses runs
@@ -601,6 +606,7 @@ The material is one JSON object:
   "recall": [
     { "sample": "r1", "at": "<prefetch time>", "session": "<session id>",
       "query": "<the query the reranker scored against>",
+      "raw_query": "<the message as Hermes sent it>",
       "candidates": [
         { "id": "r1.1", "memory": "<uuid>", "score": 1.5, "sentence": "..." } ] } ],
   "call2": [
@@ -617,8 +623,13 @@ The material is one JSON object:
   (turn `i × n / 50` of `n`), so the same run always samples the same
   turns. Each lists the prefetch's reranked candidates in ranked order
   before the gate, including those the gate turned away, scored with the
-  reranker logit the gate floor compares. `query` is what the reranker
-  scored against, after a short follow-up borrowed the previous message.
+  raw reranker logit the gate floor compares, not the logit divided by the
+  relevance scale. `query` is what the reranker
+  scored against: the message without the Discord message-id note and the
+  `[Name] ` speaker prefix, after a short follow-up borrowed the previous
+  message. Calibration uses it. `raw_query` is the message as Hermes sent
+  it, for reading beside it. Material written before it was recorded has
+  no `raw_query`, and `report precision` still reads it.
 - `call2` holds every candidate list call 2 was shown, one per claim:
   the claim and its neighbours, scored with the cosine similarity of the
   claim to each. Only what call 2 was shown is here. Flagged claims bypass

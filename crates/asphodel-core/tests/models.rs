@@ -76,6 +76,7 @@ fn open_store(dir: &TestDir) -> Store {
 fn tuning_for_fakes() -> Tuning {
     Tuning::from_toml(&format!(
         "[injection.reranker_floors]\n\"{}\" = 0.0\n\
+         [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
          [reconcile.embedding_floors]\n\"{}\" = 0.5\n",
         FakeReranker::MODEL_ID,
         FakeEmbedder::MODEL_ID,
@@ -182,6 +183,7 @@ fn request() -> LlmRequest {
         template: Template {
             name: "extract".into(),
             version: 3,
+            guidance: None,
         },
         system: "You extract memories.".into(),
         user: "Tim said: I moved to Wellington in March.".into(),
@@ -669,8 +671,52 @@ fn a_missing_floor_for_a_loaded_model_stops_the_service_opening() {
         [
             format!("reconcile.embedding_floors.\"{}\"", FakeEmbedder::MODEL_ID),
             format!("injection.reranker_floors.\"{}\"", FakeReranker::MODEL_ID),
+            format!("ranking.relevance_scales.\"{}\"", FakeReranker::MODEL_ID),
         ]
     );
+}
+
+#[test]
+fn only_a_relevance_scale_for_the_exact_reranker_id_opens_the_service() {
+    // Like the floors, the relevance scale is keyed by the exact reranker
+    // model string, quantisation included, with no fallback.
+    let with_scale = |model: &str| {
+        Tuning::from_toml(&format!(
+            "[injection.reranker_floors]\n\"{}\" = 0.0\n\
+             [reconcile.embedding_floors]\n\"{}\" = 0.5\n\
+             [ranking.relevance_scales]\n\"{model}\" = 1.0\n",
+            FakeReranker::MODEL_ID,
+            FakeEmbedder::MODEL_ID,
+        ))
+        .unwrap()
+    };
+    for model in ["fake-reranker", "fake-reranker:v2", "FAKE-RERANKER:V1"] {
+        let dir = TestDir::new();
+        let error =
+            Service::with_models(clock(), open_store(&dir), with_scale(model), Models::fake())
+                .expect_err(model);
+        let OpenError::Config(ConfigError::Invalid(errors)) = error else {
+            panic!("{error}");
+        };
+        let keys: Vec<_> = errors.iter().map(|e| e.key.clone()).collect();
+        assert_eq!(
+            keys,
+            [format!(
+                "ranking.relevance_scales.\"{}\"",
+                FakeReranker::MODEL_ID
+            )],
+            "{model}"
+        );
+    }
+
+    let dir = TestDir::new();
+    Service::with_models(
+        clock(),
+        open_store(&dir),
+        with_scale(FakeReranker::MODEL_ID),
+        Models::fake(),
+    )
+    .unwrap();
 }
 
 #[test]

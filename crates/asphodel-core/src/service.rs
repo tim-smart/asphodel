@@ -39,7 +39,9 @@ use crate::queue::{
     ChunkError, ChunkList, FailedChunk, Failure, Lease, Leases, QueueError, Retried, SourceKind,
 };
 use crate::reembed::{ReembedError, ReembedStatus};
-use crate::retrieval::{Permit, Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
+use crate::retrieval::{
+    Permit, Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest, Reranking,
+};
 use crate::sessions::Sessions;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
@@ -56,6 +58,9 @@ pub struct Service {
     /// `None` only for a service built with [`Service::open`], which the
     /// existing callers use; [`Service::with_models`] always sets it.
     models: Option<Models>,
+    /// The loaded reranker's gate floor and relevance scale, looked up once
+    /// in [`Service::with_models`]. `None` exactly when `models` is.
+    reranking: Option<Reranking>,
     /// The extraction queue's leases, one per bank at most. They live here
     /// rather than in the store so a restart releases them.
     leases: Leases,
@@ -130,6 +135,7 @@ impl Service {
             store,
             tuning,
             models: None,
+            reranking: None,
             leases: Leases::default(),
             sessions,
             reranker_permit: Arc::default(),
@@ -147,10 +153,11 @@ impl Service {
 
     /// Builds a service on an open store, the tuning it runs under and the
     /// models it serves with. The tuning must have a floor for each model's
-    /// exact id, or the service doesn't open: a missing gate floor would
-    /// flood injection, and a missing reconcile floor would skip
-    /// reconciliation. The check lives here, not in `serve`, so the replay
-    /// harness gets the same refusal.
+    /// exact id and a relevance scale for the reranker's, or the service
+    /// doesn't open: a missing gate floor would flood injection, a missing
+    /// reconcile floor would skip reconciliation, and a missing scale would
+    /// reweigh the other ranking terms. The check lives here, not in
+    /// `serve`, so the replay harness gets the same refusal.
     pub fn with_models(
         clock: Arc<dyn Clock>,
         store: Store,
@@ -159,6 +166,7 @@ impl Service {
     ) -> Result<Self, OpenError> {
         let ids = models.ids();
         tuning.check_floors(&ids.embedding, &ids.reranker)?;
+        let reranking = Reranking::for_model(&tuning, &ids.reranker);
         let sessions = Sessions::new(tuning.sessions.in_context_idle_days);
         let started = clock.now();
         let schedule = Schedule::new(started);
@@ -167,6 +175,7 @@ impl Service {
             store,
             tuning,
             models: Some(models),
+            reranking,
             leases: Leases::default(),
             sessions,
             reranker_permit: Arc::default(),
@@ -559,6 +568,7 @@ impl Service {
             store: &self.store,
             tuning: &self.tuning,
             models: self.models.as_ref().ok_or(RecallError::NoModels)?,
+            reranking: self.reranking.ok_or(RecallError::NoModels)?,
             previous: &self.previous_embedders,
             sessions: &self.sessions,
             permit: &self.reranker_permit,
