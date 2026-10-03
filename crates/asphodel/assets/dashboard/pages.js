@@ -259,8 +259,12 @@ function select(h, { id, label, value, options, onchange }) {
   );
 }
 
+/// Retracted and forgotten memories are out of use: what lies ahead of them
+/// is a purge or an erase, not a fade.
+const OUT_OF_USE = ["retracted", "forgetting"];
+
 function memoryRow(ctx, memory) {
-  const { h, fadeLabel, pill, time } = ctx.ui;
+  const { h, fadeLabel, outOfUseLabel, pill, time } = ctx.ui;
   const kept = memory.significance.effective === "kept";
   return h(
     "li",
@@ -284,7 +288,7 @@ function memoryRow(ctx, memory) {
       ]),
     ),
     " ",
-    fadeLabel(memory.fade),
+    OUT_OF_USE.includes(memory.status) ? outOfUseLabel(memory.status, memory.purge) : fadeLabel(memory.fade),
   );
 }
 
@@ -449,7 +453,7 @@ function guardText(ui, guard) {
 // owner's actions on it.
 async function memory(ctx) {
   const { api, ui, bank, at } = ctx;
-  const { h, time, fadeLabel, purgeLabel, pill } = ui;
+  const { h, time, fadeLabel, outOfUseLabel, purgeLabel, pill, gauge } = ui;
   const view = await api.memory(bank, at.id);
   const status = memoryStatus(view);
   const kept = view.significance.owner === "kept";
@@ -622,7 +626,15 @@ async function memory(ctx) {
         h(
           "div",
           { class: "outlook" },
-          h("div", { class: "outlook-fade" }, fadeLabel(view.projection.fade)),
+          h(
+            "div",
+            { class: "outlook-fade" },
+            status === "forgetting"
+              ? outOfUseLabel(status, null)
+              : status === "retracted"
+                ? h("span", { class: "fade", "data-fade": "out" }, gauge("out"), h("span", {}, "Out of use: recall, the agenda and the system prompt skip it"))
+                : fadeLabel(view.projection.fade),
+          ),
           h("div", { class: "outlook-purge" }, purgeLabel(view.projection.purge)),
           !view.projection.purge && view.purge.guards.length
             ? h("ul", { class: "guards" }, view.purge.guards.map((g) => h("li", {}, guardText(ui, g))))

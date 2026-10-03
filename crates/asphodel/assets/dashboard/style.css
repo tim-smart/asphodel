@@ -3,6 +3,32 @@
    pales as it nears its fade (every step stays readable), and a stem gauge
    beside it shows how much life it has left. */
 
+/* Source Serif 4 from Adobe's 4.005 release, unmodified and served by the
+   daemon; SIL Open Font License, in OFL.txt beside these files. */
+@font-face {
+  font-family: "Source Serif 4";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/dashboard/SourceSerif4-Regular.ttf.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Source Serif 4";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/dashboard/SourceSerif4-It.ttf.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Source Serif 4";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/dashboard/SourceSerif4-Semibold.ttf.woff2") format("woff2");
+}
+
 :root {
   color-scheme: light dark;
 
@@ -35,7 +61,7 @@
   --ink-soon: var(--ink-3);
   --ink-faded: #5f6b72;
 
-  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "TeX Gyre Pagella", "URW Palladio L", P052, "Book Antiqua", Georgia, "Noto Serif", "DejaVu Serif", serif;
+  --serif: "Source Serif 4", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", Ubuntu, Cantarell, sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
 
@@ -553,6 +579,15 @@ label {
 [data-fade="faded"] .gauge {
   background: transparent;
   box-shadow: inset 0 0 0 1px var(--ink-faded);
+}
+
+/* Out of use: no life left to show, but the space keeps the column aligned. */
+.fade[data-fade="out"] .gauge {
+  visibility: hidden;
+}
+
+.fade[data-fade="out"] {
+  color: var(--ink-3);
 }
 
 [data-fade="never"] .gauge > span {
@@ -1131,6 +1166,11 @@ dialog.confirm h2 {
 
   .memory .fade {
     justify-self: start;
+  }
+
+  /* Stacked, there's no column to keep aligned. */
+  .fade[data-fade="out"] .gauge {
+    display: none;
   }
 
   .crumb {

@@ -124,16 +124,33 @@ export function mount(root, { fetch }) {
     return svg;
   }
 
+  /// One attention line as the banner shows it. A bank's failed-chunks line,
+  /// found from the counts in `status.banks`, links to that bank's ingestion
+  /// page in place of the CLI hint, and is left out on that page itself.
+  function attentionLine(line, status, at) {
+    for (const [name, counts] of Object.entries(status.banks ?? {})) {
+      if (!counts.failed_chunks || !line.startsWith(`${name}: ${counts.failed_chunks} failed chunk`)) continue;
+      if (at.bank === name && at.section === "chunks") return [];
+      return [
+        [
+          `${line.split(";")[0]}. `,
+          h("a", { href: `#/banks/${encodeURIComponent(name)}/chunks` }, "Review them on the Ingestion page"),
+        ],
+      ];
+    }
+    return [codeSpans(line)];
+  }
+
   function showStatus(status, at) {
     if (!banner || !status) return;
-    const lines = status.attention ?? [];
+    const lines = (status.attention ?? []).flatMap((line) => attentionLine(line, status, at));
     banner.replaceChildren(
       lines.length
         ? h(
             "section",
             { class: "attention", role: "status", "aria-label": "Needs attention" },
             h("p", { class: "attention-title" }, "Needs attention"),
-            h("ul", {}, lines.map((line) => h("li", {}, codeSpans(line)))),
+            h("ul", {}, lines.map((line) => h("li", {}, line))),
           )
         : "",
     );

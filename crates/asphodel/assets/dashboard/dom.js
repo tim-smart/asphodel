@@ -37,7 +37,8 @@ export function elements(document) {
   /// The stem gauge: how much life a memory has left before it fades.
   /// Decorative; the label beside it says the same in words.
   function gauge(stage, fade) {
-    const fill = stage === "never" ? 1 : stage === "faded" ? 0 : Math.min(1, Math.log1p(fade.bank_days) / Math.log1p(180));
+    const fill =
+      stage === "never" ? 1 : stage === "faded" || stage === "out" ? 0 : Math.min(1, Math.log1p(fade.bank_days) / Math.log1p(180));
     return h("span", { class: "gauge", "aria-hidden": "true", style: { "--fill": fill.toFixed(3) } }, h("span"));
   }
 
@@ -51,6 +52,20 @@ export function elements(document) {
           ? ["Faded: recall no longer finds it"]
           : [`Fades in ${bankDays(fade.bank_days)}, no sooner than `, time(fade.earliest_at)];
     return h("span", { class: "fade", "data-fade": stage }, gauged ? gauge(stage, fade) : null, h("span", {}, words));
+  }
+
+  /// What a retracted or forgotten memory's row says in place of a fade:
+  /// it's out of use already, so only its purge, or its erase, is ahead.
+  function outOfUseLabel(status, purge) {
+    const words =
+      status === "forgetting"
+        ? ["Being forgotten: the erase removes it"]
+        : !purge
+          ? ["Out of use. Never purged while things stay as they are"]
+          : purge.bank_days === 0
+            ? ["Out of use. Can be purged at the next sweep"]
+            : [`Out of use. Purged in ${bankDays(purge.bank_days)}, no sooner than `, time(purge.earliest_at)];
+    return h("span", { class: "fade", "data-fade": "out" }, gauge("out"), h("span", {}, words));
   }
 
   /// When a memory's chain can be purged.
@@ -69,7 +84,7 @@ export function elements(document) {
     return h("span", { class: "pill", "data-tone": tone ?? text }, text);
   }
 
-  return { h, append, time, gauge, fadeLabel, purgeLabel, pill };
+  return { h, append, time, gauge, fadeLabel, outOfUseLabel, purgeLabel, pill };
 }
 
 /// Where a memory sits on its way to fading: `never`, `far`, `near`,

@@ -689,7 +689,9 @@ outside the daemon.
 
 The dashboard is plain ES modules and CSS under
 `crates/asphodel/assets/dashboard/`, embedded in the binary as they are:
-there is no build step and nothing to install. Node runs its tests only:
+there is no build step and nothing to install. Its serif is Source Serif 4,
+Adobe's woff2 release files unmodified, served from the daemon under the SIL
+Open Font License (`OFL.txt` beside them, also at `/dashboard/OFL.txt`). Node runs its tests only:
 `cd tests/dashboard && nix develop ../.. -c sh -c 'npm ci && npm test'`.
 
 ## Deleting a bank
