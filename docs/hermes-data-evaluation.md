@@ -115,8 +115,10 @@ if it refuses, report the message verbatim and stop.
 
 ## 3. Backend configuration
 
-`$ASPHODEL_REPLAY_DIR/replay.toml`. Floors are placeholders until step 8;
-the run refuses to start without them.
+`$ASPHODEL_REPLAY_DIR/replay.toml`. The embedding floor is a placeholder
+until step 8. The MiniLM injection floor is Tim's TIM-131 recommendation
+from 10 labelled prefetches, pending live-run acceptance. The run refuses
+to start without floors for the exact loaded models.
 
 ```toml
 [llm]
@@ -127,7 +129,7 @@ endpoint = "https://api.openai.com/v1"    # or: auth = "chatgpt" and no endpoint
 "bge-small-en-v1.5:int8" = 0.8
 
 [injection.reranker_floors]
-"ms-marco-MiniLM-L-6-v2:int8" = 3.0
+"ms-marco-MiniLM-L-6-v2:int8" = -8.0
 
 [ranking.relevance_scales]
 "ms-marco-MiniLM-L-6-v2:int8" = 3.564211

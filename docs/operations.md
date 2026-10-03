@@ -118,6 +118,15 @@ The tuning file is TOML, and every key in it is optional except three kinds:
   Like the floors, the relevance scale is keyed by the exact model string,
   quantisation included, with no fallback.
 
+The deploy and evaluation examples use a raw-logit injection floor of
+`-8.0` for `ms-marco-MiniLM-L-6-v2:int8`, as recommended in TIM-131 from
+10 labelled prefetches. It keeps over half the relevant memories; higher
+floors roughly halve those kept for little precision gain, while the token
+budget still caps injection. Live-run injected-token counts and probes
+p02/p04 remain to be accepted. The relevance scale stays `3.564211`.
+These are configuration values, not built-in defaults: floors and scales
+must still be supplied for the exact model id.
+
 `[llm] concurrency` (default 1) is how many LLM calls may be in flight at
 once across the daemon, refreshes included, and how many chunks each bank
 extracts at once. Chunks still commit in queue order, and a chunk whose

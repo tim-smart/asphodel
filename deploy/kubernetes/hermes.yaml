@@ -26,15 +26,15 @@ data:
     # drop `endpoint`, and log in once the pod is up:
     #   kubectl exec -it hermes-0 -c asphodel -- asphodel llm login --data-dir /data
 
-    # Calibrated in replay before the deploy (docs/replay.md, "Labelling and
-    # the precision curve"). These values are placeholders.
+    # Calibrate this embedding-floor placeholder in replay before deployment
+    # (docs/replay.md, "Labelling and the precision curve").
     [reconcile.embedding_floors]
     "bge-small-en-v1.5:int8" = 0.8
 
-    # Provisional until the labels exist: +3.0 injects 31 right and 8 wrong
-    # on the agent-drafted probe set.
+    # Recommended in TIM-131 from 10 labelled prefetches. Live-run injection
+    # tokens and probes p02/p04 still need acceptance; the gate uses raw logits.
     [injection.reranker_floors]
-    "ms-marco-MiniLM-L-6-v2:int8" = 3.0
+    "ms-marco-MiniLM-L-6-v2:int8" = -8.0
 
     # The reranker logit is divided by this before it's added to the other
     # ranking terms. The other weights were sized for jina-reranker-v1-turbo-en
