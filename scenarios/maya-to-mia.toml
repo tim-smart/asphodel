@@ -1,0 +1,115 @@
+# Maya corrected to Mia. The wrong name is mentioned on three separate
+# occasions, then corrected. The correction retracts Maya, makes Mia the head of
+# the chain, hides Maya from recall, and Mia inherits Maya's accesses: created
+# on day 0, mentioned again on days 4 and 8, plus her own creation on day 12. On
+# those four accesses she's still in recall 100 days on (strength 0.10, fading),
+# where a fresh minor memory from day 12 would have faded on day 75, and she
+# fades on day 547, with 5% either side.
+
+name = "maya-to-mia"
+group = "ci"
+description = "Correcting Maya to Mia keeps the corrected name as strong as the wrong one was."
+
+[bank]
+timezone = "UTC"
+
+[tuning]
+clock.quiet_rate = 1.0
+
+[[turn]]
+at = "2026-01-05T09:00:00Z"
+session = "s1"
+user = "My sister is called Maya."
+assistant = "Nice to know."
+
+[[turn.claim]]
+label = "maya"
+content = "Tim's sister is called Maya."
+quote = "My sister is called Maya"
+kind = "fact"
+significance = "minor"
+
+[[turn]]
+at = "2026-01-09T09:00:00Z"
+session = "s1"
+user = "By the way, my sister is called Maya, in case you forgot."
+assistant = "I hadn't."
+
+[[turn.claim]]
+content = "Tim's sister is called Maya."
+quote = "my sister is called Maya"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "maya", outcome = "mentioned_again" }]
+
+[[turn]]
+at = "2026-01-13T09:00:00Z"
+session = "s1"
+user = "I know I keep saying it: my sister is called Maya."
+assistant = "You do."
+
+[[turn.claim]]
+content = "Tim's sister is called Maya."
+quote = "my sister is called Maya"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "maya", outcome = "mentioned_again" }]
+
+[[turn]]
+at = "2026-01-17T09:00:00Z"
+session = "s1"
+user = "I misspelled her name before: my sister is called Mia, not Maya."
+assistant = "Mia it is."
+
+[[turn.claim]]
+label = "mia"
+content = "Tim's sister is called Mia."
+quote = "my sister is called Mia"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "maya", outcome = "retracts" }]
+
+[[probe]]
+id = "mia-is-the-head"
+at = "2026-01-17T10:00:00Z"
+kind = "exists"
+memory = "mia"
+memory_kind = "fact"
+head = true
+retracted = false
+
+[[probe]]
+id = "maya-is-retracted"
+at = "2026-01-17T10:00:00Z"
+kind = "exists"
+memory = "maya"
+head = false
+retracted = true
+
+[[probe]]
+id = "recall-finds-mia"
+at = "2026-01-17T10:00:00Z"
+kind = "recall_finds"
+memory = "mia"
+query = "What is my sister called?"
+
+[[probe]]
+id = "recall-hides-maya"
+at = "2026-01-17T10:00:00Z"
+kind = "recall_lacks"
+memory = "maya"
+query = "What is my sister called?"
+
+[[probe]]
+id = "mia-still-in-recall-on-day-100"
+at = "2026-04-15T09:00:00Z"
+kind = "band"
+memory = "mia"
+band = "fading"
+
+[[probe]]
+id = "mia-fades-on-the-inherited-log"
+at = "2027-08-28T09:00:00Z"
+kind = "faded_at"
+memory = "mia"
+between = ["2027-06-09T01:09:55Z", "2027-08-02T18:01:30Z"]

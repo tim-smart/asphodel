@@ -13,5 +13,3 @@ Asphodel runs as a single long-lived daemon that owns the store, the embedding m
 - When the daemon is down, Hermes carries on without memory. Turns are spooled and replayed later, so ingest has to stay idempotent.
 - Every operator command is an HTTP client of the daemon. Nothing else opens the database.
 - Hermes' own backup doesn't cover Asphodel's data.
-
-Decided in "API surface and Hermes transport" (TIM-94) on 2026-10-01.

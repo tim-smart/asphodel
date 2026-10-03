@@ -1,0 +1,88 @@
+# A rescheduled appointment. The new slot retracts the old one and becomes the
+# head of the chain. The dated agenda, judged by bank-local date, lists the new
+# slot once it's within the seven-day horizon and never the retracted one, and
+# drops the appointment once it has happened, when the memory is recently past.
+#
+# Times are given in UTC; the bank is in Auckland (UTC+13 in February), so
+# 2026-02-02T20:00Z is 09:00 on 3 February bank-local.
+
+name = "rescheduled-appointment"
+group = "ci"
+description = "A reschedule retracts the old slot, the agenda lists the new one and not the old, and the appointment is recently past once it has happened."
+
+[bank]
+timezone = "Pacific/Auckland"
+
+[[turn]]
+at = "2026-02-02T20:00:00Z"
+session = "s1"
+user = "I have a dentist appointment on 10 February at 2pm."
+assistant = "I'll keep that in mind."
+
+[[turn.claim]]
+label = "dentist"
+content = "Tim has a dentist appointment on 2026-02-10 at 14:00."
+quote = "I have a dentist appointment on 10 February at 2pm"
+kind = "event"
+significance = "minor"
+valid_from = { at = "2026-02-10T14:00", precision = "minute" }
+
+[[turn]]
+at = "2026-02-05T20:00:00Z"
+session = "s1"
+user = "The dentist moved my appointment to 17 February at 2pm."
+assistant = "Updated: 17 February at 2pm."
+
+[[turn.claim]]
+label = "dentist-moved"
+content = "Tim has a dentist appointment on 2026-02-17 at 14:00."
+quote = "The dentist moved my appointment to 17 February at 2pm"
+kind = "event"
+significance = "minor"
+valid_from = { at = "2026-02-17T14:00", precision = "minute" }
+reconcile = [{ memory = "dentist", outcome = "retracts" }]
+
+[[probe]]
+id = "new-slot-is-the-head"
+at = "2026-02-05T21:00:00Z"
+kind = "exists"
+memory = "dentist-moved"
+memory_kind = "event"
+head = true
+retracted = false
+phase = "upcoming"
+
+[[probe]]
+id = "old-slot-is-retracted"
+at = "2026-02-05T21:00:00Z"
+kind = "exists"
+memory = "dentist"
+head = false
+retracted = true
+
+# 12 February bank-local: 17 February is inside the seven-day horizon.
+[[probe]]
+id = "agenda-lists-the-new-slot"
+at = "2026-02-11T20:00:00Z"
+kind = "agenda_has"
+memory = "dentist-moved"
+
+[[probe]]
+id = "agenda-never-lists-the-old-slot"
+at = "2026-02-11T20:00:00Z"
+kind = "agenda_lacks"
+memory = "dentist"
+
+# 19 February bank-local: the appointment has happened.
+[[probe]]
+id = "appointment-is-recently-past"
+at = "2026-02-18T20:00:00Z"
+kind = "exists"
+memory = "dentist-moved"
+phase = "recently_past"
+
+[[probe]]
+id = "agenda-drops-it-once-past"
+at = "2026-02-18T20:00:00Z"
+kind = "agenda_lacks"
+memory = "dentist-moved"

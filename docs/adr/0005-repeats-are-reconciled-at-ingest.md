@@ -13,5 +13,3 @@ Extraction makes two LLM calls per chunk. The first extracts claims. The second,
 - Reconciliation runs only when a claim lands above a similarity floor or signals a change, so a chunk that touches nothing already known costs one call. The floor is tuned for recall on real sessions and stored per embedding model, because a missed neighbour creates a silent duplicate.
 - Code, not the LLM, decides from `observed_at` which of two memories is newer, so an old document can't overrule a newer memory.
 - Reversing this later is expensive. Once a store has been built this way it holds accesses rather than duplicates, so the history needed to switch to append-and-consolidate no longer exists.
-
-Decided in "Extraction: significance, validity windows and supersession" (TIM-92) on 2026-10-01.

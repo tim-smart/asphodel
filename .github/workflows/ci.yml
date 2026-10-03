@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing in the check and test jobs may reach a model host. fastembed and
+  # the ONNX models come from the nix store or the repo, never from a download
+  # at build or test time. The image job fetches the models the manifest pins,
+  # as fixed-output nix derivations checked against its SHA-256s.
+  HF_HUB_OFFLINE: "1"
+  # The runner ran out of disk linking the test binaries: each statically
+  # links fastembed, ort and tokenizers, and full debug info made them
+  # 150-230 MB apiece. Without it one is about 27 MB. Incremental state is
+  # never reused in CI, so it isn't written.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      # Only Cargo's downloads are cached. `target` is rebuilt each run: a
+      # restored one brought back every earlier head's artifacts and filled
+      # the disk.
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: cargo fmt --check
+        run: nix develop -c cargo fmt --check
+
+      - name: cargo clippy
+        run: nix develop -c cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: nix develop -c cargo test
+
+  plugin:
+    name: plugin tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: pytest
+        run: nix develop -c python -m pytest plugin/tests
+
+  image:
+    name: OCI image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      # The build checks the baked model dir against the manifest compiled
+      # into the binary.
+      - name: nix build .#image
+        run: nix build .#image -L
+
+      # Runs the image as a pod would, on the real models, until /v1/health
+      # answers 200. The floors are placeholders: the daemon only checks
+      # that each model has one.
+      - name: serve from the image
+        run: |
+          image=$(docker load < result | sed -n 's/^Loaded image: //p')
+          cat > ci.toml <<'TOML'
+          [reconcile.embedding_floors]
+          "bge-small-en-v1.5:int8" = 0.8
+
+          [injection.reranker_floors]
+          "jina-reranker-v1-turbo-en:int8" = 0.0
+          TOML
+          docker run -d --name asphodel -p 127.0.0.1:7720:7720 \
+            --read-only --tmpfs /data:uid=65532,gid=65532 --tmpfs /tmp \
+            -v "$PWD/ci.toml:/etc/asphodel/asphodel.toml:ro" \
+            -e ASPHODEL_TOKEN=ci \
+            "$image" serve --listen 0.0.0.0:7720 --data-dir /data \
+            --config /etc/asphodel/asphodel.toml
+          for _ in $(seq 60); do
+            if curl -fsS http://127.0.0.1:7720/v1/health; then
+              docker exec -e ASPHODEL_TOKEN=ci asphodel asphodel status
+              docker stop asphodel
+              docker logs asphodel 2>&1 | tail -n 3
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs asphodel
+          exit 1

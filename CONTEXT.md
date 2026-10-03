@@ -59,7 +59,7 @@ How exact each end of a validity window is: year, month, day, hour or minute.
 _Avoid_: Granularity, resolution
 
 **Phase**:
-Where a memory sits relative to now (upcoming, recently past or long past), always computed and never stored.
+Where a memory sits relative to now (upcoming, current, overdue, recently past or long past), always computed and never stored. Recently past lasts 30 days after the validity window closes.
 _Avoid_: Status, lifecycle state
 
 **Observed at**:
@@ -86,6 +86,7 @@ _Avoid_: Expired, closed, completed
 
 **Retracted**:
 A memory that turned out to be wrong, such as a correction or a rescheduled appointment. It's hidden from current and history answers, but kept for audit.
+A denied memory, one the user says never happened or isn't true, is retracted too. The only difference is what happens to anything it had ended: a correction still ends it, and a denial opens it again.
 _Avoid_: Deleted, invalidated, cancelled
 
 **Refined**:
@@ -191,7 +192,7 @@ The exact input a memory came from, either a conversation turn or a document, ke
 _Avoid_: Episode, chunk, input, raw message
 
 **Tombstone**:
-What's left of a source, or of a passage in one, once its text is gone: the key and content hash, with no text. It stops the same input being ingested and extracted again. A turn that asked to forget is stored as a tombstone from the start.
+What's left of a source, or of a passage in one, once its text is gone: the key and content hash, with no text. It stops the same input being ingested and extracted again. An edited section of a document, or a later turn that repeats the same words, is new input, not the same input. A turn that asked to forget is stored as a tombstone from the start.
 _Avoid_: Marker, stub, deleted row
 
 **Sweep**:
@@ -223,7 +224,7 @@ A statement extraction has found in a chunk but not yet reconciled. It becomes a
 _Avoid_: Fact (that's a kind), candidate, extracted fact
 
 **Reconciliation**:
-The step of extraction that compares claims with the closest existing memories and decides whether each is new, mentioned again, confirmed, or ends, retracts or refines an existing memory.
+The step of extraction that compares claims with the closest existing memories and decides whether each is new, mentioned again, confirmed, or ends, retracts, denies or refines an existing memory.
 _Avoid_: Deduplication, merging, consolidation
 
 **Entity**:

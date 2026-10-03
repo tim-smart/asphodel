@@ -1,0 +1,150 @@
+# Hermes with Asphodel as a native sidecar (docs/operations.md).
+#
+# Before applying:
+#   - push the image `nix build .#image` builds and set it below;
+#   - create the secret:
+#       kubectl create secret generic asphodel \
+#         --from-literal=token="$(openssl rand -hex 32)" \
+#         --from-literal=llm-api-key=<key>
+#   - fill in the tuning file, including the calibrated floors;
+#   - replace the Hermes container with your own.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: asphodel-config
+data:
+  asphodel.toml: |
+    # The tuning file (ADR 0009). Every key is optional except the LLM
+    # model and a floor for each model the daemon runs: it refuses to start
+    # without them.
+
+    [llm]
+    model = "<the model the floors were calibrated against>"
+    endpoint = "https://api.openai.com/v1"
+    # For a ChatGPT subscription instead of an API key, set
+    #   auth = "chatgpt"
+    # drop `endpoint`, and log in once the pod is up:
+    #   kubectl exec -it hermes-0 -c asphodel -- asphodel llm login --data-dir /data
+
+    # Calibrated in replay before the deploy (docs/replay.md, "Labelling and
+    # the precision curve"). These values are placeholders.
+    [reconcile.embedding_floors]
+    "bge-small-en-v1.5:int8" = 0.8
+
+    [injection.reranker_floors]
+    "jina-reranker-v1-turbo-en:int8" = 0.0
+---
+# Only the backup CronJob uses this. Hermes reaches the daemon on loopback.
+apiVersion: v1
+kind: Service
+metadata:
+  name: asphodel
+spec:
+  selector:
+    app.kubernetes.io/name: hermes
+  ports:
+    - name: asphodel
+      port: 7720
+      targetPort: asphodel
+---
+# One replica, always: the daemon holds an exclusive lock on its data dir,
+# and a second pod on the same volume would wait on it or fail. A
+# StatefulSet never runs two pods for one ordinal. A Deployment works too,
+# with `replicas: 1` and `strategy: {type: Recreate}`.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hermes
+spec:
+  replicas: 1
+  serviceName: asphodel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hermes
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hermes
+    spec:
+      securityContext:
+        # The image runs as 65532. fsGroup gives it the data volume.
+        fsGroup: 65532
+      # Room for the daemon to finish the chunk in flight on SIGTERM. Native
+      # sidecars stop after the main containers, so Hermes stops first.
+      terminationGracePeriodSeconds: 120
+      initContainers:
+        # A native sidecar (Kubernetes 1.29+): an init container that keeps
+        # running. Hermes starts once the startup probe passes.
+        - name: asphodel
+          image: registry.example.com/asphodel:0.1.0
+          restartPolicy: Always
+          args:
+            - serve
+            # Off loopback, so the kubelet's probes and the backup job can
+            # reach it. That makes the token mandatory for every client.
+            - --listen=0.0.0.0:7720
+            - --data-dir=/data
+            - --config=/etc/asphodel/asphodel.toml
+          env:
+            - name: ASPHODEL_TOKEN
+              valueFrom:
+                secretKeyRef: {name: asphodel, key: token}
+            - name: ASPHODEL_LLM_API_KEY
+              valueFrom:
+                secretKeyRef: {name: asphodel, key: llm-api-key, optional: true}
+          ports:
+            - name: asphodel
+              containerPort: 7720
+          # /v1/health answers 503 while the store migrates and the models
+          # load, and 200 once the daemon is ready. It needs no token.
+          startupProbe:
+            httpGet: {path: /v1/health, port: asphodel}
+            periodSeconds: 2
+            failureThreshold: 150
+          readinessProbe:
+            httpGet: {path: /v1/health, port: asphodel}
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {memory: 1Gi}
+          volumeMounts:
+            - name: asphodel-data
+              mountPath: /data
+            - name: asphodel-config
+              mountPath: /etc/asphodel
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: hermes
+          image: registry.example.com/hermes:latest
+          env:
+            - name: ASPHODEL_URL
+              value: http://127.0.0.1:7720
+            - name: ASPHODEL_TOKEN
+              valueFrom:
+                secretKeyRef: {name: asphodel, key: token}
+          # ... the rest of your Hermes container, with the plugin installed
+          # under $HERMES_HOME/plugins/asphodel.
+      volumes:
+        - name: asphodel-config
+          configMap:
+            name: asphodel-config
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    # A local or block volume. The daemon refuses NFS, SMB/CIFS, CephFS and
+    # FUSE unless given --allow-network-fs, because SQLite's locking and WAL
+    # aren't safe on them.
+    - metadata:
+        name: asphodel-data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi

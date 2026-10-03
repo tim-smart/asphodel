@@ -5,11 +5,31 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
   };
 
-  outputs = {nixpkgs, ...}: let
+  outputs = {
+    self,
+    nixpkgs,
+    ...
+  }: let
+    inherit (nixpkgs) lib;
     forAllSystems = function:
-      nixpkgs.lib.genAttrs nixpkgs.lib.systems.flakeExposed
+      lib.genAttrs lib.systems.flakeExposed
       (system: function nixpkgs.legacyPackages.${system});
   in {
+    packages = forAllSystems (pkgs: let
+      asphodel = pkgs.callPackage ./nix/package.nix {
+        gitSha = self.rev or null;
+      };
+      models = pkgs.callPackage ./nix/models.nix {inherit asphodel;};
+    in
+      {
+        inherit asphodel models;
+        default = asphodel;
+      }
+      // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        # `nix build .#image`, then `docker load < result`.
+        image = pkgs.callPackage ./nix/image.nix {inherit asphodel models;};
+      });
+
     devShells = forAllSystems (pkgs: let
       python = pkgs.python3.withPackages (ps: [ps.pytest]);
     in {

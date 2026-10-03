@@ -1,0 +1,64 @@
+# A three-week holiday (ADR 0004). A trivial memory is mentioned once while
+# the bank is in conversation for three days, then nobody talks for three
+# weeks. Bank time runs at full speed for 24 hours after each turn and at
+# the quiet rate (0.1) otherwise, so the gap counts for 2.1 bank days and
+# the memory is still in recall when the conversation resumes on world day
+# 24 (5.1 bank days), where a world clock would have faded it on day 15.
+# Daily chatter then keeps the bank at full speed, and the memory fades on
+# bank day 15.09, which is world day 24 + (15.09 − 5.1) = 33.99, with 5%
+# of the lifetime either side.
+
+name = "three-week-holiday"
+group = "ci"
+description = "A trivial memory survives a three-week gap on bank time and fades at the bank day the quiet rate gives."
+
+[bank]
+timezone = "UTC"
+
+[[turn]]
+at = "2026-01-05T09:00:00Z"
+session = "s1"
+user = "My neighbour's cat is called Biscuit."
+assistant = "A good name for a cat."
+
+[[turn.claim]]
+label = "biscuit"
+content = "Tim's neighbour's cat is called Biscuit."
+quote = "My neighbour's cat is called Biscuit"
+kind = "fact"
+significance = "trivial"
+
+# Two more days in conversation before the holiday.
+[[chatter]]
+from = "2026-01-06T09:00:00Z"
+every = "1d"
+count = 2
+
+# Back from the holiday on world day 24, and talking every day after.
+[[chatter]]
+from = "2026-01-29T09:00:00Z"
+every = "1d"
+count = 22
+
+# World day 16, quiet since day 3: 4.3 bank days, strength −0.26.
+[[probe]]
+id = "still-in-recall-on-world-day-16"
+at = "2026-01-21T09:00:00Z"
+kind = "band"
+memory = "biscuit"
+band = "fading"
+
+# An hour before the first turn back: 5.1 bank days, strength −0.32.
+[[probe]]
+id = "still-in-recall-after-the-holiday"
+at = "2026-01-29T08:00:00Z"
+kind = "band"
+memory = "biscuit"
+band = "fading"
+
+[[probe]]
+id = "fades-on-bank-day-15"
+at = "2026-02-20T09:00:00Z"
+kind = "faded_at"
+memory = "biscuit"
+between = ["2026-02-07T14:43:59Z", "2026-02-09T02:58:23Z"]
