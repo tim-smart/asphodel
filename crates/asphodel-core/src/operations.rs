@@ -679,15 +679,19 @@ pub struct ForgetRow {
     pub pending: bool,
 }
 
-/// One recall and what came back. The query is content, and the sweep
-/// clears it at the 90-day horizon.
+/// One recall and what came back. The queries are content, and the sweep
+/// clears both at the 90-day horizon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecallRow {
     pub id: Uuid,
     pub kind: String,
     pub session_id: Option<String>,
     pub at: Timestamp,
+    /// The query that ran: for a prefetch, the cleaned message.
     pub query: Option<String>,
+    /// A prefetch's message as it was sent. `None` for other kinds and for
+    /// prefetches logged before schema version 11.
+    pub raw_query: Option<String>,
     pub latency_ms: i64,
     pub swept_at: Option<Timestamp>,
     pub results: Vec<Uuid>,
@@ -798,7 +802,8 @@ fn recalls(
     limit: usize,
 ) -> Result<Vec<RecallRow>, rusqlite::Error> {
     let mut statement = conn.prepare(
-        "SELECT id, uuid, kind, session_id, at, query, latency_ms, swept_at FROM recalls
+        "SELECT id, uuid, kind, session_id, at, query, latency_ms, swept_at, raw_query
+         FROM recalls
          WHERE bank_id = ?1 ORDER BY at DESC, id DESC LIMIT ?2",
     )?;
     let mut results = conn.prepare(
@@ -820,6 +825,7 @@ fn recalls(
                     query: row.get(5)?,
                     latency_ms: row.get(6)?,
                     swept_at: row.get::<_, Option<i64>>(7)?.map(timestamp),
+                    raw_query: row.get(8)?,
                     results: Vec::new(),
                 },
             ))

@@ -369,6 +369,35 @@ pub fn phase_term(
     if low_confidence { term / 2.0 } else { term }
 }
 
+/// The note Hermes' Discord gateway puts in front of a turn's message,
+/// up to the message id.
+const DISCORD_NOTE_START: &str = "[Triggering message id: `";
+
+/// The user's message as prefetch recalls for it: without the note Hermes'
+/// Discord gateway puts in front of it, naming the triggering message's id,
+/// and without the `[Name] ` speaker prefix of a shared thread, which
+/// follows the note. Nothing else is touched, and either can be missing.
+/// A message that is only these cleans to nothing.
+pub fn clean_query(raw: &str) -> String {
+    let mut text = raw.trim_start();
+    if let Some(rest) = text.strip_prefix(DISCORD_NOTE_START)
+        && let Some(end) = rest.find(']')
+        && !rest[..end].contains('\n')
+    {
+        text = rest[end + 1..].trim_start();
+    }
+    // As the replay importer reads the speaker: `^\[([^\]\n]+)\] `.
+    if let Some(rest) = text.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+        && end > 0
+        && !rest[..end].contains('\n')
+        && let Some(message) = rest[end + 1..].strip_prefix(' ')
+    {
+        text = message;
+    }
+    text.trim().to_owned()
+}
+
 /// The query prefetch runs: the message itself, or, when it's a short
 /// follow-up of fewer than [`SHORT_FOLLOW_UP_WORDS`] words split on
 /// whitespace ("yes, book it"), the previous prefetch query and then the
@@ -477,6 +506,8 @@ pub struct GateCandidate {
 pub struct ScoredPrefetch {
     pub prefetch: Prefetch,
     pub query: String,
+    /// The message as it was sent, before [`clean_query`].
+    pub raw_query: String,
     pub candidates: Vec<GateCandidate>,
 }
 
@@ -491,7 +522,8 @@ pub(crate) fn scored_prefetch(
     let started = Instant::now();
     let deadline = started + cx.deadline;
     let now = cx.store.now();
-    let query = effective_query(&request.query, request.previous_query.as_deref());
+    let previous = request.previous_query.as_deref().map(clean_query);
+    let query = effective_query(&clean_query(&request.query), previous.as_deref());
     let (bank_id, bank_tz) = find_bank(cx.store, bank)?;
     let in_context: BTreeSet<Uuid> = cx
         .sessions
@@ -583,6 +615,7 @@ pub(crate) fn scored_prefetch(
             kind: RecallKind::Prefetch,
             session_id: Some(&request.session_id),
             query: &query,
+            raw_query: Some(&request.query),
             latency_ms: elapsed_ms(started),
             at: now,
             results: &logged,
@@ -611,6 +644,7 @@ pub(crate) fn scored_prefetch(
             reranked,
         },
         query,
+        raw_query: request.query.clone(),
         candidates: shown,
     })
 }
@@ -721,6 +755,7 @@ pub(crate) fn recall(
             kind: RecallKind::Tool,
             session_id: request.session_id.as_deref(),
             query: &query,
+            raw_query: None,
             latency_ms: elapsed_ms(started),
             at: now,
             results: &logged,
@@ -894,6 +929,7 @@ pub(crate) fn select(
                 kind: RecallKind::Refresh,
                 session_id: None,
                 query,
+                raw_query: None,
                 latency_ms: elapsed_ms(started),
                 at: now,
                 results: &logged,

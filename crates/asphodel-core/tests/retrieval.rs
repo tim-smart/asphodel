@@ -26,8 +26,8 @@ use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, ModelError, Models, Reranker,
 };
 use asphodel_core::retrieval::{
-    Band, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, effective_query,
-    estimate_tokens, fuse, phase_term,
+    Band, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, clean_query,
+    effective_query, estimate_tokens, fuse, phase_term,
 };
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::{OpenOptions, Store, VectorIndex, micros};
@@ -522,6 +522,20 @@ impl Harness {
             .unwrap()
     }
 
+    /// A recall row's cleaned query and the raw query it was cleaned from.
+    fn recall_queries(&self, recall_id: Uuid) -> (String, Option<String>) {
+        self.service
+            .store()
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT query, raw_query FROM recalls WHERE uuid = ?1",
+                [recall_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
     /// A recall's results, best rank first: memory and whether injected.
     fn results(&self, recall_id: Uuid) -> Vec<(Uuid, bool)> {
         let store = self.service.store().unwrap();
@@ -719,6 +733,59 @@ fn a_short_follow_up_finds_what_the_previous_query_asked_about() {
 
     let followed = h.prefetch_after("s", "yes, book it", Some("dentist appointment Friday"));
     assert_eq!(followed.injected, vec![dentist]);
+}
+
+// Cleaning the query
+
+/// The note Hermes' Discord gateway puts in front of a turn's message, with
+/// a synthetic message id.
+const DISCORD_NOTE: &str = "[Triggering message id: `100000000000000001` \u{2014} use as \
+                            `message_id` for reply/react/pin via the discord tools.]";
+
+#[test]
+fn each_format_cleans_to_the_message() {
+    let message = "what time is the ferry on Saturday?";
+    for (raw, cleaned) in [
+        (format!("[Sam] {message}"), message),
+        (format!("{DISCORD_NOTE}\n\n{message}"), message),
+        (format!("{DISCORD_NOTE}\n\n[Sam] {message}"), message),
+        // Only a leading prefix is a speaker's.
+        (
+            "remind me to pack [the blue bag] tomorrow".to_owned(),
+            "remind me to pack [the blue bag] tomorrow",
+        ),
+    ] {
+        assert_eq!(clean_query(&raw), cleaned, "{raw:?}");
+    }
+}
+
+#[test]
+fn a_message_of_only_the_note_and_prefix_cleans_to_nothing() {
+    for raw in [
+        "[Sam] ".to_owned(),
+        DISCORD_NOTE.to_owned(),
+        format!("{DISCORD_NOTE}\n\n[Sam] "),
+    ] {
+        assert_eq!(clean_query(&raw), "", "{raw:?}");
+    }
+}
+
+/// Prefetch recalls for the cleaned message, so the note's words don't make
+/// a short follow-up long, and the log keeps the raw query beside it.
+#[test]
+fn a_prefetch_recalls_for_the_cleaned_query_and_logs_both() {
+    let h = Harness::new();
+    let dentist = h.insert(fact("Tim's dentist appointment is on Friday."));
+    let raw = format!("{DISCORD_NOTE}\n\n[Sam] yes, book it");
+    let prefetch = h.prefetch_after("s", &raw, Some("[Sam] dentist appointment Friday"));
+    assert_eq!(prefetch.injected, vec![dentist]);
+    assert_eq!(
+        h.recall_queries(prefetch.recall_id),
+        (
+            "dentist appointment Friday\nyes, book it".to_owned(),
+            Some(raw)
+        )
+    );
 }
 
 // Retrievers and clean-up

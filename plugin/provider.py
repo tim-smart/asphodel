@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -47,6 +48,11 @@ BUILTIN_MEMORY_FLAGS = ("memory_enabled", "user_profile_enabled")
 HERMES_TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
 #: Pending recalls kept per session, the daemon's ``PENDING_PER_SESSION``.
 PENDING_RECALLS_PER_SESSION = 4
+#: What the daemon's ``clean_query`` strips from the front of a prefetch
+#: query: Hermes' Discord message-id note, then the ``[Name] `` speaker
+#: prefix. The daemon does the cleaning; the plugin only uses this to skip a
+#: query with nothing left.
+_QUERY_NOISE = re.compile(r"^(?:\[Triggering message id: `[^\]\n]*\]\s*)?(?:\[[^\]\n]+\] )?")
 
 
 @dataclass(frozen=True)
@@ -337,8 +343,13 @@ class AsphodelMemoryProvider(MemoryProvider):
         """``POST /v1/banks/{bank}/prefetch`` with the query, the session's
         last prefetch query as ``previous_query`` and, once, a pending block
         id. Stores the ``recall_id`` for ``sync_turn`` and the injected count
-        for ``recall_status``. "" on any failure."""
+        for ``recall_status``. The query goes as Hermes gave it, for the daemon
+        to clean, but one that cleans to nothing isn't sent. "" then and on
+        any failure."""
         self._last_injected = 0
+        if not isinstance(query, str) or not _QUERY_NOISE.sub("", query.lstrip(), count=1).strip():
+            log.debug("prefetch: skipped, the query cleans to nothing")
+            return ""
         try:
             deadline = time.monotonic() + self.timeouts.prefetch
             if self.client is None or not self.bank:

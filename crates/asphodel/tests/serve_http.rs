@@ -2335,10 +2335,11 @@ fn a_restored_store_keeps_its_fingerprint_and_pauses_purge_under_another() {
 }
 
 /// SQL that undoes the latest registered migration, `SCHEMA_VERSION`'s, by
-/// dropping the tables and indexes it creates. It only handles a migration
-/// that creates tables and indexes and nothing else, and fails loudly on any
-/// other, so this test is extended when such a migration lands rather than
-/// downgrading to a schema no older binary wrote.
+/// dropping the tables, indexes and added columns it creates. It only
+/// handles a migration that creates tables and indexes or adds columns and
+/// nothing else, and fails loudly on any other, so this test is extended
+/// when such a migration lands rather than downgrading to a schema no older
+/// binary wrote.
 fn undo_latest_migration() -> String {
     use asphodel_core::store::SCHEMA_VERSION;
 
@@ -2390,6 +2391,9 @@ fn undo_latest_migration() -> String {
             ["CREATE", "INDEX", ..] | ["CREATE", "UNIQUE", "INDEX"] => {
                 let at = if upper[1] == "UNIQUE" { 3 } else { 2 };
                 undo.push(format!("DROP INDEX IF EXISTS {};", name(at)))
+            }
+            ["ALTER", "TABLE", ..] if upper.get(3..5) == Some(&["ADD".into(), "COLUMN".into()]) => {
+                undo.push(format!("ALTER TABLE {} DROP COLUMN {};", name(2), name(5)))
             }
             _ => panic!(
                 "{} does more than create tables and indexes; extend this downgrade for it",

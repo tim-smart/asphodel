@@ -1,5 +1,8 @@
 """``prefetch`` and ``recall_status``: the body, the previous query, the
-pending ``recall_id``, the 3 s budget and "" on every failure."""
+pending ``recall_id``, the 3 s budget, "" on every failure and no call for a
+query that cleans to nothing."""
+
+import pytest
 
 from conftest import SESSION
 from fake_daemon import INJECTION
@@ -66,3 +69,30 @@ def test_sends_a_pending_block_id_once_when_the_block_had_no_session(make_provid
     bodies = [r.body for r in daemon.requests_for("prefetch")]
     assert bodies[0]["block_id"]
     assert bodies[1].get("block_id") is None
+
+
+#: The note Hermes' Discord gateway puts in front of a turn's message, with
+#: a synthetic message id.
+DISCORD_NOTE = (
+    "[Triggering message id: `100000000000000001` \u2014 use as `message_id` "
+    "for reply/react/pin via the discord tools.]"
+)
+
+
+def test_sends_the_raw_query_for_the_daemon_to_clean(make_provider, daemon):
+    provider = make_provider()
+    raw = f"{DISCORD_NOTE}\n\n[Sam] what time is the ferry on Saturday?"
+    assert provider.prefetch(raw, session_id=SESSION) == INJECTION
+    assert daemon.requests_for("prefetch")[0].body["query"] == raw
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["", "   ", "[Sam] ", DISCORD_NOTE, f"{DISCORD_NOTE}\n\n[Sam] "],
+    ids=["empty", "blank", "prefix", "note", "note-and-prefix"],
+)
+def test_a_query_that_cleans_to_nothing_is_not_prefetched(make_provider, daemon, query):
+    provider = make_provider()
+    assert provider.prefetch(query, session_id=SESSION) == ""
+    assert daemon.requests_for("prefetch") == []
+    assert provider.recall_status() is None

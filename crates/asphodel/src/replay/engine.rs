@@ -517,7 +517,7 @@ impl<'a> Engine<'a> {
             && turn.class == SessionClass::Primary
             && !turn.prefetch_only
         {
-            collector.turn(turn.at, &turn.session, &scored.query, &scored.candidates);
+            collector.turn(turn.at, &turn.session, &scored);
         }
         let prefetch = scored.prefetch;
         let tokens = estimate_tokens(&prefetch.text) as u64;

@@ -605,6 +605,7 @@ The material is one JSON object:
   "recall": [
     { "sample": "r1", "at": "<prefetch time>", "session": "<session id>",
       "query": "<the query the reranker scored against>",
+      "raw_query": "<the message as Hermes sent it>",
       "candidates": [
         { "id": "r1.1", "memory": "<uuid>", "score": 1.5, "sentence": "..." } ] } ],
   "call2": [
@@ -622,7 +623,11 @@ The material is one JSON object:
   turns. Each lists the prefetch's reranked candidates in ranked order
   before the gate, including those the gate turned away, scored with the
   reranker logit the gate floor compares. `query` is what the reranker
-  scored against, after a short follow-up borrowed the previous message.
+  scored against: the message without the Discord message-id note and the
+  `[Name] ` speaker prefix, after a short follow-up borrowed the previous
+  message. Calibration uses it. `raw_query` is the message as Hermes sent
+  it, for reading beside it. Material written before it was recorded has
+  no `raw_query`, and `report precision` still reads it.
 - `call2` holds every candidate list call 2 was shown, one per claim:
   the claim and its neighbours, scored with the cosine similarity of the
   claim to each. Only what call 2 was shown is here. Flagged claims bypass

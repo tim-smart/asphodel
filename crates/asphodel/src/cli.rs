@@ -1903,15 +1903,25 @@ fn audit(args: ListArgs, kind: AuditList) -> anyhow::Result<()> {
                     .as_f64()
                     .map_or_else(|| "none".to_string(), |delta| delta.to_string()),
             ),
-            AuditList::Recalls => println!(
-                "{}  {} {} ({} ms, {} results): {}",
-                text(row, "at"),
-                text(row, "kind"),
-                text(row, "id"),
-                count(row, "latency_ms"),
-                list(row, "results").len(),
-                row["query"].as_str().unwrap_or("[swept]"),
-            ),
+            AuditList::Recalls => {
+                let query = row["query"].as_str();
+                println!(
+                    "{}  {} {} ({} ms, {} results): {}",
+                    text(row, "at"),
+                    text(row, "kind"),
+                    text(row, "id"),
+                    count(row, "latency_ms"),
+                    list(row, "results").len(),
+                    query.unwrap_or("[swept]"),
+                );
+                // A prefetch's message before cleaning, when cleaning
+                // changed it.
+                if let Some(raw) = row["raw_query"].as_str()
+                    && Some(raw) != query
+                {
+                    println!("  raw: {raw}");
+                }
+            }
         }
     }
     Ok(())
