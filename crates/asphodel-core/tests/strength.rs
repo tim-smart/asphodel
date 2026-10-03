@@ -366,7 +366,7 @@ fn floor_spacing_is_world_time_even_in_a_quiet_bank() {
 // Lifetimes on the strength function itself.
 
 #[test]
-fn one_mention_lifetimes_reproduce_tim_91() {
+fn one_mention_lifetimes_reproduce_reference_table() {
     for (significance, days) in LIFETIMES {
         let fades = crossing(0.0, 200.0 * DAYS_PER_YEAR, TAU, |day| {
             strength_at(significance, &[created(0.0)], day).value

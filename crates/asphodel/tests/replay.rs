@@ -314,7 +314,7 @@ fn an_unknown_scenario_field_doesnt_parse() {
 // The first set, through `asphodel replay`.
 
 #[test]
-fn lifetimes_reproduce_tim_91_within_tolerance() {
+fn lifetimes_reproduce_reference_table_within_tolerance() {
     let dir = TestDir::new();
     let run = replay(&dir, &scenario("lifetimes"), &[]);
     run.assert_passed();
