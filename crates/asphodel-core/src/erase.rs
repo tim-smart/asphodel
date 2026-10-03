@@ -1,12 +1,11 @@
-//! Forget, and the one erase path forget and purge share (ADR 0008; ADR 0010,
-//! "Forgetting").
+//! Forget, and the one erase path forget and purge share.
 //!
 //! **Chains.** Both act on whole supersession chains: every memory joined
 //! along `superseded_by`, whichever version was named. `ended_by` isn't a
 //! chain link, so a memory another one ended stays, keeps its `valid_until`
 //! and loses only the pointer.
 //!
-//! **Forget splits in two** (ADR 0010). Everything that can be undone
+//! **Forget splits in two.** Everything that can be undone
 //! happens when it's called: the chain is hidden (`hidden_at`), which keeps
 //! it out of recall, injection, the agenda, refresh inputs and `used`
 //! credit; model entries citing it are dropped; recall rows naming it are
@@ -34,7 +33,7 @@
 //! character, so the spans of other memories in the same chunk still hold.
 //! The source keeps its key and content hash, and the chunk its hash, so
 //! sending the same turn or document again is a duplicate and a later
-//! version can't bring the passage back for extraction (ADR 0002).
+//! version can't bring the passage back for extraction.
 //! A document's other versions hold the passage in their own text, so it's
 //! masked wherever it appears verbatim in them, and the masks are recorded
 //! in `chunk_redactions` for a version ingested later to apply to its text.
@@ -69,7 +68,7 @@ pub const REDACTION_MASK: char = '\u{2588}';
 
 /// What `memory_forget` and `POST /v1/banks/{bank}/forget` take. `session_id`
 /// is the Hermes session whose `sync_turn` will
-/// carry the request turn, so the audit row can be linked to it (ADR 0010);
+/// carry the request turn, so the audit row can be linked to it;
 /// the CLI sends none.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ForgetRequest {
@@ -200,7 +199,7 @@ pub(crate) fn forget(
         let scrub: BTreeSet<Uuid> = uuids.iter().copied().collect();
         scrub_stored(&tx, bank_id, &scrub)?;
         aftermath.scrub = scrub;
-        // The audit row (ADR 0010), written now so a crash before the
+        // The audit row, written now so a crash before the
         // erase still leaves it. `after` is the session's latest turn so
         // far: the request turn is the next one, whatever the clock says.
         let after: Option<i64> = match session {
@@ -359,7 +358,7 @@ pub(crate) fn erase_chain(
             other => rusqlite::Error::ToSqlConversionFailure(Box::new(other)),
         })?;
         tx.execute("DELETE FROM memories WHERE id = ?1", [member])?;
-        // A re-embed may have staged its vector too (ADR 0010).
+        // A re-embed may have staged its vector too.
         tx.execute("DELETE FROM reembed_vectors WHERE memory_id = ?1", [member])?;
     }
     delete_orphans(tx, &entities)?;
@@ -1089,7 +1088,7 @@ impl From<rusqlite::Error> for BankDeleteError {
     }
 }
 
-/// Deletes a bank (ADR 0010). Every memory goes
+/// Deletes a bank. Every memory goes
 /// through the erase path as one purge, which drops the model entries
 /// citing them and their vectors; then everything else the bank holds goes
 /// too, its tombstones, edit rows and session mappings included, and one

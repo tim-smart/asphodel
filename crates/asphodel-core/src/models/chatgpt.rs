@@ -570,8 +570,8 @@ impl From<LlmError> for Post {
 }
 
 impl CodexResponses {
-    /// `clock` decides when the access token is due for refresh (ADR 0004:
-    /// nothing reads the wall clock).
+    /// `clock` decides when the access token is due for refresh: nothing
+    /// reads the wall clock.
     pub fn new(settings: LlmSettings, store: TokenStore, clock: Arc<dyn Clock>) -> Self {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(settings.timeout))

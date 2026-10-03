@@ -1,6 +1,6 @@
 //! `asphodel serve` and the models, run as a process.
 //!
-//! Under ADR 0009, the daemon loads the models from the model dir
+//! The daemon loads the models from the model dir
 //! before it is ready, never downloads, fails fast on a missing file, and
 //! refuses to start without a floor for each loaded model. These tests see
 //! only what an operator sees: exit codes, stderr and the model dir.
@@ -102,7 +102,7 @@ fn an_empty_model_dir_stops_startup_naming_the_missing_file() {
 
 #[test]
 fn a_floor_for_the_real_models_does_not_cover_the_fakes() {
-    // ADR 0009: a missing floor for a configured model stops the daemon,
+    // A missing floor for a configured model stops the daemon,
     // whichever models are configured. Floors are keyed by the exact model
     // string, so a production tuning file doesn't make a fake daemon start,
     // and the switch can't hide a missing floor.

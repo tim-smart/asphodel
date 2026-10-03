@@ -10,7 +10,7 @@
 //! 2. refuse a network filesystem unless [`OpenOptions::allow_network_fs`];
 //! 3. take the exclusive lock, so one daemon owns a data dir at a time;
 //! 4. open [`DB_FILE`] in WAL mode with foreign keys on;
-//! 5. take the pre-migration copy and run any pending migrations (ADR 0010);
+//! 5. take the pre-migration copy and run any pending migrations;
 //! 6. delete pre-migration copies older than seven days.
 //!
 //! The service repeats step 6 through [`Store::expire_copies`], waking at
@@ -55,7 +55,7 @@ pub const DB_FILE: &str = "asphodel.db";
 /// it when the process dies.
 pub const LOCK_FILE: &str = "lock";
 
-/// The `store_meta` key of the stored deletion fingerprint (ADR 0009).
+/// The `store_meta` key of the stored deletion fingerprint.
 pub const META_DELETION_FINGERPRINT: &str = "deletion_fingerprint";
 
 /// The `store_meta` key of the deletion inputs behind the stored
@@ -285,9 +285,9 @@ impl Store {
         Ok(migrations::version(&self.connection())?)
     }
 
-    /// Compares the binary's deletion fingerprint with the stored one (ADR
-    /// 0009). On first start the fingerprint is just recorded. A different
-    /// stored value pauses purge until an operator acknowledges it.
+    /// Compares the binary's deletion fingerprint with the stored one. On
+    /// first start the fingerprint is just recorded. A different stored
+    /// value pauses purge until an operator acknowledges it.
     pub fn check_fingerprint(&self, current: &Fingerprint) -> Result<PurgePause, StoreError> {
         let conn = self.connection();
         let stored: Option<String> = conn
@@ -359,8 +359,8 @@ impl Store {
     }
 
     /// Deletes the pre-migration copies past their seven days on the store's
-    /// clock (ADR 0010). Open does this once; the service's housekeeping does
-    /// it while the daemon runs, so the bound holds without a restart.
+    /// clock. Open does this once; the service's housekeeping does it while
+    /// the daemon runs, so the bound holds without a restart.
     pub fn expire_copies(&self) -> Result<Vec<PathBuf>, StoreError> {
         expire_copies(&self.connection(), &self.dir, self.clock.now())
     }
@@ -460,8 +460,7 @@ pub(crate) fn register_extensions() {
 ///
 /// `secure_delete` zeroes deleted content instead of leaving it in free
 /// pages. Without it, a deleted recall row of a forget request, a swept
-/// source or an erased passage stays readable in the database file (ADR
-/// 0002, ADR 0010).
+/// source or an erased passage stays readable in the database file.
 fn configure(conn: &Connection) -> Result<(), StoreError> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(

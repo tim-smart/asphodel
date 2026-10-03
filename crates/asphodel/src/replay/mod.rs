@@ -62,9 +62,8 @@ use report::{Aggregate, Flags, Report};
 use scenario::Group;
 use timeline::Timeline;
 
-/// Floors for the deterministic fakes, the layer group `ci` runs under
-/// (ADR 0009): the reranker gate open, the reconcile floor where the unit
-/// tests put it.
+/// Floors for the deterministic fakes, the layer group `ci` runs under: the
+/// reranker gate open, the reconcile floor where the unit tests put it.
 pub(crate) fn fake_floors() -> String {
     format!(
         "[injection.reranker_floors]\n{:?} = 0.0\n[reconcile.embedding_floors]\n{:?} = 0.5\n",
@@ -461,8 +460,8 @@ pub(crate) fn inside_private(dir: &Path, path: &Path, what: &str) -> anyhow::Res
 }
 
 /// A TOML file that didn't parse, as an error that names the file and
-/// where, and holds none of the file's text (ADR 0010, "Logging"): the
-/// parser's own message quotes the source, so it goes to `trace` only.
+/// where, and holds none of the file's text: the parser's own message quotes
+/// the source, so it goes to `trace` only.
 pub(crate) fn toml_error(path: &Path, text: &str, error: &toml::de::Error) -> anyhow::Error {
     trace!(file = %path.display(), %error, "a private TOML file didn't parse");
     match error.span() {
@@ -480,9 +479,8 @@ pub(crate) fn toml_error(path: &Path, text: &str, error: &toml::de::Error) -> an
 }
 
 /// A JSON line that didn't parse, as an error that names the file, the
-/// line and the column, and holds none of the line's text (ADR 0010,
-/// "Logging"): serde's message can quote a value, so it goes to `trace`
-/// only.
+/// line and the column, and holds none of the line's text: serde's message
+/// can quote a value, so it goes to `trace` only.
 pub(crate) fn json_error(
     path: &Path,
     line: usize,

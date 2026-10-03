@@ -1,4 +1,4 @@
-//! Entity correction, re-embedding and bank deletion follow ADR 0010.
+//! Entity correction, re-embedding and bank deletion, each run as a daemon job.
 //!
 //! The API under test is the `Service` methods: `merge_entities`,
 //! `unmerge_entity`, `unlink_entity`, `start_reembed`, `run_reembed`,
@@ -466,7 +466,7 @@ fn a_merge_moves_aliases_links_and_filters_and_an_unmerge_moves_them_back() {
 
     let merged = merge(&h, &sam.to_string(), "Samuel").unwrap();
 
-    // ADR 0010: the row is kept with `merged_into` set, and the aliases and
+    // The row is kept with `merged_into` set, and the aliases and
     // links `into` lacked move to it in one logged edit. A link `into`
     // already had stays on `from`, where it resolves through the merge.
     assert_eq!((merged.from, merged.into), (sam, samuel));
@@ -903,7 +903,7 @@ fn a_bank_whose_recorded_model_isnt_loaded_is_refused_without_embedding() {
         .unwrap();
     let unavailable = |model: &str| model == FakeEmbedder::MODEL_ID;
 
-    // ADR 0010: recall and prefetch are refused
+    // Recall and prefetch are refused
     // rather than searched with another model's vectors.
     match h.service.recall(
         "main",

@@ -1,4 +1,5 @@
-//! Purge eligibility (ADR 0008).
+//! Purge eligibility: a chain is purged once its head's strength falls δ
+//! (`purge.delta`, 1.0 by default) below the recall threshold τ.
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;

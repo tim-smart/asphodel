@@ -14,8 +14,8 @@
 //! second.
 //!
 //! A forget's erase waits on the same queue, behind the chunks queued
-//! before it, and nothing queued after it is claimed until it has run (ADR
-//! 0010), so each step runs a due erase first.
+//! before it, and nothing queued after it is claimed until it has run, so
+//! each step runs a due erase first.
 //!
 //! On shutdown a worker finishes the chunks in flight and stops before
 //! claiming another. Nothing queued is lost, since the queue is in SQLite.

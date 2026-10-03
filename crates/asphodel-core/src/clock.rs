@@ -1,6 +1,6 @@
 //! The clock the service layer runs on.
 //!
-//! Memory runs on bank time and truth on world time (ADR 0004), and both are
+//! Strength runs on bank time and validity on world time, and both are
 //! derived from one source of "now" that the caller hands in. `serve` passes
 //! [`SystemClock`]; `replay` passes a [`SimulatedClock`] and advances it by
 //! hand. No other code reads the system time or asks the database for it.

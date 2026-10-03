@@ -1,6 +1,5 @@
 //! The replay harness on scripted scenarios, including deletion policy
-//! and memory lifetimes under ADRs 0004 and 0008. The contract these tests
-//! pin is `docs/replay.md`.
+//! and memory lifetimes. The contract these tests pin is `docs/replay.md`.
 //!
 //! The tests drive the binary as a process, as `serve_http.rs` does, and
 //! read the JSON report, so nothing here depends on how the engine is laid
@@ -337,7 +336,7 @@ fn the_purge_table_reproduces_adr_0008_and_the_shadow_table_counts_re_mentions()
     let run = replay(&dir, &scenario("purge-table"), &[]);
     run.assert_passed();
     let report = run.report();
-    // ADR 0008 protects the reinforced memories and the major one, not
+    // Purge spares the reinforced memories and the major one, not
     // the single minor/notable mentions. Both purge before the run ends.
     assert_eq!(purges(report), 5, "{}", report["purges_per_day"]);
     let shadow = &report["purged_then_re_mentioned"];
@@ -492,7 +491,7 @@ significance = "minor"
     );
     let swept = replay(&dir, &daily_path, &["--until", "2026-01-05T15:00:00Z"]);
     swept.assert_passed();
-    // ADR 0007's seeded "User profile" also refreshes at the sweep.
+    // The seeded "User profile" also refreshes at the sweep.
     // Only the explicit model had a creation-triggered debounce earlier.
     assert_eq!(
         swept.report()["refresh_calls_per_day"],

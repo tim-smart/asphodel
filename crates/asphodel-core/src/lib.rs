@@ -3,7 +3,7 @@
 //! The daemon (`asphodel serve`) and the replay harness (`asphodel replay`)
 //! both drive this crate in-process. Nothing in here reads the wall clock:
 //! every operation takes its notion of "now" from the [`clock::Clock`] it was
-//! given, so a replay can run years of bank time in minutes (ADR 0004).
+//! given, so a replay can run years of bank time in minutes.
 
 pub mod agenda;
 pub mod chunking;

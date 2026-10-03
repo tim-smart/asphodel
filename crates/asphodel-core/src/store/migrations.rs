@@ -1,4 +1,4 @@
-//! Schema migrations and the pre-migration copy (ADR 0010).
+//! Schema migrations and the pre-migration copy.
 //!
 //! The schema version is SQLite's `user_version`. The pending migrations
 //! run in one transaction that also records one row in `migrations` and
@@ -122,7 +122,7 @@ fn check_integrity(copy: &Connection, path: &Path) -> Result<(), StoreError> {
 
 /// `PRAGMA integrity_check`, with what it found when that isn't `ok`. A
 /// file SQLite can't read as a database fails with the reading error.
-/// Backup and restore check their copies with it too (ADR 0010).
+/// Backup and restore check their copies with it too.
 pub(crate) fn integrity_problems(conn: &Connection) -> Result<(), String> {
     let mut statement = conn
         .prepare("PRAGMA integrity_check")

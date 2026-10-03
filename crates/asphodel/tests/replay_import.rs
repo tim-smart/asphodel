@@ -249,7 +249,7 @@ fn multimodal(parts: Value) -> String {
 
 /// Text parts are kept, image parts dropped, and the memory block in its
 /// default `<memory-context>` fence is cut out, so injected memory never
-/// becomes source text (ADR 0002).
+/// becomes source text.
 #[test]
 fn multimodal_content_keeps_its_text_and_loses_images_and_the_memory_block() {
     let dir = TestDir::new();
@@ -670,7 +670,7 @@ fn assert_refused_without(output: &Output, sentinel: &str, words: &[&str]) {
     }
 }
 
-/// (ADR 0010, "Logging"): A manifest that doesn't parse is
+/// Content is logged only at `trace`: a manifest that doesn't parse is
 /// refused naming the file and the line, never quoting it.
 #[test]
 fn a_malformed_manifest_is_refused_without_quoting_it() {

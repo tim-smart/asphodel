@@ -117,8 +117,7 @@ pub(crate) fn router(app: Shared) -> Router {
 }
 
 /// An error as the API returns it: a status and `{"error": "..."}`. No
-/// message carries content (ADR 0010): the service's errors name kinds and
-/// ids only.
+/// message carries content: the service's errors name kinds and ids only.
 #[derive(Debug)]
 pub(crate) struct ApiError {
     status: StatusCode,
@@ -452,8 +451,8 @@ async fn health(State(app): State<Shared>) -> (StatusCode, Json<Health>) {
     }
 }
 
-/// `GET /v1/config`: the resolved config, secrets redacted (ADR 0009), with
-/// the purge state as it is now, after any ack.
+/// `GET /v1/config`: the resolved config, secrets redacted, with the purge
+/// state as it is now, after any ack.
 async fn config(State(app): State<Shared>) -> Result<Json<ResolvedConfig>, ApiError> {
     let ready = app.ready().ok_or_else(ApiError::not_ready)?;
     let mut config = ready.config.clone();
@@ -462,7 +461,7 @@ async fn config(State(app): State<Shared>) -> Result<Json<ResolvedConfig>, ApiEr
 }
 
 /// `GET /v1/purge/plan`: which fingerprinted values changed and what the
-/// sweep would delete now (ADR 0010). It deletes nothing.
+/// sweep would delete now. It deletes nothing.
 async fn purge_plan(State(app): State<Shared>) -> Result<Json<PurgePlan>, ApiError> {
     let plan = app.call(|service| service.purge_plan()).await?;
     Ok(Json(plan))
@@ -483,10 +482,10 @@ async fn purge_ack(
 const BACKUP_CHUNK: usize = 64 * 1024;
 
 /// `POST /v1/backup`: an online backup of the store, integrity-checked,
-/// streamed with its SHA-256 and length in headers (ADR 0010). The copy is
-/// unlinked from the data dir before the first byte goes, so a stream that
-/// stops part way leaves nothing behind. The completion is recorded for
-/// `status` just before the last bytes are sent.
+/// streamed with its SHA-256 and length in headers. The copy is unlinked from
+/// the data dir before the first byte goes, so a stream that stops part way
+/// leaves nothing behind. The completion is recorded for `status` just before
+/// the last bytes are sent.
 async fn backup(State(app): State<Shared>) -> Result<Response, ApiError> {
     let service = Arc::clone(&app.ready().ok_or_else(ApiError::not_ready)?.service);
     let Backup {
@@ -536,8 +535,8 @@ async fn backup(State(app): State<Shared>) -> Result<Response, ApiError> {
 
 /// `GET /v1/status`: queue depth, failures, the purge pause with both
 /// hashes, the last sweep, the pre-migration copy and the last backup, and
-/// what needs attention (ADR 0010). Always 200: `asphodel status` decides
-/// its exit code from `attention`.
+/// what needs attention. Always 200: `asphodel status` decides its exit code
+/// from `attention`.
 async fn status(State(app): State<Shared>) -> Result<Json<Status>, ApiError> {
     let status = app.call(|service| service.status()).await?;
     Ok(Json(status))
@@ -697,7 +696,7 @@ async fn keep(
 /// plugin, with the session its request turn will arrive in. Returns every
 /// id the erase removes. The erase runs at once when nothing was queued
 /// before it, and otherwise the bank's worker or housekeeping runs it
-/// behind those chunks (ADR 0010).
+/// behind those chunks.
 async fn forget(
     State(app): State<Shared>,
     Path(bank): Path<String>,

@@ -1,4 +1,4 @@
-//! Bank time: the clock strength runs on (ADR 0004).
+//! Bank time: the clock strength runs on.
 
 use jiff::Timestamp;
 

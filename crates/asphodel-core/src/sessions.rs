@@ -14,7 +14,7 @@
 //! - **The in-context set** is what the agent can already see this session:
 //!   committed injections and recall-tool results (and, once it exists, the
 //!   agenda). Injection skips it, and it's cleared on compaction. Extraction
-//!   judges `used` (ADR 0001) against the set as each turn's sync left it,
+//!   judges `used` against the set as each turn's sync left it,
 //!   which ingest stores with the turn ([`Sessions::after_turn`]), never
 //!   against the session as it is when the worker gets there.
 //! - **Idle timeout.** A session untouched for
@@ -169,7 +169,7 @@ impl Sessions {
     }
 
     /// Takes `memories` out of every session of the bank, in context and
-    /// pending, as forget does (ADR 0010).
+    /// pending, as forget does.
     pub(crate) fn scrub(&self, bank_id: i64, memories: &BTreeSet<Uuid>, now: Timestamp) {
         let mut sessions = self.live(now);
         for ((bank, _), session) in sessions.iter_mut() {

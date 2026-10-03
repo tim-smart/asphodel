@@ -1,7 +1,7 @@
 -- Asphodel schema, version 5: a queued turn's in-context set.
 --
 -- Extraction judges a turn's `used` verdicts against the memories the agent
--- could see when it wrote the reply (ADR 0001): the session's in-context set as
+-- could see when it wrote the reply: the session's in-context set as
 -- the turn's sync left it. The bank's worker reaches the turn later, and
 -- sessions live in daemon memory, so reading the session then let a clear on
 -- compaction, a later recall or a restart change which memories the turn was
@@ -17,9 +17,9 @@
 --
 -- For the erase path and the sweep:
 -- - forget must remove the forgotten memories' ids from every row here,
---   queued or failed, as part of ADR 0010's scrubbing of in-context sets.
---   Extraction already ignores ids that are hidden or gone, so this is
---   about not keeping the reference.
+--   queued or failed, along with the rest of forget's scrubbing of in-context
+--   sets. Extraction already ignores ids that are hidden or gone, so this
+--   is about not keeping the reference.
 -- - the sweep must delete a turn's row when it deletes the text of the
 --   turn or of its failed chunk. Sources are kept as tombstones, so the
 --   cascade below doesn't cover that.

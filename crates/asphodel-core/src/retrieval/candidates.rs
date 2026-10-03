@@ -1,7 +1,7 @@
 //! Cleaning up the retrievers' hits before fusion.
 //!
 //! - A retracted or hidden hit is dropped. Retracted memories are kept for
-//!   audit only, and a hidden one is waiting to be erased (ADR 0010).
+//!   audit only, and a hidden one is waiting to be erased.
 //! - Any other hit is replaced by the head of its supersession chain, as
 //!   reconciliation does, so a refined memory shows its latest version. A
 //!   chain whose head is retracted or hidden shows nothing.

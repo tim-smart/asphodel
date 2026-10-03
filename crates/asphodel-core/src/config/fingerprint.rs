@@ -1,4 +1,4 @@
-//! The deletion fingerprint (ADR 0009).
+//! The deletion fingerprint.
 //!
 //! Purge and the source sweep are pure functions of the access log, the
 //! clock and the values below, so changing one of them on a live store can

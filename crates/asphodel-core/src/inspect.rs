@@ -1,12 +1,11 @@
-//! What `memory show`, `entity show` and `model show` print (ADR 0010,
-//! "Inspection and correction").
+//! What `memory show`, `entity show` and `model show` print.
 //!
 //! These are for the operator, through the CLI; the agent gets no new tool.
 //! They read only. A view holds content, since showing it is the point, so
 //! nothing here is logged above `trace`.
 //!
 //! **Projected dates.** Strength runs on bank time, which only runs at full
-//! speed for a day after each turn (ADR 0004). So a fade or purge date is
+//! speed for a day after each turn. So a fade or purge date is
 //! given as the bank days until it, assuming the memory isn't used again,
 //! and as the earliest world date it can happen: the date it would be if
 //! bank time ran at full speed from now. A quieter bank reaches it later.
@@ -208,7 +207,7 @@ pub struct StrengthView {
     pub recallable: bool,
 }
 
-/// Purge, read on the chain's head as the sweep reads it (ADR 0008).
+/// Purge, read on the chain's head as the sweep reads it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PurgeView {
     pub head: Uuid,
@@ -227,8 +226,7 @@ pub struct PurgeView {
 pub enum Guard {
     /// δ is unset, so nothing is ever purged.
     PurgeDisabled,
-    /// The deletion settings changed and no one has acknowledged them
-    /// (ADR 0009).
+    /// The deletion settings changed and no one has acknowledged them.
     PurgePaused,
     /// Forget hid the chain; its erase removes it instead.
     Forgotten,
@@ -388,7 +386,7 @@ pub(crate) fn memory(
         earliest_at: later(now, days),
     });
 
-    // Purge reads the chain's head (ADR 0008).
+    // Purge reads the chain's head.
     let head = chain_head(&links, memory_id);
     let members = chain(&links, memory_id);
     let head_strength = loader.strength(&conn, head)?.value;

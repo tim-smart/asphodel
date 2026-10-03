@@ -1,4 +1,4 @@
-# A three-week holiday (ADR 0004). A trivial memory is mentioned once while
+# A three-week holiday. A trivial memory is mentioned once while
 # the bank is in conversation for three days, then nobody talks for three
 # weeks. Bank time runs at full speed for 24 hours after each turn and at
 # the quiet rate (0.1) otherwise, so the gap counts for 2.1 bank days and

@@ -1,8 +1,10 @@
-//! The strength model, phase and state confidence obey ADRs 0001, 0003,
-//! 0004 and 0008.
+//! The strength model, phase and state confidence: strength counts use, not
+//! retrieval; the lasting floor counts every access; memory runs on bank
+//! time and truth on world time; and purge is a margin below the recall
+//! threshold.
 //!
 //! These tests exercise the production API in `asphodel_core::strength`,
-//! checking it against the lifetime tables and ADRs 0004 and 0008 and
+//! checking it against the lifetime, abandoned-bank and purge tables and
 //! against their closed forms.
 //!
 //! Tolerances:
@@ -10,11 +12,13 @@
 //! - [`EXACT`] (1e-9, on the log scale strength lives on) for values worked
 //!   by hand from the formula. Each test shows the arithmetic.
 //! - [`TABLE`] (5% relative) for the rounded figures in the lifetimes
-//!   table and the ADR 0008 purge table: "15 days", "2 months", "9 months",
+//!   table and the purge table: "15 days", "2 months", "9 months",
 //!   "3 years", "12 years" and "12.5 years" are 15.09 d, 63.0 d, 262.8 d,
 //!   1096.6 d, 4576 d and 4576 d, and the worst of them is 4.5% off.
-//! - [`ABOUT`] (10% relative) for ADR 0004's "about 10 weeks, 1.7 years and 7
-//!   years", which are 9.3 weeks, 1.70 years and 7.17 years.
+//! - [`ABOUT`] (10% relative) for how long one mention lasts in an abandoned
+//!   bank at the 0.1 quiet rate, "about 10 weeks, 1.7 years and 7 years" at
+//!   significance 0, 0.3 and 0.5, which are 9.3 weeks, 1.70 years and 7.17
+//!   years.
 //! - [`CROSSING`] (1e-6 relative) between a bisected crossing time and its
 //!   closed form.
 //!
@@ -46,7 +50,7 @@ const DAYS_PER_YEAR: f64 = 365.2425;
 /// fixtures, and still inside jiff's range.
 const FAR_DAYS: f64 = 1000.0 * DAYS_PER_YEAR;
 
-/// δ as ADR 0008 starts it.
+/// The purge margin δ below the recall threshold, as it starts.
 const DELTA: f64 = 1.0;
 
 // Fixtures.
@@ -197,7 +201,7 @@ const LIFETIMES: [(f64, f64); 5] = [
     (0.9, 12.0 * DAYS_PER_YEAR),
 ];
 
-/// ADR 0008's purge table: significance, how long until one mention is
+/// The purge table at δ = 1.0: significance, how long until one mention is
 /// purged in bank days (`None` for never), and the separate occasions that
 /// make it unpurgeable.
 const PURGES: [(Significance, Option<f64>, u32); 5] = [
@@ -212,8 +216,9 @@ const PURGES: [(Significance, Option<f64>, u32); 5] = [
 /// that lift the floor to τ.
 const PERMANENCE: [(f64, u32); 3] = [(0.0, 18), (0.3, 8), (0.5, 4)];
 
-/// ADR 0004: significance, and how long one mention lasts in an abandoned
-/// bank, in world days.
+/// Significance, and how long one mention lasts in an abandoned bank, in
+/// world days. Bank time runs at the 0.1 quiet rate once a day has passed
+/// since the last turn.
 const ABANDONED: [(f64, f64); 3] = [
     (0.0, 10.0 * 7.0),
     (0.3, 1.7 * DAYS_PER_YEAR),
@@ -227,7 +232,7 @@ fn abandoned_days(significance: f64) -> f64 {
     1.0 + (one_mention_days(significance, TAU) - 1.0) / quiet_rate
 }
 
-// Bank time (ADR 0004).
+// Bank time: full speed for 24 hours after a turn, the quiet rate otherwise.
 
 #[test]
 fn bank_time_runs_at_full_speed_for_24_hours_after_a_turn() {
@@ -339,8 +344,8 @@ fn accesses_after_now_are_ignored() {
 
 #[test]
 fn the_floor_counts_occasions_at_least_three_world_days_apart() {
-    // ADR 0003: daily for a week is about 3 occasions, every ten days for
-    // three months is 10.
+    // The floor takes at most one access per three world days: daily for a
+    // week is about 3 occasions, every ten days for three months is 10.
     let week: Vec<_> = (0..7).map(|d| used(f64::from(d))).collect();
     assert_eq!(strength_at(0.0, &week, 7.0).occasions, 3);
     let months: Vec<_> = (0..10).map(|i| used(10.0 * f64::from(i))).collect();
@@ -512,7 +517,9 @@ fn tie_order_adding_tied_accesses_never_weakens_the_heaviest_alone() {
     }
 }
 
-// Window close (ADR 0003).
+// Window close: only recent use restarts, from a single recency boost
+// placed at the later of the window close and when the end became known.
+// The lasting floor stays.
 
 fn close(closes: f64, known: f64) -> Option<WindowClose> {
     Some(WindowClose {
@@ -602,7 +609,7 @@ fn a_past_appointment_comes_back_to_recall_when_its_window_closes() {
 
 #[test]
 fn an_appointment_discussed_daily_for_a_week_fades_and_can_be_purged() {
-    // ADR 0003: about 3 occasions, so it fades.
+    // About 3 occasions three world days apart, so it fades.
     let trivial = Significance::Trivial.value();
     let accesses: Vec<_> = (0..7).map(|d| mentioned(f64::from(d))).collect();
     let s = closed_strength(trivial, &accesses, close(7.0, 0.0), FAR_DAYS);
@@ -612,8 +619,9 @@ fn an_appointment_discussed_daily_for_a_week_fades_and_can_be_purged() {
 
 #[test]
 fn a_state_used_for_three_months_stays_in_history_after_it_ends() {
-    // ADR 0003: "User lived in Berlin", minor, used every ten days for three
-    // months, ended on day 95 and reported on day 100.
+    // "User lived in Berlin", minor, used every ten days for three months,
+    // ended on day 95 and reported on day 100. An ended memory stays in
+    // history.
     let minor = Significance::Minor.value();
     let accesses: Vec<_> = std::iter::once(created(0.0))
         .chain((1..10).map(|i| used(10.0 * f64::from(i))))
@@ -954,7 +962,7 @@ fn only_a_mention_or_a_confirmation_resets_state_confidence() {
     assert_near(c, 1.0, EXACT);
 }
 
-// Purge eligibility (ADR 0008).
+// Purge eligibility.
 
 #[test]
 fn a_memory_is_purged_strictly_below_tau_minus_delta() {

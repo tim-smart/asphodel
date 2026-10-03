@@ -1,5 +1,6 @@
-//! Source ingest, chunking, secret scanning and the extraction queue follow
-//! ADRs 0002 and 0010.
+//! Source ingest, chunking, secret scanning and the extraction queue. Sources
+//! are kept verbatim, so ingest is idempotent and secrets are removed before
+//! the text is stored.
 //!
 //! The API under test is `asphodel_core::{ingest, chunking, secrets,
 //! queue}`, the extraction constants and the `Service` methods over them.
@@ -405,7 +406,7 @@ fn sentence_with(kind: SecretKind, seed: usize) -> (String, String) {
     (text, secret)
 }
 
-// Secret scanning (ADR 0002)
+// Secret scanning
 
 #[test]
 fn every_kind_is_found_and_redacted_in_place() {
@@ -775,7 +776,7 @@ fn an_unknown_timezone_or_bank_is_refused_and_nothing_is_stored() {
     assert_eq!(h.count("SELECT COUNT(*) FROM extraction_queue"), 0);
 }
 
-// Idempotency (ADR 0002)
+// Idempotency
 
 #[test]
 fn the_same_turn_twice_does_nothing_the_second_time() {
@@ -825,7 +826,7 @@ fn a_duplicate_does_not_requeue_an_extracted_chunk() {
 
 #[test]
 fn a_swept_source_stays_a_tombstone_when_it_is_sent_again() {
-    // ADR 0008: the sweep deletes the text and keeps the key, so re-ingest
+    // The sweep deletes the text and keeps the key, so re-ingest
     // can't bring the passage back.
     let h = Harness::new();
     let sent = turn(
@@ -1071,7 +1072,7 @@ fn memories_from_a_removed_section_are_left_alone() {
 
 #[test]
 fn a_tombstoned_chunk_is_not_extracted_again_from_a_new_version() {
-    // ADR 0002: the chunk hash is the forget tombstone. Once the
+    // The chunk hash is the forget tombstone. Once the
     // erase or the sweep has removed a chunk's text, a new version that
     // still holds the passage must not bring it back.
     let h = Harness::new();
@@ -1094,7 +1095,7 @@ fn a_tombstoned_chunk_is_not_extracted_again_from_a_new_version() {
     assert_eq!(queued_hashes(&h, second.source), hashes_of(&v2, &[HOME]));
 }
 
-// Secrets at ingest (ADR 0002)
+// Secrets at ingest
 
 /// The kinds recorded on a source, from its `secret_kinds` column.
 fn recorded_kinds(h: &Harness, source: Uuid) -> BTreeSet<String> {
@@ -1184,7 +1185,7 @@ fn the_key_is_computed_from_the_redacted_text() {
     assert_eq!(second.source, first.source);
 }
 
-// The turn that asks to forget (ADR 0010)
+// The turn that asks to forget is never stored
 
 #[test]
 fn a_forget_request_is_stored_only_as_a_tombstone_and_never_queued() {
@@ -1224,7 +1225,7 @@ fn a_forget_request_is_stored_only_as_a_tombstone_and_never_queued() {
 
 #[test]
 fn a_forget_request_deletes_its_recall_row() {
-    // ADR 0010: the recall row for the turn's `recall_id` holds the
+    // The recall row for the turn's `recall_id` holds the
     // request as its query, so it goes too. Other recalls stay.
     let h = Harness::new();
     let bank: i64 = h.one("SELECT id FROM banks WHERE name = 'main'", []);
@@ -1528,7 +1529,7 @@ fn a_bank_hands_out_up_to_its_concurrency_in_queue_order() {
 
 #[test]
 fn a_hold_waits_for_every_lease_in_the_pool_and_hands_out_none_meanwhile() {
-    // Deleting a bank holds it (ADR 0010). With a pool the hold must wait
+    // Deleting a bank holds it. With a pool the hold must wait
     // for every lease that's out and stop new ones, or a busy bank would
     // never come free.
     let h = Harness::with_concurrency(2);
@@ -1619,7 +1620,8 @@ fn completing_a_chunk_marks_it_extracted_and_takes_it_off_the_queue() {
     let lease = claim(&h, "main").unwrap();
     let chunk = lease.chunk;
     // Call 1's output is saved on the chunk so a failed call 2 can resume
-    // and dropped when the chunk commits (ADR 0008).
+    // and dropped when the chunk commits, so the claim text doesn't outlive
+    // a purge or forget.
     h.execute(
         "UPDATE chunks SET call1_output = '{\"claims\":[]}' WHERE uuid = ?1",
         [chunk.to_string()],
@@ -2419,7 +2421,7 @@ fn bank_config_takes_a_platform_id_over_from_a_stranger_and_logs_it() {
 
 #[test]
 fn a_merged_speaker_resolves_to_the_surviving_entity() {
-    // ADR 0010: a merge sets `merged_into` and keeps the row. A speaker id
+    // A merge sets `merged_into` and keeps the row. A speaker id
     // pointing at the merged entity resolves through it.
     let h = Harness::new();
     let (a, _) = speaker(&h, "main", "discord", "5678", "Sam");

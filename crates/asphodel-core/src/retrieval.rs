@@ -27,7 +27,8 @@
 //! Injection then gates on the reranker floor for the loaded model and
 //! takes at most `injection.cap` memories in about `injection.token_budget`
 //! tokens. Every recall writes one row to the recall log ([`log`]) and none
-//! writes an access (ADR 0001). "Now" is always the service's clock.
+//! writes an access: being recalled never strengthens a memory. "Now" is
+//! always the service's clock.
 
 mod arms;
 pub(crate) mod candidates;
@@ -237,7 +238,7 @@ pub enum RecallError {
     Model { error: ModelError },
 
     /// The bank's recorded embedding model isn't loaded, so its vectors
-    /// can't be searched (ADR 0010). `asphodel reembed --bank` moves it to
+    /// can't be searched. `asphodel reembed --bank` moves it to
     /// the daemon's model.
     #[error(
         "the bank records embedding model {model}, which this daemon doesn't carry; run `asphodel reembed --bank` to move it"
@@ -403,7 +404,7 @@ pub(crate) struct Context<'a> {
     pub tuning: &'a Tuning,
     pub models: &'a Models,
     /// Embedding models the daemon carries besides its own, for banks a
-    /// re-embed hasn't moved yet (ADR 0010).
+    /// re-embed hasn't moved yet.
     pub previous: &'a [Arc<dyn crate::models::Embedder>],
     pub sessions: &'a Sessions,
     /// The service's permit to run its reranker.
@@ -420,7 +421,7 @@ const QUERY_EMBED_ATTEMPTS: usize = 2;
 impl Context<'_> {
     /// Embeds `query` with the model `bank_id` is served with, and returns
     /// the vector together with the store's connection, held, under which
-    /// that model is still the one the bank records (ADR 0010). The model
+    /// that model is still the one the bank records. The model
     /// isn't run under the connection, so a re-embed's swap can land while
     /// it runs. That's caught when the connection is taken back, and the
     /// query embedded again with the new model, up to
@@ -522,7 +523,7 @@ pub(crate) fn scored_prefetch(
         )
     });
 
-    // There's no fallback floor (ADR 0009); a service built with models
+    // There's no fallback floor: a service built with models
     // always has one, and a missing one injects nothing.
     let floor = cx
         .tuning

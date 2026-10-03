@@ -1,5 +1,5 @@
 //! The store contracts cover SQLite schema, migrations, locking and model
-//! identity, following ADRs 0002, 0008, 0009 and 0010.
+//! identity.
 //!
 //! Every store here runs on a `SimulatedClock` stopped at one instant, so a
 //! stored time that equals that instant can only have come from the Clock.
@@ -248,7 +248,7 @@ fn dropping_a_store_releases_its_data_dir() {
     assert_eq!(second.schema_version().unwrap(), SCHEMA_VERSION);
 }
 
-// Opening and migrating from empty (ADR 0010)
+// Opening and migrating from empty
 
 #[test]
 fn a_missing_data_dir_is_created_and_a_file_is_refused() {
@@ -311,7 +311,7 @@ fn reopening_a_current_store_applies_nothing() {
 
 #[test]
 fn a_store_newer_than_the_binary_is_refused() {
-    // ADR 0010: restore checks the schema version isn't newer than the
+    // Restore checks the schema version isn't newer than the
     // binary, and opening does the same.
     let dir = TestDir::new();
     let store = open(&dir.data(), clock());
@@ -486,7 +486,7 @@ fn memory_content_is_searchable_with_fts5() {
 
 #[test]
 fn source_keys_make_ingest_idempotent() {
-    // ADR 0002: a conflicting ingest does nothing. The key is
+    // A conflicting ingest does nothing. The key is
     // bank, session, message time and content hash for a turn, and bank,
     // document id and content hash for a document.
     let dir = TestDir::new();
@@ -559,7 +559,7 @@ fn at_most_one_access_per_memory_per_turn() {
     );
 }
 
-// The pre-migration copy (ADR 0010)
+// The pre-migration copy
 
 #[test]
 fn the_copy_is_keyed_by_the_from_version_and_never_overwritten() {
@@ -766,7 +766,7 @@ fn housekeeping_selects_the_earliest_existing_copy_deadline() {
     assert_eq!(upkeep.next_due, None);
 }
 
-// The deletion fingerprint (ADR 0009)
+// The deletion fingerprint
 
 #[test]
 fn an_unrelated_tuning_change_does_not_pause_purge() {
@@ -1171,7 +1171,7 @@ fn the_profile_is_seeded_on_create_only() {
 
 #[test]
 fn models_are_recorded_at_creation_and_merge_does_not_change_them() {
-    // a bank records its model ids. ADR 0010: changing
+    // a bank records its model ids. Changing
     // them is `asphodel reembed`, not a config merge.
     let dir = TestDir::new();
     let service = service(&dir);
@@ -1357,7 +1357,7 @@ fn a_deleted_model_takes_its_entries_and_their_citations() {
 
 #[test]
 fn a_corrupt_existing_copy_refuses_the_migration_and_is_kept() {
-    // ADR 0010: the pre-migration copy is the same integrity-checked copy
+    // The pre-migration copy is the same integrity-checked copy
     // backup makes, and a copy for the same from-version is never
     // overwritten. A damaged file under the copy's name can't be trusted and
     // can't be replaced, so the migration must stop and name it.

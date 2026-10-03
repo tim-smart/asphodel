@@ -3,8 +3,8 @@ name = "hermes-plugin-asphodel"
 version = "0.1.0"
 description = "Hermes Agent memory provider plugin: Asphodel"
 requires-python = ">=3.11"
-# No dependencies, on purpose (ADR 0006): the plugin is a standard-library HTTP
-# client of the daemon. Hermes installs declared deps into its own pinned venv
+# No dependencies, on purpose: the plugin is a standard-library HTTP client of
+# the daemon. Hermes installs declared deps into its own pinned venv
 # and refuses a plugin that cannot resolve, so an empty list is the safe one.
 dependencies = []
 

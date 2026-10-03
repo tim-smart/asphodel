@@ -38,9 +38,9 @@ mod api;
 mod worker;
 
 /// The longest the daemon waits between housekeeping passes. It normally
-/// wakes at the next copy's deadline (ADR 0010); this cap bounds how late
-/// that wake can be after a host suspend, which tokio's monotonic timer
-/// doesn't count, and is the retry delay after a failed pass.
+/// wakes at the next copy's deadline; this cap bounds how late that wake can
+/// be after a host suspend, which tokio's monotonic timer doesn't count, and
+/// is the retry delay after a failed pass.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// The longest the refresh timer sleeps. A trigger written meanwhile moves
@@ -184,7 +184,7 @@ pub(crate) async fn run_with(
 
     // The store opens, migrates and loads its models while the listener answers
     // 503: the lock, the filesystem check, the migrations and the floors all
-    // have to pass before the daemon is ready (ADR 0010).
+    // have to pass before the daemon is ready.
     let started = {
         let clock = Arc::clone(&clock);
         let stop = stop.clone();
@@ -233,7 +233,7 @@ pub(crate) async fn run_with(
         llm: started.llm,
     });
     info!(version = asphodel_core::VERSION, listen = %address, "asphodel listening");
-    // A re-embed a restart stopped resumes from where it got to (ADR 0010).
+    // A re-embed a restart stopped resumes from where it got to.
     match service.pending_reembeds() {
         Ok(banks) => {
             for bank in banks {
@@ -385,8 +385,8 @@ fn start(
             Service::with_models(Arc::clone(&clock), store, config.tuning.clone(), models)?
         }
     };
-    // Purge and the sweep run, or wait for an ack, as the store's
-    // fingerprint says (ADR 0009). Forget never waits.
+    // Purge and the sweep run, or wait for an ack, as the store's deletion
+    // fingerprint says. Forget never waits.
     let service = service.with_purge_pause(config.purge.clone());
     let llm = llm_client(&config, &args.data_dir, Arc::clone(&clock), script)?;
     config.fake_llm = llm.as_ref().is_some_and(|(_, fake)| *fake);
@@ -501,11 +501,11 @@ fn models_switch() -> anyhow::Result<ModelsSwitch> {
     }
 }
 
-/// Resolves the LLM settings so a misconfiguration stops the daemon
-/// (ADR 0009): a half-set `[llm]`, or a key set together with
-/// `auth = "chatgpt"`. In `chatgpt` mode the token file under the data dir
-/// decides whether the daemon is logged in; it can start logged out, and
-/// extraction waits for `asphodel llm login`.
+/// Resolves the LLM settings so a misconfiguration stops the daemon: a
+/// half-set `[llm]`, or a key set together with `auth = "chatgpt"`. In
+/// `chatgpt` mode the token file under the data dir decides whether the
+/// daemon is logged in; it can start logged out, and extraction waits for
+/// `asphodel llm login`.
 fn llm_status(config: &ResolvedConfig, data_dir: &Path) -> anyhow::Result<Option<LlmStatus>> {
     let Some(settings) = LlmSettings::from_config(&config.tuning, &config.deployment)? else {
         return Ok(None);

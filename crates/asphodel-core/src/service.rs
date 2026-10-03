@@ -65,8 +65,8 @@ pub struct Service {
     /// prefetch and explicit recall so a timed-out call never queues work
     /// behind the one running.
     reranker_permit: Arc<Permit>,
-    /// The reranker deadline: [`RERANKER_DEADLINE`], fixed in code
-    /// (ADR 0009), unless [`Service::with_reranker_deadline`] set another.
+    /// The reranker deadline: [`RERANKER_DEADLINE`], fixed in code, unless
+    /// [`Service::with_reranker_deadline`] set another.
     reranker_deadline: Duration,
     /// Each bank's last refresh trigger and last daily sweep. In memory;
     /// the requests themselves are in the store.
@@ -77,14 +77,14 @@ pub struct Service {
     /// refresh at once.
     refreshing: Mutex<()>,
     /// Whether purge and the source sweep run, from the stored deletion
-    /// fingerprint at startup and any ack since (ADR 0009).
+    /// fingerprint at startup and any ack since.
     purge: Mutex<PurgePause>,
     /// Each bank's last nightly sweep.
     sweeps: SweepSchedule,
     /// Held while the sweep runs, so two callers never sweep at once.
     sweeping: Mutex<()>,
     /// Embedding models carried besides the models' own, for banks a
-    /// re-embed hasn't moved yet (ADR 0010).
+    /// re-embed hasn't moved yet.
     previous_embedders: Vec<Arc<dyn Embedder>>,
     /// The banks whose re-embed is running, and why each one's last run
     /// failed.
@@ -111,7 +111,7 @@ struct ReembedRuns {
 /// Why a service couldn't be built on a store and models.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
-    /// The tuning has no floor for a loaded model (ADR 0009).
+    /// The tuning has no floor for a loaded model.
     #[error(transparent)]
     Config(#[from] ConfigError),
 }
@@ -148,8 +148,8 @@ impl Service {
     /// models it serves with. The tuning must have a floor for each model's
     /// exact id, or the service doesn't open: a missing gate floor would
     /// flood injection, and a missing reconcile floor would skip
-    /// reconciliation (ADR 0009). The check lives here, not in `serve`, so
-    /// the replay harness gets the same refusal.
+    /// reconciliation. The check lives here, not in `serve`, so the replay
+    /// harness gets the same refusal.
     pub fn with_models(
         clock: Arc<dyn Clock>,
         store: Store,
@@ -184,7 +184,7 @@ impl Service {
     /// The same service, also carrying `embedder`, a model banks may have
     /// recorded before the daemon's model changed. Each such bank is served
     /// with it until `asphodel reembed` swaps the bank to the daemon's
-    /// model (ADR 0010). It needs a reconcile floor like the daemon's own.
+    /// model. It needs a reconcile floor like the daemon's own.
     pub fn with_previous_embedder(
         mut self,
         embedder: Arc<dyn Embedder>,
@@ -226,8 +226,8 @@ impl Service {
     }
 
     /// The embedder `bank_id` is served with: the model it recorded, until
-    /// a re-embed swaps it (ADR 0010). Refused when this service doesn't
-    /// carry that model, so no vector is written or compared under another.
+    /// a re-embed swaps it. Refused when this service doesn't carry that
+    /// model, so no vector is written or compared under another.
     fn bank_embedder<'a>(
         &'a self,
         models: &'a Models,
@@ -242,7 +242,7 @@ impl Service {
     }
 
     /// The same service with the reranker deadline set to
-    /// `deadline`. The deadline is fixed in code (ADR 0009); this is for
+    /// `deadline`. The deadline is fixed in code; this is for
     /// tests of the fallback and for the bench, which shouldn't wait 1.5 s
     /// per slow call.
     pub fn with_reranker_deadline(mut self, deadline: Duration) -> Self {
@@ -252,9 +252,10 @@ impl Service {
 
     /// The same service with the purge state `serve` read from the store at
     /// startup ([`Store::check_fingerprint`]). A service built without it
-    /// runs purge, which is what replay wants: replay never pauses (ADR
-    /// 0009). While purge runs, the store also keeps the deletion inputs
-    /// behind its fingerprint, so `purge plan` can name what changes later.
+    /// runs purge, which is what replay wants: replay is where δ is changed
+    /// on purpose, so it never pauses. While purge runs, the store also
+    /// keeps the deletion inputs behind its fingerprint, so `purge plan` can
+    /// name what changes later.
     pub fn with_purge_pause(self, pause: PurgePause) -> Self {
         if pause == PurgePause::Running
             && let Err(error) = self
@@ -823,8 +824,8 @@ impl Service {
     /// The periodic store upkeep. `serve` calls it on a timer and the replay
     /// harness after advancing its clock, so it runs on this service's clock
     /// either way. It runs whether or not purge is
-    /// paused: deleting an expired pre-migration copy is ADR 0010's bound on
-    /// how long forgotten content survives, not a purge.
+    /// paused: deleting a pre-migration copy 7 days after its migration is
+    /// what bounds how long forgotten content survives, not a purge.
     ///
     /// The result says when the next pass is due, so a caller can wake at a
     /// copy's deadline instead of finding it on a later poll.
@@ -854,7 +855,7 @@ impl Service {
     }
 }
 
-/// Backup, status and the audit lists (ADR 0010). Restore is offline, under
+/// Backup, status and the audit lists. Restore is offline, under
 /// the data-dir lock, so it isn't here: [`crate::operations::restore`].
 impl Service {
     /// `POST /v1/backup`: an online backup of the store, checked, in a file
@@ -895,9 +896,8 @@ impl Service {
     }
 }
 
-/// Inspection and correction (ADR 0010). The views read
-/// only; each correction is one logged edit, and refreshes the models it
-/// changes what they see.
+/// Inspection and correction. The views read only; each correction is one
+/// logged edit, and refreshes the models it changes what they see.
 impl Service {
     /// `memory show`: the memory, both significance fields, its passage or
     /// why it's gone, its accesses, edits and chain, its strength in parts,
@@ -1021,7 +1021,7 @@ impl Service {
 }
 
 /// Re-embedding and bank deletion, the daemon jobs that change a bank at
-/// scale (ADR 0010).
+/// scale.
 impl Service {
     /// How long a re-embed's swap or a bank deletion waits for the bank's
     /// chunk in flight: longer than any one extraction takes.
@@ -1147,7 +1147,7 @@ impl Service {
     }
 }
 
-/// Forget, the erase path and the nightly sweep (ADRs 0008, 0009 and 0010).
+/// Forget, the erase path and the nightly sweep.
 impl Service {
     /// `memory_forget`: hides each named memory's whole chain at once and
     /// queues its erase behind the chunks already queued
@@ -1164,7 +1164,7 @@ impl Service {
 
     /// [`Service::forget`] with the request as the plugin sends it: the
     /// session its request turn will arrive in, so the audit row can be
-    /// linked to that turn when it's ingested (ADR 0010).
+    /// linked to that turn when it's ingested.
     pub fn forget_request(
         &self,
         bank: &str,
@@ -1333,7 +1333,7 @@ impl Service {
     }
 }
 
-/// Mental models, the agenda and the system prompt block (ADR 0007).
+/// Mental models, the agenda and the system prompt block.
 impl Service {
     /// The model surface, `model create`. The enabled
     /// models' `max_tokens` must fit `mental_models.budget`. A new enabled

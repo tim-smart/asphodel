@@ -9,7 +9,7 @@
 //! - its own accesses and those it inherits along `superseded_by`, never
 //!   along `ended_by` ([`inherits_from`]);
 //! - its window's close, when it has one, with the end known at the
-//!   `observed_at` of the `ended_by` memory or else its own (ADR 0003);
+//!   `observed_at` of the `ended_by` memory or else its own;
 //! - the bank's clock ([`BankTime`]), from the bank's turns.
 
 use jiff::Timestamp;
@@ -276,7 +276,7 @@ pub(crate) fn significance_value(level: &str) -> f64 {
 }
 
 /// The memory's validity window and its source's timezone, which purge's
-/// guards read on a chain's head (ADR 0008). `None` for an unknown kind.
+/// guards read on a chain's head. `None` for an unknown kind.
 pub(crate) fn window(
     conn: &Connection,
     memory_id: i64,

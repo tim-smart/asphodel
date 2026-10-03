@@ -1,10 +1,10 @@
 //! Public ids: UUIDv7, timed by the store's clock, or derived
 //! UUIDv5s for a replay.
 //!
-//! `uuid::Uuid::now_v7` reads the system clock, which ADR 0004 forbids, so
-//! timed ids are built from a [`Timestamp`] the caller took from the
-//! [`Clock`] (`clippy.toml` denies the direct call). A shared `ContextV7`
-//! keeps ids minted in the same instant ordered.
+//! `uuid::Uuid::now_v7` reads the system clock, which only the [`Clock`]
+//! may do, so timed ids are built from a [`Timestamp`] the caller took from
+//! it (`clippy.toml` denies the direct call). A shared `ContextV7` keeps ids
+//! minted in the same instant ordered.
 //!
 //! A replay opens its store with deterministic ids. A memory's id is then
 //! UUIDv5 of (source id, `<chunk position>:<claim index in call 1's reply>`).

@@ -1,5 +1,4 @@
-//! Forget, purge and the nightly sweep follow the deletion contracts in
-//! ADRs 0002, 0008, 0009 and 0010.
+//! Forget, purge and the nightly sweep follow their deletion contracts.
 //!
 //! The API under test is `asphodel_core::erase`, `asphodel_core::sweep`
 //! and the `Service` methods over them: `forget`, `erase_next`,
@@ -9,7 +8,8 @@
 //! Thursday 1 October 2026 in Auckland (UTC+13) unless a test moves it. The
 //! next 04:00 there, when the nightly sweep runs, is 15:00 UTC the same day.
 //! The tuning sets `clock.quiet_rate = 1.0`, so bank time is world time and
-//! a trivial memory said once in 2021 is well past ADR 0008's nine months.
+//! a trivial memory said once in 2021 is well past the nine months of bank
+//! time after which a trivial memory mentioned once is purged.
 //! Memories a test only needs present are inserted directly, as an earlier
 //! extraction would have left them; the ones whose passages matter are
 //! extracted from real turns with `FakeLlm`.
@@ -762,7 +762,7 @@ fn handle(input: &RefreshInput, memory: Uuid) -> String {
         .clone()
 }
 
-// Forget (ADR 0010, "Forgetting")
+// Forget
 
 #[test]
 fn forget_hides_at_once_and_erases_behind_a_queued_chunk() {
@@ -995,7 +995,7 @@ fn forget_erases_the_whole_chain_and_clears_what_points_into_it() {
     assert!(!audit[0].contains("Berlin") && !audit[0].contains("Lisbon"));
 }
 
-// Purge in the nightly sweep (ADR 0008)
+// Purge in the nightly sweep
 
 #[test]
 fn the_sweep_purges_a_faded_chain_at_four_bank_local_without_redacting() {
@@ -1153,7 +1153,7 @@ fn a_date_still_ahead_on_the_head_holds_a_faded_chain_back() {
 
 #[test]
 fn a_task_is_held_until_thirty_days_past_its_due_date() {
-    // ADR 0008: the agenda's overdue window is the guard. Undated tasks
+    // The agenda's 30-day overdue window is the guard. Undated tasks
     // have none.
     let h = Harness::new();
     let passport = h.insert(faded(task(PASSPORT, Some("2026-09-20T00:00"))));
@@ -1174,7 +1174,7 @@ fn a_task_is_held_until_thirty_days_past_its_due_date() {
     assert_eq!(h.rows(&[passport]), 0);
 }
 
-// The source, failed-chunk and recall-log sweep (ADR 0008)
+// The source, failed-chunk and recall-log sweep, 90 days after ingest
 
 #[test]
 fn the_sweep_deletes_text_past_the_horizon_and_keeps_the_keys() {
@@ -1263,8 +1263,7 @@ fn the_sweep_deletes_text_past_the_horizon_and_keeps_the_keys() {
     );
 }
 
-// The deletion fingerprint, the plan and the ack (ADR 0009; ADR 0010,
-// "Sweeps, pauses and failures")
+// The deletion fingerprint, the plan and the ack
 
 #[test]
 fn a_changed_fingerprint_pauses_purge_until_the_running_hash_is_acked() {

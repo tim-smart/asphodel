@@ -1,5 +1,5 @@
 """Shaping a Hermes turn into the daemon's ``Turn`` body: the backfill strip,
-the ``memory_forget`` scan (ADR 0010) and the message time."""
+the ``memory_forget`` scan and the message time."""
 
 from __future__ import annotations
 

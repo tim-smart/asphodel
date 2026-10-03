@@ -3,10 +3,9 @@
 Brain-like memory for the [Hermes agent](https://github.com/NousResearch/hermes-agent).
 Asphodel extracts memories from conversations and documents. They
 strengthen with use, the significant ones stick, and the unused ones fade
-out of recall. `CONTEXT.md` is the glossary, and `docs/adr/` holds the
-decisions behind it.
+out of recall. `CONTEXT.md` is the glossary.
 
-It comes in two parts (ADR 0006):
+It comes in two parts:
 
 - **The daemon**, `asphodel serve`. One process owns the SQLite store, the
   embedding model, the reranker and the extraction worker. Every other

@@ -1,5 +1,4 @@
-//! The nightly sweep, and acknowledging a purge pause (ADR 0008; ADR 0009; ADR
-//! 0010, "Sweeps, pauses and failures").
+//! The nightly sweep, and acknowledging a purge pause.
 //!
 //! **When.** Each bank's sweep runs at `mental_models.sweep_time` bank-local
 //! (04:00), on the service's clock, once a day. The daemon runs it before

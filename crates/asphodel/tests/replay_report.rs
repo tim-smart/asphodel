@@ -12,8 +12,7 @@
 //!   precision curve for each list as JSON.
 //!
 //! Everything these read or write is derived from history, so all of it
-//! stays under the private dir and errors never quote it (ADR 0010,
-//! "Logging").
+//! stays under the private dir and errors never quote it.
 
 mod support;
 

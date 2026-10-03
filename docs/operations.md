@@ -2,7 +2,7 @@
 
 How to run Asphodel and look after it. Every operator command is an HTTP
 client of the running daemon, and anything that changes the store at scale
-runs as a daemon job (ADR 0010). There are two exceptions, both offline:
+runs as a daemon job. There are two exceptions, both offline:
 `asphodel restore`, and the copy the daemon takes before a schema
 migration.
 
@@ -95,8 +95,7 @@ Secrets have no flag, so they never show in a process list.
 
 ### The tuning file
 
-The tuning file is TOML, and every key in it is optional except two kinds
-(ADR 0009):
+The tuning file is TOML, and every key in it is optional except two kinds:
 
 - `[llm] model`, the exact model string. The floors are calibrated against
   one model.
@@ -110,7 +109,7 @@ The tuning file is TOML, and every key in it is optional except two kinds
 once across the daemon, refreshes included, and how many chunks each bank
 extracts at once. Chunks still commit in queue order, and a chunk whose
 search missed a memory another chunk committed reconciles again, so a
-repeat stays one memory (ADR 0005). Measure it in replay before raising it
+repeat stays one memory. Measure it in replay before raising it
 (`docs/replay.md`, "Concurrency").
 
 `[llm] language` (unset by default) is the language memories and mental
@@ -481,10 +480,9 @@ from you.
 
 The store keeps a fingerprint of every setting that decides an
 irreversible deletion: the fixed strength constants, `clock.quiet_rate`,
-`purge.delta`, `agenda.overdue_days` and `purge.source_horizon_days` (ADR
-0009). When the daemon starts with a fingerprint that differs from the
-stored one, purge and the sweep of sources and recall rows pause. Forget
-never pauses.
+`purge.delta`, `agenda.overdue_days` and `purge.source_horizon_days`.
+When the daemon starts with a fingerprint that differs from the stored one,
+purge and the sweep of sources and recall rows pause. Forget never pauses.
 
 1. `asphodel purge plan` shows which values changed and how many memories,
    sources and rows the sweep would delete now. It deletes nothing and can
@@ -501,7 +499,7 @@ Running the plan first is recommended, but nothing enforces it.
 The owner forgets through the agent's `memory_forget` tool, and the
 operator with `asphodel forget --bank B <id>...`. Forget is irreversible
 and erases a memory, every earlier and later version of it, and the
-passages they came from (ADR 0010).
+passages they came from.
 
 The erase happens in two parts. At once, the chain is hidden from recall,
 injection, the agenda, mental model refreshes and `used` credit; model

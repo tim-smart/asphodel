@@ -515,7 +515,7 @@ fn plain_text(
 
 /// Cuts every fenced memory block out of `text`. A start with no end cuts
 /// to the end of the text, since injected memory must never become source
-/// text (ADR 0002).
+/// text.
 fn strip_memory_block(text: &str, block: &MemoryBlock, counts: &mut Counts) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;

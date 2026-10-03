@@ -6,8 +6,7 @@ reply path and Hermes cuts it off at 8 s, so the plugin's own budget is 3 s.
 retry. ``sync_turn`` already runs on Hermes' single background worker, so it
 sends synchronously and spools on failure. Nothing here ever raises into
 Hermes: every hook catches everything and logs at ``warning`` or below with
-ids, counts and status codes only (ADR 0010). Content is logged only at
-:data:`TRACE`.
+ids, counts and status codes only. Content is logged only at :data:`TRACE`.
 """
 
 from __future__ import annotations
@@ -194,7 +193,7 @@ class AsphodelMemoryProvider(MemoryProvider):
     def _ensure_bank(self, timeout: float) -> None:
         """``PUT``s the bank unless one already succeeded. Raises what the
         client raises. Once the bank is set up a later 404 never recreates it:
-        ``bank delete`` expects the plugin to be disabled first (ADR 0010)."""
+        ``bank delete`` expects the plugin to be disabled first."""
         if self._bank_ready:
             return
         identity = {

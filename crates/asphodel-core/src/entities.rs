@@ -1,4 +1,4 @@
-//! Entity correction (ADR 0010, "Inspection and correction").
+//! Entity correction.
 //!
 //! **Merges keep the entity row.** `entity merge <from> <into>` sets
 //! `from.merged_into` and moves `from`'s aliases and links to `into` in one
@@ -19,7 +19,8 @@
 //! None of these touch a memory's sentence, kind or window.
 //!
 //! Every edit row holds rowids and counts, never names or aliases, and no
-//! error carries an entity's name (ADR 0010, "Logging").
+//! error carries an entity's name: names are content, logged only at
+//! `trace`.
 
 use std::collections::BTreeSet;
 

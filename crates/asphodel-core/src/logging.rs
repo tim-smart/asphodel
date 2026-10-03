@@ -1,10 +1,10 @@
 //! Tracing setup, and the rule on what may be logged.
 //!
-//! Memory content is logged only at `trace` (ADR 0010). Content means
-//! sentences, source text, recall queries, entity names and aliases, and LLM
-//! bodies. Anything at `debug` or above carries ids, counts, kinds and
-//! durations only, and panic messages carry ids only. `docs/logging.md` has
-//! the full rule.
+//! Memory content is logged only at `trace`. Content means sentences,
+//! source text, recall queries, entity names and aliases, and LLM bodies.
+//! Anything at `debug` or above carries ids, counts, kinds and durations
+//! only, and panic messages carry ids only. `docs/logging.md` has the full
+//! rule.
 
 use std::io::IsTerminal;
 

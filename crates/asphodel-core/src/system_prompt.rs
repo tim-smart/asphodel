@@ -5,8 +5,8 @@
 //! so the plugin's 2 s fetch never waits on a refresh.
 //!
 //! - **The budget.** The whole text stays within `mental_models.budget`
-//!   tokens, which the agenda and every model share (ADR 0007). The pointer
-//!   line is always there. The agenda is laid out first and whole, and folds
+//!   tokens, which the agenda and every model share. The pointer line is
+//!   always there. The agenda is laid out first and whole, and folds
 //!   only when it and the pointer alone are over: undated tasks, then
 //!   routines, least-ranked first, then dated lines in the agenda's fold
 //!   order. The models fill what's left, oldest first, each with its
@@ -155,9 +155,9 @@ pub(crate) fn build(
     let agenda = crate::agenda::build(&conn, tuning, bank_id, tz, now)?;
     let budget = tuning.mental_models.budget as usize;
     let pointer = pointer(now, tz);
-    // The agenda and every enabled model share the budget (ADR 0007), with
-    // the pointer line always kept. Each try lays the sections out as they'd
-    // be rendered and measures the whole text.
+    // The agenda and every enabled model share the budget, with the pointer
+    // line always kept. Each try lays the sections out as they'd be rendered
+    // and measures the whole text.
     let fits = |sections: &[String]| -> bool {
         let mut text = sections.join("\n\n");
         if !text.is_empty() {

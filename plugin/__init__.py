@@ -1,10 +1,10 @@
 """Asphodel memory provider for the Hermes agent.
 
-A thin, dependency-free Python client of the Asphodel daemon (ADR 0006, "One
-daemon, and a thin Hermes plugin"). Hermes discovers this directory because
-this file names ``MemoryProvider`` and ``register_memory_provider``, loads it
-under a synthetic package name, and calls :func:`register`. Every submodule
-is imported relatively for that reason.
+A thin, dependency-free Python client of the Asphodel daemon, which owns the
+store and the models. Hermes discovers this directory because this file
+names ``MemoryProvider`` and ``register_memory_provider``, loads it under a
+synthetic package name, and calls :func:`register`. Every submodule is
+imported relatively for that reason.
 
 The Hermes hook contract is defined in ``agent/memory_provider.py``.
 """

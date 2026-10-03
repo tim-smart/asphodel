@@ -14,7 +14,7 @@ metadata:
   name: asphodel-config
 data:
   asphodel.toml: |
-    # The tuning file (ADR 0009). Every key is optional except the LLM
+    # The tuning file. Every key is optional except the LLM
     # model and a floor for each model the daemon runs: it refuses to start
     # without them.
 

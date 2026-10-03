@@ -1,5 +1,5 @@
-# ADR 0004 runs memory on bank time, so no code may read the wall clock
-# directly. Everything goes through `asphodel_core::clock::Clock`, and the
+# Memory runs on bank time, so no code may read the wall clock directly.
+# Everything goes through `asphodel_core::clock::Clock`, and the
 # `SystemClock` implementation is the only allowed exception.
 disallowed-methods = [
   { path = "std::time::SystemTime::now", reason = "read the time through the Clock trait" },
