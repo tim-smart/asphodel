@@ -566,6 +566,17 @@ impl Harness {
             .collect::<Result<_, _>>()
             .unwrap()
     }
+
+    /// The score a recall logged for `memory`.
+    fn score(&self, recall_id: Uuid, memory: Uuid) -> f64 {
+        self.one::<Option<f64>, _>(
+            "SELECT r.score FROM recall_results r
+             JOIN recalls c ON c.id = r.recall_id JOIN memories m ON m.id = r.memory_id
+             WHERE c.uuid = ?1 AND m.uuid = ?2",
+            [recall_id.to_string(), memory.to_string()],
+        )
+        .unwrap()
+    }
 }
 
 fn turn(session: &str, message_at: &str, user: &str, recall_id: Option<String>) -> Turn {
@@ -599,6 +610,33 @@ fn ids(recall: &Recall) -> Vec<Uuid> {
 }
 
 // Fusion
+
+#[test]
+fn relevance_is_the_logit_divided_by_the_relevance_scale() {
+    // At scale 1.0 relevance is the raw logit, so scores are what they
+    // were before the scale; any other scale divides it, in prefetch and
+    // in recall alike. Nothing else in the score depends on the scale.
+    let scores = |scale: f64| {
+        let h = Harness::with_scale(0.0, scale);
+        let pottery = h.insert(fact("Tim takes a pottery class."));
+        let prefetch = h.prefetch("s", "pottery class schedule");
+        let recall = h.recall(query("pottery class schedule"));
+        (
+            h.score(prefetch.recall_id, pottery),
+            h.score(recall.recall_id, pottery),
+        )
+    };
+    let (prefetch_raw, recall_raw) = scores(1.0);
+    let (prefetch_scaled, recall_scaled) = scores(4.0);
+    // Two shared words: a logit of 1.5, so relevance 1.5 and then 0.375.
+    let expected = 1.5 - 1.5 / 4.0;
+    for (raw, scaled) in [(prefetch_raw, prefetch_scaled), (recall_raw, recall_scaled)] {
+        assert!(
+            (raw - scaled - expected).abs() < 1e-9,
+            "{raw} - {scaled} isn't {expected}"
+        );
+    }
+}
 
 #[test]
 fn fusion_sums_reciprocal_ranks_with_k_60() {

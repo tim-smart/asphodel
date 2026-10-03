@@ -407,10 +407,11 @@ fn embedding_floors_must_be_cosines() {
 }
 
 #[test]
-fn relevance_scales_must_be_positive_divisors() {
+fn relevance_scales_must_be_positive_and_finite() {
     // The scale divides the reranker logit into relevance, so zero, a
     // negative or a non-finite one is rejected.
-    for value in ["0.0", "-1.0", "nan", "inf"] {
+    assert!(Tuning::default().ranking.relevance_scales.is_empty());
+    for value in ["0.0", "-0.0", "-1.0", "nan", "inf", "-inf"] {
         assert_eq!(
             invalid_keys(&format!("[ranking.relevance_scales]\nm = {value}\n")),
             ["ranking.relevance_scales.\"m\""],

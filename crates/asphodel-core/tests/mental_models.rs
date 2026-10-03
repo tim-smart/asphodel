@@ -29,10 +29,10 @@ use std::time::Duration;
 use asphodel_core::ingest::Turn;
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmGate, LlmRequest,
-    LlmResponse, ModelError as EmbedError, Models, Template,
+    LlmResponse, ModelError as EmbedError, Models, Reranker, Template,
 };
 use asphodel_core::retrieval::{PrefetchRequest, estimate_tokens};
-use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME};
+use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME, PROFILE_QUESTION};
 use asphodel_core::store::{OpenOptions, Store, VectorIndex, micros};
 use asphodel_core::strength::Kind;
 use asphodel_core::{Service, SimulatedClock, Tuning};
@@ -676,6 +676,31 @@ fn plans_model() -> ModelSpec {
 }
 
 // Refresh triggers and scheduling
+
+#[test]
+fn a_refresh_scores_relevance_as_the_logit_divided_by_the_relevance_scale() {
+    // The refresh's selection scores like prefetch and recall: at scale 1.0
+    // relevance is the raw logit, and any other scale divides it.
+    let score = |scale: f64| -> f64 {
+        let h = Harness::with_scale(scale, "");
+        let tea = h.insert(fact(TEA));
+        h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+        h.one::<Option<f64>, _>(
+            "SELECT r.score FROM recall_results r
+             JOIN recalls c ON c.id = r.recall_id JOIN memories m ON m.id = r.memory_id
+             WHERE c.kind = 'refresh' AND m.uuid = ?1",
+            [tea.to_string()],
+        )
+        .unwrap()
+    };
+    let logit = f64::from(FakeReranker.rerank(PROFILE_QUESTION, &[TEA]).unwrap()[0]);
+    let (raw, scaled) = (score(1.0), score(4.0));
+    let expected = logit - logit / 4.0;
+    assert!(
+        (raw - scaled - expected).abs() < 1e-9,
+        "{raw} - {scaled} isn't {expected}"
+    );
+}
 
 #[test]
 fn a_notable_memory_triggers_a_refresh_five_minutes_later() {
