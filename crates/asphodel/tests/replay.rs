@@ -807,13 +807,25 @@ fn a_scripted_outcome_whose_target_isnt_a_neighbour_is_a_scenario_error() {
         &format!(
             "{HOME_TURN}
 [[turn]]
-at = \"2026-01-06T09:00:00Z\"
+at = \"2026-01-05T10:00:00Z\"
 session = \"s1\"
 user = \"The weather is lovely today.\"
 assistant = \"Enjoy it.\"
 
 [[turn.claim]]
 label = \"weather\"
+content = \"The weather was lovely on 2026-01-05.\"
+quote = \"The weather is lovely today\"
+kind = \"event\"
+significance = \"trivial\"
+
+[[turn]]
+at = \"2026-01-06T09:00:00Z\"
+session = \"s1\"
+user = \"The weather is lovely today.\"
+assistant = \"Enjoy it.\"
+
+[[turn.claim]]
 content = \"The weather was lovely on 2026-01-06.\"
 quote = \"The weather is lovely today\"
 kind = \"event\"
@@ -827,9 +839,19 @@ memory = \"home\"
 "
         ),
     );
+    // An absorbing outcome cannot label a new memory. Keep this claim
+    // unlabelled so loader validation lets it reach call 2. The earlier
+    // weather claim supplies a real neighbour, but home is not one.
+    contract::load(&path).expect("the non-neighbour fixture must pass loader validation");
     let run = replay(&dir, &path, &[]);
-    run.assert_refused("weather");
-    assert!(run.stderr().contains("home"), "{}", run.stderr());
+    run.assert_refused("home");
+    assert!(
+        run.stderr().contains(
+            r#"its outcome names "home", which isn't among the neighbours call 2 is shown for it"#
+        ),
+        "{}",
+        run.stderr()
+    );
 }
 
 #[test]
