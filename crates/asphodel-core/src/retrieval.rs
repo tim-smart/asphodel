@@ -293,7 +293,9 @@ pub fn fuse(lists: &[&[i64]]) -> Vec<i64> {
 /// relevance + w_s·strength + max(−3, ln(state_confidence)) + phase_term
 /// ```
 ///
-/// `state_confidence` is 1.0 for anything but a state, so its term is 0.
+/// `relevance` is the reranker logit divided by the reranker's relevance
+/// scale ([`Reranking::relevance`]). `state_confidence` is 1.0 for anything
+/// but a state, so its term is 0.
 pub fn score(
     relevance: f64,
     w_s: f64,
@@ -432,6 +434,8 @@ pub(crate) struct Context<'a> {
     pub store: &'a Store,
     pub tuning: &'a Tuning,
     pub models: &'a Models,
+    /// The loaded reranker's floor and relevance scale.
+    pub reranking: Reranking,
     /// Embedding models the daemon carries besides its own, for banks a
     /// re-embed hasn't moved yet.
     pub previous: &'a [Arc<dyn crate::models::Embedder>],
@@ -441,6 +445,33 @@ pub(crate) struct Context<'a> {
     /// [`RERANKER_DEADLINE`](crate::constants::RERANKER_DEADLINE) unless a
     /// test or bench set another.
     pub deadline: Duration,
+}
+
+/// The gate floor and relevance scale for the loaded reranker, looked up
+/// by its exact model id once, when the service opens. There's no fallback
+/// for either.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Reranking {
+    /// The injection gate, compared with the raw logit.
+    pub floor: f64,
+    /// What the logit is divided by to give relevance.
+    pub scale: f64,
+}
+
+impl Reranking {
+    /// The floor and scale `tuning` gives `reranker_model`, or `None` when
+    /// either is missing.
+    pub fn for_model(tuning: &Tuning, reranker_model: &str) -> Option<Self> {
+        Some(Self {
+            floor: *tuning.injection.reranker_floors.get(reranker_model)?,
+            scale: *tuning.ranking.relevance_scales.get(reranker_model)?,
+        })
+    }
+
+    /// The relevance term of the score for a reranker logit.
+    pub fn relevance(&self, logit: f64) -> f64 {
+        logit / self.scale
+    }
 }
 
 /// How many times a query is embedded before a recall gives up on a bank
@@ -547,7 +578,7 @@ pub(crate) fn scored_prefetch(
             ranking,
         );
         score(
-            logit,
+            cx.reranking.relevance(logit),
             ranking.w_s_inject,
             candidate.strength,
             candidate.state_confidence,
@@ -555,15 +586,9 @@ pub(crate) fn scored_prefetch(
         )
     });
 
-    // There's no fallback floor: a service built with models
-    // always has one, and a missing one injects nothing.
-    let floor = cx
-        .tuning
-        .injection
-        .reranker_floors
-        .get(cx.models.reranker.model_id())
-        .copied()
-        .unwrap_or(f64::INFINITY);
+    // The floor gates on the raw logit, not on relevance, so the floors
+    // and the logits in the labelling material stay comparable.
+    let floor = cx.reranking.floor;
     let cap = cx.tuning.injection.cap as usize;
     let budget = cx.tuning.injection.token_budget as usize;
     let header = format::header(now, &bank_tz);
@@ -704,7 +729,7 @@ pub(crate) fn recall(
             0.0
         };
         score(
-            logit,
+            cx.reranking.relevance(logit),
             ranking.w_s_recall,
             candidate.strength,
             candidate.state_confidence,
@@ -885,7 +910,7 @@ pub(crate) fn select(
                 ranking,
             );
             let score = score(
-                logit,
+                cx.reranking.relevance(logit),
                 ranking.w_s_inject,
                 candidate.strength,
                 candidate.state_confidence,

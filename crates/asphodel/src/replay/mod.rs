@@ -63,12 +63,15 @@ use scenario::Group;
 use timeline::Timeline;
 
 /// Floors for the deterministic fakes, the layer group `ci` runs under: the
-/// reranker gate open, the reconcile floor where the unit tests put it.
+/// reranker gate open, the reranker's logit taken as relevance unscaled,
+/// and the reconcile floor where the unit tests put it.
 pub(crate) fn fake_floors() -> String {
     format!(
-        "[injection.reranker_floors]\n{:?} = 0.0\n[reconcile.embedding_floors]\n{:?} = 0.5\n",
-        FakeReranker::MODEL_ID,
-        FakeEmbedder::MODEL_ID
+        "[injection.reranker_floors]\n{reranker:?} = 0.0\n\
+         [ranking.relevance_scales]\n{reranker:?} = 1.0\n\
+         [reconcile.embedding_floors]\n{embedder:?} = 0.5\n",
+        reranker = FakeReranker::MODEL_ID,
+        embedder = FakeEmbedder::MODEL_ID,
     )
 }
 
