@@ -18,7 +18,7 @@ use crate::constants::{
 };
 use crate::queue::{self, Lease};
 use crate::store::bank::{add_alias, log_edit, log_memory_edit};
-use crate::store::{Store, StoreError, VectorError, VectorIndex, micros};
+use crate::store::{Store, StoreError, VectorError, VectorIndex, micros, timestamp};
 
 /// A new memory's row, as the edits on its neighbours need it.
 struct Written {
@@ -145,7 +145,7 @@ pub(super) fn commit(
                         edit == Edit::Denies
                     ),
                 )?;
-                reopen(tx, store, unit, neighbour, by, edit == Edit::Denies)?;
+                reopen(tx, store, unit, neighbour, by, edit)?;
             }
             Edit::Refines => {
                 tx.execute(
@@ -160,7 +160,7 @@ pub(super) fn commit(
                     neighbour,
                     &format!("{{\"superseded_by\":{}}}", by.id),
                 )?;
-                reopen(tx, store, unit, neighbour, by, false)?;
+                reopen(tx, store, unit, neighbour, by, edit)?;
                 // A citation of a refined memory moves to
                 // the head of its chain, where its accesses are inherited.
                 tx.execute(
@@ -592,23 +592,30 @@ fn end(
 }
 
 /// The memories `superseded` had ended, now that a claim supersedes it. After a `retracts` or
-/// `refines` their end follows the successor, which still ended them. After
+/// `refines` their end follows the successor, which still ended them, except
+/// task refinements preserve the original closing boundary. Retractions and
+/// state refinements keep event-time endings. After
 /// a `denies` (`denied`) the ending never happened, so they're open again.
-/// The label decides, never the kinds. Either way the edit is logged.
+/// The label decides whether to reopen. Either way the edit is logged.
 fn reopen(
     tx: &Transaction<'_>,
     store: &Store,
     unit: &Unit,
     superseded: i64,
     successor: &Written,
-    denied: bool,
+    edit: Edit,
 ) -> Result<(), rusqlite::Error> {
-    let mut statement = tx.prepare_cached("SELECT id FROM memories WHERE ended_by = ?1")?;
-    let ended: Vec<i64> = statement
-        .query_map([superseded], |row| row.get(0))?
+    let mut statement = tx.prepare_cached(
+        "SELECT id, kind = 'task', valid_until, valid_until_precision
+         FROM memories WHERE ended_by = ?1",
+    )?;
+    let ended: Vec<(i64, bool, i64, String)> = statement
+        .query_map([superseded], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
         .collect::<Result<_, _>>()?;
-    for memory in ended {
-        if denied {
+    for (memory, task, until, precision) in ended {
+        if edit == Edit::Denies {
             tx.execute(
                 "UPDATE memories SET valid_until = NULL, valid_until_precision = NULL,
                         ended_by = NULL, updated_at = ?2
@@ -627,13 +634,24 @@ fn reopen(
                 ),
             )?;
         } else {
+            let end_at = if task && edit == Edit::Refines {
+                (
+                    Stamp {
+                        at: timestamp(until),
+                        precision: Precision::parse(&precision).expect("a stored precision parses"),
+                    },
+                    false,
+                )
+            } else {
+                successor.end
+            };
             end(
                 tx,
                 store,
                 unit,
                 memory,
                 successor.id,
-                successor.end,
+                end_at,
                 EDIT_END_REPOINTED,
             )?;
         }
