@@ -81,6 +81,31 @@ fn repeated_replay_runs_write_byte_identical_reports() {
     );
 }
 
+/// Replay takes `[llm] concurrency` from the overrides like the daemon,
+/// with up to that many chunks out at once in simulated time. The small
+/// history never needs call 2, so a run at 5 replays the cassette recorded
+/// at 1 without a miss and ends with the same memories.
+#[test]
+fn replay_at_concurrency_five_ends_with_the_memories_of_a_serial_run() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let serial = record(&dir, &corpus).report();
+    let five = dir.private_file("five.toml", "[llm]\nconcurrency = 5\n");
+    let pooled = replay_history(
+        &dir,
+        &corpus,
+        "replay",
+        PASSING_PROBES,
+        "five",
+        None,
+        &["--overrides", five.to_str().unwrap()],
+    );
+    assert_ok(&pooled.output);
+    let pooled = pooled.report();
+    assert_eq!(pooled["llm"]["misses"], 0, "{pooled}");
+    assert_eq!(pooled["memories"], serial["memories"], "{pooled}");
+}
+
 /// `replay` fails on a miss.
 #[test]
 fn replay_fails_on_a_cassette_miss() {

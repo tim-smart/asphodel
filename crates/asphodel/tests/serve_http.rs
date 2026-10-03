@@ -505,6 +505,19 @@ impl Daemon {
         ))
     }
 
+    fn ingest_document(&self, bank: &str, id: &str, text: &str) -> Value {
+        self.ok(self.post(
+            &format!("/v1/banks/{bank}/documents"),
+            &json!({
+                "document_id": id,
+                "text": text,
+                "reference_date": "2026-09-30",
+                "reference_date_exact": true,
+                "timezone": null
+            }),
+        ))
+    }
+
     fn recall(&self, bank: &str, query: &str) -> Value {
         self.ok(self.post(
             &format!("/v1/banks/{bank}/recall"),
@@ -937,6 +950,182 @@ fn chunks_queued_before_a_restart_are_extracted_after_it() {
         .ready();
     second.wait_for_memory("main");
     second.wait_extracted("main");
+}
+
+// Concurrent extraction: a pool of leases per bank behind `[llm] concurrency`.
+
+/// `[llm] concurrency` set to `n`.
+fn pool(n: u32) -> String {
+    format!("[llm]\nconcurrency = {n}\n")
+}
+
+/// Queues `documents` in bank `main` on a daemon with no LLM, then stops
+/// it, so the daemon a test starts next finds the whole queue at once.
+fn queue_without_an_llm(dir: &TestDir, tuning: &str, documents: &[(String, String)]) {
+    let mut daemon = Serve::new(dir).tuning(tuning).ready();
+    daemon.create_bank("main");
+    for (id, text) in documents {
+        daemon.ingest_document("main", id, text);
+    }
+    assert_eq!(
+        daemon.chunks("main")["queued"].as_array().unwrap().len(),
+        documents.len()
+    );
+    daemon.sigterm();
+    assert!(daemon.wait_exit().success(), "{}", daemon.log);
+}
+
+/// `n` one-chunk documents that share no sentence.
+fn distinct_documents(n: usize) -> Vec<(String, String)> {
+    (0..n)
+        .map(|i| {
+            (
+                format!("day-{i}.md"),
+                format!("# Day {i}\n\nNothing much happened on day {i}.\n"),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn five_leases_extract_in_about_a_fifth_of_the_serial_time() {
+    // Ten chunks whose call 1 takes a second and finds nothing, so call 2
+    // never runs: 10 s one at a time, about 2 s five at a time, plus about
+    // a second to start.
+    let dir = TestDir::new();
+    let tuning = pool(5);
+    queue_without_an_llm(&dir, &tuning, &distinct_documents(10));
+
+    let steps = vec![json!({"reply": empty_reply(), "delay_ms": 1000}); 10];
+    let started = Instant::now();
+    let mut daemon = Serve::new(&dir).tuning(&tuning).script(&steps).ready();
+    daemon.wait_extracted("main");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "took {elapsed:?} against 10 s serial\n{}",
+        daemon.log
+    );
+}
+
+#[test]
+fn two_chunks_in_flight_stating_one_fact_make_one_memory_and_a_mention() {
+    // Both chunks run call 1 before either commits, and neither finds a
+    // neighbour. The second to commit finds a memory made since its search
+    // at or above the floor for its claim, so it searches again and runs
+    // call 2, which labels the claim a mention: one memory plus one access,
+    // never a second copy (ADR 0005). Each call 1 takes 3 s, so both
+    // finishing within 5 s of the start means they ran together.
+    let dir = TestDir::new();
+    let tuning = pool(2);
+    queue_without_an_llm(
+        &dir,
+        &tuning,
+        &[
+            ("notes.md".to_string(), NOTES.to_string()),
+            (
+                "more-notes.md".to_string(),
+                "# More notes\n\nI live in Auckland, near the harbour.\n".to_string(),
+            ),
+        ],
+    );
+
+    let mention = json!({"claims": [{
+        "claim": "c1",
+        "labels": [{"neighbour": "n1", "label": "mentioned_again"}]
+    }]});
+    let started = Instant::now();
+    let mut daemon = Serve::new(&dir)
+        .tuning(&tuning)
+        .script(&[
+            json!({"reply": auckland_reply(), "delay_ms": 3000}),
+            json!({"reply": auckland_reply(), "delay_ms": 3000}),
+            json!({"reply": mention}),
+        ])
+        .ready();
+    daemon.wait_extracted("main");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(5500),
+        "took {elapsed:?}: the chunks ran one after the other\n{}",
+        daemon.log
+    );
+
+    let recall = daemon.recall("main", "where does Tim live? Auckland");
+    let ids: Vec<&str> = recall["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|result| result["sentence"] == SENTENCE)
+        .map(|result| result["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 1, "one memory, not a copy per chunk: {recall}");
+    let memory = daemon.ok(daemon.get(&format!("/v1/banks/main/memories/{}", ids[0])));
+    let kinds: Vec<&str> = memory["accesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|access| access["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["created", "mentioned_again"], "{memory}");
+}
+
+/// Eight chunks on a pool of two, where the first LLM call hits `limit`,
+/// a hold of about six seconds. Every call after it waits for the hold
+/// to end, so between the calls already in flight finishing and the hold
+/// ending nothing is extracted, and no chunk counts a failure.
+fn a_limit_pauses_every_caller_and_counts_nothing(limit: Value) {
+    let dir = TestDir::new();
+    let tuning = pool(2);
+    queue_without_an_llm(&dir, &tuning, &distinct_documents(8));
+
+    // One call may have started before the limit came back; the rest run
+    // after the hold. 8 more replies: every chunk, the limited one again.
+    let mut steps = vec![limit, json!({"reply": empty_reply(), "delay_ms": 1000})];
+    steps.extend(vec![json!({"reply": empty_reply(), "delay_ms": 500}); 7]);
+    let mut daemon = Serve::new(&dir).tuning(&tuning).script(&steps).ready();
+
+    let snapshot = |daemon: &Daemon| {
+        let chunks = daemon.chunks("main");
+        let queued = chunks["queued"].as_array().unwrap().clone();
+        for chunk in &queued {
+            assert_eq!(
+                chunk["error_count"], 0,
+                "a hold isn't the chunk's failure: {chunks}"
+            );
+        }
+        assert_eq!(chunks["failed"], json!([]), "{chunks}");
+        queued.len()
+    };
+    std::thread::sleep(Duration::from_millis(1500));
+    let early = snapshot(&daemon);
+    std::thread::sleep(Duration::from_millis(1500));
+    let later = snapshot(&daemon);
+    assert_eq!(
+        early, later,
+        "chunks were extracted while the hold was on\n{}",
+        daemon.log
+    );
+    assert!(later >= 7, "{later} chunks still queued");
+
+    daemon.wait_extracted("main");
+}
+
+#[test]
+fn a_usage_limit_pauses_every_caller_and_counts_no_failure() {
+    use asphodel_core::{Clock, SystemClock};
+    // The daemon runs on the system clock, so the reset is in its time.
+    let resets_at = SystemClock.now() + jiff::SignedDuration::from_secs(6);
+    a_limit_pauses_every_caller_and_counts_nothing(
+        json!({"fail": "usage_limited", "resets_at": resets_at.to_string()}),
+    );
+}
+
+#[test]
+fn a_429_with_retry_after_pauses_every_caller_and_counts_no_failure() {
+    a_limit_pauses_every_caller_and_counts_nothing(
+        json!({"fail": "status", "status": 429, "retry_after_secs": 6}),
+    );
 }
 
 // The CLI as a client (ADR 0006, ADR 0010).

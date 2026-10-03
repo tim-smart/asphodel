@@ -848,6 +848,48 @@ fn forget_hides_at_once_and_erases_behind_a_queued_chunk() {
 }
 
 #[test]
+fn a_chunk_queued_after_a_forget_isnt_claimed_until_the_erase_has_run() {
+    // The erase waits behind the chunks queued before the forget. With a
+    // pool of leases, a chunk queued after it could be out at the same
+    // time and reconcile against the hidden memory; committed after the
+    // erase, its labels would be dropped as vanished and the forgotten
+    // content created again. So the erase is a barrier to claims.
+    let h = Harness::new().restart_with("[llm]\nconcurrency = 2\n");
+    let maya = h.insert(fact(MAYA));
+    let before = h.ingest("chat", "My daughter Maya likes tea.");
+    h.forget(&[maya]);
+    h.set(h.now() + minutes(1));
+    let after = h.ingest("chat", "My daughter is called Maya.");
+
+    let first = h
+        .service
+        .claim_chunk(BANK)
+        .unwrap()
+        .expect("the chunk queued before the forget");
+    assert_eq!(first.source, before);
+    assert!(
+        h.service.claim_chunk(BANK).unwrap().is_none(),
+        "the chunk queued after the forget waits for the erase"
+    );
+    h.service.complete_chunk(first).unwrap();
+    assert!(
+        h.service.claim_chunk(BANK).unwrap().is_none(),
+        "a due erase still holds it back until it has run"
+    );
+
+    h.service
+        .erase_next(BANK)
+        .unwrap()
+        .expect("the erase is at the head of the queue");
+    let next = h
+        .service
+        .claim_chunk(BANK)
+        .unwrap()
+        .expect("the erase has run");
+    assert_eq!(next.source, after);
+}
+
+#[test]
 fn forget_erases_the_whole_chain_and_clears_what_points_into_it() {
     // forget takes every memory along
     // `superseded_by`, whichever version it names. `ended_by` isn't a chain

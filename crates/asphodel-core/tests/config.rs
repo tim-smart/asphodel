@@ -320,6 +320,18 @@ fn quiet_rate_must_keep_bank_time_moving() {
 }
 
 #[test]
+fn llm_concurrency_defaults_to_one_and_is_at_least_one() {
+    // At 1, extraction runs one LLM call at a time, as before the pool.
+    let concurrency =
+        |tuning: &Tuning| serde_json::to_value(tuning).unwrap()["llm"]["concurrency"].clone();
+    assert_eq!(concurrency(&Tuning::default()), 1);
+    assert_eq!(concurrency(&load("[llm]\nconcurrency = 5\n").unwrap()), 5);
+    for value in ["0", "-1", "1.5"] {
+        assert_rejected(&format!("[llm]\nconcurrency = {value}\n"));
+    }
+}
+
+#[test]
 fn embedding_floors_must_be_cosines() {
     // floors inside the model's score range.
     for value in ["1.5", "-1.01", "nan", "inf"] {
@@ -681,6 +693,7 @@ fn excluded_tuning_values_leave_the_fingerprint_alone() {
         "[sessions]\nmapping_expiry_days = 7\n",
         "[llm]\nmodel = \"other-model\"\n",
         "[llm]\nendpoint = \"https://other.example/v1\"\n",
+        "[llm]\nconcurrency = 5\n",
     ] {
         assert_eq!(
             load(text).unwrap().deletion_fingerprint(),
