@@ -13,8 +13,10 @@ in for it.
 
 The model id is the exact string, quantisation included. It keys the
 floors in the tuning file (`reconcile.embedding_floors` and
-`injection.reranker_floors`) and is what a bank records when it is created.
-A daemon won't start without a floor for each model it runs.
+`injection.reranker_floors`) and the reranker's relevance scale
+(`ranking.relevance_scales`), and is what a bank records when it is
+created. A daemon won't start without a floor for each model it runs and a
+scale for its reranker.
 
 The manifest in `crates/asphodel-core/src/models/manifest.rs` pins each
 model to a Hugging Face revision and lists the SHA-256 of every file. Both

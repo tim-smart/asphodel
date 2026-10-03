@@ -85,8 +85,8 @@ jobs:
         run: nix build .#image -L
 
       # Runs the image as a pod would, on the real models, until /v1/health
-      # answers 200. The floors are placeholders: the daemon only checks
-      # that each model has one.
+      # answers 200. The floors and scale are placeholders: the daemon only
+      # checks that each model has them.
       - name: serve from the image
         run: |
           image=$(docker load < result | sed -n 's/^Loaded image: //p')
@@ -96,6 +96,9 @@ jobs:
 
           [injection.reranker_floors]
           "jina-reranker-v1-turbo-en:int8" = 0.0
+
+          [ranking.relevance_scales]
+          "jina-reranker-v1-turbo-en:int8" = 1.0
           TOML
           docker run -d --name asphodel -p 127.0.0.1:7720:7720 \
             --read-only --tmpfs /data:uid=65532,gid=65532 --tmpfs /tmp \

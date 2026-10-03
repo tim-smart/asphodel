@@ -119,6 +119,9 @@ endpoint = "https://api.openai.com/v1"    # or: auth = "chatgpt" and no endpoint
 
 [injection.reranker_floors]
 "jina-reranker-v1-turbo-en:int8" = 0.0
+
+[ranking.relevance_scales]
+"jina-reranker-v1-turbo-en:int8" = 1.0
 ```
 
 **Stop here and get approval.** Then one of:
