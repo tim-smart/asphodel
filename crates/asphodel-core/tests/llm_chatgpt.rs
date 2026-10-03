@@ -119,6 +119,7 @@ fn request() -> LlmRequest {
         template: Template {
             name: "extract".into(),
             version: 3,
+            guidance: None,
         },
         system: "You extract memories.".into(),
         user: "Tim said: I moved to Wellington in March.".into(),
