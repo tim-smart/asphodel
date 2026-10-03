@@ -1093,6 +1093,39 @@ fn an_unchanged_fingerprint_skips_the_llm_and_force_doesnt() {
 }
 
 #[test]
+fn the_refresh_prompt_states_the_language_rule() {
+    // The system prompt of a forced refresh of the profile on `h`.
+    let system = |h: &Harness| {
+        h.insert(fact(TEA));
+        let llm = quiet_llm(1);
+        h.service
+            .refresh_model(BANK, PROFILE_NAME, &llm, true)
+            .unwrap();
+        llm.requests()[0].system.clone()
+    };
+
+    // Unset, the entries match the memories' language.
+    let inferred = system(&Harness::new());
+    assert!(
+        inferred.contains("Write the entries in the language of the memories they cite."),
+        "{inferred}"
+    );
+
+    // Set, every entry is in that language.
+    let forced = system(&Harness::with_tuning("[llm]\nlanguage = \"English\"\n"));
+    assert!(
+        forced.contains(
+            "Write every entry in English, translating if the memories are in another language."
+        ),
+        "{forced}"
+    );
+    assert!(
+        !forced.contains("in the language of the memories"),
+        "{forced}"
+    );
+}
+
+#[test]
 fn the_fingerprint_follows_the_selection_only() {
     let h = Harness::new();
     h.insert(fact(TEA));

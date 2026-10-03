@@ -506,6 +506,55 @@ fn a_fast_claims_miss_calls_live_with_an_llm_and_counts_it() {
     assert_eq!(report["llm"]["live"], 1, "{report}");
 }
 
+/// `fast` reuses call 1's claims by chunk, but claims recorded without
+/// `[llm] language` are in the text's language. With the setting on, every
+/// chunk's call 1 is a miss answered live, and the next `fast` run with it
+/// reuses those.
+#[test]
+fn fast_doesnt_reuse_claims_recorded_without_the_language() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    record(&dir, &corpus);
+    let call1 = |records: Vec<Value>| {
+        records
+            .into_iter()
+            .filter(|record| record["template"]["name"] == "extract_claims")
+            .count() as u64
+    };
+    let recorded = call1(cassette_records(&dir));
+    assert!(recorded > 0);
+
+    let english = dir.private_file("english.toml", "[llm]\nlanguage = \"English\"\n");
+    let overrides = ["--overrides", english.to_str().unwrap()];
+    let script = live_script(&dir);
+    let first = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "fast-english",
+        Some(&script),
+        &overrides,
+    );
+    assert_ok(&first.output);
+    let report = first.report();
+    assert_eq!(report["llm"]["misses"], recorded, "{report}");
+    assert_eq!(report["llm"]["live"], recorded, "{report}");
+    assert_eq!(call1(cassette_records(&dir)), 2 * recorded);
+
+    let second = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "fast-english-again",
+        None,
+        &overrides,
+    );
+    assert_ok(&second.output);
+    assert_eq!(second.report()["llm"]["misses"], 0);
+}
+
 // The determinism self-test.
 
 /// `fast` on its own recording needs no LLM, counts zero misses and passes
