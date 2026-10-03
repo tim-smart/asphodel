@@ -116,8 +116,10 @@ repeat stays one memory. Measure it in replay before raising it
 model entries are written in, such as `"English"`. Unset, each is written in
 the language of the text it comes from. The local models are English-only,
 so set it to `"English"` if the assistant is used in another language
-(`docs/models.md`). It applies to new extraction and refreshes only. An empty
-value stops the daemon.
+(`docs/models.md`). It applies to new extraction and refreshes only; a
+memory already stored in another language is translated with `asphodel
+memory translate` (see "Memories" under "Commands"). An empty value stops
+the daemon.
 
 An unknown key or an out-of-range value stops the daemon too. The LLM's two
 modes, an API key or a ChatGPT subscription, are in `docs/models.md`. For
@@ -234,10 +236,37 @@ whatever it says.
   chain, the secret-scan kinds, strength in its parts, any guard holding
   back a purge, and projected fade and purge dates. The dates are bank-time
   durations plus the earliest world date at full speed.
+- `asphodel memory translate --bank B <id>` translates a memory into
+  `[llm] language`. See below.
 - `asphodel forget --bank B <id>...`: see "Forgetting".
 
 A memory's sentence, kind and window are never edited from the CLI. Those
 change through conversation.
+
+Translation is the one exception, and even it doesn't edit a sentence.
+`[llm] language` only shapes new extraction, so memories stored before it
+was set stay in the language they were said in, and the English-only models
+can't match an English query to them. `memory translate` asks the LLM for
+the memory's sentence in `[llm] language` and writes the result as a new
+memory that supersedes the old one, the way a refinement does. The new one
+keeps everything else: kind, window, both significance fields, the source
+passage it points at, and its entity links. It's in the same chain, so it
+inherits every access and its strength is unchanged. It's embedded and
+indexed under the new sentence, the supersession is logged as
+`memory_refined` with `translated_to`, and mental models citing the old
+memory move to the new one and refresh. The LLM sees only the sentence,
+never the passage.
+
+It's a daemon operation on one memory, so find the ids first, with recall
+or a query over a backup copy. It's refused when `[llm] language` is unset,
+since there's nothing to translate into, and with 409 when the memory has
+been superseded, naming the memory that superseded it. That covers a
+repeat: once translated, the old id is superseded by the translation, and
+naming the translation answers "already in" the language without asking the
+LLM. A memory the LLM hands back unchanged is already in the language, and
+nothing is written. The memory is checked again when the translation is
+written, so one that extraction refined while the LLM answered is left to
+its new version; translate that one if it needs it.
 
 ### Entities
 

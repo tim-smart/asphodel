@@ -22,7 +22,8 @@ models are English-only. A memory in another language gets a poor
 embedding, and the reconcile and reranker floors were set on English, so a
 store fed text in another language should set `[llm] language = "English"`
 in the tuning file (`docs/operations.md`). Only new extraction follows the
-setting, so a store that already holds other languages stays mixed.
+setting, so a store that already holds other languages stays mixed until
+`asphodel memory translate` moves those memories over one at a time.
 
 ### The model dir
 
