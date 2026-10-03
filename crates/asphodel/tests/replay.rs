@@ -834,6 +834,27 @@ memory = \"home\"
 }
 
 #[test]
+fn a_scenario_refuses_to_run_above_concurrency_one() {
+    // Its call 2 replies are scripted against what a serial run shows.
+    let dir = TestDir::new();
+    let path = inline(
+        &dir,
+        "pooled",
+        &format!(
+            "{HOME_TURN}
+[[probe]]
+at = \"2026-01-06T09:00:00Z\"
+kind = \"exists\"
+memory = \"home\"
+"
+        ),
+    );
+    let overrides = dir.file("concurrency.toml", "[llm]\nconcurrency = 2\n");
+    let run = replay(&dir, &path, &["--overrides", overrides.to_str().unwrap()]);
+    run.assert_refused("concurrency");
+}
+
+#[test]
 fn a_used_memory_that_isnt_in_context_is_a_scenario_error() {
     let dir = TestDir::new();
     // A new session whose query shares no word with the memory: nothing is

@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use asphodel_core::config::PurgePause;
 use asphodel_core::constants::CHUNK_RETRY_CAP;
-use asphodel_core::ingest::{Outcome, Turn};
+use asphodel_core::ingest::{Document, Outcome, Turn};
 use asphodel_core::mental_models::{
     Model, Outcome as RefreshOutcome, REFRESH_TEMPLATE, RefreshInput,
 };
@@ -887,6 +887,45 @@ fn a_chunk_queued_after_a_forget_isnt_claimed_until_the_erase_has_run() {
         .unwrap()
         .expect("the erase has run");
     assert_eq!(next.source, after);
+}
+
+#[test]
+fn at_concurrency_one_a_turn_after_a_forget_waits_for_the_erase_behind_an_earlier_document() {
+    // Turns go ahead of documents, so the turn queued after the forget
+    // sorts first. It still waits: it would reconcile against the hidden
+    // memory and could commit after the erase.
+    let h = Harness::new();
+    let maya = h.insert(fact(MAYA));
+    let notes = h
+        .service
+        .ingest_document(
+            BANK,
+            &Document {
+                document_id: "notes.md".into(),
+                text: "# Notes\n\nMaya likes tea.\n".into(),
+                reference_date: h.now().to_zoned(TimeZone::UTC).date(),
+                reference_date_exact: true,
+                timezone: Some(TZ.into()),
+            },
+        )
+        .unwrap()
+        .source;
+    h.forget(&[maya]);
+    let after = h.ingest("chat", "My daughter is called Maya.");
+
+    let first = h
+        .service
+        .claim_chunk(BANK)
+        .unwrap()
+        .expect("the document's chunk");
+    assert_eq!(first.source, notes);
+    h.service.complete_chunk(first).unwrap();
+    assert!(h.service.claim_chunk(BANK).unwrap().is_none());
+    h.service
+        .erase_next(BANK)
+        .unwrap()
+        .expect("the erase is at the head of the queue");
+    assert_eq!(h.service.claim_chunk(BANK).unwrap().unwrap().source, after);
 }
 
 #[test]

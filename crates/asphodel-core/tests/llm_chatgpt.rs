@@ -1119,6 +1119,26 @@ fn a_plain_429_stays_a_retryable_status() {
     assert!(error.is_retryable());
 }
 
+#[test]
+fn a_429_with_retry_after_in_seconds_is_a_rate_limit_hold() {
+    let backend = StubServer::backend(
+        StubResponse::json(
+            429,
+            json!({"error": {"type": "rate_limit_exceeded", "message": "slow down"}}),
+        )
+        .with_header("Retry-After", "12"),
+    );
+    let dir = TestDir::new();
+    let error = client(&backend, logged_in_store(&dir), clock())
+        .complete(&request())
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::from_secs(12)),
+        "{error:?}"
+    );
+    assert!(!error.is_retryable(), "deferral, not a retry");
+}
+
 // Secret hygiene across the whole client.
 
 #[test]

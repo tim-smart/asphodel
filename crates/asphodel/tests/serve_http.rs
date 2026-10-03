@@ -1070,6 +1070,86 @@ fn two_chunks_in_flight_stating_one_fact_make_one_memory_and_a_mention() {
     assert_eq!(kinds, ["created", "mentioned_again"], "{memory}");
 }
 
+#[test]
+fn sigterm_finishes_every_chunk_in_flight_before_stopping() {
+    let dir = TestDir::new();
+    let tuning = pool(2);
+    queue_without_an_llm(&dir, &tuning, &distinct_documents(3));
+    let mut daemon = Serve::new(&dir)
+        .tuning(&tuning)
+        .script(&vec![json!({"reply": empty_reply(), "delay_ms": 2000}); 3])
+        .ready();
+    daemon.wait_until(
+        "two chunks in flight",
+        |daemon| daemon.chunks("main"),
+        |chunks| {
+            chunks["queued"]
+                .as_array()
+                .is_some_and(|queued| queued.iter().filter(|c| c["in_flight"] == true).count() == 2)
+        },
+    );
+
+    daemon.sigterm();
+    let status = daemon.wait_exit();
+    assert!(status.success(), "{status}\n{}", daemon.log);
+    assert_eq!(
+        daemon.log.matches("chunk extracted").count(),
+        2,
+        "both chunks in flight commit, and no third is claimed\n{}",
+        daemon.log
+    );
+    drop(daemon);
+
+    // Only the chunk never claimed is still queued, with nothing counted.
+    let restarted = Serve::new(&dir).tuning(&tuning).ready();
+    let chunks = restarted.chunks("main");
+    let queued = chunks["queued"].as_array().unwrap();
+    assert_eq!(queued.len(), 1, "{chunks}");
+    assert_eq!(queued[0]["error_count"], 0, "{chunks}");
+    assert_eq!(chunks["failed"], json!([]), "{chunks}");
+}
+
+#[test]
+fn deleting_a_bank_waits_for_its_chunks_in_flight_and_stops_its_worker() {
+    let dir = TestDir::new();
+    let tuning = pool(2);
+    queue_without_an_llm(&dir, &tuning, &distinct_documents(3));
+    let mut daemon = Serve::new(&dir)
+        .tuning(&tuning)
+        .script(&vec![json!({"reply": empty_reply(), "delay_ms": 1500}); 3])
+        .ready();
+    daemon.wait_until(
+        "two chunks in flight",
+        |daemon| daemon.chunks("main"),
+        |chunks| {
+            chunks["queued"]
+                .as_array()
+                .is_some_and(|queued| queued.iter().filter(|c| c["in_flight"] == true).count() == 2)
+        },
+    );
+
+    let deleted = daemon.send("DELETE", "/v1/banks/main?confirm=main", None);
+    assert_eq!(deleted.status, 200, "{}\n{}", deleted.body, daemon.log);
+    // The hold drained the pool: both chunks in flight committed, and the
+    // third was never handed out.
+    // The commit logs before it releases its chunk, so before the delete.
+    daemon.wait_for_line("deleted a bank");
+    assert_eq!(
+        daemon.log.matches("extracted a chunk").count(),
+        2,
+        "{}",
+        daemon.log
+    );
+    assert_eq!(daemon.get("/v1/banks/main/chunks").status, 404);
+
+    // The old worker stopped with its bank, so the bank made again under
+    // the name gets a new one, which takes the script's last step.
+    daemon.create_bank("main");
+    daemon.ingest_document("main", "again.md", "# Again\n\nA new start.\n");
+    daemon.wait_extracted("main");
+    daemon.wait_for_line("chunk extracted");
+}
+
 /// Eight chunks on a pool of two, where the first LLM call hits `limit`,
 /// a hold of about six seconds. Every call after it waits for the hold
 /// to end, so between the calls already in flight finishing and the hold

@@ -106,6 +106,162 @@ fn replay_at_concurrency_five_ends_with_the_memories_of_a_serial_run() {
     assert_eq!(pooled["memories"], serial["memories"], "{pooled}");
 }
 
+/// The small history with the home turn said again ten minutes later in
+/// the same session, imported to `corpus/twice.jsonl`.
+fn imported_with_home_twice(dir: &TestDir) -> std::path::PathBuf {
+    let state_db = dir.private_path("state-twice.db");
+    let db: StateDb = hermes::small_history(&state_db);
+    db.turn(
+        "s-main",
+        epoch("2026-01-05T09:10:00Z"),
+        &format!("{}, still.", hermes::HOME_QUOTE),
+        "Noted again.",
+    );
+    drop(db);
+    let corpus = dir.private_path("corpus/twice.jsonl");
+    assert_ok(&support::import(dir, &state_db, &corpus));
+    corpus
+}
+
+/// A script whose every step answers any call: call 1 with the home
+/// claim, call 2 labelling it a mention of the one neighbour, and a
+/// refresh with no edits. Neither parser refuses the others' fields.
+fn mention_script(dir: &TestDir) -> std::path::PathBuf {
+    let mut claim = support::home_claim();
+    claim["claim"] = serde_json::json!("c1");
+    claim["labels"] = serde_json::json!([{"neighbour": "n1", "label": "mentioned_again"}]);
+    support::script_answering_everything(dir, "mention-script", vec![claim], Vec::new())
+}
+
+/// Two chunks out at once in simulated time, with an hour's latency: the
+/// home turn and its repeat ten minutes later.
+fn pooled_flags(dir: &TestDir) -> Vec<String> {
+    let pooled = dir.private_file("pooled.toml", "[llm]\nconcurrency = 2\n");
+    vec![
+        "--overrides".into(),
+        pooled.to_str().unwrap().into(),
+        "--latency".into(),
+        "1h".into(),
+    ]
+}
+
+fn is_call2(record: &Value) -> bool {
+    record["template"]["name"] == "reconcile_claims"
+}
+
+/// At concurrency 2 the repeat is claimed before the first home turn
+/// commits, so neither sees the other at its search. The repeat's commit
+/// is stale: it runs call 2 again through the cassette, live in `live`,
+/// and becomes a mention of the one memory. `replay` of that cassette
+/// simulates the same run.
+#[test]
+fn a_stale_commit_redoes_call_2_through_the_cassette_and_replays() {
+    let dir = TestDir::new();
+    let corpus = imported_with_home_twice(&dir);
+    let script = mention_script(&dir);
+    let flags = pooled_flags(&dir);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+
+    let live = replay_history(
+        &dir,
+        &corpus,
+        "live",
+        PASSING_PROBES,
+        "live",
+        Some(&script),
+        &flags,
+    );
+    assert_ok(&live.output);
+    let live = live.report();
+    assert_eq!(live["call2_rate"]["redos"], 1, "{live}");
+    assert_eq!(live["call2_rate"]["call2"], 1, "{live}");
+    assert_eq!(
+        live["memories"].as_array().unwrap().len(),
+        1,
+        "a mention, not a copy: {live}"
+    );
+    let call2: Vec<Value> = cassette_records(&dir)
+        .into_iter()
+        .filter(is_call2)
+        .collect();
+    assert_eq!(call2.len(), 1, "the redo's call 2 is recorded");
+
+    let replay = replay_history(
+        &dir,
+        &corpus,
+        "replay",
+        PASSING_PROBES,
+        "replay",
+        None,
+        &flags,
+    );
+    assert_ok(&replay.output);
+    let replay = replay.report();
+    assert_eq!(replay["llm"]["misses"], 0, "{replay}");
+    assert_eq!(simulation(&live), simulation(&replay));
+}
+
+/// Without the redo's call 2 in the cassette, `replay` stops on the miss
+/// and `fast` answers it from the LLM and records it.
+#[test]
+fn a_redo_that_misses_stops_replay_and_is_answered_live_in_fast() {
+    let dir = TestDir::new();
+    let corpus = imported_with_home_twice(&dir);
+    let script = mention_script(&dir);
+    let flags = pooled_flags(&dir);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let live = replay_history(
+        &dir,
+        &corpus,
+        "live",
+        PASSING_PROBES,
+        "live",
+        Some(&script),
+        &flags,
+    );
+    assert_ok(&live.output);
+    let without: Vec<Value> = cassette_records(&dir)
+        .into_iter()
+        .filter(|record| !is_call2(record))
+        .collect();
+    write_cassette(&dir, &without);
+
+    let replay = replay_history(
+        &dir,
+        &corpus,
+        "replay",
+        PASSING_PROBES,
+        "replay",
+        None,
+        &flags,
+    );
+    assert_refused(&replay.output, "miss");
+    assert!(
+        !replay.report_path.exists(),
+        "a failed run writes no report"
+    );
+
+    let fast = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "fast",
+        Some(&script),
+        &flags,
+    );
+    assert_ok(&fast.output);
+    let fast = fast.report();
+    assert_eq!(fast["call2_rate"]["redos"], 1, "{fast}");
+    assert_eq!(fast["llm"]["misses"], 1, "{fast}");
+    assert_eq!(fast["llm"]["live"], 1, "{fast}");
+    assert_eq!(
+        cassette_records(&dir).into_iter().filter(is_call2).count(),
+        1,
+        "fast records the call it answered live"
+    );
+}
+
 /// `replay` fails on a miss.
 #[test]
 fn replay_fails_on_a_cassette_miss() {
