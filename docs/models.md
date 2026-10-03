@@ -18,7 +18,11 @@ A daemon won't start without a floor for each model it runs (ADR 0009).
 
 The manifest in `crates/asphodel-core/src/models/manifest.rs` pins each
 model to a Hugging Face revision and lists the SHA-256 of every file. Both
-models are English-only.
+models are English-only. A memory in another language gets a poor
+embedding, and the reconcile and reranker floors were set on English, so a
+store fed text in another language should set `[llm] language = "English"`
+in the tuning file (`docs/operations.md`). Only new extraction follows the
+setting, so a store that already holds other languages stays mixed.
 
 ### The model dir
 
@@ -117,6 +121,17 @@ hands out scripted replies and records the requests it was given. The
 cassette records the logical request (template, prompts, schema), never
 the wire body or headers, so a recording made in one mode replays in the
 other.
+
+**Language.** Unset, `[llm] language` leaves call 1 writing each claim in
+the language of the passage it quotes and a refresh writing entries in the
+language of the memories they cite. Set to a language name such as
+`"English"`, both write in that language and translate when the text is in
+another. A claim's `quote` and `surface_form` still match the text exactly,
+since a quote that isn't in the text throws the claim away, and entity names
+keep the form the text uses. The rule sits in the system prompt, which stays
+the same for every chunk, so provider prompt caching still works. Call 2
+returns only handles and labels, so it has no rule. In replay, `fast` reuses
+call 1's claims only from a recording made with the same language.
 
 `ASPHODEL_LLM_SCRIPT=<file>` runs the daemon's extraction workers on a
 `FakeLlm` that plays the file's steps in order, one per call: a JSON array

@@ -113,6 +113,13 @@ search missed a memory another chunk committed reconciles again, so a
 repeat stays one memory (ADR 0005). Measure it in replay before raising it
 (`docs/replay.md`, "Concurrency").
 
+`[llm] language` (unset by default) is the language memories and mental
+model entries are written in, such as `"English"`. Unset, each is written in
+the language of the text it comes from. The local models are English-only,
+so set it to `"English"` if the assistant is used in another language
+(`docs/models.md`). It applies to new extraction and refreshes only. An empty
+value stops the daemon.
+
 An unknown key or an out-of-range value stops the daemon too. The LLM's two
 modes, an API key or a ChatGPT subscription, are in `docs/models.md`. For
 the subscription, log in once the pod is up:

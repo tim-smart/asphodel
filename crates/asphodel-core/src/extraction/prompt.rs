@@ -1,7 +1,8 @@
 //! Call 1's request: the rules, the rendered input and the reply schema.
 //!
-//! The system prompt is the same for every chunk, so a provider can cache
-//! it; everything about the chunk goes in the user prompt.
+//! The system prompt is the same for every chunk on a daemon, so a provider
+//! can cache it; everything about the chunk goes in the user prompt. Only
+//! `[llm] language` changes it.
 
 use std::fmt::Write as _;
 
@@ -17,7 +18,7 @@ const SYSTEM: &str = r#"You extract memories for a personal assistant's long-ter
 
 # Claims
 
-Each claim is one sentence that makes sense on its own: use names instead of pronouns, and absolute dates instead of relative ones ("tomorrow" becomes "on 2 October 2026"). Put the why into the sentence; there are no separate fields for who, what or why. Write the claim in the language of the passage it quotes and never translate. Entity names and dates stay as they appear.
+Each claim is one sentence that makes sense on its own: use names instead of pronouns, and absolute dates instead of relative ones ("tomorrow" becomes "on 2 October 2026"). Put the why into the sentence; there are no separate fields for who, what or why. {language_rule}
 
 `quote` is the exact passage of the text the claim comes from, copied character for character. Quote only from the text, never from the context: the context is there so you can understand the text, and a claim found only in the context is not extracted. A claim whose quote isn't in the text is thrown away.
 
@@ -74,6 +75,21 @@ Link each claim to the entities it's about. Known entities are listed with a han
 
 The memories already in the assistant's context are listed with handles (`m1`, `m2`, …), and so are any entries of the assistant's standing notes about the user (`n1`, `n2`, …), each with the memories it rests on. In `used_injected_ids`, give the handles of those the assistant's reply actually relied on: a memory's, or an entry's when the reply relied on the entry. Being shown a memory or an entry isn't using it, and a document has no reply, so for a document this is empty."#;
 
+/// The language rule without `[llm] language`.
+const INFERRED_LANGUAGE: &str = "Write the claim in the language of the passage it quotes and never translate. Entity names and dates stay as they appear.";
+
+/// The system prompt, with the language rule for `language`.
+fn system(language: Option<&str>) -> String {
+    let rule = match language {
+        None => INFERRED_LANGUAGE.to_owned(),
+        Some(language) => format!(
+            "Write every claim in {}, translating if the text is in another language. Entity names keep the form the text uses, and `quote` and `surface_form` stay exactly as the text has them.",
+            language.trim()
+        ),
+    };
+    SYSTEM.replace("{language_rule}", &rule)
+}
+
 /// Call 1's request for `input`. The reply schema is strict, every property
 /// required.
 pub fn call1_request(input: &Call1Input) -> LlmRequest {
@@ -82,7 +98,7 @@ pub fn call1_request(input: &Call1Input) -> LlmRequest {
             name: CALL1_TEMPLATE.into(),
             version: CALL1_VERSION,
         },
-        system: SYSTEM.into(),
+        system: system(input.language.as_deref()),
         user: render(input),
         schema_name: SCHEMA_NAME.into(),
         schema: schema(),

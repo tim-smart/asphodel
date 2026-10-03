@@ -37,7 +37,7 @@ pub(crate) use schedule::Schedule;
 /// The refresh call's template name and version, which replay's cassette
 /// keys include.
 pub const REFRESH_TEMPLATE: &str = "refresh_model";
-pub const REFRESH_VERSION: u32 = 1;
+pub const REFRESH_VERSION: u32 = 2;
 
 /// The least time between two refreshes of one model, and the wait before
 /// a failed refresh is tried again. Fixed
@@ -135,6 +135,9 @@ pub struct Entry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RefreshInput {
     pub question: String,
+    /// `[llm] language`: the language every entry is written in. `None`
+    /// writes them in the language of the memories they cite.
+    pub language: Option<String>,
     pub max_tokens: u32,
     /// The selection.
     pub memories: Vec<InputMemory>,
