@@ -149,11 +149,50 @@ fn is_call2(record: &Value) -> bool {
     record["template"]["name"] == "reconcile_claims"
 }
 
+/// The passing probes, plus the home memory's strength a second before and
+/// at 11:10:30, when the repeat's redo commits under `--latency 1h`.
+fn redo_probes() -> String {
+    format!(
+        "{PASSING_PROBES}
+[[probe]]
+id = \"p003\"
+at = \"2026-01-05T11:10:29Z\"
+kind = \"band\"
+memory = \"lives in Auckland\"
+band = \"strong\"
+
+[[probe]]
+id = \"p004\"
+at = \"2026-01-05T11:10:30Z\"
+kind = \"band\"
+memory = \"lives in Auckland\"
+band = \"strong\"
+"
+    )
+}
+
+/// A probe's observed strength, by id.
+fn strength(report: &Value, id: &str) -> f64 {
+    report["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|probe| probe["id"] == id)
+        .unwrap_or_else(|| panic!("no probe {id}: {report}"))["observed"]["strength"]
+        .as_f64()
+        .unwrap()
+}
+
 /// At concurrency 2 the repeat is claimed before the first home turn
 /// commits, so neither sees the other at its search. The repeat's commit
 /// is stale: it runs call 2 again through the cassette, live in `live`,
 /// and becomes a mention of the one memory. `replay` of that cassette
 /// simulates the same run.
+///
+/// Under `--latency 1h` the redo is charged the hour again. The home
+/// turn syncs at 09:00:30 and commits at 10:00:30; the repeat syncs at
+/// 09:10:30, completes at 10:10:30, and its redo commits at 11:10:30, two
+/// hours after its sync. Until then the store doesn't hold its mention.
 #[test]
 fn a_stale_commit_redoes_call_2_through_the_cassette_and_replays() {
     let dir = TestDir::new();
@@ -162,11 +201,12 @@ fn a_stale_commit_redoes_call_2_through_the_cassette_and_replays() {
     let flags = pooled_flags(&dir);
     let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
 
+    let probes = redo_probes();
     let live = replay_history(
         &dir,
         &corpus,
         "live",
-        PASSING_PROBES,
+        &probes,
         "live",
         Some(&script),
         &flags,
@@ -175,6 +215,17 @@ fn a_stale_commit_redoes_call_2_through_the_cassette_and_replays() {
     let live = live.report();
     assert_eq!(live["call2_rate"]["redos"], 1, "{live}");
     assert_eq!(live["call2_rate"]["call2"], 1, "{live}");
+    let hours = |n: u64| n * 60 * 60 * 1000;
+    assert_eq!(live["extraction_lag"]["p50_ms"], hours(1), "{live}");
+    assert_eq!(
+        live["extraction_lag"]["p95_ms"],
+        hours(2),
+        "the redo is charged the constant latency again: {live}"
+    );
+    assert!(
+        strength(&live, "p004") > strength(&live, "p003"),
+        "the mention lands at 11:10:30, not before: {live}"
+    );
     assert_eq!(
         live["memories"].as_array().unwrap().len(),
         1,
@@ -186,15 +237,7 @@ fn a_stale_commit_redoes_call_2_through_the_cassette_and_replays() {
         .collect();
     assert_eq!(call2.len(), 1, "the redo's call 2 is recorded");
 
-    let replay = replay_history(
-        &dir,
-        &corpus,
-        "replay",
-        PASSING_PROBES,
-        "replay",
-        None,
-        &flags,
-    );
+    let replay = replay_history(&dir, &corpus, "replay", &probes, "replay", None, &flags);
     assert_ok(&replay.output);
     let replay = replay.report();
     assert_eq!(replay["llm"]["misses"], 0, "{replay}");

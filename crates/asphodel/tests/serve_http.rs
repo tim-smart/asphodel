@@ -1483,6 +1483,61 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     );
 }
 
+#[test]
+fn a_refresh_held_by_an_extraction_limit_answers_held_over_http_and_the_cli() {
+    // A memory is extracted, so the profile has something to refresh; then
+    // the next extraction call hits a usage limit, so the gate holds every
+    // call. A refresh asked for then never reaches the LLM: it's held until
+    // the reset, not failed, over HTTP and the CLI alike.
+    use asphodel_core::{Clock, SystemClock};
+    let resets_at = jiff::Timestamp::from_second(SystemClock.now().as_second() + 3600).unwrap();
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir)
+        .script(&[
+            json!({"reply": auckland_reply()}),
+            json!({"fail": "usage_limited", "resets_at": resets_at.to_string()}),
+        ])
+        .ready();
+    daemon.create_bank("main");
+    daemon.ingest_notes("main", "notes.md");
+    daemon.wait_for_memory("main");
+    daemon.ingest_document("main", "later.md", "# Later\n\nNothing much happened.\n");
+    daemon.wait_for_line("every LLM call holds");
+
+    let held = daemon.ok(daemon.post(
+        "/v1/banks/main/models/User%20profile/refresh?force=true",
+        &Value::Null,
+    ));
+    assert_eq!(held["outcome"], "held", "{held}");
+    let until: jiff::Timestamp = held["detail"]["until"].as_str().unwrap().parse().unwrap();
+    assert_eq!(until, resets_at, "{held}");
+
+    let json = run(cli(&daemon).args([
+        "model",
+        "refresh",
+        "--bank",
+        "main",
+        "User profile",
+        "--force",
+        "--json",
+    ]));
+    let json: Value = serde_json::from_str(&succeeded(json)).unwrap();
+    assert_eq!(json["outcome"], "held", "{json}");
+
+    let output = run(cli(&daemon).args([
+        "model",
+        "refresh",
+        "--bank",
+        "main",
+        "User profile",
+        "--force",
+    ]));
+    let text = succeeded(output);
+    assert!(text.contains("held"), "{text}");
+    assert!(text.contains(&resets_at.to_string()), "{text}");
+    assert!(!text.contains("failed"), "{text}");
+}
+
 // Forget and the purge pause (ADR 0009; ADR 0010).
 
 #[test]
