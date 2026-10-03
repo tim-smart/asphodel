@@ -14,7 +14,7 @@ in for it.
 The model id is the exact string, quantisation included. It keys the
 floors in the tuning file (`reconcile.embedding_floors` and
 `injection.reranker_floors`) and is what a bank records when it is created.
-A daemon won't start without a floor for each model it runs (ADR 0009).
+A daemon won't start without a floor for each model it runs.
 
 The manifest in `crates/asphodel-core/src/models/manifest.rs` pins each
 model to a Hugging Face revision and lists the SHA-256 of every file. Both
@@ -72,7 +72,7 @@ environment only, and the resolved config shows `models.fake = true`.
 
 A bank records the embedding model it was created under and is served with
 that model, not the daemon's, until `asphodel reembed --bank <bank>` moves
-it (ADR 0010). During a change the image carries both models: the daemon
+it. During a change the image carries both models: the daemon
 runs the new one and keeps the old one for banks still recorded under it
 (`Service::with_previous_embedder`). The manifest lists one embedding
 model today, so a change adds the new model to it and keeps the old one as
@@ -159,8 +159,8 @@ it, which is why `api_key` stays the default.
 
 Subscription usage windows will throttle the real-history import.
 A large backfill could take days. Keep `llm.model` pinned and calibrate
-against that exact model; subscription mode does not change ADR 0009's
-single-model calibration requirement.
+against that exact model: the floors and cassettes are calibrated against
+one model, and subscription mode does not change that.
 
 **Logging in.** `asphodel llm login --data-dir <dir>` runs the device-code
 flow: it prints a URL and a one-time code, waits for approval, and writes

@@ -19,8 +19,8 @@ use crate::clock::{Clock, SystemClock};
 use crate::config::{Deployment, LLM_API_KEY_ENV, LlmAuth, Secret, Tuning};
 
 /// Where the LLM is and how to talk to it. The endpoint and model come from
-/// `[llm]` in the tuning file, and the key from `ASPHODEL_LLM_API_KEY`
-/// (ADR 0009).
+/// `[llm]` in the tuning file, and the key only from the environment,
+/// `ASPHODEL_LLM_API_KEY`.
 #[derive(Debug, Clone)]
 pub struct LlmSettings {
     /// Which wire format and credentials: Chat Completions with a key, or

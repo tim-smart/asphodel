@@ -1,4 +1,4 @@
-//! Mental models (ADR 0007).
+//! Mental models.
 //!
 //! A model answers a standing question, such as "who is the user?", with
 //! entries: one sentence each, citing the memories it rests on. Only the
@@ -192,7 +192,7 @@ pub struct Applied {
     pub removed: Vec<Uuid>,
     pub rejected: Vec<Rejected>,
     /// Entries dropped because a memory they cite left the input: fading,
-    /// retraction or ending takes an entry out of the model (ADR 0007).
+    /// retraction or ending takes an entry out of the model.
     pub dropped: Vec<Uuid>,
     /// Entries trimmed to fit `max_tokens`, lowest-ranked first.
     pub trimmed: Vec<Uuid>,

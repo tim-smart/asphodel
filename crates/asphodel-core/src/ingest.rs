@@ -4,8 +4,8 @@
 //! chunks and queues the chunks. It never calls a model; extraction takes
 //! chunks off the queue ([`crate::queue`]). Its invariants:
 //!
-//! - **Sources are kept verbatim** after the secret scan (ADR 0002). The
-//!   stored text is the clean turn, never Hermes' `api_content`.
+//! - **Sources are kept verbatim** after the secret scan. The stored text
+//!   is the clean turn, never Hermes' `api_content`.
 //! - **Ingest is idempotent**. The key
 //!   is bank, session, message time and content hash for a turn, and bank,
 //!   document id and content hash for a document. A conflicting ingest does
@@ -16,7 +16,7 @@
 //!   has been swept or erased, because the hash is the tombstone.
 //! - **The turn that asks to forget** is stored as a tombstone only: its key
 //!   and nothing else. It's never chunked or queued, and its recall row is
-//!   deleted (ADR 0010).
+//!   deleted, so extraction can't recreate what it asks to forget.
 //! - **Speakers** are resolved by `<platform>:<id>`
 //!   through `speaker_ids`, never through aliases. The owner's platform ids
 //!   map to the seeded `user`, a turn with no author is the owner's, and
@@ -73,7 +73,7 @@ pub struct Turn {
     pub platform: Option<String>,
     /// The `recall_id` the plugin echoes from `prefetch`.
     pub recall_id: Option<String>,
-    /// The turn called `memory_forget` (ADR 0010).
+    /// The turn called `memory_forget`.
     #[serde(default)]
     pub forget_requested: bool,
 }
@@ -145,7 +145,7 @@ impl Ingested {
 }
 
 /// Why an ingest was refused. Nothing is stored when it is, and no variant
-/// carries content (ADR 0010).
+/// carries content.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     #[error("unknown bank")]
@@ -176,8 +176,8 @@ pub const TURN_SEPARATOR: &str = "\n\n";
 /// `in_context` is the session's in-context set as this turn's sync leaves
 /// it, the memories the agent could see when it wrote the reply. It's
 /// stored with the turn in the same transaction, and extraction judges the
-/// turn's `used` verdicts against it alone (ADR 0001). A
-/// duplicate or a tombstone stores none.
+/// turn's `used` verdicts against it alone. A duplicate or a tombstone
+/// stores none.
 ///
 /// `entries` are the mental model entries of the block the session holds.
 /// Those whose cited memories are all in `in_context` are stored with it,
@@ -223,7 +223,7 @@ pub fn ingest_turn(
         ),
     );
     if turn.forget_requested {
-        // ADR 0010: only the key, from the start. No text, no provenance
+        // Only the key, from the start. No text, no provenance
         // beyond the key, nothing to extract.
         tx.execute(
             "INSERT INTO sources (uuid, bank_id, kind, session_id, message_at, content_hash,
@@ -459,7 +459,7 @@ pub fn ingest_document(
     })
 }
 
-/// Links the `forget` audit rows a request turn answers (ADR 0010): those
+/// Links the `forget` audit rows a request turn answers: those
 /// in its session, not yet linked, written after the session's previous
 /// turn. Order is by rowid, never by clock, so a forget and its turn at the
 /// same instant still pair, and a forget whose request turn never arrived
@@ -535,7 +535,7 @@ fn parse_uuid(text: &str) -> Uuid {
 }
 
 /// Advances the bank's turn counter and the start of bank time's latest
-/// full-speed window (ADR 0004). Documents don't count.
+/// full-speed window, the 24 hours after a turn. Documents don't count.
 fn count_turn(tx: &Transaction<'_>, bank_id: i64, message_at: i64) -> Result<(), IngestError> {
     tx.execute(
         "UPDATE banks SET turns = turns + 1,
@@ -707,7 +707,7 @@ fn seeded_user(tx: &Transaction<'_>, bank_id: i64) -> Result<Speaker, IngestErro
     })
 }
 
-/// Follows `merged_into` to the entity that survived any merges (ADR 0010).
+/// Follows `merged_into` to the entity that survived any merges.
 /// The walk is bounded, so a corrupt cycle can't hang ingest.
 fn surviving_entity(
     tx: &Transaction<'_>,

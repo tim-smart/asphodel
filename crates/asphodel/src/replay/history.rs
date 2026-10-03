@@ -262,9 +262,9 @@ fn mode_name(mode: ReplayMode) -> &'static str {
 }
 
 /// The LLM `live` and `fast` call on a miss, built as `serve` builds its
-/// own (ADR 0009): the scripted fake from `ASPHODEL_LLM_SCRIPT` for tests,
-/// else `[llm]` with the API key from the environment or the ChatGPT login
-/// under `--token-dir`. `None` when nothing is configured.
+/// own: the scripted fake from `ASPHODEL_LLM_SCRIPT` for tests, else `[llm]`
+/// with the API key from the environment or the ChatGPT login under
+/// `--token-dir`. `None` when nothing is configured.
 fn live_client(
     tuning: &Tuning,
     args: &ReplayArgs,

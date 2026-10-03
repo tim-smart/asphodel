@@ -1,4 +1,4 @@
--- Asphodel schema, version 10: re-embedding a bank (ADR 0010).
+-- Asphodel schema, version 10: re-embedding a bank.
 --
 -- `asphodel reembed --bank` is a daemon job. `reembeds` holds a bank's
 -- job: the model it embeds with and the last memory rowid it reached, so a

@@ -79,7 +79,7 @@ is what a restart did to them before. No action is needed.
 ## Schema version 7: where a mention was said
 
 Forget erases a memory's chain behind the chunks queued before it, and
-those chunks reconcile against the hidden memory (ADR 0010). A claim that
+those chunks reconcile against the hidden memory. A claim that
 only mentions or confirms the memory leaves an access, and before version
 7 an access recorded only its source, so the erase couldn't tell which part
 of the turn or document to redact. From version 7, `accesses.spans` holds
@@ -108,7 +108,7 @@ version gets no chunk row, so forget also masks each passage wherever it
 appears verbatim in the document's other versions, and a version ingested
 after the forget masks the recorded characters before its text is stored.
 
-What forget blocks is the same input, not the same words (ADR 0002). A
+What forget blocks is the same input, not the same words. A
 section a later version leaves unchanged is masked as above. A section the
 owner edits is new input: if it still contains the forgotten words, it's
 stored and extracted like any other new text, and can bring the memory
@@ -133,7 +133,7 @@ or document than the mention itself.
 
 ## Schema version 9: a sweep's counts survive its failure
 
-The nightly sweep writes one run row per bank, with counts only (ADR 0010).
+The nightly sweep writes one run row per bank, with counts only.
 Each purge and the source sweep commit on their own before the row is
 written, so before version 9 a sweep that failed after deleting something,
 and was run again, wrote a row that left out what the failed attempt

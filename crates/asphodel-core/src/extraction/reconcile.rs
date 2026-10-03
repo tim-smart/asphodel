@@ -1,18 +1,18 @@
 //! Reconciliation: finding each claim's nearest stored memories and
-//! turning call 2's labels into a plan for the commit (ADR 0005).
+//! turning call 2's labels into a plan for the commit.
 //!
 //! **Neighbours.** Each claim is searched two ways within its bank: vector
 //! search on its embedding and BM25 over memory content. The two ranked
 //! lists are fused by reciprocal rank and cut to [`NEIGHBOURS_PER_CLAIM`].
 //! A hit on a superseded memory shows the head of its chain instead, and a
 //! chain whose head is retracted shows nothing. Faded, ended and hidden
-//! memories are shown: a re-mention strengthens what's there (ADR 0008),
-//! and a chunk queued before a forget reconciles against the hidden memory
-//! so it's erased with it (ADR 0010). A claim that changes something or
-//! asks to be remembered is flagged: its vector hits aren't held to the
-//! floor, and the open tasks and current states linked to its entities come
-//! on top. The chunk shows at most [`NEIGHBOUR_CAP`] neighbours, each once,
-//! filled best rank first across claims.
+//! memories are shown: a re-mention strengthens what's there rather than
+//! starting a new memory, and a chunk queued before a forget reconciles
+//! against the hidden memory so it's erased with it. A claim that changes
+//! something or asks to be remembered is flagged: its vector hits aren't
+//! held to the floor, and the open tasks and current states linked to its
+//! entities come on top. The chunk shows at most [`NEIGHBOUR_CAP`]
+//! neighbours, each once, filled best rank first across claims.
 //!
 //! **When call 2 runs.** Only the vector floor for the embedding model
 //! decides: a claim whose vector search finds a neighbour at or above it,

@@ -3,10 +3,10 @@
 `asphodel replay` runs the service layer in-process as a discrete-event
 simulation on a simulated clock, so decay can be watched over years in
 seconds. This page is the contract for the scripted side of it: the scenario
-file, the command, the report and the probes. See also ADRs 0004 and 0008. Real-history
-replay (the `state.db` importer, cassettes, `fast` mode, `bench`, the
-A/B diff, the HTML page, and the labelling material and precision curve)
-builds on the same engine and is under "Real history" below.
+file, the command, the report and the probes. Real-history replay (the
+`state.db` importer, cassettes, `fast` mode, `bench`, the A/B diff, the HTML
+page, and the labelling material and precision curve) builds on the same
+engine and is under "Real history" below.
 
 ## Running a scenario
 
@@ -134,8 +134,9 @@ nothing can't hide in a scenario.
 
 ### Chatter
 
-A run of turns with nothing to extract, to keep the bank in conversation so
-bank time runs at full speed (ADR 0004):
+A run of turns with nothing to extract, to keep the bank in conversation.
+Bank time runs at full speed for 24 hours after each turn and at the quiet
+rate (`clock.quiet_rate`, 0.1) otherwise, so chatter keeps it at full speed:
 
 ```toml
 [[chatter]]
@@ -286,13 +287,12 @@ A probe naming a label no claim defines is refused before the run.
   they commit in the order they were claimed: a chunk whose latency ends
   first waits for those claimed before it. A commit that finds a memory or
   an edit since its search that it must reconcile against searches and
-  runs call 2 again at that instant (ADR 0005, "Amendment: reconciliation
-  is checked at commit"), and commits a latency later. A redo is charged
-  like any chunk: the served latency of the call 2 that answered it, or
-  the `--latency` constant when that's set, so a redo is never free. The
-  chunk keeps its lease and its place at the head of the order while the
-  events in between run, so probes and prefetches meanwhile see the store
-  without it, and the chunks claimed after it wait for it. When the
+  runs call 2 again at that instant, and commits a latency later. A redo is
+  charged like any chunk: the served latency of the call 2 that answered
+  it, or the `--latency` constant when that's set, so a redo is never free.
+  The chunk keeps its lease and its place at the head of the order while
+  the events in between run, so probes and prefetches meanwhile see the
+  store without it, and the chunks claimed after it wait for it. When the
   cassette has no recording of that call 2, as when a serial run showed
   call 2 other neighbours or ran none, it misses: `live` and `fast` answer
   it from the LLM and record it, and `replay` stops.
@@ -333,7 +333,7 @@ A probe naming a label no claim defines is refused before the run.
   no wall-clock time. Every sort that reaches ranking or the report breaks
   ties by id.
 - **The fake floors.** Group `ci` runs on the deterministic fake embedder
-  and reranker, which need floors (ADR 0009). The engine layers
+  and reranker, which need floors like any model. The engine layers
   `reconcile.embedding_floors."fake-embedder:v1" = 0.5` and
   `injection.reranker_floors."fake-reranker:v1" = 0.0` above the code
   defaults; a scenario's `[tuning]` can change them.
@@ -385,10 +385,10 @@ order, so two runs compare byte for byte.
 | Scenario | What it checks |
 |---|---|
 | `lifetimes` | The lifetimes table: one mention at each level fades at 15 days, 2 months, 9 months, 3 years and 12 years of bank time, within 5%. |
-| `purge-table` | ADR 0008: one trivial, minor or notable mention is purged at 9 months, 3 years and 12.5 years; trivial mentioned on 4 occasions, minor on 3, notable on 2 and anything major never is; a claim stated again after its memory was purged comes back as a new memory and the shadow table counts it. |
+| `purge-table` | One trivial, minor or notable mention is purged at 9 months, 3 years and 12.5 years; trivial mentioned on 4 occasions, minor on 3, notable on 2 and anything major never is; a claim stated again after its memory was purged comes back as a new memory and the shadow table counts it. |
 | `maya-to-mia` | Correcting Maya to Mia retracts Maya, makes Mia the head, hides Maya from recall, and Mia inherits Maya's accesses: she's still in recall 100 days on, where a fresh minor memory would have faded, and fades at the day the inherited log gives. |
 | `rescheduled-appointment` | A reschedule retracts the old slot, the agenda lists the new one and not the old, and the appointment is recently past once it has happened. |
-| `three-week-holiday` | ADR 0004: a trivial memory mentioned once is still in recall after a three-week gap, where world time would have faded it, and fades at the bank day the quiet rate gives. |
+| `three-week-holiday` | A trivial memory mentioned once is still in recall after a three-week gap, where world time would have faded it, and fades at the bank day the quiet rate gives. |
 | `extraction-latency` | Extraction latency is simulated: a turn's memories don't exist until its completion, and a bank's completions queue behind each other. Also the `--until` fixture. |
 
 The tolerance for the lifetimes and purge ranges is 5% of the closed-form
@@ -411,7 +411,7 @@ production already does. A hosted endpoint sees it.
 `docs/hermes-data-evaluation.md` is the step-by-step handoff for running
 this on Tim's history, with what to measure and how to report it.
 
-Errors hold no content (ADR 0010, "Logging"). A manifest, probes file,
+Errors hold no content (`docs/logging.md`). A manifest, probes file,
 corpus or cassette that doesn't parse is named with the line and column,
 never quoted; a probe whose regex doesn't compile is named by its id, not
 its pattern. The parser's own message, which can quote the input, is
@@ -469,7 +469,7 @@ The manifest is TOML: `timezone`, `bank` (default `main`), `assistant`,
 scenario's shape (`name`, `question`, `max_tokens`, `kinds`; see
 "Models" above). `state.db` holds no mental models, so these are the ones
 a corpus run creates in the bank before the first event, beside the
-"User profile" every bank is seeded with (ADR 0007). They share the
+"User profile" every bank is seeded with. They share the
 bank's mental model token budget with it, as `model create` does, so a
 run whose models don't fit is refused.
 

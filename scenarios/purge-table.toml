@@ -1,5 +1,5 @@
-# ADR 0008's purge table through the store, with δ = 1.0 and bank time at
-# world speed. One mention is purged at the first 04:00 sweep after
+# The purge table through the store, with δ = 1.0 and bank time at world
+# speed. One mention is purged at the first 04:00 sweep after
 # strength falls below τ − δ: e^((S·σ − τ + δ) / a) days after the mention,
 # which is 262.8 days for trivial, 1096.6 for minor and 4576 for notable.
 # The exists probes sit 5% before the crossing and the absent probes 5%

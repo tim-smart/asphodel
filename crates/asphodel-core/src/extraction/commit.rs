@@ -155,7 +155,7 @@ pub(super) fn commit(
         // it, with the bank's debounce ([`crate::mental_models::effects`]).
 
         // A new version of a forgotten memory joins a chain waiting to be
-        // erased (ADR 0010), so it's hidden from the moment it's committed.
+        // erased, so it's hidden from the moment it's committed.
         // An ending isn't a chain link, so what it creates stays.
         if edit != Edit::Ends {
             tx.execute(
@@ -385,7 +385,7 @@ fn insert_memory(
 /// Links a memory to its entities, keeping each link's surface form. A new
 /// surface form becomes an alias in a logged edit, so a mislink can be
 /// undone; a pronoun never does. A known entity merged into another since
-/// call 1 read its input is linked as the entity that survived (ADR 0010).
+/// call 1 read its input is linked as the entity that survived.
 fn link_entities(
     tx: &Transaction<'_>,
     store: &Store,

@@ -12,7 +12,7 @@
 //! ```
 //!
 //! Strength runs on bank time ([`BankTime`]); windows, phase, due dates and
-//! state confidence run on world time in the source's timezone (ADR 0004).
+//! state confidence run on world time in the source's timezone.
 
 mod bank_time;
 mod chain;
@@ -41,8 +41,9 @@ fn world_days(from: Timestamp, to: Timestamp) -> f64 {
     (to.as_microsecond() - from.as_microsecond()) as f64 / MICROS_PER_DAY
 }
 
-/// The four kinds of access (ADR 0001). The kind sets an access's weight in
-/// recent use; the lasting floor ignores it.
+/// The four kinds of access, the only things that strengthen a memory:
+/// being returned by a search, injected or viewed never does. The kind sets
+/// an access's weight in recent use; the lasting floor ignores it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccessKind {
     Created,
@@ -70,7 +71,8 @@ pub struct Access {
     pub at: Timestamp,
 }
 
-/// A validity window's close, which restarts recent use (ADR 0003).
+/// A validity window's close, which restarts recent use. The lasting floor
+/// still counts every access.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowClose {
     /// When the window closed: [`Window::closes_at`], so already the end of

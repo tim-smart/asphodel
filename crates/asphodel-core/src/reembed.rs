@@ -1,4 +1,4 @@
-//! Re-embedding a bank (ADR 0010, "Consequences").
+//! Re-embedding a bank.
 //!
 //! A bank records the embedding model it was created under, and is served
 //! with that model, not the daemon's, until a re-embed swaps it. So the daemon

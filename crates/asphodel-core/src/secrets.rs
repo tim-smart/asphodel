@@ -1,4 +1,4 @@
-//! The secret scan that runs before anything is stored (ADR 0002).
+//! The secret scan that runs before anything is stored.
 //!
 //! When a pattern matches, the matched span is redacted in
 //! place with a marker that names the pattern kind, the redacted text is
@@ -18,8 +18,8 @@ use regex::{Captures, Regex};
 use serde::Serialize;
 
 /// The kinds of secret the scan recognises. The name of each kind is what's
-/// recorded on the source and shown by `memory show` (ADR 0010), so renaming
-/// one is a migration.
+/// recorded on the source and shown by `memory show`, so renaming one is a
+/// migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretKind {

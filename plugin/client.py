@@ -27,7 +27,7 @@ class DaemonUnavailable(Exception):
 
 class DaemonError(Exception):
     """The daemon answered with a non-2xx status. ``message`` is the daemon's
-    ``error`` field, which names kinds and ids only (ADR 0010)."""
+    ``error`` field, which names kinds and ids only."""
 
     def __init__(self, status: int, message: str) -> None:
         super().__init__(f"daemon answered {status}: {message}")

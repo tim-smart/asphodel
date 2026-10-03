@@ -23,9 +23,9 @@
 //! 6. **Trim.** Over `max_tokens`, the lowest-ranked entries go, ranked by
 //!    the best score among each one's cited memories.
 //!
-//! The prompt and reply are never written to disk (ADR 0007). The
-//! retrieval writes one `refresh` row to the recall log, and nothing writes
-//! an access.
+//! The prompt and reply are never written to disk, so forget has nothing
+//! to scrub there. The retrieval writes one `refresh` row to the recall
+//! log, and nothing writes an access.
 
 use std::collections::{BTreeMap, BTreeSet};
 

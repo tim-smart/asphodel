@@ -1,4 +1,4 @@
-//! The configuration surface (ADR 0009).
+//! The configuration surface.
 //!
 //! Every setting sits in one of five places:
 //!

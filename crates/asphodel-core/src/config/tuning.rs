@@ -32,7 +32,8 @@ pub struct Tuning {
     pub llm: LlmTuning,
 }
 
-/// `[clock]`: bank time (ADR 0004).
+/// `[clock]`: bank time, the clock strength runs on. It runs at full speed
+/// for 24 hours after any turn in the bank and at `quiet_rate` otherwise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClockTuning {
@@ -47,7 +48,7 @@ impl Default for ClockTuning {
     }
 }
 
-/// `[purge]`: the deletion policy (ADR 0008).
+/// `[purge]`: the deletion policy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PurgeTuning {
@@ -189,7 +190,8 @@ impl Default for AgendaTuning {
     }
 }
 
-/// `[mental_models]` (ADR 0007).
+/// `[mental_models]`: the prompt block's budget, and when and on what
+/// refreshes run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MentalModelsTuning {

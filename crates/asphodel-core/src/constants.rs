@@ -1,10 +1,10 @@
-//! Settings fixed in code (ADR 0009).
+//! Settings fixed in code.
 //!
 //! Every constant the strength model was calibrated with lives here, apart
 //! from the quiet-time rate, which is [`Tuning`](crate::config::Tuning). None
 //! of these ever appears in a config struct: strength is never stored, so
 //! editing one changes every memory at once. Changing a value here is a code
-//! change and an ADR.
+//! change that reopens the strength model's calibration.
 //!
 //! Durations on bank time are in bank days, and durations on world time are
 //! in world days, matching the strength formula.
@@ -48,7 +48,7 @@ pub const N0: f64 = 18.0;
 pub const MIN_ACCESS_AGE_DAYS: f64 = 0.01;
 
 /// The floor spacing: accesses count as separate occasions only when they
-/// are at least this many world days apart (ADR 0003).
+/// are at least this many world days apart.
 pub const FLOOR_SPACING_DAYS: f64 = 3.0;
 
 /// The weight of a `created` access in recent use.
@@ -69,7 +69,7 @@ pub const WEIGHT_CONFIRMED: f64 = 2.0;
 pub const WEIGHT_WINDOW_CLOSE: f64 = 1.0;
 
 /// Bank time runs at full speed for this long after any turn in the bank,
-/// and at the tuned quiet-time rate otherwise (ADR 0004).
+/// and at the tuned quiet-time rate otherwise.
 pub const FULL_SPEED_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// World days after its window closes that a memory is recently past rather

@@ -39,7 +39,7 @@ pub fn load(path: &Path, group: Group) -> anyhow::Result<Vec<Probe>> {
             ));
         }
         // The regex error quotes the pattern, which is about Tim's
-        // memories, so only `trace` sees it (ADR 0010).
+        // memories, so only `trace` sees it.
         if let Err(error) = Regex::new(probe.check.memory()) {
             tracing::trace!(probe = %id, %error, "a probe's memory regex doesn't parse");
             errors.push(format!("probe {id}: its memory regex doesn't parse"));

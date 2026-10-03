@@ -1,9 +1,9 @@
 -- Asphodel schema, version 9: a sweep's counts survive its failure.
 --
--- A sweep run row holds counts only (ADR 0010). Each purge and the source sweep
--- commit in transactions of their own before the row is written, so a sweep
--- that failed after deleting something, and was run again, wrote a row that
--- left out what the failed attempt deleted. `sweep_progress` holds a bank's
+-- A sweep run row holds counts only. Each purge and the source sweep commit
+-- in transactions of their own before the row is written, so a sweep that
+-- failed after deleting something, and was run again, wrote a row that left
+-- out what the failed attempt deleted. `sweep_progress` holds a bank's
 -- counts while its sweep runs. Each deletion adds to it in its own transaction,
 -- and the last step writes the run row from it and deletes it, in one
 -- transaction. A sweep resumed after a failure or a restart carries on with the

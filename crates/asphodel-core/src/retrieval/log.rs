@@ -2,7 +2,7 @@
 //! the memories that came back, whether each was injected, the latency, the
 //! session and the bank's turn counter. It's for detecting `used`, for the
 //! replay harness and for "why did it bring that up?". Nothing here writes
-//! an access: being recalled never counts towards strength (ADR 0001).
+//! an access: being recalled never counts towards strength.
 
 use jiff::Timestamp;
 use rusqlite::Connection;

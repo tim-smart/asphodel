@@ -1,6 +1,6 @@
-//! The CLI's HTTP client of the daemon (ADR 0006, ADR 0010): every
-//! subcommand but `serve`, `models fetch`, `llm login` and `replay` goes
-//! through it, so nothing but the daemon opens the database.
+//! The CLI's HTTP client of the daemon: every subcommand but `serve`,
+//! `models fetch`, `llm login` and `replay` goes through it, so nothing but
+//! the daemon opens the database.
 //!
 //! `--url` takes `http://host:port` or `unix:/path`, the two forms `--listen`
 //! takes. There's no TLS: the daemon serves plain HTTP, on loopback or behind

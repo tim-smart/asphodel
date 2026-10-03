@@ -2,9 +2,8 @@
 --
 -- Every `*_at` column is an INTEGER of microseconds since the Unix epoch, in
 -- UTC, written from the service's Clock. No column defaults to SQLite's own
--- clock, so a replay on a simulated clock writes the same rows as production
--- (ADR 0004). Timezone-dependent rendering happens in code, from the source's
--- timezone.
+-- clock, so a replay on a simulated clock writes the same rows as production.
+-- Timezone-dependent rendering happens in code, from the source's timezone.
 --
 -- Rowids are AUTOINCREMENT so they are never reused: sqlite-vec keys vectors by
 -- rowid, and a reused id would attach an old vector to a new memory. The `uuid`
@@ -12,8 +11,8 @@
 -- across banks: every row that belongs to a bank carries its `bank_id`, and
 -- joins never leave it.
 
--- Daemon-wide facts: the stored deletion fingerprint (ADR 0009), the time
--- the last backup completed (ADR 0010).
+-- Daemon-wide facts: the stored deletion fingerprint, the time the last
+-- backup completed.
 CREATE TABLE store_meta (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,
@@ -22,7 +21,7 @@ CREATE TABLE store_meta (
 
 -- One row per schema migration this store has been through. The
 -- pre-migration copy keyed by `from_version` is deleted 7 days after
--- `completed_at` (ADR 0010).
+-- `completed_at`.
 CREATE TABLE migrations (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   from_version   INTEGER NOT NULL,
@@ -34,7 +33,8 @@ CREATE TABLE migrations (
 
 -- Banks: identity, timezone and the recorded model ids. `turns` is the per-bank
 -- monotonic turn counter and `last_turn_at` is where bank time's full-speed
--- window starts (ADR 0004).
+-- window starts: bank time runs at full speed for 24 hours after a turn and at
+-- `quiet_rate` otherwise.
 CREATE TABLE banks (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid            TEXT NOT NULL UNIQUE,
@@ -52,7 +52,7 @@ CREATE TABLE banks (
 
 -- Entities are first-class but there is no graph. `seeded` marks the `user` and
 -- `assistant` every bank starts with; they can only ever be merge targets. A
--- merge keeps the row and sets `merged_into` (ADR 0010).
+-- merge keeps the row and sets `merged_into`.
 CREATE TABLE entities (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid        TEXT NOT NULL UNIQUE,
@@ -100,12 +100,12 @@ CREATE TRIGGER entity_aliases_fts_update AFTER UPDATE OF alias ON entity_aliases
   INSERT INTO entity_aliases_fts (rowid, alias) VALUES (new.id, new.alias);
 END;
 
--- Sources are kept verbatim while a memory rests on them (ADR 0002, ADR
--- 0008). `text` is the user message or the document, `reply` the
--- assistant's reply of a turn; both are the clean turn, never Hermes'
--- `api_content`. The sweep sets them to NULL and `tombstoned_at`, keeping
--- the key so ingest stays idempotent. A turn that asked to forget is a
--- tombstone from the start (ADR 0010).
+-- Sources are kept verbatim while a memory rests on them, and otherwise for
+-- the 90-day source horizon after ingest. `text` is the user message or the
+-- document, `reply` the assistant's reply of a turn; both are the clean turn,
+-- never Hermes' `api_content`. The sweep sets them to NULL and
+-- `tombstoned_at`, keeping the key so ingest stays idempotent. A turn that
+-- asked to forget is a tombstone from the start.
 CREATE TABLE sources (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid                 TEXT NOT NULL UNIQUE,
@@ -144,9 +144,9 @@ CREATE INDEX sources_bank_session ON sources(bank_id, session_id) WHERE kind = '
 
 -- The chunk is the extraction unit. `content_hash` is fixed at ingest and never
 -- recomputed: it is the forget tombstone, not an integrity check.
--- `call1_output` is dropped when the chunk commits (ADR 0008). Offsets are into
--- the source text. A chunk whose extraction is pending or failed is never
--- swept.
+-- `call1_output` is dropped when the chunk commits, so the claim text doesn't
+-- outlive a purge or forget. Offsets are into the source text. A chunk whose
+-- extraction is pending or failed is never swept.
 CREATE TABLE chunks (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid              TEXT NOT NULL UNIQUE,
@@ -172,7 +172,7 @@ CREATE INDEX chunks_failed ON chunks(bank_id, failed_at) WHERE failed_at IS NOT 
 
 -- The extraction queue, in SQLite so nothing queued is lost on SIGTERM. Chunks
 -- run in `observed_at` order with turns ahead of document chunks; an erase job
--- waits behind the chunks queued before it (ADR 0010).
+-- waits behind the chunks queued before it.
 CREATE TABLE extraction_queue (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   bank_id     INTEGER NOT NULL REFERENCES banks(id),
@@ -191,11 +191,10 @@ CREATE INDEX extraction_queue_order ON extraction_queue(bank_id, priority, obser
 
 -- Memories. Content and kind never change: a different claim is a new memory.
 -- `significance` is the level extraction gave; `owner_significance` is the
--- owner's setting, which keep, unkeep and `memory significance` write (ADR
--- 0010). Strength is never stored. Times in the validity window are UTC
--- instants at the start of their unit, each with its precision. `hidden_at` is
--- set the moment forget is called, before the erase runs behind the queue (ADR
--- 0010).
+-- owner's setting, which keep, unkeep and `memory significance` write.
+-- Strength is never stored. Times in the validity window are UTC instants at
+-- the start of their unit, each with its precision. `hidden_at` is set the
+-- moment forget is called, before the erase runs behind the queue.
 CREATE TABLE memories (
   id                         INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid                       TEXT NOT NULL UNIQUE,
@@ -280,8 +279,8 @@ CREATE TABLE memory_entities (
 );
 CREATE INDEX memory_entities_entity ON memory_entities(entity_id);
 
--- The access log: append-only, and only the events that count towards strength
--- (ADR 0001). `at` is world time; `turn` is the bank's turn counter at the
+-- The access log: append-only, and only the events that count towards
+-- strength. `at` is world time; `turn` is the bank's turn counter at the
 -- time, kept for replay and the recall log. At most one access per memory per
 -- turn, keeping the strongest kind.
 CREATE TABLE accesses (
@@ -297,8 +296,8 @@ CREATE TABLE accesses (
 CREATE INDEX accesses_memory_at ON accesses(memory_id, at);
 
 -- The recall log: one row per recall, with what came back. It stores the query,
--- which is the user's message, so rows are swept at the 90-day horizon (ADR
--- 0008). Being recalled never counts as an access.
+-- which is the user's message, so rows are swept at the 90-day horizon. Being
+-- recalled never counts as an access.
 CREATE TABLE recalls (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid       TEXT NOT NULL UNIQUE,
@@ -325,7 +324,7 @@ CREATE TABLE recall_results (
 CREATE INDEX recall_results_memory ON recall_results(memory_id);
 
 -- The edit log: every metadata edit, merge, forget, purge, restore,
--- acknowledgement and bank deletion (ADR 0010). `details` is JSON of ids,
+-- acknowledgement and bank deletion. `details` is JSON of ids,
 -- times, spans and counts, never content. `bank_id` is NULL for daemon-wide
 -- rows such as `restored` and `bank_deleted`.
 CREATE TABLE edits (
@@ -343,8 +342,8 @@ CREATE INDEX edits_bank_kind ON edits(bank_id, kind);
 CREATE INDEX edits_memory ON edits(memory_id) WHERE memory_id IS NOT NULL;
 CREATE INDEX edits_entity ON edits(entity_id) WHERE entity_id IS NOT NULL;
 
--- Mental models (ADR 0007): a question, filters, a token budget, and entries
--- that each cite the memories they rest on. The `inject` flag is gone: every
+-- Mental models: a question, filters, a token budget, and entries that each
+-- cite the memories they rest on. The `inject` flag is gone: every
 -- enabled model is injected.
 CREATE TABLE mental_models (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -401,7 +400,7 @@ CREATE TABLE session_blocks (
 );
 
 -- One row per bank per nightly sweep, counts only, with the fingerprint and
--- δ it ran under (ADR 0010). `delta` NULL means never purge.
+-- δ it ran under. `delta` NULL means never purge.
 CREATE TABLE sweep_runs (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   bank_id             INTEGER NOT NULL REFERENCES banks(id),

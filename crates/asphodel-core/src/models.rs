@@ -148,9 +148,9 @@ impl std::fmt::Debug for Models {
     }
 }
 
-/// The embedder a bank whose recorded model is `recorded` is served with
-/// (ADR 0010): that model when it's the daemon's own or one of the
-/// `previous` models it carries during a change. `None` when the daemon
+/// The embedder a bank whose recorded model is `recorded` is served with:
+/// that model when it's the daemon's own or one of the `previous` models
+/// it carries during a change. `None` when the daemon
 /// doesn't carry it: another model's vectors aren't comparable with the
 /// bank's, so the bank is refused until a re-embed moves it.
 pub(crate) fn serving<'a>(

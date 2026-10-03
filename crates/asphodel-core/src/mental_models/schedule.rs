@@ -1,4 +1,4 @@
-//! When refreshes run (ADR 0007).
+//! When refreshes run.
 //!
 //! - A triggering write marks the models it concerns with
 //!   `refresh_requested_at`, kept from the first trigger since their last

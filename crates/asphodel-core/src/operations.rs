@@ -1,4 +1,4 @@
-//! Backup, restore, status and the audit lists (ADR 0010).
+//! Backup, restore, status and the audit lists.
 //!
 //! - **Backup** takes SQLite's online backup into a temporary file in the
 //!   data dir, writes the backup time into the copy, checks it with
@@ -8,7 +8,8 @@
 //!   integrity and that its schema version isn't newer than the binary's,
 //!   moves the current database and its WAL aside, and copies the backup in
 //!   with a daemon-wide `restored` edit row. A deletion fingerprint that
-//!   differs from the binary's pauses purge at the next start (ADR 0009).
+//!   differs from the binary's pauses purge at the next start, until an
+//!   operator acknowledges it.
 //! - **Status** gathers what an operator alerts on, and says what needs
 //!   attention. A store with no backup yet doesn't: Asphodel has no backup
 //!   schedule of its own.
@@ -100,7 +101,7 @@ impl From<std::io::Error> for BackupError {
 }
 
 /// Takes the online backup of `store` into a temporary file in its data
-/// dir and checks it (ADR 0010).
+/// dir and checks it.
 pub(crate) fn take_backup(store: &Store) -> Result<Backup, BackupError> {
     let dir = store.dir();
     let (path, file) =
@@ -448,7 +449,7 @@ fn io(context: String) -> impl Fn(std::io::Error) -> StoreError {
     }
 }
 
-/// What `GET /v1/status` and `asphodel status` report (ADR 0010).
+/// What `GET /v1/status` and `asphodel status` report.
 #[derive(Debug, Clone, Serialize)]
 pub struct Status {
     pub version: &'static str,

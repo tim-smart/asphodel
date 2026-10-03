@@ -36,8 +36,8 @@ impl Embedder for FakeEmbedder {
 
 /// A second deterministic embedder with its own id, which hashes words
 /// into other buckets: a stand-in for a changed embedding model, so a
-/// re-embed can be driven on fakes (ADR 0010). `ASPHODEL_MODELS=fake-v2`
-/// serves with it and carries [`FakeEmbedder`] for banks recorded under it.
+/// re-embed can be driven on fakes. `ASPHODEL_MODELS=fake-v2` serves with
+/// it and carries [`FakeEmbedder`] for banks recorded under it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FakeEmbedderV2;
 

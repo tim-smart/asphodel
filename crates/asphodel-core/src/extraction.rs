@@ -19,14 +19,14 @@
 //! 4. **Reconciliation.** Code finds each claim's nearest stored memories,
 //!    and when one clears the floor or a claim signals a change, call 2
 //!    ([`call2_request`]) labels the claims against them
-//!    ([`reconcile`](self::reconcile), ADR 0005). Call 1's reply is
-//!    saved on the chunk first, so a failed call 2 is retried from it.
+//!    ([`reconcile`](self::reconcile)). Call 1's reply is saved on the
+//!    chunk first, so a failed call 2 is retried from it.
 //! 5. **Commit.** One transaction writes the new memories and their
 //!    vectors, entity links, new entities and aliases as logged edits, the
 //!    neighbours ended, retracted or refined and their logged edits, the
 //!    `created`, `mentioned_again`, `confirmed` and `used` accesses, and
-//!    marks the chunk extracted, dropping call 1's saved reply (ADR 0001,
-//!    ADR 0008).
+//!    marks the chunk extracted, dropping call 1's saved reply so no claim
+//!    text outlives a purge or forget.
 //!
 //! A failure anywhere before the commit writes nothing but the queue's
 //! count of the failed attempt and call 1's saved reply, so the chunk is
@@ -40,7 +40,7 @@
 //! call 2 was shown, or any new memory when a claim is flagged. A chunk
 //! that missed something is [`Committed::Stale`]: it searches and runs
 //! call 2 again from the same call 1, which isn't counted against it, so a
-//! repeat is still an access on the memory it repeats (ADR 0005).
+//! repeat is still an access on the memory it repeats.
 
 mod call2;
 mod claims;
@@ -392,7 +392,7 @@ pub enum DropReason {
 }
 
 /// Why an extraction didn't commit. No variant carries the prompt, the reply
-/// or a claim (ADR 0010).
+/// or a claim, since content is only ever logged at `trace`.
 ///
 /// The chunk's `last_error_kind` names the cause: `llm_transport`,
 /// `llm_timeout`, `llm_status` (with the status), `llm_no_content`,
@@ -450,9 +450,9 @@ pub enum ExtractError {
     NoModels,
 
     /// The bank's recorded embedding model isn't loaded, so its claims
-    /// can't be compared with its memories or given vectors that fit them
-    /// (ADR 0010). Nothing is counted: the queue holds until a re-embed
-    /// moves the bank to the daemon's model.
+    /// can't be compared with its memories or given vectors that fit them.
+    /// Nothing is counted: the queue holds until a re-embed moves the bank
+    /// to the daemon's model.
     #[error(
         "the bank records embedding model {model}, which this daemon doesn't carry; run `asphodel reembed --bank` to move it"
     )]
@@ -1038,8 +1038,8 @@ fn vanished(
 }
 
 /// The reconcile floor for the embedder's exact model. The service refuses
-/// to open without one (ADR 0009), so a missing floor never runs call 2 on
-/// similarity alone.
+/// to open without one, so a missing floor never runs call 2 on similarity
+/// alone.
 fn floor(tuning: &Tuning, embedder: &dyn Embedder) -> f64 {
     tuning
         .reconcile
@@ -1077,7 +1077,8 @@ fn embed(
 }
 
 /// Saves call 1's reply on the chunk before call 2 runs, with the handles
-/// it was given, so a retry resumes from it. The commit drops it (ADR 0008).
+/// it was given, so a retry resumes from it. The commit drops it, so no
+/// claim text outlives a purge or forget.
 fn save(store: &Store, lease: &Lease, reply: &Value, unit: &input::Unit) -> Result<(), StoreError> {
     let saved = json!({
         "reply": reply,

@@ -2,11 +2,11 @@
 //! `bank`, `chunks`, `recall`, `forget`, `keep`, `unkeep`, `memory`, `entity`,
 //! `model`, `reembed`, `purge`, `backup`, `status` and the audit lists are HTTP
 //! clients of it ([`crate::client`]); `models fetch` and `llm login` work on
-//! files, and `restore` works on the data dir offline (ADR 0010). `replay` runs
-//! scripted scenarios and real-history corpora, `import` writes those corpora,
-//! `report diff` compares runs, `report html` renders one, `report precision`
-//! turns labelled material into a precision curve, and `bench` drives a daemon
-//! on a copy of a replayed store.
+//! files, and `restore` works on the data dir offline. `replay` runs scripted
+//! scenarios and real-history corpora, `import` writes those corpora, `report
+//! diff` compares runs, `report html` renders one, `report precision` turns
+//! labelled material into a precision curve, and `bench` drives a daemon on a
+//! copy of a replayed store.
 
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -162,10 +162,10 @@ pub struct ClientArgs {
     pub token: Option<String>,
 }
 
-/// Deployment flags (ADR 0009). Each has an `ASPHODEL_*` environment
-/// variable, and a flag wins over its variable. The secrets, `ASPHODEL_TOKEN`
-/// and `ASPHODEL_LLM_API_KEY`, have no flag: they come from the environment
-/// only, so they never show up in a process list.
+/// Deployment flags. Each has an `ASPHODEL_*` environment variable, and a
+/// flag wins over its variable. The secrets, `ASPHODEL_TOKEN` and
+/// `ASPHODEL_LLM_API_KEY`, have no flag: they come from the environment only,
+/// so they never show up in a process list.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
     /// Address to listen on: `host:port`, or `unix:/path` for a socket.
@@ -369,8 +369,7 @@ pub struct IdsArgs {
 }
 
 /// `asphodel purge`: purge and the sweep pause when the settings that
-/// decide deletion change, until an operator acknowledges them (ADR 0009,
-/// ADR 0010).
+/// decide deletion change, until an operator acknowledges them.
 #[derive(Debug, Subcommand)]
 pub enum PurgeCommand {
     /// Show which settings changed and what the sweep would delete now. It
@@ -392,8 +391,8 @@ pub enum PurgeCommand {
     },
 }
 
-/// `asphodel backup` (ADR 0010). Asphodel has no destination, schedule or
-/// retention of its own: a timer pipes `--out -` wherever it should go.
+/// `asphodel backup`. Asphodel has no destination, schedule or retention of
+/// its own: a timer pipes `--out -` wherever it should go.
 #[derive(Debug, Args)]
 pub struct BackupArgs {
     #[command(flatten)]
@@ -406,7 +405,7 @@ pub struct BackupArgs {
     pub out: PathBuf,
 }
 
-/// `asphodel restore` (ADR 0010): offline, under the data-dir lock.
+/// `asphodel restore`: offline, under the data-dir lock.
 #[derive(Debug, Args)]
 pub struct RestoreArgs {
     /// The backup to restore.
@@ -480,8 +479,8 @@ pub struct ModelShowArgs {
     pub entry: Option<String>,
 }
 
-/// `asphodel memory` (ADR 0010): a memory's metadata can be edited, never
-/// its sentence, kind or window.
+/// `asphodel memory`: a memory's metadata can be edited, never its sentence,
+/// kind or window.
 #[derive(Debug, Subcommand)]
 pub enum MemoryCommand {
     /// Show a memory: both significance fields, its passage or why it's
@@ -511,7 +510,7 @@ pub enum MemoryCommand {
     },
 }
 
-/// `asphodel entity` (ADR 0010). An entity is named by its id, `user`,
+/// `asphodel entity`. An entity is named by its id, `user`,
 /// `assistant`, or a name or alias only one entity of the bank has.
 #[derive(Debug, Subcommand)]
 pub enum EntityCommand {

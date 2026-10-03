@@ -1,4 +1,4 @@
-# A one-off restore (ADR 0010, docs/operations.md "Restore"). Restore is
+# A one-off restore (docs/operations.md, "Restore"). Restore is
 # offline and takes the data-dir lock without waiting, so the old pod must be
 # gone, not just scaled away, before this one starts.
 #

@@ -3,7 +3,7 @@
 //! Keeping a memory sets its `owner_significance` to `kept`, as high as
 //! significance goes, so it never fades. Unkeeping hands it back to the
 //! significance extraction gave it. Both take memory ids only, never text,
-//! and write the same field `memory significance` will (ADR 0010).
+//! and write the same field `memory significance` will.
 //! Each change is a logged edit with ids and levels, never content.
 //!
 //! An id that isn't a memory of the bank, or names one that's been
@@ -25,7 +25,7 @@ pub const MAX_IDS: usize = 50;
 /// The edit kind unkeep writes.
 pub const EDIT_UNKEPT: &str = "memory_unkept";
 
-/// The edit kind `memory significance` writes (ADR 0010).
+/// The edit kind `memory significance` writes.
 pub const EDIT_SIGNIFICANCE_SET: &str = "owner_significance_set";
 
 /// The levels `memory significance` takes: extraction's five and `kept`.

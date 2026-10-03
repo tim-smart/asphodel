@@ -1,4 +1,4 @@
-# A nightly backup (ADR 0010). Asphodel has no destination, schedule or
+# A nightly backup. Asphodel has no destination, schedule or
 # retention of its own, so this job owns all three.
 #
 # The image has no shell, so the copy is taken in two steps: the init

@@ -20,10 +20,10 @@
 //! memory as a neighbour, as when one worker ran them in turn.
 //!
 //! Only `chunk` jobs are handed out here. The `erase` jobs that wait behind
-//! them belong to the erase path (ADR 0010), and are a barrier: no chunk
-//! queued after a pending erase is handed out until the erase has run, so
-//! no chunk reconciles against a memory being forgotten unless it was
-//! queued before the forget.
+//! them belong to the erase path, and are a barrier: no chunk queued after
+//! a pending erase is handed out until the erase has run, so no chunk
+//! reconciles against a memory being forgotten unless it was queued before
+//! the forget.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -98,8 +98,8 @@ impl Leases {
     /// Takes the bank without a chunk, waiting up to `wait` for every
     /// lease it has out to finish, so no extraction runs on the bank until
     /// the hold drops. Nothing more is handed out while it waits. A
-    /// re-embed's swap and a bank deletion hold it (ADR 0010). `None` when
-    /// the wait ran out.
+    /// re-embed's swap and a bank deletion hold it. `None` when the wait
+    /// ran out.
     pub(crate) fn hold(&self, bank_id: i64, wait: Duration) -> Option<BankHold> {
         let deadline = Instant::now() + wait;
         let mut state = self.lock();
@@ -243,8 +243,8 @@ impl Drop for Lease {
     }
 }
 
-/// Why an attempt failed: the error kind and HTTP status, never the response
-/// (ADR 0010). `kind` is static so it can't carry content.
+/// Why an attempt failed: the error kind and HTTP status, never the
+/// response. `kind` is static so it can't carry content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ChunkError {
     pub kind: &'static str,
@@ -395,8 +395,9 @@ pub(crate) fn check_held(leases: &Leases, lease: &Lease) -> Result<(), QueueErro
     }
 }
 
-/// Marks the chunk extracted, drops call 1's saved output (ADR 0008) and
-/// takes it off the queue. The lease is released when it drops.
+/// Marks the chunk extracted, drops call 1's saved output so no claim text
+/// outlives a purge or forget, and takes it off the queue. The lease is
+/// released when it drops.
 pub(crate) fn complete(store: &Store, leases: &Leases, lease: Lease) -> Result<(), QueueError> {
     check_held(leases, &lease)?;
     let mut conn = store.connection();

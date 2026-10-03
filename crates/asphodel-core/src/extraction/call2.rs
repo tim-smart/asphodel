@@ -3,7 +3,8 @@
 //! The system prompt is the same for every chunk, so a provider can cache
 //! it; everything about the chunk goes in the user prompt.
 //! The prompt never asks which of a claim and a neighbour is newer: code
-//! decides direction from `observed_at` (ADR 0005).
+//! decides direction from `observed_at`, so an old document can't
+//! overrule a newer memory.
 
 use std::fmt::Write as _;
 
