@@ -37,6 +37,36 @@ fn simulation(report: &Value) -> Value {
 
 // Recording modes.
 
+#[test]
+fn live_report_hashes_the_completed_cassette() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let script = live_script(&dir);
+    let aggregate = dir.path("aggregate.json");
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "live",
+        PASSING_PROBES,
+        "live",
+        Some(&script),
+        &["--aggregate", aggregate.to_str().unwrap()],
+    );
+    assert_ok(&run.output);
+    let cassette = fs::read(dir.private_path("cassettes/main.jsonl")).unwrap();
+    assert!(!cassette.is_empty(), "the live run must record calls");
+    let expected = format!("{:x}", Sha256::digest(&cassette));
+    let report = run.report();
+    let aggregate: Value = serde_json::from_slice(&fs::read(aggregate).unwrap()).unwrap();
+    assert_eq!(
+        (&report["cassette_hash"], &aggregate["cassette_hash"]),
+        (
+            &serde_json::json!(expected),
+            &serde_json::json!(Sha256::digest(&cassette).to_vec())
+        )
+    );
+}
+
 /// `live` calls the LLM and records; `replay` of that cassette needs no
 /// LLM and simulates the same run.
 #[test]

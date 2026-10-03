@@ -135,7 +135,7 @@ fn execute(args: &BenchArgs) -> anyhow::Result<PathBuf> {
     let requests = args.requests.map_or(DEFAULT_REQUESTS, NonZeroUsize::get);
 
     let copy = copy_store(&dir, &store)?;
-    let result = daemon_config(&copy).and_then(|config| {
+    let result = daemon_config(&copy, args.config.as_deref()).and_then(|config| {
         measure(
             &copy,
             config,
@@ -190,17 +190,19 @@ fn copy_store(dir: &Path, store: &Path) -> anyhow::Result<PathBuf> {
 
 /// The daemon's tuning, resolved the way the replay resolved its own:
 /// the code defaults, the fake floors when `ASPHODEL_MODELS=fake`, then
-/// `ASPHODEL_CONFIG`; written under the copy so `serve` reads one file.
-fn daemon_config(copy: &Path) -> anyhow::Result<PathBuf> {
+/// `--config` (or `ASPHODEL_CONFIG`); written under the copy so `serve` reads one file.
+fn daemon_config(copy: &Path, config: Option<&Path>) -> anyhow::Result<PathBuf> {
     let fake = replay::fake_models_requested()?;
     let mut layers: Vec<(String, String)> = Vec::new();
     if fake {
         layers.push(("the fake floors".into(), replay::fake_floors()));
     }
-    if let Some(path) = std::env::var_os("ASPHODEL_CONFIG") {
-        let path = PathBuf::from(path);
+    if let Some(path) = config
+        .map(Path::to_owned)
+        .or_else(|| std::env::var_os("ASPHODEL_CONFIG").map(PathBuf::from))
+    {
         let text = fs::read_to_string(&path)
-            .with_context(|| format!("reading ASPHODEL_CONFIG {}", path.display()))?;
+            .with_context(|| format!("reading the bench config {}", path.display()))?;
         layers.push((path.display().to_string(), text));
     }
     let layers: Vec<Layer<'_>> = layers
@@ -267,9 +269,11 @@ fn measure(
     match daemon.join() {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            if result.is_ok() {
-                return Err(error.context("the bench daemon failed"));
-            }
+            let context = match &result {
+                Ok(_) => "the bench daemon failed".to_owned(),
+                Err(measure_error) => format!("the bench daemon failed: {measure_error:#}"),
+            };
+            return Err(error.context(context));
         }
         Err(_) => bail!("the bench daemon panicked"),
     }

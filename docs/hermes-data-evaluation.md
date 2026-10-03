@@ -41,13 +41,13 @@ are not yours:
 
 ```sh
 git clone https://github.com/tim-smart/asphodel.git && cd asphodel
-git checkout asphodel-v1
+git checkout main
 nix build                        # ./result/bin/asphodel, ORT wired by the wrapper
 nix build .#models -o models     # both ONNX models, 72 MB, fixed-output fetch
 export ASPHODEL_MODEL_DIR=$PWD/models
 export ASPHODEL_REPLAY_DIR=$HOME/asphodel-private   # outside any git tree, outside ~/multica_workspaces
 mkdir -p "$ASPHODEL_REPLAY_DIR"
-export PATH="$PWD/result/bin:$PATH"   # not an alias: `/usr/bin/time -v` and scripts need the real executable
+export PATH="$PWD/result/bin:$PATH"   # not an alias: the timing wrapper and scripts need the real executable
 asphodel --version
 ```
 
@@ -62,17 +62,26 @@ asphodel replay --scenario scenarios/lifetimes.toml   # a scripted run into the 
 ## 1. A read-only copy of Hermes' `state.db`
 
 No Asphodel command does this. Use SQLite's online backup from inside the
-Hermes container; it only reads the live file. Adjust pod and container
-names.
+Hermes container; it only reads the live file. The cluster runs a Deployment
+in namespace `hermes`, not a StatefulSet. Adjust the Deployment and
+container names if needed. Select a running pod once and keep using it for
+the backup, copy and cleanup.
 
 ```sh
-kubectl exec hermes-0 -c hermes -- python3 -c '
+SELECTOR=$(kubectl get deployment/hermes -n hermes -o go-template='{{range $key, $value := .spec.selector.matchLabels}}{{$key}}={{$value}},{{end}}')
+SELECTOR=${SELECTOR%,}
+test -n "$SELECTOR" || exit 1
+HERMES_POD=$(kubectl get pods -n hermes -l "$SELECTOR" --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}')
+test -n "$HERMES_POD" || exit 1
+kubectl wait -n hermes --for=condition=Ready "pod/$HERMES_POD" --timeout=60s
+kubectl exec -n hermes "$HERMES_POD" -c hermes -- python3 -c '
 import sqlite3, os
 src = sqlite3.connect(os.path.join(os.environ["HERMES_HOME"], "state.db"))
 dst = sqlite3.connect("/tmp/state-copy.db")
 src.backup(dst); dst.close(); src.close()'
-kubectl cp -c hermes hermes-0:/tmp/state-copy.db "$ASPHODEL_REPLAY_DIR/state.db"
-kubectl exec hermes-0 -c hermes -- rm /tmp/state-copy.db
+kubectl cp -n hermes -c hermes "$HERMES_POD:/tmp/state-copy.db" "$ASPHODEL_REPLAY_DIR/state.db"
+kubectl exec -n hermes "$HERMES_POD" -c hermes -- rm /tmp/state-copy.db
 ```
 
 ## 2. Manifest and import
@@ -137,8 +146,30 @@ else.
 
 ## 4. The recording run
 
+On Linux, including NixOS, resolve GNU time from the nixpkgs input pinned
+by this checkout's `flake.lock`. Run this from the repository root, before
+measuring, so downloading or building time is not included in the result:
+
 ```sh
-/usr/bin/time -v asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode live \
+GNU_TIME="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#time)/bin/time"
+```
+
+The command below uses `"$GNU_TIME" -v`. On macOS, replace that prefix
+with `/usr/bin/time -l`; it reports maximum resident set size in bytes
+rather than GNU time's KiB. Both send timing output to `live.log`. Use the
+same platform-specific prefix for later measurements. To check timing
+without private data or live calls, run the scripted scenario first:
+
+```sh
+"$GNU_TIME" -v asphodel replay --scenario scenarios/lifetimes.toml
+```
+
+GNU time prints `Elapsed (wall clock) time` and `Maximum resident set size
+(kbytes)` to stderr. The macOS form prints `real` and `maximum resident
+set size`. Only start the live run below after the endpoint/model approval.
+
+```sh
+"$GNU_TIME" -v asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode live \
     --config "$ASPHODEL_REPLAY_DIR/replay.toml" \
     --labelling "$ASPHODEL_REPLAY_DIR/labelling.json" \
     --aggregate "$ASPHODEL_REPLAY_DIR/aggregate-live.json" \
@@ -317,7 +348,7 @@ refused.
 ## 7. Bench
 
 ```sh
-asphodel bench --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" \
+asphodel bench --config "$ASPHODEL_REPLAY_DIR/replay.toml" --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" \
     --concurrency 1 --concurrency 4 --concurrency 16 --requests 64 \
     --report "$ASPHODEL_REPLAY_DIR/reports/bench.json"
 ```
@@ -436,7 +467,8 @@ so rather than improvise.
   level and the fraction the reranker answered within its deadline; replay
   `extraction_lag` p50/p95 in simulated time; `llm.latency_ms` percentiles
   from the live run.
-- Manual: wall time of each replay run (`/usr/bin/time -v`, "Elapsed"), and
+- Manual: wall time of each replay run (step 4's GNU time prefix, "Elapsed",
+  or macOS `/usr/bin/time -l`, "real"), and
   cassette size on disk.
 - Manual, if a real daemon is reachable: `curl -s -o /dev/null -w
   '%{time_total}\n'` against `/v1/health`, which should be milliseconds. Do
@@ -445,10 +477,11 @@ so rather than improvise.
 
 ### Resource use
 
-- Not implemented in Asphodel. Measure manually: `/usr/bin/time -v`
-  "Maximum resident set size" for the replay and for `asphodel serve` on the
-  bench copy with both models loaded; `du -sh "$ASPHODEL_REPLAY_DIR/store"
-  "$ASPHODEL_REPLAY_DIR/cassettes"`; `kubectl top pod hermes-0 --containers`
+- Not implemented in Asphodel. Measure manually with step 4's GNU time
+  prefix or macOS `/usr/bin/time -l`: "Maximum resident set size" for the
+  replay and for `asphodel serve` on the bench copy with both models loaded;
+  `du -sh "$ASPHODEL_REPLAY_DIR/store"
+  "$ASPHODEL_REPLAY_DIR/cassettes"`; `kubectl top pod -n hermes "$HERMES_POD" --containers`
   if the real sidecar is running. The example deployment requests 512 MiB
   and limits 1 GiB; report whether the daemon's RSS fits with the models
   loaded.

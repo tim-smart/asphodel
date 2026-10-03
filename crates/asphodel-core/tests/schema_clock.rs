@@ -33,17 +33,18 @@ fn workspace_root() -> PathBuf {
         .unwrap()
 }
 
-/// Every `.rs` and `.sql` file under `dir`, skipping build output, the git
-/// dir and `tests/` directories (which hold this file).
+/// Every `.rs` and `.sql` file under `dir`, skipping build output, hidden
+/// directories and `tests/` directories (which hold this file).
 fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
         if path.is_dir() {
-            if matches!(
-                entry.file_name().to_str(),
-                Some("target" | ".git" | "tests")
-            ) {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with('.') || matches!(name, "target" | "tests"))
+            {
                 continue;
             }
             source_files(&path, out);
@@ -90,5 +91,29 @@ fn no_sql_reads_sqlites_clock() {
         hits.is_empty(),
         "SQL reads SQLite's clock; take the time from the Clock instead:\n{}",
         hits.join("\n")
+    );
+}
+
+#[test]
+fn source_scan_skips_dot_directories_but_keeps_visible_sources() {
+    let root = std::env::temp_dir().join(format!("asphodel-clock-scan-{}", std::process::id()));
+    fs::create_dir_all(root.join(".direnv/rust-src")).unwrap();
+    fs::create_dir_all(root.join(".other")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join(".direnv/rust-src/lib.rs"), "CURRENT_TIMESTAMP").unwrap();
+    fs::write(root.join(".other/schema.sql"), "CURRENT_TIMESTAMP").unwrap();
+    fs::write(root.join("src/lib.rs"), "").unwrap();
+    fs::write(root.join("src/schema.sql"), "").unwrap();
+    let mut files = Vec::new();
+    source_files(&root, &mut files);
+    let mut relative: Vec<_> = files
+        .iter()
+        .map(|path| path.strip_prefix(&root).unwrap().to_owned())
+        .collect();
+    relative.sort();
+    fs::remove_dir_all(&root).unwrap();
+    assert_eq!(
+        relative,
+        [PathBuf::from("src/lib.rs"), PathBuf::from("src/schema.sql")]
     );
 }
