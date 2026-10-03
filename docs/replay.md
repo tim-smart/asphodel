@@ -491,15 +491,17 @@ asphodel replay --corpus <file> --mode live|replay|fast \
 ```
 
 - **Modes**. Every LLM call is keyed by SHA-256 of
-  the model id, the template name and version, and the whole request.
+  the model id, the template (name, version and, for call 1, the hash of
+  any `[extraction] guidance`), and the whole request.
   `live` answers from the cassette and calls and records on a miss;
   `--no-cache` empties the cassette when the run opens it and records
   afresh, so a re-recording leaves one record per call, and the report's
   cassette hash is of the empty cassette it started from. `replay` answers from
   the cassette and fails on a miss, with exit 2 and no report. `fast`
-  reuses call 1's claims by chunk (source id and chunk position) and
-  `[llm] language`, so claims recorded in one language never answer a run
-  set to another, and `used` verdicts by (reply hash, sentence hash) pair, judges the pairs nobody has
+  reuses call 1's claims by chunk (source id and chunk position), template
+  version, guidance hash and `[llm] language`, so claims recorded under
+  another prompt or in another language never answer this run, and `used`
+  verdicts by (reply hash, sentence hash) pair, judges the pairs nobody has
   judged with one short `judge_used` call, and answers call 2 and refreshes
   by request key, calling the LLM on a miss when one is configured. The
   report counts every miss, so "fast with zero misses" is a number.
@@ -549,7 +551,9 @@ asphodel replay --corpus <file> --mode live|replay|fast \
 ### The report and the aggregate
 
 A real-history report has `kind` `live`, `replay` or `fast`, `group`
-`models` or `fake`, `corpus_hash` and `cassette_hash`, and beside the
+`models` or `fake`, `corpus_hash` and `cassette_hash`, `call1` with call
+1's template `version` and the `guidance_hash` of `[extraction] guidance`
+(null without it), and beside the
 scripted fields: `injected_tokens` (per session with a synced turn, the
 per-turn p50 and p95, and cron apart), `profile_tokens` (sampled daily),
 `call2_rate`, `agenda_lines_per_day`, `significance_histogram`,
@@ -560,8 +564,8 @@ of its cassette differ only in `kind`, `flags`, `llm` and `cassette_hash`.
 
 `--aggregate <file>` writes the one thing that may leave the private dir. Its type has no string field but a probe's id: the run's kind
 is a set of booleans, days are days since the epoch, weeks are two
-integers, and the hashes and the git SHA are byte arrays. It carries the
-probe results, the purge, fade and band series, the token, lag and call
+integers, and the hashes and the git SHA are byte arrays. It carries
+`call1` as the report has it, the probe results, the purge, fade and band series, the token, lag and call
 counts, and the histograms.
 
 `asphodel report diff A B [--force]` compares two reports: it refuses runs

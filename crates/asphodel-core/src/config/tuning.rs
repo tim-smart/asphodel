@@ -26,6 +26,7 @@ pub struct Tuning {
     pub recall: RecallTuning,
     pub injection: InjectionTuning,
     pub reconcile: ReconcileTuning,
+    pub extraction: ExtractionTuning,
     pub agenda: AgendaTuning,
     pub mental_models: MentalModelsTuning,
     pub sessions: SessionsTuning,
@@ -154,6 +155,17 @@ pub struct ReconcileTuning {
     /// The cosine floor that decides whether call 2 runs, keyed by the exact
     /// embedding model string, quantisation included.
     pub embedding_floors: BTreeMap<String, f64>,
+}
+
+/// `[extraction]`: what call 1 is told beyond its fixed rules.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExtractionTuning {
+    /// The owner's guidance on what's worth remembering, added after call
+    /// 1's fixed prompt, which it leaves as is. Its hash is part of call 1's
+    /// template, so replay's cassettes and reports are keyed to the exact
+    /// prompt. Unset sends the fixed prompt alone.
+    pub guidance: Option<String>,
 }
 
 /// `[agenda]`: the list in `system_prompt_block()` chosen by world time.
@@ -583,6 +595,11 @@ impl Tuning {
             && language.trim().is_empty()
         {
             fail("llm.language", "must not be empty".into());
+        }
+        if let Some(guidance) = &self.extraction.guidance
+            && guidance.trim().is_empty()
+        {
+            fail("extraction.guidance", "must not be empty".into());
         }
         if let Some(endpoint) = &self.llm.endpoint {
             // Keep the raw spelling: URL parsing silently repairs missing

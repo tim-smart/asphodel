@@ -891,6 +891,7 @@ fn a_refresh_held_by_the_gate_waits_for_the_hold_not_thirty_minutes(
         template: Template {
             name: "extract_claims".into(),
             version: 2,
+            guidance: None,
         },
         system: String::new(),
         user: String::new(),

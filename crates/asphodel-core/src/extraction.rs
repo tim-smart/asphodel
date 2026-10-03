@@ -83,6 +83,7 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config::Tuning;
@@ -97,7 +98,13 @@ pub use prompt::call1_request;
 
 /// Call 1's template name and version, which replay's cassette keys include.
 pub const CALL1_TEMPLATE: &str = "extract_claims";
-pub const CALL1_VERSION: u32 = 3;
+pub const CALL1_VERSION: u32 = 4;
+
+/// The hash call 1's template carries for `[extraction] guidance`:
+/// lower-case hex SHA-256 of the text as the prompt inserts it, trimmed.
+pub fn guidance_hash(guidance: Option<&str>) -> Option<String> {
+    guidance.map(|guidance| crate::chunking::hex(&Sha256::digest(guidance.trim().as_bytes())))
+}
 
 /// Call 2's template name and version, which replay's cassette keys include.
 pub const CALL2_TEMPLATE: &str = "reconcile_claims";
@@ -199,6 +206,9 @@ pub struct Call1Input {
     /// `[llm] language`: the language every claim is written in. `None`
     /// writes each in the language of the passage it quotes.
     pub language: Option<String>,
+    /// `[extraction] guidance`, added after the fixed rules. `None` sends
+    /// them alone.
+    pub guidance: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -133,6 +133,20 @@ the same for every chunk, so provider prompt caching still works. Call 2
 returns only handles and labels, so it has no rule. In replay, `fast` reuses
 call 1's claims only from a recording made with the same language.
 
+**What call 1 leaves out.** Call 1 doesn't extract that someone asked a
+question or made a request, or the assistant's routine operations and
+checks, such as running a command or verifying a fix, unless the text
+records a decision, a commitment, a date, or where something is stored. On
+real history these were nearly half of what it extracted, and few held
+anything lasting (`docs/operations.md`, "The tuning file").
+
+**Guidance.** `[extraction] guidance` is added, trimmed, after call 1's fixed
+system prompt under its own heading. The rules, the user prompt and the reply
+schema stay as they are. Call 1's template carries the SHA-256 of the text
+as inserted beside its version, so a cassette record, `fast`'s reuse of
+claims and a replay report are each tied to the exact prompt. Without
+guidance the template carries no hash.
+
 `ASPHODEL_LLM_SCRIPT=<file>` runs the daemon's extraction workers on a
 `FakeLlm` that plays the file's steps in order, one per call: a JSON array
 of `{"reply": <json>}` or `{"fail": "<kind>"}` steps, each with an optional
