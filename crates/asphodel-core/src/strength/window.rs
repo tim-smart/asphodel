@@ -110,11 +110,14 @@ impl Window {
     /// `overdue_days` × 24 h, with `overdue_days` from
     /// `Tuning::agenda.overdue_days`. The agenda lists an overdue task until
     /// then, and purge holds the task back until then, so the two share this
-    /// boundary and nothing on the agenda can be purged.
+    /// boundary and nothing on the agenda can be purged. A completed task
+    /// is held no later than the end of its closing unit.
     pub fn overdue_until(&self, tz: &TimeZone, overdue_days: u32) -> Option<Timestamp> {
         let days = SignedDuration::from_hours(24 * i64::from(overdue_days));
-        self.overdue_from(tz)
-            .map(|from| from.checked_add(days).unwrap_or(Timestamp::MAX))
+        self.overdue_from(tz).map(|from| {
+            let until = from.checked_add(days).unwrap_or(Timestamp::MAX);
+            self.closes_at(tz).map_or(until, |close| until.min(close))
+        })
     }
 
     /// Upcoming before the end of `valid_from`'s unit, past from

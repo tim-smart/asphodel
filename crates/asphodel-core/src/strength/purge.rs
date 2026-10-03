@@ -37,8 +37,8 @@ impl PurgeRule {
 /// - the head's `valid_from` or `valid_until` unit hasn't ended yet, so a
 ///   day-precision appointment is held until that day ends in the source's
 ///   timezone;
-/// - the head is a task before [`Window::overdue_until`]. This holds for a
-///   completed task too, where it's redundant but harmless.
+/// - the head is a task before [`Window::overdue_until`], capped at the
+///   end of its closing unit for a completed task.
 ///
 /// Recurring memories and undated open tasks have no guard.
 pub fn purge_eligible(
