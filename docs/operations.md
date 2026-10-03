@@ -95,7 +95,7 @@ Secrets have no flag, so they never show in a process list.
 
 ### The tuning file
 
-The tuning file is TOML, and every key in it is optional except two kinds:
+The tuning file is TOML, and every key in it is optional except three kinds:
 
 - `[llm] model`, the exact model string. The floors are calibrated against
   one model.
@@ -104,6 +104,14 @@ The tuning file is TOML, and every key in it is optional except two kinds:
   `injection.reranker_floors."jina-reranker-v1-turbo-en:int8"`. They're set
   in replay from labelled history (`docs/replay.md`, "Labelling and the
   precision curve"), and the daemon refuses to start without them.
+- A relevance scale for the reranker:
+  `ranking.relevance_scales."jina-reranker-v1-turbo-en:int8" = 1.0`. The
+  score divides the reranker's logit by it, so a reranker with a wider
+  logit range doesn't drown out strength, state confidence and phase,
+  whose weights were sized for jina. The gate floor still compares the raw
+  logit. The daemon refuses to start without one for the loaded reranker.
+  Like the floors, the relevance scale is keyed by the exact model string,
+  quantisation included, with no fallback.
 
 `[llm] concurrency` (default 1) is how many LLM calls may be in flight at
 once across the daemon, refreshes included, and how many chunks each bank
@@ -625,5 +633,6 @@ With that in place, a change goes like this:
 A bank already refused because the daemon dropped its model recovers the
 same way: `asphodel reembed --bank B` needs only the daemon's model.
 
-A reranker-only change needs only its new `injection.reranker_floors`
-entry. Reranker scores aren't stored, so there's nothing to re-embed.
+A reranker-only change needs only its new `injection.reranker_floors` and
+`ranking.relevance_scales` entries. Reranker scores aren't stored, so
+there's nothing to re-embed.

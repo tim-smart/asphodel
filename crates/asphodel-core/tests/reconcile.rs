@@ -145,6 +145,7 @@ impl Drop for TestDir {
 fn tuning_with_floor(floor: f64) -> Tuning {
     Tuning::from_toml(&format!(
         "[injection.reranker_floors]\n\"{}\" = 0.0\n\
+         [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
          [reconcile.embedding_floors]\n\"{}\" = {floor:?}\n",
         FakeReranker::MODEL_ID,
         FakeEmbedder::MODEL_ID,

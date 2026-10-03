@@ -70,6 +70,7 @@ impl Harness {
             Store::open(&dir.0.join("data"), OpenOptions::default(), clock.clone()).unwrap();
         let tuning = Tuning::from_toml(&format!(
             "[injection.reranker_floors]\n\"{}\" = 0.0\n\
+             [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
              [reconcile.embedding_floors]\n\"{}\" = 0.5\n",
             FakeReranker::MODEL_ID,
             FakeEmbedder::MODEL_ID,

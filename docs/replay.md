@@ -333,9 +333,10 @@ A probe naming a label no claim defines is refused before the run.
   no wall-clock time. Every sort that reaches ranking or the report breaks
   ties by id.
 - **The fake floors.** Group `ci` runs on the deterministic fake embedder
-  and reranker, which need floors like any model. The engine layers
-  `reconcile.embedding_floors."fake-embedder:v1" = 0.5` and
-  `injection.reranker_floors."fake-reranker:v1" = 0.0` above the code
+  and reranker, which need floors and a relevance scale like any model. The
+  engine layers `reconcile.embedding_floors."fake-embedder:v1" = 0.5`,
+  `injection.reranker_floors."fake-reranker:v1" = 0.0` and
+  `ranking.relevance_scales."fake-reranker:v1" = 1.0` above the code
   defaults; a scenario's `[tuning]` can change them.
 - **The shadow table.** Every purged chain's rows (content and embedding)
   are copied to a table in the replay store, never anywhere else. After
@@ -622,7 +623,8 @@ The material is one JSON object:
   (turn `i × n / 50` of `n`), so the same run always samples the same
   turns. Each lists the prefetch's reranked candidates in ranked order
   before the gate, including those the gate turned away, scored with the
-  reranker logit the gate floor compares. `query` is what the reranker
+  raw reranker logit the gate floor compares, not the logit divided by the
+  relevance scale. `query` is what the reranker
   scored against: the message without the Discord message-id note and the
   `[Name] ` speaker prefix, after a short follow-up borrowed the previous
   message. Calibration uses it. `raw_query` is the message as Hermes sent

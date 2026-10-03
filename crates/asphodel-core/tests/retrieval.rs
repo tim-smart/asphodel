@@ -241,12 +241,23 @@ impl Harness {
     }
 
     /// `injection` is extra keys for `[injection]`, and `rest` extra
-    /// sections.
+    /// sections. The relevance scale is 1.0.
     fn with(floor: f64, extra: &str, reranker: Arc<dyn Reranker>) -> Self {
+        Self::with_scaled(floor, 1.0, extra, reranker)
+    }
+
+    /// A gate floor of `floor` and a relevance scale of `scale` for the
+    /// fake reranker.
+    fn with_scale(floor: f64, scale: f64) -> Self {
+        Self::with_scaled(floor, scale, "", Arc::new(FakeReranker))
+    }
+
+    fn with_scaled(floor: f64, scale: f64, extra: &str, reranker: Arc<dyn Reranker>) -> Self {
         let (injection, rest) = extra.split_once("\n---\n").unwrap_or((extra, ""));
         let tuning = Tuning::from_toml(&format!(
             "[injection]\n{injection}\n\
              [injection.reranker_floors]\n\"{}\" = {floor:?}\n\
+             [ranking.relevance_scales]\n\"{0}\" = {scale:?}\n\
              [reconcile.embedding_floors]\n\"{}\" = 0.5\n{rest}",
             FakeReranker::MODEL_ID,
             FakeEmbedder::MODEL_ID,
@@ -555,6 +566,17 @@ impl Harness {
             .collect::<Result<_, _>>()
             .unwrap()
     }
+
+    /// The score a recall logged for `memory`.
+    fn score(&self, recall_id: Uuid, memory: Uuid) -> f64 {
+        self.one::<Option<f64>, _>(
+            "SELECT r.score FROM recall_results r
+             JOIN recalls c ON c.id = r.recall_id JOIN memories m ON m.id = r.memory_id
+             WHERE c.uuid = ?1 AND m.uuid = ?2",
+            [recall_id.to_string(), memory.to_string()],
+        )
+        .unwrap()
+    }
 }
 
 fn turn(session: &str, message_at: &str, user: &str, recall_id: Option<String>) -> Turn {
@@ -588,6 +610,49 @@ fn ids(recall: &Recall) -> Vec<Uuid> {
 }
 
 // Fusion
+
+#[test]
+fn relevance_is_the_logit_divided_by_the_relevance_scale() {
+    // At scale 1.0 relevance is the raw logit, so scores are what they
+    // were before the scale; any other scale divides it, in prefetch and
+    // in recall alike. Nothing else in the score depends on the scale.
+    let scores = |scale: f64| {
+        let h = Harness::with_scale(0.0, scale);
+        let pottery = h.insert(fact("Tim takes a pottery class."));
+        let prefetch = h.prefetch("s", "pottery class schedule");
+        let recall = h.recall(query("pottery class schedule"));
+        (
+            h.score(prefetch.recall_id, pottery),
+            h.score(recall.recall_id, pottery),
+        )
+    };
+    let (prefetch_raw, recall_raw) = scores(1.0);
+    let (prefetch_scaled, recall_scaled) = scores(4.0);
+    let tuning = Tuning::default();
+    let strength = asphodel_core::strength::strength(
+        asphodel_core::constants::Significance::Notable.value(),
+        &[asphodel_core::strength::Access {
+            kind: asphodel_core::strength::AccessKind::Created,
+            at: at(EARLIER),
+        }],
+        None,
+        &asphodel_core::strength::BankTime::new(&[at(EARLIER)], tuning.clock.quiet_rate),
+        at(START),
+    )
+    .value;
+    // A fact without volatility or a window has zero confidence/phase terms.
+    // Pin the original formula as well as the scale-dependent difference.
+    assert!((prefetch_raw - (1.5 + 0.5 * strength)).abs() < 1e-9);
+    assert!((recall_raw - (1.5 + 0.2 * strength)).abs() < 1e-9);
+    // Two shared words: a logit of 1.5, so relevance 1.5 and then 0.375.
+    let expected = 1.5 - 1.5 / 4.0;
+    for (raw, scaled) in [(prefetch_raw, prefetch_scaled), (recall_raw, recall_scaled)] {
+        assert!(
+            (raw - scaled - expected).abs() < 1e-9,
+            "{raw} - {scaled} isn't {expected}"
+        );
+    }
+}
 
 #[test]
 fn fusion_sums_reciprocal_ranks_with_k_60() {
@@ -962,6 +1027,96 @@ fn injected_memories_are_in_score_order() {
             "- A pottery note.",
         ]
     );
+}
+
+// The relevance scale
+
+#[test]
+fn the_floor_gates_on_the_raw_logit_whatever_the_relevance_scale() {
+    // At 4.0, a gate on relevance would stop the two-word memory
+    // (1.5 / 4 < 1.0), and at 0.25 it would pass the one-word one
+    // (0.5 / 0.25 >= 1.0).
+    for scale in [0.25, 4.0] {
+        let h = Harness::with_scale(1.0, scale);
+        let pottery = h.insert(fact("Tim takes a pottery class."));
+        let one_word = h.insert(fact("The class was cancelled."));
+        let scored = h
+            .service
+            .scored_prefetch(
+                BANK,
+                &PrefetchRequest {
+                    session_id: "s".into(),
+                    query: "pottery class schedule".into(),
+                    previous_query: None,
+                    block_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(scored.prefetch.injected, vec![pottery], "scale {scale}");
+        // The labelling material shows the raw logit too.
+        let logit = |memory: Uuid| {
+            scored
+                .candidates
+                .iter()
+                .find(|c| c.memory == memory)
+                .unwrap()
+                .logit
+        };
+        assert_eq!(logit(pottery), Some(1.5), "scale {scale}");
+        assert_eq!(logit(one_word), Some(0.5), "scale {scale}");
+    }
+}
+
+#[test]
+fn the_relevance_scale_leaves_the_phase_term_alone_in_injection() {
+    // A long-past memory sharing four query words, against a current one
+    // sharing two. At scale 1.0 the extra words outweigh the full phase
+    // penalty (3.5 - 1.0 > 1.5). At 10.0 they don't (0.35 - 1.0 < 0.15),
+    // unless the penalty were scaled too.
+    let order = |scale: f64| {
+        let h = Harness::with_scale(0.0, scale);
+        let past = h.insert(Memory {
+            kind: "event",
+            valid_from: Some((local("2026-07-20T00:00"), "day")),
+            valid_until: Some((local("2026-08-01T00:00"), "day")),
+            ..fact("Tim's pottery class schedule changed at the studio.")
+        });
+        let current = h.insert(fact("Tim's pottery class meets weekly."));
+        let injected = h.prefetch("s", "pottery class schedule studio").injected;
+        (injected, past, current)
+    };
+    let (injected, past, current) = order(1.0);
+    assert_eq!(injected, vec![past, current]);
+    let (injected, past, current) = order(10.0);
+    assert_eq!(injected, vec![current, past]);
+}
+
+#[test]
+fn the_relevance_scale_leaves_the_strength_term_alone_in_recall() {
+    // A faded memory sharing three query words, against a fresh one sharing
+    // two. At scale 1.0 the extra word outweighs w_s_recall·strength; at
+    // 100.0 strength decides, unless it were scaled too.
+    let order = |scale: f64| {
+        let h = Harness::with_scale(1.0, scale);
+        let faded = h.insert(Memory {
+            significance: "trivial",
+            observed_at: at("2021-01-01T00:00:00Z"),
+            ..fact("Tim's pottery class schedule note.")
+        });
+        let fresh = h.insert(Memory {
+            observed_at: h.service.now(),
+            ..fact("Tim's pottery class note.")
+        });
+        (
+            ids(&h.recall(query("pottery class schedule"))),
+            faded,
+            fresh,
+        )
+    };
+    let (ranked, faded, fresh) = order(1.0);
+    assert_eq!(ranked[..2], [faded, fresh]);
+    let (ranked, faded, fresh) = order(100.0);
+    assert_eq!(ranked[..2], [fresh, faded]);
 }
 
 // The reranker deadline
