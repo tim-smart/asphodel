@@ -214,7 +214,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             version: VERSION,
             git_sha: option_env!("ASPHODEL_GIT_SHA"),
             corpus_hash: Some(corpus.hash.clone()),
-            cassette_hash: Some(recorder.hash.clone()),
+            cassette_hash: Some(recorder.completed_hash()?),
             tuning: tuning.clone(),
             flags: Flags {
                 latency_ms: latency

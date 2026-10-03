@@ -915,6 +915,10 @@ pub struct DiffArgs {
 /// on a copy of the replayed store.
 #[derive(Debug, Args)]
 pub struct BenchArgs {
+    /// The production tuning file, layered over the code defaults.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
     /// The private directory whose replayed store is copied.
     #[arg(long, env = "ASPHODEL_REPLAY_DIR")]
     pub replay_dir: Option<PathBuf>,

@@ -17,7 +17,7 @@
   in {
     packages = forAllSystems (pkgs: let
       asphodel = pkgs.callPackage ./nix/package.nix {
-        gitSha = self.rev or null;
+        gitSha = self.rev or (self.dirtyRev or null);
       };
       models = pkgs.callPackage ./nix/models.nix {inherit asphodel;};
     in

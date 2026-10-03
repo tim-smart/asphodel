@@ -273,6 +273,18 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// SHA-256 of the completed cassette, including records written by this run.
+    pub fn completed_hash(&self) -> anyhow::Result<String> {
+        super::refuse_symlink(&self.path)?;
+        match fs::read(&self.path) {
+            Ok(bytes) => Ok(hex(&Sha256::digest(&bytes))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(self.hash.clone()),
+            Err(error) => {
+                Err(error).with_context(|| format!("hashing the cassette {}", self.path.display()))
+            }
+        }
+    }
+
     /// Opens the cassette, reading what it holds. The file is created on
     /// the first record, never followed through a symlink. With
     /// `no_cache` it's emptied instead: a re-recording starts afresh, and

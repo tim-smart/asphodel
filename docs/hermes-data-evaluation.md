@@ -41,7 +41,7 @@ are not yours:
 
 ```sh
 git clone https://github.com/tim-smart/asphodel.git && cd asphodel
-git checkout asphodel-v1
+git checkout main
 nix build                        # ./result/bin/asphodel, ORT wired by the wrapper
 nix build .#models -o models     # both ONNX models, 72 MB, fixed-output fetch
 export ASPHODEL_MODEL_DIR=$PWD/models
@@ -62,17 +62,26 @@ asphodel replay --scenario scenarios/lifetimes.toml   # a scripted run into the 
 ## 1. A read-only copy of Hermes' `state.db`
 
 No Asphodel command does this. Use SQLite's online backup from inside the
-Hermes container; it only reads the live file. Adjust pod and container
-names.
+Hermes container; it only reads the live file. The cluster runs a Deployment
+in namespace `hermes`, not a StatefulSet. Adjust the Deployment and
+container names if needed. Select a running pod once and keep using it for
+the backup, copy and cleanup.
 
 ```sh
-kubectl exec hermes-0 -c hermes -- python3 -c '
+SELECTOR=$(kubectl get deployment/hermes -n hermes -o go-template='{{range $key, $value := .spec.selector.matchLabels}}{{$key}}={{$value}},{{end}}')
+SELECTOR=${SELECTOR%,}
+test -n "$SELECTOR" || exit 1
+HERMES_POD=$(kubectl get pods -n hermes -l "$SELECTOR" --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}')
+test -n "$HERMES_POD" || exit 1
+kubectl wait -n hermes --for=condition=Ready "pod/$HERMES_POD" --timeout=60s
+kubectl exec -n hermes "$HERMES_POD" -c hermes -- python3 -c '
 import sqlite3, os
 src = sqlite3.connect(os.path.join(os.environ["HERMES_HOME"], "state.db"))
 dst = sqlite3.connect("/tmp/state-copy.db")
 src.backup(dst); dst.close(); src.close()'
-kubectl cp -c hermes hermes-0:/tmp/state-copy.db "$ASPHODEL_REPLAY_DIR/state.db"
-kubectl exec hermes-0 -c hermes -- rm /tmp/state-copy.db
+kubectl cp -n hermes -c hermes "$HERMES_POD:/tmp/state-copy.db" "$ASPHODEL_REPLAY_DIR/state.db"
+kubectl exec -n hermes "$HERMES_POD" -c hermes -- rm /tmp/state-copy.db
 ```
 
 ## 2. Manifest and import
@@ -133,6 +142,11 @@ the first call fails there, switch to `api_key` before concluding anything
 else.
 
 ## 4. The recording run
+
+The command below uses GNU time on Linux (`/usr/bin/time -v`). On macOS,
+replace that prefix with `/usr/bin/time -l`; it reports maximum resident
+set size in bytes rather than GNU time's KiB. Both send timing output to
+`live.log`. Use the same platform-specific prefix for later measurements.
 
 ```sh
 /usr/bin/time -v asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode live \
@@ -284,7 +298,7 @@ refused.
 ## 7. Bench
 
 ```sh
-asphodel bench --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" \
+asphodel bench --config "$ASPHODEL_REPLAY_DIR/replay.toml" --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" \
     --concurrency 1 --concurrency 4 --concurrency 16 --requests 64 \
     --report "$ASPHODEL_REPLAY_DIR/reports/bench.json"
 ```
@@ -415,7 +429,7 @@ so rather than improvise.
 - Not implemented in Asphodel. Measure manually: `/usr/bin/time -v`
   "Maximum resident set size" for the replay and for `asphodel serve` on the
   bench copy with both models loaded; `du -sh "$ASPHODEL_REPLAY_DIR/store"
-  "$ASPHODEL_REPLAY_DIR/cassettes"`; `kubectl top pod hermes-0 --containers`
+  "$ASPHODEL_REPLAY_DIR/cassettes"`; `kubectl top pod -n hermes "$HERMES_POD" --containers`
   if the real sidecar is running. The example deployment requests 512 MiB
   and limits 1 GiB; report whether the daemon's RSS fits with the models
   loaded.
