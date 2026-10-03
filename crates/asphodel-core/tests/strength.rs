@@ -518,7 +518,8 @@ fn tie_order_adding_tied_accesses_never_weakens_the_heaviest_alone() {
 }
 
 // Window close: only recent use restarts, from a single recency boost
-// placed when the end became known. The lasting floor stays.
+// placed at the later of the window close and when the end became known.
+// The lasting floor stays.
 
 fn close(closes: f64, known: f64) -> Option<WindowClose> {
     Some(WindowClose {
