@@ -24,6 +24,9 @@ export function mount(root, { fetch }) {
   let generation = 0;
   let stopped = false;
   let notice = null;
+  // Set while an action moves to another page, so its notice survives the
+  // navigation.
+  let carryNotice = false;
   let banner = null;
   let tabs = null;
   let main = null;
@@ -184,12 +187,18 @@ export function mount(root, { fetch }) {
     });
   }
 
-  /// Runs an action, then shows the page again with what it did, or why the
-  /// daemon refused.
-  async function act(work) {
+  /// Runs an action, then shows what it did, or why the daemon refused. With
+  /// `then`, a success moves to that page (the action may have taken this
+  /// one away); a refusal stays put.
+  async function act(work, { then } = {}) {
     try {
       const said = await work();
       notice = said ? { tone: "done", body: said } : null;
+      if (then && window.location.hash !== then) {
+        carryNotice = true;
+        window.location.hash = then;
+        return;
+      }
     } catch (error) {
       if (error instanceof Unauthorized) return prompt(error.rejected);
       notice = { tone: "error", body: error instanceof ApiError ? error.message : String(error.message ?? error) };
@@ -273,6 +282,7 @@ export function mount(root, { fetch }) {
       if (mine !== generation || stopped) return;
       if (error instanceof Unauthorized) return prompt(error.rejected);
       main.replaceChildren(
+        ...[noticeElement()].filter(Boolean),
         h("h1", { tabindex: "-1" }, "This page didn't load"),
         h("p", { class: "notice", "data-tone": "error", role: "alert" }, error instanceof ApiError ? error.message : String(error.message ?? error)),
         h("p", {}, h("a", { href: at.bank ? `#/banks/${encodeURIComponent(at.bank)}/memories` : "#/" }, at.bank ? "Back to the memories" : "Back to the banks")),
@@ -282,10 +292,12 @@ export function mount(root, { fetch }) {
   }
 
   function onHashChange() {
-    notice = null;
+    const carried = carryNotice;
+    carryNotice = false;
+    if (!carried) notice = null;
     for (const dialog of dialogs) dialog.remove();
     dialogs.clear();
-    render({ focusHeading: true });
+    render(carried ? { focusNotice: true } : { focusHeading: true });
   }
 
   async function poll() {

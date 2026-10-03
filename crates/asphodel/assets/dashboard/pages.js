@@ -540,12 +540,17 @@ async function memory(ctx) {
                 action: "Forget memory",
               });
               if (!confirmed) return;
-              ctx.act(async () => {
-                const done = await api.forget(bank, [view.id]);
-                return done.forgotten.length
-                  ? `Forgot ${memoryCount(done.forgotten.length)}: this one and every version in its chain. The erase finishes behind the bank's queue.`
-                  : "Nothing to forget: it was already gone.";
-              });
+              // The erase may run before forget answers, so the result is
+              // shown on the list rather than on this memory's page.
+              ctx.act(
+                async () => {
+                  const done = await api.forget(bank, [view.id]);
+                  return done.forgotten.length
+                    ? `Forgot ${memoryCount(done.forgotten.length)}: “${view.sentence}” and every version in its chain.`
+                    : "Nothing to forget: it was already gone.";
+                },
+                { then: bankHash(bank, "memories") },
+              );
             },
           },
           "Forget…",
@@ -808,7 +813,7 @@ async function source(ctx) {
                 ctx.act(async () => {
                   const done = await api.removeDocument(bank, s.document_id);
                   const dequeued = done.dequeued ? ` and took ${plural(done.dequeued, "chunk")} off the queue` : "";
-                  return `Removed ${s.document_id}: ${plural(done.sources.length, "version")}. Forgot ${memoryCount(done.forgotten.length)}${dequeued}.`;
+                  return `Removed ${done.document_id}: ${plural(done.sources.length, "version")}. Forgot ${memoryCount(done.forgotten.length)}${dequeued}.`;
                 });
               },
             },

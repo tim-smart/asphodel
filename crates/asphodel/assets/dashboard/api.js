@@ -84,9 +84,9 @@ export function client(fetch, storage) {
     unkeep: (name, ids) => call("POST", `${bank(name)}/unkeep`, { ids }),
     sources: (name, params) => call("GET", `${bank(name)}/sources${query(params)}`),
     source: (name, id) => call("GET", `${bank(name)}/sources/${path(id)}`),
-    // The route takes the id's slashes as they are; each part is encoded.
-    removeDocument: (name, documentId) =>
-      call("DELETE", `${bank(name)}/documents/${documentId.split("/").map(encodeURIComponent).join("/")}`),
+    // The id goes in the body exactly as ingested: a URL path would lose `..`
+    // and `.` segments to normalization and could name another document.
+    removeDocument: (name, documentId) => call("POST", `${bank(name)}/documents/remove`, { document_id: documentId }),
     chunks: (name) => call("GET", `${bank(name)}/chunks`),
     retryChunks: (name, chunks) => call("POST", `${bank(name)}/chunks/retry`, chunks ? { chunks } : {}),
   };
