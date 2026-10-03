@@ -95,10 +95,10 @@ jobs:
           "bge-small-en-v1.5:int8" = 0.8
 
           [injection.reranker_floors]
-          "jina-reranker-v1-turbo-en:int8" = 0.0
+          "ms-marco-MiniLM-L-6-v2:int8" = 0.0
 
           [ranking.relevance_scales]
-          "jina-reranker-v1-turbo-en:int8" = 1.0
+          "ms-marco-MiniLM-L-6-v2:int8" = 1.0
           TOML
           docker run -d --name asphodel -p 127.0.0.1:7720:7720 \
             --read-only --tmpfs /data:uid=65532,gid=65532 --tmpfs /tmp \

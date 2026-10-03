@@ -104,7 +104,7 @@ impl Embedder for OnnxEmbedder {
     }
 }
 
-/// jina-reranker-v1-turbo-en int8 behind fastembed.
+/// ms-marco-MiniLM-L-6-v2 int8 behind fastembed.
 pub struct OnnxReranker {
     model_id: String,
     model: Mutex<TextRerank>,

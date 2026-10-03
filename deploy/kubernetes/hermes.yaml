@@ -31,13 +31,17 @@ data:
     [reconcile.embedding_floors]
     "bge-small-en-v1.5:int8" = 0.8
 
+    # Provisional until the labels exist: +3.0 injects 31 right and 8 wrong
+    # on the agent-drafted probe set.
     [injection.reranker_floors]
-    "jina-reranker-v1-turbo-en:int8" = 0.0
+    "ms-marco-MiniLM-L-6-v2:int8" = 3.0
 
     # The reranker logit is divided by this before it's added to the other
-    # ranking terms. jina is the reference, at 1.0.
+    # ranking terms. The other weights were sized for jina-reranker-v1-turbo-en
+    # int8, so the scale is std(L-6 logits) / std(jina logits), measured over
+    # every candidate in the 69-query eval pools.
     [ranking.relevance_scales]
-    "jina-reranker-v1-turbo-en:int8" = 1.0
+    "ms-marco-MiniLM-L-6-v2:int8" = 3.564211
 ---
 # Only the backup CronJob uses this. Hermes reaches the daemon on loopback.
 apiVersion: v1

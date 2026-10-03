@@ -9,7 +9,7 @@ in for it.
 | Role | Model id | Source | Size |
 |---|---|---|---|
 | Embedding | `bge-small-en-v1.5:int8` | `Xenova/bge-small-en-v1.5` at `ea104da`, `onnx/model_quantized.onnx` | 34 MB |
-| Reranker | `jina-reranker-v1-turbo-en:int8` | `jinaai/jina-reranker-v1-turbo-en` at `b8c14f4`, `onnx/model_quantized.onnx` | 38 MB |
+| Reranker | `ms-marco-MiniLM-L-6-v2:int8` | `Xenova/ms-marco-MiniLM-L-6-v2` at `a091443`, `onnx/model_quantized.onnx` | 23 MB |
 
 The model id is the exact string, quantisation included. It keys the
 floors in the tuning file (`reconcile.embedding_floors` and
@@ -36,7 +36,7 @@ Models live under one directory, resolved in this order:
 3. `$HOME/.cache/asphodel/models`.
 
 Each model has its own subdirectory (`bge-small-en-v1.5-int8`,
-`jina-reranker-v1-turbo-en-int8`) holding `model.onnx`, `tokenizer.json`,
+`ms-marco-MiniLM-L-6-v2-int8`) holding `model.onnx`, `tokenizer.json`,
 `config.json`, `special_tokens_map.json` and `tokenizer_config.json`.
 
 `asphodel models fetch` fills the dir from the manifest. It skips files

@@ -4,7 +4,7 @@
 //! in for it:
 //!
 //! - [`Embedder`] over bge-small-en-v1.5 int8;
-//! - [`Reranker`] over jina-reranker-v1-turbo-en int8;
+//! - [`Reranker`] over ms-marco-MiniLM-L-6-v2 int8;
 //! - [`LlmClient`] over any OpenAI-compatible endpoint, with structured JSON
 //!   output. Replay's recording and cassette modes wrap it.
 //!

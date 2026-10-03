@@ -39,16 +39,16 @@
       };
     }
     {
-      # jina-reranker-v1-turbo-en:int8
-      dir = "jina-reranker-v1-turbo-en-int8";
-      repo = "jinaai/jina-reranker-v1-turbo-en";
-      revision = "b8c14f4e723d9e0aab4732a7b7b93741eeeb77c2";
+      # ms-marco-MiniLM-L-6-v2:int8
+      dir = "ms-marco-MiniLM-L-6-v2-int8";
+      repo = "Xenova/ms-marco-MiniLM-L-6-v2";
+      revision = "a09144355adeed5f58c8ed011d209bf8ee5a1fec";
       sha256 = {
-        "model.onnx" = "3defdef1ae34e119bd704216087743e79665934c96aebabcb6077c239dc3ae66";
-        "tokenizer.json" = "0046da43cc8c424b317f56b092b0512aaaa65c4f925d2f16af9d9eeb4d0ef902";
-        "config.json" = "e050ff6a15ae9295e84882fa0e98051bd8754856cd5201395ebf00ce9f2d609b";
-        "special_tokens_map.json" = "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f";
-        "tokenizer_config.json" = "d291c6652d96d56ffdbcf1ea19d9bae5ed79003f7648c627e725a619227ce8fa";
+        "model.onnx" = "e9d8ebf845c413e981c175bfe49a3bfa9b3dcce2a3ba54875ee5df5a58639fbe";
+        "tokenizer.json" = "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66";
+        "config.json" = "d827779a72d27ae68cf878a6fc2e954542663fe21ca515d9f4783fc96be2d37e";
+        "special_tokens_map.json" = "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3";
+        "tokenizer_config.json" = "0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53";
       };
     }
   ];
