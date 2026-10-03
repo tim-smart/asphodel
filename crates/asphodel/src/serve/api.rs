@@ -23,6 +23,7 @@ use asphodel_core::keep::{
     KeepError, Kept, MemoryIds, SignificanceRequest, SignificanceSet, Unkept,
 };
 use asphodel_core::mental_models::{Model, ModelEdit, ModelError, ModelSpec, Outcome as Refreshed};
+use asphodel_core::models::LlmError;
 use asphodel_core::operations::{
     Audit, AuditError, AuditList, BACKED_UP_AT_HEADER, Backup, BackupError, LENGTH_HEADER,
     SHA256_HEADER, Status,
@@ -34,6 +35,7 @@ use asphodel_core::store::StoreError;
 use asphodel_core::store::bank::{Bank, BankError, BankIdentity};
 use asphodel_core::sweep::{PurgeAck, PurgeError, PurgePlan};
 use asphodel_core::system_prompt::Block;
+use asphodel_core::translate::{TranslateError, Translation};
 use asphodel_core::{Health, ResolvedConfig, Service};
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -92,6 +94,10 @@ pub(crate) fn router(app: Shared) -> Router {
         .route(
             "/v1/banks/{bank}/memories/{memory}/significance",
             put(set_significance),
+        )
+        .route(
+            "/v1/banks/{bank}/memories/{memory}/translate",
+            post(translate_memory),
         )
         .route("/v1/banks/{bank}/entities/{entity}", get(show_entity))
         .route("/v1/banks/{bank}/merges", post(merge))
@@ -240,6 +246,34 @@ impl From<KeepError> for ApiError {
                 Self::new(StatusCode::BAD_REQUEST, error.to_string())
             }
             KeepError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<TranslateError> for ApiError {
+    fn from(error: TranslateError) -> Self {
+        match error {
+            TranslateError::UnknownBank | TranslateError::UnknownMemory => {
+                Self::new(StatusCode::NOT_FOUND, error.to_string())
+            }
+            TranslateError::LanguageUnset => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
+            TranslateError::Superseded { .. } => Self::new(StatusCode::CONFLICT, error.to_string()),
+            TranslateError::Busy
+            | TranslateError::NoModels
+            | TranslateError::ModelUnavailable { .. } => {
+                Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+            }
+            TranslateError::Llm(
+                LlmError::NotConfigured { .. }
+                | LlmError::LoginRequired
+                | LlmError::UsageLimited { .. }
+                | LlmError::RateLimited { .. },
+            ) => Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+            TranslateError::Llm(_) | TranslateError::BadReply => {
+                Self::new(StatusCode::BAD_GATEWAY, error.to_string())
+            }
+            TranslateError::Embed(_) => Self::internal(error),
+            TranslateError::Store(error) => error.into(),
         }
     }
 }
@@ -901,6 +935,30 @@ async fn set_significance(
         .call(move |service| service.set_significance(&bank, &memory, level.as_deref()))
         .await?;
     Ok(Json(set))
+}
+
+/// `POST /v1/banks/{bank}/memories/{id}/translate`: `asphodel memory
+/// translate`. 503 when no LLM is configured, 409 naming the head when the
+/// memory has been superseded.
+async fn translate_memory(
+    State(app): State<Shared>,
+    Path((bank, memory)): Path<(String, String)>,
+) -> Result<Json<Translation>, ApiError> {
+    let llm = app
+        .ready()
+        .ok_or_else(ApiError::not_ready)?
+        .llm
+        .clone()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no LLM is configured, so memories can't be translated",
+            )
+        })?;
+    let translation = app
+        .call(move |service| service.translate_memory(&bank, &memory, llm.as_ref()))
+        .await?;
+    Ok(Json(translation))
 }
 
 /// `GET /v1/banks/{bank}/entities/{entity}`: `asphodel entity show`, by

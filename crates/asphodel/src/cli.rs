@@ -79,7 +79,7 @@ enum Command {
     /// Hand kept memories back to the significance extraction gave them.
     Unkeep(IdsArgs),
 
-    /// Show a memory, or set the owner's significance on it.
+    /// Show a memory, set the owner's significance on it, or translate it.
     #[command(subcommand)]
     Memory(MemoryCommand),
 
@@ -480,7 +480,7 @@ pub struct ModelShowArgs {
 }
 
 /// `asphodel memory`: a memory's metadata can be edited, never its sentence,
-/// kind or window.
+/// kind or window. A translation is a new memory superseding it.
 #[derive(Debug, Subcommand)]
 pub enum MemoryCommand {
     /// Show a memory: both significance fields, its passage or why it's
@@ -507,6 +507,19 @@ pub enum MemoryCommand {
         /// The memory's id.
         id: String,
         level: String,
+    },
+
+    /// Translate a memory into `[llm] language`, as a new memory that
+    /// supersedes it and keeps its strength, accesses and source. Refused
+    /// without `[llm] language`, and for a memory that's been superseded,
+    /// naming the one that superseded it.
+    Translate {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        /// The memory's id.
+        id: String,
     },
 }
 
@@ -1966,7 +1979,7 @@ fn bank_delete(client_args: &ClientArgs, name: &str, confirm: &str) -> anyhow::R
     Ok(())
 }
 
-/// `asphodel memory show|significance`.
+/// `asphodel memory show|significance|translate`.
 fn memory(command: MemoryCommand) -> anyhow::Result<()> {
     match command {
         MemoryCommand::Show { client, bank, id } => {
@@ -2016,6 +2029,35 @@ fn memory(command: MemoryCommand) -> anyhow::Result<()> {
                 shown("to"),
                 text(&set, "extracted"),
             );
+            Ok(())
+        }
+        MemoryCommand::Translate { client, bank, id } => {
+            let json = client.json;
+            let client = Client::new(&client)?;
+            let translation: Value = client.post(
+                &format!(
+                    "/v1/banks/{}/memories/{}/translate",
+                    segment(&bank),
+                    segment(&id)
+                ),
+                &Value::Null,
+            )?;
+            if json {
+                return print_json(&translation);
+            }
+            match translation.get("outcome").and_then(Value::as_str) {
+                Some("translated") => println!(
+                    "{} -> {}: translated into {}",
+                    text(&translation, "from"),
+                    text(&translation, "to"),
+                    text(&translation, "language"),
+                ),
+                _ => println!(
+                    "{}: already in {}, nothing written",
+                    text(&translation, "memory"),
+                    text(&translation, "language"),
+                ),
+            }
             Ok(())
         }
     }

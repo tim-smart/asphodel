@@ -47,6 +47,7 @@ use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
 use crate::sweep::{PurgeError, PurgePlan, SweepSchedule, Sweeps};
 use crate::system_prompt::{Block, BlockEntry, Blocks};
+use crate::translate::{Found, TranslateError, Translation};
 
 /// One running store: the daemon's banks, models, extraction queue and jobs,
 /// driven by a clock.
@@ -823,6 +824,62 @@ impl Service {
             self.after_writes(bank_id, watermark, &[])?;
         }
         Ok(unkept)
+    }
+
+    /// Translates one memory into `[llm] language` with `llm`, as a new
+    /// head superseding it (`memory translate`, [`crate::translate`]).
+    /// Refused when the language isn't set, and when the memory isn't its
+    /// chain's head, before the call or by the time it answers. Nothing is
+    /// held while the LLM answers. Afterwards, waits at most five seconds
+    /// for the bank, returning `Busy` if it cannot hold it for the write.
+    pub fn translate_memory(
+        &self,
+        bank: &str,
+        id: &str,
+        llm: &dyn LlmClient,
+    ) -> Result<Translation, TranslateError> {
+        let language = self
+            .tuning
+            .llm
+            .language
+            .as_deref()
+            .map(str::trim)
+            .filter(|language| !language.is_empty())
+            .ok_or(TranslateError::LanguageUnset)?;
+        let models = self.models.as_ref().ok_or(TranslateError::NoModels)?;
+        let named = match crate::translate::named(&self.store, bank, id, language)? {
+            Found::Head(named) => named,
+            Found::Translated(translation) => return Ok(translation),
+        };
+        let Some(sentence) = crate::translate::ask(llm, &named.content, language)? else {
+            return Ok(Translation::AlreadyInLanguage {
+                memory: named.uuid,
+                language: language.to_owned(),
+            });
+        };
+        // Drain prepared extractions and wait out a re-embed swap before
+        // choosing the embedder. Keep the hold through embedding and commit.
+        let _hold = self
+            .leases
+            .hold(named.bank_id, Duration::from_secs(5))
+            .ok_or(TranslateError::Busy)?;
+        let (recorded, watermark) = {
+            let conn = self.store.connection();
+            (
+                crate::reembed::recorded_model(&conn, named.bank_id).map_err(StoreError::Sqlite)?,
+                crate::mental_models::watermark(&conn, named.bank_id)
+                    .map_err(StoreError::Sqlite)?,
+            )
+        };
+        let embedder = crate::models::serving(models, &self.previous_embedders, &recorded)
+            .ok_or(TranslateError::ModelUnavailable { model: recorded })?;
+        let to = crate::translate::commit(&self.store, &named, &sentence, language, embedder)?;
+        self.after_writes(named.bank_id, watermark, &[])?;
+        Ok(Translation::Translated {
+            from: named.uuid,
+            to,
+            language: language.to_owned(),
+        })
     }
 
     /// Checkpoints the WAL into the database file, as the daemon does on

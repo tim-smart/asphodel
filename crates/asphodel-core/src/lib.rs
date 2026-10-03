@@ -30,6 +30,7 @@ pub mod store;
 pub mod strength;
 pub mod sweep;
 pub mod system_prompt;
+pub mod translate;
 
 pub use clock::{Clock, SimulatedClock, SystemClock};
 pub use config::{ResolvedConfig, Tuning};
