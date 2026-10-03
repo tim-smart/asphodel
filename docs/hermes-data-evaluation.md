@@ -156,22 +156,52 @@ asphodel report html "$ASPHODEL_REPLAY_DIR/reports/state-live.json"
 
 The report's `memories` list has ids and times but no sentences. To see
 what a memory says, serve a copy of the replayed store with no LLM. The
-copy keeps the bank's recorded models, so `ASPHODEL_MODEL_DIR` must be set,
-and the floors in `replay.toml` are enough config. Nothing here calls a
-backend: recall runs the local embedder and reranker only.
+copy keeps the bank's recorded models, so `ASPHODEL_MODEL_DIR` must be set.
+Write `$ASPHODEL_REPLAY_DIR/browse.toml` separately from `replay.toml`:
+
+```toml
+# No [llm]: neither extraction nor background refresh has a backend.
+[purge]
+delta = "never"
+
+[reconcile.embedding_floors]
+"bge-small-en-v1.5:int8" = 0.8
+
+[injection.reranker_floors]
+"jina-reranker-v1-turbo-en:int8" = 0.0
+```
+
+Use the same floors as your replay config if you changed them. The replay
+config above uses the default numeric purge delta; `"never"` changes its
+deletion fingerprint. On the fresh copy this pauses the entire nightly
+sweep, including source, failed-chunk and recall-log deletion, not just
+memory purge. `delta = "never"` alone does **not** disable the source sweep;
+the unacknowledged fingerprint change does. Nothing here calls a backend:
+recall runs the local embedder and reranker only, and refresh returns 503.
 
 ```sh
+test ! -e "$ASPHODEL_REPLAY_DIR/browse" || { echo "Remove the old browse copy first"; exit 1; }
 cp -r "$ASPHODEL_REPLAY_DIR/store" "$ASPHODEL_REPLAY_DIR/browse"
-asphodel serve --data-dir "$ASPHODEL_REPLAY_DIR/browse" --config "$ASPHODEL_REPLAY_DIR/replay.toml" \
+asphodel serve --data-dir "$ASPHODEL_REPLAY_DIR/browse" --config "$ASPHODEL_REPLAY_DIR/browse.toml" \
     --listen 127.0.0.1:7741 2> "$ASPHODEL_REPLAY_DIR/browse.log" &
+ASPHODEL_BROWSE_PID=$!
 export ASPHODEL_URL=http://127.0.0.1:7741
+asphodel purge plan --json
 asphodel recall --bank main "what is my sister called"
 asphodel memory show --bank main <id>
 ```
 
-The daemon warns that the deletion fingerprint changed and purge is
-paused: good, nothing is deleted while you browse. Recall writes the copy's
-recall log only. Stop it with `kill` when done, and delete `browse/` after
+Wait for the daemon to be ready, then check that `purge plan --json` shows
+`pause.state` as `"paused"` before recalling anything. If it shows `"running"`,
+stop and check that this is a fresh copy of the replay store with a numeric
+purge delta, not a previously acknowledged browse store. Never run
+`purge ack` on the browse daemon, and do not issue `forget` or `erase`: those
+explicit deletion commands do not respect the purge pause.
+
+The daemon warns that the deletion fingerprint changed. Both purge and the
+source/recall sweep stay paused while you browse. Recall writes the copy's
+recall log only. Stop it with `kill "$ASPHODEL_BROWSE_PID"` when done, and
+delete `browse/` after
 the evaluation: it is a second copy of the history. Never point this at a
 `serve` data dir Hermes uses.
 
