@@ -33,17 +33,18 @@ fn workspace_root() -> PathBuf {
         .unwrap()
 }
 
-/// Every `.rs` and `.sql` file under `dir`, skipping build output, the git
-/// dir and `tests/` directories (which hold this file).
+/// Every `.rs` and `.sql` file under `dir`, skipping build output, hidden
+/// directories and `tests/` directories (which hold this file).
 fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
         if path.is_dir() {
-            if matches!(
-                entry.file_name().to_str(),
-                Some("target" | ".git" | "tests")
-            ) {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with('.') || matches!(name, "target" | "tests"))
+            {
                 continue;
             }
             source_files(&path, out);
