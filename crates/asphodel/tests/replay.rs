@@ -368,6 +368,50 @@ fn a_rescheduled_appointment_moves_on_the_agenda() {
 }
 
 #[test]
+fn p18_closes_the_task_before_the_future_event_and_excludes_it_from_agenda() {
+    let dir = TestDir::new();
+    replay(&dir, &scenario("p18"), &[]).assert_passed();
+}
+
+#[test]
+fn p18_memory_show_has_no_overdue_task_guard_after_completion() {
+    use std::sync::Arc;
+
+    use asphodel_core::clock::SimulatedClock;
+    use asphodel_core::config::Tuning;
+    use asphodel_core::inspect::Guard;
+    use asphodel_core::service::Service;
+    use asphodel_core::store::{OpenOptions, Store};
+
+    let dir = TestDir::new();
+    let run = replay(&dir, &scenario("p18"), &[]);
+    // Inspect even if the replay probes fail, so this guard is checked
+    // independently of the closure and agenda assertions.
+    let id = run.probe("p18-2")["observed"]["id"]
+        .as_str()
+        .expect("p18-2 resolves its memory");
+    let clock = Arc::new(SimulatedClock::new("2026-01-12T09:00:00Z".parse().unwrap()));
+    let store = Store::open(
+        &dir.path("private/store"),
+        OpenOptions::default(),
+        clock.clone(),
+    )
+    .unwrap();
+    let service = Service::open(clock, store, Tuning::default());
+    // This is the same view used by `memory show`, after the final correction closes.
+    let view = service.show_memory("main", id).unwrap();
+    assert!(
+        !view
+            .purge
+            .guards
+            .iter()
+            .any(|guard| matches!(guard, Guard::OverdueTask { .. })),
+        "p18: {:?}",
+        view.purge.guards
+    );
+}
+
+#[test]
 fn a_three_week_holiday_runs_on_bank_time() {
     let dir = TestDir::new();
     replay(&dir, &scenario("three-week-holiday"), &[]).assert_passed();

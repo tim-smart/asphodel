@@ -2001,6 +2001,7 @@ fn a_correction_of_another_kind_still_repoints_the_end() {
     // correction below is filed as a fact rather than an event, but it still
     // supersedes the memory that ended the task, so it is a successor and
     // the task stays ended.
+    // A task correction closes at observation time, not the successor event time.
     let h = Harness::new();
     let task = h.insert_memory("main", TAX_TASK, "task", "notable");
     let filed = h.insert_memory("main", TAX_FILED, "event", "minor");
@@ -2038,7 +2039,7 @@ fn a_correction_of_another_kind_still_repoints_the_end() {
     assert_eq!(
         h.change(task),
         Change {
-            valid_until: timed(local("2026-10-02T00:00"), "day"),
+            valid_until: timed(at("2026-10-02T06:30:00Z"), "minute"),
             ended_by: Some(later),
             ..Change::untouched()
         }
