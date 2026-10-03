@@ -76,6 +76,7 @@ fn open_store(dir: &TestDir) -> Store {
 fn tuning_for_fakes() -> Tuning {
     Tuning::from_toml(&format!(
         "[injection.reranker_floors]\n\"{}\" = 0.0\n\
+         [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
          [reconcile.embedding_floors]\n\"{}\" = 0.5\n",
         FakeReranker::MODEL_ID,
         FakeEmbedder::MODEL_ID,

@@ -241,12 +241,23 @@ impl Harness {
     }
 
     /// `injection` is extra keys for `[injection]`, and `rest` extra
-    /// sections.
+    /// sections. The relevance scale is 1.0.
     fn with(floor: f64, extra: &str, reranker: Arc<dyn Reranker>) -> Self {
+        Self::with_scaled(floor, 1.0, extra, reranker)
+    }
+
+    /// A gate floor of `floor` and a relevance scale of `scale` for the
+    /// fake reranker.
+    fn with_scale(floor: f64, scale: f64) -> Self {
+        Self::with_scaled(floor, scale, "", Arc::new(FakeReranker))
+    }
+
+    fn with_scaled(floor: f64, scale: f64, extra: &str, reranker: Arc<dyn Reranker>) -> Self {
         let (injection, rest) = extra.split_once("\n---\n").unwrap_or((extra, ""));
         let tuning = Tuning::from_toml(&format!(
             "[injection]\n{injection}\n\
              [injection.reranker_floors]\n\"{}\" = {floor:?}\n\
+             [ranking.relevance_scales]\n\"{0}\" = {scale:?}\n\
              [reconcile.embedding_floors]\n\"{}\" = 0.5\n{rest}",
             FakeReranker::MODEL_ID,
             FakeEmbedder::MODEL_ID,
@@ -284,19 +295,6 @@ impl Harness {
         harness.chunk = harness.one("SELECT id FROM chunks", []);
         harness.execute("DELETE FROM extraction_queue", []);
         harness
-    }
-
-    /// A gate floor of `floor` and a relevance scale of `scale` for the
-    /// fake reranker.
-    fn with_scale(floor: f64, scale: f64) -> Self {
-        Self::with(
-            floor,
-            &format!(
-                "\n---\n[ranking.relevance_scales]\n\"{}\" = {scale:?}\n",
-                FakeReranker::MODEL_ID
-            ),
-            Arc::new(FakeReranker),
-        )
     }
 
     fn with_deadline(self, deadline: Duration) -> Self {

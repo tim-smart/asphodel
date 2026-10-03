@@ -230,6 +230,7 @@ impl Harness {
         let tuning = Tuning::from_toml(&format!(
             "[clock]\nquiet_rate = 1.0\n\
              [injection.reranker_floors]\n\"{}\" = 1.0\n\
+             [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
              [reconcile.embedding_floors]\n\"{}\" = 0.5\n{extra}",
             FakeReranker::MODEL_ID,
             FakeEmbedder::MODEL_ID,

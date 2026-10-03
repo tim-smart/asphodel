@@ -168,6 +168,7 @@ fn a_full_file_sets_every_value() {
         w_s_recall = 0.3
         phase_bonus = 1.5
         phase_penalty = 0.5
+        relevance_scales = { "jina-reranker-v1-turbo-en:int8" = 1.0 }
 
         [llm]
         model = "some-model:q4_K_M"
@@ -205,6 +206,10 @@ fn a_full_file_sets_every_value() {
     assert_eq!(t.ranking.w_s_recall, 0.3);
     assert_eq!(t.ranking.phase_bonus, 1.5);
     assert_eq!(t.ranking.phase_penalty, 0.5);
+    assert_eq!(
+        t.ranking.relevance_scales["jina-reranker-v1-turbo-en:int8"],
+        1.0
+    );
     assert_eq!(t.llm.model.as_deref(), Some("some-model:q4_K_M"));
     assert_eq!(t.llm.endpoint.as_deref(), Some("https://llm.example/v1"));
 }
@@ -481,7 +486,8 @@ fn only_a_floor_for_the_exact_model_string_counts() {
     // Int8 and fp32 give different scores, so there's no fallback.
     let t = load(
         "[reconcile.embedding_floors]\n\"bge-small-en-v1.5:int8\" = 0.8\n\
-         [injection.reranker_floors]\n\"jina-reranker-v1-turbo-en:int8\" = -1.0\n",
+         [injection.reranker_floors]\n\"jina-reranker-v1-turbo-en:int8\" = -1.0\n\
+         [ranking.relevance_scales]\n\"jina-reranker-v1-turbo-en:int8\" = 1.0\n",
     )
     .unwrap();
     t.check_floors("bge-small-en-v1.5:int8", "jina-reranker-v1-turbo-en:int8")

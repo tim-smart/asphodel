@@ -235,17 +235,24 @@ impl Harness {
 
     /// `extra` is more tuning TOML, appended to the floors the fakes need.
     fn with_tuning(extra: &str) -> Self {
-        Self::build(extra, Models::fake())
+        Self::build(1.0, extra, Models::fake())
+    }
+
+    /// [`Harness::with_tuning`] with a relevance scale of `scale` for the
+    /// fake reranker.
+    fn with_scale(scale: f64, extra: &str) -> Self {
+        Self::build(scale, extra, Models::fake())
     }
 
     /// Default tuning on `models`.
     fn with_models(models: Models) -> Self {
-        Self::build("", models)
+        Self::build(1.0, "", models)
     }
 
-    fn build(extra: &str, models: Models) -> Self {
+    fn build(scale: f64, extra: &str, models: Models) -> Self {
         let tuning = Tuning::from_toml(&format!(
             "[injection.reranker_floors]\n\"{}\" = 1.0\n\
+             [ranking.relevance_scales]\n\"{0}\" = {scale:?}\n\
              [reconcile.embedding_floors]\n\"{}\" = 0.5\n{extra}",
             FakeReranker::MODEL_ID,
             FakeEmbedder::MODEL_ID,
@@ -1070,6 +1077,34 @@ fn a_cited_memory_stays_in_the_input_past_the_top_sixty() {
     let input = h.input(PROFILE_NAME);
     assert_eq!(input.memories.len(), 61, "the top 60 and the cited one");
     assert!(inputs(&input).contains(&weak));
+}
+
+#[test]
+fn the_relevance_scale_leaves_the_strength_term_alone_in_a_refresh() {
+    // With room for one memory: a weak one sharing five words with the
+    // profile question, against a strong one sharing none. At scale 1.0 the
+    // shared words outweigh w_s_inject·strength; at 100.0 strength decides,
+    // unless it were scaled too.
+    let selected = |scale: f64| {
+        let h = Harness::with_scale(
+            scale,
+            "[mental_models]\ninput_budget = 1\ninput_budget_with_cited = 1\n",
+        );
+        let weak = h.insert(Memory {
+            significance: "trivial",
+            ..fact("The user likes work and home life.")
+        });
+        let strong = h.insert(Memory {
+            significance: "critical",
+            observed_at: h.service.now(),
+            ..fact("Tim cooks dinner.")
+        });
+        (inputs(&h.input(PROFILE_NAME)), weak, strong)
+    };
+    let (input, weak, _) = selected(1.0);
+    assert_eq!(input, BTreeSet::from([weak]));
+    let (input, _, strong) = selected(100.0);
+    assert_eq!(input, BTreeSet::from([strong]));
 }
 
 #[test]
