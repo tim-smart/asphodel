@@ -241,6 +241,13 @@ function bank(name, counts) {
   };
 }
 
+/// One more document, its only version, for a test to add to `state.sources`.
+export function document(id, documentId, text) {
+  const added = source(id, { document_id: documentId, ingested_at: "2026-10-02T08:00:00Z", text, chunks: [] });
+  added.versions = [{ id, ingested_at: added.ingested_at, gone: null }];
+  return added;
+}
+
 function source(id, fields) {
   return {
     id,
@@ -342,8 +349,13 @@ function error(status, message, headers) {
 
 export class FakeDaemon {
   /// `token: null` is a loopback daemon without one, which checks nothing.
-  constructor({ token = TOKEN, state = fixtures() } = {}) {
+  /// `eraseOnForget` runs the erase before forget answers, as the daemon does
+  /// when nothing is queued: the forgotten chain's rows are gone at once, so
+  /// reading one of its memories is a 404. Otherwise they stay, hidden, as
+  /// they do while the erase waits behind the queue.
+  constructor({ token = TOKEN, state = fixtures(), eraseOnForget = false } = {}) {
     this.token = token;
+    this.eraseOnForget = eraseOnForget;
     this.state = state;
     this.requests = [];
     this.fetch = this.fetch.bind(this);
@@ -425,8 +437,13 @@ export class FakeDaemon {
       const found = state.sources.find((s) => s.id === id);
       return found ? json(200, found) : error(404, "unknown source");
     }
-    if (collection === "documents" && method === "DELETE") {
-      return this.removeDocument(segments.slice(4).join("/"));
+    // The document id travels in the body, never the path: a path can't
+    // carry `..` or `.` past URL normalization.
+    if (collection === "documents" && id === "remove" && method === "POST") {
+      if (typeof body?.document_id !== "string" || body.document_id === "") {
+        return error(400, "document_id is required");
+      }
+      return this.removeDocument(body.document_id);
     }
     if (collection === "chunks" && id === undefined && method === "GET") {
       const failedOnly = query.get("failed") === "true";
@@ -508,6 +525,10 @@ export class FakeDaemon {
         this.state.views[member.id].hidden_at = "2026-10-03T09:05:00Z";
       }
     }
+    if (this.eraseOnForget) {
+      this.state.memories = this.state.memories.filter((m) => !forgotten.includes(m.id));
+      for (const id of forgotten) delete this.state.views[id];
+    }
     return json(200, { forgotten, unknown });
   }
 
@@ -546,7 +567,7 @@ export class FakeDaemon {
       this.state.memories.find((m) => m.id === id).status = "forgetting";
       this.state.views[id].hidden_at = "2026-10-03T09:05:00Z";
     }
-    return json(200, { sources: versions.map((s) => s.id), forgotten, dequeued: 0 });
+    return json(200, { document_id: documentId, sources: versions.map((s) => s.id), forgotten, dequeued: 0 });
   }
 
   retry(chunks) {
