@@ -160,7 +160,7 @@ on uncleaned queries.
 
 ## Schema version 12: removed documents
 
-`asphodel document remove` and `DELETE /v1/banks/{bank}/documents/{id}`
+`asphodel document remove` and `POST /v1/banks/{bank}/documents/remove`
 clear a document's text and mark each of its versions with the new
 `sources.removed_at`. The migration only adds the column. No action is
 needed.

@@ -18,7 +18,7 @@ use asphodel_core::entities::{
 };
 use asphodel_core::erase::{
     BankDeleteError, BankDeleted, DocumentRemoved, ForgetError, ForgetRequest, Forgotten,
-    RemoveDocumentError,
+    RemoveDocumentError, RemoveDocumentRequest,
 };
 use asphodel_core::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use asphodel_core::inspect::{
@@ -69,10 +69,7 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/v1/banks/{bank}", put(put_bank).delete(delete_bank))
         .route("/v1/banks/{bank}/turns", post(turns))
         .route("/v1/banks/{bank}/documents", post(documents))
-        .route(
-            "/v1/banks/{bank}/documents/{*document}",
-            axum::routing::delete(remove_document),
-        )
+        .route("/v1/banks/{bank}/documents/remove", post(remove_document))
         .route("/v1/banks/{bank}/sources", get(sources))
         .route("/v1/banks/{bank}/sources/{source}", get(show_source))
         .route("/v1/banks/{bank}/prefetch", post(prefetch))
@@ -387,6 +384,9 @@ impl From<RemoveDocumentError> for ApiError {
         match error {
             RemoveDocumentError::UnknownBank | RemoveDocumentError::UnknownDocument => {
                 Self::new(StatusCode::NOT_FOUND, error.to_string())
+            }
+            RemoveDocumentError::EmptyDocumentId => {
+                Self::new(StatusCode::BAD_REQUEST, error.to_string())
             }
             RemoveDocumentError::Store(error) => error.into(),
         }
@@ -1035,13 +1035,19 @@ async fn show_source(
     Ok(Json(shown))
 }
 
-/// `DELETE /v1/banks/{bank}/documents/{document id}`: `asphodel document
-/// remove`, every version of the document. The id may hold slashes. The
-/// dashboard asks the owner to confirm first; the route doesn't.
+/// `POST /v1/banks/{bank}/documents/remove` with `{"document_id": ...}`:
+/// `asphodel document remove`, every version of the document. The id comes
+/// in the body, exactly as ingested, never in the path, where a client
+/// would normalize `.` and `..` away. The dashboard asks the owner to
+/// confirm first; the route doesn't.
 async fn remove_document(
     State(app): State<Shared>,
-    Path((bank, document)): Path<(String, String)>,
+    Path(bank): Path<String>,
+    body: Result<Json<RemoveDocumentRequest>, JsonRejection>,
 ) -> Result<Json<DocumentRemoved>, ApiError> {
+    let Json(RemoveDocumentRequest {
+        document_id: document,
+    }) = body?;
     let name = bank.clone();
     let removed = app
         .call(move |service| {
