@@ -1,7 +1,6 @@
 //! `asphodel import`: a copy of Hermes' `state.db` and the private manifest
-//! into a replay corpus, checked against "Replay harness: simulated-clock
-//! replay of recorded sessions" (TIM-96, decisions 1 and 8) and TIM-117's
-//! scope. Every `state.db` here is synthetic, built by `support::hermes`
+//! into a replay corpus. Every `state.db` here is synthetic, built by
+//! `support::hermes`
 //! with the Hermes DDL.
 //!
 //! What the tests read of the corpus is deliberately small: it's JSON
@@ -74,7 +73,7 @@ fn imported(dir: &TestDir, state_db: &Path) -> std::path::PathBuf {
 
 // Turns.
 
-/// TIM-96, decision 1: each turn is a prefetch at the user message's time
+/// Each turn is a prefetch at the user message's time
 /// and a `sync_turn` at the final assistant reply's time. Tool rows, and
 /// the assistant rows that only call tools, are skipped.
 #[test]
@@ -131,11 +130,11 @@ fn each_turn_becomes_a_prefetch_and_a_sync_and_tool_rows_are_skipped() {
     assert!(!text.contains("TOOL-RESULT-TEXT"), "{text}");
 }
 
-/// Tim's decision on TIM-117 (Architect, 09:28): import only rows with
+/// Import only rows with
 /// `active = 1 OR compacted = 1`, key the clear on the
 /// `_compressed_summary` row, and order by timestamp, not row id.
 ///
-/// This is the shape Hermes `bfc71526` writes when a compaction carries a
+/// This is the shape Hermes writes when a compaction carries a
 /// verbatim tail: the turn before the tail is archived (`active=0,
 /// compacted=1`), the tail's originals get rewind flags (`active=0,
 /// compacted=0`), and the summary and the tail's clones are inserted as
@@ -240,7 +239,7 @@ fn a_carried_tail_replays_once_before_the_clear() {
     assert!(!text.contains("HERMES-COMPACTION-SUMMARY"), "{text}");
 }
 
-// Multimodal content (TIM-96, decision 1): Hermes stores it as `\0json:`
+// Multimodal content: Hermes stores it as `\0json:`
 // and a parts list, with the injected memory block inside a text part.
 
 /// A multimodal user row in Hermes' encoding: `parts` after the prefix.
@@ -310,7 +309,7 @@ fn the_manifest_memory_block_overrides_the_default_fence() {
     assert!(!text.contains("INJECTED-MEMORY-TEXT"), "{text}");
 }
 
-/// TIM-96, decision 1: the `[Name] ` prefix stays in the text and only picks
+/// The `[Name] ` prefix stays in the text and only picks
 /// the speaker, which is the owner unless the name is a non-owner speaker
 /// in the manifest. Backfilled history before `[New message]` is stripped
 /// the way `plugin/turns.py` strips it: up to the last marker and the
@@ -361,7 +360,7 @@ fn speakers_come_from_the_prefix_and_backfill_is_stripped() {
     assert!(!text.contains("BACKFILLED-CHANNEL-HISTORY"), "{text}");
 }
 
-/// TIM-96, decision 1: cron sessions get prefetch only, and subagent
+/// Cron sessions get prefetch only, and subagent
 /// sessions (those with a `parent_session_id`) are skipped.
 #[test]
 fn cron_sessions_get_prefetch_only_and_subagent_sessions_nothing() {
@@ -389,7 +388,7 @@ fn cron_sessions_get_prefetch_only_and_subagent_sessions_nothing() {
 
 // The schema check.
 
-/// TIM-117: the importer checks the schema it was written against and
+/// The importer checks the schema it was written against and
 /// fails loudly on a mismatch, naming what's wrong. It writes no corpus.
 #[test]
 fn a_schema_version_the_importer_wasnt_written_against_fails_the_import() {
@@ -432,7 +431,7 @@ fn a_retyped_column_fails_the_import_and_names_the_column() {
     assert!(!corpus.exists(), "a refused import writes no corpus");
 }
 
-// Privacy (TIM-96, decision 8).
+// Privacy.
 
 /// The importer never copies the system prompt or `api_content`: not into
 /// the corpus, not into its output, not into any file under the private
@@ -604,8 +603,7 @@ fn manifest_models_reach_the_corpus_header_and_its_hash() {
     assert_ne!(home, work, "a model's question changes the corpus");
 }
 
-// The TIM-117 review findings on `4ac0205` (Run D), as regressions. Each
-// names the blocker it pins.
+// Import validation and private-input handling.
 
 /// `asphodel import` with the given manifest and `state.db` paths, as
 /// they are, and the corpus to `out`.
@@ -643,7 +641,7 @@ fn assert_refused_without(output: &Output, sentinel: &str, words: &[&str]) {
     }
 }
 
-/// Blocker 1 (ADR 0010, "Logging"): a manifest that doesn't parse is
+/// (ADR 0010, "Logging"): A manifest that doesn't parse is
 /// refused naming the file and the line, never quoting it.
 #[test]
 fn a_malformed_manifest_is_refused_without_quoting_it() {
@@ -667,7 +665,7 @@ fn a_malformed_manifest_is_refused_without_quoting_it() {
     assert!(!corpus.exists());
 }
 
-/// Blocker 1: a multimodal row whose parts aren't JSON is refused without
+/// A multimodal row whose parts aren't JSON is refused without
 /// quoting the row.
 #[test]
 fn a_malformed_multimodal_row_is_refused_without_quoting_it() {
@@ -690,7 +688,7 @@ fn a_malformed_multimodal_row_is_refused_without_quoting_it() {
     assert!(!corpus.exists());
 }
 
-/// Blocker 5 (TIM-96, decision 8): the manifest and the `state.db` copy
+/// The manifest and the `state.db` copy
 /// are private, so each is refused outside the private dir, and through a
 /// symlink inside it that points outside. Nothing is read: the manifest's
 /// sentinel never appears, and no corpus is written.
@@ -733,7 +731,7 @@ fn import_inputs_outside_the_private_dir_are_refused() {
     }
 }
 
-/// TIM-117 re-review, blocker 1: a manifest that parses but repeats a
+/// A manifest that parses but repeats a
 /// model's name is refused without naming it. A model name is the
 /// manifest's, and nothing in the manifest leaves except into the corpus
 /// header.

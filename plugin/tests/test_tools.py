@@ -1,4 +1,4 @@
-"""The four tools (TIM-94, decision 9) and the owner check (decision 1)."""
+"""The four tools and the owner check."""
 
 import json
 

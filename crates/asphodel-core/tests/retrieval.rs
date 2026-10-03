@@ -1,10 +1,5 @@
-//! Retrieval, checked against "Retrieval: hybrid recall, reranking, the
-//! injection gate and the recall log" (TIM-109) and the decisions it rests
-//! on: "Retrieval and ranking" (TIM-93, its resolution and every amendment,
-//! including TIM-109's on the reranker deadline and the idle timeout), "API
-//! surface and Hermes transport" (TIM-94, decisions 6 and 9), the TIM-99
-//! amendment on the previous message, "What is a memory record?" (TIM-90,
-//! the recall log), and ADRs 0001 and 0010.
+//! Hybrid recall, reranking, injection gates and recall logs follow ADRs
+//! 0001 and 0010.
 //!
 //! The API under test is `asphodel_core::retrieval` and the `Service`
 //! methods over it: `prefetch`, `recall`, `in_context`, `clear_session` and
@@ -578,7 +573,7 @@ fn ids(recall: &Recall) -> Vec<Uuid> {
     recall.results.iter().map(|r| r.id).collect()
 }
 
-// Fusion (decision 2)
+// Fusion
 
 #[test]
 fn fusion_sums_reciprocal_ranks_with_k_60() {
@@ -609,7 +604,7 @@ fn a_repeat_within_one_list_counts_once() {
     assert_eq!(fuse(&[&[1, 1, 2], &[2]]), vec![2, 1]);
 }
 
-// Score (decision 5) and phase (decision 6)
+// Score and phase
 
 fn utc(text: &str) -> WorldTime {
     WorldTime {
@@ -696,7 +691,7 @@ fn low_window_confidence_halves_the_phase_term_in_both_directions() {
     assert!(phase(&ended, true) < 0.0);
 }
 
-// Short follow-ups (decision 8, as amended by TIM-99)
+// Short follow-ups
 
 #[test]
 fn a_message_under_eight_words_borrows_the_previous_prefetch_query() {
@@ -726,7 +721,7 @@ fn a_short_follow_up_finds_what_the_previous_query_asked_about() {
     assert_eq!(followed.injected, vec![dentist]);
 }
 
-// Retrievers and clean-up (decision 1)
+// Retrievers and clean-up
 
 #[test]
 fn the_entity_arm_finds_memories_linked_to_an_entity_the_query_names() {
@@ -801,7 +796,7 @@ fn retracted_and_hidden_memories_never_come_back() {
     assert_eq!(logged, 0);
 }
 
-// The injection gate (decisions 8 and 9)
+// The injection gate
 
 #[test]
 fn injection_gates_on_the_reranker_floor() {
@@ -902,7 +897,7 @@ fn injected_memories_are_in_score_order() {
     );
 }
 
-// The reranker deadline (decision 8, as amended by TIM-109)
+// The reranker deadline
 
 #[test]
 fn a_late_reranker_injects_nothing_and_still_logs_the_prefetch() {
@@ -936,7 +931,7 @@ fn a_late_reranker_injects_nothing_and_still_logs_the_prefetch() {
     assert!(h.in_context("s").is_empty());
 }
 
-// The injection format (decision 10)
+// The injection format
 
 #[test]
 fn the_injection_has_a_recall_time_header_and_one_line_per_memory() {
@@ -1016,7 +1011,7 @@ fn annotations_give_absolute_dates() {
     };
     // 3 October 2026 is a Saturday, and 27 September a Sunday.
     has(&format!("- {dentist} [upcoming Sat 3 Oct 15:00]"));
-    // Every annotation date carries its weekday (decision 10): 30 September
+    // Every annotation date carries its weekday: 30 September
     // 2026 is a Wednesday and 12 September a Saturday.
     has(&format!("- {passport} [overdue since Wed 30 Sep]"));
     has(&format!("- {berlin} [ended Sat 12 Sep]"));
@@ -1027,7 +1022,7 @@ fn annotations_give_absolute_dates() {
     assert!(sister_line.contains("date uncertain"), "{sister_line}");
 }
 
-// The in-context skip and per-session state (TIM-94, decision 6)
+// The in-context skip and per-session state
 
 #[test]
 fn a_committed_injection_isnt_injected_again_in_that_session() {
@@ -1051,7 +1046,7 @@ fn a_committed_injection_isnt_injected_again_in_that_session() {
 #[test]
 fn a_turn_without_a_recall_id_commits_nothing() {
     // A turn with no id can't be matched to any pending injection: syncs
-    // can arrive after the next prefetch (TIM-99), so it leaves them all
+    // can arrive after the next prefetch, so it leaves them all
     // pending, and only an echo of an injection's own id commits it.
     let h = Harness::new();
     let pottery = h.insert(fact("Tim takes a pottery class."));
@@ -1075,7 +1070,7 @@ fn a_turn_with_an_unknown_recall_id_commits_nothing() {
 
 #[test]
 fn interleaved_syncs_commit_each_acknowledged_injection() {
-    // TIM-99: a turn's sync can arrive after the next prefetch.
+    // a turn's sync can arrive after the next prefetch.
     let h = Harness::new();
     let pottery = h.insert(fact("Tim takes a pottery class."));
     let canoe = h.insert(fact("Tim paddles his canoe on Sundays."));
@@ -1096,7 +1091,7 @@ fn interleaved_syncs_commit_each_acknowledged_injection() {
 
 #[test]
 fn a_resent_turn_leaves_the_pending_injection_alone() {
-    // Ingest is idempotent (ADR 0002, TIM-90): a turn resent from the spool
+    // Ingest is idempotent (ADR 0002): a turn resent from the spool
     // or retried is a duplicate and settles nothing.
     let h = Harness::new();
     let pottery = h.insert(fact("Tim takes a pottery class."));
@@ -1172,7 +1167,7 @@ fn the_idle_timeout_is_tunable() {
     );
 }
 
-// The recall log (TIM-90) and accesses (ADR 0001)
+// The recall log and accesses (ADR 0001)
 
 #[test]
 fn a_prefetch_logs_one_row_with_what_was_injected() {
@@ -1231,7 +1226,7 @@ fn recalling_never_writes_an_access() {
     assert_eq!(found.strength, Band::Faded);
 }
 
-// Explicit recall (decision 13, TIM-94 decision 9)
+// Explicit recall
 
 #[test]
 fn a_fresh_memory_is_strong() {
@@ -1392,7 +1387,7 @@ fn a_fact_matches_a_happened_range_only_through_a_stated_start_inside_it() {
 #[test]
 fn an_open_start_reaches_back_to_any_range_before_the_end() {
     // Either end of a window can be open (CONTEXT.md), and `happened`
-    // filters the window, not when it was said (decision 4). Said on 15
+    // filters the window, not when it was said. Said on 15
     // September with an end of 12 September and no stated start, this state
     // held on 11 and 12 September.
     let h = Harness::with_floor(0.0);
@@ -1412,7 +1407,7 @@ fn an_open_start_reaches_back_to_any_range_before_the_end() {
 
 #[test]
 fn an_ended_fact_matches_a_happened_range_inside_its_window() {
-    // The start-only rule is for a fact with no window (decision 4); once a
+    // The start-only rule is for a fact with no window; once a
     // fact is ended, its window is bounded and history can find it.
     let h = Harness::with_floor(0.0);
     let acme = h.insert(Memory {
@@ -1500,7 +1495,7 @@ fn recall_returns_ten_results_unless_asked_for_up_to_thirty() {
     assert_eq!(asked(30), 30);
 }
 
-// A queued turn's in-context set (TIM-94, decision 6; ADR 0001)
+// A queued turn's in-context set (ADR 0001)
 //
 // Extraction checks a turn for use against the memories the agent could see
 // when it wrote the reply: the session's in-context set as the turn's sync

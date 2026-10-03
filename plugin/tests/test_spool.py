@@ -1,4 +1,4 @@
-"""The spool (TIM-94, decision 6; ADR 0006): one JSON file per turn under
+"""The spool (ADR 0006): one JSON file per turn under
 ``$HERMES_HOME/asphodel/spool/`` when the daemon is down, written by rename,
 replayed after the next 2xx, capped at about 10 MB or 7 days."""
 

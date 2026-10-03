@@ -1,20 +1,15 @@
-//! The strength model, phase and state confidence, checked against "Strength
-//! model, phase and state confidence as pure functions" (TIM-104) and the
-//! decisions it rests on: "Strength model: decay, reinforcement and
-//! significance" (TIM-91),
-//! "Should memories expire, and how?" (TIM-85, as amended), "What is a
-//! memory record?" (TIM-90), "Retrieval and ranking" (TIM-93), "Deletion
-//! policy" (TIM-97), and ADRs 0001, 0003, 0004 and 0008.
+//! The strength model, phase and state confidence obey ADRs 0001, 0003,
+//! 0004 and 0008.
 //!
 //! These tests exercise the production API in `asphodel_core::strength`,
-//! checking it against the tables in TIM-91, ADR 0004 and ADR 0008 and
+//! checking it against the lifetime tables and ADRs 0004 and 0008 and
 //! against their closed forms.
 //!
 //! Tolerances:
 //!
 //! - [`EXACT`] (1e-9, on the log scale strength lives on) for values worked
 //!   by hand from the formula. Each test shows the arithmetic.
-//! - [`TABLE`] (5% relative) for the rounded figures in the TIM-91 lifetimes
+//! - [`TABLE`] (5% relative) for the rounded figures in the lifetimes
 //!   table and the ADR 0008 purge table: "15 days", "2 months", "9 months",
 //!   "3 years", "12 years" and "12.5 years" are 15.09 d, 63.0 d, 262.8 d,
 //!   1096.6 d, 4576 d and 4576 d, and the worst of them is 4.5% off.
@@ -192,7 +187,7 @@ fn one_mention_days(significance: f64, threshold: f64) -> f64 {
     ((S * significance - threshold) / A).exp()
 }
 
-/// TIM-91's lifetimes table: significance, and how long one mention stays
+/// Lifetime figures: significance, and how long one mention stays
 /// in recall, in bank days.
 const LIFETIMES: [(f64, f64); 5] = [
     (0.1, 15.0),
@@ -213,7 +208,7 @@ const PURGES: [(Significance, Option<f64>, u32); 5] = [
     (Significance::Critical, None, 1),
 ];
 
-/// TIM-91's permanence figures: significance and the separate occasions
+/// Permanence figures: significance and the separate occasions
 /// that lift the floor to τ.
 const PERMANENCE: [(f64, u32); 3] = [(0.0, 18), (0.3, 8), (0.5, 4)];
 
@@ -278,7 +273,7 @@ fn a_turn_before_the_interval_speeds_up_its_start_and_later_turns_dont_count() {
     );
 }
 
-// Recent use and the lasting floor (TIM-91).
+// Recent use and the lasting floor.
 
 #[test]
 fn a_fresh_access_counts_at_the_minimum_age() {
@@ -309,7 +304,7 @@ fn an_access_made_while_fresh_fades_faster() {
 
 #[test]
 fn massed_use_spikes_then_falls_below_spaced_use() {
-    // TIM-91: 15 uses in one day against 5 uses a week apart.
+    // 15 uses in one day against 5 uses a week apart.
     let massed: Vec<_> = std::iter::once(created(0.0))
         .chain((1..15).map(|h| used(f64::from(h) / 24.0)))
         .collect();
@@ -588,7 +583,7 @@ fn a_window_that_hasnt_closed_or_isnt_known_to_have_closed_counts_everything() {
 
 #[test]
 fn a_past_appointment_comes_back_to_recall_when_its_window_closes() {
-    // TIM-85: "how did the dentist go?" works the next day. A trivial
+    // "how did the dentist go?" works the next day. A trivial
     // appointment mentioned once, 90 days ahead.
     let trivial = Significance::Trivial.value();
     let accesses = [created(0.0)];
@@ -629,7 +624,7 @@ fn a_state_used_for_three_months_stays_in_history_after_it_ends() {
     assert_near(s.value, 0.75 + floor_with(10), EXACT);
 }
 
-// Inheritance (TIM-91, decision 3).
+// Inheritance.
 
 const MAYA: i64 = 1;
 const MIA: i64 = 2;
@@ -755,7 +750,7 @@ fn nothing_is_inherited_along_ended_by() {
     assert_eq!(chain(&links, 3), BTreeSet::from([3, 4]));
 }
 
-// Time precision and phase (TIM-90, TIM-85), on world time in the source's
+// Time precision and phase, on world time in the source's
 // timezone.
 
 #[test]
@@ -905,7 +900,7 @@ fn facts_states_and_routines_without_an_end_stay_current() {
     );
 }
 
-// State confidence (TIM-91, decision 8).
+// State confidence.
 
 #[test]
 fn state_confidence_is_a_coin_flip_at_t_on_the_log_logistic_curve() {

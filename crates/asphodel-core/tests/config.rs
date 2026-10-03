@@ -1,7 +1,5 @@
-//! The configuration surface, checked against ADR 0008, ADR 0009 and the
-//! resolutions they came from: "Strength model" (TIM-91), "Retrieval and
-//! ranking" (TIM-93), "Mental models" (TIM-95, with ADR 0007), "Deletion
-//! policy" (TIM-97) and "Configuration surface" (TIM-98).
+//! Configuration validation, layering and deletion fingerprints follow ADRs
+//! 0007, 0008 and 0009.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -301,7 +299,7 @@ fn secrets_bank_identity_and_deployment_settings_are_not_tuning_keys() {
 
 #[test]
 fn delta_must_be_finite_and_not_negative() {
-    // TIM-98: δ is null or ≥ 0.
+    // δ is null or ≥ 0.
     assert_eq!(invalid_keys("[purge]\ndelta = -0.5\n"), ["purge.delta"]);
     assert_rejected("[purge]\ndelta = nan\n");
     assert_rejected("[purge]\ndelta = -inf\n");
@@ -323,7 +321,7 @@ fn quiet_rate_must_keep_bank_time_moving() {
 
 #[test]
 fn embedding_floors_must_be_cosines() {
-    // TIM-98: floors inside the model's score range.
+    // floors inside the model's score range.
     for value in ["1.5", "-1.01", "nan", "inf"] {
         assert_rejected(&format!("[reconcile.embedding_floors]\nm = {value}\n"));
     }

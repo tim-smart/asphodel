@@ -1,8 +1,7 @@
 //! `asphodel serve`'s data dir, run as a process: the store it opens there,
 //! the exclusive lock on it, and what a second daemon sees.
 //!
-//! "Store: SQLite schema, migrations and the data-dir lock" (TIM-103), from
-//! "API surface and Hermes transport" (TIM-94, decision 4): SQLite in WAL
+//! SQLite in WAL
 //! mode lives under `--data-dir`, and the daemon takes an exclusive lock on
 //! the data dir. These tests see only what an operator sees: flags, exit
 //! codes, stderr, `/v1/health` and the files in the data dir. The daemon
@@ -23,7 +22,7 @@ const STARTUP: Duration = Duration::from_secs(10);
 /// `asphodel serve` with a clean environment, so the caller's `ASPHODEL_*`
 /// variables can't leak in. It runs on the fake models with a floor for
 /// each, because the daemon loads its models before it is ready and the
-/// real ones aren't on a CI machine (TIM-105).
+/// real ones aren't on a CI machine.
 fn serve(dir: &TestDir) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
     command
@@ -179,7 +178,7 @@ impl Daemon {
 
     /// Waits for `/v1/health` to answer 200. The socket is bound before the
     /// store opens, and health answers 503 while migrations run and the
-    /// models load (TIM-94, decision 3); "asphodel listening" is logged
+    /// models load; "asphodel listening" is logged
     /// once it answers 200.
     fn wait_ready(&self) {
         let deadline = Instant::now() + STARTUP;
@@ -348,7 +347,7 @@ fn the_store_is_one_sqlite_database_in_wal_mode_under_the_data_dir() {
     let (path, header) = &files[0];
     assert_wal(path, header);
 
-    // A clean stop checkpoints the WAL (TIM-94, decision 3) and leaves the
+    // A clean stop checkpoints the WAL and leaves the
     // same database behind, still in WAL mode.
     let (status, log) = daemon.terminate();
     assert!(status.success(), "clean stop exited with {status}:\n{log}");

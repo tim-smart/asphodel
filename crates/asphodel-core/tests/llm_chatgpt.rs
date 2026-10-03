@@ -1,10 +1,7 @@
-//! The ChatGPT/Codex subscription mode of the LLM client, checked against
-//! the scope addition to "Models: local embeddings, reranker and the
-//! OpenAI-compatible LLM client" (TIM-105, comment `01a0f6c8`), "Replay
-//! harness" (TIM-96, decisions 4 and 8) and ADR 0009.
+//! The ChatGPT/Codex subscription client follows the authentication and
+//! transport contracts in ADR 0009.
 //!
-//! The protocol was read from `openai/codex` at `6b4daaf` (2026-10-01),
-//! because the Codex backend is undocumented:
+//! The protocol follows `openai/codex`; the Codex backend is undocumented:
 //!
 //! - `codex-rs/login/src/device_code_auth.rs`: the device-code login.
 //!   `POST {issuer}/api/accounts/deviceauth/usercode` with `{client_id}`
@@ -41,7 +38,7 @@
 //!   and `response.incomplete`.
 //! - `codex-rs/codex-api/src/api_bridge.rs`: a 429 whose body is
 //!   `{"error": {"type": "usage_limit_reached", "resets_at": <unix
-//!   seconds>, ...}}` is a usage limit, not a rate limit; the reset is an
+//!  seconds>,...}}` is a usage limit, not a rate limit; the reset is an
 //!   absolute time, also sent as the `x-codex-primary-reset-at` header.
 //! - `codex-rs/login/src/auth/default_client.rs`: requests carry an
 //!   `originator` header and a `User-Agent` built from it.
@@ -1119,7 +1116,7 @@ fn no_error_or_response_carries_a_token() {
     }
 }
 
-// Review regressions (PR #3 review of edd84ad). These run in the ordinary
+// Transport regressions. These run in the ordinary
 // offline suite now that the protocol fixes have landed.
 
 #[test]
@@ -1268,7 +1265,7 @@ fn a_non_json_refusal_at_any_login_step_reports_its_status() {
     }
 }
 
-// Security regressions (security review of edd84ad). These run in the
+// Security regressions. These run in the
 // ordinary offline suite now that the security fixes have landed.
 
 /// Holds the issuer's refresh reply until the test opens it, and tells the

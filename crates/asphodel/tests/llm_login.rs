@@ -1,5 +1,5 @@
 //! `asphodel llm login` and `asphodel serve` in `chatgpt` mode, run as a
-//! process (the scope addition to TIM-105, comment `01a0f6c8`).
+//! process.
 //!
 //! The owner logs in once with the device-code flow; the daemon reads the
 //! token file under the data dir and refreshes it itself. These tests see

@@ -315,7 +315,7 @@ pub fn write_cassette(dir: &TestDir, records: &[Value]) {
     fs::write(dir.private_path("cassettes/main.jsonl"), text).unwrap();
 }
 
-/// A script for the `judge_used` top-up (TIM-96, decision 4): every step
+/// A script for the `judge_used` top-up: every step
 /// judges that the reply relied on nothing.
 pub fn judge_script(dir: &TestDir) -> PathBuf {
     let steps: Vec<Value> = (0..32)
@@ -336,7 +336,7 @@ pub fn cassette_records(dir: &TestDir) -> Vec<Value> {
         .collect()
 }
 
-/// Real-history probes (TIM-96, decision 5): opaque ids, memories matched
+/// Real-history probes: opaque ids, memories matched
 /// by a regex on the sentence. Every one passes on the small history.
 pub const PASSING_PROBES: &str = r#"
 [[probe]]

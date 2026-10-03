@@ -1,8 +1,5 @@
-//! The store, checked against "Store: SQLite schema, migrations and the
-//! data-dir lock" (TIM-103) and the decisions it rests on: "What is a memory
-//! record?" (TIM-90), "Rust storage and search stack" (TIM-89), "API surface
-//! and Hermes transport" (TIM-94, decisions 4 and 7), "Mental models"
-//! (TIM-95, decisions 2 and 6), ADR 0002, ADR 0008, ADR 0009 and ADR 0010.
+//! The store contracts cover SQLite schema, migrations, locking and model
+//! identity, following ADRs 0002, 0008, 0009 and 0010.
 //!
 //! Every store here runs on a `SimulatedClock` stopped at one instant, so a
 //! stored time that equals that instant can only have come from the Clock.
@@ -133,7 +130,7 @@ fn unit(axis: usize) -> Vec<f32> {
     vector
 }
 
-// Network filesystems (TIM-94, decision 4)
+// Network filesystems
 
 #[test]
 fn nfs_smb_cifs_ceph_and_fuse_are_network_filesystems() {
@@ -215,7 +212,7 @@ fn filesystem_policy_refuses_each_network_kind_unless_overridden() {
     }
 }
 
-// The data-dir lock (TIM-94, decision 4)
+// The data-dir lock
 
 #[test]
 fn two_stores_cannot_share_a_data_dir() {
@@ -336,7 +333,7 @@ fn a_store_newer_than_the_binary_is_refused() {
 
 #[test]
 fn every_id_column_is_an_autoincrement_rowid() {
-    // TIM-90: rowids are never reused, because sqlite-vec keys vectors by
+    // rowids are never reused, because sqlite-vec keys vectors by
     // them.
     let dir = TestDir::new();
     let store = open(&dir.data(), clock());
@@ -418,7 +415,7 @@ fn rows_the_store_writes_carry_the_clocks_time() {
 
 #[test]
 fn a_memorys_content_and_kind_never_change() {
-    // TIM-90: a different claim is a new memory; everything else is
+    // a different claim is a new memory; everything else is
     // metadata that can be edited in place.
     let dir = TestDir::new();
     let clock = clock();
@@ -489,7 +486,7 @@ fn memory_content_is_searchable_with_fts5() {
 
 #[test]
 fn source_keys_make_ingest_idempotent() {
-    // ADR 0002 and TIM-90: a conflicting ingest does nothing. The key is
+    // ADR 0002: a conflicting ingest does nothing. The key is
     // bank, session, message time and content hash for a turn, and bank,
     // document id and content hash for a document.
     let dir = TestDir::new();
@@ -528,14 +525,14 @@ fn source_keys_make_ingest_idempotent() {
     };
     document("d1", main, "notes.md", "hash-a").unwrap();
     assert!(document("d2", main, "notes.md", "hash-a").is_err());
-    // Re-ingesting a document id with new content is allowed (TIM-94).
+    // Re-ingesting a document id with new content is allowed.
     document("d3", main, "notes.md", "hash-c").unwrap();
     document("d4", other, "notes.md", "hash-a").unwrap();
 }
 
 #[test]
 fn at_most_one_access_per_memory_per_turn() {
-    // TIM-90: `used` and `mentioned_again` in the same turn don't count
+    // `used` and `mentioned_again` in the same turn don't count
     // twice.
     let dir = TestDir::new();
     let clock = clock();
@@ -789,7 +786,7 @@ fn an_unrelated_tuning_change_does_not_pause_purge() {
     );
 }
 
-// Public ids (TIM-90)
+// Public ids
 
 #[test]
 fn public_ids_are_uuidv7_timed_by_the_clock() {
@@ -820,7 +817,7 @@ fn ids_minted_in_the_same_instant_are_distinct_and_ordered() {
     assert_eq!(sorted, ids, "ids minted in order don't sort in order");
 }
 
-// Vector search (TIM-89)
+// Vector search
 
 #[test]
 fn the_index_takes_384_dimensions_and_rejects_others() {
@@ -872,7 +869,7 @@ fn nearest_returns_the_closest_memory_first_with_cosine_distance() {
 #[test]
 fn nearest_past_the_knn_limit_scans_exactly() {
     // sqlite-vec refuses a KNN query for more than KNN_K_MAX neighbours, so a
-    // larger k is an exact scan (the TIM-108 re-review). It must give the
+    // larger k is an exact scan. It must give the
     // same neighbours in the same order and metric, within the bank.
     use asphodel_core::store::Neighbour;
     use asphodel_core::store::vector::KNN_K_MAX;
@@ -942,7 +939,7 @@ fn upsert_replaces_and_remove_forgets() {
 
 #[test]
 fn a_vector_commits_or_rolls_back_with_its_memory() {
-    // TIM-89: vec0 stores into shadow tables in the same file, so vectors
+    // vec0 stores into shadow tables in the same file, so vectors
     // commit or roll back atomically with the enclosing transaction.
     let dir = TestDir::new();
     let clock = clock();
@@ -977,7 +974,7 @@ fn a_vector_commits_or_rolls_back_with_its_memory() {
     assert_eq!(near[0].memory_id, memory);
 }
 
-// Bank create-or-merge (TIM-94, decision 7)
+// Bank create-or-merge
 
 fn service(dir: &TestDir) -> Service {
     let clock = clock();
@@ -1007,8 +1004,8 @@ fn creating_a_bank_seeds_user_assistant_and_the_profile() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    // TIM-92: the names are the first aliases; the seeded assistant has
-    // type `thing`. TIM-94: the owner is a person.
+    // the names are the first aliases; the seeded assistant has
+    // type `thing`. the owner is a person.
     assert_eq!(
         entities,
         [
@@ -1040,7 +1037,7 @@ fn creating_a_bank_seeds_user_assistant_and_the_profile() {
         ]
     );
 
-    // TIM-95, decision 2: only "User profile" is seeded, enabled, at the
+    // only "User profile" is seeded, enabled, at the
     // tuned budget.
     let (name, max_tokens, enabled): (String, i64, i64) = conn
         .query_row(
@@ -1151,7 +1148,7 @@ fn renaming_adds_an_alias_and_removes_none() {
 
 #[test]
 fn the_profile_is_seeded_on_create_only() {
-    // TIM-95, decision 2: an owner who deletes it doesn't get it back on
+    // an owner who deletes it doesn't get it back on
     // the next Hermes start.
     let dir = TestDir::new();
     let service = service(&dir);
@@ -1174,7 +1171,7 @@ fn the_profile_is_seeded_on_create_only() {
 
 #[test]
 fn models_are_recorded_at_creation_and_merge_does_not_change_them() {
-    // TIM-94, decision 4: a bank records its model ids. ADR 0010: changing
+    // a bank records its model ids. ADR 0010: changing
     // them is `asphodel reembed`, not a config merge.
     let dir = TestDir::new();
     let service = service(&dir);
@@ -1214,13 +1211,13 @@ fn an_unknown_timezone_or_empty_name_creates_nothing() {
     assert_eq!(count(&conn, "SELECT count(*) FROM edits"), 0);
 }
 
-// Review regressions (TIM-103 review through c157b84)
+// Regressions
 
 #[test]
 fn the_seeded_profile_takes_facts_and_slow_states() {
-    // TIM-95, decision 3: the profile takes facts, plus states with
-    // volatility of weeks or slower, and null volatility passes. Decision 2
-    // makes those the model's own filters, not words in its question.
+    // the profile takes facts, plus states with
+    // volatility of weeks or slower, and null volatility passes.
+    // These are the model's own filters, not words in its question.
     let dir = TestDir::new();
     let service = service(&dir);
     service.ensure_bank("main", &identity(), &models()).unwrap();
@@ -1245,7 +1242,7 @@ fn the_seeded_profile_takes_facts_and_slow_states() {
 #[test]
 fn merge_leaves_the_profiles_filters_alone() {
     // An owner edit to a model's filters survives every later
-    // `PUT /v1/banks/{bank}` (TIM-94, decision 7; TIM-95, decision 2).
+    // `PUT /v1/banks/{bank}`.
     let dir = TestDir::new();
     let service = service(&dir);
     service.ensure_bank("main", &identity(), &models()).unwrap();
@@ -1278,7 +1275,7 @@ fn merge_leaves_the_profiles_filters_alone() {
 
 #[test]
 fn a_deleted_memory_takes_its_citations_and_leaves_the_entry() {
-    // TIM-95, decision 6: forget and purge delete the memory row, the
+    // forget and purge delete the memory row, the
     // cascade removes its citations, and code drops the entry. The entry
     // has to survive the cascade for code to see what it cited.
     let dir = TestDir::new();

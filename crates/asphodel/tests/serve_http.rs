@@ -1,16 +1,13 @@
 //! The daemon over HTTP, and the CLI as its client, run as processes.
 //!
-//! "HTTP API and the CLI as its client" (TIM-110), from "API surface and
-//! Hermes transport" (TIM-94, decisions 2, 3 and 10) and ADR 0006: the
-//! routes under `/v1`, the bearer token off loopback, `/v1/health` answering
+//! Under ADR 0006, the HTTP contract includes routes under `/v1`,
+//! the bearer token off loopback, `/v1/health` answering
 //! 503 until the store and models are ready, SIGTERM finishing the chunk in
 //! flight and checkpointing the WAL, and every CLI subcommand reaching the
-//! daemon over `--url`. "Agenda, mental models and the system prompt block"
-//! (TIM-111) adds the model routes, `/system-prompt`, `/agenda` and
-//! `asphodel model`. "Erase path, forget, purge and the nightly sweep"
-//! (TIM-112) adds `forget`, `/v1/purge/plan` and `/v1/purge/ack`, and
-//! `asphodel forget` and `asphodel purge plan|ack`. "Operations: backup,
-//! restore, status and audit lists" (TIM-114) adds `/v1/backup`,
+//! daemon over `--url`. The tests also cover the model routes,
+//! `/system-prompt`, `/agenda` and `asphodel model`; `forget`,
+//! `/v1/purge/plan`, `/v1/purge/ack`, `asphodel forget` and
+//! `asphodel purge plan|ack`; and `/v1/backup`,
 //! `/v1/status` and the audit lists, `asphodel backup`, `status` and the
 //! list commands, and the offline `asphodel restore`.
 //!
@@ -572,7 +569,7 @@ fn position(log: &str, pattern: &str) -> usize {
         .unwrap_or_else(|| panic!("no {pattern:?} in the log:\n{log}"))
 }
 
-// Health and readiness (TIM-94, decision 3).
+// Health and readiness.
 
 #[test]
 fn health_is_503_until_the_store_has_migrated_and_the_models_have_loaded() {
@@ -638,7 +635,7 @@ fn a_daemon_that_fails_to_start_after_binding_exits_and_removes_its_socket() {
     assert_eq!(first.get("/v1/health").status, 200);
 }
 
-// The bearer token (TIM-94, decision 2).
+// The bearer token.
 
 #[test]
 fn off_loopback_every_route_but_health_needs_the_bearer_token() {
@@ -843,7 +840,7 @@ fn errors_are_json_with_the_right_status() {
     }
 }
 
-// SIGTERM (TIM-94, decision 3).
+// SIGTERM.
 
 #[test]
 fn sigterm_refuses_ingest_finishes_the_chunk_in_flight_and_checkpoints() {
@@ -1094,8 +1091,7 @@ fn the_cli_reaches_a_tcp_daemon_with_the_token_from_the_environment() {
     assert!(!output.status.success(), "--token was accepted");
 }
 
-// Mental models and the system prompt block (TIM-111; TIM-95, decisions 2,
-// 4, 7 and 8; TIM-94, decision 8).
+// Mental models and the system prompt block.
 
 /// A refresh reply adding one entry citing the first memory in its input.
 fn adds_entry(text: &str) -> Value {
@@ -1218,8 +1214,7 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     );
 }
 
-// Forget and the purge pause (TIM-112; TIM-94, decision 9, as amended by
-// TIM-97; ADR 0009; ADR 0010).
+// Forget and the purge pause (ADR 0009; ADR 0010).
 
 #[test]
 fn forget_erases_over_http_and_the_cli() {
@@ -1339,7 +1334,7 @@ fn a_changed_fingerprint_pauses_purge_until_the_cli_acks_the_running_hash() {
 
 #[test]
 fn a_ready_erase_runs_after_a_restart_without_an_llm() {
-    // Review finding 5 on TIM-112. The forget arrives while a chunk queued
+    // The forget arrives while a chunk queued
     // before it is in flight, so its erase waits. SIGTERM lets that chunk
     // finish and stops the worker before the erase runs. Restarted with no
     // LLM there's no worker, but the erase is ready and must still run.
@@ -1380,30 +1375,30 @@ fn a_ready_erase_runs_after_a_restart_without_an_llm() {
     second.wait_for_line("erased a chain");
 }
 
-// Backup, restore, status and the audit lists (TIM-114; TIM-99, decisions 1,
-// 6 and 7; ADR 0010, "Backup and restore" and "Sweeps, pauses and failures").
+// Backup, restore, status and the audit lists (ADR 0010,
+// "Backup and restore" and "Sweeps, pauses and failures").
 //
 // The contract these tests pin, beyond what the ADR says:
 //
 // - `POST /v1/backup` answers 200 with the copy as its body and the
-//   copy's SHA-256 (lowercase hex) and length in bytes in
-//   `SHA256_HEADER` and `LENGTH_HEADER`, and leaves no temporary file in
-//   the data dir. It needs the bearer token like every route but health.
+// copy's SHA-256 (lowercase hex) and length in bytes in
+// `SHA256_HEADER` and `LENGTH_HEADER`, and leaves no temporary file in
+// the data dir. It needs the bearer token like every route but health.
 // - `asphodel backup --out <file|->` fails, and leaves nothing at `<file>`,
-//   when the stream is cut short, its length or hash doesn't match the
-//   headers, or, for a file, the copy fails `PRAGMA integrity_check`.
+// when the stream is cut short, its length or hash doesn't match the
+// headers, or, for a file, the copy fails `PRAGMA integrity_check`.
 // - `asphodel restore <file> --data-dir <dir>` keeps the old database (and
-//   its WAL) in the data dir under another name, and writes a daemon-wide
-//   `restored` edit row whose details hold `backed_up_at`, `restored_at`
-//   and `binary_version`. The backup time has to travel inside the copy,
-//   since the stream reaches the restore through pipes.
+// its WAL) in the data dir under another name, and writes a daemon-wide
+// `restored` edit row whose details hold `backed_up_at`, `restored_at`
+// and `binary_version`. The backup time has to travel inside the copy,
+// since the stream reaches the restore through pipes.
 // - `GET /v1/status` holds `attention` (an array, empty when nothing needs
-//   it), `last_backup_at`, `last_sweep`, `pre_migration_copy` and
-//   `banks.<bank>.{queued, failed_chunks, failed_refreshes}`. `asphodel
-//   status` prints it, and exits non-zero whenever `attention` isn't empty,
-//   with `--json` too.
+// it), `last_backup_at`, `last_sweep`, `pre_migration_copy` and
+// `banks.<bank>.{queued, failed_chunks, failed_refreshes}`. `asphodel
+// status` prints it, and exits non-zero whenever `attention` isn't empty,
+// with `--json` too.
 // - `GET /v1/banks/{bank}/{purges,forgets,sweeps,recalls}` answer
-//   `{"<list>": [...]}`, and `asphodel <list> --bank <bank>` prints them.
+// `{"<list>": [...]}`, and `asphodel <list> --bank <bank>` prints them.
 
 /// The response header holding the backup's SHA-256, as lowercase hex.
 const SHA256_HEADER: &str = "asphodel-sha256";

@@ -1,4 +1,4 @@
-//! The TIM-117 review's lock gap, as regressions. A prepared chunk is
+//! Lock-gap regressions. A prepared chunk is
 //! committed while the sweep purges one of its neighbours at the last
 //! moment before the commit takes the store for its writes, through the
 //! [`super::gap`] hook. The commit must plan against the store it writes

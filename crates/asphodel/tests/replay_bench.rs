@@ -1,7 +1,7 @@
 //! `asphodel bench`: concurrent prefetches over HTTP against a daemon
 //! started on a copy of the replayed store, to see how the reranker
-//! deadline behaves under contention ("Replay harness", TIM-96, decision
-//! 3; TIM-117's scope). The store is the one a `live` run on the synthetic
+//! deadline behaves under contention. The store is the one a `live` run
+//! on the synthetic
 //! history leaves under the private dir.
 
 mod support;
@@ -61,7 +61,7 @@ fn bench_runs_on_a_copy_of_the_replayed_store() {
     }
 }
 
-/// The bench daemon listens on loopback only (TIM-96, decision 3). The
+/// The bench daemon listens on loopback only. The
 /// address is checked before anything else, so no store is needed.
 #[test]
 fn bench_refuses_a_listen_address_off_loopback() {
@@ -75,7 +75,7 @@ fn bench_refuses_a_listen_address_off_loopback() {
 }
 
 /// The bench runs only on a copy of a store replay made, never on any
-/// other (TIM-96, decision 3; TIM-99).
+/// other.
 #[test]
 fn bench_refuses_a_private_dir_without_a_replayed_store() {
     let dir = TestDir::new();

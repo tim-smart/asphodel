@@ -1,9 +1,5 @@
-//! The local models and the LLM client, checked against "Models: local
-//! embeddings, reranker and the OpenAI-compatible LLM client" (TIM-105) and
-//! the decisions it rests on: "Rust storage and search stack" (TIM-89),
-//! "Retrieval and ranking" (TIM-93, decision 3), "API surface and Hermes
-//! transport" (TIM-94, decision 4, as amended by TIM-99), "Replay harness"
-//! (TIM-96, decision 4), "Configuration surface" (TIM-98) and ADR 0009.
+//! Local embedding and reranking models and the OpenAI-compatible LLM client
+//! follow the loading and transport contracts in ADR 0009.
 //!
 //! Nothing here touches the network. The OpenAI-compatible client is tested
 //! against [`StubServer`], a loopback HTTP/1.1 server in this file, and the
@@ -369,7 +365,7 @@ fn serve_one(mut stream: TcpStream, response: StubResponse, log: &Mutex<Vec<Stub
     let _ = stream.flush();
 }
 
-// The model dir (TIM-94, decision 4; TIM-98 deployment).
+// The model dir.
 
 #[test]
 fn the_model_dir_is_the_override_then_the_xdg_cache_then_home() {
@@ -395,7 +391,7 @@ fn the_model_dir_is_the_override_then_the_xdg_cache_then_home() {
     }
 }
 
-// `asphodel models fetch` (TIM-94, decision 4).
+// `asphodel models fetch`.
 
 #[test]
 fn fetch_fills_an_empty_dir_and_checks_every_file() {
@@ -567,7 +563,7 @@ fn a_corrupt_file_fails_before_onnx_runtime_is_touched() {
     );
 }
 
-// The fakes (TIM-96, decision 2).
+// The fakes.
 
 #[test]
 fn the_fake_embedder_is_deterministic_unit_length_and_384_wide() {
@@ -664,7 +660,7 @@ fn a_missing_floor_for_a_loaded_model_stops_the_service_opening() {
 
 #[test]
 fn a_new_bank_records_the_loaded_models() {
-    // TIM-94, decision 4: a bank records its embedding and reranker model
+    // a bank records its embedding and reranker model
     // ids. They come from what's loaded, not from the caller.
     let dir = TestDir::new();
     let service = Service::with_models(
@@ -682,7 +678,7 @@ fn a_new_bank_records_the_loaded_models() {
     assert_eq!(bank.reranker_model, FakeReranker::MODEL_ID);
 
     // A merge leaves the recorded ids alone: a change goes through
-    // `asphodel reembed` (TIM-99), never through bank config.
+    // `asphodel reembed`, never through bank config.
     let again = service
         .ensure_bank_with_models(
             "tim",
@@ -847,7 +843,7 @@ fn content_that_is_not_json_is_an_error_that_carries_only_its_size() {
         "{error:?}"
     );
     assert!(!error.is_retryable());
-    // TIM-96, decision 8: no content in logs. The reply is Tim's data.
+    // no content in logs. The reply is Tim's data.
     let shown = format!("{error} {error:?}");
     assert!(!shown.contains("Wellington"), "{shown}");
 }
@@ -1009,7 +1005,7 @@ fn real_models_embed_and_rerank() {
     let near = cosine(&vectors[0], &vectors[1]);
     let far = cosine(&vectors[0], &vectors[2]);
     assert!(near > far, "near {near} far {far}");
-    // bge-small scores even unrelated pairs at 0.6 or more (TIM-93), so the
+    // bge-small scores even unrelated pairs at 0.6 or more, so the
     // check is on the gap, not an absolute.
     assert!(near - far > 0.1, "near {near} far {far}");
     // Deterministic across calls and batches.

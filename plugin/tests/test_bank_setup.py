@@ -1,5 +1,5 @@
-"""Bank setup that ``initialize`` couldn't finish (TIM-94, decision 3; ADR
-0010): until a ``PUT`` succeeds, every bank operation retries it first and
+"""Bank setup that ``initialize`` couldn't finish (ADR 0010): until a ``PUT``
+succeeds, every bank operation retries it first and
 turns are spooled, not dropped. Once the bank exists, a 404 never recreates
 it: ``bank delete`` expects the plugin to be disabled first."""
 
@@ -49,7 +49,7 @@ def test_a_404_after_setup_does_not_recreate_the_bank(make_provider, daemon, her
     assert spooled(hermes_home) == []
 
 
-# -- a delayed setup shares the hook's budget (TIM-94, decisions 5 and 8) -------------
+# -- a delayed setup shares the hook's budget -------------------------------------
 
 
 def _recover_slowly(make_provider, daemon, *, put_delay, route, route_delay):

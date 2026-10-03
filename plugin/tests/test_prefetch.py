@@ -1,6 +1,5 @@
-"""``prefetch`` and ``recall_status`` (TIM-94, decisions 5 and 6; TIM-99
-amendment): the body, the previous query, the pending ``recall_id``, the 3 s
-budget and "" on every failure."""
+"""``prefetch`` and ``recall_status``: the body, the previous query, the
+pending ``recall_id``, the 3 s budget and "" on every failure."""
 
 from conftest import SESSION
 from fake_daemon import INJECTION
@@ -56,7 +55,7 @@ def test_gives_up_at_the_budget(make_provider, daemon, clock):
 
 
 def test_sends_a_pending_block_id_once_when_the_block_had_no_session(make_provider, daemon):
-    """TIM-95 decision 4 fallback: a block fetched before the session id was
+    """Session fallback: a block fetched before the session id was
     known is mapped through the session's first prefetch."""
     provider = make_provider(init={"session_id": ""})
     provider.system_prompt_block()

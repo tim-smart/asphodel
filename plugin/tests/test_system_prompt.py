@@ -1,4 +1,4 @@
-"""``system_prompt_block`` (TIM-94, decision 8; TIM-95 decision 4): the GET
+"""``system_prompt_block``: the GET
 carries the session id, the budget is 2 s with one retry, and a miss is ""."""
 
 from conftest import SESSION

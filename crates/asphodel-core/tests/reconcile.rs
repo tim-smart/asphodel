@@ -1,11 +1,5 @@
-//! Reconciliation (call 2), checked against "Reconciliation: neighbour
-//! search, labels and supersession" (TIM-108) and the decisions it rests on:
-//! "Extraction: significance, validity windows and supersession" (TIM-92,
-//! round 1, the resolution and the TIM-97 amendment), "Strength model:
-//! decay, reinforcement and significance" (TIM-91, decisions 2 and 3),
-//! "Mental models" (TIM-95, decision 6), "What is a memory record?" (TIM-90,
-//! ended, retracted and refined, and the access log), and ADRs 0001, 0003
-//! and 0005.
+//! Reconciliation (call 2) contracts cover neighbour search, labels,
+//! supersession and accesses, following ADRs 0001, 0003 and 0005.
 //!
 //! These are golden tests against `FakeLlm`: each scripts call 1's reply and
 //! then call 2's, and checks what's committed, or checks the input and
@@ -1015,7 +1009,7 @@ fn a_neighbour_above_the_floor_runs_call_2() {
     assert_eq!(neighbour.observed_at, at(EARLIER));
     assert!(!neighbour.ended);
 
-    // A claim with no labels is new (TIM-92).
+    // A claim with no labels is new.
     let extracted = reconcile(&h, call1, call2_reply(vec![]));
     assert_eq!(extracted.memories.len(), 1);
     assert_eq!(h.content(extracted.memories[0]), TEA_AGAIN);
@@ -1064,7 +1058,7 @@ fn a_flagged_claim_sees_open_tasks_and_current_states_of_its_entities() {
     assert_eq!(call2(&h, &reply(vec![travel.clone()])), None);
 
     // A claim that changes something gets the wider set: the open tasks and
-    // current states linked to its entities (TIM-92).
+    // current states linked to its entities.
     let input = call2(&h, &reply(vec![changes(travel.clone())])).expect("call 2 runs");
     assert!(input.claims[0].flagged);
     let found = shown_for(&input, 0);
@@ -1286,7 +1280,7 @@ fn the_request_is_the_input_and_the_call_2_schema() {
     assert!(request.user.contains(TEA_AGAIN));
     assert!(request.user.contains(TEA));
     assert!(request.user.contains(&neighbour_handle(&input, tea)));
-    // The six labels of the TIM-92 amendment, `denies` among them. Code
+    // The six reconciliation labels, `denies` among them. Code
     // decides direction from observed_at, so the prompt never asks the LLM
     // which of the two is newer (ADR 0005).
     let labels: BTreeSet<&str> = request.schema["properties"]["claims"]["items"]["properties"]
@@ -1326,7 +1320,7 @@ fn mentioned_again_writes_an_access_and_no_memory() {
     assert!(extracted.memories.is_empty());
     assert_eq!(h.memories_in("main"), 1);
     // At the source's ingested_at and turn, like every access extraction
-    // writes (TIM-92).
+    // writes.
     assert_eq!(
         h.accesses(tea),
         vec![
@@ -1438,7 +1432,7 @@ fn mentioned_again_raises_significance_to_the_larger() {
         ]),
     );
 
-    // TIM-92: the larger of the existing and the new score, logged.
+    // the larger of the existing and the new score, logged.
     assert_eq!(h.significance(tea), ("notable".into(), None));
     assert_eq!(h.edits_on(tea, EDIT_SIGNIFICANCE_RAISED), 1);
     // A weaker mention never lowers it, and there's nothing to log.
@@ -1471,7 +1465,7 @@ fn mentioned_again_never_changes_a_significance_the_owner_set() {
 
 #[test]
 fn remember_this_on_a_mention_keeps_the_neighbour() {
-    // TIM-92: remember-this goes on the neighbour when the label is
+    // remember-this goes on the neighbour when the label is
     // mentioned again or confirmed, and only from the owner's own message.
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -1537,8 +1531,8 @@ fn a_reschedule_retracts_the_old_appointment() {
     let new = extracted.memories[0];
     assert_eq!(h.content(new), DENTIST_9);
     assert_eq!(h.valid_from(new), timed(local("2026-10-09T00:00"), "day"));
-    // TIM-90: a reschedule is a retraction, which sets invalidated_at (to
-    // the retracting claim's observed_at, TIM-92) and superseded_by, and
+    // a reschedule is a retraction, which sets invalidated_at (to
+    // the retracting claim's observed_at) and superseded_by, and
     // leaves the old window alone.
     assert_eq!(
         h.change(old),
@@ -1575,7 +1569,7 @@ fn a_refinement_supersedes_without_retracting() {
     );
 
     let tokyo = extracted.memories[0];
-    // TIM-90: refined sets superseded_by only. The old one wasn't wrong.
+    // refined sets superseded_by only. The old one wasn't wrong.
     assert_eq!(
         h.change(japan),
         Change {
@@ -1584,7 +1578,7 @@ fn a_refinement_supersedes_without_retracting() {
         }
     );
     assert_eq!(h.edits_on(japan, EDIT_REFINED), 1);
-    // TIM-92: on refines, remember-this goes on the new memory.
+    // on refines, remember-this goes on the new memory.
     assert_eq!(
         h.significance(tokyo),
         ("notable".into(), Some("kept".into()))
@@ -1615,7 +1609,7 @@ fn an_ending_sets_valid_until_and_ended_by() {
     );
 
     let moved = extracted.memories[0];
-    // TIM-92: valid_until is the ending memory's valid_from, with its
+    // valid_until is the ending memory's valid_from, with its
     // precision. Ended isn't retracted or superseded: Berlin stays in
     // history and inherits nothing.
     assert_eq!(
@@ -1633,7 +1627,7 @@ fn an_ending_sets_valid_until_and_ended_by() {
 
 #[test]
 fn an_ending_with_no_start_ends_on_the_day_it_was_said_with_low_confidence() {
-    // TIM-92: with no start on the ending memory, valid_until is its
+    // with no start on the ending memory, valid_until is its
     // observed_at with low window confidence. It's at day precision, like an
     // event with no stated time, so the instant is the start of
     // that day in the source's timezone.
@@ -1665,7 +1659,7 @@ fn an_ending_with_no_start_ends_on_the_day_it_was_said_with_low_confidence() {
 
 #[test]
 fn maya_corrected_to_mia_keeps_the_strength_maya_had() {
-    // TIM-91 decision 3: a successor inherits every access along
+    // a successor inherits every access along
     // superseded_by, so correcting the name keeps the corrected one as
     // strong as the wrong one was.
     let h = Harness::new();
@@ -1726,7 +1720,7 @@ fn maya_corrected_to_mia_keeps_the_strength_maya_had() {
 
 #[test]
 fn labels_on_an_ended_neighbour_are_rejected() {
-    // TIM-92: code rejects any label on a neighbour that's already ended. A
+    // code rejects any label on a neighbour that's already ended. A
     // claim left with no labels is new.
     let h = Harness::new();
     let acme = h.fact(ACME);
@@ -1781,7 +1775,7 @@ fn a_label_on_an_unknown_neighbour_is_ignored() {
 fn an_older_claim_arriving_after_a_newer_one_is_created_already_ended() {
     // ADR 0005: code, not the LLM, decides which is newer, so an old
     // document can't overrule a newer memory. An older claim labelled ends
-    // is created ended by the neighbour (TIM-92).
+    // is created ended by the neighbour.
     let h = Harness::new();
     let lisbon = h.fact(LISBON);
     h.set_observed_at(lisbon, at("2026-09-20T00:00:00Z"));
@@ -1814,8 +1808,8 @@ fn an_older_claim_arriving_after_a_newer_one_is_created_already_ended() {
 #[test]
 fn an_older_claim_ending_a_neighbour_with_no_start_ends_at_its_observed_at() {
     // The neighbour has no start, so the older claim ends where the
-    // neighbour was said, with low confidence (TIM-92, "this applies in both
-    // directions"). It's at day precision, as for a newer claim.
+    // neighbour was said, with low confidence in both
+    // directions. It's at day precision, as for a newer claim.
     let h = Harness::new();
     let lisbon = h.fact(LISBON);
     h.set_observed_at(lisbon, local("2026-09-20T09:00"));
@@ -1910,7 +1904,7 @@ fn an_older_mention_writes_its_access_even_on_an_ended_neighbour() {
 
 #[test]
 fn a_tie_on_observed_at_goes_to_the_later_ingest() {
-    // TIM-92: ties on observed_at are broken by the later ingested_at, then
+    // ties on observed_at are broken by the later ingested_at, then
     // rowid. The fixture's source was ingested an hour before the turn, so
     // the claim is the newer and ends the neighbour.
     let h = Harness::new();
@@ -1930,7 +1924,7 @@ fn a_tie_on_observed_at_goes_to_the_later_ingest() {
     )
     .memories[0];
     assert_eq!(h.change(berlin).ended_by, Some(moved));
-    // TIM-92: an event with no stated time starts on the day it was said,
+    // an event with no stated time starts on the day it was said,
     // with low window confidence. Nothing ends or supersedes it.
     assert_eq!(
         h.change(moved),
@@ -1945,7 +1939,7 @@ fn a_tie_on_observed_at_goes_to_the_later_ingest() {
 
 #[test]
 fn a_later_version_of_a_document_doesnt_reinforce_itself() {
-    // TIM-92: when the neighbour comes from an earlier version of the same
+    // when the neighbour comes from an earlier version of the same
     // document id, mentioned again and confirmed write no access.
     let h = Harness::new();
     ingest_doc(
@@ -1982,7 +1976,7 @@ fn a_later_version_of_a_document_doesnt_reinforce_itself() {
 
 #[test]
 fn a_correction_of_another_kind_still_repoints_the_end() {
-    // TIM-92, "Reopening": with a successor, ended_by is repointed. The
+    // with a successor, ended_by is repointed. The
     // correction below is filed as a fact rather than an event, but it still
     // supersedes the memory that ended the task, so it is a successor and
     // the task stays ended.
@@ -2032,8 +2026,7 @@ fn a_correction_of_another_kind_still_repoints_the_end() {
     assert_eq!(h.all_edits_on(task), 1);
 }
 
-// Denials (the TIM-92 amendment from TIM-108: six labels, and reopening by
-// label).
+// Denials and reopening by label.
 
 /// A task and a state that `Tim filed the tax return.` (1 October) ended, as
 /// an earlier reconciliation would have left them, and a turn on 2 October
@@ -2092,7 +2085,7 @@ fn a_denial_reopens_everything_its_neighbour_ended() {
 
 #[test]
 fn a_refinement_of_an_ender_repoints_what_it_ended() {
-    // The amendment repoints ends for a `refines` successor as for a
+    // Reconciliation repoints ends for a `refines` successor as for a
     // `retracts` one: the refined filing still completed the task.
     let h = Harness::new();
     let (task, worry, filed) = filed_and_ended(&h, "I filed the tax return online.");
@@ -2215,8 +2208,7 @@ fn denies_on_an_ended_or_retracted_neighbour_is_rejected() {
     assert_eq!(h.edits_on(dentist, EDIT_RETRACTED), 1);
 }
 
-// A forget's queued chunks (ADR 0010; "Erase path, forget, purge and the
-// nightly sweep", TIM-112). Forget hides the chain at once and erases it
+// A forget's queued chunks (ADR 0010). Forget hides the chain at once and erases it
 // behind the chunks already queued. Those chunks reconcile against the
 // hidden memory, which is still there, so what they say joins its chain
 // and is erased with it. `hidden_at` is set here as forget sets it.
@@ -2288,7 +2280,7 @@ fn a_mention_queued_before_a_forget_is_an_access_on_the_hidden_memory() {
 
 #[test]
 fn a_refinement_moves_mental_model_citations_to_the_head() {
-    // TIM-95 decision 6: reconcile moves a citation of a refined memory to
+    // reconcile moves a citation of a refined memory to
     // the head of its chain, where its accesses are inherited.
     let h = Harness::new();
     let japan = h.insert_memory("main", JAPAN, "event", "notable");
@@ -2554,7 +2546,7 @@ fn a_failed_search_is_counted_and_writes_nothing() {
 #[test]
 fn a_search_that_keeps_failing_fails_the_chunk_and_the_queue_moves_on() {
     // A fault that recurs reaches the retry cap rather than holding the
-    // bank's queue (TIM-92: "after a capped number of failures, the chunk is
+    // bank's queue ("after a capped number of failures, the chunk is
     // marked failed and surfaced instead of retried").
     let h = Harness::new();
     h.fact(TEA);
@@ -2660,7 +2652,7 @@ fn a_failed_call_2_keeps_call_1s_reply_for_the_retry_and_drops_it_on_commit() {
     assert_eq!(error.failure(), Some(Failure::Retry { error_count: 1 }));
 
     // Nothing committed but the count, and call 1's reply is saved so the
-    // retry resumes from it (TIM-92).
+    // retry resumes from it.
     let chunk = lease(&h, "main").chunk;
     assert_eq!(h.memories_in("main"), 1);
     assert_eq!(h.accesses(tea), vec![Harness::fixture_access()]);
@@ -2687,7 +2679,7 @@ fn a_failed_call_2_keeps_call_1s_reply_for_the_retry_and_drops_it_on_commit() {
     assert!(extracted.memories.is_empty());
     assert_eq!(h.accesses(tea).len(), 2);
 
-    // TIM-97: the saved reply goes when the chunk commits, so the claim text
+    // the saved reply goes when the chunk commits, so the claim text
     // can't outlive a purge or forget in the chunk row.
     let saved: Option<String> = h.chunk_column(extracted.chunk, "call1_output");
     assert_eq!(saved, None);

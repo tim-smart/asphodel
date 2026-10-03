@@ -1,7 +1,5 @@
-//! "No timestamp comes from SQLite's clock" (TIM-103). "What is a memory
-//! record?" (TIM-90) put it as: the schema never takes a timestamp from the
-//! database clock, and every time comes through a clock the replay harness
-//! can swap out.
+//! The schema never takes a timestamp from the database clock. Every time
+//! comes through a clock the replay harness can swap out.
 //!
 //! `clippy.toml` already denies the Rust wall-clock calls. This closes the
 //! other door: SQL that asks SQLite for the time, whether as a column default

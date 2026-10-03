@@ -1,11 +1,5 @@
-//! Ingest, checked against "Ingest: sources, chunking, secret scanning and
-//! the extraction queue" (TIM-106) and the decisions it rests on: "What is a
-//! memory record?" (TIM-90, sources), "Extraction: significance, validity
-//! windows and supersession" (TIM-92, inputs, documents and chunks, edited
-//! documents, other decision 1), "API surface and Hermes transport" (TIM-94,
-//! decisions 1 and 5), "Replay harness" (TIM-96, the `[New message]`
-//! amendment), "Operations" (TIM-99, decision 2), "Configuration surface"
-//! (TIM-98, the extraction constants), and ADRs 0002 and 0010.
+//! Source ingest, chunking, secret scanning and the extraction queue follow
+//! ADRs 0002 and 0010.
 //!
 //! The API under test is `asphodel_core::{ingest, chunking, secrets,
 //! queue}`, the extraction constants and the `Service` methods over them.
@@ -391,7 +385,7 @@ fn sentence_with(kind: SecretKind, seed: usize) -> (String, String) {
     (text, secret)
 }
 
-// Secret scanning (ADR 0002; TIM-92, other decision 1)
+// Secret scanning (ADR 0002)
 
 #[test]
 fn every_kind_is_found_and_redacted_in_place() {
@@ -401,7 +395,7 @@ fn every_kind_is_found_and_redacted_in_place() {
         assert_eq!(found.kinds, BTreeSet::from([kind]), "{kind:?}");
         assert!(!found.text.contains(&secret), "{kind:?} is gone");
         assert!(found.text.contains(&kind.marker()), "{kind:?}'s marker");
-        // TIM-92: "redacted in place with a marker that names the pattern kind".
+        // "redacted in place with a marker that names the pattern kind".
         assert!(
             kind.marker().contains(kind.as_str()),
             "{kind:?}'s marker names it"
@@ -458,7 +452,7 @@ fn every_match_is_redacted_and_each_kind_is_recorded_once() {
 fn ordinary_text_is_left_alone() {
     // Over-redaction loses memories, so the patterns are specific.
     let text = "Commit 9f1c2d3e4b5a69788796a5b4c3d2e1f0a9b8c7d6 fixed task-list sorting.\n\
-                Ticket 01a0f5ff-97b0-7689-bda0-3390158c3c2d is done.\n\
+                Record 12345678-1234-7234-8234-123456789abc is complete.\n\
                 See https://example.com/docs?page=2 and ssh://git@github.com/tim/asphodel.\n\
                 AKIA is a prefix; sk- is a prefix; eyJ is a prefix.\n\
                 Meet at 10:30 on 2026-10-03, password reset by Friday.";
@@ -484,7 +478,7 @@ fn a_scan_of_redacted_text_finds_nothing_more() {
     assert_eq!(twice.text, once.text);
 }
 
-// Chunking (TIM-92, documents and chunks)
+// Chunking
 
 /// Every chunk's text is its range of the document, the ranges are in order
 /// and don't overlap, and every non-whitespace character is in one.
@@ -600,7 +594,7 @@ fn one_paragraph_over_the_budget_is_still_split() {
 
 #[test]
 fn offsets_count_characters_not_bytes() {
-    // TIM-90: memories point into their source by character offsets.
+    // memories point into their source by character offsets.
     let text = "# Café ☕\n\nNaïve résumé.\n\n# Über\n\nGrüße aus Köln. 🌧️\n";
     let chunks = split_document(text);
     assert_eq!(chunks.len(), 2);
@@ -649,7 +643,7 @@ fn a_chunk_hash_covers_its_text_and_heading_path() {
     );
 }
 
-// Turns (TIM-90 sources; TIM-94 decision 5)
+// Turns
 
 #[test]
 fn a_turn_is_stored_verbatim_with_its_provenance() {
@@ -683,7 +677,7 @@ fn a_turn_is_stored_verbatim_with_its_provenance() {
     assert_eq!(
         h.source_column::<String>(source, "text"),
         "[Sam] I'm flying to Berlin on 3 October.",
-        "the speaker prefix stays (TIM-96)"
+        "the speaker prefix stays"
     );
     assert_eq!(
         h.source_column::<String>(source, "reply"),
@@ -761,11 +755,11 @@ fn an_unknown_timezone_or_bank_is_refused_and_nothing_is_stored() {
     assert_eq!(h.count("SELECT COUNT(*) FROM extraction_queue"), 0);
 }
 
-// Idempotency (TIM-90, ADR 0002)
+// Idempotency (ADR 0002)
 
 #[test]
 fn the_same_turn_twice_does_nothing_the_second_time() {
-    // Hermes retries, and the plugin's spool replays (TIM-94, decision 6).
+    // Hermes retries, and the plugin's spool replays.
     let h = Harness::new();
     let sent = turn(
         "s",
@@ -873,7 +867,7 @@ fn the_same_words_in_another_session_at_another_time_or_in_another_bank_are_new(
     assert_eq!(depth(&h, "other"), 1);
 }
 
-// Documents (TIM-92; TIM-94 decision 10)
+// Documents
 
 #[test]
 fn a_document_is_stored_with_its_reference_date() {
@@ -899,7 +893,7 @@ fn a_document_is_stored_with_its_reference_date() {
     assert_eq!(h.source_column::<i64>(source, "reference_date_exact"), 1);
     assert_eq!(h.source_column::<String>(source, "timezone"), TZ);
     assert_eq!(h.source_column::<i64>(source, "ingested_at"), h.now());
-    // TIM-90: a time is stored as the start of its unit in the source's
+    // a time is stored as the start of its unit in the source's
     // timezone, so the reference date is midnight in Auckland.
     let midnight = date(2026, 9, 15)
         .to_zoned(TimeZone::get(TZ).unwrap())
@@ -963,7 +957,7 @@ fn hashes_of(text: &str, sections: &[&str]) -> Vec<String> {
 
 #[test]
 fn an_edited_document_queues_only_chunks_no_earlier_version_had() {
-    // TIM-92, edited documents: chunks are matched by hash, and a chunk seen
+    // chunks are matched by hash, and a chunk seen
     // in any earlier version is skipped.
     let h = Harness::new();
     let v1 = [PLANS, WORK_V1].concat();
@@ -1006,7 +1000,7 @@ fn an_edited_document_queues_only_chunks_no_earlier_version_had() {
 
 #[test]
 fn an_earlier_reference_date_is_accepted() {
-    // TIM-92: reconciliation's direction rule makes older claims harmless,
+    // reconciliation's direction rule makes older claims harmless,
     // and a rejection would be a failure nobody sees.
     let h = Harness::new();
     ingest_doc(&h, "main", &document("life.md", PLANS, date(2026, 9, 15)));
@@ -1021,7 +1015,7 @@ fn an_earlier_reference_date_is_accepted() {
 
 #[test]
 fn memories_from_a_removed_section_are_left_alone() {
-    // TIM-92: deleting a line from a note doesn't make it false.
+    // deleting a line from a note doesn't make it false.
     let h = Harness::new();
     let v1 = [PLANS, WORK_V1].concat();
     let first = ingest_doc(&h, "main", &document("life.md", &v1, date(2026, 9, 1)));
@@ -1057,7 +1051,7 @@ fn memories_from_a_removed_section_are_left_alone() {
 
 #[test]
 fn a_tombstoned_chunk_is_not_extracted_again_from_a_new_version() {
-    // ADR 0002 and TIM-92: the chunk hash is the forget tombstone. Once the
+    // ADR 0002: the chunk hash is the forget tombstone. Once the
     // erase or the sweep has removed a chunk's text, a new version that
     // still holds the passage must not bring it back.
     let h = Harness::new();
@@ -1080,7 +1074,7 @@ fn a_tombstoned_chunk_is_not_extracted_again_from_a_new_version() {
     assert_eq!(queued_hashes(&h, second.source), hashes_of(&v2, &[HOME]));
 }
 
-// Secrets at ingest (ADR 0002; TIM-92, other decision 1)
+// Secrets at ingest (ADR 0002)
 
 /// The kinds recorded on a source, from its `secret_kinds` column.
 fn recorded_kinds(h: &Harness, source: Uuid) -> BTreeSet<String> {
@@ -1170,7 +1164,7 @@ fn the_key_is_computed_from_the_redacted_text() {
     assert_eq!(second.source, first.source);
 }
 
-// The turn that asks to forget (TIM-99 decision 2, ADR 0010)
+// The turn that asks to forget (ADR 0010)
 
 #[test]
 fn a_forget_request_is_stored_only_as_a_tombstone_and_never_queued() {
@@ -1269,7 +1263,7 @@ fn a_forget_request_sent_again_stays_a_tombstone() {
     assert!(!h.store_holds("Forget where I live."));
 }
 
-// Speakers (TIM-94, decision 1)
+// Speakers
 
 #[test]
 fn the_owners_platform_id_resolves_to_user() {
@@ -1348,7 +1342,7 @@ fn anyone_else_becomes_a_person_of_their_own() {
         "person"
     );
     assert!(aliases(&h, speaker.entity).contains("discord:5678"));
-    // TIM-92: a new alias is a logged edit, so a mislink can be undone.
+    // a new alias is a logged edit, so a mislink can be undone.
     assert!(
         h.one::<i64, _>(
             "SELECT COUNT(*) FROM edits e JOIN entities n ON n.id = e.entity_id
@@ -1437,7 +1431,7 @@ fn speakers_never_cross_banks() {
     assert_eq!(h.entities_in("other"), 3);
 }
 
-// The extraction queue (TIM-92; TIM-94 decision 3)
+// The extraction queue
 
 #[test]
 fn each_bank_has_one_worker() {
@@ -1477,7 +1471,7 @@ fn each_bank_has_one_worker() {
 
 #[test]
 fn turns_go_ahead_of_documents_then_observed_at_order_across_a_restart() {
-    // TIM-92: serialised in observed_at order, with turns ahead of document
+    // serialised in observed_at order, with turns ahead of document
     // chunks. The order is the stored queue's, so it holds after a restart.
     let h = Harness::new();
     let doc = ingest_doc(
@@ -1533,7 +1527,7 @@ fn completing_a_chunk_marks_it_extracted_and_takes_it_off_the_queue() {
     let lease = claim(&h, "main").unwrap();
     let chunk = lease.chunk;
     // Call 1's output is saved on the chunk so a failed call 2 can resume
-    // (TIM-92), and dropped when the chunk commits (ADR 0008).
+    // and dropped when the chunk commits (ADR 0008).
     h.execute(
         "UPDATE chunks SET call1_output = '{\"claims\":[]}' WHERE uuid = ?1",
         [chunk.to_string()],
@@ -1669,7 +1663,7 @@ fn reaching_the_retry_cap_marks_the_chunk_failed_and_the_queue_moves_on() {
     );
 }
 
-// Recovery after a restart (TIM-94 decision 3: nothing queued is lost)
+// Recovery after a restart
 
 #[test]
 fn the_queue_survives_a_restart_with_the_chunk_in_flight_first() {
@@ -1743,7 +1737,7 @@ fn a_failed_chunk_stays_failed_after_a_restart() {
     assert_eq!(listed[0].chunk, failed);
 }
 
-// Regressions from the TIM-106 review
+// Ingest regressions
 
 #[test]
 fn a_lease_from_before_a_restart_cannot_complete_the_new_workers_chunk() {
@@ -1820,7 +1814,7 @@ fn a_lease_from_another_store_is_refused() {
 
 #[test]
 fn a_display_name_cannot_capture_another_speakers_platform_id() {
-    // TIM-94, decision 1: speakers are attributed by platform id. A display
+    // speakers are attributed by platform id. A display
     // name that looks like a platform id is free text, not an identity.
     let h = Harness::new();
     let impostor = ingest(
@@ -1848,7 +1842,7 @@ fn a_display_name_cannot_capture_another_speakers_platform_id() {
 #[test]
 fn a_display_name_cannot_capture_the_owners_platform_id() {
     // The owner's platform id can be added after strangers have spoken
-    // (`PUT /v1/banks/{bank}` merges, TIM-94 decision 7). A stranger who
+    // (`PUT /v1/banks/{bank}` merges). A stranger who
     // used it as a display name earlier must not become the owner's
     // identity, or the owner's turns be attributed to them.
     let h = Harness::new();
@@ -1904,7 +1898,7 @@ fn a_display_name_cannot_capture_the_owners_platform_id() {
 
 #[test]
 fn a_repeated_section_in_a_first_version_is_queued_each_time() {
-    // TIM-92 skips chunks seen in earlier versions of a document, not
+    // Ingest skips chunks seen in earlier versions of a document, not
     // chunks repeated within the version being ingested.
     let h = Harness::new();
     let text = "# A\n\nRepeat.\n\n# A\n\nRepeat.\n";
@@ -1933,8 +1927,7 @@ fn a_repeated_section_in_an_edit_is_queued_when_no_earlier_version_had_it() {
     assert_eq!(second.chunks_queued, 2, "both Home sections are new");
 }
 
-// Speaker ids and the version 2 migration (TIM-94 decision 1; the TIM-106
-// review)
+// Speaker ids and the version 2 migration
 
 /// Puts the harness's store back to schema version 1, as the version 1
 /// binary would have left it after the same calls: drops `speaker_ids` and

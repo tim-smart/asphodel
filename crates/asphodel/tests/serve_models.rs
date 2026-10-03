@@ -1,8 +1,6 @@
 //! `asphodel serve` and the models, run as a process.
 //!
-//! "Models: local embeddings, reranker and the OpenAI-compatible LLM
-//! client" (TIM-105), from "API surface and Hermes transport" (TIM-94,
-//! decision 4) and ADR 0009: the daemon loads the models from the model dir
+//! Under ADR 0009, the daemon loads the models from the model dir
 //! before it is ready, never downloads, fails fast on a missing file, and
 //! refuses to start without a floor for each loaded model. These tests see
 //! only what an operator sees: exit codes, stderr and the model dir.

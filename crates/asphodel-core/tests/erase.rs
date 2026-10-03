@@ -1,12 +1,5 @@
-//! The erase path, forget, purge and the nightly sweep, checked against
-//! "Erase path, forget, purge and the nightly sweep" (TIM-112) and the
-//! decisions it rests on: "Deletion policy: when faded memories are purged"
-//! (TIM-97, decisions 2 to 6, as amended by TIM-99 for failed chunks),
-//! "What is a memory record?" (TIM-90, as amended by TIM-97 for chain-wide
-//! forget), "Configuration surface" (TIM-98, the deletion fingerprint),
-//! "Operations" (TIM-99, decisions 3, 7 and 8), and ADRs 0002, 0008, 0009
-//! and 0010. Where a ticket comment and an ADR disagree, the ADR wins;
-//! where two comments disagree, the later amendment wins.
+//! Forget, purge and the nightly sweep follow the deletion contracts in
+//! ADRs 0002, 0008, 0009 and 0010.
 //!
 //! The API under test is `asphodel_core::erase`, `asphodel_core::sweep`
 //! and the `Service` methods over them: `forget`, `erase_next`,
@@ -769,7 +762,7 @@ fn handle(input: &RefreshInput, memory: Uuid) -> String {
         .clone()
 }
 
-// Forget (ADR 0010, "Forgetting"; TIM-99, decision 3)
+// Forget (ADR 0010, "Forgetting")
 
 #[test]
 fn forget_hides_at_once_and_erases_behind_a_queued_chunk() {
@@ -856,7 +849,7 @@ fn forget_hides_at_once_and_erases_behind_a_queued_chunk() {
 
 #[test]
 fn forget_erases_the_whole_chain_and_clears_what_points_into_it() {
-    // TIM-97 decisions 2 and 5: forget takes every memory along
+    // forget takes every memory along
     // `superseded_by`, whichever version it names. `ended_by` isn't a chain
     // link: Berlin stays, with its end and without the pointer. Orphan
     // entities go, except seeded ones and merge tombstones.
@@ -921,7 +914,7 @@ fn forget_erases_the_whole_chain_and_clears_what_points_into_it() {
     assert!(!audit[0].contains("Berlin") && !audit[0].contains("Lisbon"));
 }
 
-// Purge in the nightly sweep (ADR 0008; TIM-97, decisions 1 to 6)
+// Purge in the nightly sweep (ADR 0008)
 
 #[test]
 fn the_sweep_purges_a_faded_chain_at_four_bank_local_without_redacting() {
@@ -974,7 +967,7 @@ fn the_sweep_purges_a_faded_chain_at_four_bank_local_without_redacting() {
     assert_eq!(h.source_text(h.source), FIXTURE);
 
     // The audit lists and status read it back: ids and counts, never
-    // content, and only the bank's own (TIM-99, decision 7; TIM-114).
+    // content, and only the bank's own.
     h.service
         .ensure_bank_with_models(
             "other",
@@ -1029,7 +1022,7 @@ fn the_sweep_purges_a_faded_chain_at_four_bank_local_without_redacting() {
 
 #[test]
 fn a_model_citing_a_purged_memory_refreshes_once_that_night() {
-    // TIM-97 decision 6: the sweep purges before the night's refresh, so a
+    // the sweep purges before the night's refresh, so a
     // model whose entry cited a purged memory refreshes once, without it.
     let h = Harness::new();
     h.insert(fact(TEA));
@@ -1063,7 +1056,7 @@ fn a_model_citing_a_purged_memory_refreshes_once_that_night() {
 
 #[test]
 fn a_date_still_ahead_on_the_head_holds_a_faded_chain_back() {
-    // TIM-97 decision 3, read on the head: a retracted predecessor's old
+    // On the head, a retracted predecessor's old
     // slot keeps nothing alive.
     let h = Harness::new();
     let concert = h.insert(faded(event(CONCERT, "2026-12-12T00:00")));
@@ -1100,8 +1093,7 @@ fn a_task_is_held_until_thirty_days_past_its_due_date() {
     assert_eq!(h.rows(&[passport]), 0);
 }
 
-// The source, failed-chunk and recall-log sweep (ADR 0008; TIM-97 decision
-// 4, as amended by TIM-99)
+// The source, failed-chunk and recall-log sweep (ADR 0008)
 
 #[test]
 fn the_sweep_deletes_text_past_the_horizon_and_keeps_the_keys() {
@@ -1191,7 +1183,7 @@ fn the_sweep_deletes_text_past_the_horizon_and_keeps_the_keys() {
 }
 
 // The deletion fingerprint, the plan and the ack (ADR 0009; ADR 0010,
-// "Sweeps, pauses and failures"; TIM-99, decision 8)
+// "Sweeps, pauses and failures")
 
 #[test]
 fn a_changed_fingerprint_pauses_purge_until_the_running_hash_is_acked() {
@@ -1321,7 +1313,7 @@ fn an_entity_a_model_filter_names_survives_the_erase() {
     assert!(!h.entity_exists(plain));
 }
 
-// Regressions from the TIM-112 review of 6b27c51
+// Migration regressions
 
 /// Puts the store back to schema version 7, as that binary left it: a
 /// mention's span lives in `accesses.spans`, and nothing a later version
@@ -1341,7 +1333,7 @@ fn downgrade_spans_to_v7(h: &Harness) {
 
 #[test]
 fn a_mention_span_stored_by_version_7_still_redacts_after_an_upgrade() {
-    // Review finding 2 moves mention spans out of `accesses` in a new
+    // Mention spans move out of `accesses` in a new
     // migration. A store that recorded spans under version 7 has to keep
     // redacting them once it's upgraded.
     let h = Harness::new();
@@ -1368,13 +1360,10 @@ fn a_mention_span_stored_by_version_7_still_redacts_after_an_upgrade() {
     );
 }
 
-/// The rest of the regressions from the TIM-112 review of 6b27c51, and the
-/// two gaps it left open: linking a forget to the turn that asked for it,
-/// and mentions stored before spans were. Each failed on 6b27c51 for the
-/// reason its finding gives and passes from 33d1c4c, which added the purge
-/// seam (`purge_candidates`, `purge_chain`), `run_erases` and
-/// `forget_request`.
-mod review {
+/// Regression contracts for transactional purge, erase scheduling, forget
+/// request links and legacy mention spans. These exercise `purge_candidates`,
+/// `purge_chain`, `run_erases` and `forget_request`.
+mod regressions {
     use super::*;
 
     use std::time::Duration;
@@ -1522,7 +1511,7 @@ mod review {
         }
     }
 
-    // Finding 1: purge decides inside each chain's transaction.
+    // purge decides inside each chain's transaction.
 
     #[test]
     fn purge_rechecks_each_chain_inside_its_own_transaction() {
@@ -1557,13 +1546,13 @@ mod review {
         assert_eq!(h.forgotten_details()["memories"], json!([forgotten]));
     }
 
-    // Finding 2: a same-document mention keeps its passage for the erase.
+    // a same-document mention keeps its passage for the erase.
 
     #[test]
     fn a_reworded_section_of_the_same_document_queued_before_a_forget_is_redacted() {
-        // Not crediting a later version of the same document is right
-        // (TIM-92); dropping where it restated the memory isn't. The
-        // rewording keeps this apart from finding 7's exact-text match.
+        // Not crediting a later version of the same document is right;
+        // dropping where it restated the memory isn't. Rewording tests
+        // passage preservation separately from exact-text matching.
         let h = Harness::new();
         h.doc("family.md", "# Family\n\nMy daughter is called Maya.\n");
         let maya = h
@@ -1586,7 +1575,7 @@ mod review {
         assert!(text.contains("is six now."), "{text}");
     }
 
-    // Finding 3: a refresh in flight can't bring back a forgotten memory.
+    // a refresh in flight can't bring back a forgotten memory.
 
     /// A refresh LLM that forgets `memory` while its call is in flight, and
     /// with `erase` runs the erase too, then answers `reply`.
@@ -1651,7 +1640,7 @@ mod review {
         refresh_while_forgetting(true);
     }
 
-    // Finding 4: a failed sweep settles what it committed and stays due.
+    // a failed sweep settles what it committed and stays due.
 
     #[test]
     fn a_sweep_that_fails_after_a_purge_settles_it_and_runs_again() {
@@ -1688,7 +1677,7 @@ mod review {
         let again = h.service.run_sweeps().unwrap();
         assert_eq!(again.ran.len(), 1, "the failed night is still due");
         assert_eq!(h.one::<i64, _>("SELECT COUNT(*) FROM sweep_runs", []), 1);
-        // The re-review of 4c5d9e1: the run row counts what the failed
+        // The run row counts what the failed
         // attempt deleted, and says when that attempt started.
         assert_eq!(again.ran[0].purged_memories, 1);
         assert_eq!(h.sweep_run(), (1, micros(at(SWEEP))));
@@ -1719,7 +1708,7 @@ mod review {
         assert_eq!(h.sweep_run(), (1, micros(at(SWEEP))));
     }
 
-    // Finding 5: ready erases run without a worker. The daemon half is
+    // ready erases run without a worker. The daemon half is
     // `a_ready_erase_runs_after_a_restart_without_an_llm` in serve_http.
 
     #[test]
@@ -1750,7 +1739,7 @@ mod review {
         assert!(!h.source_text(said).contains("Maya"));
     }
 
-    // Finding 6: the plan counts what the sweep frees by purging.
+    // the plan counts what the sweep frees by purging.
 
     #[test]
     fn the_plan_counts_a_source_the_sweep_frees_by_purging() {
@@ -1768,7 +1757,7 @@ mod review {
         );
     }
 
-    // Finding 7: every version of a document loses a forgotten passage.
+    // every version of a document loses a forgotten passage.
 
     #[test]
     fn every_version_of_a_document_loses_a_forgotten_passage() {
@@ -1811,7 +1800,7 @@ mod review {
         assert!(text.contains("The kettle is new."), "{text}");
     }
 
-    // Gap 1: a forget is linked to the turn that asked for it (TIM-113).
+    // a forget is linked to the turn that asked for it.
     // Each test runs at one instant on the stopped clock, so only the order
     // of writes can tell the turns apart.
 
@@ -1869,7 +1858,7 @@ mod review {
         assert_eq!(h.forget_rows()[1]["request"], Value::Null);
     }
 
-    // Gap 2: mentions stored before version 7 have no span. The erase masks
+    // mentions stored before version 7 have no span. The erase masks
     // more rather than less, keeps what surviving memories rest on, and
     // counts the fallbacks in its audit row.
 
@@ -1963,7 +1952,7 @@ mod review {
         assert_eq!(audit["whole_source"], 1);
     }
 
-    // The re-review of 4c5d9e1, finding 1: overlapping passages across
+    // Overlapping passages across
     // versions. Masking one passage in a version mustn't stop a longer one
     // that contains it being found there, in one erase or in a later one.
 

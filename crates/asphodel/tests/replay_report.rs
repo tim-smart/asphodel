@@ -1,21 +1,19 @@
-//! The HTML report, the labelling material and the precision curve,
-//! checked against "Replay harness: simulated-clock replay of recorded
-//! sessions" (TIM-96, decisions 6, 7 and 8) and TIM-121's scope, on
-//! synthetic history only.
+//! The HTML report, labelling material and precision curve contracts,
+//! exercised on synthetic history only.
 //!
 //! - `asphodel report html R [--out FILE]` writes one page holding the
-//!   report's numbers, every asset inlined (decision 7). Without `--out`
+//!   report's numbers, every asset inlined. Without `--out`
 //!   it goes beside the report, as `R` with the extension `html`.
-//! - `asphodel replay ... --labelling FILE` writes the labelling material
-//!   (decision 6): recall candidates at 50 sampled turns, scored with the
+//! - `asphodel replay... --labelling FILE` writes the labelling material
+//!   with recall candidates at 50 sampled turns, scored with the
 //!   reranker logit the gate floor compares, and call 2's candidate lists,
 //!   scored with the cosine similarity the reconcile floor compares.
 //! - `asphodel report precision --labels L --material M` prints the
 //!   precision curve for each list as JSON.
 //!
 //! Everything these read or write is derived from history, so all of it
-//! stays under the private dir and errors never quote it (decision 8; ADR
-//! 0010, "Logging").
+//! stays under the private dir and errors never quote it (ADR 0010,
+//! "Logging").
 
 mod support;
 
@@ -53,7 +51,7 @@ fn simulation(report: &Value) -> Value {
     report
 }
 
-// The HTML report (TIM-96, decision 7).
+// The HTML report.
 
 fn report_html(dir: &TestDir, report: &Path, extra: &[&str]) -> Output {
     asphodel(dir)
@@ -252,7 +250,7 @@ fn the_html_report_is_refused_outside_the_private_dir() {
     assert!(!target.exists());
 }
 
-// The labelling material (TIM-96, decision 6).
+// The labelling material.
 
 /// More synced turns than the 50 the material samples, one session each so
 /// no turn's candidates are hidden as already in context. The first two
@@ -571,7 +569,7 @@ fn labelling_material_is_refused_over_the_runs_own_files() {
 }
 
 /// A claim that changes something is shown its nearest memories whatever
-/// their similarity (TIM-92, the flagged claim's wider set), and BM25
+/// their similarity, and BM25
 /// neighbours are never held to the vector floor at all. So call 2's lists
 /// can hold candidates scoring below the reconcile floor, and the material
 /// keeps them as shown, with their real similarity: the curve is precision
@@ -654,7 +652,7 @@ fn call2_material_keeps_a_flagged_claims_neighbour_below_the_floor() {
     );
 }
 
-// The precision curve (TIM-96, decision 6).
+// The precision curve.
 
 fn precision(dir: &TestDir, labels: &Path, material: &Path) -> Output {
     asphodel(dir)

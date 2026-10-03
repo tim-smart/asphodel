@@ -44,7 +44,7 @@ mod gap_tests;
 
 /// A test's hook into [`commit_prepared`] at the last moment before the
 /// commit takes the store for its writes: whatever it does to the store,
-/// the commit must see (TIM-117 review, the lock gap). Test builds only.
+/// the commit must see. Test builds only.
 #[cfg(test)]
 pub(crate) mod gap {
     use std::cell::RefCell;
@@ -761,7 +761,7 @@ pub(crate) fn commit_prepared(
     queue::check_held(leases, &lease)?;
 
     // The last moment before the commit takes the store, where a test can
-    // change it (TIM-117 review, the lock gap).
+    // change it.
     #[cfg(test)]
     gap::run(store);
 

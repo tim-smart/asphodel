@@ -22,7 +22,7 @@ const FLOORS_FOR_FAKES: &str = "[injection.reranker_floors]\n\"fake-reranker:v1\
 
 /// `asphodel serve` with a clean environment, so the caller's `ASPHODEL_*`
 /// variables can't leak in. It runs on the fake models, because the real
-/// ones aren't on a CI machine (TIM-105).
+/// ones aren't on a CI machine.
 fn serve() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
     command
@@ -356,7 +356,7 @@ fn a_malformed_llm_endpoint_stops_startup() {
 
 #[test]
 fn serve_needs_a_data_dir_from_the_flag_or_the_environment() {
-    // TIM-94, decision 4: the store lives under `--data-dir`. A daemon with
+    // The store lives under `--data-dir`. A daemon with
     // neither the flag nor `ASPHODEL_DATA_DIR` has nowhere to persist, so it
     // must refuse to start rather than answer ready with no store.
     let dir = TestDir::new();

@@ -1,4 +1,4 @@
-"""Plugin config (TIM-94, decisions 2, 3 and 7): ``config.json`` under
+"""Plugin config: ``config.json`` under
 ``$HERMES_HOME/asphodel/``, ``ASPHODEL_URL`` winning over ``url``, the token
 from ``ASPHODEL_TOKEN``, and ``is_available`` that never touches the
 network."""

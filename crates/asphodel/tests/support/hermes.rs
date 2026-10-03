@@ -2,8 +2,8 @@
 //! real-history replay tests. Nothing here is adapted from a real session.
 //!
 //! The DDL is the `sessions`, `messages`, `system_prompts` and
-//! `schema_version` tables of hermes-agent's `hermes_state_common.py` at
-//! `bfc71526` (schema version 31), every column included, so the importer
+//! `schema_version` tables of hermes-agent's `hermes_state_common.py`
+//! (schema version 31), every column included, so the importer
 //! is checked against the shape it will meet rather than the columns it
 //! reads.
 
@@ -11,7 +11,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, params};
 
-/// The Hermes schema version the DDL below was copied at.
+/// The Hermes schema version represented by the DDL below.
 pub const SCHEMA_VERSION: i64 = 31;
 
 const DDL: &str = "
@@ -126,8 +126,7 @@ CREATE TABLE messages (
 ";
 
 /// Text that must never leave `state.db`: the system prompt (in both places
-/// Hermes keeps it) and `api_content`, which carries injected memory
-/// (TIM-96, decisions 1 and 8).
+/// Hermes keeps it) and `api_content`, which carries injected memory.
 pub const SYSTEM_PROMPT_SENTINEL: &str = "SENTINEL-SESSION-SYSTEM-PROMPT-7f3a";
 pub const PROMPT_TABLE_SENTINEL: &str = "SENTINEL-PROMPT-TABLE-1c9e";
 pub const API_CONTENT_SENTINEL: &str = "SENTINEL-API-CONTENT-5b20";
@@ -263,7 +262,7 @@ pub fn epoch(at: &str) -> f64 {
     at.parse::<jiff::Timestamp>().unwrap().as_second() as f64
 }
 
-/// The manifest every test imports with (TIM-96, decision 1): Tim owns the
+/// The manifest every test imports with: Tim owns the
 /// bank on `discord:1`, and Sam is a known other speaker. Bob, who appears
 /// in a prefix, isn't listed.
 pub const MANIFEST: &str = r#"

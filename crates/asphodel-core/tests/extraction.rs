@@ -1,15 +1,9 @@
-//! Extraction call 1, checked against "Extraction call 1: claims,
-//! significance, windows, entities and used verdicts" (TIM-107) and the
-//! decisions it rests on: "What is a memory record?" (TIM-90, the memory,
-//! time, entities and accesses), "Strength model: decay, reinforcement and
-//! significance" (TIM-91, decisions 6 and 7), "Extraction: significance,
-//! validity windows and supersession" (TIM-92, round 1 and the resolution,
-//! as amended by TIM-97), "API surface and Hermes transport" (TIM-94,
-//! decision 1), and ADRs 0001, 0002, 0005, 0008 and 0010.
+//! Extraction call 1 contracts cover claims, significance, validity windows,
+//! entities and used verdicts, following ADRs 0001, 0002, 0005, 0008 and 0010.
 //!
 //! These are golden tests against `FakeLlm`: each scripts call 1's reply and
 //! checks what's committed, or checks the input and request call 1 is given.
-//! Most of them run where reconciliation (call 2, TIM-108) has nothing to
+//! Most of them run where reconciliation (call 2) has nothing to
 //! compare with, so every claim that survives the checks in code becomes a
 //! new memory; where a claim lands near an earlier one, call 2 is scripted
 //! to label nothing. Reconciliation itself is tested in `reconcile.rs`.
@@ -150,7 +144,7 @@ impl Harness {
         Self::with_options(models, OpenOptions::default())
     }
 
-    /// A store with replay's deterministic ids (TIM-96, decision 4).
+    /// A store with replay's deterministic ids.
     fn deterministic() -> Self {
         Self::with_options(
             Models::fake(),
@@ -841,7 +835,7 @@ fn reply(claims: Vec<Value>, used: &[&str]) -> Value {
 /// Extracts the head of `main`'s queue with call 1 answering `reply` and, if
 /// the claims land near something stored, call 2 labelling nothing, so each
 /// claim stays new. "Tim said One." and "Tim said Two." are close enough under
-/// the fake embedder for reconciliation (TIM-108) to compare them.
+/// the fake embedder for reconciliation to compare them.
 fn extract_unlabelled(h: &Harness, reply: Value) -> Extracted {
     run(
         h,
@@ -1673,7 +1667,7 @@ fn a_documents_memory_is_observed_at_its_reference_date_and_created_at_ingest() 
             ..Row::new(content, "event", observed_at, span(text, quote))
         }
     );
-    // TIM-92: the created access is the source's ingested_at, never the time
+    // the created access is the source's ingested_at, never the time
     // extraction ran, so a backdated document doesn't arrive faded.
     assert_eq!(
         h.accesses(memories[0]),
@@ -1788,7 +1782,7 @@ fn remember_this_from_the_owner_keeps_the_memory() {
     );
     let row = h.row(memories[0]);
     // The owner's keep sits beside the level extraction gave, so unkeep can
-    // hand it back (TIM-94, decision 9).
+    // hand it back.
     assert_eq!(row.owner_significance, Some("kept".into()));
     assert_eq!(row.significance, "notable");
 }
@@ -1895,7 +1889,7 @@ fn a_claim_without_a_quote_from_the_chunk_is_dropped() {
     let current = ingest(&h, &turn("s1", T1, "Yes, still there.", "Great."));
     h.focus(h.chunk_of(current.source, 0));
 
-    // TIM-92: "Yes" after "Are you still at Acme?" is the user's claim,
+    // "Yes" after "Are you still at Acme?" is the user's claim,
     // written out in full from the context but quoted from the answer. A
     // quote from the context, or from nowhere, drops the claim.
     let extracted = extract(
@@ -2029,7 +2023,7 @@ fn a_new_surface_form_becomes_a_logged_alias() {
             &[],
         ),
     );
-    // TIM-92: a new surface form is added as an alias in a logged edit, so a
+    // a new surface form is added as an alias in a logged edit, so a
     // mislink can be undone. A known one and a pronoun aren't.
     assert_eq!(h.aliases(ana), vec!["Ana".to_string(), "Annie".to_string()]);
     assert_eq!(h.aliases(user), user_aliases);
@@ -2079,7 +2073,7 @@ fn a_proposed_entity_never_reuses_one_that_existed_before_call_1() {
     assert!(!found(&h, &input).contains(&entities[0]));
 
     // Name00 missed the cap, so call 1 never compared it and proposed a new
-    // entity. TIM-92 reuses only an entity created after call 1 ran, so this
+    // entity. Extraction reuses only an entity created after call 1 ran, so this
     // is a second Name00, not the one call 1 never saw.
     let extracted = extract(
         &h,
@@ -2146,7 +2140,7 @@ fn a_proposed_entity_reuses_one_created_while_call_1_ran() {
         .extract_chunk(lease(&h, "main"), &llm, &[])
         .unwrap();
 
-    // TIM-92: code repeats the exact alias lookup at commit and links the
+    // code repeats the exact alias lookup at commit and links the
     // entity created after call 1 ran, rather than a duplicate.
     let lisbon = h.entities_named("main", "Lisbon");
     assert_eq!(lisbon.len(), 1);
@@ -2268,7 +2262,7 @@ fn a_used_verdict_keeps_a_stronger_access_in_the_same_turn() {
     let handles = [memory_handle(&input, tea), memory_handle(&input, cake)];
 
     extract_with(&h, reply(vec![], &[&handles[0], &handles[1]]), &[tea, cake]);
-    // TIM-90: at most one access per memory per turn, keeping the strongest.
+    // at most one access per memory per turn, keeping the strongest.
     let in_turn = |memory: Uuid| -> Vec<String> {
         h.accesses(memory)
             .into_iter()
@@ -2291,7 +2285,7 @@ fn accesses_carry_the_turn_number_of_their_source() {
     ingest(&h, &turn("s1", "2026-10-01T06:20:00Z", "Three.", "Ok."));
     assert_eq!(h.turns("main"), 3);
 
-    // Turns first in observed_at order, then the document (TIM-92).
+    // Turns first in observed_at order, then the document.
     let mut turns = Vec::new();
     for quote in ["One", "Two", "Three", "Doc"] {
         let memory = extract_unlabelled(
@@ -2516,8 +2510,7 @@ fn an_unusable_llm_holds_the_queue_without_counting() {
     assert_eq!(lease.error_count, 0);
 }
 
-// The TIM-107 review: regressions for its findings, and the guarantees it
-// found untested.
+// Extraction regressions.
 
 /// Ana with three fresh memories linked, at major, notable and minor.
 fn ana_with_memories(h: &Harness) -> Uuid {
@@ -2548,7 +2541,7 @@ fn inherited_accesses_rank_a_candidates_memories() {
     let h = Harness::new();
     let ana = ana_with_memories(&h);
     // A trivial correction that inherits a well-used predecessor's accesses
-    // along superseded_by (TIM-91, decision 3). On its own accesses it would
+    // along superseded_by. On its own accesses it would
     // rank last.
     let surname = h.insert_memory("main", "Ana's surname is Ngata.", "trivial");
     h.link(surname, ana);
@@ -2648,7 +2641,7 @@ fn remember_this_on_a_quote_the_reply_repeats_is_not_kept() {
     // The owner asks about the sentence and the reply repeats it with
     // "remember this". The quote's first occurrence is in the owner's
     // message, but the claim can't be shown to come from it, so it isn't
-    // kept (TIM-92 other decision 3).
+    // kept.
     let memories = golden(
         &h,
         "Is \"Ana's birthday is 4 May\" correct?",
@@ -2816,7 +2809,7 @@ fn a_name_matches_its_alias_in_either_normalization_form() {
     }
 }
 
-// Composed aliases (the TIM-107 re-review of `d4825ab`). Passages are
+// Composed aliases. Passages are
 // searched in NFC, so every alias has to be stored in NFC too: on every
 // write, and for the aliases a store already holds.
 
@@ -3183,8 +3176,7 @@ fn the_prompts_state_the_extraction_rules() {
     ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
     let system = call1_request(&input(&h, "main", &[])).system;
     // Scripted replies can't show these instructions were given, so check
-    // the prompt carries them (TIM-92, "Inputs", "Significance", "Time" and
-    // "Language").
+    // the prompt carries the input, significance, time and language rules.
     for rule in [
         // Only what the assistant did, and its tasks only when asked and dated.
         "From the assistant's reply, only what the assistant says it has done or will do.",
@@ -3219,14 +3211,13 @@ fn the_prompts_state_the_extraction_rules() {
     assert!(user.contains("Don't resolve relative times."), "{user}");
 }
 
-// Deterministic entity ids (TIM-116's review of TIM-96 decision 4, as
-// amended): in replay an entity id is UUIDv5 of the creating source's id
-// and `entity:<chunk position>:<name>`, where `<name>` is the key commit
+// Deterministic entity ids: in replay an entity id is UUIDv5 of the
+// creating source's id and `entity:<chunk position>:<name>`, where `<name>` is the key commit
 // dedups proposals on, the proposed name composed to NFC, trimmed and
 // lowercased. Neither the surface form nor anything else in the store
 // enters the key.
 
-/// The id the amended rule gives an entity `key` proposed in chunk
+/// The deterministic id for an entity `key` proposed in chunk
 /// `position` of `source`. `key` is written out already normalized.
 fn entity_id(source: Uuid, position: u32, key: &str) -> Uuid {
     asphodel_core::store::ids::derived(source, &format!("entity:{position}:{key}"))
@@ -3285,7 +3276,7 @@ fn deterministic_entity_ids_are_independent_of_existing_entities() {
     );
     assert_eq!(ingested.chunks_queued, 2);
     // Each chunk proposes a new "Anna". The second chunk's call 1 may be
-    // shown the first's, which commit never reuses (TIM-92), so it creates
+    // shown the first's, which commit never reuses, so it creates
     // a second entity whose id mustn't depend on the first existing.
     let first = extract(
         &h,

@@ -1,6 +1,5 @@
-"""The package is what Hermes' discovery and loader expect (TIM-88,
-"Packaging and discovery"), and it depends on nothing outside the standard
-library and Hermes itself (ADR 0006)."""
+"""The package is what Hermes' discovery and loader expect, and it depends
+on nothing outside the standard library and Hermes itself (ADR 0006)."""
 
 import ast
 import importlib.util

@@ -1,12 +1,5 @@
-//! The agenda, mental models and the system prompt block, checked against
-//! "Agenda, mental models and the system prompt block" (TIM-111) and the
-//! decisions it rests on: "Mental models: synthesized documents over
-//! memories" (TIM-95, its resolution and its amendment, "refreshes follow
-//! conversations"), "Retrieval and ranking" (TIM-93, decisions 7 and 12 and
-//! both TIM-95 amendments), "API surface and Hermes transport" (TIM-94,
-//! decision 8, as amended by TIM-95), and ADRs 0001 and 0007. Where a
-//! ticket comment and the ADR disagree, the ADR wins; where two comments
-//! disagree, the later amendment wins.
+//! Agenda, mental models and the system prompt block follow ADRs 0001 and
+//! 0007, including refresh scheduling and memory precedence.
 //!
 //! These tests drive the service on a `SimulatedClock` and refresh models
 //! with `FakeLlm`. Triggers go through the write paths that exist:
@@ -17,8 +10,7 @@
 //!
 //! The API under test is `asphodel_core::mental_models`,
 //! `asphodel_core::agenda`, `asphodel_core::system_prompt` and the
-//! `Service` methods over them. Where the tickets left a detail open, the
-//! tests follow the choice the implementation documents: inclusive agenda
+//! `Service` methods over them. The tests check inclusive agenda
 //! bounds, disabled models outside the budget, and code dropping entries
 //! whose memories left a refresh's input.
 //!
@@ -675,7 +667,7 @@ fn plans_model() -> ModelSpec {
     }
 }
 
-// Refresh triggers and scheduling (TIM-95 amendment, decision 1; ADR 0007)
+// Refresh triggers and scheduling (ADR 0007)
 
 #[test]
 fn a_notable_memory_triggers_a_refresh_five_minutes_later() {
@@ -742,7 +734,7 @@ fn a_memory_below_the_trigger_level_waits_for_the_sweep() {
     assert!(refreshes.ran.is_empty());
     assert_eq!(refreshes.next_due, Some(at(SWEEP)));
 
-    // The sweep lets minor additions in (TIM-95 amendment, decision 1).
+    // The sweep lets minor additions in.
     h.set(at(SWEEP));
     assert_eq!(h.tick(&llm).ran.len(), 1);
     assert_eq!(refresh_calls(&llm), 1);
@@ -769,7 +761,7 @@ fn a_memory_the_models_filters_leave_out_triggers_nothing() {
 #[test]
 fn an_owner_edit_triggers_a_refresh_that_isnt_skipped() {
     // The question is in the fingerprint, so the same memories still get an
-    // LLM call (TIM-95, decision 7).
+    // LLM call.
     let h = Harness::new();
     h.insert(fact(TEA));
     h.refresh_adding(PROFILE_NAME, &[]);
@@ -851,7 +843,7 @@ fn a_failed_refresh_is_retried_after_thirty_minutes_not_at_the_next_trigger() {
     assert_eq!(profile.last_error, Some(FailureKind::Llm));
     assert_eq!(profile.last_error_at, Some(failed_at));
     assert_eq!(profile.last_refreshed_at, None);
-    // `status` counts it and says it needs attention (TIM-114).
+    // `status` counts it and says it needs attention.
     let status = h.service.status().unwrap();
     assert_eq!(status.banks[BANK].failed_refreshes, 1);
     assert_eq!(status.attention.len(), 1, "{:?}", status.attention);
@@ -923,7 +915,7 @@ fn a_disabled_model_is_never_refreshed() {
 
 #[test]
 fn a_refresh_never_runs_inside_a_block_fetch() {
-    // The plugin fetches the block with a 2 s budget (TIM-95, decision 7).
+    // The plugin fetches the block with a 2 s budget.
     let h = Harness::new();
     h.says(notable(TEA));
     h.advance(minutes(10));
@@ -931,7 +923,7 @@ fn a_refresh_never_runs_inside_a_block_fetch() {
     assert_eq!(h.profile().last_refreshed_at, None);
 }
 
-// The refresh input and the fingerprint (TIM-95, decisions 3 and 7)
+// The refresh input and the fingerprint
 
 #[test]
 fn a_refresh_selects_current_memories_above_tau_that_pass_the_filters() {
@@ -1084,7 +1076,7 @@ fn a_faded_memory_leaves_the_model_at_the_next_sweep() {
 
 #[test]
 fn a_refresh_logs_its_retrieval_and_writes_no_access() {
-    // TIM-95, decision 10: reading or refreshing a model never counts as an
+    // reading or refreshing a model never counts as an
     // access. The schema's recall log has a `refresh` kind for its
     // retrieval: one row per refresh, with no session.
     let h = Harness::new();
@@ -1101,7 +1093,7 @@ fn a_refresh_logs_its_retrieval_and_writes_no_access() {
 
 #[test]
 fn entries_are_never_embedded_extracted_from_or_ingested() {
-    // TIM-95, decision 10: no feedback loops.
+    // no feedback loops.
     let h = Harness::new();
     let tea = h.insert(fact(TEA));
     let counts = |h: &Harness| -> (i64, i64, i64, i64) {
@@ -1118,7 +1110,7 @@ fn entries_are_never_embedded_extracted_from_or_ingested() {
     assert_eq!(counts(&h), before);
 }
 
-// Entries and edits (TIM-95, decision 5)
+// Entries and edits
 
 #[test]
 fn untouched_entries_are_copied_byte_for_byte_and_edits_keep_their_id() {
@@ -1271,7 +1263,7 @@ fn a_malformed_reply_leaves_the_entries_untouched_and_records_an_error() {
     ));
 }
 
-// The budget (TIM-95, decision 8)
+// The budget
 
 #[test]
 fn creating_a_model_past_the_budget_is_refused() {
@@ -1406,7 +1398,7 @@ fn entries_past_max_tokens_are_trimmed_lowest_ranked_first() {
     assert!(tokens <= 30, "{tokens} tokens");
 }
 
-// Memories win (TIM-95, decision 6; ADR 0007)
+// Memories win (ADR 0007)
 
 #[test]
 fn an_entry_citing_a_retracted_memory_is_dropped_from_the_block() {
@@ -1508,8 +1500,7 @@ fn a_refinement_moves_the_citation_to_the_head_of_the_chain() {
 
 #[test]
 fn an_entry_citing_a_low_confidence_state_shows_its_age() {
-    // TIM-95, decision 5, as injection does (TIM-91, decision 8; TIM-93,
-    // decision 10): "observed 30 days ago, Tue 1 Sep".
+    // As in injection, show the age: "observed 30 days ago, Tue 1 Sep".
     let h = Harness::new();
     let job = h.insert(Memory {
         kind: "state",
@@ -1526,8 +1517,7 @@ fn an_entry_citing_a_low_confidence_state_shows_its_age() {
     assert!(line.contains("Tue 1 Sep"), "{line}");
 }
 
-// The block (TIM-95, decision 8 and the amendment's decision 2; TIM-94,
-// decision 8)
+// The block
 
 #[test]
 fn the_block_holds_the_agenda_each_enabled_model_and_the_pointer_line() {
@@ -1655,7 +1645,7 @@ fn the_clock_alone_changes_the_block_only_at_local_midnight() {
     assert_eq!(friday.agenda.len(), 1);
 }
 
-// In context (TIM-95, decision 4; TIM-93, decision 7)
+// In context
 
 #[test]
 fn a_sessions_block_puts_its_agenda_and_cited_memories_in_context() {
@@ -1721,7 +1711,7 @@ fn a_mapping_expires_after_thirty_days_without_a_turn() {
     assert!(h.in_context("s1").is_empty());
 }
 
-// The agenda (TIM-93, decision 7, as amended by TIM-95, decision 1)
+// The agenda
 
 #[test]
 fn dated_lines_hold_events_and_tasks_within_seven_local_days() {
@@ -1909,7 +1899,7 @@ fn undated_open_tasks_are_gated_on_tau_and_capped() {
     }
 }
 
-// Regressions from the TIM-111 implementation run (1429a07), fixed in a8e3e31
+// Refresh retry regressions
 
 /// An embedder that answers like `FakeEmbedder` until a test makes it
 /// fail, counting every call.
@@ -1942,10 +1932,9 @@ impl Embedder for FlakyEmbedder {
 
 #[test]
 fn a_refresh_whose_retrieval_fails_waits_thirty_minutes_like_any_failure() {
-    // TIM-95 amendment, decision 1: "A failed refresh is retried once the
-    // 30-minute interval has passed". At 1429a07 a refresh whose retrieval
-    // failed was only logged, so the request stayed due and every timer
-    // pass, a minute apart in `serve`, retried it.
+    // A failed refresh waits 30 minutes before retrying. Logging a
+    // retrieval failure without settling the request would leave it due
+    // on every timer pass, a minute apart in `serve`.
     let embedder = Arc::new(FlakyEmbedder::default());
     let h = Harness::with_models(Models {
         embedder: embedder.clone(),
@@ -1986,10 +1975,10 @@ fn a_refresh_whose_retrieval_fails_waits_thirty_minutes_like_any_failure() {
     assert_eq!(profile.last_refreshed_at, Some(failed_at + minutes(30)));
 }
 
-// Call 1 sees the entries a session's block holds (TIM-95, decision 4:
+// Call 1 sees the entries a session's block holds.
 // "Extraction receives each entry's text with its memory ids, so a reply
 // that relies on an entry counts as `used` on every memory the entry
-// cites"). Entries get their own handles, `n1`, `n2`, ..., listed with the
+// cites". Entries get their own handles, `n1`, `n2`,..., listed with the
 // handles of the in-context memories they cite, and a `used_injected_ids`
 // naming an entry credits each memory it cites once. They're snapshotted
 // with the turn when it's ingested, as its in-context set is.
@@ -2032,7 +2021,7 @@ fn a_reply_relying_on_an_entry_is_credited_on_every_memory_it_cites() {
 fn a_turns_entries_are_the_ones_its_session_held_when_it_was_synced() {
     // The worker reaches the turn later. A refresh rewording the entry in
     // between changes neither what call 1 is shown nor what's credited, and
-    // the snapshot goes once the turn is extracted (TIM-110 review).
+    // the snapshot goes once the turn is extracted.
     let (h, cat, tea) = a_turn_after_the_block();
     let snapshots = |h: &Harness| -> i64 { h.one("SELECT COUNT(*) FROM turn_entries", []) };
     assert_eq!(snapshots(&h), 1);
@@ -2069,7 +2058,7 @@ fn a_turns_entries_are_the_ones_its_session_held_when_it_was_synced() {
     assert_eq!(snapshots(&h), 0, "the snapshot outlived the extraction");
 }
 
-// The block-id fallback (TIM-95, decision 4): "if Hermes gives no session
+// The block-id fallback: "if Hermes gives no session
 // id at `system_prompt_block()` time, the plugin sends the block id with
 // its first `prefetch`, and the daemon persists the mapping then."
 // `PrefetchRequest::block_id` names the block. The daemon keeps what each
@@ -2178,7 +2167,7 @@ fn a_block_id_from_another_bank_maps_nothing() {
     assert!(h.in_context("s1").is_empty());
 }
 
-// Regressions from the TIM-111 review of c8f2230, fixed in f6da4b2
+// Refresh and budget regressions
 
 /// A refresh LLM that, while its first call is in flight, has the owner
 /// keep `keep`: a triggering write landing in the middle of a refresh.
@@ -2207,7 +2196,7 @@ impl LlmClient for KeepsDuringCall<'_> {
 
 #[test]
 fn a_trigger_during_a_refresh_is_refreshed_after_the_interval() {
-    // Review finding 1. The refresh selected its inputs before the keep, so
+    // The refresh selected its inputs before the keep, so
     // the kept memory was never shown to the LLM. The request the keep made
     // has to survive the refresh's completion and run once the minimum
     // interval has passed, not wait for the next write or the 04:00 sweep.
@@ -2238,7 +2227,7 @@ fn a_trigger_during_a_refresh_is_refreshed_after_the_interval() {
 
 #[test]
 fn a_stated_end_holds_through_its_unit_in_the_block() {
-    // Review finding 2. A stored time is the start of its unit, so an end
+    // A stored time is the start of its unit, so an end
     // of 1 October holds through 1 October, and an end in October through
     // October (`Window::closes_at`). A future ending, already recorded with
     // `ended_by`, hasn't ended anything yet.
@@ -2336,7 +2325,7 @@ fn a_stated_end_holds_through_its_unit_on_the_agenda() {
 
 #[test]
 fn the_whole_block_stays_within_the_budget_and_records_only_what_it_renders() {
-    // Review finding 3. ADR 0007: every model "shares about 800 tokens of
+    // ADR 0007: every model "shares about 800 tokens of
     // `system_prompt_block()` with the agenda". The agenda keeps its own
     // caps and is laid out first, so today's appointment can't be pushed
     // out by a model; the models get what's left. What the block lists or

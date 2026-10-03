@@ -1,4 +1,4 @@
-"""``sync_turn`` (TIM-94, decisions 1, 5 and 6; TIM-88 timestamps): the Turn
+"""``sync_turn``: the Turn
 body, the primary gate, the ``ingest`` switch and the echoed ``recall_id``."""
 
 from datetime import datetime
@@ -92,8 +92,9 @@ def test_ingest_false_sends_nothing(make_provider, daemon):
     assert daemon.requests_for("turns") == []
 
 
-# -- recall ids across overlapping turns (TIM-99; Hermes syncs on a background
-# worker, so the next turn's prefetch can run before this turn's sync) ----------
+# -- recall ids across overlapping turns -----------------------------------------
+# Hermes syncs on a background worker, so the next turn's prefetch can run
+# before this turn's sync.
 
 
 def _recall_id_per_query(daemon):

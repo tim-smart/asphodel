@@ -1,4 +1,4 @@
-"""``initialize`` (TIM-94, decisions 3 and 7, round 1 item 5): one health
+"""``initialize``: one health
 probe, ``PUT`` the bank with the configured identity, warnings through
 ``warning_callback``, and never a failure."""
 

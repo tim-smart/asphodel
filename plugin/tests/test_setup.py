@@ -1,4 +1,4 @@
-"""Setup (TIM-94, decision 7; round 1 item 5): ``save_config`` into
+"""Setup: ``save_config`` into
 ``config.json``, and ``post_setup`` turning Hermes' built-in memory off and
 activating the provider."""
 

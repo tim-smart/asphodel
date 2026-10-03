@@ -1,17 +1,12 @@
-//! The replay harness on scripted scenarios, checked against "Replay
-//! harness: simulated-clock replay of recorded sessions" (TIM-96, the
-//! resolution and its TIM-97 and TIM-98 amendments), "Deletion policy"
-//! (TIM-97, decision 7), the lifetimes in "Strength model" (TIM-91), and
-//! ADRs 0004 and 0008. The contract these tests pin is `docs/replay.md`.
+//! The replay harness on scripted scenarios, including deletion policy
+//! and memory lifetimes under ADRs 0004 and 0008. The contract these tests
+//! pin is `docs/replay.md`.
 //!
 //! The tests drive the binary as a process, as `serve_http.rs` does, and
 //! read the JSON report, so nothing here depends on how the engine is laid
 //! out inside. The scenario files under `scenarios/` are the fixtures; the
 //! command's own loader (`asphodel::replay::scenario`) parses every
 //! checked-in one here and checks that labels resolve.
-//!
-//! Where TIM-96 leaves a detail open, `docs/replay.md` proposes one and
-//! says so. Those are the places to argue with.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -594,7 +589,7 @@ head = true
     );
 }
 
-/// TIM-116 review, finding 4: the simulated worker claims the head of the
+/// The simulated worker claims the head of the
 /// queue, which production orders by priority (turns before documents),
 /// not in arrival order. The turn at 09:05 goes before the document's
 /// second chunk, which arrived at 09:00.
@@ -719,7 +714,7 @@ fn the_report_names_its_run_and_defaults_its_path() {
     assert!(default.is_file(), "no report at {}", default.display());
 }
 
-// Overrides and layering (TIM-98 amendment).
+// Overrides and layering.
 
 #[test]
 fn overrides_layer_over_the_production_file_in_the_shape_of_tuning() {
@@ -753,7 +748,7 @@ fn overrides_layer_over_the_production_file_in_the_shape_of_tuning() {
     assert_eq!(run.report()["tuning"]["clock"]["quiet_rate"], 0.5);
 }
 
-// Privacy and the private directory (TIM-96, decisions 3 and 8).
+// Privacy and the private directory.
 
 #[test]
 fn replay_refuses_to_run_without_a_private_directory() {
@@ -865,12 +860,10 @@ memory = \"home\"
     replay(&dir, &path, &[]).assert_refused("home");
 }
 
-// The TIM-116 review findings on `ceef0c5`, accepted as regressions. Each
-// names the finding it pins. They fail until the fixes land, except where
-// noted.
+// Replay directory ownership, output containment and completion.
 
-/// Finding 1: replay resets `<replay dir>/store` without checking it made
-/// it. A store dir replay didn't create, such as a stopped daemon's data
+/// Replay may reset only a store it created. A store dir replay didn't
+/// create, such as a stopped daemon's data
 /// dir named `store`, is refused before anything in it is touched.
 #[test]
 fn replay_refuses_to_reset_a_store_it_didnt_create() {
@@ -888,12 +881,10 @@ fn replay_refuses_to_reset_a_store_it_didnt_create() {
     );
 }
 
-/// Finding 2: the store lock is dropped before the reset, so two replays
-/// on one private dir can race. The guard this pins: a replay holds its
-/// private dir for its whole run, so a second replay on the same dir is
-/// refused and the first finishes untouched. It passes today through the
-/// store lock; the race between the lock's release and the reset has no
-/// black-box reproduction and is fixed by control flow.
+/// A replay holds its private dir for its whole run, so a second replay
+/// on the same dir is refused and the first finishes untouched. This
+/// exercises lock contention; a race between lock release and store reset
+/// has no black-box reproduction and must be prevented by control flow.
 #[test]
 fn a_second_replay_on_the_same_private_dir_is_refused_while_the_first_runs() {
     let dir = TestDir::new();
@@ -937,9 +928,8 @@ fn a_second_replay_on_the_same_private_dir_is_refused_while_the_first_runs() {
     );
 }
 
-/// Finding 3: the default report path joins the scenario's name unchecked,
-/// so a name with a path in it writes outside the private dir. A name is
-/// one filename component.
+/// The default report path uses the scenario's name, which must be one
+/// filename component so the report stays inside the private dir.
 #[test]
 fn a_scenario_name_that_isnt_a_filename_is_refused() {
     let dir = TestDir::new();
@@ -964,7 +954,7 @@ fn a_scenario_name_that_isnt_a_filename_is_refused() {
     );
 }
 
-/// Finding 3: `--report` is checked like the private dir. A destination
+/// `--report` is checked like the private dir. A destination
 /// inside a git working tree is refused.
 #[test]
 fn a_report_path_inside_a_git_working_tree_is_refused() {
@@ -980,7 +970,7 @@ fn a_report_path_inside_a_git_working_tree_is_refused() {
     assert!(!report.exists(), "the report was written inside the tree");
 }
 
-/// Finding 3: an existing symlink at the report path would write through
+/// An existing symlink at the report path would write through
 /// to wherever it points. It's refused and left as it was.
 #[test]
 fn a_report_path_that_is_a_symlink_is_refused() {
@@ -1081,9 +1071,8 @@ fn a_report_inside_the_store_is_refused() {
     assert_reserved_report("store/asphodel.db");
 }
 
-/// Finding 5: the run ends at the last event, so a completion scheduled
-/// after it never happens and the report says success with nothing
-/// extracted. Accepted work is drained before the run ends.
+/// Accepted work is drained before the run ends, including completions
+/// scheduled after the last event, so extraction appears in the report.
 #[test]
 fn accepted_sources_are_extracted_even_after_the_last_probe() {
     let dir = TestDir::new();
@@ -1099,7 +1088,7 @@ fn accepted_sources_are_extracted_even_after_the_last_probe() {
     );
 }
 
-/// Finding 6: two probes with one id would share a probe session and, for
+/// Two probes with one id would share a probe session and, for
 /// `injects`, could evict each other's pending injections. Ids are unique
 /// and the loader says so.
 #[test]
@@ -1128,7 +1117,7 @@ memory = \"home\"
     run.assert_refused("twin");
 }
 
-/// Finding 6: probe sessions are `probe:<id>`, and no scenario session may
+/// Probe sessions are `probe:<id>`, and no scenario session may
 /// start with `probe:`, so an `injects` probe can never touch a scenario
 /// session's pending injection or idle timeout.
 #[test]
@@ -1143,7 +1132,7 @@ fn a_scenario_session_in_the_probe_namespace_is_refused() {
     run.assert_refused("probe:");
 }
 
-/// Finding 7: TIM-96 decision 4 keys a memory id by its source and claim
+/// A memory id is keyed by its source and claim
 /// ordinal. The source is the one ingest minted for the turn's key, and the
 /// ordinal is the claim's chunk position and index in call 1's reply, so a
 /// document's chunks can't collide.

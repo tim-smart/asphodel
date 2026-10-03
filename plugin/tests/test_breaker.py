@@ -1,4 +1,4 @@
-"""The circuit breaker (TIM-94, decision 6): three consecutive connection
+"""The circuit breaker: three consecutive connection
 failures open it for 30 s; while open no request is made and every hook
 answers as if the daemon were down. HTTP errors never trip it."""
 

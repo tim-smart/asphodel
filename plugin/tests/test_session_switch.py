@@ -1,4 +1,4 @@
-"""``on_session_switch`` (TIM-94, decision 5; TIM-95 decision 4): clear the
+"""``on_session_switch``: clear the
 session's in-context set on compression, reset or rewind; rebind on every
 switch; a plain ``/resume`` clears nothing."""
 

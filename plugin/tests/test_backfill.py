@@ -1,4 +1,4 @@
-"""The backfill strip (TIM-96's amendment to TIM-94): on history backfill the
+"""The backfill strip: on history backfill the
 gateway puts other people's recent messages and a ``[New message]`` marker in
 front of the user text. Everything before the marker goes; the ``[Name] ``
 prefix of a shared thread stays."""

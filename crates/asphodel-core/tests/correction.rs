@@ -1,6 +1,4 @@
-//! Entity correction, re-embedding and bank deletion, checked against
-//! "Operations: inspection, entity correction, re-embedding and bank
-//! deletion" (TIM-115), TIM-99 decisions 5 and 10, and ADR 0010.
+//! Entity correction, re-embedding and bank deletion follow ADR 0010.
 //!
 //! The API under test is the `Service` methods: `merge_entities`,
 //! `unmerge_entity`, `unlink_entity`, `start_reembed`, `run_reembed`,
@@ -580,7 +578,7 @@ fn a_reembed_resumes_from_its_cursor_and_swaps_in_the_new_model() {
     let new = Counting::new(Arc::new(FakeEmbedderV2), Some(2));
     let h = h.restart_with(new.clone(), old.clone());
 
-    // TIM-99, as amended: until the swap the bank is served with the
+    // until the swap the bank is served with the
     // model it recorded.
     h.recall("main", "tea");
     assert!(old.calls() > 0);
@@ -905,7 +903,7 @@ fn a_bank_whose_recorded_model_isnt_loaded_is_refused_without_embedding() {
         .unwrap();
     let unavailable = |model: &str| model == FakeEmbedder::MODEL_ID;
 
-    // ADR 0010, as decided on TIM-115: recall and prefetch are refused
+    // ADR 0010: recall and prefetch are refused
     // rather than searched with another model's vectors.
     match h.service.recall(
         "main",
@@ -1051,7 +1049,7 @@ fn a_reembed_recovers_a_bank_whose_recorded_model_isnt_loaded() {
     );
 }
 
-// Review regressions: a re-embed's swap racing recall, staged vectors and
+// Regressions: a re-embed's swap racing recall, staged vectors and
 // erasure, the purge projection across a window close, and unlink after
 // two merges.
 

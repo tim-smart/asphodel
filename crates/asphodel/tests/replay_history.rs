@@ -1,8 +1,5 @@
-//! Real-history replay on a synthetic history: the LLM recording modes,
-//! determinism, the report, the aggregate export and the A/B diff, checked
-//! against "Replay harness: simulated-clock replay of recorded sessions"
-//! (TIM-96, decisions 3, 4, 6, 7 and 8, with the TIM-97 and TIM-98
-//! amendments) and TIM-117's scope and done-when.
+//! Real-history replay on a synthetic history: LLM recording modes,
+//! deterministic reports, private aggregate exports and A/B diffs.
 //!
 //! The history is `support::hermes::small_history`, imported with
 //! `asphodel import`. `live` runs on a scripted stand-in for the LLM
@@ -38,7 +35,7 @@ fn simulation(report: &Value) -> Value {
     report
 }
 
-// Recording modes (TIM-96, decision 4).
+// Recording modes.
 
 /// `live` calls the LLM and records; `replay` of that cassette needs no
 /// LLM and simulates the same run.
@@ -66,7 +63,7 @@ fn replay_of_a_live_cassette_simulates_the_same_run_without_an_llm() {
     assert_eq!(simulation(&live), simulation(&replay));
 }
 
-/// TIM-96, decision 3: with the same corpus, cassette and overrides,
+/// With the same corpus, cassette and overrides,
 /// `replay` writes a byte-identical report.
 #[test]
 fn repeated_replay_runs_write_byte_identical_reports() {
@@ -95,7 +92,7 @@ fn replay_fails_on_a_cassette_miss() {
     assert!(!run.report_path.exists(), "a failed run writes no report");
 }
 
-/// TIM-96, decision 4: `used` verdicts are cached per (reply, sentence)
+/// `used` verdicts are cached per (reply, sentence)
 /// pair, and in `fast` the pairs nobody has judged get one short top-up
 /// call per chunk, recorded like any other call, so the next `fast` run
 /// needs none.
@@ -228,7 +225,7 @@ fn a_fast_claims_miss_calls_live_with_an_llm_and_counts_it() {
     assert_eq!(report["llm"]["live"], 1, "{report}");
 }
 
-// The determinism self-test (TIM-117, done-when).
+// The determinism self-test.
 
 /// `fast` on its own recording needs no LLM, counts zero misses and passes
 /// the self-test.
@@ -250,11 +247,11 @@ fn the_self_test_passes_for_fast_with_zero_misses() {
     assert_eq!(run.report()["llm"]["misses"], 0);
 }
 
-// The report (TIM-96, decisions 6 and 7).
+// The report.
 
 /// Injected tokens per session and per turn, with cron reported apart so
 /// it doesn't skew the percentiles; purges per day next to the
-/// purged-then-re-mentioned rate (TIM-97 amendment).
+/// purged-then-re-mentioned rate.
 #[test]
 fn the_report_counts_injected_tokens_with_cron_apart_and_purges() {
     let dir = TestDir::new();
@@ -287,10 +284,10 @@ fn the_report_counts_injected_tokens_with_cron_apart_and_purges() {
     );
 }
 
-// Privacy (TIM-96, decision 8).
+// Privacy.
 
 /// The aggregate export is the only thing that leaves the private dir, and
-/// its only string values are probe ids (TIM-117, done-when). A failed
+/// its only string values are probe ids. A failed
 /// probe is included, since that's where a sentence would most likely
 /// leak.
 #[test]
@@ -397,7 +394,7 @@ fn real_history_material_is_refused_outside_the_private_dir() {
     assert!(!cassette.exists());
 }
 
-// The A/B diff (TIM-96, decision 6).
+// The A/B diff.
 
 /// The diff refuses to compare runs with a different corpus unless forced,
 /// and compares runs on the same one.
@@ -459,7 +456,7 @@ fn sha(bytes: &[u8]) -> String {
 
 /// The diff lists a memory that faded in one run and not the other by id,
 /// and numbers that differ beyond the tolerance by path, leaving out those
-/// within it (TIM-96, decision 6). The two reports are one run's report
+/// within it. The two reports are one run's report
 /// edited by hand, so the corpus and cassette match and only the edited
 /// values differ.
 #[test]
@@ -520,7 +517,7 @@ fn the_diff_lists_fates_by_id_and_numbers_beyond_the_tolerance_by_path() {
     );
 }
 
-// Refreshes (TIM-96, decision 4). Every bank is seeded with "User profile"
+// Refreshes. Every bank is seeded with "User profile"
 // (ADR 0007); the corpus here adds `home` from the manifest, within the
 // budget the profile leaves. The live stand-in answers every call with a
 // reply call 1 and a refresh can both read, so the order of calls doesn't
@@ -755,8 +752,7 @@ fn fast_refresh_live_calls_the_llm_for_an_unrecorded_refresh() {
     assert!(cassette_records(&dir).iter().any(is_home_refresh));
 }
 
-// The TIM-117 review findings on `4ac0205` (Run D), as regressions. Each
-// names the blocker it pins.
+// Input validation, replay timing and cassette substitution.
 
 /// Exit 0 with every probe passed, or the failed probes in the message.
 fn assert_probes_pass(run: &support::Run) {
@@ -783,7 +779,7 @@ fn assert_refused_without(output: &std::process::Output, sentinel: &str, words: 
     }
 }
 
-/// Blocker 1 (ADR 0010, "Logging"): a probes file that doesn't parse is
+/// (ADR 0010, "Logging"): A probes file that doesn't parse is
 /// refused naming the file and the line, never quoting it.
 #[test]
 fn a_malformed_probes_file_is_refused_without_quoting_it() {
@@ -804,7 +800,7 @@ fn a_malformed_probes_file_is_refused_without_quoting_it() {
     );
 }
 
-/// Blocker 1: a probe whose regex doesn't compile is refused naming the
+/// A probe whose regex doesn't compile is refused naming the
 /// probe, never the pattern.
 #[test]
 fn a_probe_regex_that_doesnt_compile_is_refused_without_quoting_it() {
@@ -818,7 +814,7 @@ fn a_probe_regex_that_doesnt_compile_is_refused_without_quoting_it() {
     assert_refused_without(&run.output, "SENTINEL-PROBE-PATTERN", &["p001"]);
 }
 
-/// Blocker 1: a corpus line that doesn't parse is refused naming the line,
+/// A corpus line that doesn't parse is refused naming the line,
 /// never quoting it.
 #[test]
 fn a_malformed_corpus_line_is_refused_without_quoting_it() {
@@ -849,7 +845,7 @@ fn a_malformed_corpus_line_is_refused_without_quoting_it() {
     assert_refused_without(&run.output, sentinel, &[&format!("line {}", line + 1)]);
 }
 
-/// Blocker 2 (TIM-96, decision 3): with nonzero live latency, a prefetch between a turn's sync
+/// With nonzero live latency, a prefetch between a turn's sync
 /// and its completion doesn't see the turn's memory, and one after does.
 /// Both prefetches ask the same question from sessions of their own; the
 /// probes check the store at the same two moments.
@@ -923,7 +919,7 @@ memory = "lives in Auckland"
     assert_ok(&run.output);
 }
 
-/// Blocker 3: `--no-cache` re-records from scratch, so re-recording leaves
+/// `--no-cache` re-records from scratch, so re-recording leaves
 /// one record per call, and the replay's lag is one call's latency, not
 /// the sum over every recording.
 #[test]
@@ -969,7 +965,7 @@ fn re_recording_with_no_cache_starts_a_fresh_cassette() {
     );
 }
 
-/// Blocker 3: a chunk's latency comes from the records that answered it,
+/// A chunk's latency comes from the records that answered it,
 /// not from every record tagged with the chunk. Copies of each record
 /// under another model, ten times slower, sit first in the cassette; the
 /// replay answers from the original model's and keeps its lag.
@@ -1105,7 +1101,7 @@ fn record_with_a_meaning_m1(dir: &TestDir, corpus: &std::path::Path) {
     write_cassette(dir, &kept);
 }
 
-/// Blocker 4 (TIM-96, decision 4): a substituted refresh cites the memory
+/// A substituted refresh cites the memory
 /// it cited when recorded, not whichever memory holds its handle now.
 #[test]
 fn a_substituted_refresh_cites_the_memory_it_was_recorded_with() {
@@ -1139,7 +1135,7 @@ memory = "lives in Auckland"
     assert_probes_pass(&run);
 }
 
-/// Blocker 4: when the memory a substituted refresh cited isn't in the
+/// When the memory a substituted refresh cited isn't in the
 /// current input, the operation is dropped, even though its handle names
 /// another memory now.
 #[test]
@@ -1167,7 +1163,7 @@ memory = "lives in Auckland"
     assert_probes_pass(&run);
 }
 
-/// Blocker 4: nearest-refresh substitution only considers records of the
+/// Nearest-refresh substitution only considers records of the
 /// run's own LLM model. A record under another model at the very time of
 /// the refresh loses to the run's own model's record 200 days off.
 #[test]
@@ -1214,7 +1210,7 @@ fn a_refresh_recorded_under_another_model_is_never_substituted() {
     assert_probes_pass(&run);
 }
 
-// TIM-117 re-review, blocker 3: a substituted refresh's edit or remove
+// A substituted refresh's edit or remove
 // whose recorded entry is absent from this run is dropped, even though its
 // handle names another entry now.
 
