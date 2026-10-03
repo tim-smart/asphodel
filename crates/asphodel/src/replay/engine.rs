@@ -8,17 +8,29 @@
 //! every store write carries the simulated time.
 //!
 //! Extraction is queued at a source's sync. Each bank has one simulated
-//! worker. Whenever it's free, at a sync or at its previous completion, it
-//! claims the head of the production queue (turns before documents, then
-//! observed time) and commits that chunk a latency later. At that moment
-//! it also commits the same source's next chunks, for as long as each is
-//! the queue's head. Once another source is at the head, for example a
-//! turn synced in the meantime, the worker claims that instead. The rest
-//! of the document then waits behind it and is charged another latency
-//! when its turn comes. A probe or prefetch before a completion sees the
-//! store without those memories. Accesses are stamped with the source's
-//! ingest time, as in production. The run ends at the latest of the last
-//! event, `--until` and the last completion.
+//! worker with room for `[llm] concurrency` chunks. Whenever it has room,
+//! at a sync or at a completion, it claims the head of the production
+//! queue (turns before documents, then observed time) and commits that
+//! chunk a latency later. When that chunk is the only one out, it also
+//! commits the same source's next chunks at that moment, for as long as
+//! each is the queue's head. Once another source is at the head, for
+//! example a turn synced in the meantime, the worker claims that instead.
+//! The rest of the document then waits behind it and is charged another
+//! latency when its turn comes. A probe or prefetch before a completion
+//! sees the store without those memories. Accesses are stamped with the
+//! source's ingest time, as in production. The run ends at the latest of
+//! the last event, `--until` and the last completion.
+//!
+//! With more than one chunk out, chunks commit in the order they were
+//! claimed: one whose latency ends first waits for those claimed before
+//! it. A commit that finds a memory or an edit since its search that it
+//! must reconcile against searches and runs call 2 again at that instant,
+//! through the cassette, and commits a latency later: its call 2's served
+//! latency, or the `--latency` constant, as any chunk is charged. It keeps
+//! its lease and its place in the order meanwhile, and the events in
+//! between run as usual. The report counts these redos. Scenarios
+//! script call 2 against what a serial run shows it, so they run at
+//! concurrency 1.
 //!
 //! The LLM is answered one of two ways. For a scenario, from its claims: call
 //! 1's reply is built from them, and call 2's from their outcomes against the
@@ -35,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asphodel_core::extraction::{Call1Input, DropReason, Extracted, Prepared};
+use asphodel_core::extraction::{Call1Input, Committed, DropReason, Extracted, Prepared};
 use asphodel_core::ingest::{Document, Outcome as IngestOutcome, Turn, TurnAuthor};
 use asphodel_core::inspect::InspectError;
 use asphodel_core::models::{FakeLlm, LlmClient, LlmError, LlmRequest, LlmResponse};
@@ -171,6 +183,8 @@ struct Pending {
 /// A chunk the worker has claimed and prepared: its LLM calls ran at the
 /// claim, and it commits at its completion.
 struct Ready {
+    /// Its place in the order chunks were claimed.
+    ticket: u64,
     prepared: Prepared,
     source: Uuid,
     position: u32,
@@ -262,8 +276,17 @@ pub struct Engine<'a> {
     shadow: Vec<ShadowRow>,
     /// Synced sources by id, until their last chunk is extracted.
     pending: BTreeMap<Uuid, Pending>,
-    /// Whether the worker holds a lease, with its completion on the queue.
-    working: bool,
+    /// How many chunks the worker may have out at once.
+    concurrency: usize,
+    /// The chunks out, by ticket in claim order, with their completions on
+    /// the queue or, when they're done, in `done`.
+    out: std::collections::VecDeque<u64>,
+    /// Chunks whose latency has ended, waiting for those claimed before
+    /// them to commit.
+    done: BTreeMap<u64, Ready>,
+    next_ticket: u64,
+    /// Commits that found their chunk stale and reconciled it again.
+    redos: u64,
     refresh_llm: NoEdits,
     probes: Vec<ProbeResult>,
     purges: BTreeMap<String, u64>,
@@ -311,6 +334,11 @@ impl<'a> Engine<'a> {
                 .collect::<Result<_, _>>()
                 .map_err(|_| Failure::Scenario("a probe's memory regex doesn't parse".into()))?,
         };
+        if matches!(llm, Llm::Scripted) && tuning.llm.concurrency > 1 {
+            return Err(Failure::Scenario(
+                "a scenario scripts call 2 against what a serial run shows it, so it runs at [llm] concurrency = 1".into(),
+            ));
+        }
         let labelling = settings.labelling.then(Collector::default);
         let mut engine = Self {
             service,
@@ -331,7 +359,11 @@ impl<'a> Engine<'a> {
             created: Vec::new(),
             shadow: Vec::new(),
             pending: BTreeMap::new(),
-            working: false,
+            concurrency: tuning.llm.concurrency.max(1) as usize,
+            out: std::collections::VecDeque::new(),
+            done: BTreeMap::new(),
+            next_ticket: 0,
+            redos: 0,
             refresh_llm: NoEdits {
                 calls: Mutex::new(Vec::new()),
                 clock,
@@ -575,62 +607,99 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// When the bank's one worker is free, it claims the head of the
-    /// production queue, runs its LLM calls at once, and commits it a
-    /// latency later.
+    /// While the worker has room, it claims the head of the production
+    /// queue, runs its LLM calls at once, and commits it a latency later.
     fn start_worker(&mut self) -> Result<(), Failure> {
-        if self.working {
-            return Ok(());
-        }
-        match self.service.next_extraction(&self.settings.bank)? {
-            Some(claimed) => {
-                let ready = self.prepare_chunk(claimed)?;
-                self.schedule_completion(ready)
+        while self.out.len() < self.concurrency {
+            match self.service.next_extraction(&self.settings.bank)? {
+                Some(claimed) => {
+                    let ready = self.prepare_chunk(claimed)?;
+                    self.schedule_completion(ready)?;
+                }
+                None => break,
             }
-            None => Ok(()),
         }
+        Ok(())
     }
 
-    /// Holds the worker on a prepared chunk until its latency from now.
+    /// Holds a slot of the worker on a prepared chunk until its latency
+    /// from now.
     fn schedule_completion(&mut self, ready: Ready) -> Result<(), Failure> {
         let at = self
             .clock
             .now()
             .checked_add(ready.latency)
             .unwrap_or(Timestamp::MAX);
-        self.working = true;
+        self.out.push_back(ready.ticket);
         self.extend_end(at);
         self.push(at, 1, EventKind::Completion(Box::new(ready)));
         Ok(())
     }
 
-    /// Commits the worker's chunk, and with it the rest of its source's
-    /// chunks while they are the queue's head: the latency is per source,
-    /// so those are prepared and committed here. Then the worker takes
-    /// the next head, if any.
+    /// Commits the chunks whose latency has ended, in the order they were
+    /// claimed, so one finishing early waits for those claimed before it.
+    /// When a chunk committed was the only one out, the rest of its
+    /// source's chunks commit with it while they are the queue's head: the
+    /// latency is per source, so those are prepared and committed here.
+    /// Then the worker fills its room again.
     fn complete(&mut self, ready: Ready) -> Result<(), Failure> {
-        let source = ready.source;
-        self.commit_chunk(ready)?;
-        let next = loop {
-            match self.service.next_extraction(&self.settings.bank)? {
-                Some(claimed) if claimed.lease.source == source => {
-                    let ready = self.prepare_chunk(claimed)?;
-                    self.commit_chunk(ready)?;
-                }
-                other => break other,
+        self.done.insert(ready.ticket, ready);
+        let mut committed = false;
+        let mut next = None;
+        while let Some(ticket) = self.out.front().copied() {
+            let Some(ready) = self.done.remove(&ticket) else {
+                break;
+            };
+            let source = ready.source;
+            if let Some(redone) = self.commit_chunk(ready)? {
+                // It keeps its lease and its place at the head of the
+                // order, and everything claimed after it waits for it.
+                self.schedule_redo(redone);
+                break;
             }
-        };
+            self.out.pop_front();
+            committed = true;
+            if self.out.is_empty() {
+                next = loop {
+                    match self.service.next_extraction(&self.settings.bank)? {
+                        Some(claimed) if claimed.lease.source == source => {
+                            let ready = self.prepare_chunk(claimed)?;
+                            let ticket = ready.ticket;
+                            if let Some(redone) = self.commit_chunk(ready)? {
+                                self.out.push_back(ticket);
+                                self.schedule_redo(redone);
+                                break None;
+                            }
+                        }
+                        other => break other,
+                    }
+                };
+            }
+        }
+        if !committed {
+            return Ok(());
+        }
         // Notable writes start the refresh debounce from the completion.
         let refreshes = self.run_refreshes()?;
         self.schedule_timer(refreshes);
-        self.working = false;
-        match next {
-            Some(claimed) => {
-                let ready = self.prepare_chunk(claimed)?;
-                self.schedule_completion(ready)
-            }
-            None => Ok(()),
+        if let Some(claimed) = next {
+            let ready = self.prepare_chunk(claimed)?;
+            self.schedule_completion(ready)?;
         }
+        self.start_worker()
+    }
+
+    /// Holds a stale chunk, redone at this instant, until its redo's
+    /// latency from now, when it commits. It stays out on its lease, at
+    /// the head of the order, while the events in between run.
+    fn schedule_redo(&mut self, ready: Ready) {
+        let at = self
+            .clock
+            .now()
+            .checked_add(ready.latency)
+            .unwrap_or(Timestamp::MAX);
+        self.extend_end(at);
+        self.push(at, 1, EventKind::Completion(Box::new(ready)));
     }
 
     /// Runs the refreshes due with the run's refresh client and counts
@@ -750,7 +819,9 @@ impl<'a> Engine<'a> {
                 collector.call2(now, lists);
             }
         }
+        self.next_ticket += 1;
         Ok(Ready {
+            ticket: self.next_ticket,
             prepared,
             source,
             position,
@@ -759,20 +830,37 @@ impl<'a> Engine<'a> {
         })
     }
 
-    /// Commits a prepared chunk at its completion.
-    fn commit_chunk(&mut self, ready: Ready) -> Result<(), Failure> {
+    /// Commits a prepared chunk at its completion. A chunk the commit finds
+    /// stale is redone now and handed back, with the redo's latency, to
+    /// complete again: `None` when it committed.
+    fn commit_chunk(&mut self, ready: Ready) -> Result<Option<Ready>, Failure> {
         let Ready {
+            ticket,
             prepared,
             source,
             position,
             mine,
             ..
         } = ready;
+        let extracted = match self.service.try_commit_extraction(prepared)? {
+            Committed::Extracted(extracted) => extracted,
+            Committed::Stale(stale) => {
+                self.redos += 1;
+                let (prepared, latency) = self.redo_chunk(*stale)?;
+                return Ok(Some(Ready {
+                    ticket,
+                    prepared,
+                    source,
+                    position,
+                    mine,
+                    latency,
+                }));
+            }
+        };
         let mut pending = self
             .pending
             .remove(&source)
             .ok_or_else(|| internal(format!("no pending extraction for source {source}")))?;
-        let extracted = self.service.commit_extraction(prepared)?;
 
         let now = self.clock.now();
         self.note_created(&extracted, source, position, &mine, &pending.name)?;
@@ -789,7 +877,51 @@ impl<'a> Engine<'a> {
                 pending.claims.len()
             )));
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// Searches and runs call 2 again for a chunk its commit found stale,
+    /// through the cassette, at the commit's instant, with the latency the
+    /// redo takes: the served latency of the call 2 that answered it, or
+    /// the settings' constant under `--latency`, as any chunk is charged.
+    /// A call 2 whose neighbours differ from the recording's misses: `live`
+    /// and `fast` ask the LLM, and `replay` stops. Only real history gets
+    /// here: scenarios run at concurrency 1, where nothing is ever stale.
+    fn redo_chunk(&mut self, stale: Prepared) -> Result<(Prepared, SignedDuration), Failure> {
+        let Llm::Recorded(recorder, _) = self.llm else {
+            return Err(internal("a scenario's chunk went stale at concurrency 1"));
+        };
+        let had_call2 = stale.call2_input().is_some();
+        let context = ChunkContext::new(
+            ChunkKey {
+                source: stale.lease().source,
+                position: stale.lease().position,
+            },
+            stale.call1_input(),
+        );
+        recorder.enter(context);
+        let result = self.service.redo_extraction(stale, recorder);
+        let served = recorder.served_latency();
+        recorder.leave();
+        match result {
+            Ok(prepared) => {
+                if !had_call2 && prepared.call2_input().is_some() {
+                    self.call2_chunks += 1;
+                }
+                let latency = if self.settings.latency_from_cassette {
+                    SignedDuration::try_from(served).unwrap_or(SignedDuration::MAX)
+                } else {
+                    self.settings.latency
+                };
+                Ok((prepared, latency))
+            }
+            Err(error) => Err(match recorder.first_miss() {
+                Some(miss) => Failure::Internal(anyhow::anyhow!(
+                    "{miss}; a replay fails on a miss, and fast needs an LLM for one"
+                )),
+                None => error.into(),
+            }),
+        }
     }
 
     /// Prepares a chunk through the cassette, with how long the calls that
@@ -1380,6 +1512,14 @@ impl<'a> Engine<'a> {
                 } else {
                     self.call2_chunks as f64 / self.chunks as f64
                 },
+                redos: (self.concurrency > 1).then_some(self.redos),
+                redo_rate: (self.concurrency > 1).then(|| {
+                    if self.chunks == 0 {
+                        0.0
+                    } else {
+                        self.redos as f64 / self.chunks as f64
+                    }
+                }),
             },
             agenda_lines_per_day: self
                 .agenda_lines

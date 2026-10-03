@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use asphodel_core::clock::{Clock, SimulatedClock};
@@ -20,7 +20,7 @@ use asphodel_core::config::{ConfigError, Deployment, Secret, Tuning};
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::vector::EMBEDDING_DIMENSIONS;
 use asphodel_core::store::{OpenOptions, Store};
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -227,6 +227,8 @@ impl StubRequest {
 #[derive(Debug, Clone)]
 struct StubResponse {
     status: u16,
+    /// Headers sent besides the content type, length and connection.
+    headers: Vec<(String, String)>,
     body: String,
     /// Held before answering, for the timeout test.
     delay: Duration,
@@ -236,6 +238,7 @@ impl StubResponse {
     fn json(value: Value) -> Self {
         Self {
             status: 200,
+            headers: Vec::new(),
             body: value.to_string(),
             delay: Duration::ZERO,
         }
@@ -244,9 +247,15 @@ impl StubResponse {
     fn status(status: u16) -> Self {
         Self {
             status,
+            headers: Vec::new(),
             body: "{}".into(),
             delay: Duration::ZERO,
         }
+    }
+
+    fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
     }
 
     /// An OpenAI-style completion whose content is `content`.
@@ -356,9 +365,14 @@ fn serve_one(mut stream: TcpStream, response: StubResponse, log: &Mutex<Vec<Stub
         503 => "Service Unavailable",
         _ => "Status",
     };
+    let extra: String = response
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let _ = write!(
         stream,
-        "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{}",
         response.status,
         response.body.len(),
         response.body
@@ -900,6 +914,80 @@ fn http_statuses_map_to_retryable_or_not() {
 }
 
 #[test]
+fn a_429_with_retry_after_in_seconds_is_a_rate_limit() {
+    // Seconds say when to come back, so every caller holds for that long
+    // and nothing is counted.
+    let server = StubServer::start(StubResponse::status(429).with_header("Retry-After", "30"));
+    let error = OpenAiCompatible::new(server.settings(None))
+        .complete(&request())
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::from_secs(30)),
+        "{error:?}"
+    );
+    assert!(!error.is_retryable(), "deferral, not a retry");
+
+    // A header that's neither seconds nor a date counts like none.
+    let server = StubServer::start(StubResponse::status(429).with_header("Retry-After", "soon"));
+    let error = OpenAiCompatible::new(server.settings(None))
+        .complete(&request())
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::Status { status: 429 }),
+        "{error:?}"
+    );
+
+    // Retry-After on any other status changes nothing.
+    let server = StubServer::start(StubResponse::status(503).with_header("Retry-After", "30"));
+    let error = OpenAiCompatible::new(server.settings(None))
+        .complete(&request())
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::Status { status: 503 }),
+        "{error:?}"
+    );
+}
+
+/// `Retry-After` as an HTTP date, the header's other form (RFC 9110).
+fn retry_after_date(from_now: jiff::SignedDuration) -> String {
+    let at = asphodel_core::clock::SystemClock.now() + from_now;
+    jiff::fmt::rfc2822::DateTimePrinter::new()
+        .timestamp_to_rfc9110_string(&at)
+        .unwrap()
+}
+
+#[test]
+fn a_429_with_retry_after_as_a_date_is_a_rate_limit_too() {
+    // A future date holds every caller until then, like seconds would; a
+    // date already past holds no time at all. Neither is counted.
+    let server = StubServer::start(StubResponse::status(429).with_header(
+        "Retry-After",
+        &retry_after_date(SignedDuration::from_mins(10)),
+    ));
+    let error = OpenAiCompatible::new(server.settings(None))
+        .complete(&request())
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::RateLimited { retry_after }
+            if retry_after > Duration::from_secs(8 * 60) && retry_after <= Duration::from_secs(10 * 60)),
+        "{error:?}"
+    );
+    assert!(!error.is_retryable(), "deferral, not a retry");
+
+    let server = StubServer::start(StubResponse::status(429).with_header(
+        "Retry-After",
+        &retry_after_date(SignedDuration::from_mins(-10)),
+    ));
+    let error = OpenAiCompatible::new(server.settings(None))
+        .complete(&request())
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::ZERO),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn a_slow_endpoint_times_out() {
     let mut response = StubResponse::completion("{}");
     response.delay = Duration::from_secs(3);
@@ -963,6 +1051,166 @@ fn the_fake_llm_replies_in_order_and_records_requests() {
 
     assert_eq!(fake.requests(), vec![first, second.clone(), request()]);
     assert_eq!(fake.requests()[1].user, second.user);
+}
+
+// The gate: the daemon's one way to the LLM.
+
+/// An LLM whose calls wait until the test lets one go, counting how many
+/// are in at once.
+#[derive(Default)]
+struct Held {
+    state: Mutex<HeldState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct HeldState {
+    inside: usize,
+    most: usize,
+    released: usize,
+}
+
+impl Held {
+    fn wait_until(&self, holds: impl Fn(&HeldState) -> bool) {
+        let state = self.state.lock().unwrap();
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !holds(state))
+            .unwrap();
+        drop(state);
+        assert!(!timeout.timed_out(), "the calls never got there");
+    }
+
+    fn release(&self, calls: usize) {
+        self.state.lock().unwrap().released += calls;
+        self.changed.notify_all();
+    }
+}
+
+impl LlmClient for Held {
+    fn model(&self) -> &str {
+        "held"
+    }
+
+    fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        let mut state = self.state.lock().unwrap();
+        state.inside += 1;
+        state.most = state.most.max(state.inside);
+        self.changed.notify_all();
+        while state.released == 0 {
+            state = self.changed.wait(state).unwrap();
+        }
+        state.released -= 1;
+        state.inside -= 1;
+        self.changed.notify_all();
+        Ok(LlmResponse {
+            json: json!({}),
+            usage: None,
+            latency: Duration::ZERO,
+        })
+    }
+}
+
+#[test]
+fn the_gate_lets_at_most_its_limit_of_calls_through_at_once() {
+    let inner = Arc::new(Held::default());
+    let gate = LlmGate::new(inner.clone(), 2, clock());
+    std::thread::scope(|scope| {
+        let calls: Vec<_> = (0..3)
+            .map(|_| scope.spawn(|| gate.complete(&request())))
+            .collect();
+        inner.wait_until(|state| state.inside == 2);
+        // The third waits in the gate, not in the LLM.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(inner.state.lock().unwrap().inside, 2);
+
+        inner.release(1);
+        inner.wait_until(|state| state.inside == 2 && state.released == 0);
+        inner.release(2);
+        for call in calls {
+            call.join().unwrap().unwrap();
+        }
+    });
+    assert_eq!(inner.state.lock().unwrap().most, 2);
+}
+
+/// A scripted LLM behind a gate of two on a clock stopped at [`start`].
+fn gated(script: Value) -> (Arc<FakeLlm>, LlmGate, Arc<SimulatedClock>) {
+    let inner = Arc::new(FakeLlm::from_script("fake-llm", &script.to_string()).unwrap());
+    let clock = Arc::new(SimulatedClock::new(start()));
+    let gate = LlmGate::new(inner.clone(), 2, clock.clone());
+    (inner, gate, clock)
+}
+
+#[test]
+fn a_usage_limit_on_one_call_holds_every_call_refreshes_included_until_it_resets() {
+    let resets_at = start() + SignedDuration::from_hours(1);
+    let (inner, gate, clock) = gated(json!([
+        {"fail": "usage_limited", "resets_at": resets_at.to_string()},
+        {"reply": {"claims": []}},
+    ]));
+    let error = gate.complete(&request()).unwrap_err();
+    assert!(matches!(error, LlmError::UsageLimited { resets_at: at } if at == resets_at));
+
+    // An extraction call and a refresh call (which names its memories)
+    // both hold without reaching the LLM.
+    clock.advance(SignedDuration::from_mins(59));
+    let extraction = gate.complete(&request()).unwrap_err();
+    let refresh = gate.complete_identified(&request(), &[]).unwrap_err();
+    for error in [extraction, refresh] {
+        assert!(
+            matches!(error, LlmError::UsageLimited { resets_at: at } if at == resets_at),
+            "{error:?}"
+        );
+    }
+    assert_eq!(inner.requests().len(), 1, "held calls never reach the LLM");
+
+    clock.set(resets_at);
+    assert_eq!(
+        gate.complete(&request()).unwrap().json,
+        json!({"claims": []})
+    );
+    assert_eq!(inner.requests().len(), 2);
+}
+
+#[test]
+fn a_rate_limit_from_a_refresh_holds_extraction_for_what_is_left_of_it() {
+    let (inner, gate, clock) = gated(json!([
+        {"fail": "status", "status": 429, "retry_after_secs": 30},
+        {"reply": {"operations": []}},
+    ]));
+    let error = gate.complete_identified(&request(), &[]).unwrap_err();
+    assert!(
+        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::from_secs(30)),
+        "{error:?}"
+    );
+
+    clock.advance(SignedDuration::from_secs(10));
+    let error = gate.complete(&request()).unwrap_err();
+    assert!(
+        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::from_secs(20)),
+        "{error:?}"
+    );
+    assert_eq!(inner.requests().len(), 1);
+
+    clock.advance(SignedDuration::from_secs(20));
+    gate.complete(&request()).unwrap();
+    assert_eq!(inner.requests().len(), 2);
+}
+
+#[test]
+fn a_429_without_retry_after_holds_no_one() {
+    let (inner, gate, _clock) = gated(json!([
+        {"fail": "status", "status": 429},
+        {"reply": {"claims": []}},
+    ]));
+    let error = gate.complete(&request()).unwrap_err();
+    assert!(
+        matches!(error, LlmError::Status { status: 429 }),
+        "{error:?}"
+    );
+    gate.complete(&request()).unwrap();
+    assert_eq!(inner.requests().len(), 2);
 }
 
 // The real models. Ignored: they run only when the models are present.

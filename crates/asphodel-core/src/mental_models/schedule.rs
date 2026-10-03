@@ -6,7 +6,9 @@
 //!   `refresh_debounce_minutes` after the bank's last trigger, and never
 //!   later than `refresh_max_delay_minutes` after its first.
 //! - A model is refreshed at most every [`MIN_REFRESH_INTERVAL`], and a
-//!   failed refresh waits as long before it's tried again.
+//!   failed refresh waits as long before it's tried again. A refresh the
+//!   LLM's hold kept from running isn't a failure: it's due again when the
+//!   hold lifts. Holds live in memory, like the bank's last trigger.
 //! - Every bank has a sweep at `sweep_time` bank-local each day, which
 //!   checks every enabled model; the fingerprint skip keeps it cheap.
 //!
@@ -34,12 +36,15 @@ use jiff::{SignedDuration, Timestamp};
 use super::{MIN_REFRESH_INTERVAL, ModelRow};
 use crate::config::MentalModelsTuning;
 
-/// Each bank's last trigger and last sweep, and each model's generation.
+/// Each bank's last trigger and last sweep, and each model's generation
+/// and hold.
 #[derive(Debug)]
 pub(crate) struct Schedule {
     started: Timestamp,
     banks: Mutex<HashMap<i64, Bank>>,
     generations: Mutex<HashMap<i64, u64>>,
+    /// Until when each held model's refresh waits for the LLM.
+    holds: Mutex<HashMap<i64, Timestamp>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,7 +60,21 @@ impl Schedule {
             started,
             banks: Mutex::default(),
             generations: Mutex::default(),
+            holds: Mutex::default(),
         }
+    }
+
+    /// The LLM held `model`'s refresh until `until`.
+    pub(crate) fn held(&self, model: i64, until: Timestamp) {
+        let mut holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
+        holds.insert(model, until);
+    }
+
+    /// Until when `model`'s refresh waits for the LLM, if it's held after
+    /// `now`.
+    pub(crate) fn held_until(&self, model: i64, now: Timestamp) -> Option<Timestamp> {
+        let holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
+        holds.get(&model).copied().filter(|until| *until > now)
     }
 
     /// A refresh of `model` was requested: its generation moves on.

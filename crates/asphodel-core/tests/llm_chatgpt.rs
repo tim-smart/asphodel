@@ -1119,6 +1119,49 @@ fn a_plain_429_stays_a_retryable_status() {
     assert!(error.is_retryable());
 }
 
+#[test]
+fn a_429_with_retry_after_in_seconds_is_a_rate_limit_hold() {
+    let backend = StubServer::backend(
+        StubResponse::json(
+            429,
+            json!({"error": {"type": "rate_limit_exceeded", "message": "slow down"}}),
+        )
+        .with_header("Retry-After", "12"),
+    );
+    let dir = TestDir::new();
+    let error = client(&backend, logged_in_store(&dir), clock())
+        .complete(&request())
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::from_secs(12)),
+        "{error:?}"
+    );
+    assert!(!error.is_retryable(), "deferral, not a retry");
+}
+
+#[test]
+fn a_429_with_retry_after_as_a_date_holds_until_then_on_the_clients_clock() {
+    let until = start() + SignedDuration::from_mins(5);
+    let date = jiff::fmt::rfc2822::DateTimePrinter::new()
+        .timestamp_to_rfc9110_string(&until)
+        .unwrap();
+    let backend = StubServer::backend(
+        StubResponse::json(
+            429,
+            json!({"error": {"type": "rate_limit_exceeded", "message": "slow down"}}),
+        )
+        .with_header("Retry-After", &date),
+    );
+    let dir = TestDir::new();
+    let error = client(&backend, logged_in_store(&dir), clock())
+        .complete(&request())
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::from_secs(5 * 60)),
+        "{error:?}"
+    );
+}
+
 // Secret hygiene across the whole client.
 
 #[test]

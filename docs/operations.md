@@ -106,6 +106,13 @@ The tuning file is TOML, and every key in it is optional except two kinds
   in replay from labelled history (`docs/replay.md`, "Labelling and the
   precision curve"), and the daemon refuses to start without them.
 
+`[llm] concurrency` (default 1) is how many LLM calls may be in flight at
+once across the daemon, refreshes included, and how many chunks each bank
+extracts at once. Chunks still commit in queue order, and a chunk whose
+search missed a memory another chunk committed reconciles again, so a
+repeat stays one memory (ADR 0005). Measure it in replay before raising it
+(`docs/replay.md`, "Concurrency").
+
 An unknown key or an out-of-range value stops the daemon too. The LLM's two
 modes, an API key or a ChatGPT subscription, are in `docs/models.md`. For
 the subscription, log in once the pod is up:

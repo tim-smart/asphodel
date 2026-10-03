@@ -1,29 +1,35 @@
 //! The durable extraction queue, in the `extraction_queue` table so nothing
 //! queued is lost on SIGTERM or a crash.
 //!
-//! Each bank has one worker: while a bank has a [`Lease`] out, it
-//! hands out no other. Chunks run with turns ahead of document chunks, then
-//! in `observed_at` order, ties broken by the later `ingested_at` and then by
-//! rowid. A failed attempt is counted on the chunk and the chunk is
-//! retried in place, so nothing behind it overtakes it; at
-//! [`CHUNK_RETRY_CAP`] it's marked failed, leaves the queue and is surfaced
-//! instead of retried.
+//! Each bank hands out up to `[llm] concurrency` [`Lease`]s at once, the
+//! heads of its queue in order; at the default of 1 it has one worker.
+//! Chunks run with turns ahead of document chunks, then in `observed_at`
+//! order, ties broken by the later `ingested_at` and then by rowid. A
+//! failed attempt is counted on the chunk and the chunk is retried in
+//! place, so nothing behind it overtakes it; at [`CHUNK_RETRY_CAP`] it's
+//! marked failed, leaves the queue and is surfaced instead of retried.
 //!
 //! Leases live in memory, not the store. A restart releases them, and the
-//! chunk that was in flight is handed out first again without counting an
-//! error, while the error count itself is stored, so the cap holds across
-//! restarts. Dropping a lease without completing or failing it releases it
-//! too, so a worker that panics doesn't stall its bank.
+//! chunks that were in flight are handed out first again without counting
+//! an error, while the error count itself is stored, so the cap holds
+//! across restarts. Dropping a lease without completing or failing it
+//! releases it too, so a worker that panics doesn't stall its bank.
+//!
+//! The leases a bank has out commit in the order they were handed out
+//! ([`Leases::wait_turn`]), so an older chunk never sees a newer one's
+//! memory as a neighbour, as when one worker ran them in turn.
 //!
 //! Only `chunk` jobs are handed out here. The `erase` jobs that wait behind
-//! them belong to the erase path (ADR 0010).
+//! them belong to the erase path (ADR 0010), and are a barrier: no chunk
+//! queued after a pending erase is handed out until the erase has run, so
+//! no chunk reconciles against a memory being forgotten unless it was
+//! queued before the forget.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -38,56 +44,141 @@ pub enum SourceKind {
     Document,
 }
 
-/// The leases out, by bank rowid: the queue row each bank's worker holds.
+/// The leases out, by bank rowid, and the holds on banks.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Leases(Arc<Mutex<BTreeMap<i64, i64>>>);
+pub(crate) struct Leases(Arc<Registry>);
+
+#[derive(Debug, Default)]
+struct Registry {
+    state: Mutex<State>,
+    /// Signalled whenever a lease or hold is released.
+    released: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    banks: BTreeMap<i64, Bank>,
+    /// The next lease's place in the order leases were handed out.
+    next: u64,
+}
+
+#[derive(Debug, Default)]
+struct Bank {
+    /// The queue rows out, each with its place in the hand-out order.
+    out: BTreeMap<i64, u64>,
+    /// A [`BankHold`] is out.
+    held: bool,
+    /// Holds waiting for `out` to empty. Nothing is handed out meanwhile,
+    /// so a busy bank can't starve them.
+    draining: u32,
+    /// Extraction commits so far, which a prepared chunk compares to tell
+    /// whether another chunk of its bank committed since its search.
+    commits: u64,
+}
 
 impl Leases {
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<i64, i64>> {
+    fn lock(&self) -> MutexGuard<'_, State> {
         self.0
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn release(&self, bank_id: i64, queue_id: i64) {
-        let mut held = self.lock();
-        if held.get(&bank_id) == Some(&queue_id) {
-            held.remove(&bank_id);
+    fn release(&self, bank_id: i64, queue_id: i64, order: u64) {
+        let mut state = self.lock();
+        if let Some(bank) = state.banks.get_mut(&bank_id)
+            && bank.out.get(&queue_id) == Some(&order)
+        {
+            bank.out.remove(&queue_id);
+        }
+        drop(state);
+        self.0.released.notify_all();
+    }
+
+    /// Takes the bank without a chunk, waiting up to `wait` for every
+    /// lease it has out to finish, so no extraction runs on the bank until
+    /// the hold drops. Nothing more is handed out while it waits. A
+    /// re-embed's swap and a bank deletion hold it (ADR 0010). `None` when
+    /// the wait ran out.
+    pub(crate) fn hold(&self, bank_id: i64, wait: Duration) -> Option<BankHold> {
+        let deadline = Instant::now() + wait;
+        let mut state = self.lock();
+        let mut draining = false;
+        loop {
+            let bank = state.banks.entry(bank_id).or_default();
+            if !bank.held && bank.out.is_empty() {
+                bank.held = true;
+                if draining {
+                    bank.draining -= 1;
+                }
+                return Some(BankHold {
+                    leases: self.clone(),
+                    bank_id,
+                });
+            }
+            if !draining {
+                bank.draining += 1;
+                draining = true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bank.draining -= 1;
+                drop(state);
+                self.0.released.notify_all();
+                return None;
+            }
+            state = self
+                .0
+                .released
+                .wait_timeout(state, left.min(HOLD_POLL))
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
     }
 
-    /// Takes the bank's lease without a chunk, waiting up to `wait` for its
-    /// worker to finish the chunk in flight, so no extraction runs on the
-    /// bank until the hold drops. A re-embed's swap and a bank deletion
-    /// hold it (ADR 0010). `None` when the wait ran out.
-    pub(crate) fn hold(&self, bank_id: i64, wait: Duration) -> Option<BankHold> {
-        let started = Instant::now();
+    /// Waits until every lease of the bank handed out before `lease` has
+    /// been completed, failed or dropped, so the bank's chunks commit in the
+    /// order they were handed out.
+    pub(crate) fn wait_turn(&self, lease: &Lease) {
+        let mut state = self.lock();
         loop {
-            {
-                let mut held = self.lock();
-                if let std::collections::btree_map::Entry::Vacant(entry) = held.entry(bank_id) {
-                    entry.insert(HOLD);
-                    return Some(BankHold {
-                        leases: self.clone(),
-                        bank_id,
-                    });
-                }
+            let earlier = state.banks.get(&lease.bank_id).is_some_and(|bank| {
+                bank.out
+                    .iter()
+                    .any(|(&queue_id, &order)| order < lease.order && queue_id != lease.queue_id)
+            });
+            if !earlier {
+                return;
             }
-            if started.elapsed() >= wait {
-                return None;
-            }
-            std::thread::sleep(HOLD_POLL);
+            state = self
+                .0
+                .released
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+    }
+
+    /// How many extraction commits the bank has had in this service.
+    pub(crate) fn commits(&self, bank_id: i64) -> u64 {
+        self.lock()
+            .banks
+            .get(&bank_id)
+            .map_or(0, |bank| bank.commits)
+    }
+
+    /// Counts an extraction commit on the bank. The caller still holds the
+    /// store, so a search that reads the count under the store sees it move
+    /// with the commit's writes.
+    pub(crate) fn committed(&self, bank_id: i64) {
+        self.lock().banks.entry(bank_id).or_default().commits += 1;
     }
 }
 
-/// The queue row a [`BankHold`] stands in for. Queue rowids start at 1.
-const HOLD: i64 = 0;
-
-/// How often [`Leases::hold`] looks again while a chunk is in flight.
+/// How often [`Leases::hold`] looks again while it waits, in case a
+/// release was missed.
 const HOLD_POLL: Duration = Duration::from_millis(50);
 
-/// A bank's lease held without a chunk; dropping it releases the bank.
+/// A bank held without a chunk; dropping it releases the bank.
 #[derive(Debug)]
 pub(crate) struct BankHold {
     leases: Leases,
@@ -96,13 +187,18 @@ pub(crate) struct BankHold {
 
 impl Drop for BankHold {
     fn drop(&mut self) {
-        self.leases.release(self.bank_id, HOLD);
+        let mut state = self.leases.lock();
+        if let Some(bank) = state.banks.get_mut(&self.bank_id) {
+            bank.held = false;
+        }
+        drop(state);
+        self.leases.0.released.notify_all();
     }
 }
 
-/// A chunk handed to its bank's one worker. Complete it with
+/// A chunk handed out from its bank's queue. Complete it with
 /// [`complete_chunk`] or fail it with [`fail_chunk`]; dropping it releases
-/// the bank without changing the chunk.
+/// it without changing the chunk.
 #[derive(Debug)]
 pub struct Lease {
     pub chunk: Uuid,
@@ -116,6 +212,8 @@ pub struct Lease {
     bank_id: i64,
     queue_id: i64,
     chunk_id: i64,
+    /// Its place in the order the service handed leases out.
+    order: u64,
     leases: Leases,
 }
 
@@ -141,7 +239,7 @@ impl Eq for Lease {}
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.leases.release(self.bank_id, self.queue_id);
+        self.leases.release(self.bank_id, self.queue_id, self.order);
     }
 }
 
@@ -177,8 +275,8 @@ pub struct FailedChunk {
 pub enum QueueError {
     #[error("unknown bank")]
     UnknownBank,
-    /// The lease isn't the one its bank's worker holds in this service, such
-    /// as a lease from before a restart or from another store.
+    /// The lease isn't one its bank has out in this service, such as a
+    /// lease from before a restart or from another store.
     #[error("the lease on chunk {chunk} is no longer held")]
     NotHeld { chunk: Uuid },
     #[error(transparent)]
@@ -196,48 +294,69 @@ fn bank_id(conn: &rusqlite::Connection, bank: &str) -> Result<i64, QueueError> {
     Ok(bank_id)
 }
 
-/// The head of the bank's queue, or `None` when the queue is empty or the
-/// bank's worker already holds a lease.
+/// The first chunk in the bank's queue that isn't out already, or `None`
+/// when there's none, the bank has `limit` leases out, or it's held. A
+/// chunk queued after a pending erase isn't handed out until the erase has
+/// run.
 pub(crate) fn claim(
     store: &Store,
     leases: &Leases,
     bank: &str,
+    limit: usize,
 ) -> Result<Option<Lease>, QueueError> {
     let conn = store.connection();
     let bank_id = bank_id(&conn, bank)?;
-    let mut held = leases.lock();
-    if held.contains_key(&bank_id) {
-        return Ok(None);
+    let mut state = leases.lock();
+    {
+        let held = state.banks.entry(bank_id).or_default();
+        if held.held || held.draining > 0 || held.out.len() >= limit.max(1) {
+            return Ok(None);
+        }
     }
-    let head = conn
-        .query_row(
-            "SELECT q.id, c.id, c.uuid, s.uuid, s.kind, c.position, q.observed_at, c.error_count
-             FROM extraction_queue q
-             JOIN chunks c ON c.id = q.chunk_id
-             JOIN sources s ON s.id = c.source_id
-             WHERE q.bank_id = ?1 AND q.kind = 'chunk'
-             ORDER BY q.priority, q.observed_at, s.ingested_at, q.id
-             LIMIT 1",
-            [bank_id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                ))
-            },
-        )
-        .optional()?;
+    let out = &state.banks[&bank_id].out;
+    let mut statement = conn.prepare_cached(
+        "SELECT q.id, c.id, c.uuid, s.uuid, s.kind, c.position, q.observed_at, c.error_count
+         FROM extraction_queue q
+         JOIN chunks c ON c.id = q.chunk_id
+         JOIN sources s ON s.id = c.source_id
+         WHERE q.bank_id = ?1 AND q.kind = 'chunk'
+           AND q.id < COALESCE(
+             (SELECT MIN(e.id) FROM extraction_queue e
+              WHERE e.bank_id = ?1 AND e.kind = 'erase'),
+             9223372036854775807)
+         ORDER BY q.priority, q.observed_at, s.ingested_at, q.id",
+    )?;
+    let mut rows = statement.query([bank_id])?;
+    let mut head = None;
+    while let Some(row) = rows.next()? {
+        let queue_id: i64 = row.get(0)?;
+        if out.contains_key(&queue_id) {
+            continue;
+        }
+        head = Some((
+            queue_id,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+        ));
+        break;
+    }
     let Some((queue_id, chunk_id, chunk, source, kind, position, observed_at, error_count)) = head
     else {
         return Ok(None);
     };
-    held.insert(bank_id, queue_id);
+    let order = state.next;
+    state.next += 1;
+    state
+        .banks
+        .entry(bank_id)
+        .or_default()
+        .out
+        .insert(queue_id, order);
     Ok(Some(Lease {
         chunk: chunk.parse().expect("a stored uuid parses"),
         source: source.parse().expect("a stored uuid parses"),
@@ -252,17 +371,23 @@ pub(crate) fn claim(
         bank_id,
         queue_id,
         chunk_id,
+        order,
         leases: leases.clone(),
     }))
 }
 
-/// Checks that `lease` is the one its bank's worker holds in this service.
-/// Rowids alone don't identify a lease: after a restart the same chunk is
-/// claimed again under the same rowids, and another store's rowids can
-/// coincide. So the lease must also come from this service's registry.
+/// Checks that `lease` is one its bank has out in this service. Rowids
+/// alone don't identify a lease: after a restart the same chunk is claimed
+/// again under the same rowids, and another store's rowids can coincide.
+/// So the lease must also come from this service's registry.
 pub(crate) fn check_held(leases: &Leases, lease: &Lease) -> Result<(), QueueError> {
     if Arc::ptr_eq(&leases.0, &lease.leases.0)
-        && leases.lock().get(&lease.bank_id) == Some(&lease.queue_id)
+        && leases
+            .lock()
+            .banks
+            .get(&lease.bank_id)
+            .and_then(|bank| bank.out.get(&lease.queue_id))
+            == Some(&lease.order)
     {
         Ok(())
     } else {
@@ -313,7 +438,7 @@ pub(crate) fn finish(
     Ok(())
 }
 
-/// Counts a failed attempt. Below the cap the chunk stays at the head of
+/// Counts a failed attempt. Below the cap the chunk stays at its place in
 /// its bank's queue; at the cap it's marked failed and leaves the queue.
 pub(crate) fn fail(
     store: &Store,
@@ -415,7 +540,7 @@ pub struct QueuedChunk {
     pub observed_at: Timestamp,
     /// Failed attempts so far, below the retry cap.
     pub error_count: u32,
-    /// Whether the bank's worker holds it now.
+    /// Whether it's out on a lease now.
     pub in_flight: bool,
 }
 
@@ -452,7 +577,12 @@ pub(crate) fn queued(
 ) -> Result<Vec<QueuedChunk>, QueueError> {
     let conn = store.connection();
     let bank_id = bank_id(&conn, bank)?;
-    let held = leases.lock().get(&bank_id).copied();
+    let held: Vec<i64> = leases
+        .lock()
+        .banks
+        .get(&bank_id)
+        .map(|bank| bank.out.keys().copied().collect())
+        .unwrap_or_default();
     let mut statement = conn.prepare(
         "SELECT q.id, c.uuid, s.uuid, s.kind, c.position, q.observed_at, c.error_count
          FROM extraction_queue q
@@ -480,7 +610,7 @@ pub(crate) fn queued(
             position: u32::try_from(row.get::<_, i64>(4)?).unwrap_or(u32::MAX),
             observed_at: timestamp(row.get(5)?),
             error_count: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(u32::MAX),
-            in_flight: held == Some(queue_id),
+            in_flight: held.contains(&queue_id),
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)

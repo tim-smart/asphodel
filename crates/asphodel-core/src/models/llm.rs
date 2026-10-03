@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use jiff::Timestamp;
 
 use super::chatgpt::CODEX_ENDPOINT;
+use crate::clock::{Clock, SystemClock};
 use crate::config::{Deployment, LLM_API_KEY_ENV, LlmAuth, Secret, Tuning};
 
 /// Where the LLM is and how to talk to it. The endpoint and model come from
@@ -177,6 +178,11 @@ pub enum LlmError {
     #[error("the ChatGPT usage limit is reached until {resets_at}")]
     UsageLimited { resets_at: Timestamp },
 
+    /// The endpoint answered 429 with a `Retry-After`. Not a failure: every
+    /// caller holds for that long. A 429 without one is a [`Self::Status`].
+    #[error("the LLM is rate limited for {}s", retry_after.as_secs())]
+    RateLimited { retry_after: Duration },
+
     /// The backend reported a failed or incomplete response. Only the code
     /// is kept.
     #[error("the LLM backend failed the request: {code}")]
@@ -186,8 +192,8 @@ pub enum LlmError {
 impl LlmError {
     /// Whether the caller's retry policy may try again: transport errors,
     /// timeouts, 408, 429 and 5xx. Never for a reply that came back and was
-    /// wrong, and never for a usage limit, which is deferred to `resets_at`
-    /// instead.
+    /// wrong, and never for a usage limit or a 429 that said when to come
+    /// back, which are deferred to then instead.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport { .. } | Self::Timeout => true,
@@ -199,6 +205,7 @@ impl LlmError {
             | Self::Conflicting { .. }
             | Self::LoginRequired
             | Self::UsageLimited { .. }
+            | Self::RateLimited { .. }
             | Self::Backend { .. } => false,
         }
     }
@@ -310,7 +317,9 @@ impl LlmClient for OpenAiCompatible {
         let mut response = call.send_json(self.body(request)).map_err(transport)?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            return Err(LlmError::Status { status });
+            // A Retry-After date is the server's wall time, whatever clock
+            // the caller runs on.
+            return Err(status_error(status, response.headers(), SystemClock.now()));
         }
         let text = response
             .body_mut()
@@ -328,6 +337,38 @@ impl LlmClient for OpenAiCompatible {
             latency,
         })
     }
+}
+
+/// A non-2xx status as an error: a 429 with a `Retry-After` is
+/// [`LlmError::RateLimited`], anything else [`LlmError::Status`].
+/// `Retry-After` is seconds or an HTTP date (RFC 9110), read against `now`;
+/// a date already past holds for no time. A value that's neither counts
+/// like no header.
+pub(super) fn status_error(
+    status: u16,
+    headers: &ureq::http::HeaderMap,
+    now: Timestamp,
+) -> LlmError {
+    let retry_after = headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| retry_after(value.trim(), now));
+    match (status, retry_after) {
+        (429, Some(retry_after)) => LlmError::RateLimited { retry_after },
+        _ => LlmError::Status { status },
+    }
+}
+
+/// A `Retry-After` value as a wait from `now`, or `None` when it's neither
+/// seconds nor an HTTP date.
+fn retry_after(value: &str, now: Timestamp) -> Option<Duration> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let at = jiff::fmt::rfc2822::DateTimeParser::new()
+        .parse_timestamp(value)
+        .ok()?;
+    Some(Duration::try_from(now.duration_until(at)).unwrap_or(Duration::ZERO))
 }
 
 /// Maps a ureq error. The message names the error kind, never the body.
@@ -417,6 +458,7 @@ enum Mode {
 ///   {"reply": {"claims": [], "used": []}},
 ///   {"fail": "status", "status": 503},
 ///   {"fail": "usage_limited", "resets_at": "2026-10-02T00:00:00Z"},
+///   {"fail": "status", "status": 429, "retry_after_secs": 30},
 ///   {"reply": {"claims": [], "used": []}, "delay_ms": 2000}
 /// ]
 /// ```
@@ -439,6 +481,10 @@ pub struct ScriptStep {
     /// When the usage window resets, for `"fail": "usage_limited"`.
     #[serde(default)]
     pub resets_at: Option<Timestamp>,
+    /// The `Retry-After` of a `"fail": "status"` with status 429, which
+    /// makes it [`LlmError::RateLimited`].
+    #[serde(default)]
+    pub retry_after_secs: Option<u64>,
     /// How long the call takes before it answers, in milliseconds.
     #[serde(default)]
     pub delay_ms: u64,
@@ -479,8 +525,11 @@ impl ScriptStep {
                 reason: "scripted".into(),
             },
             ScriptedFailure::Timeout => LlmError::Timeout,
-            ScriptedFailure::Status => LlmError::Status {
-                status: self.status.unwrap_or(500),
+            ScriptedFailure::Status => match (self.status.unwrap_or(500), self.retry_after_secs) {
+                (429, Some(seconds)) => LlmError::RateLimited {
+                    retry_after: Duration::from_secs(seconds),
+                },
+                (status, _) => LlmError::Status { status },
             },
             ScriptedFailure::NoContent => LlmError::NoContent,
             ScriptedFailure::NotJson => LlmError::NotJson { bytes: 0 },

@@ -42,9 +42,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use asphodel_core::extraction::{
-    CALL2_TEMPLATE, Call2Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT,
-    EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, ExtractError, NEIGHBOUR_CAP,
-    NEIGHBOURS_PER_CLAIM, call2_request,
+    CALL2_TEMPLATE, Call2Input, Committed, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED,
+    EDIT_KEPT, EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, ExtractError, Extracted,
+    NEIGHBOUR_CAP, NEIGHBOURS_PER_CLAIM, Prepared, call2_request,
 };
 
 // Fixtures
@@ -224,6 +224,25 @@ impl Harness {
             .unwrap();
         service
             .ensure_bank_with_models("other", &identity())
+            .unwrap();
+        Self {
+            service,
+            clock,
+            _dir: dir,
+        }
+    }
+
+    /// [`Harness::new`] with `[llm] concurrency = n`, so `main` hands out
+    /// up to `n` chunks at once.
+    fn with_concurrency(n: u32) -> Self {
+        let dir = TestDir::new();
+        let clock = Arc::new(SimulatedClock::new(at(START)));
+        let store = Store::open(&dir.data(), OpenOptions::default(), clock.clone()).unwrap();
+        let mut tuning = tuning_for_fakes();
+        tuning.llm.concurrency = n;
+        let service = Service::with_models(clock.clone(), store, tuning, Models::fake()).unwrap();
+        service
+            .ensure_bank_with_models("main", &identity())
             .unwrap();
         Self {
             service,
@@ -2496,6 +2515,239 @@ fn call_2_and_the_commit_run_in_observed_at_order() {
     let input =
         call2(&h, &reply(vec![claim(BERLIN, "fact", "I live in Berlin")])).expect("call 2 runs");
     assert_eq!(shown(&input), BTreeSet::from([berlin]));
+}
+
+// Chunks in flight together (`[llm] concurrency`, ADR 0005's amendment).
+
+/// The owner says `user` in session `s1` at `message_at`. Returns the source.
+fn owner_says_at(h: &Harness, message_at: &str, user: &str) -> Uuid {
+    h.service
+        .ingest_turn("main", &turn("s1", message_at, user, "Noted."))
+        .unwrap()
+        .source
+}
+
+/// Claims the head of `main`'s queue and prepares it with the LLM
+/// answering `replies` in turn: call 1's, then call 2's if it runs.
+fn prepared(h: &Harness, replies: Vec<Value>) -> Prepared {
+    let claimed = h
+        .service
+        .next_extraction("main")
+        .unwrap()
+        .expect("a chunk is queued");
+    let llm = FakeLlm::scripted(MODEL, replies);
+    h.service
+        .prepare_extraction(claimed.lease, &llm, &claimed.in_context, &claimed.entries)
+        .unwrap()
+}
+
+fn committed(h: &Harness, prepared: Prepared) -> Extracted {
+    match h.service.try_commit_extraction(prepared).unwrap() {
+        Committed::Extracted(extracted) => extracted,
+        Committed::Stale(stale) => panic!("{stale:?} went stale"),
+    }
+}
+
+fn stale(h: &Harness, prepared: Prepared) -> Prepared {
+    match h.service.try_commit_extraction(prepared).unwrap() {
+        Committed::Stale(stale) => *stale,
+        Committed::Extracted(extracted) => panic!("committed without a redo: {extracted:?}"),
+    }
+}
+
+/// Reconciles a stale chunk again with call 2 answering `reply`, and
+/// checks call 1 didn't run again.
+fn redone(h: &Harness, stale: Prepared, reply: Value) -> Prepared {
+    let llm = FakeLlm::scripted(MODEL, vec![reply]);
+    let redone = h.service.redo_extraction(stale, &llm).unwrap();
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1, "only call 2 runs again");
+    assert_eq!(requests[0].template.name, CALL2_TEMPLATE);
+    redone
+}
+
+#[test]
+fn a_memory_committed_since_the_search_at_the_floor_reconciles_the_chunk_again() {
+    // Two chunks out at once state one fact, and neither saw the other's
+    // memory when it searched. The second's commit finds it at the floor,
+    // so the chunk reconciles again from the same call 1 and is a mention,
+    // not a copy.
+    let h = Harness::with_concurrency(2);
+    owner_says(&h, "I like green tea.");
+    owner_says_at(&h, "2026-10-01T06:40:00Z", "I like green tea, still.");
+    let call1 = reply(vec![claim(TEA, "fact", "I like green tea")]);
+    let first = prepared(&h, vec![call1.clone()]);
+    let second = prepared(&h, vec![call1]);
+    assert!(second.call2_input().is_none(), "nothing near at its search");
+
+    let tea = committed(&h, first).memories[0];
+    let second = stale(&h, second);
+    let input = h
+        .service
+        .redo_input(&second)
+        .unwrap()
+        .expect("call 2 runs now");
+    assert_eq!(shown(&input), BTreeSet::from([tea]));
+    let second = redone(
+        &h,
+        second,
+        call2_reply(vec![labelled(
+            &input.claims[0].handle,
+            &[(neighbour_handle(&input, tea), "mentioned_again")],
+        )]),
+    );
+    let extracted = committed(&h, second);
+
+    assert!(extracted.memories.is_empty());
+    assert_eq!(h.memories_in("main"), 1);
+    let kinds: Vec<String> = h.accesses(tea).into_iter().map(|row| row.kind).collect();
+    assert_eq!(kinds, ["created", "mentioned_again"]);
+    let errors: i64 = h.chunk_column(extracted.chunk, "error_count");
+    assert_eq!(errors, 0, "a redo isn't a failed attempt");
+}
+
+#[test]
+fn an_edit_since_the_search_on_a_shown_neighbour_reconciles_the_chunk_again() {
+    // The first chunk's mention raises the neighbour's significance, an
+    // edit and no new memory, so only the edit can send the second back.
+    let h = Harness::with_concurrency(2);
+    let tea = h.fact(TEA);
+    owner_says(&h, "I love green tea.");
+    owner_says_at(&h, "2026-10-01T06:40:00Z", "I like green tea.");
+    let mention = |input: &Call2Input| {
+        call2_reply(vec![labelled(
+            &input.claims[0].handle,
+            &[(neighbour_handle(input, tea), "mentioned_again")],
+        )])
+    };
+    let major = reply(vec![
+        claim(TEA, "fact", "I love green tea").with("significance", json!("major")),
+    ]);
+    let first_call2 = mention(&call2(&h, &major).expect("call 2 runs"));
+    let first = prepared(&h, vec![major, first_call2]);
+    // The second chunk is shown the same neighbour, under the same handles.
+    let second_call2 = mention(first.call2_input().unwrap());
+    let minor = reply(vec![claim(TEA, "fact", "I like green tea")]);
+    let second = prepared(&h, vec![minor, second_call2.clone()]);
+    assert_eq!(shown(second.call2_input().unwrap()), BTreeSet::from([tea]));
+
+    committed(&h, first);
+    assert_eq!(h.edits_on(tea, EDIT_SIGNIFICANCE_RAISED), 1);
+    assert_eq!(h.memories_in("main"), 1, "the first chunk made no memory");
+    let second = stale(&h, second);
+    let second = redone(&h, second, second_call2);
+    committed(&h, second);
+
+    assert_eq!(h.memories_in("main"), 1);
+    let kinds: Vec<String> = h.accesses(tea).into_iter().map(|row| row.kind).collect();
+    assert_eq!(kinds, ["created", "mentioned_again", "mentioned_again"]);
+}
+
+#[test]
+fn a_flagged_claim_reconciles_again_after_any_new_memory_and_an_unflagged_one_only_at_the_floor() {
+    // A memory below the floor for a claim leaves an unflagged claim alone,
+    // but a flagged claim pulls in its entities' tasks and states whatever
+    // their similarity, so any new memory sends it back.
+    let similarity = |a: &str, b: &str| -> f64 {
+        let vectors = FakeEmbedder.embed(&[a, b]).unwrap();
+        vectors[0]
+            .iter()
+            .zip(&vectors[1])
+            .map(|(x, y)| f64::from(*x) * f64::from(*y))
+            .sum()
+    };
+    for (claim, memory) in [(WEATHER, CAT), (TAX_FILED, CAT), (TAX_FILED, WEATHER)] {
+        assert!(
+            similarity(claim, memory) < FLOOR,
+            "{claim} is near {memory}"
+        );
+    }
+    let h = Harness::with_concurrency(3);
+    owner_says(&h, "My cat is called Miso.");
+    owner_says_at(
+        &h,
+        "2026-10-01T06:40:00Z",
+        "The weather in Wellington was sunny.",
+    );
+    owner_says_at(&h, "2026-10-01T06:50:00Z", "I filed the tax return.");
+    let cat = prepared(
+        &h,
+        vec![reply(vec![claim(CAT, "fact", "My cat is called Miso")])],
+    );
+    let weather = prepared(
+        &h,
+        vec![reply(vec![claim(
+            WEATHER,
+            "event",
+            "The weather in Wellington was sunny",
+        )])],
+    );
+    let filed = prepared(
+        &h,
+        vec![reply(vec![changes(claim(
+            TAX_FILED,
+            "event",
+            "I filed the tax return",
+        ))])],
+    );
+
+    committed(&h, cat);
+    committed(&h, weather);
+    let filed = stale(&h, filed);
+    let filed = match h.service.redo_input(&filed).unwrap() {
+        Some(_) => redone(&h, filed, call2_reply(vec![])),
+        None => h
+            .service
+            .redo_extraction(filed, &FakeLlm::scripted(MODEL, vec![]))
+            .unwrap(),
+    };
+    assert_eq!(committed(&h, filed).memories.len(), 1);
+    assert_eq!(h.memories_in("main"), 3);
+}
+
+#[test]
+fn chunks_commit_in_the_order_they_were_claimed() {
+    // A later chunk's commit waits for every earlier one to commit, or to
+    // be dropped without committing.
+    let h = Harness::with_concurrency(3);
+    owner_says(&h, "The weather in Wellington was sunny.");
+    let dropped = owner_says_at(&h, "2026-10-01T06:40:00Z", "My bike is a Brompton.");
+    owner_says_at(&h, "2026-10-01T06:50:00Z", "My cat is called Miso.");
+    let weather = prepared(
+        &h,
+        vec![reply(vec![claim(
+            WEATHER,
+            "event",
+            "The weather in Wellington was sunny",
+        )])],
+    );
+    let bike = prepared(&h, vec![reply(vec![])]);
+    assert_eq!(bike.lease().source, dropped);
+    let cat = prepared(
+        &h,
+        vec![reply(vec![claim(CAT, "fact", "My cat is called Miso")])],
+    );
+
+    std::thread::scope(|scope| {
+        let last = scope.spawn(|| committed(&h, cat));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!last.is_finished(), "two chunks claimed before it are out");
+
+        committed(&h, weather);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!last.is_finished(), "one claimed before it is still out");
+
+        drop(bike);
+        let cat = last.join().unwrap().memories[0];
+        assert_eq!(h.content(cat), CAT);
+    });
+    let again = h
+        .service
+        .claim_chunk("main")
+        .unwrap()
+        .expect("the dropped chunk is queued again");
+    assert_eq!(again.source, dropped);
+    assert_eq!(again.error_count, 0);
 }
 
 /// Breaks BM25 for the whole store, so every neighbour search fails. Only a

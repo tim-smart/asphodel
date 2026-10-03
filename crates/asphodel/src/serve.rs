@@ -20,8 +20,8 @@ use asphodel_core::config::{
     Deployment, LLM_API_KEY_ENV, LlmAuth, ModelsConfig, Secret, TOKEN_ENV,
 };
 use asphodel_core::models::{
-    CodexResponses, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, LlmSettings,
-    LlmStatus, ModelOptions, Models, OpenAiCompatible, TokenStore,
+    CodexResponses, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, LlmGate,
+    LlmSettings, LlmStatus, ModelOptions, Models, OpenAiCompatible, TokenStore,
 };
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::{Clock, ResolvedConfig, Service, SystemClock, Tuning};
@@ -388,8 +388,15 @@ fn start(
     // Purge and the sweep run, or wait for an ack, as the store's
     // fingerprint says (ADR 0009). Forget never waits.
     let service = service.with_purge_pause(config.purge.clone());
-    let llm = llm_client(&config, &args.data_dir, clock, script)?;
+    let llm = llm_client(&config, &args.data_dir, Arc::clone(&clock), script)?;
     config.fake_llm = llm.as_ref().is_some_and(|(_, fake)| *fake);
+    // Extraction and refresh share one gate: `[llm] concurrency` calls in
+    // flight at most, and one hold when any of them hits a limit.
+    let concurrency = config.tuning.llm.concurrency as usize;
+    let llm = llm.map(|(llm, fake)| {
+        let gate: Arc<dyn LlmClient> = Arc::new(LlmGate::new(llm, concurrency, clock));
+        (gate, fake)
+    });
     info!(
         config = %serde_json::to_string(&config)?,
         "resolved config"

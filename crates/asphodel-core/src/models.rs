@@ -19,6 +19,7 @@ mod chatgpt;
 mod dir;
 mod fake;
 mod fetch;
+mod gate;
 mod llm;
 mod manifest;
 mod onnx;
@@ -38,6 +39,7 @@ pub use chatgpt::{
 pub use dir::{ModelDir, ModelError};
 pub use fake::{FakeEmbedder, FakeEmbedderV2, FakeReranker};
 pub use fetch::{FetchError, FetchFailure, FetchReport, Fetcher, HttpFetcher, fetch_models};
+pub use gate::LlmGate;
 pub use llm::{
     FakeLlm, LlmClient, LlmError, LlmRequest, LlmResponse, LlmSettings, LlmUsage, OpenAiCompatible,
     ScriptError, ScriptStep, ScriptedFailure, Template,

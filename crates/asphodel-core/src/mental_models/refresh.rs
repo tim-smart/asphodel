@@ -42,7 +42,7 @@ use super::{
     volatility_str,
 };
 use crate::constants::TAU;
-use crate::models::{LlmClient, LlmRequest, Template};
+use crate::models::{LlmClient, LlmError, LlmRequest, Template};
 use crate::retrieval::candidates::Candidate;
 use crate::retrieval::{Context, Selected, estimate_tokens, linked_memories};
 use crate::store::micros;
@@ -193,7 +193,9 @@ pub(crate) fn refresh_input(
 /// Refreshes `model` with `llm`. Unless `force`, it's skipped when the
 /// fingerprint matches the last completed refresh's. A failed retrieval,
 /// an LLM failure or a malformed reply is `Ok(Outcome::Failed)`, recorded
-/// on the model so the schedule waits before trying again.
+/// on the model so the schedule waits before trying again. An LLM held by
+/// a limit is `Ok(Outcome::Held)`: nothing is recorded as failed, and the
+/// refresh stays requested until the hold lifts.
 pub(crate) fn refresh(
     cx: &Context<'_>,
     schedule: &Schedule,
@@ -256,6 +258,10 @@ pub(crate) fn refresh(
     let reply = match llm.complete_identified(&request, &identities) {
         Ok(response) => response.json,
         Err(error) => {
+            if let Some(until) = held_until(&error, cx.store.now()) {
+                tracing::info!(model = %model.uuid, %until, "a mental model refresh waits for the LLM's hold");
+                return held(cx, schedule, model, until);
+            }
             tracing::warn!(model = %model.uuid, %error, "a mental model refresh failed");
             return failed(cx, model, FailureKind::Llm);
         }
@@ -295,6 +301,38 @@ impl Started<'_> {
     fn unchanged(&self) -> bool {
         self.schedule.generation(self.model) == self.generation
     }
+}
+
+/// When a limit the LLM reported lifts, or `None` for any other error.
+fn held_until(error: &LlmError, now: jiff::Timestamp) -> Option<jiff::Timestamp> {
+    match error {
+        LlmError::UsageLimited { resets_at } => Some(*resets_at),
+        LlmError::RateLimited { retry_after } => Some(
+            jiff::SignedDuration::try_from(*retry_after)
+                .ok()
+                .and_then(|wait| now.checked_add(wait).ok())
+                .unwrap_or(jiff::Timestamp::MAX),
+        ),
+        _ => None,
+    }
+}
+
+/// Keeps the refresh requested and due again at `until`, without recording
+/// a failure: the call never reached the LLM.
+fn held(
+    cx: &Context<'_>,
+    schedule: &Schedule,
+    model: &ModelRow,
+    until: jiff::Timestamp,
+) -> Result<Outcome, ModelError> {
+    let now = micros(cx.store.now());
+    cx.store.connection().execute(
+        "UPDATE mental_models SET refresh_requested_at = COALESCE(refresh_requested_at, ?2)
+         WHERE id = ?1",
+        (model.id, now),
+    )?;
+    schedule.held(model.id, until);
+    Ok(Outcome::Held { until })
 }
 
 fn failed(cx: &Context<'_>, model: &ModelRow, kind: FailureKind) -> Result<Outcome, ModelError> {

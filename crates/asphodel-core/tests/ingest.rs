@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use asphodel_core::Service;
 use asphodel_core::clock::{Clock, SimulatedClock};
@@ -102,6 +103,25 @@ impl Harness {
         let dir = TestDir::new();
         let clock = Arc::new(SimulatedClock::new(start()));
         let service = open_service(&dir, clock.clone());
+        service.ensure_bank("main", &identity(), &models()).unwrap();
+        service
+            .ensure_bank("other", &identity(), &models())
+            .unwrap();
+        Self {
+            service,
+            clock,
+            dir,
+        }
+    }
+
+    /// [`Harness::new`] with `[llm] concurrency = n`, so each bank hands out
+    /// up to `n` leases at once.
+    fn with_concurrency(n: u32) -> Self {
+        let dir = TestDir::new();
+        let clock = Arc::new(SimulatedClock::new(start()));
+        let tuning = Tuning::from_toml(&format!("[llm]\nconcurrency = {n}\n")).unwrap();
+        let store = Store::open(&dir.data(), OpenOptions::default(), clock.clone()).unwrap();
+        let service = Service::open(clock.clone(), store, tuning);
         service.ensure_bank("main", &identity(), &models()).unwrap();
         service
             .ensure_bank("other", &identity(), &models())
@@ -1467,6 +1487,78 @@ fn each_bank_has_one_worker() {
             .contains("Two.")
     );
     h.service.complete_chunk(other).unwrap();
+}
+
+#[test]
+fn a_bank_hands_out_up_to_its_concurrency_in_queue_order() {
+    // With `[llm] concurrency` above 1 a bank has a pool of leases: the
+    // heads of its queue in order, as many as the pool holds.
+    let h = Harness::with_concurrency(2);
+    for (at, text) in [
+        ("2026-10-01T06:00:00Z", "One."),
+        ("2026-10-01T06:01:00Z", "Two."),
+        ("2026-10-01T06:02:00Z", "Three."),
+    ] {
+        ingest(&h, "main", &turn("s", at, text, "Ok."));
+    }
+    let text = |lease: &Lease| h.chunk_column::<String>(lease.chunk, "text");
+
+    let one = claim(&h, "main").expect("main's head");
+    let two = claim(&h, "main").expect("the next head, while the first is out");
+    assert!(text(&one).contains("One."));
+    assert!(text(&two).contains("Two."));
+    assert!(claim(&h, "main").is_none(), "the pool is full");
+    let in_flight: Vec<bool> = h
+        .service
+        .chunks("main", false)
+        .unwrap()
+        .queued
+        .iter()
+        .map(|chunk| chunk.in_flight)
+        .collect();
+    assert_eq!(in_flight, [true, true, false]);
+
+    h.service.complete_chunk(one).unwrap();
+    let three = claim(&h, "main").expect("a freed lease takes the next head");
+    assert!(text(&three).contains("Three."));
+    h.service.complete_chunk(two).unwrap();
+    h.service.complete_chunk(three).unwrap();
+    assert_eq!(depth(&h, "main"), 0);
+}
+
+#[test]
+fn a_hold_waits_for_every_lease_in_the_pool_and_hands_out_none_meanwhile() {
+    // Deleting a bank holds it (ADR 0010). With a pool the hold must wait
+    // for every lease that's out and stop new ones, or a busy bank would
+    // never come free.
+    let h = Harness::with_concurrency(2);
+    for (at, text) in [
+        ("2026-10-01T06:00:00Z", "One."),
+        ("2026-10-01T06:01:00Z", "Two."),
+        ("2026-10-01T06:02:00Z", "Three."),
+    ] {
+        ingest(&h, "main", &turn("s", at, text, "Ok."));
+    }
+    let one = claim(&h, "main").expect("main's head");
+    let two = claim(&h, "main").expect("the next head, while the first is out");
+
+    std::thread::scope(|scope| {
+        let deleting = scope.spawn(|| h.service.delete_bank("main", "main"));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!deleting.is_finished(), "the delete waits for both leases");
+
+        drop(one);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!deleting.is_finished(), "the second lease is still out");
+        assert!(
+            claim(&h, "main").is_none(),
+            "the freed lease isn't handed out while the hold waits"
+        );
+
+        drop(two);
+        deleting.join().unwrap().unwrap();
+    });
+    assert!(h.service.claim_chunk("main").is_err(), "the bank is gone");
 }
 
 #[test]

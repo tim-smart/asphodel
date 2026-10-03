@@ -82,6 +82,91 @@ pub(super) struct Search {
     pub neighbours: Vec<Neighbour>,
 }
 
+/// What a bank held when a chunk searched it: its newest memory and edit,
+/// and how many extraction commits it had had in this service.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Snapshot {
+    pub memory: i64,
+    pub edit: i64,
+    pub commits: u64,
+}
+
+/// The bank now, read on the connection the search runs on. `commits` is
+/// the lease registry's count, read while the store is held.
+pub(super) fn snapshot(
+    conn: &Connection,
+    bank_id: i64,
+    commits: u64,
+) -> Result<Snapshot, rusqlite::Error> {
+    let memory = conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM memories WHERE bank_id = ?1",
+        [bank_id],
+        |row| row.get(0),
+    )?;
+    let edit = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM edits", [], |row| {
+        row.get(0)
+    })?;
+    Ok(Snapshot {
+        memory,
+        edit,
+        commits,
+    })
+}
+
+/// Whether a chunk must search again because of what was committed since
+/// `snapshot`: a new memory at or above the floor for one of its claims, a
+/// new memory at all when a claim is flagged (its entity-linked tasks and
+/// states come in whatever their similarity), or an edit since on a
+/// neighbour call 2 was shown (ended, retracted, refined).
+pub(super) fn stale(
+    conn: &Connection,
+    bank_id: i64,
+    snapshot: &Snapshot,
+    floor: f64,
+    checked: &Checked,
+    vectors: &[Vec<f32>],
+    search: Option<&Search>,
+) -> Result<bool, rusqlite::Error> {
+    if checked.memories.is_empty() {
+        return Ok(false);
+    }
+    let newest: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM memories WHERE bank_id = ?1",
+        [bank_id],
+        |row| row.get(0),
+    )?;
+    if newest > snapshot.memory {
+        if checked.memories.iter().any(|memory| memory.flagged) {
+            return Ok(true);
+        }
+        let mut statement = conn.prepare_cached(
+            "SELECT 1 FROM memory_vectors
+             WHERE bank_id = ?1 AND memory_id > ?2
+               AND 1.0 - vec_distance_cosine(embedding, ?3) >= ?4
+             LIMIT 1",
+        )?;
+        for vector in vectors {
+            let bytes: Vec<u8> = vector
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            if statement.exists((bank_id, snapshot.memory, &bytes, floor))? {
+                return Ok(true);
+            }
+        }
+    }
+    if let Some(search) = search {
+        let mut statement =
+            conn.prepare_cached("SELECT 1 FROM edits WHERE id > ?1 AND memory_id = ?2 LIMIT 1")?;
+        for neighbour in &search.neighbours {
+            if statement.exists((snapshot.edit, neighbour.id))? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Finds each claim's neighbours and decides whether call 2 runs. `vectors`
 /// are the claims' embeddings, one per checked memory.
 pub(super) fn search(
@@ -458,7 +543,7 @@ pub(super) enum Edit {
 }
 
 /// Everything the labels decided, for the commit to write.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct Plan {
     /// One per checked claim, in order.
     pub fates: Vec<Fate>,

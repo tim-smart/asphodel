@@ -177,7 +177,16 @@ it.
 
 **Usage limits.** A 429 whose body says `usage_limit_reached` carries the
 time the window resets. The client returns `UsageLimited { resets_at }`,
-which is not a retry: extraction holds the queue until then.
+which is not a retry: extraction holds the queue until then. A 429 from
+either mode with a `Retry-After`, in seconds or as an HTTP date (RFC 9110),
+is `RateLimited { retry_after }`, held the same way; a date already past
+holds for no time. A 429 without one, or with a value that's neither, is
+a counted, retryable failure. The `api_key` client reads a date against
+the system clock, since it's the server's wall time. The daemon shares
+either hold: once one call hits it, every call, refreshes included, holds
+until it lifts. No chunk counts a failure for it, and a refresh it holds
+isn't a failed refresh: it stays requested and is due again when the hold
+lifts, instead of thirty minutes later.
 
 **Secrets.** Tokens never appear in `Debug` output, logs, errors, the
 resolved config or cassettes. A failed or incomplete response keeps only a

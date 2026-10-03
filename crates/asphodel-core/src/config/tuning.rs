@@ -273,7 +273,7 @@ pub enum LlmAuth {
 /// `[llm]`: the one LLM for extraction, reconciliation and refresh. Its API
 /// key is a secret and comes from the environment only; so does the
 /// subscription's token file.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmTuning {
     /// How the LLM is authenticated: an API key (the default) or a ChatGPT
@@ -291,6 +291,22 @@ pub struct LlmTuning {
     /// Unset leaves it to the backend's default. Part of what calibration
     /// is pinned to, like the model.
     pub reasoning_effort: Option<String>,
+
+    /// How many LLM calls may be in flight at once, daemon-wide, and how
+    /// many chunks each bank extracts at once. At 1, extraction is serial.
+    pub concurrency: u32,
+}
+
+impl Default for LlmTuning {
+    fn default() -> Self {
+        Self {
+            auth: LlmAuth::default(),
+            model: None,
+            endpoint: None,
+            reasoning_effort: None,
+            concurrency: 1,
+        }
+    }
 }
 
 /// One TOML layer of tuning, named for error messages.
@@ -547,6 +563,9 @@ impl Tuning {
             fail("sessions.in_context_idle_days", "must be at least 1".into());
         }
 
+        if self.llm.concurrency == 0 {
+            fail("llm.concurrency", "must be at least 1".into());
+        }
         if let Some(model) = &self.llm.model
             && model.trim().is_empty()
         {
