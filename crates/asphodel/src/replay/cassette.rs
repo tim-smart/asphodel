@@ -620,7 +620,7 @@ impl Recorder {
 
     /// `fast` with `--refresh recorded`: the recorded refresh of the same
     /// mental model, by the question line the request starts with, nearest
-    /// in simulated time, among those made with this run's LLM model and
+    /// in simulated time, among those made with this run's LLM model, language, and
     /// the request's template version. Its operations are carried over by
     /// identity: each handle goes to the memory or entry it stood for when
     /// recorded, then to that one's handle now, and an operation whose
@@ -640,6 +640,7 @@ impl Recorder {
             .map(|&position| &index.records[position])
             .filter(|record| {
                 record.model == self.model
+                    && record.language == self.language
                     && record.template.version == request.template.version
                     && record.request.user.lines().next().unwrap_or("") == question
             })
