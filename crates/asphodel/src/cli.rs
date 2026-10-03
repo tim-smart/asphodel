@@ -1442,6 +1442,10 @@ fn model(command: ModelCommand) -> anyhow::Result<()> {
                         count("trimmed"),
                     );
                 }
+                Some("held") => println!(
+                    "held: the refresh waits until {}",
+                    detail["until"].as_str().unwrap_or("unknown")
+                ),
                 _ => bail!(
                     "the refresh failed ({}); it's tried again in 30 minutes",
                     detail.as_str().unwrap_or("unknown")
