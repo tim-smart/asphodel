@@ -258,7 +258,9 @@ impl From<TranslateError> for ApiError {
             }
             TranslateError::LanguageUnset => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
             TranslateError::Superseded { .. } => Self::new(StatusCode::CONFLICT, error.to_string()),
-            TranslateError::NoModels | TranslateError::ModelUnavailable { .. } => {
+            TranslateError::Busy
+            | TranslateError::NoModels
+            | TranslateError::ModelUnavailable { .. } => {
                 Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
             }
             TranslateError::Llm(

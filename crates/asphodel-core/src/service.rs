@@ -820,7 +820,8 @@ impl Service {
     /// head superseding it (`memory translate`, [`crate::translate`]).
     /// Refused when the language isn't set, and when the memory isn't its
     /// chain's head, before the call or by the time it answers. Nothing is
-    /// held while the LLM answers.
+    /// held while the LLM answers. Afterwards, waits at most five seconds
+    /// for the bank, returning `Busy` if it cannot hold it for the write.
     pub fn translate_memory(
         &self,
         bank: &str,
@@ -846,6 +847,12 @@ impl Service {
                 language: language.to_owned(),
             });
         };
+        // Drain prepared extractions and wait out a re-embed swap before
+        // choosing the embedder. Keep the hold through embedding and commit.
+        let _hold = self
+            .leases
+            .hold(named.bank_id, Duration::from_secs(5))
+            .ok_or(TranslateError::Busy)?;
         let (recorded, watermark) = {
             let conn = self.store.connection();
             (

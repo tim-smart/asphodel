@@ -25,6 +25,9 @@
 //! answered, is refused with the head it now has. A head whose predecessor
 //! was translated into the language, or a sentence the LLM hands back
 //! unchanged, writes nothing. Nothing is held while the LLM answers.
+//! Afterwards the bank is held through embedding and commit, after waiting
+//! at most five seconds for in-flight extractions or another hold. A busy
+//! bank is refused without writing, so the operator can retry.
 
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -68,6 +71,9 @@ pub enum TranslateError {
 
     #[error("[llm] language isn't set, so there's nothing to translate into")]
     LanguageUnset,
+
+    #[error("the bank is busy; retry the translation")]
+    Busy,
 
     #[error("the memory has been superseded by {head}; name that one instead")]
     Superseded { head: Uuid },
