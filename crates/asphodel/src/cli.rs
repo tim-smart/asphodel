@@ -17,6 +17,7 @@ use asphodel_core::SystemClock;
 use asphodel_core::config::{Secret, TOKEN_ENV};
 use asphodel_core::constants::Volatility;
 use asphodel_core::entities::{AliasRemoval, LinkRequest, MergeRequest};
+use asphodel_core::erase::RemoveDocumentRequest;
 use asphodel_core::ingest::Document;
 use asphodel_core::keep::{MemoryIds, SignificanceRequest};
 use asphodel_core::mental_models::{ModelEdit, ModelSpec};
@@ -2419,16 +2420,16 @@ fn document(command: DocumentCommand) -> anyhow::Result<()> {
         DocumentCommand::Remove { client, bank, id } => {
             let json = client.json;
             let client = Client::new(&client)?;
-            let removed: Value = client.delete(&format!(
-                "/v1/banks/{}/documents/{}",
-                segment(&bank),
-                segment(&id)
-            ))?;
+            let removed: Value = client.post(
+                &format!("/v1/banks/{}/documents/remove", segment(&bank)),
+                &RemoveDocumentRequest { document_id: id },
+            )?;
             if json {
                 return print_json(&removed);
             }
             println!(
-                "removed {id}: {} versions, {} memories forgotten, {} chunks dequeued",
+                "removed {}: {} versions, {} memories forgotten, {} chunks dequeued",
+                text(&removed, "document_id"),
                 list(&removed, "sources").len(),
                 list(&removed, "forgotten").len(),
                 count(&removed, "dequeued"),

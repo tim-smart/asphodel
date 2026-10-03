@@ -110,9 +110,20 @@ impl From<rusqlite::Error> for ForgetError {
 /// much went with them, never the document id or its text.
 pub const EDIT_DOCUMENT_REMOVED: &str = "document_removed";
 
+/// What `POST /v1/banks/{bank}/documents/remove` takes: the document id
+/// exactly as it was ingested. It's never a path segment, since a client
+/// normalizes `.` and `..` out of a path before sending it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveDocumentRequest {
+    pub document_id: String,
+}
+
 /// What `remove_document` returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DocumentRemoved {
+    /// The id removed, as given, so a client can check it's the one the
+    /// owner confirmed.
+    pub document_id: String,
     /// Every version of the document, oldest first.
     pub sources: Vec<Uuid>,
     /// Every memory forgotten with it: the whole chain of each memory that
@@ -130,6 +141,9 @@ pub enum RemoveDocumentError {
 
     #[error("the bank has no such document, or it was removed already")]
     UnknownDocument,
+
+    #[error("give the id of the document to remove")]
+    EmptyDocumentId,
 
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -246,6 +260,9 @@ pub(crate) fn remove_document(
     bank: &str,
     document_id: &str,
 ) -> Result<(i64, DocumentRemoved, Aftermath), RemoveDocumentError> {
+    if document_id.is_empty() {
+        return Err(RemoveDocumentError::EmptyDocumentId);
+    }
     let now = micros(store.now());
     let mut conn = store.connection();
     let tx = conn.transaction()?;
@@ -332,6 +349,7 @@ pub(crate) fn remove_document(
     Ok((
         bank_id,
         DocumentRemoved {
+            document_id: document_id.to_string(),
             sources: uuids,
             forgotten,
             dequeued,

@@ -661,8 +661,11 @@ every version ever ingested under it. It's irreversible.
 Memories the document only mentioned again, which rest on other turns or
 documents, stay. Everything listed under "What forget can't reach" applies
 here too, and a new version of the document with different text is new
-input. The dashboard asks for confirmation before it calls the route; the
-CLI and the route don't.
+input. Over HTTP it's `POST /v1/banks/{bank}/documents/remove` with
+`{"document_id": "<id>"}`, the id exactly as ingested; it's never part of
+the path, where a client would turn `folder/../notes` into `notes`. The
+dashboard asks for confirmation before it calls the route; the CLI and the
+route don't.
 
 ## The dashboard
 

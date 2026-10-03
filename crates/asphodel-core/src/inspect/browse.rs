@@ -547,10 +547,8 @@ pub(crate) fn memories(
             .collect::<Result<_, _>>()?
     };
 
-    // Status and phase are cheap: every row gets them, so the status
-    // counts cover every other filter.
-    let mut statuses = StatusCounts::default();
-    let mut matched: Vec<(Row, MemoryStatus, Option<Phase>)> = Vec::new();
+    // Status and phase are cheap, so every row gets them.
+    let mut candidates: Vec<(Row, MemoryStatus, Option<Phase>)> = Vec::new();
     for row in rows {
         let phase = window(&conn, row.id)?.map(|(window, tz)| window.phase(&tz, now));
         if query.phase != PhaseFilter::Any && !phase.is_some_and(|phase| query.phase.admits(phase))
@@ -558,11 +556,9 @@ pub(crate) fn memories(
             continue;
         }
         let status = row.status(now);
-        statuses.add(status);
-        if query.status.is_none_or(|wanted| wanted == status) {
-            matched.push((row, status, phase));
-        }
+        candidates.push((row, status, phase));
     }
+    let wanted = |status: MemoryStatus| query.status.is_none_or(|wanted| wanted == status);
 
     // Strength and the projections cost a few queries a row, so they're
     // taken for every match only when the sort or the fade filter needs
@@ -602,44 +598,55 @@ pub(crate) fn memories(
         })
     };
 
-    let needs_all = query.fading.is_some() || query.sort != MemorySort::Created;
-    let (memories, total) = if needs_all {
-        let mut all = matched
+    // The status counts cover every filter but `status`. The fade filter
+    // needs each candidate's projection before they can be counted, so it
+    // takes them for every status; without it, the projections are taken
+    // for the matches only when the sort needs them, and otherwise for the
+    // page alone.
+    let mut statuses = StatusCounts::default();
+    let (memories, total) = if let Some(fading) = query.fading {
+        let mut all = candidates
             .into_iter()
             .map(summarise)
             .collect::<Result<Vec<_>, _>>()?;
-        if let Some(fading) = query.fading {
-            all.retain(|memory| fades(memory, fading));
+        all.retain(|memory| fades(memory, fading));
+        for memory in &all {
+            statuses.add(memory.status);
         }
-        match query.sort {
-            MemorySort::Created => all.sort_by_key(|memory| std::cmp::Reverse(memory.created_at)),
-            MemorySort::Fade => all.sort_by(|a, b| {
-                let days = |memory: &MemorySummary| {
-                    memory
-                        .fade
-                        .as_ref()
-                        .map_or(f64::INFINITY, |fade| fade.bank_days)
-                };
-                days(a).total_cmp(&days(b))
-            }),
-            MemorySort::Strength => all.sort_by(|a, b| b.strength.total_cmp(&a.strength)),
-        }
+        all.retain(|memory| wanted(memory.status));
+        sort(&mut all, query.sort);
         let total = all.len();
         (all.into_iter().skip(offset).take(size).collect(), total)
     } else {
-        // Newest first: the rows came oldest first, rowid breaking ties.
-        matched.sort_by(|a, b| {
-            b.0.created_at
-                .cmp(&a.0.created_at)
-                .then(b.0.id.cmp(&a.0.id))
-        });
-        let total = matched.len();
-        let memories = matched
+        for (_, status, _) in &candidates {
+            statuses.add(*status);
+        }
+        let mut matched: Vec<_> = candidates
             .into_iter()
-            .skip(offset)
-            .take(size)
-            .map(summarise)
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter(|(_, status, _)| wanted(*status))
+            .collect();
+        let total = matched.len();
+        let memories = if query.sort == MemorySort::Created {
+            // Newest first: the rows came oldest first, rowid breaking ties.
+            matched.sort_by(|a, b| {
+                b.0.created_at
+                    .cmp(&a.0.created_at)
+                    .then(b.0.id.cmp(&a.0.id))
+            });
+            matched
+                .into_iter()
+                .skip(offset)
+                .take(size)
+                .map(summarise)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut all = matched
+                .into_iter()
+                .map(summarise)
+                .collect::<Result<Vec<_>, _>>()?;
+            sort(&mut all, query.sort);
+            all.into_iter().skip(offset).take(size).collect()
+        };
         (memories, total)
     };
     Ok(MemoryPage {
@@ -649,6 +656,23 @@ pub(crate) fn memories(
         statuses,
         as_of: now,
     })
+}
+
+/// Puts summarised rows in `sort`'s order.
+fn sort(all: &mut [MemorySummary], sort: MemorySort) {
+    match sort {
+        MemorySort::Created => all.sort_by_key(|memory| std::cmp::Reverse(memory.created_at)),
+        MemorySort::Fade => all.sort_by(|a, b| {
+            let days = |memory: &MemorySummary| {
+                memory
+                    .fade
+                    .as_ref()
+                    .map_or(f64::INFINITY, |fade| fade.bank_days)
+            };
+            days(a).total_cmp(&days(b))
+        }),
+        MemorySort::Strength => all.sort_by(|a, b| b.strength.total_cmp(&a.strength)),
+    }
 }
 
 fn fades(memory: &MemorySummary, fading: Fading) -> bool {
