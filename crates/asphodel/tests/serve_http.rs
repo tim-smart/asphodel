@@ -2507,6 +2507,10 @@ fn an_older_backup_restores_into_a_new_data_dir_and_migrates_with_a_copy() {
 // `forgotten` and `dequeued`; 404 for a document the bank never had.
 // - `GET /dashboard` is served without the token, since the page holds
 // nothing; every route it calls needs the token like any other.
+// - The page's module script, and every module it imports as "./name.js",
+// is served without the token from `/dashboard/`, as JavaScript, byte for
+// byte as it is in `assets/dashboard/`: there is no build step. One of
+// them is `app.js`, the module `tests/dashboard` drives.
 
 impl Daemon {
     /// The memories `query` lists in `bank`.
@@ -2660,4 +2664,71 @@ fn off_loopback_the_dashboard_page_is_open_and_its_routes_need_the_token() {
             );
         }
     }
+}
+
+#[test]
+fn the_dashboard_scripts_are_served_unbuilt_without_the_token() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).bind();
+    daemon.wait_ready();
+    let addr = daemon.addr.clone();
+
+    let page = request(&addr, "GET", "/dashboard", None, None).unwrap();
+    let script = module_script(&page.body)
+        .unwrap_or_else(|| panic!("no <script type=\"module\" src=...>: {}", page.body));
+    assert!(
+        script.starts_with("/dashboard/"),
+        "{script} must resolve the same from /dashboard and /dashboard/"
+    );
+
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let mut pending = vec![script];
+    let mut served = Vec::new();
+    while let Some(path) = pending.pop() {
+        if served.contains(&path) {
+            continue;
+        }
+        let reply = request(&addr, "GET", &path, None, None).unwrap();
+        assert_eq!(reply.status, 200, "{path}: {}", reply.body);
+        assert!(
+            reply.headers.contains("content-type: text/javascript"),
+            "{path}: {}",
+            reply.headers
+        );
+        let file = assets.join(path.trim_start_matches('/'));
+        let on_disk = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("{path} isn't {}: {error}", file.display()));
+        assert!(
+            reply.body == on_disk,
+            "{path} differs from {}",
+            file.display()
+        );
+        let base = &path[..=path.rfind('/').unwrap()];
+        pending.extend(relative_imports(&reply.body).map(|import| format!("{base}{import}")));
+        served.push(path);
+    }
+    assert!(
+        served.iter().any(|path| path == "/dashboard/app.js"),
+        "{served:?}"
+    );
+}
+
+/// The `src` of the page's first `<script type="module">`.
+fn module_script(html: &str) -> Option<String> {
+    let tag = html
+        .split("<script")
+        .skip(1)
+        .map(|rest| &rest[..rest.find('>').unwrap_or(rest.len())])
+        .find(|tag| tag.contains("type=\"module\""))?;
+    let src = &tag[tag.find("src=\"")? + 5..];
+    Some(src[..src.find('"')?].to_string())
+}
+
+/// The `./name.js` modules a module imports, by name.
+fn relative_imports(module: &str) -> impl Iterator<Item = String> + '_ {
+    module.match_indices("\"./").filter_map(|(at, _)| {
+        let rest = &module[at + 3..];
+        let name = &rest[..rest.find('"')?];
+        name.ends_with(".js").then(|| name.to_string())
+    })
 }
