@@ -261,7 +261,8 @@ A probe naming a label no claim defines is refused before the run.
   were scheduled in. So a probe at a turn's `at` sees that turn's prefetch
   and, with zero latency, its memories.
 - **Extraction** is queued at a source's sync. Each bank has one simulated
-  worker. Whenever it's free, at a sync or at its previous completion, it
+  worker with room for `[llm] concurrency` chunks, 1 by default. Whenever
+  it has room, at a sync or at a completion, it
   claims the head of the production queue (turns before documents, then
   observed time), runs its LLM calls and neighbour search at once, as
   production's worker does when it claims, and commits that chunk a
@@ -270,7 +271,8 @@ A probe naming a label no claim defines is refused before the run.
   ended, refined or restated it commits as new. The check runs inside the
   commit's transaction, under the same hold on the store as its writes,
   so in `serve`, where the sweep and erases run on another thread, a
-  neighbour can't go between the check and the writes either. At the completion the
+  neighbour can't go between the check and the writes either. At the
+  completion of a chunk that was the only one out, the
   worker also prepares and commits the same source's next chunks, for as
   long as each is the queue's head. Once another source is at the head, for example a
   turn synced in the meantime, the worker claims that instead. The rest
@@ -279,6 +281,19 @@ A probe naming a label no claim defines is refused before the run.
   store without those memories. Accesses are stamped with the source's
   ingest time, as in production. The run ends at the latest of the last
   event, `--until` and the last completion.
+- **Concurrency.** Above `[llm] concurrency = 1` (set it in `--overrides`)
+  the worker keeps that many chunks out, each prepared at its claim, and
+  they commit in the order they were claimed: a chunk whose latency ends
+  first waits for those claimed before it. A commit that finds a memory or
+  an edit since its search that it must reconcile against searches and
+  runs call 2 again at that instant, with no latency of its own (ADR 0005,
+  "Amendment: reconciliation is checked at commit"). That call 2 is shown
+  other neighbours than a serial run's, so it misses the cassette: `live`
+  and `fast` answer it from the LLM and record it, and `replay` stops.
+  The report counts these redos as `call2_rate.redos` and
+  `call2_rate.redo_rate`, per chunk, fields that only appear above 1.
+  Scenarios script call 2 against what a serial run shows it, so a
+  scenario refuses to run above 1.
 - **Sweeps** run at `mental_models.sweep_time` bank-local (04:00) on the
   simulated clock, purge first, then the source and recall-log sweep, and
   then the refreshes due. Replay records the deletion fingerprint on its

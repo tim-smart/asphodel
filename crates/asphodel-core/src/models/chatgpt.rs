@@ -654,6 +654,7 @@ impl CodexResponses {
             .send_json(self.body(request))
             .map_err(super::llm::transport)?;
         let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let reset_header = response
             .headers()
             .get("x-codex-primary-reset-at")
@@ -672,7 +673,7 @@ impl CodexResponses {
                 if let Some(resets_at) = usage_limit(&text, reset_header) {
                     return Err(LlmError::UsageLimited { resets_at }.into());
                 }
-                return Err(LlmError::Status { status }.into());
+                return Err(super::llm::status_error(status, &headers).into());
             }
             _ => return Err(LlmError::Status { status }.into()),
         }

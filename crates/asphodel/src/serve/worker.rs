@@ -1,29 +1,37 @@
-//! The extraction workers: one per bank, so each bank's chunks run one at a
-//! time in queue order, and banks don't wait on each other.
+//! The extraction workers: one per bank, each running up to `[llm]
+//! concurrency` chunks at once, so banks don't wait on each other. At the
+//! default of 1 a bank's chunks run one at a time in queue order.
 //!
-//! A worker takes the head of its bank's queue, extracts it on a blocking
-//! thread and moves on to the next. When the queue is empty it sleeps until
-//! an ingest or a retry wakes it. A held queue (no login, a usage limit)
-//! waits without counting anything, and a counted failure waits a little
-//! before the retry when the LLM might recover, so a dead endpoint doesn't
-//! burn through the retry cap in a second.
+//! A worker claims the heads of its bank's queue while it has room, and
+//! extracts each on a blocking thread. The chunks commit in the order they
+//! were claimed, and one that another's commit made stale reconciles again
+//! ([`asphodel_core::extraction`]). When the queue is empty, or the bank has
+//! as many chunks out as it may, the worker sleeps until a chunk finishes or
+//! an ingest or a retry wakes it. A held queue (no login, a usage limit, a
+//! 429 that said when to retry) waits without counting anything, and a
+//! counted failure waits a little before the retry when the LLM might
+//! recover, so a dead endpoint doesn't burn through the retry cap in a
+//! second.
 //!
 //! A forget's erase waits on the same queue, behind the chunks queued
-//! before it (ADR 0010), so each step runs a due erase first.
+//! before it, and nothing queued after it is claimed until it has run (ADR
+//! 0010), so each step runs a due erase first.
 //!
-//! On shutdown a worker finishes the chunk in flight and stops before claiming
-//! another. Nothing queued is lost, since the queue is in SQLite.
+//! On shutdown a worker finishes the chunks in flight and stops before
+//! claiming another. Nothing queued is lost, since the queue is in SQLite.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asphodel_core::Service;
-use asphodel_core::extraction::ExtractError;
+use asphodel_core::extraction::{ExtractError, Extracted};
 use asphodel_core::models::{LlmClient, LlmError};
 use asphodel_core::queue::{Failure, QueueError};
+use asphodel_core::service::Claimed;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 /// How long a held queue waits before trying again, unless the LLM said
@@ -133,99 +141,139 @@ struct Worker {
     registry: Registry,
 }
 
-/// What one blocking step did.
+/// What one blocking claim step did.
 enum Step {
     /// An erase ran, deleting this many memories.
     Erased(usize),
     EraseFailed(QueueError),
-    /// No erase was due, so the head chunk was extracted, or not.
-    Extracted(Result<Option<asphodel_core::extraction::Extracted>, ExtractError>),
+    /// No erase was due, so the head chunk was claimed, or not.
+    Claimed(Result<Option<Claimed>, ExtractError>),
 }
 
-/// What a worker does after one step.
+/// What a worker does after a chunk's extraction ends.
 enum Next {
-    /// Take the next chunk at once.
+    /// Claim again at once.
     Continue,
-    /// Sleep until woken: the queue is empty.
-    Idle,
-    /// Sleep this long, or until stopped.
+    /// Claim nothing for this long, or until stopped.
     Wait(Duration),
     /// The bank is gone.
     Exit,
 }
 
+type Extraction = Result<Extracted, ExtractError>;
+
 impl Worker {
-    async fn run(mut self) {
+    async fn run(self) {
         debug!(bank = %self.bank, "extraction worker started");
+        let limit = self.service.tuning().llm.concurrency.max(1) as usize;
+        let mut in_flight: JoinSet<Extraction> = JoinSet::new();
+        // No claims before this, after a held queue or a counted failure.
+        let mut resume: Option<Instant> = None;
+        // The queue had nothing to claim at the last look.
+        let mut drained = false;
+        let mut exit = false;
         loop {
-            if *self.stop.borrow() {
+            let stopping = *self.stop.borrow() || exit;
+            if stopping && in_flight.is_empty() {
                 break;
             }
-            let service = Arc::clone(&self.service);
-            let llm = Arc::clone(&self.llm);
-            let bank = self.bank.clone();
-            // The blocking step always runs to the end: shutdown waits for
-            // the chunk in flight rather than abandoning it.
-            let step = tokio::task::spawn_blocking(move || match service.erase_next(&bank) {
-                Ok(Some(erased)) => Step::Erased(erased.memories.len()),
-                Ok(None) => Step::Extracted(service.extract_next(&bank, llm.as_ref())),
-                Err(error) => Step::EraseFailed(error),
-            })
-            .await;
-            let next = match step {
-                Ok(Step::Erased(memories)) => {
-                    info!(bank = %self.bank, memories, "erased a forgotten chain");
-                    Next::Continue
-                }
-                Ok(Step::EraseFailed(QueueError::UnknownBank)) => Next::Exit,
-                Ok(Step::EraseFailed(error)) => {
-                    warn!(bank = %self.bank, %error, "an erase failed");
-                    Next::Wait(ERROR_WAIT)
-                }
-                Ok(Step::Extracted(result)) => self.next(result),
-                Err(error) => {
-                    warn!(bank = %self.bank, %error, "an extraction step panicked");
-                    Next::Wait(ERROR_WAIT)
-                }
-            };
-            match next {
-                Next::Continue => {}
-                Next::Exit => {
-                    let mut banks = self
-                        .registry
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if banks
-                        .get(&self.bank)
-                        .is_some_and(|notify| Arc::ptr_eq(notify, &self.notify))
-                    {
-                        banks.remove(&self.bank);
+            let waiting = resume.is_some_and(|at| Instant::now() < at);
+            if !stopping && !waiting && !drained && in_flight.len() < limit {
+                match self.claim().await {
+                    Ok(Step::Erased(memories)) => {
+                        info!(bank = %self.bank, memories, "erased a forgotten chain");
+                        continue;
                     }
-                    break;
-                }
-                Next::Idle => {
-                    tokio::select! {
-                        _ = self.notify.notified() => {}
-                        _ = self.stop.wait_for(|stop| *stop) => break,
+                    Ok(Step::EraseFailed(QueueError::UnknownBank)) => exit = true,
+                    Ok(Step::EraseFailed(error)) => {
+                        warn!(bank = %self.bank, %error, "an erase failed");
+                        resume = Some(after(ERROR_WAIT));
+                    }
+                    Ok(Step::Claimed(Ok(Some(claimed)))) => {
+                        let service = Arc::clone(&self.service);
+                        let llm = Arc::clone(&self.llm);
+                        // The blocking extraction always runs to the end:
+                        // shutdown waits for the chunks in flight rather than
+                        // abandoning them.
+                        in_flight.spawn_blocking(move || {
+                            let Claimed {
+                                lease,
+                                in_context,
+                                entries,
+                            } = claimed;
+                            service.extract_leased(lease, llm.as_ref(), &in_context, &entries)
+                        });
+                        continue;
+                    }
+                    Ok(Step::Claimed(Ok(None))) => drained = true,
+                    Ok(Step::Claimed(Err(error))) => match self.next(Err(error)) {
+                        Next::Continue => {}
+                        Next::Wait(wait) => resume = Some(after(wait)),
+                        Next::Exit => exit = true,
+                    },
+                    Err(error) => {
+                        warn!(bank = %self.bank, %error, "an extraction step panicked");
+                        resume = Some(after(ERROR_WAIT));
                     }
                 }
-                Next::Wait(wait) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
-                        _ = self.stop.wait_for(|stop| *stop) => break,
+                continue;
+            }
+            let sleep_until = resume.filter(|_| waiting);
+            tokio::select! {
+                Some(done) = in_flight.join_next(), if !in_flight.is_empty() => {
+                    drained = false;
+                    let next = match done {
+                        Ok(result) => self.next(result),
+                        Err(error) => {
+                            warn!(bank = %self.bank, %error, "an extraction step panicked");
+                            Next::Wait(ERROR_WAIT)
+                        }
+                    };
+                    match next {
+                        Next::Continue => {}
+                        Next::Wait(wait) => {
+                            let at = after(wait);
+                            resume = Some(resume.map_or(at, |resume| resume.max(at)));
+                        }
+                        Next::Exit => exit = true,
                     }
                 }
+                _ = self.notify.notified(), if !stopping => drained = false,
+                _ = tokio::time::sleep_until(sleep_until.unwrap_or_else(Instant::now)),
+                    if !stopping && sleep_until.is_some() => resume = None,
+                _ = wait_for_stop(self.stop.clone()), if !stopping => {}
+            }
+        }
+        if exit {
+            let mut banks = self
+                .registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if banks
+                .get(&self.bank)
+                .is_some_and(|notify| Arc::ptr_eq(notify, &self.notify))
+            {
+                banks.remove(&self.bank);
             }
         }
         debug!(bank = %self.bank, "extraction worker stopped");
     }
 
-    fn next(
-        &self,
-        result: Result<Option<asphodel_core::extraction::Extracted>, ExtractError>,
-    ) -> Next {
+    /// Runs a due erase, or claims the next chunk, on a blocking thread.
+    async fn claim(&self) -> Result<Step, tokio::task::JoinError> {
+        let service = Arc::clone(&self.service);
+        let bank = self.bank.clone();
+        tokio::task::spawn_blocking(move || match service.erase_next(&bank) {
+            Ok(Some(erased)) => Step::Erased(erased.memories.len()),
+            Ok(None) => Step::Claimed(service.next_extraction(&bank)),
+            Err(error) => Step::EraseFailed(error),
+        })
+        .await
+    }
+
+    fn next(&self, result: Extraction) -> Next {
         let error = match result {
-            Ok(Some(extracted)) => {
+            Ok(extracted) => {
                 info!(
                     bank = %self.bank,
                     chunk = %extracted.chunk,
@@ -235,7 +283,6 @@ impl Worker {
                 );
                 return Next::Continue;
             }
-            Ok(None) => return Next::Idle,
             Err(error) => error,
         };
         match &error {
@@ -247,6 +294,7 @@ impl Worker {
                             .unwrap_or(Duration::ZERO)
                             .max(RETRY_WAIT)
                     }
+                    LlmError::RateLimited { retry_after } => (*retry_after).max(RETRY_WAIT),
                     _ => HELD_WAIT,
                 };
                 Next::Wait(wait)
@@ -278,6 +326,19 @@ impl Worker {
             }
         }
     }
+}
+
+/// `wait` from now, or a year from now when that's further than the clock
+/// can say.
+fn after(wait: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(wait)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+}
+
+/// Resolves once `stop` is set.
+async fn wait_for_stop(mut stop: watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stop| *stop).await;
 }
 
 /// The wait before retrying a chunk after a counted failure: none once it

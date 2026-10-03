@@ -25,7 +25,7 @@ use crate::entities::{
 use crate::erase::{
     Aftermath, BankDeleteError, BankDeleted, Erased, ForgetError, ForgetRequest, Forgotten,
 };
-use crate::extraction::{Call1Input, Call2Input, ExtractError, Extracted};
+use crate::extraction::{Call1Input, Call2Input, Committed, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use crate::inspect::{EntityView, InspectError, MemoryView, ModelView};
 use crate::keep::{KeepError, Kept, SignificanceSet, Unkept};
@@ -397,10 +397,16 @@ impl Service {
         crate::ingest::ingest_document(&self.store, bank, document)
     }
 
-    /// The head of `bank`'s extraction queue, or `None` when the queue is
-    /// empty or the bank's worker already holds a lease ([`crate::queue`]).
+    /// The first chunk in `bank`'s extraction queue that isn't out already,
+    /// or `None` when there's none or the bank already has `[llm]
+    /// concurrency` leases out ([`crate::queue`]).
     pub fn claim_chunk(&self, bank: &str) -> Result<Option<Lease>, QueueError> {
-        crate::queue::claim(&self.store, &self.leases, bank)
+        crate::queue::claim(
+            &self.store,
+            &self.leases,
+            bank,
+            self.tuning.llm.concurrency as usize,
+        )
     }
 
     /// Marks a leased chunk extracted and takes it off the queue.
@@ -707,19 +713,59 @@ impl Service {
     }
 
     /// The second half of [`Service::extract_leased`]: commits a prepared
-    /// chunk, then runs what follows writes.
+    /// chunk, then runs what follows writes. It waits for every chunk of
+    /// the bank handed out before this one to commit or fail first. A chunk
+    /// that another commit made stale since its search
+    /// ([`crate::extraction`]) is [`ExtractError::Stale`], with nothing
+    /// written or counted; [`Service::try_commit_extraction`] hands it back
+    /// to reconcile again instead.
     pub fn commit_extraction(
         &self,
         prepared: crate::extraction::Prepared,
     ) -> Result<Extracted, ExtractError> {
+        match self.try_commit_extraction(prepared)? {
+            Committed::Extracted(extracted) => Ok(extracted),
+            Committed::Stale(_) => Err(ExtractError::Stale),
+        }
+    }
+
+    /// [`Service::commit_extraction`], handing a stale chunk back with its
+    /// lease still held, for [`Service::redo_extraction`].
+    pub fn try_commit_extraction(
+        &self,
+        prepared: crate::extraction::Prepared,
+    ) -> Result<Committed, ExtractError> {
         let bank_id = prepared.lease().bank_id();
         let watermark = {
             let conn = self.store.connection();
             crate::mental_models::watermark(&conn, bank_id).map_err(StoreError::Sqlite)?
         };
-        let extracted = crate::extraction::commit_prepared(&self.store, &self.leases, prepared)?;
-        self.after_writes(bank_id, watermark, &extracted.memories)?;
-        Ok(extracted)
+        let committed = crate::extraction::commit_prepared(&self.store, &self.leases, prepared)?;
+        if let Committed::Extracted(extracted) = &committed {
+            self.after_writes(bank_id, watermark, &extracted.memories)?;
+        }
+        Ok(committed)
+    }
+
+    /// What call 2 would be given if `prepared` searched again now, or
+    /// `None` when it wouldn't run. Reads only: replay scripts the redo's
+    /// call 2 from it.
+    pub fn redo_input(
+        &self,
+        prepared: &crate::extraction::Prepared,
+    ) -> Result<Option<Call2Input>, ExtractError> {
+        Ok(crate::extraction::redo_input(&self.store, prepared)?)
+    }
+
+    /// Searches and runs call 2 again with `llm` for a chunk
+    /// [`Service::try_commit_extraction`] found stale, keeping its call 1.
+    /// The redo isn't counted against the chunk.
+    pub fn redo_extraction(
+        &self,
+        prepared: crate::extraction::Prepared,
+        llm: &dyn LlmClient,
+    ) -> Result<crate::extraction::Prepared, ExtractError> {
+        crate::extraction::redo(&self.store, &self.leases, llm, prepared)
     }
 
     /// The second half of [`Service::extract_next`]: extracts a chunk

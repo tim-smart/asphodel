@@ -31,6 +31,16 @@
 //! A failure anywhere before the commit writes nothing but the queue's
 //! count of the failed attempt and call 1's saved reply, so the chunk is
 //! retried in place.
+//!
+//! With `[llm] concurrency` above 1 a bank has several chunks in flight,
+//! each searching before the others commit. Each commits in the order it
+//! was handed out ([`crate::queue`]), and the commit checks, under the
+//! store, what its search could have missed: a memory committed since that
+//! clears the floor for one of its claims, an edit since on a neighbour
+//! call 2 was shown, or any new memory when a claim is flagged. A chunk
+//! that missed something is [`Committed::Stale`]: it searches and runs
+//! call 2 again from the same call 1, which isn't counted against it, so a
+//! repeat is still an access on the memory it repeats (ADR 0005).
 
 mod call2;
 mod claims;
@@ -389,7 +399,7 @@ pub enum DropReason {
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractError {
     /// The LLM can't be used at all: not configured, conflicting settings,
-    /// no valid login, or a usage limit. Not the chunk's fault, so nothing is
+    /// no valid login, a usage limit, or a 429 that said when to retry. Not the chunk's fault, so nothing is
     /// counted and the chunk stays at the head of the queue.
     #[error("the extraction queue holds: {error}")]
     Held { error: LlmError },
@@ -451,6 +461,13 @@ pub enum ExtractError {
     #[error("committing the chunk failed: {error}")]
     Commit { error: StoreError, failure: Failure },
 
+    /// Another chunk of the bank committed something since this one's
+    /// search that it must reconcile against, and the caller can't run
+    /// call 2 again. Nothing is counted: the lease is released and the
+    /// chunk is extracted again.
+    #[error("the chunk's neighbours changed since its search")]
+    Stale,
+
     #[error(transparent)]
     Queue(#[from] QueueError),
 
@@ -474,6 +491,7 @@ impl ExtractError {
             | ExtractError::Model { .. }
             | ExtractError::NoModels
             | ExtractError::ModelUnavailable { .. }
+            | ExtractError::Stale
             | ExtractError::Queue(_)
             | ExtractError::Store(_) => None,
         }
@@ -543,8 +561,16 @@ pub struct Prepared {
     lease: Lease,
     input: Call1Input,
     unit: input::Unit,
+    /// Call 1's reply, saved on the chunk before call 2 runs.
+    reply: Value,
+    /// Whether the reply is saved on the chunk already.
+    saved: bool,
     checked: claims::Checked,
     vectors: Vec<Vec<f32>>,
+    /// The reconcile floor the search used.
+    floor: f64,
+    /// The bank as the search saw it.
+    snapshot: reconcile::Snapshot,
     search: Option<reconcile::Search>,
     labels: Vec<call2::ClaimLabels>,
     plan: reconcile::Plan,
@@ -555,6 +581,37 @@ impl Prepared {
     pub fn lease(&self) -> &Lease {
         &self.lease
     }
+
+    /// What call 1 was given.
+    pub fn call1_input(&self) -> &Call1Input {
+        &self.input
+    }
+
+    /// What call 2 was given, or `None` when it didn't run.
+    pub fn call2_input(&self) -> Option<&Call2Input> {
+        self.search.as_ref().map(|search| &search.input)
+    }
+}
+
+impl std::fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Prepared")
+            .field("chunk", &self.lease.chunk)
+            .field("claims", &self.checked.memories.len())
+            .field("reconciled", &self.search.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// What [`commit_prepared`] did.
+#[derive(Debug)]
+pub enum Committed {
+    /// The chunk is committed.
+    Extracted(Extracted),
+    /// Another chunk of the bank committed since this one's search
+    /// something it must reconcile against. Nothing was written; run
+    /// [`redo`] and commit again.
+    Stale(Box<Prepared>),
 }
 
 /// A claim and the neighbours call 2 was shown for it, for replay's
@@ -595,7 +652,8 @@ pub(crate) fn call2_lists(
 
 /// Runs call 1 on the leased chunk, or takes its saved reply, reconciles
 /// the claims with call 2 when they land near something stored, and commits
-/// the result.
+/// the result, reconciling again as often as another chunk of the bank
+/// commits something it must see first.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract(
     store: &Store,
@@ -607,10 +665,15 @@ pub(crate) fn extract(
     in_context: &[Uuid],
     entries: &[BlockEntry],
 ) -> Result<Extracted, ExtractError> {
-    let prepared = prepare(
+    let mut prepared = prepare(
         store, leases, tuning, embedder, lease, llm, in_context, entries,
     )?;
-    commit_prepared(store, leases, prepared)
+    loop {
+        match commit_prepared(store, leases, prepared)? {
+            Committed::Extracted(extracted) => return Ok(extracted),
+            Committed::Stale(stale) => prepared = redo(store, leases, llm, *stale)?,
+        }
+    }
 }
 
 /// The first half of [`extract`]: everything up to the commit, the LLM
@@ -674,20 +737,93 @@ pub(crate) fn prepare(
         }
     };
 
+    let claims = checked.memories.len();
+    reconcile_claims(
+        store,
+        leases,
+        llm,
+        Prepared {
+            lease,
+            input,
+            unit,
+            reply,
+            saved: resumed,
+            checked,
+            vectors,
+            floor: floor(tuning, embedder),
+            snapshot: reconcile::Snapshot::default(),
+            search: None,
+            labels: Vec::new(),
+            plan: reconcile::Plan::all_new(claims),
+        },
+    )
+}
+
+/// Searches and runs call 2 again for a chunk [`commit_prepared`] found
+/// stale, from the same call 1. The redo itself isn't counted against the
+/// chunk; a call 2 that fails is, as it would be the first time.
+pub(crate) fn redo(
+    store: &Store,
+    leases: &Leases,
+    llm: &dyn LlmClient,
+    prepared: Prepared,
+) -> Result<Prepared, ExtractError> {
+    tracing::info!(
+        chunk = %prepared.input.chunk,
+        "another chunk committed near this one since its search; reconciling again"
+    );
+    reconcile_claims(store, leases, llm, prepared)
+}
+
+/// What call 2 would be given if `prepared` searched again now, or `None`
+/// when it wouldn't run. Reads only.
+pub(crate) fn redo_input(
+    store: &Store,
+    prepared: &Prepared,
+) -> Result<Option<Call2Input>, StoreError> {
+    let conn = store.connection();
+    Ok(reconcile::search(
+        &conn,
+        prepared.floor,
+        &prepared.input,
+        &prepared.unit,
+        &prepared.checked,
+        &prepared.vectors,
+    )?
+    .map(|search| search.input))
+}
+
+/// Finds the claims' neighbours, noting what the bank held at that moment,
+/// and runs call 2 when they land near something stored.
+fn reconcile_claims(
+    store: &Store,
+    leases: &Leases,
+    llm: &dyn LlmClient,
+    prepared: Prepared,
+) -> Result<Prepared, ExtractError> {
+    let Prepared {
+        lease,
+        input,
+        unit,
+        reply,
+        mut saved,
+        checked,
+        vectors,
+        floor,
+        ..
+    } = prepared;
     // The connection is released before the failure is counted.
     let searched = {
         let conn = store.connection();
-        reconcile::search(
-            &conn,
-            floor(tuning, embedder),
-            &input,
-            &unit,
-            &checked,
-            &vectors,
+        reconcile::snapshot(&conn, unit.bank_id, leases.commits(unit.bank_id)).and_then(
+            |snapshot| {
+                reconcile::search(&conn, floor, &input, &unit, &checked, &vectors)
+                    .map(|search| (snapshot, search))
+            },
         )
     };
-    let search = match searched {
-        Ok(search) => search,
+    let (snapshot, search) = match searched {
+        Ok(searched) => searched,
         Err(error) => {
             let failure = queue::fail(store, leases, lease, SEARCH)?;
             return Err(ExtractError::Search {
@@ -699,8 +835,9 @@ pub(crate) fn prepare(
     let (labels, plan) = match &search {
         None => (Vec::new(), reconcile::Plan::all_new(checked.memories.len())),
         Some(search) => {
-            if !resumed {
+            if !saved {
                 save(store, &lease, &reply, &unit)?;
+                saved = true;
             }
             let labels = match llm.complete(&call2_request(&search.input)) {
                 Ok(response) => match call2::parse(&response.json) {
@@ -727,90 +864,114 @@ pub(crate) fn prepare(
         lease,
         input,
         unit,
+        reply,
+        saved,
         checked,
         vectors,
+        floor,
+        snapshot,
         search,
         labels,
         plan,
     })
 }
 
-/// The second half of [`extract`]: writes a prepared chunk. A neighbour
-/// that went between the halves, purged or forgotten, is planned without:
-/// call 2's labels on it are dropped, so a claim that would have ended,
-/// refined or restated it is new instead, as if it had never been stored.
+/// The second half of [`extract`]: writes a prepared chunk, once every
+/// chunk of its bank handed out before it has committed or failed. A
+/// neighbour that went between the halves, purged or forgotten, is planned
+/// without: call 2's labels on it are dropped, so a claim that would have
+/// ended, refined or restated it is new instead, as if it had never been
+/// stored. When another chunk of the bank committed since the search
+/// something this one must reconcile against, nothing is written and the
+/// chunk comes back [`Committed::Stale`].
 ///
-/// The check, the replanning and the writes share one hold on the store
+/// The checks, the replanning and the writes share one hold on the store
 /// and one transaction, so a sweep or an erase on another thread can't
 /// delete a neighbour between the check and the writes.
 pub(crate) fn commit_prepared(
     store: &Store,
     leases: &Leases,
     prepared: Prepared,
-) -> Result<Extracted, ExtractError> {
-    let Prepared {
-        lease,
-        input,
-        unit,
-        checked,
-        vectors,
-        search,
-        labels,
-        plan,
-    } = prepared;
-    queue::check_held(leases, &lease)?;
+) -> Result<Committed, ExtractError> {
+    queue::check_held(leases, &prepared.lease)?;
+    leases.wait_turn(&prepared.lease);
 
     // The last moment before the commit takes the store, where a test can
     // change it.
     #[cfg(test)]
     gap::run(store);
 
+    let bank_id = prepared.unit.bank_id;
     let committed = {
         let mut conn = store.connection();
-        (|| -> Result<(Extracted, reconcile::Plan), StoreError> {
+        (|| -> Result<Option<(Extracted, reconcile::Plan)>, StoreError> {
             let tx = conn.transaction()?;
-            let plan = match &search {
-                Some(search) => {
-                    without_vanished(&tx, search, &input, &unit, &checked, &labels)?.unwrap_or(plan)
-                }
-                None => plan,
+            if leases.commits(bank_id) != prepared.snapshot.commits
+                && reconcile::stale(
+                    &tx,
+                    bank_id,
+                    &prepared.snapshot,
+                    prepared.floor,
+                    &prepared.checked,
+                    &prepared.vectors,
+                    prepared.search.as_ref(),
+                )?
+            {
+                return Ok(None);
+            }
+            let plan = match &prepared.search {
+                Some(search) => without_vanished(
+                    &tx,
+                    search,
+                    &prepared.input,
+                    &prepared.unit,
+                    &prepared.checked,
+                    &prepared.labels,
+                )?
+                .unwrap_or_else(|| prepared.plan.clone()),
+                None => prepared.plan.clone(),
             };
-            let neighbours = search.as_ref().map(|search| search.neighbours.as_slice());
+            let neighbours = prepared
+                .search
+                .as_ref()
+                .map(|search| search.neighbours.as_slice());
             let extracted = commit::commit(
                 &tx,
                 store,
-                &lease,
-                &input,
-                &unit,
-                &checked,
-                &vectors,
+                &prepared.lease,
+                &prepared.input,
+                &prepared.unit,
+                &prepared.checked,
+                &prepared.vectors,
                 &plan,
                 neighbours.unwrap_or_default(),
             )?;
             tx.commit()?;
-            Ok((extracted, plan))
+            leases.committed(bank_id);
+            Ok(Some((extracted, plan)))
         })()
     };
     match committed {
-        Ok((extracted, plan)) => {
+        Ok(Some((extracted, plan))) => {
             tracing::info!(
                 chunk = %extracted.chunk,
                 memories = extracted.memories.len(),
                 used = extracted.used.len(),
                 dropped = extracted.dropped.len(),
                 entities_created = extracted.entities_created.len(),
-                reconciled = search.is_some(),
+                reconciled = prepared.search.is_some(),
                 accesses = plan.accesses.len(),
                 edits = plan.edits.len(),
                 "extracted a chunk"
             );
-            Ok(extracted)
+            Ok(Committed::Extracted(extracted))
         }
+        Ok(None) => Ok(Committed::Stale(Box::new(prepared))),
         Err(error) => {
             // A commit that fails every time must still reach the retry cap
             // rather than hold the bank's queue for ever. The store's hold
             // was released above, so the failure can be counted.
-            let failure = queue::fail(store, leases, lease, COMMIT)?;
+            let failure = queue::fail(store, leases, prepared.lease, COMMIT)?;
             Err(ExtractError::Commit { error, failure })
         }
     }
@@ -1020,7 +1181,8 @@ fn chunk_error(error: &LlmError) -> Option<ChunkError> {
         LlmError::NotConfigured { .. }
         | LlmError::Conflicting { .. }
         | LlmError::LoginRequired
-        | LlmError::UsageLimited { .. } => return None,
+        | LlmError::UsageLimited { .. }
+        | LlmError::RateLimited { .. } => return None,
         LlmError::Transport { .. } => ("llm_transport", None),
         LlmError::Timeout => ("llm_timeout", None),
         LlmError::Status { status } => ("llm_status", Some(*status)),

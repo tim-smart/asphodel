@@ -189,6 +189,13 @@ pub struct Call2Rate {
     pub chunks: u64,
     pub call2: u64,
     pub rate: f64,
+    /// Commits that found their chunk stale and reconciled it again, and
+    /// that per chunk. Only above `[llm] concurrency = 1`, where a chunk
+    /// can be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redos: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redo_rate: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -390,6 +397,8 @@ impl Aggregate {
                 chunks: report.call2_rate.chunks,
                 call2: report.call2_rate.call2,
                 rate: report.call2_rate.rate,
+                redos: report.call2_rate.redos,
+                redo_rate: report.call2_rate.redo_rate,
             },
             agenda_lines_per_day: report.agenda_lines_per_day.iter().map(day).collect(),
             significance_histogram: report.significance_histogram.clone(),

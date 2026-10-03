@@ -177,7 +177,11 @@ it.
 
 **Usage limits.** A 429 whose body says `usage_limit_reached` carries the
 time the window resets. The client returns `UsageLimited { resets_at }`,
-which is not a retry: extraction holds the queue until then.
+which is not a retry: extraction holds the queue until then. A 429 from
+either mode with a `Retry-After` in seconds is `RateLimited { retry_after }`,
+held the same way; one without it is a counted, retryable failure. The
+daemon shares either hold: once one call hits it, every call, refreshes
+included, holds until it lifts, so no chunk counts a failure for it.
 
 **Secrets.** Tokens never appear in `Debug` output, logs, errors, the
 resolved config or cassettes. A failed or incomplete response keeps only a
