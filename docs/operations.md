@@ -253,6 +253,9 @@ login` talks to the daemon. They take `--url` (or `ASPHODEL_URL`) and read
 - `asphodel bank config <bank> ...` takes the same fields. Fields not given
   are left as they are, and a new name adds an alias without removing the
   old one.
+- `asphodel bank list` lists every bank with its memories by status
+  (live, superseded, ended, retracted, forgetting), how many are kept, its
+  turns and documents, and its queued and failed chunks.
 - `asphodel bank delete <bank> --confirm <bank>`: see "Deleting a bank".
 
 ### Documents
@@ -264,8 +267,22 @@ defaults to the file's name. Ingesting the same id again with new text is
 an edit, even with an earlier date. A document never makes a memory kept,
 whatever it says.
 
+- `asphodel document list --bank B [--id ID]` lists document versions,
+  newest first, each with its chunks, the memories resting on it, and
+  anything queued or failed.
+- `asphodel document show --bank B <source>` shows one version: its other
+  versions, and each chunk with where it is in extraction and the memories
+  resting on it or mentioned in it.
+- `asphodel document remove --bank B <id>`: see "Removing a document".
+
 ### Memories
 
+- `asphodel memory list --bank B [--status S] [--kind K] [--search WORDS]
+  [--entity E] [--significance L] [--document ID] [--session S]
+  [--fading faded|week|month|never] [--sort created|fade|strength]
+  [--limit N] [--cursor C]` lists memories with their status, strength
+  and when each fades if it isn't used again. Listing reads only: unlike
+  recall, it writes no recall row and never counts as using a memory.
 - `asphodel recall --bank B <query> [--from T] [--to T] [--on happened|said]
   [--phase upcoming|past|current|any] [--kind K]... [--entity E]
   [--limit N]` is the same recall the agent's `memory_recall` tool runs.
@@ -284,6 +301,7 @@ whatever it says.
   durations plus the earliest world date at full speed.
 - `asphodel memory translate --bank B <id>` translates a memory into
   `[llm] language`. See below.
+- `asphodel memory retract --bank B <id>`: see "Retracting a memory".
 - `asphodel forget --bank B <id>...`: see "Forgetting".
 
 A memory's sentence, kind and window are never edited from the CLI. Those
@@ -611,6 +629,52 @@ What forget can't reach:
 - **Old mentions.** A memory mentioned before schema version 7 has no
   recorded span for the mention, so forget masks more of that turn or
   document than the mention itself (`docs/upgrading.md`, version 8).
+
+## Retracting a memory
+
+`asphodel memory retract --bank B <id>` is the owner saying a memory never
+held: a denial, as when the user says so in conversation, with no new memory
+replacing it. The memory leaves recall, the agenda, the prompt block, mental
+model refreshes and live sessions at once, and whatever it had ended is open
+again, since that ending never happened either. It isn't erased: it stays
+listed as retracted, keeps its access log, and the sweep purges it once it
+fades, like any other memory. There's no undo.
+
+Only the newest version of a memory can be retracted. An older one is
+refused with 409, naming the version that replaced it, and so is a repeat.
+Use forget instead when the content itself has to go.
+
+## Removing a document
+
+`asphodel document remove --bank B <id>` removes a document by its id:
+every version ever ingested under it. It's irreversible.
+
+- Every memory resting on the document's chunks is forgotten, through the
+  same path as `asphodel forget`, so every earlier and later version of it
+  goes too, even one a later turn refined.
+- Chunks still waiting for extraction leave the queue. A chunk already being
+  extracted finishes its LLM calls, and its commit is then refused, so
+  nothing it found is written.
+- Each version's text is cleared at once. The versions keep their keys, so
+  sending any of them again is a duplicate and queues nothing.
+
+Memories the document only mentioned again, which rest on other turns or
+documents, stay. Everything listed under "What forget can't reach" applies
+here too, and a new version of the document with different text is new
+input. Over HTTP it's `POST /v1/banks/{bank}/documents/remove` with
+`{"document_id": "<id>"}`, the id exactly as ingested; it's never part of
+the path, where a client would turn `folder/../notes` into `notes`. The
+dashboard asks for confirmation before it calls the route; the CLI and the
+route don't.
+
+## The dashboard
+
+The daemon serves a dashboard at `/dashboard` for browsing banks, documents
+and memories, and for keeping, retracting and forgetting them and removing
+documents. The page itself needs no token, since it holds nothing. It asks
+for the token and sends it on every `/v1` call it makes, which need it like
+any other client. Browsing never goes through recall, so looking at a
+memory doesn't strengthen it or log a recall.
 
 ## Deleting a bank
 

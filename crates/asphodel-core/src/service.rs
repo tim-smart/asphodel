@@ -23,11 +23,15 @@ use crate::entities::{
     Unmerged,
 };
 use crate::erase::{
-    Aftermath, BankDeleteError, BankDeleted, Erased, ForgetError, ForgetRequest, Forgotten,
+    Aftermath, BankDeleteError, BankDeleted, DocumentRemoved, Erased, ForgetError, ForgetRequest,
+    Forgotten, RemoveDocumentError,
 };
 use crate::extraction::{Call1Input, Call2Input, Committed, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Outcome, Turn};
-use crate::inspect::{EntityView, InspectError, MemoryView, ModelView};
+use crate::inspect::{
+    BankOverview, EntityView, InspectError, MemoryPage, MemoryQuery, MemoryView, ModelView,
+    SourceDetail, SourcePage, SourceQuery,
+};
 use crate::keep::{KeepError, Kept, SignificanceSet, Unkept};
 use crate::mental_models::{
     Model, ModelEdit, ModelError, ModelSpec, Outcome as RefreshOutcome, RefreshInput, RefreshRun,
@@ -39,6 +43,7 @@ use crate::queue::{
     ChunkError, ChunkList, FailedChunk, Failure, Lease, Leases, QueueError, Retried, SourceKind,
 };
 use crate::reembed::{ReembedError, ReembedStatus};
+use crate::retract::{RetractError, Retracted};
 use crate::retrieval::{
     Permit, Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest, Reranking,
 };
@@ -988,6 +993,39 @@ impl Service {
         crate::inspect::model_view(&self.store, bank, name, entry)
     }
 
+    /// The dashboard's bank list: every bank with its counts by memory
+    /// status, kind and significance, its sources and its queue.
+    pub fn banks(&self) -> Result<Vec<BankOverview>, InspectError> {
+        crate::inspect::banks(&self.store)
+    }
+
+    /// The memory list, filtered and sorted, with each memory's status,
+    /// strength, and fade and purge dates as `memory show` projects them.
+    /// Reads only: it never goes through recall, so it writes no access
+    /// and no recall row.
+    pub fn list_memories(
+        &self,
+        bank: &str,
+        query: &MemoryQuery,
+    ) -> Result<MemoryPage, InspectError> {
+        crate::inspect::memories(&self.store, &self.tuning, &self.purge_pause(), bank, query)
+    }
+
+    /// The bank's turns and document versions, newest ingest first.
+    pub fn list_sources(
+        &self,
+        bank: &str,
+        query: &SourceQuery,
+    ) -> Result<SourcePage, InspectError> {
+        crate::inspect::sources(&self.store, bank, query)
+    }
+
+    /// One source: its text or why it's gone, a document's versions, and
+    /// each chunk with its extraction state and the memories on it.
+    pub fn show_source(&self, bank: &str, id: &str) -> Result<SourceDetail, InspectError> {
+        crate::inspect::source(&self.store, |bank_id| self.leases.out(bank_id), bank, id)
+    }
+
     /// The first instant the memory's strength fell below τ, from its
     /// access log and the bank's clock as they stand now, to the minute.
     /// `None` when it hasn't faded yet. It's what a replay's `faded_at`
@@ -1184,6 +1222,25 @@ impl Service {
         self.reembeds.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// `memory retract <id>`: the owner says the memory never held
+    /// ([`crate::retract`]). It leaves recall, the agenda, the block and
+    /// live sessions at once, and what it ended is open again.
+    pub fn retract(&self, bank: &str, id: &str) -> Result<Retracted, RetractError> {
+        let watermark = self.watermark_for(bank)?;
+        let (bank_id, retracted) = crate::retract::retract(&self.store, bank, id)?;
+        if let Some((_, watermark)) = watermark {
+            self.after_writes(bank_id, watermark, &[])?;
+        }
+        self.settle(
+            bank_id,
+            Aftermath {
+                models: BTreeSet::new(),
+                scrub: BTreeSet::from([retracted.memory]),
+            },
+        )?;
+        Ok(retracted)
+    }
+
     /// `bank delete <bank> --confirm <bank>`: erases the bank through the
     /// erase path and removes everything it holds, writing a daemon-wide
     /// `bank_deleted` row with counts. `confirm` must repeat the name. A
@@ -1240,6 +1297,28 @@ impl Service {
         let (bank_id, forgotten, aftermath) = crate::erase::forget(&self.store, bank, request)?;
         self.settle(bank_id, aftermath)?;
         Ok(forgotten)
+    }
+
+    /// `document remove <id>`: removes every version of a document
+    /// ([`crate::erase::remove_document`]). The memories resting on it are
+    /// forgotten, its waiting chunks dequeued and its text cleared at once;
+    /// a chunk in flight is discarded when it tries to commit.
+    pub fn remove_document(
+        &self,
+        bank: &str,
+        document_id: &str,
+    ) -> Result<DocumentRemoved, RemoveDocumentError> {
+        let out = {
+            let conn = self.store.connection();
+            match crate::ingest::find_bank(&conn, bank)? {
+                Some((bank_id, _)) => self.leases.out(bank_id),
+                None => return Err(RemoveDocumentError::UnknownBank),
+            }
+        };
+        let (bank_id, removed, aftermath) =
+            crate::erase::remove_document(&self.store, &out, bank, document_id)?;
+        self.settle(bank_id, aftermath)?;
+        Ok(removed)
     }
 
     /// Runs every erase that's ready, in every bank, behind the same

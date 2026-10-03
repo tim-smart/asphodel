@@ -481,6 +481,12 @@ pub enum ExtractError {
     #[error("the chunk's neighbours changed since its search")]
     Stale,
 
+    /// The chunk's document was removed while it was queued or in flight.
+    /// Nothing from it is written; the chunk leaves the queue unextracted
+    /// and nothing is counted.
+    #[error("the chunk's document was removed")]
+    SourceRemoved,
+
     #[error(transparent)]
     Queue(#[from] QueueError),
 
@@ -505,6 +511,7 @@ impl ExtractError {
             | ExtractError::NoModels
             | ExtractError::ModelUnavailable { .. }
             | ExtractError::Stale
+            | ExtractError::SourceRemoved
             | ExtractError::Queue(_)
             | ExtractError::Store(_) => None,
         }
@@ -703,6 +710,10 @@ pub(crate) fn prepare(
     entries: &[BlockEntry],
 ) -> Result<Prepared, ExtractError> {
     queue::check_held(leases, &lease)?;
+    if queue::source_removed(&store.connection(), lease.chunk_id())? {
+        discard(store, &lease)?;
+        return Err(ExtractError::SourceRemoved);
+    }
     let (input, mut unit, saved) = {
         let conn = store.connection();
         let (input, unit) =
@@ -917,8 +928,15 @@ pub(crate) fn commit_prepared(
     let bank_id = prepared.unit.bank_id;
     let committed = {
         let mut conn = store.connection();
-        (|| -> Result<Option<(Extracted, reconcile::Plan)>, StoreError> {
+        (|| -> Result<Commit, StoreError> {
             let tx = conn.transaction()?;
+            // The document was removed since the chunk was handed out:
+            // nothing it found may be written.
+            if queue::source_removed(&tx, prepared.lease.chunk_id())? {
+                queue::drop_removed(&tx, &prepared.lease)?;
+                tx.commit()?;
+                return Ok(Commit::Removed);
+            }
             if leases.commits(bank_id) != prepared.snapshot.commits
                 && reconcile::stale(
                     &tx,
@@ -930,7 +948,7 @@ pub(crate) fn commit_prepared(
                     prepared.search.as_ref(),
                 )?
             {
-                return Ok(None);
+                return Ok(Commit::Stale);
             }
             let plan = match &prepared.search {
                 Some(search) => without_vanished(
@@ -961,11 +979,12 @@ pub(crate) fn commit_prepared(
             )?;
             tx.commit()?;
             leases.committed(bank_id);
-            Ok(Some((extracted, plan)))
+            Ok(Commit::Written(Box::new((extracted, plan))))
         })()
     };
     match committed {
-        Ok(Some((extracted, plan))) => {
+        Ok(Commit::Written(written)) => {
+            let (extracted, plan) = *written;
             tracing::info!(
                 chunk = %extracted.chunk,
                 memories = extracted.memories.len(),
@@ -979,7 +998,14 @@ pub(crate) fn commit_prepared(
             );
             Ok(Committed::Extracted(extracted))
         }
-        Ok(None) => Ok(Committed::Stale(Box::new(prepared))),
+        Ok(Commit::Stale) => Ok(Committed::Stale(Box::new(prepared))),
+        Ok(Commit::Removed) => {
+            tracing::info!(
+                chunk = %prepared.input.chunk,
+                "the chunk's document was removed; its extraction is discarded"
+            );
+            Err(ExtractError::SourceRemoved)
+        }
         Err(error) => {
             // A commit that fails every time must still reach the retry cap
             // rather than hold the bank's queue for ever. The store's hold
@@ -988,6 +1014,25 @@ pub(crate) fn commit_prepared(
             Err(ExtractError::Commit { error, failure })
         }
     }
+}
+
+/// What one try at [`commit_prepared`]'s transaction did.
+enum Commit {
+    Written(Box<(Extracted, reconcile::Plan)>),
+    /// Another chunk committed something this one must see first.
+    Stale,
+    /// The chunk's document was removed; it left the queue.
+    Removed,
+}
+
+/// Takes a leased chunk whose document was removed off the queue.
+fn discard(store: &Store, lease: &Lease) -> Result<(), ExtractError> {
+    let mut conn = store.connection();
+    let tx = conn.transaction()?;
+    queue::drop_removed(&tx, lease)?;
+    tx.commit()?;
+    tracing::info!(chunk = %lease.chunk, "the chunk's document was removed; it isn't extracted");
+    Ok(())
 }
 
 /// The plan again without call 2's labels on neighbours that are no longer

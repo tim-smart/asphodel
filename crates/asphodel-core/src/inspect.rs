@@ -32,6 +32,15 @@ use crate::strength::{
     Phase, WorldTime, chain, chain_head, projected_below, projected_below_after, unit_end,
 };
 
+mod browse;
+
+pub use browse::{
+    BankOverview, ChunkCounts, ChunkState, ChunkView, DEFAULT_LIST, Fading, MAX_LIST, MemoryPage,
+    MemoryQuery, MemorySort, MemoryStatus, MemorySummary, SourceCounts, SourceDetail, SourcePage,
+    SourceQuery, SourceSummary, SourceVersion, StatusCounts,
+};
+pub(crate) use browse::{banks, memories, source, sources};
+
 /// The most linked memories `entity show` lists, newest first.
 pub const ENTITY_MEMORIES: usize = 100;
 
@@ -48,6 +57,12 @@ pub enum InspectError {
 
     #[error("the model has no such entry")]
     UnknownEntry,
+
+    #[error("no such source in the bank")]
+    UnknownSource,
+
+    #[error("{reason}")]
+    InvalidQuery { reason: &'static str },
 
     #[error(transparent)]
     Entity(#[from] EntityError),
@@ -152,6 +167,8 @@ pub enum Gone {
     Redacted,
     /// The turn asked to forget, so it was never stored.
     ForgetRequested,
+    /// The owner removed the document, every version of it.
+    Removed,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -324,7 +341,7 @@ pub(crate) fn memory(
                 m.source_start, m.source_end, m.ended_by,
                 c.uuid, c.text, c.tombstoned_at,
                 s.uuid, s.kind, s.session_id, s.document_id, s.message_at, s.timezone,
-                s.secret_kinds, s.tombstoned_at, s.tombstone_reason
+                s.secret_kinds, s.tombstoned_at, s.tombstone_reason, s.removed_at
          FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
          WHERE m.id = ?1",
         [memory_id],
@@ -361,6 +378,7 @@ pub(crate) fn memory(
                 secret_kinds: row.get(31)?,
                 source_tombstoned_at: row.get::<_, Option<i64>>(32)?.map(timestamp),
                 tombstone_reason: row.get(33)?,
+                removed: row.get::<_, Option<i64>>(34)?.is_some(),
             })
         },
     )?;
@@ -373,89 +391,16 @@ pub(crate) fn memory(
     let strength = loader.strength(&conn, memory_id)?;
     let effective = row.owner.clone().unwrap_or(row.significance.clone());
 
-    let fade = projected_below(
-        inputs.significance,
-        &inputs.accesses,
-        inputs.close,
-        loader.bank_time(),
-        now,
-        TAU,
-    )
-    .map(|days| Projected {
-        bank_days: days,
-        earliest_at: later(now, days),
-    });
-
-    // Purge reads the chain's head.
-    let head = chain_head(&links, memory_id);
-    let members = chain(&links, memory_id);
-    let head_strength = loader.strength(&conn, head)?.value;
+    let Outlook {
+        fade,
+        head,
+        head_strength,
+        line,
+        guards,
+        purge,
+    } = outlook(&conn, tuning, pause, &loader, memory_id, now)?;
     let delta = tuning.purge.delta;
-    let line = delta.map(|delta| TAU - delta);
-    let mut guards = Vec::new();
-    let mut held_until: Option<Timestamp> = None;
-    if delta.is_none() {
-        guards.push(Guard::PurgeDisabled);
-    }
-    if *pause != PurgePause::Running {
-        guards.push(Guard::PurgePaused);
-    }
-    let hidden = {
-        let mut statement = conn.prepare_cached("SELECT hidden_at FROM memories WHERE id = ?1")?;
-        let mut hidden = false;
-        for member in &members {
-            hidden |= statement
-                .query_row([member], |row| row.get::<_, Option<i64>>(0))?
-                .is_some();
-        }
-        hidden
-    };
-    if hidden {
-        guards.push(Guard::Forgotten);
-    }
-    if let Some((head_window, head_tz)) = window(&conn, head)? {
-        let date_until = [head_window.valid_from, head_window.valid_until]
-            .into_iter()
-            .flatten()
-            .map(|time| unit_end(time, &head_tz))
-            .max();
-        if let Some(until) = date_until.filter(|until| *until > now) {
-            guards.push(Guard::DateAhead { until });
-            held_until = Some(until);
-        }
-        if let Some(until) = head_window
-            .overdue_until(&head_tz, tuning.agenda.overdue_days)
-            .filter(|until| now < *until)
-        {
-            guards.push(Guard::OverdueTask { until });
-            held_until = Some(held_until.map_or(until, |held| held.max(until)));
-        }
-    }
-    if line.is_some_and(|line| head_strength >= line) {
-        guards.push(Guard::Strength);
-    }
-    // The first time the guards have cleared and the head is below the
-    // line together: a window closing as its date guard clears restarts
-    // recent use, so the head can be below the line now and above it then.
-    let purge = match line {
-        Some(line) if !hidden => {
-            let head_inputs = loader.inputs(&conn, head)?;
-            projected_below_after(
-                head_inputs.significance,
-                &head_inputs.accesses,
-                head_inputs.close,
-                loader.bank_time(),
-                now,
-                held_until.map_or(now, |held| held.max(now)),
-                line,
-            )
-            .map(|days| Projected {
-                bank_days: days,
-                earliest_at: later(now, days),
-            })
-        }
-        _ => None,
-    };
+    let members = chain(&links, memory_id);
 
     let mut chain_members = Vec::new();
     {
@@ -618,6 +563,121 @@ pub(crate) fn memory(
     })
 }
 
+/// A memory's fade and purge, if it isn't used again: what `memory show`
+/// projects, and what each row of the memory list carries.
+struct Outlook {
+    fade: Option<Projected>,
+    /// The chain's head, which purge reads.
+    head: i64,
+    head_strength: f64,
+    line: Option<f64>,
+    guards: Vec<Guard>,
+    purge: Option<Projected>,
+}
+
+fn outlook(
+    conn: &Connection,
+    tuning: &Tuning,
+    pause: &PurgePause,
+    loader: &StrengthLoader,
+    memory_id: i64,
+    now: Timestamp,
+) -> Result<Outlook, rusqlite::Error> {
+    let inputs = loader.inputs(conn, memory_id)?;
+    let fade = projected_below(
+        inputs.significance,
+        &inputs.accesses,
+        inputs.close,
+        loader.bank_time(),
+        now,
+        TAU,
+    )
+    .map(|days| Projected {
+        bank_days: days,
+        earliest_at: later(now, days),
+    });
+
+    // Purge reads the chain's head.
+    let links = loader.links();
+    let head = chain_head(links, memory_id);
+    let members = chain(links, memory_id);
+    let head_strength = loader.strength(conn, head)?.value;
+    let delta = tuning.purge.delta;
+    let line = delta.map(|delta| TAU - delta);
+    let mut guards = Vec::new();
+    let mut held_until: Option<Timestamp> = None;
+    if delta.is_none() {
+        guards.push(Guard::PurgeDisabled);
+    }
+    if *pause != PurgePause::Running {
+        guards.push(Guard::PurgePaused);
+    }
+    let hidden = {
+        let mut statement = conn.prepare_cached("SELECT hidden_at FROM memories WHERE id = ?1")?;
+        let mut hidden = false;
+        for member in &members {
+            hidden |= statement
+                .query_row([member], |row| row.get::<_, Option<i64>>(0))?
+                .is_some();
+        }
+        hidden
+    };
+    if hidden {
+        guards.push(Guard::Forgotten);
+    }
+    if let Some((head_window, head_tz)) = window(conn, head)? {
+        let date_until = [head_window.valid_from, head_window.valid_until]
+            .into_iter()
+            .flatten()
+            .map(|time| unit_end(time, &head_tz))
+            .max();
+        if let Some(until) = date_until.filter(|until| *until > now) {
+            guards.push(Guard::DateAhead { until });
+            held_until = Some(until);
+        }
+        if let Some(until) = head_window
+            .overdue_until(&head_tz, tuning.agenda.overdue_days)
+            .filter(|until| now < *until)
+        {
+            guards.push(Guard::OverdueTask { until });
+            held_until = Some(held_until.map_or(until, |held| held.max(until)));
+        }
+    }
+    if line.is_some_and(|line| head_strength >= line) {
+        guards.push(Guard::Strength);
+    }
+    // The first time the guards have cleared and the head is below the
+    // line together: a window closing as its date guard clears restarts
+    // recent use, so the head can be below the line now and above it then.
+    let purge = match line {
+        Some(line) if !hidden => {
+            let head_inputs = loader.inputs(conn, head)?;
+            projected_below_after(
+                head_inputs.significance,
+                &head_inputs.accesses,
+                head_inputs.close,
+                loader.bank_time(),
+                now,
+                held_until.map_or(now, |held| held.max(now)),
+                line,
+            )
+            .map(|days| Projected {
+                bank_days: days,
+                earliest_at: later(now, days),
+            })
+        }
+        _ => None,
+    };
+    Ok(Outlook {
+        fade,
+        head,
+        head_strength,
+        line,
+        guards,
+        purge,
+    })
+}
+
 struct MemoryRow {
     content: String,
     kind: String,
@@ -650,12 +710,15 @@ struct MemoryRow {
     secret_kinds: Option<String>,
     source_tombstoned_at: Option<Timestamp>,
     tombstone_reason: Option<String>,
+    removed: bool,
 }
 
 /// The memory's passage, or why it's gone.
 fn passage(row: &MemoryRow) -> (Option<String>, Option<Gone>) {
     let Some(text) = &row.chunk_text else {
-        let gone = if row.tombstone_reason.as_deref() == Some("forget_requested") {
+        let gone = if row.removed {
+            Gone::Removed
+        } else if row.tombstone_reason.as_deref() == Some("forget_requested") {
             Gone::ForgetRequested
         } else {
             Gone::Swept {

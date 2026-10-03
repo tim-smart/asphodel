@@ -106,6 +106,55 @@ impl From<rusqlite::Error> for ForgetError {
     }
 }
 
+/// The edit kind removing a document writes: the sources removed and how
+/// much went with them, never the document id or its text.
+pub const EDIT_DOCUMENT_REMOVED: &str = "document_removed";
+
+/// What `POST /v1/banks/{bank}/documents/remove` takes: the document id
+/// exactly as it was ingested. It's never a path segment, since a client
+/// normalizes `.` and `..` out of a path before sending it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveDocumentRequest {
+    pub document_id: String,
+}
+
+/// What `remove_document` returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DocumentRemoved {
+    /// The id removed, as given, so a client can check it's the one the
+    /// owner confirmed.
+    pub document_id: String,
+    /// Every version of the document, oldest first.
+    pub sources: Vec<Uuid>,
+    /// Every memory forgotten with it: the whole chain of each memory that
+    /// rested on its chunks.
+    pub forgotten: Vec<Uuid>,
+    /// Chunks taken off the queue before extraction. A chunk in flight
+    /// stays, and its commit is refused.
+    pub dequeued: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RemoveDocumentError {
+    #[error("unknown bank")]
+    UnknownBank,
+
+    #[error("the bank has no such document, or it was removed already")]
+    UnknownDocument,
+
+    #[error("give the id of the document to remove")]
+    EmptyDocumentId,
+
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl From<rusqlite::Error> for RemoveDocumentError {
+    fn from(error: rusqlite::Error) -> Self {
+        RemoveDocumentError::Store(StoreError::Sqlite(error))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EraseReason {
@@ -156,7 +205,6 @@ pub(crate) fn forget(
     if ids.len() > MAX_IDS {
         return Err(ForgetError::TooMany { given: ids.len() });
     }
-    let now = micros(store.now());
     let mut conn = store.connection();
     let tx = conn.transaction()?;
     let (bank_id, _) = find_bank(&tx, bank)?.ok_or(ForgetError::UnknownBank)?;
@@ -181,9 +229,150 @@ pub(crate) fn forget(
         }
     }
 
-    let links = bank_links(&tx, bank_id)?;
+    let (uuids, members, aftermath) = hide(&tx, store, bank_id, &named, session)?;
+    tx.commit()?;
+    if !members.is_empty() {
+        tracing::info!(
+            memories = members.len(),
+            "forgot a chain; its erase is queued"
+        );
+    }
+    Ok((
+        bank_id,
+        Forgotten {
+            forgotten: uuids,
+            unknown,
+        },
+        aftermath,
+    ))
+}
+
+/// Removes every version of the document `document_id` names: forgets the
+/// memories resting on its chunks as [`forget`] would, takes its chunks
+/// that are waiting off the queue, and clears each version's text now. The
+/// sources keep their keys, so sending a version again is a duplicate. A
+/// chunk on a lease in `out` (queue rowids) is left to its worker, whose
+/// commit is refused because the source is removed. Memories the document
+/// only mentioned again are left alone.
+pub(crate) fn remove_document(
+    store: &Store,
+    out: &BTreeSet<i64>,
+    bank: &str,
+    document_id: &str,
+) -> Result<(i64, DocumentRemoved, Aftermath), RemoveDocumentError> {
+    if document_id.is_empty() {
+        return Err(RemoveDocumentError::EmptyDocumentId);
+    }
+    let now = micros(store.now());
+    let mut conn = store.connection();
+    let tx = conn.transaction()?;
+    let (bank_id, _) = find_bank(&tx, bank)?.ok_or(RemoveDocumentError::UnknownBank)?;
+    let sources: Vec<(i64, String)> = {
+        let mut statement = tx.prepare(
+            "SELECT id, uuid FROM sources
+             WHERE bank_id = ?1 AND kind = 'document' AND document_id = ?2
+               AND removed_at IS NULL
+             ORDER BY ingested_at, id",
+        )?;
+        statement
+            .query_map((bank_id, document_id), |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    if sources.is_empty() {
+        return Err(RemoveDocumentError::UnknownDocument);
+    }
+
+    let mut dequeued = 0;
+    let mut named = Vec::new();
+    {
+        let mut queued = tx.prepare_cached(
+            "SELECT q.id FROM extraction_queue q JOIN chunks c ON c.id = q.chunk_id
+             WHERE c.source_id = ?1",
+        )?;
+        let mut resting = tx.prepare_cached(
+            "SELECT m.id FROM memories m JOIN chunks c ON c.id = m.chunk_id
+             WHERE c.source_id = ?1 AND m.hidden_at IS NULL ORDER BY m.id",
+        )?;
+        for (source, _) in &sources {
+            let jobs: Vec<i64> = queued
+                .query_map([source], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            for job in jobs.into_iter().filter(|job| !out.contains(job)) {
+                tx.execute("DELETE FROM extraction_queue WHERE id = ?1", [job])?;
+                dequeued += 1;
+            }
+            for memory in resting.query_map([source], |row| row.get::<_, i64>(0))? {
+                named.push(memory?);
+            }
+        }
+    }
+    let (forgotten, members, aftermath) = hide(&tx, store, bank_id, &named, None)?;
+
+    for (source, _) in &sources {
+        tx.execute(
+            "UPDATE chunks SET text = NULL, call1_output = NULL, failed_at = NULL,
+                    tombstoned_at = COALESCE(tombstoned_at, ?2)
+             WHERE source_id = ?1",
+            (source, now),
+        )?;
+        tx.execute(
+            "UPDATE sources SET text = NULL, reply = NULL,
+                    tombstoned_at = COALESCE(tombstoned_at, ?2), removed_at = ?2
+             WHERE id = ?1",
+            (source, now),
+        )?;
+    }
+    let uuids: Vec<Uuid> = sources
+        .iter()
+        .map(|(_, uuid)| uuid.parse().expect("a stored uuid parses"))
+        .collect();
+    log_edit(
+        &tx,
+        store,
+        bank_id,
+        EDIT_DOCUMENT_REMOVED,
+        None,
+        &serde_json::json!({
+            "sources": uuids,
+            "memories": members.len(),
+            "dequeued": dequeued,
+        })
+        .to_string(),
+    )?;
+    tx.commit()?;
+    tracing::info!(
+        sources = uuids.len(),
+        memories = members.len(),
+        dequeued,
+        "removed a document"
+    );
+    Ok((
+        bank_id,
+        DocumentRemoved {
+            document_id: document_id.to_string(),
+            sources: uuids,
+            forgotten,
+            dequeued,
+        },
+        aftermath,
+    ))
+}
+
+/// Forget's immediate part for the memories with rowids `named`, inside the
+/// caller's transaction: hides their whole chains, drops what cites them,
+/// and queues their erase. Returns the chains' ids and rowids, and what the
+/// service settles.
+fn hide(
+    tx: &Transaction<'_>,
+    store: &Store,
+    bank_id: i64,
+    named: &[i64],
+    session: Option<&str>,
+) -> Result<(Vec<Uuid>, BTreeSet<i64>, Aftermath), rusqlite::Error> {
+    let now = micros(store.now());
+    let links = bank_links(tx, bank_id)?;
     let members: BTreeSet<i64> = named.iter().flat_map(|&id| chain(&links, id)).collect();
-    let uuids = uuids_of(&tx, &members)?;
+    let uuids = uuids_of(tx, &members)?;
     let mut aftermath = Aftermath::default();
     if !members.is_empty() {
         let mut hide = tx.prepare_cached(
@@ -194,10 +383,10 @@ pub(crate) fn forget(
             hide.execute((member, now))?;
         }
         drop(hide);
-        aftermath.models = drop_entries(&tx, &members)?;
-        delete_recalls(&tx, &members)?;
+        aftermath.models = drop_entries(tx, &members)?;
+        delete_recalls(tx, &members)?;
         let scrub: BTreeSet<Uuid> = uuids.iter().copied().collect();
-        scrub_stored(&tx, bank_id, &scrub)?;
+        scrub_stored(tx, bank_id, &scrub)?;
         aftermath.scrub = scrub;
         // The audit row, written now so a crash before the
         // erase still leaves it. `after` is the session's latest turn so
@@ -212,7 +401,7 @@ pub(crate) fn forget(
             None => None,
         };
         log_edit(
-            &tx,
+            tx,
             store,
             bank_id,
             EDIT_FORGET,
@@ -236,21 +425,7 @@ pub(crate) fn forget(
             ),
         )?;
     }
-    tx.commit()?;
-    if !members.is_empty() {
-        tracing::info!(
-            memories = members.len(),
-            "forgot a chain; its erase is queued"
-        );
-    }
-    Ok((
-        bank_id,
-        Forgotten {
-            forgotten: uuids,
-            unknown,
-        },
-        aftermath,
-    ))
+    Ok((uuids, members, aftermath))
 }
 
 /// Runs the erase at the head of the bank's queue once every chunk queued

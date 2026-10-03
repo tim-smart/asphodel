@@ -157,3 +157,10 @@ The migration only adds the column. Recalls logged before it, and recall
 tool and refresh rows, have no raw query. No action is needed, but a
 reranker floor calibrated on recalls from before version 11 was calibrated
 on uncleaned queries.
+
+## Schema version 12: removed documents
+
+`asphodel document remove` and `POST /v1/banks/{bank}/documents/remove`
+clear a document's text and mark each of its versions with the new
+`sources.removed_at`. The migration only adds the column. No action is
+needed.

@@ -9,7 +9,8 @@
 //! `/v1/purge/plan`, `/v1/purge/ack`, `asphodel forget` and
 //! `asphodel purge plan|ack`; and `/v1/backup`,
 //! `/v1/status` and the audit lists, `asphodel backup`, `status` and the
-//! list commands, and the offline `asphodel restore`.
+//! list commands, and the offline `asphodel restore`; and the dashboard's
+//! routes and page.
 //!
 //! The daemon runs on the fake models (`ASPHODEL_MODELS=fake`) and a
 //! scripted fake LLM (`ASPHODEL_LLM_SCRIPT`), both environment only. The
@@ -2485,4 +2486,272 @@ fn an_older_backup_restores_into_a_new_data_dir_and_migrates_with_a_copy() {
     let rows = restored_rows(&data);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["schema_version"], older);
+}
+
+// The dashboard.
+//
+// The contract these tests pin:
+//
+// - `GET /v1/banks` answers `{"banks": [{"name": ...}, ...]}`.
+// - `GET /v1/banks/{bank}/memories?status=&q=&sort=` answers
+// `{"memories": [...]}`, each row with `id`, `sentence`, `status` and
+// `fade`. `GET /v1/banks/{bank}/sources?kind=document` answers
+// `{"sources": [...]}`, and `GET /v1/banks/{bank}/sources/{source}` the
+// text, or why it's gone, and each chunk with the memories resting on it.
+// None of them, nor `GET .../memories/{memory}`, writes an access or a
+// recall row.
+// - `POST /v1/banks/{bank}/memories/{memory}/retract` answers `memory`,
+// `retracted_at` and `reopened`; 409 for a repeat, 404 for an unknown
+// memory or bank.
+// - `POST /v1/banks/{bank}/documents/remove` takes `{"document_id": ...}`,
+// the id exactly as ingested, and answers `document_id`, `sources`,
+// `forgotten` and `dequeued`; 404 for a document the bank never had. A
+// document id is never a path segment: a client normalizes `.` and `..`
+// out of a path, so the id it confirmed wouldn't be the one it sent. There
+// is no `DELETE` route for documents.
+// - `GET /dashboard` is served without the token, since the page holds
+// nothing; every route it calls needs the token like any other.
+
+impl Daemon {
+    /// `POST /v1/banks/{bank}/documents/remove` for `document`.
+    fn remove_document(&self, bank: &str, document: &str) -> Reply {
+        self.post(
+            &format!("/v1/banks/{bank}/documents/remove"),
+            &json!({ "document_id": document }),
+        )
+    }
+
+    /// The memories `query` lists in `bank`.
+    fn memories(&self, bank: &str, query: &str) -> Vec<Value> {
+        let listed = self.ok(self.get(&format!("/v1/banks/{bank}/memories?{query}")));
+        listed["memories"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no memories array: {listed}"))
+            .clone()
+    }
+}
+
+#[test]
+fn the_dashboard_routes_browse_without_writing_anything() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir)
+        .script(&[json!({"reply": auckland_reply()})])
+        .ready();
+    daemon.create_bank("main");
+    let ingested = daemon.ingest_notes("main", "notes.md");
+    daemon.wait_extracted("main");
+
+    let banks = daemon.ok(daemon.get("/v1/banks"));
+    assert_eq!(banks["banks"][0]["name"], "main", "{banks}");
+
+    let live = daemon.memories("main", "status=live&sort=fade");
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live[0]["sentence"], SENTENCE);
+    assert_eq!(live[0]["status"], "live");
+    assert!(live[0]["fade"]["bank_days"].is_number(), "{}", live[0]);
+    assert!(live[0]["fade"]["earliest_at"].is_string(), "{}", live[0]);
+    let id = live[0]["id"].as_str().unwrap().to_string();
+    assert_eq!(daemon.memories("main", "q=Auckland")[0]["id"], id.as_str());
+    assert!(daemon.memories("main", "q=Berlin").is_empty());
+    assert!(daemon.memories("main", "status=retracted").is_empty());
+
+    let sources = daemon.ok(daemon.get("/v1/banks/main/sources?kind=document"));
+    assert_eq!(sources["sources"][0]["id"], ingested["source"], "{sources}");
+    assert_eq!(sources["sources"][0]["document_id"], "notes.md");
+    let source = ingested["source"].as_str().unwrap();
+    let shown = daemon.ok(daemon.get(&format!("/v1/banks/main/sources/{source}")));
+    assert_eq!(shown["text"], NOTES, "{shown}");
+    assert_eq!(shown["chunks"][0]["memories"], json!([id]), "{shown}");
+
+    // Looking is not using: no access, no recall.
+    let memory = daemon.ok(daemon.get(&format!("/v1/banks/main/memories/{id}")));
+    let kinds: Vec<&str> = memory["accesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|access| access["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["created"], "{memory}");
+    let recalls = daemon.ok(daemon.get("/v1/banks/main/recalls"));
+    assert_eq!(recalls["recalls"], json!([]), "{recalls}");
+}
+
+#[test]
+fn retract_and_document_removal_answer_over_http() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir)
+        .script(&[json!({"reply": auckland_reply()})])
+        .ready();
+    daemon.create_bank("main");
+    let ingested = daemon.ingest_notes("main", "notes.md");
+    let source = ingested["source"].as_str().unwrap().to_string();
+    daemon.wait_extracted("main");
+    let id = daemon.memories("main", "status=live")[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let retract = format!("/v1/banks/main/memories/{id}/retract");
+    let retracted = daemon.ok(daemon.post(&retract, &json!({})));
+    assert_eq!(retracted["memory"], id.as_str(), "{retracted}");
+    assert!(retracted["retracted_at"].is_string(), "{retracted}");
+    assert_eq!(retracted["reopened"], json!([]), "{retracted}");
+    let again = daemon.post(&retract, &json!({}));
+    assert_eq!(again.status, 409, "{}", again.body);
+    assert!(again.json()["error"].is_string());
+    let unknown = "01a0f958-0000-7000-8000-000000000000";
+    let reply = daemon.post(
+        &format!("/v1/banks/main/memories/{unknown}/retract"),
+        &json!({}),
+    );
+    assert_eq!(reply.status, 404, "{}", reply.body);
+    let reply = daemon.post(
+        &format!("/v1/banks/nobody/memories/{id}/retract"),
+        &json!({}),
+    );
+    assert_eq!(reply.status, 404, "{}", reply.body);
+    let retracted = daemon.memories("main", "status=retracted");
+    assert_eq!(retracted.len(), 1, "{retracted:?}");
+    assert_eq!(retracted[0]["id"], id.as_str());
+    assert!(daemon.memories("main", "status=live").is_empty());
+
+    let removed = daemon.ok(daemon.remove_document("main", "notes.md"));
+    assert_eq!(removed["document_id"], "notes.md", "{removed}");
+    assert_eq!(removed["sources"], json!([source]), "{removed}");
+    assert_eq!(removed["forgotten"], json!([id]), "{removed}");
+    assert_eq!(removed["dequeued"], 0, "{removed}");
+    let reply = daemon.remove_document("main", "other.md");
+    assert_eq!(reply.status, 404, "{}", reply.body);
+
+    // The daemon runs the erase; the memory is gone and the source stays
+    // as a tombstone, so the same document brings nothing back.
+    daemon.wait_until(
+        "the erase",
+        |daemon| json!(daemon.get(&format!("/v1/banks/main/memories/{id}")).status),
+        |status| status == 404,
+    );
+    let shown = daemon.ok(daemon.get(&format!("/v1/banks/main/sources/{source}")));
+    assert_eq!(shown["text"], Value::Null, "{shown}");
+    assert_eq!(shown["gone"]["reason"], "removed", "{shown}");
+    let again = daemon.ingest_notes("main", "notes.md");
+    assert_eq!(again["outcome"], "duplicate");
+    assert_eq!(daemon.chunks("main")["queued"], json!([]));
+}
+
+#[test]
+fn off_loopback_the_dashboard_page_is_open_and_its_routes_need_the_token() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).bind();
+    daemon.wait_ready();
+    let addr = daemon.addr.clone();
+
+    let page = request(&addr, "GET", "/dashboard", None, None).unwrap();
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.headers.contains("content-type: text/html"),
+        "{}",
+        page.headers
+    );
+    assert!(!page.body.contains(TOKEN));
+
+    let memory = "01a0f958-0000-7000-8000-000000000000";
+    for token in [None, Some("wrong-token")] {
+        for (method, path) in [
+            ("GET", "/v1/banks".to_string()),
+            ("GET", "/v1/banks/main/memories".to_string()),
+            ("GET", "/v1/banks/main/sources".to_string()),
+            ("GET", format!("/v1/banks/main/sources/{memory}")),
+            ("POST", format!("/v1/banks/main/memories/{memory}/retract")),
+            ("POST", "/v1/banks/main/documents/remove".to_string()),
+        ] {
+            let reply = request(&addr, method, &path, token, None).unwrap();
+            assert_eq!(reply.status, 401, "{method} {path} with {token:?}");
+            assert!(
+                reply.headers.contains("www-authenticate: bearer"),
+                "{}",
+                reply.headers
+            );
+        }
+    }
+}
+
+#[test]
+fn a_document_is_removed_by_the_exact_id_in_the_body() {
+    // Each id is its own document. Sent as a path, `folder/../victim` would
+    // reach the daemon as `victim`, and `..` not at all.
+    let dir = TestDir::new();
+    let daemon = Serve::new(&dir).ready();
+    daemon.create_bank("main");
+    let mut sources = std::collections::BTreeMap::new();
+    for (id, text) in [
+        ("victim", "# Victim\n\nThe victim stays.\n"),
+        ("folder/../victim", "# Folder\n\nThis one goes.\n"),
+        ("..", "# Dots\n\nSo does this one.\n"),
+    ] {
+        let ingested = daemon.ingest_document("main", id, text);
+        sources.insert(id, ingested["source"].as_str().unwrap().to_string());
+    }
+
+    for id in ["folder/../victim", ".."] {
+        let removed = daemon.ok(daemon.remove_document("main", id));
+        assert_eq!(removed["document_id"], id, "{removed}");
+        assert_eq!(removed["sources"], json!([sources[id]]), "{removed}");
+        assert_eq!(removed["dequeued"], 1, "{removed}");
+    }
+    let victim = daemon.ok(daemon.get(&format!("/v1/banks/main/sources/{}", sources["victim"])));
+    assert_eq!(victim["gone"], Value::Null, "{victim}");
+    assert_eq!(victim["chunks"][0]["state"], "queued", "{victim}");
+
+    // Nothing removes a document by its id in the path.
+    let reply = daemon.send("DELETE", "/v1/banks/main/documents/victim", None);
+    assert_eq!(reply.status, 404, "{}", reply.body);
+    let victim = daemon.ok(daemon.get(&format!("/v1/banks/main/sources/{}", sources["victim"])));
+    assert_eq!(victim["gone"], Value::Null, "{victim}");
+
+    for body in [json!({}), json!({ "document_id": "" })] {
+        let reply = daemon.post("/v1/banks/main/documents/remove", &body);
+        assert!(
+            matches!(reply.status, 400 | 422),
+            "{body}: {} {}",
+            reply.status,
+            reply.body
+        );
+    }
+    let reply = daemon.remove_document("nobody", "victim");
+    assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+#[test]
+fn the_cli_removes_a_document_by_its_exact_id() {
+    let dir = TestDir::new();
+    let daemon = Serve::new(&dir).ready();
+    daemon.create_bank("main");
+    let victim = daemon.ingest_document("main", "victim", "# Victim\n\nThe victim stays.\n");
+    let other = daemon.ingest_document("main", "folder/../victim", "# Folder\n\nThis one goes.\n");
+
+    let out = succeeded(run(cli(&daemon).args([
+        "document",
+        "remove",
+        "--bank",
+        "main",
+        "folder/../victim",
+        "--json",
+    ])));
+    let removed: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(removed["document_id"], "folder/../victim", "{removed}");
+    assert_eq!(removed["sources"], json!([other["source"]]), "{removed}");
+
+    let out = succeeded(run(
+        cli(&daemon).args(["document", "remove", "--bank", "main", "victim"])
+    ));
+    assert!(out.contains("removed victim"), "{out}");
+    let shown = daemon.ok(daemon.get(&format!(
+        "/v1/banks/main/sources/{}",
+        victim["source"].as_str().unwrap()
+    )));
+    assert_eq!(shown["gone"]["reason"], "removed", "{shown}");
+
+    let output = run(cli(&daemon).args(["document", "remove", "--bank", "main", "victim"]));
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("404"), "{}", stderr(&output));
 }

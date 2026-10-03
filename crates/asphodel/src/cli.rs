@@ -17,6 +17,7 @@ use asphodel_core::SystemClock;
 use asphodel_core::config::{Secret, TOKEN_ENV};
 use asphodel_core::constants::Volatility;
 use asphodel_core::entities::{AliasRemoval, LinkRequest, MergeRequest};
+use asphodel_core::erase::RemoveDocumentRequest;
 use asphodel_core::ingest::Document;
 use asphodel_core::keep::{MemoryIds, SignificanceRequest};
 use asphodel_core::mental_models::{ModelEdit, ModelSpec};
@@ -79,9 +80,14 @@ enum Command {
     /// Hand kept memories back to the significance extraction gave them.
     Unkeep(IdsArgs),
 
-    /// Show a memory, set the owner's significance on it, or translate it.
+    /// List, show, retract or translate memories, or set the owner's
+    /// significance on one.
     #[command(subcommand)]
     Memory(MemoryCommand),
+
+    /// List and show a bank's documents, and remove one with every version.
+    #[command(subcommand)]
+    Document(DocumentCommand),
 
     /// Show and correct entities: merge, unmerge, aliases and links.
     #[command(subcommand)]
@@ -241,6 +247,12 @@ pub enum BankCommand {
         name: String,
         #[command(flatten)]
         identity: IdentityArgs,
+    },
+    /// List every bank with its memories by status, its sources and its
+    /// queue.
+    List {
+        #[command(flatten)]
+        client: ClientArgs,
     },
     /// Delete a bank and everything in it, through the erase path. Disable
     /// the plugin first: its `initialize` creates the bank again, empty.
@@ -483,6 +495,23 @@ pub struct ModelShowArgs {
 /// kind or window. A translation is a new memory superseding it.
 #[derive(Debug, Subcommand)]
 pub enum MemoryCommand {
+    /// List a bank's memories with their status, strength and when each
+    /// fades if it isn't used again. Reads only: listing never counts as
+    /// using a memory.
+    List(Box<MemoryListArgs>),
+
+    /// Retract a memory: say it never held. It leaves recall, the agenda and
+    /// the prompt block at once, and what it ended is open again. It stays
+    /// listed as retracted until it fades and the sweep purges it.
+    Retract {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        /// The memory's id.
+        id: String,
+    },
+
     /// Show a memory: both significance fields, its passage or why it's
     /// gone, its accesses, edits and chain, the secret-scan kinds, its
     /// strength in parts, what holds back a purge, and projected fade and
@@ -519,6 +548,88 @@ pub enum MemoryCommand {
         #[arg(long)]
         bank: String,
         /// The memory's id.
+        id: String,
+    },
+}
+
+/// `asphodel memory list`: each filter narrows the list.
+#[derive(Debug, Args)]
+pub struct MemoryListArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    #[arg(long)]
+    pub bank: String,
+    /// live, superseded, ended, retracted or forgetting.
+    #[arg(long)]
+    pub status: Option<String>,
+    /// fact, event, state, task or recurring.
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Words the sentence must all contain.
+    #[arg(long)]
+    pub search: Option<String>,
+    /// An entity by id, name or alias.
+    #[arg(long)]
+    pub entity: Option<String>,
+    /// The effective significance: trivial, minor, notable, major, critical
+    /// or kept.
+    #[arg(long)]
+    pub significance: Option<String>,
+    /// Only memories resting on this document id.
+    #[arg(long)]
+    pub document: Option<String>,
+    /// Only memories from this session's turns.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// faded, week, month or never.
+    #[arg(long)]
+    pub fading: Option<String>,
+    /// created (newest first), fade (soonest first) or strength.
+    #[arg(long)]
+    pub sort: Option<String>,
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// The cursor the page before printed.
+    #[arg(long)]
+    pub cursor: Option<String>,
+}
+
+/// `asphodel document`: documents by their id, every version of which is
+/// a source of its own.
+#[derive(Debug, Subcommand)]
+pub enum DocumentCommand {
+    /// List document versions, newest first.
+    List {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        /// Only the versions of this document id.
+        #[arg(long)]
+        id: Option<String>,
+    },
+
+    /// Show one version: its chunks, where each is in extraction, and the
+    /// memories resting on it.
+    Show {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        /// The version's source id.
+        source: String,
+    },
+
+    /// Remove a document: every version of it. The memories resting on it
+    /// are forgotten, every version of them, its waiting chunks leave the
+    /// queue, and its text is cleared. Sending it again is a duplicate.
+    /// Irreversible.
+    Remove {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        /// The document id, as it was ingested.
         id: String,
     },
 }
@@ -972,12 +1083,14 @@ impl Cli {
                 name,
                 identity,
             }) => bank(&client, &name, identity),
+            Command::Bank(BankCommand::List { client }) => bank_list(&client),
             Command::Bank(BankCommand::Delete {
                 client,
                 name,
                 confirm,
             }) => bank_delete(&client, &name, &confirm),
             Command::Memory(command) => memory(command),
+            Command::Document(command) => document(command),
             Command::Entity(command) => entity(command),
             Command::Reembed(args) => reembed(args),
             Command::Chunks(args) => chunks(args),
@@ -1983,9 +2096,139 @@ fn bank_delete(client_args: &ClientArgs, name: &str, confirm: &str) -> anyhow::R
     Ok(())
 }
 
-/// `asphodel memory show|significance|translate`.
+/// `asphodel bank list`: `GET /v1/banks`.
+fn bank_list(client_args: &ClientArgs) -> anyhow::Result<()> {
+    let client = Client::new(client_args)?;
+    let banks: Value = client.get("/v1/banks")?;
+    if client_args.json {
+        return print_json(&banks);
+    }
+    let banks = list(&banks, "banks");
+    if banks.is_empty() {
+        println!("no banks");
+    }
+    for bank in banks {
+        let memories = &bank["memories"];
+        let sources = &bank["sources"];
+        let chunks = &bank["chunks"];
+        println!(
+            "{}  {} turns, {} documents",
+            text(bank, "name"),
+            count(bank, "turns"),
+            count(sources, "documents"),
+        );
+        println!(
+            "  memories: {} live, {} superseded, {} ended, {} retracted, {} forgetting; {} kept",
+            count(memories, "live"),
+            count(memories, "superseded"),
+            count(memories, "ended"),
+            count(memories, "retracted"),
+            count(memories, "forgetting"),
+            count(bank, "kept"),
+        );
+        println!(
+            "  chunks: {} queued, {} failed",
+            count(chunks, "queued"),
+            count(chunks, "failed"),
+        );
+    }
+    Ok(())
+}
+
+/// When a listed memory fades, as the list gives it.
+fn fades(memory: &Value) -> String {
+    match memory.get("fade").filter(|fade| !fade.is_null()) {
+        None => "never fades".to_string(),
+        Some(_) if memory.get("recallable").and_then(Value::as_bool) == Some(false) => {
+            "faded".to_string()
+        }
+        Some(fade) => format!(
+            "fades in {:.1} bank days, no sooner than {}",
+            fade.get("bank_days").and_then(Value::as_f64).unwrap_or(0.0),
+            text(fade, "earliest_at"),
+        ),
+    }
+}
+
+/// `asphodel memory list|show|retract|significance|translate`.
 fn memory(command: MemoryCommand) -> anyhow::Result<()> {
     match command {
+        MemoryCommand::List(args) => {
+            let client = Client::new(&args.client)?;
+            let mut query = Vec::new();
+            for (key, value) in [
+                ("status", &args.status),
+                ("kind", &args.kind),
+                ("q", &args.search),
+                ("entity", &args.entity),
+                ("significance", &args.significance),
+                ("document_id", &args.document),
+                ("session_id", &args.session),
+                ("fading", &args.fading),
+                ("sort", &args.sort),
+                ("cursor", &args.cursor),
+            ] {
+                if let Some(value) = value {
+                    query.push(format!("{key}={}", segment(value)));
+                }
+            }
+            if let Some(limit) = args.limit {
+                query.push(format!("limit={limit}"));
+            }
+            let page: Value = client.get(&format!(
+                "/v1/banks/{}/memories?{}",
+                segment(&args.bank),
+                query.join("&")
+            ))?;
+            if args.client.json {
+                return print_json(&page);
+            }
+            let memories = list(&page, "memories");
+            for memory in memories {
+                println!(
+                    "{}  [{}, {}]  {}",
+                    text(memory, "id"),
+                    text(memory, "kind"),
+                    text(memory, "status"),
+                    text(memory, "sentence"),
+                );
+                println!(
+                    "  strength {}; {}",
+                    number(memory, "strength"),
+                    fades(memory)
+                );
+            }
+            println!(
+                "{} of {} memories, as of {}",
+                memories.len(),
+                count(&page, "total"),
+                text(&page, "as_of"),
+            );
+            if let Some(cursor) = page.get("next_cursor").and_then(Value::as_str) {
+                println!("next page: --cursor {cursor}");
+            }
+            Ok(())
+        }
+        MemoryCommand::Retract { client, bank, id } => {
+            let json = client.json;
+            let client = Client::new(&client)?;
+            let retracted: Value = client.post(
+                &format!(
+                    "/v1/banks/{}/memories/{}/retract",
+                    segment(&bank),
+                    segment(&id)
+                ),
+                &Value::Null,
+            )?;
+            if json {
+                return print_json(&retracted);
+            }
+            println!("retracted {}", text(&retracted, "memory"));
+            for reopened in list(&retracted, "reopened") {
+                println!("reopened {}", reopened.as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
         MemoryCommand::Show { client, bank, id } => {
             let json = client.json;
             let client = Client::new(&client)?;
@@ -2062,6 +2305,135 @@ fn memory(command: MemoryCommand) -> anyhow::Result<()> {
                     text(&translation, "language"),
                 ),
             }
+            Ok(())
+        }
+    }
+}
+
+/// `asphodel document list|show|remove`.
+fn document(command: DocumentCommand) -> anyhow::Result<()> {
+    match command {
+        DocumentCommand::List { client, bank, id } => {
+            let json = client.json;
+            let client = Client::new(&client)?;
+            let mut path = format!(
+                "/v1/banks/{}/sources?kind=document&limit=200",
+                segment(&bank)
+            );
+            if let Some(id) = &id {
+                path.push_str(&format!("&document_id={}", segment(id)));
+            }
+            let page: Value = client.get(&path)?;
+            if json {
+                return print_json(&page);
+            }
+            let sources = list(&page, "sources");
+            if sources.is_empty() {
+                println!("no documents");
+            }
+            for source in sources {
+                let mut parts = vec![
+                    format!("{} chunks", count(source, "chunks")),
+                    format!("{} memories", count(source, "memories")),
+                ];
+                if count(source, "queued") > 0 {
+                    parts.push(format!("{} queued", count(source, "queued")));
+                }
+                if count(source, "failed") > 0 {
+                    parts.push(format!("{} failed", count(source, "failed")));
+                }
+                if let Some(gone) = source.get("gone").filter(|gone| !gone.is_null()) {
+                    parts.push(format!("text gone: {}", text(gone, "reason")));
+                }
+                println!(
+                    "{}  {}  ingested {}  {}",
+                    text(source, "id"),
+                    text(source, "document_id"),
+                    text(source, "ingested_at"),
+                    parts.join(", "),
+                );
+            }
+            if count(&page, "total") > sources.len() as u64 {
+                println!("{} of {} versions", sources.len(), count(&page, "total"));
+            }
+            Ok(())
+        }
+        DocumentCommand::Show {
+            client,
+            bank,
+            source,
+        } => {
+            let json = client.json;
+            let client = Client::new(&client)?;
+            let shown: Value = client.get(&format!(
+                "/v1/banks/{}/sources/{}",
+                segment(&bank),
+                segment(&source)
+            ))?;
+            if json {
+                return print_json(&shown);
+            }
+            println!(
+                "{}  {} {}  ingested {}",
+                text(&shown, "id"),
+                text(&shown, "kind"),
+                shown
+                    .get("document_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| shown.get("session_id").and_then(Value::as_str))
+                    .unwrap_or(""),
+                text(&shown, "ingested_at"),
+            );
+            match shown.get("gone").filter(|gone| !gone.is_null()) {
+                Some(gone) => println!("  text gone: {}", text(gone, "reason")),
+                None => println!("  {} characters", text(&shown, "text").chars().count()),
+            }
+            let versions = list(&shown, "versions");
+            if versions.len() > 1 {
+                println!("  {} versions:", versions.len());
+                for version in versions {
+                    println!(
+                        "    {}  ingested {}",
+                        text(version, "id"),
+                        text(version, "ingested_at")
+                    );
+                }
+            }
+            for chunk in list(&shown, "chunks") {
+                println!(
+                    "  chunk {} #{} [{}..{}] {}",
+                    text(chunk, "id"),
+                    count(chunk, "position"),
+                    count(chunk, "start"),
+                    count(chunk, "end"),
+                    text(chunk, "state"),
+                );
+                for memory in list(chunk, "memories") {
+                    println!("    memory {}", memory.as_str().unwrap_or(""));
+                }
+                for memory in list(chunk, "mentions") {
+                    println!("    mentions {}", memory.as_str().unwrap_or(""));
+                }
+            }
+            Ok(())
+        }
+        DocumentCommand::Remove { client, bank, id } => {
+            let json = client.json;
+            let client = Client::new(&client)?;
+            let removed: Value = client.post(
+                &format!("/v1/banks/{}/documents/remove", segment(&bank)),
+                &RemoveDocumentRequest { document_id: id },
+            )?;
+            if json {
+                return print_json(&removed);
+            }
+            println!(
+                "removed {}: {} versions, {} memories forgotten, {} chunks dequeued",
+                text(&removed, "document_id"),
+                list(&removed, "sources").len(),
+                list(&removed, "forgotten").len(),
+                count(&removed, "dequeued"),
+            );
             Ok(())
         }
     }
@@ -2156,6 +2528,7 @@ fn print_memory(view: &Value) {
                 "forget_requested" => {
                     println!("    passage gone: the turn asked to forget and was never stored")
                 }
+                "removed" => println!("    passage gone: the owner removed the document"),
                 other => println!("    passage gone: {other}"),
             }
         }

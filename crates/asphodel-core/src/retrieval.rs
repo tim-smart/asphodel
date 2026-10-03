@@ -125,7 +125,7 @@ pub enum PhaseFilter {
 }
 
 impl PhaseFilter {
-    fn admits(self, phase: Phase) -> bool {
+    pub(crate) fn admits(self, phase: Phase) -> bool {
         match self {
             PhaseFilter::Upcoming => phase == Phase::Upcoming,
             PhaseFilter::Past => matches!(phase, Phase::RecentlyPast | Phase::LongPast),
