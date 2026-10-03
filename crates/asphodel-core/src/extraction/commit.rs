@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rusqlite::{OptionalExtension, Transaction};
 use uuid::Uuid;
 
-use super::claims::{Checked, Link, NewMemory, Stamp, is_pronoun};
+use super::claims::{Checked, Link, NewMemory, Precision, Stamp, is_pronoun};
 use super::input::{Unit, survivor};
 use super::reconcile::{Edit, Fate, Neighbour, Plan, end_at};
 use super::{
@@ -24,6 +24,18 @@ use crate::store::{Store, StoreError, VectorError, VectorIndex, micros};
 struct Written {
     id: i64,
     end: (Stamp, bool),
+    said_at: Stamp,
+}
+
+impl Written {
+    /// Direct endings close tasks when the claim was said, not at its event time.
+    fn end_for(&self, task: bool) -> (Stamp, bool) {
+        if task {
+            (self.said_at, false)
+        } else {
+            self.end
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -77,6 +89,10 @@ pub(super) fn commit(
                     Some(stamp) => (stamp, memory.low_confidence),
                     None => end_at(None, input.observed_at, &unit.tz),
                 },
+                said_at: Stamp {
+                    at: input.observed_at,
+                    precision: Precision::Minute,
+                },
             },
         );
         // The caller checked every vector's width, so only SQLite can fail
@@ -101,7 +117,15 @@ pub(super) fn commit(
     for &(index, neighbour, edit) in &plan.edits {
         let by = &written[&index];
         match edit {
-            Edit::Ends => end(tx, store, unit, neighbour, by.id, by.end, EDIT_ENDED)?,
+            Edit::Ends => end(
+                tx,
+                store,
+                unit,
+                neighbour,
+                by.id,
+                by.end_for(by_id[&neighbour].kind == crate::strength::Kind::Task),
+                EDIT_ENDED,
+            )?,
             Edit::Retracts | Edit::Denies => {
                 tx.execute(
                     "UPDATE memories SET invalidated_at = ?2, superseded_by = ?3, updated_at = ?4
@@ -528,8 +552,7 @@ fn weight(kind: &str) -> f64 {
     }
 }
 
-/// Ends `neighbour` by `by`: `valid_until` where `by` starts, or the day it
-/// was said with low confidence. A guessed end lowers the ended
+/// Ends `neighbour` by `by` at the caller-selected time. A guessed end lowers the ended
 /// memory's window confidence. The edit is logged as `kind`.
 fn end(
     tx: &Transaction<'_>,
