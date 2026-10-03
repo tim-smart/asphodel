@@ -390,7 +390,7 @@ fn p18_memory_show_has_no_overdue_task_guard_after_completion() {
     let id = run.probe("p18-2")["observed"]["id"]
         .as_str()
         .expect("p18-2 resolves its memory");
-    let clock = Arc::new(SimulatedClock::new("2026-01-08T09:00:00Z".parse().unwrap()));
+    let clock = Arc::new(SimulatedClock::new("2026-01-12T09:00:00Z".parse().unwrap()));
     let store = Store::open(
         &dir.path("private/store"),
         OpenOptions::default(),
@@ -398,7 +398,7 @@ fn p18_memory_show_has_no_overdue_task_guard_after_completion() {
     )
     .unwrap();
     let service = Service::open(clock, store, Tuning::default());
-    // This is the same view used by `memory show`, on the replay clock.
+    // This is the same view used by `memory show`, after the final correction closes.
     let view = service.show_memory("main", id).unwrap();
     assert!(
         !view
