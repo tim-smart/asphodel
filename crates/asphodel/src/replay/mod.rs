@@ -58,7 +58,7 @@ use tracing::{info, trace};
 
 use crate::cli::ReplayArgs;
 use engine::{Engine, Failure, Llm, Settings};
-use report::{Aggregate, Flags, Report};
+use report::{Aggregate, Call1, Flags, Report};
 use scenario::Group;
 use timeline::Timeline;
 
@@ -222,6 +222,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             corpus_hash: None,
             cassette_hash: None,
             tuning: tuning.clone(),
+            call1: Call1::of(&tuning),
             flags: Flags {
                 latency_ms: u64::try_from(latency.as_millis()).unwrap_or(0),
                 until: args.until,

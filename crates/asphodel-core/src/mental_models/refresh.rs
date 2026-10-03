@@ -402,6 +402,7 @@ fn request(input: &RefreshInput) -> LlmRequest {
         template: Template {
             name: REFRESH_TEMPLATE.into(),
             version: REFRESH_VERSION,
+            guidance: None,
         },
         system: system(input.language.as_deref()),
         user,

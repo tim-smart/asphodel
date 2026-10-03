@@ -119,6 +119,30 @@ so set it to `"English"` if the assistant is used in another language
 (`docs/models.md`). It applies to new extraction and refreshes only. An empty
 value stops the daemon.
 
+`[extraction] guidance` (unset by default) is your own advice to call 1 on
+what's worth remembering, added after its fixed rules, such as "Skip build
+and deploy logs. Keep release dates." It can't change the rules or the reply
+format, and it applies to new extraction only. Try it in replay first: its
+hash is part of call 1's template, so a run with it records and reuses
+claims apart from runs without it (`docs/replay.md`). An empty value stops
+the daemon. Whitespace-only guidance is rejected too. Like the rest of the
+tuning file, guidance is daemon-wide and takes effect on restart. It is
+trimmed before insertion, and the user prompt, reply schema and fixed rules
+are unchanged. Every chunk uses the same system prompt.
+
+Call 1's version 4 prompt leaves out questions, requests and routine
+assistant operations unless the text records a decision, a commitment, a
+date, or where something is stored. This followed a ten-day evaluation
+(436 turns, 451 memories): 129 memories recorded assistant operations or
+reports and 91 recorded user questions. These crowded recall, while the
+49 memories rated trivial still took 7 to 13 weeks to fade.
+
+The SHA-256 of the trimmed guidance is recorded alongside the template
+version in cassette keys, replay reports and aggregate exports. Without
+guidance there is no hash; call 2, refresh and judge keys are unchanged.
+Changing guidance does not pause purge because it is not a deletion input,
+and stored memories are not re-extracted.
+
 An unknown key or an out-of-range value stops the daemon too. The LLM's two
 modes, an API key or a ChatGPT subscription, are in `docs/models.md`. For
 the subscription, log in once the pod is up:

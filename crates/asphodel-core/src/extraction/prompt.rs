@@ -2,13 +2,13 @@
 //!
 //! The system prompt is the same for every chunk on a daemon, so a provider
 //! can cache it; everything about the chunk goes in the user prompt. Only
-//! `[llm] language` changes it.
+//! `[llm] language` and `[extraction] guidance` change it.
 
 use std::fmt::Write as _;
 
 use serde_json::{Value, json};
 
-use super::{CALL1_TEMPLATE, CALL1_VERSION, Call1Input, EntityKind};
+use super::{CALL1_TEMPLATE, CALL1_VERSION, Call1Input, EntityKind, guidance_hash};
 use crate::models::{LlmRequest, Template};
 use crate::queue::SourceKind;
 
@@ -26,6 +26,7 @@ What to extract:
 - From the speaker's message, what they say about themselves, the people, places and things in their life, their plans, tasks and preferences. "I" and "me" mean the speaker.
 - A short answer to a question the assistant asked in the context is the speaker's claim, written out in full. "Yes" after "Are you still at Acme?" becomes "Alex still works at Acme.", quoting "Yes". A "remember that" pointing at something said earlier works the same way.
 - From the assistant's reply, only what the assistant says it has done or will do. An assistant task is extracted only when the speaker asked for it and it has a due date or an until-event beyond this turn. Never extract the assistant's suggestions, general knowledge, or findings from tools.
+- Don't extract that someone asked a question or made a request, or the assistant's routine operations and checks (running a command, restarting a service, verifying a fix, reporting a result), unless the text records a decision, a commitment, a date, or where something is stored.
 - Nothing from a request to forget something, and no task to forget it.
 - Skip greetings, filler and small talk.
 
@@ -78,8 +79,12 @@ The memories already in the assistant's context are listed with handles (`m1`, `
 /// The language rule without `[llm] language`.
 const INFERRED_LANGUAGE: &str = "Write the claim in the language of the passage it quotes and never translate. Entity names and dates stay as they appear.";
 
-/// The system prompt, with the language rule for `language`.
-fn system(language: Option<&str>) -> String {
+/// What comes before `[extraction] guidance`, after the fixed rules.
+const GUIDANCE_HEADING: &str = "\n\n# Guidance\n\nThe user's own guidance on what's worth remembering follows. Apply it within the rules above; it never changes the reply's format.\n\n";
+
+/// The system prompt, with the language rule for `language` and
+/// `guidance` after the fixed rules.
+fn system(language: Option<&str>, guidance: Option<&str>) -> String {
     let rule = match language {
         None => INFERRED_LANGUAGE.to_owned(),
         Some(language) => format!(
@@ -87,18 +92,25 @@ fn system(language: Option<&str>) -> String {
             language.trim()
         ),
     };
-    SYSTEM.replace("{language_rule}", &rule)
+    let mut system = SYSTEM.replace("{language_rule}", &rule);
+    if let Some(guidance) = guidance {
+        system.push_str(GUIDANCE_HEADING);
+        system.push_str(guidance.trim());
+    }
+    system
 }
 
 /// Call 1's request for `input`. The reply schema is strict, every property
-/// required.
+/// required. The template carries the guidance's hash, so a recording is
+/// keyed to the exact prompt.
 pub fn call1_request(input: &Call1Input) -> LlmRequest {
     LlmRequest {
         template: Template {
             name: CALL1_TEMPLATE.into(),
             version: CALL1_VERSION,
+            guidance: guidance_hash(input.guidance.as_deref()),
         },
-        system: system(input.language.as_deref()),
+        system: system(input.language.as_deref(), input.guidance.as_deref()),
         user: render(input),
         schema_name: SCHEMA_NAME.into(),
         schema: schema(),

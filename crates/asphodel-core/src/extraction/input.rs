@@ -290,6 +290,7 @@ pub(super) fn assemble(
         in_context: in_context_memories,
         entries: in_context_entries,
         language: tuning.llm.language.clone(),
+        guidance: tuning.extraction.guidance.clone(),
     };
     Ok((input, unit))
 }

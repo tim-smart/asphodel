@@ -9,7 +9,8 @@
 //!
 //! - `live` answers from the cassette and calls and records on a miss.
 //! - `replay` answers from the cassette and fails on a miss.
-//! - `fast` reuses call 1's claims by chunk and `[llm] language` and
+//! - `fast` reuses call 1's claims by chunk, `[llm] language` and the
+//!   `[extraction] guidance` hash, and
 //!   `used` verdicts by (reply hash, sentence hash) pair, judges the pairs
 //!   nobody has judged with one short top-up call, and answers call 2 and
 //!   refreshes by request key, calling the LLM on a miss when one is
@@ -162,13 +163,18 @@ impl ChunkContext {
     }
 }
 
+/// What `fast` reuses call 1's claims by: the chunk, the template version
+/// and guidance hash, the model and the language.
+type ClaimsKey = (ChunkKey, u32, Option<String>, String, Option<String>);
+
 /// The records, indexed three ways.
 #[derive(Default)]
 struct Index {
     records: Vec<Record>,
     by_key: BTreeMap<String, usize>,
-    /// Call 1 records by chunk, template version, model and language.
-    claims: BTreeMap<(ChunkKey, u32, String, Option<String>), usize>,
+    /// Call 1 records by chunk, template version and guidance hash, model
+    /// and language.
+    claims: BTreeMap<ClaimsKey, usize>,
     /// `used` verdicts by (reply hash, sentence hash).
     pairs: BTreeMap<(String, String), bool>,
     /// Refresh records, for the nearest-in-time substitution.
@@ -186,6 +192,7 @@ impl Index {
                 (
                     chunk.clone(),
                     record.template.version,
+                    record.template.guidance.clone(),
                     record.model.clone(),
                     record.language.clone(),
                 ),
@@ -258,6 +265,9 @@ pub struct Recorder {
     /// The run's `[llm] language`. Call 1 claims recorded in another
     /// language are never reused by chunk.
     language: Option<String>,
+    /// The hash of the run's `[extraction] guidance`. Call 1 claims
+    /// recorded under other guidance, or none, are never reused by chunk.
+    guidance: Option<String>,
     clock: Arc<SimulatedClock>,
     index: Mutex<Index>,
     chunk: Mutex<Option<ChunkContext>>,
@@ -336,6 +346,7 @@ impl Recorder {
             live,
             model,
             language,
+            guidance: None,
             clock,
             index: Mutex::new(index),
             chunk: Mutex::new(None),
@@ -395,6 +406,13 @@ impl Recorder {
         }
     }
 
+    /// Sets the run's `[extraction] guidance` hash, which `fast` reuses call
+    /// 1's claims by.
+    pub fn with_guidance(mut self, guidance: Option<String>) -> Self {
+        self.guidance = guidance;
+        self
+    }
+
     /// `fast` mode's call 1: the chunk's recorded claims, the `used` verdicts
     /// the pair cache holds, and one top-up for the pairs it doesn't. `None`
     /// when the chunk has no record, which is a miss the caller answers by
@@ -405,6 +423,7 @@ impl Recorder {
             let key = (
                 context.key.clone(),
                 CALL1_VERSION,
+                self.guidance.clone(),
                 self.model.clone(),
                 self.language.clone(),
             );
@@ -460,6 +479,7 @@ impl Recorder {
             template: Template {
                 name: JUDGE_TEMPLATE.into(),
                 version: JUDGE_VERSION,
+                guidance: None,
             },
             system: JUDGE_SYSTEM.to_owned(),
             user,

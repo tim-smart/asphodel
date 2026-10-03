@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use asphodel_core::Tuning;
+use asphodel_core::extraction::{CALL1_VERSION, guidance_hash};
 use jiff::Timestamp;
 use jiff::civil::Date;
 use serde::Serialize;
@@ -34,6 +35,8 @@ pub struct Report {
     pub cassette_hash: Option<String>,
     /// The resolved tuning, every layer applied.
     pub tuning: Tuning,
+    /// Which call 1 prompt the run extracted with.
+    pub call1: Call1,
     pub flags: Flags,
     pub probes: Vec<ProbeResult>,
     pub purges_per_day: Vec<DayCount>,
@@ -58,6 +61,24 @@ pub struct Report {
     /// everything that differs between a `live` run and the `replay` of
     /// its cassette sits here.
     pub llm: LlmCounts,
+}
+
+/// Call 1's template version and the hash of the `[extraction] guidance`
+/// its prompt carries, null without any: what a recording of call 1 is
+/// keyed to, besides the model and language.
+#[derive(Debug, Clone, Serialize)]
+pub struct Call1 {
+    pub version: u32,
+    pub guidance_hash: Option<String>,
+}
+
+impl Call1 {
+    pub fn of(tuning: &Tuning) -> Self {
+        Self {
+            version: CALL1_VERSION,
+            guidance_hash: guidance_hash(tuning.extraction.guidance.as_deref()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -245,6 +266,7 @@ pub struct Aggregate {
     pub corpus_hash: Option<Vec<u8>>,
     pub cassette_hash: Option<Vec<u8>>,
     pub git_sha: Option<Vec<u8>>,
+    pub call1: AggregateCall1,
     pub latency_ms: u64,
     pub probes: Vec<ProbeOutcome>,
     pub probes_passed: u64,
@@ -263,6 +285,13 @@ pub struct Aggregate {
     pub kind_histogram: BTreeMap<String, u64>,
     pub memories: MemoryCounts,
     pub llm: LlmCounts,
+}
+
+/// [`Call1`] with the hash as bytes.
+#[derive(Debug, Serialize)]
+pub struct AggregateCall1 {
+    pub version: u32,
+    pub guidance_hash: Option<Vec<u8>>,
 }
 
 /// The run's kind as flags, since an enum name would be a string.
@@ -342,6 +371,10 @@ impl Aggregate {
             corpus_hash: report.corpus_hash.as_deref().map(hex_bytes),
             cassette_hash: report.cassette_hash.as_deref().map(hex_bytes),
             git_sha: report.git_sha.map(hex_bytes),
+            call1: AggregateCall1 {
+                version: report.call1.version,
+                guidance_hash: report.call1.guidance_hash.as_deref().map(hex_bytes),
+            },
             latency_ms: report.flags.latency_ms,
             probes: report
                 .probes
