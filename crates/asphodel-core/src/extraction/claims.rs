@@ -297,9 +297,8 @@ fn check_claim(
             valid_until = None;
             until_event = None;
         }
-        // A task's valid_until is set only when an event ends it.
-        Kind::Task => valid_until = None,
-        Kind::Event | Kind::State | Kind::Recurring => {}
+        // A task tied to a dated event can end when that event passes.
+        Kind::Task | Kind::Event | Kind::State | Kind::Recurring => {}
     }
 
     if claim.kind == Kind::Task && from_reply && due_at.is_none() && until_event.is_none() {
