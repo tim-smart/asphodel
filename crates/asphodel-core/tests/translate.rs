@@ -493,11 +493,12 @@ fn a_translation_during_a_reembed_swap_is_embedded_with_the_new_model() {
 }
 
 #[test]
-fn an_extraction_prepared_before_a_translation_cant_split_the_chain() {
+fn a_translation_cant_commit_while_an_extraction_is_prepared() {
     // Extraction plans a refinement of the memory, then a translation of the
-    // same memory arrives before the plan commits. Whichever writes second
-    // has to see the first: the memory ends up with one successor and its
-    // chain with one head.
+    // same memory arrives before the plan commits. Committing it there would
+    // leave the plan to overwrite its supersession, splitting the chain. It
+    // waits for the bank instead, and once the wait runs out it gives up
+    // without writing and stops holding back the queue.
     let h = Harness::new(Some("English"));
     let before_work = "Sam drinks tea every morning before work.";
     let original = h.memory(before_work);
@@ -571,26 +572,18 @@ fn an_extraction_prepared_before_a_translation_cant_split_the_chain() {
         )
         .unwrap();
 
-    let (outcome, extracted) = std::thread::scope(|scope| {
-        let translate = scope.spawn(|| h.translate(original, &llm(ENGLISH)));
-        give_translation_a_chance(&h);
-        let extracted = h.service.commit_extraction(prepared);
-        (translate.join().unwrap(), extracted)
-    });
+    h.service
+        .ingest_turn("main", &turn("s2", "Sam walks to work."))
+        .unwrap();
 
-    let refinement = extracted.unwrap().memories[0];
-    let translation = match &outcome {
-        Ok(Translation::Translated { to, .. }) => Some(*to),
-        _ => None,
-    };
-    let heads: Vec<Uuid> = [Some(refinement), translation]
-        .into_iter()
-        .flatten()
-        .filter(|memory| h.show(*memory).chain.head == *memory)
-        .collect();
-    assert_eq!(
-        heads,
-        [h.show(original).chain.head],
-        "translation {outcome:?}"
+    let busy = h.translate(original, &llm(ENGLISH));
+    assert!(matches!(busy, Err(TranslateError::Busy)), "{busy:?}");
+    assert_eq!(h.refined_edits(), 0);
+
+    let refinement = h.service.commit_extraction(prepared).unwrap().memories[0];
+    assert_eq!(h.show(original).chain.head, refinement);
+    assert!(
+        h.service.next_extraction("main").unwrap().is_some(),
+        "the queue hands out the next chunk"
     );
 }
