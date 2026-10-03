@@ -35,7 +35,8 @@ use asphodel_core::erase::{DocumentRemoved, RemoveDocumentError};
 use asphodel_core::extraction::Committed;
 use asphodel_core::ingest::{Document, Ingested, Outcome, Turn};
 use asphodel_core::inspect::{
-    Gone, InspectError, MemoryQuery, MemorySort, MemoryStatus, MemorySummary, SourceQuery,
+    Fading, Gone, InspectError, MemoryQuery, MemorySort, MemoryStatus, MemorySummary, SourceQuery,
+    StatusCounts,
 };
 use asphodel_core::models::{Embedder, FakeEmbedder, FakeLlm, FakeReranker, Models};
 use asphodel_core::retract::{RetractError, Retracted};
@@ -621,6 +622,51 @@ fn each_listed_memory_fades_when_memory_show_says_and_the_soonest_sorts_first() 
     for memory in &listed {
         assert_eq!(memory.fade, fade(memory.id), "{}", memory.id);
     }
+}
+
+#[test]
+fn the_status_counts_follow_every_filter_but_status_the_fade_filter_too() {
+    // The counts are the status filter's choices: each says how many the
+    // list would hold with that status and every other filter as it is.
+    let h = Harness::new();
+    let kept = h.insert(fact(MAYA));
+    let fading = h.insert(fact(BERLIN));
+    let retracted = h.insert(fact(TEA));
+    h.service
+        .keep(BANK, &[kept.to_string(), retracted.to_string()])
+        .unwrap();
+    h.retract(retracted).unwrap();
+    assert!(
+        h.service
+            .show_memory(BANK, &fading.to_string())
+            .unwrap()
+            .projection
+            .fade
+            .is_some()
+    );
+
+    let page = h
+        .service
+        .list_memories(
+            BANK,
+            &MemoryQuery {
+                fading: Some(Fading::Never),
+                status: Some(MemoryStatus::Live),
+                ..MemoryQuery::default()
+            },
+        )
+        .unwrap();
+    let listed: Vec<Uuid> = page.memories.iter().map(|memory| memory.id).collect();
+    assert_eq!(listed, [kept]);
+    assert_eq!(page.total, 1);
+    assert_eq!(
+        page.statuses,
+        StatusCounts {
+            live: 1,
+            retracted: 1,
+            ..StatusCounts::default()
+        }
+    );
 }
 
 // Retract
