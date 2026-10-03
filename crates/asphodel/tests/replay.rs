@@ -368,6 +368,15 @@ fn a_rescheduled_appointment_moves_on_the_agenda() {
 }
 
 #[test]
+fn event_reminders_expire_but_ordinary_overdue_and_undated_tasks_stay_on_the_agenda() {
+    let dir = TestDir::new();
+    let run = replay(&dir, &scenario("dated-event-reminder"), &[]);
+    run.assert_passed();
+    assert_eq!(run.report()["llm"]["scripted"], 1);
+    assert_eq!(run.report()["llm"]["live"], 0);
+}
+
+#[test]
 fn p18_closes_the_task_before_the_future_event_and_excludes_it_from_agenda() {
     let dir = TestDir::new();
     replay(&dir, &scenario("p18"), &[]).assert_passed();

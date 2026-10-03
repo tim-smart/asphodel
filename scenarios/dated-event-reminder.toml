@@ -1,6 +1,6 @@
 name = "dated-event-reminder"
 group = "ci"
-description = "A reminder expires when its dated event passes; an undated task stays on the agenda."
+description = "A reminder expires when its dated event passes; ordinary overdue and undated tasks stay on the agenda."
 
 [bank]
 timezone = "UTC"
@@ -8,8 +8,8 @@ timezone = "UTC"
 [[turn]]
 at = "2026-02-09T09:00:00Z"
 session = "reminders"
-user = "Remind me to bring my insurance card to the dentist appointment on 10 February at 2pm. I also need to organise the garage, with no deadline."
-assistant = "Noted both tasks."
+user = "Remind me to bring my insurance card to the dentist appointment on 10 February at 2pm. I also need to organise the garage, with no deadline. I need to renew my passport by 10 February at noon."
+assistant = "Noted the tasks."
 
 [[turn.claim]]
 label = "dentist-reminder"
@@ -27,6 +27,15 @@ quote = "I also need to organise the garage, with no deadline"
 kind = "task"
 significance = "minor"
 
+[[turn.claim]]
+label = "passport-deadline"
+content = "Tim needs to renew his passport by 2026-02-10 at noon."
+quote = "I need to renew my passport by 10 February at noon"
+kind = "task"
+significance = "minor"
+due_at = { at = "2026-02-10T12:00", precision = "minute" }
+# Omitting valid_until scripts a null end: an ordinary deadline is not an expiry.
+
 [[probe]]
 id = "dated-reminder-before-event"
 at = "2026-02-10T13:59:00Z"
@@ -40,6 +49,12 @@ kind = "agenda_has"
 memory = "garage-task"
 
 [[probe]]
+id = "ordinary-overdue-task-before-event"
+at = "2026-02-10T13:59:00Z"
+kind = "agenda_has"
+memory = "passport-deadline"
+
+[[probe]]
 id = "dated-reminder-expires-after-event"
 at = "2026-02-10T14:01:00Z"
 kind = "agenda_lacks"
@@ -50,3 +65,9 @@ id = "undated-task-after-event"
 at = "2026-02-10T14:01:00Z"
 kind = "agenda_has"
 memory = "garage-task"
+
+[[probe]]
+id = "ordinary-overdue-task-after-event"
+at = "2026-02-10T14:01:00Z"
+kind = "agenda_has"
+memory = "passport-deadline"
