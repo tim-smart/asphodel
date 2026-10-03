@@ -21,7 +21,7 @@ use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
 
 /// The schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// How long a pre-migration copy is kept after its migration completes.
 pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
@@ -49,13 +49,18 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (9, include_str!("../../migrations/0009_sweep_progress.sql")),
     (10, include_str!("../../migrations/0010_reembed.sql")),
     (11, include_str!("../../migrations/0011_raw_query.sql")),
+    (
+        12,
+        include_str!("../../migrations/0012_document_removal.sql"),
+    ),
 ];
 
 /// The column a migration adds, by version. Every migration is safe to run
 /// again over a store that already has what it adds, and SQLite has no
 /// `ADD COLUMN IF NOT EXISTS`, so a migration whose column is already there
 /// is skipped.
-const ADDED_COLUMNS: &[(u32, &str, &str)] = &[(11, "recalls", "raw_query")];
+const ADDED_COLUMNS: &[(u32, &str, &str)] =
+    &[(11, "recalls", "raw_query"), (12, "sources", "removed_at")];
 
 /// What one open applied.
 #[derive(Debug, Clone, PartialEq, Eq)]

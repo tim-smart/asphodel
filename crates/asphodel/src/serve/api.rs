@@ -16,9 +16,15 @@ use asphodel_core::entities::{
     AliasRemoval, AliasRemoved, EntityError, LinkEdited, LinkRequest, MergeRequest, Merged,
     Unmerged,
 };
-use asphodel_core::erase::{BankDeleteError, BankDeleted, ForgetError, ForgetRequest, Forgotten};
+use asphodel_core::erase::{
+    BankDeleteError, BankDeleted, DocumentRemoved, ForgetError, ForgetRequest, Forgotten,
+    RemoveDocumentError,
+};
 use asphodel_core::ingest::{Document, IngestError, Ingested, Outcome, Turn};
-use asphodel_core::inspect::{EntityView, InspectError, MemoryView, ModelView};
+use asphodel_core::inspect::{
+    BankOverview, EntityView, InspectError, MemoryPage, MemoryQuery, MemoryView, ModelView,
+    SourceDetail, SourcePage, SourceQuery,
+};
 use asphodel_core::keep::{
     KeepError, Kept, MemoryIds, SignificanceRequest, SignificanceSet, Unkept,
 };
@@ -30,6 +36,7 @@ use asphodel_core::operations::{
 };
 use asphodel_core::queue::{ChunkList, QueueError, Retried, RetryRequest};
 use asphodel_core::reembed::{ReembedError, ReembedState, ReembedStatus};
+use asphodel_core::retract::{RetractError, Retracted};
 use asphodel_core::retrieval::{Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
 use asphodel_core::store::StoreError;
 use asphodel_core::store::bank::{Bank, BankError, BankIdentity};
@@ -58,9 +65,16 @@ const BODY_LIMIT: usize = 16 * 1024 * 1024;
 pub(crate) fn router(app: Shared) -> Router {
     let authorized = Router::new()
         .route("/v1/config", get(config))
+        .route("/v1/banks", get(banks))
         .route("/v1/banks/{bank}", put(put_bank).delete(delete_bank))
         .route("/v1/banks/{bank}/turns", post(turns))
         .route("/v1/banks/{bank}/documents", post(documents))
+        .route(
+            "/v1/banks/{bank}/documents/{*document}",
+            axum::routing::delete(remove_document),
+        )
+        .route("/v1/banks/{bank}/sources", get(sources))
+        .route("/v1/banks/{bank}/sources/{source}", get(show_source))
         .route("/v1/banks/{bank}/prefetch", post(prefetch))
         .route("/v1/banks/{bank}/recall", post(recall))
         .route("/v1/banks/{bank}/forget", post(forget))
@@ -90,7 +104,9 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/v1/banks/{bank}/forgets", get(forgets))
         .route("/v1/banks/{bank}/sweeps", get(sweeps))
         .route("/v1/banks/{bank}/recalls", get(recalls))
+        .route("/v1/banks/{bank}/memories", get(memories))
         .route("/v1/banks/{bank}/memories/{memory}", get(show_memory))
+        .route("/v1/banks/{bank}/memories/{memory}/retract", post(retract))
         .route(
             "/v1/banks/{bank}/memories/{memory}/significance",
             put(set_significance),
@@ -116,6 +132,8 @@ pub(crate) fn router(app: Shared) -> Router {
         .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize));
     Router::new()
         .route("/v1/health", get(health))
+        .route("/dashboard", get(super::dashboard::page))
+        .route("/dashboard/", get(super::dashboard::page))
         .merge(authorized)
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -304,7 +322,11 @@ impl From<InspectError> for ApiError {
             InspectError::UnknownBank
             | InspectError::UnknownMemory
             | InspectError::UnknownModel
-            | InspectError::UnknownEntry => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            | InspectError::UnknownEntry
+            | InspectError::UnknownSource => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            InspectError::InvalidQuery { .. } => {
+                Self::new(StatusCode::BAD_REQUEST, error.to_string())
+            }
             InspectError::Entity(error) => error.into(),
             InspectError::Store(error) => error.into(),
         }
@@ -341,6 +363,31 @@ impl From<ForgetError> for ApiError {
             ForgetError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
             ForgetError::TooMany { .. } => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
             ForgetError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<RetractError> for ApiError {
+    fn from(error: RetractError) -> Self {
+        match error {
+            RetractError::UnknownBank | RetractError::UnknownMemory => {
+                Self::new(StatusCode::NOT_FOUND, error.to_string())
+            }
+            RetractError::Superseded { .. } | RetractError::AlreadyRetracted => {
+                Self::new(StatusCode::CONFLICT, error.to_string())
+            }
+            RetractError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<RemoveDocumentError> for ApiError {
+    fn from(error: RemoveDocumentError) -> Self {
+        match error {
+            RemoveDocumentError::UnknownBank | RemoveDocumentError::UnknownDocument => {
+                Self::new(StatusCode::NOT_FOUND, error.to_string())
+            }
+            RemoveDocumentError::Store(error) => error.into(),
         }
     }
 }
@@ -921,6 +968,91 @@ async fn show_memory(
         .call(move |service| service.show_memory(&bank, &memory))
         .await?;
     Ok(Json(view))
+}
+
+/// `GET /v1/banks/{bank}/memories?status=&kind=&q=&entity=&sort=&...`: the
+/// dashboard's memory list ([`MemoryQuery`]). Reads only, never through
+/// recall.
+async fn memories(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    query: Result<Query<MemoryQuery>, QueryRejection>,
+) -> Result<Json<MemoryPage>, ApiError> {
+    let Query(query) = query?;
+    let page = app
+        .call(move |service| service.list_memories(&bank, &query))
+        .await?;
+    Ok(Json(page))
+}
+
+/// `POST /v1/banks/{bank}/memories/{id}/retract`: `asphodel memory
+/// retract`. 409 when it's already retracted, or superseded (naming the
+/// head).
+async fn retract(
+    State(app): State<Shared>,
+    Path((bank, memory)): Path<(String, String)>,
+) -> Result<Json<Retracted>, ApiError> {
+    let retracted = app
+        .call(move |service| service.retract(&bank, &memory))
+        .await?;
+    Ok(Json(retracted))
+}
+
+#[derive(Serialize)]
+struct Banks {
+    banks: Vec<BankOverview>,
+}
+
+/// `GET /v1/banks`: every bank with its counts.
+async fn banks(State(app): State<Shared>) -> Result<Json<Banks>, ApiError> {
+    let banks = app.call(|service| service.banks()).await?;
+    Ok(Json(Banks { banks }))
+}
+
+/// `GET /v1/banks/{bank}/sources?kind=&document_id=&session_id=`: turns
+/// and document versions, newest ingest first.
+async fn sources(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    query: Result<Query<SourceQuery>, QueryRejection>,
+) -> Result<Json<SourcePage>, ApiError> {
+    let Query(query) = query?;
+    let page = app
+        .call(move |service| service.list_sources(&bank, &query))
+        .await?;
+    Ok(Json(page))
+}
+
+/// `GET /v1/banks/{bank}/sources/{id}`: one source with its chunks.
+async fn show_source(
+    State(app): State<Shared>,
+    Path((bank, source)): Path<(String, String)>,
+) -> Result<Json<SourceDetail>, ApiError> {
+    let shown = app
+        .call(move |service| service.show_source(&bank, &source))
+        .await?;
+    Ok(Json(shown))
+}
+
+/// `DELETE /v1/banks/{bank}/documents/{document id}`: `asphodel document
+/// remove`, every version of the document. The id may hold slashes. The
+/// dashboard asks the owner to confirm first; the route doesn't.
+async fn remove_document(
+    State(app): State<Shared>,
+    Path((bank, document)): Path<(String, String)>,
+) -> Result<Json<DocumentRemoved>, ApiError> {
+    let name = bank.clone();
+    let removed = app
+        .call(move |service| {
+            let removed = service.remove_document(&name, &document)?;
+            if !removed.forgotten.is_empty() {
+                service.erase_next(&name)?;
+            }
+            Ok::<_, ApiError>(removed)
+        })
+        .await?;
+    app.wake(&bank);
+    Ok(Json(removed))
 }
 
 /// `PUT /v1/banks/{bank}/memories/{id}/significance`: `asphodel memory

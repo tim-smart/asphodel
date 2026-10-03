@@ -87,6 +87,7 @@ _Avoid_: Expired, closed, completed
 **Retracted**:
 A memory that turned out to be wrong, such as a correction or a rescheduled appointment. It's hidden from current and history answers, but kept for audit.
 A denied memory, one the user says never happened or isn't true, is retracted too. The only difference is what happens to anything it had ended: a correction still ends it, and a denial opens it again.
+The owner can also retract a memory directly, from the CLI or the dashboard. That's a denial with nothing replacing it.
 _Avoid_: Deleted, invalidated, cancelled
 
 **Refined**:

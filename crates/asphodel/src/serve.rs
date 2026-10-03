@@ -35,6 +35,7 @@ use crate::listen::Listen;
 use worker::Workers;
 
 mod api;
+mod dashboard;
 mod worker;
 
 /// The longest the daemon waits between housekeeping passes. It normally

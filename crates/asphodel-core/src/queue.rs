@@ -37,7 +37,7 @@ use crate::constants::CHUNK_RETRY_CAP;
 use crate::ingest::find_bank;
 use crate::store::{Store, StoreError, micros, timestamp};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     Turn,
@@ -156,6 +156,15 @@ impl Leases {
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+    }
+
+    /// The queue rowids the bank has out on leases now.
+    pub(crate) fn out(&self, bank_id: i64) -> std::collections::BTreeSet<i64> {
+        self.lock()
+            .banks
+            .get(&bank_id)
+            .map(|bank| bank.out.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     /// How many extraction commits the bank has had in this service.
@@ -432,6 +441,34 @@ pub(crate) fn finish(
             [lease.chunk_id],
         )?;
     }
+    tx.execute(
+        "DELETE FROM extraction_queue WHERE id = ?1",
+        [lease.queue_id],
+    )?;
+    Ok(())
+}
+
+/// Whether the chunk's source was removed ([`crate::erase::remove_document`])
+/// after it was queued, so nothing may be extracted from it.
+pub(crate) fn source_removed(
+    conn: &rusqlite::Connection,
+    chunk_id: i64,
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT s.removed_at IS NOT NULL FROM chunks c JOIN sources s ON s.id = c.source_id
+         WHERE c.id = ?1",
+        [chunk_id],
+        |row| row.get(0),
+    )
+}
+
+/// Takes a leased chunk whose source was removed off the queue without
+/// marking it extracted, inside the caller's transaction. The lease is
+/// released when it drops.
+pub(crate) fn drop_removed(
+    tx: &rusqlite::Transaction<'_>,
+    lease: &Lease,
+) -> Result<(), rusqlite::Error> {
     tx.execute(
         "DELETE FROM extraction_queue WHERE id = ?1",
         [lease.queue_id],

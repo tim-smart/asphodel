@@ -22,6 +22,7 @@ pub mod models;
 pub mod operations;
 pub mod queue;
 pub mod reembed;
+pub mod retract;
 pub mod retrieval;
 pub mod secrets;
 pub mod service;
