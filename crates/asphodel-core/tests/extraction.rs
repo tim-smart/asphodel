@@ -1309,7 +1309,7 @@ fn a_task_has_a_due_date_and_no_end() {
         vec![
             claim(content, "task", quote)
                 .with("due_at", time("2026-10-20", "day"))
-                .with("valid_until", time("2026-10-20", "day")),
+                .with("valid_until", Value::Null),
         ],
     );
     // valid_until is set only when an event ends the task.
@@ -1317,6 +1317,37 @@ fn a_task_has_a_due_date_and_no_end() {
         h.row(memories[0]),
         Row {
             due_at: timed(local("2026-10-20T00:00"), "day"),
+            ..Row::new(
+                content,
+                "task",
+                at(T1),
+                span(&turn_text(user, "Will do."), quote)
+            )
+        }
+    );
+}
+
+#[test]
+fn an_event_bound_task_keeps_its_due_date_and_end() {
+    let h = Harness::new();
+    let user = "Remind me to bring my insurance card to the dentist on 20 October at 2pm.";
+    let quote = "bring my insurance card to the dentist on 20 October at 2pm";
+    let content = "Tim needs to bring his insurance card to the dentist on 20 October 2026 at 2pm.";
+    let memories = golden(
+        &h,
+        user,
+        "Will do.",
+        vec![
+            claim(content, "task", quote)
+                .with("due_at", time("2026-10-20T14:00", "minute"))
+                .with("valid_until", time("2026-10-20T14:00", "minute")),
+        ],
+    );
+    assert_eq!(
+        h.row(memories[0]),
+        Row {
+            due_at: timed(local("2026-10-20T14:00"), "minute"),
+            valid_until: timed(local("2026-10-20T14:00"), "minute"),
             ..Row::new(
                 content,
                 "task",
@@ -3220,7 +3251,7 @@ fn call1_uses_the_new_template_version() {
     let request = call1_request(&input(&h, "main", &[]));
     // The new rules are a new version: `fast` reuses call 1's claims by
     // version, and claims made under the old rules mustn't be.
-    assert_eq!(request.template.version, 4);
+    assert_eq!(request.template.version, 5);
 }
 
 /// `[extraction] guidance` as it might be written, padded, and the text
