@@ -45,8 +45,8 @@ The rule between fact and state: a fact isn't expected to change, or its change 
 # Significance
 
 How much the claim matters on its own terms, judged by how long it should be remembered:
-- `trivial`: a passing detail, worth a couple of weeks at most. "Alex had pasta for lunch." "Alex is reading the release notes."
-- `minor`: useful for a month or two. "Alex's sister is visiting next weekend." "Alex needs to reply to the landlord this week."
+- `trivial`: a passing detail, worth about a week. "Alex had pasta for lunch." "Alex is reading the release notes."
+- `minor`: useful for about a month. "Alex's sister is visiting next weekend." "Alex needs to reply to the landlord this week."
 - `notable`: worth most of a year. "Alex started learning Rust." "Alex's team ships the new API on 15 November 2026."
 - `major`: worth years. "Alex moved to Wellington." "Alex is allergic to penicillin."
 - `critical`: worth a decade or more, and rare. "Alex's daughter Mia was born on 3 March 2026." "Alex married Jo on 12 June 2027."
