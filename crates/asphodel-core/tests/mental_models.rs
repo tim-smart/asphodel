@@ -695,6 +695,20 @@ fn a_refresh_scores_relevance_as_the_logit_divided_by_the_relevance_scale() {
     };
     let logit = f64::from(FakeReranker.rerank(PROFILE_QUESTION, &[TEA]).unwrap()[0]);
     let (raw, scaled) = (score(1.0), score(4.0));
+    let tuning = Tuning::default();
+    let strength = asphodel_core::strength::strength(
+        asphodel_core::constants::Significance::Notable.value(),
+        &[asphodel_core::strength::Access {
+            kind: asphodel_core::strength::AccessKind::Created,
+            at: at(EARLIER),
+        }],
+        None,
+        &asphodel_core::strength::BankTime::new(&[at(EARLIER)], tuning.clock.quiet_rate),
+        at(START),
+    )
+    .value;
+    // A fact without volatility or a window has zero confidence/phase terms.
+    assert!((raw - (logit + 0.5 * strength)).abs() < 1e-9);
     let expected = logit - logit / 4.0;
     assert!(
         (raw - scaled - expected).abs() < 1e-9,

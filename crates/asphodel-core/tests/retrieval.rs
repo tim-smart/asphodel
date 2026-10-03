@@ -628,6 +628,22 @@ fn relevance_is_the_logit_divided_by_the_relevance_scale() {
     };
     let (prefetch_raw, recall_raw) = scores(1.0);
     let (prefetch_scaled, recall_scaled) = scores(4.0);
+    let tuning = Tuning::default();
+    let strength = asphodel_core::strength::strength(
+        asphodel_core::constants::Significance::Notable.value(),
+        &[asphodel_core::strength::Access {
+            kind: asphodel_core::strength::AccessKind::Created,
+            at: at(EARLIER),
+        }],
+        None,
+        &asphodel_core::strength::BankTime::new(&[at(EARLIER)], tuning.clock.quiet_rate),
+        at(START),
+    )
+    .value;
+    // A fact without volatility or a window has zero confidence/phase terms.
+    // Pin the original formula as well as the scale-dependent difference.
+    assert!((prefetch_raw - (1.5 + 0.5 * strength)).abs() < 1e-9);
+    assert!((recall_raw - (1.5 + 0.2 * strength)).abs() < 1e-9);
     // Two shared words: a logit of 1.5, so relevance 1.5 and then 0.375.
     let expected = 1.5 - 1.5 / 4.0;
     for (raw, scaled) in [(prefetch_raw, prefetch_scaled), (recall_raw, recall_scaled)] {
