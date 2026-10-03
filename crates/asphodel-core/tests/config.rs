@@ -355,6 +355,42 @@ fn llm_language_is_unset_by_default_and_must_not_be_empty() {
 }
 
 #[test]
+fn extraction_guidance_is_unset_by_default_and_must_not_be_empty() {
+    let guidance =
+        |tuning: &Tuning| serde_json::to_value(tuning).unwrap()["extraction"]["guidance"].clone();
+    // Unset, call 1's prompt is the fixed one.
+    assert!(guidance(&Tuning::default()).is_null());
+    // Set, it can run over several lines.
+    let tuning =
+        load("[extraction]\nguidance = \"\"\"\nSkip build logs.\nKeep release dates.\n\"\"\"\n")
+            .unwrap();
+    assert_eq!(guidance(&tuning), "Skip build logs.\nKeep release dates.\n");
+    // `GET /v1/config` shows the resolved value.
+    let config = ResolvedConfig::new(tuning, deployment(None, None));
+    let json = serde_json::to_value(&config).unwrap();
+    assert_eq!(
+        json["tuning"]["extraction"]["guidance"],
+        "Skip build logs.\nKeep release dates.\n"
+    );
+    // The overrides file replaces it, as replay's A/B runs need.
+    let layered = layers(&[
+        "[extraction]\nguidance = \"Skip build logs.\"\n",
+        "[extraction]\nguidance = \"Keep release dates.\"\n",
+    ])
+    .unwrap();
+    assert_eq!(guidance(&layered), "Keep release dates.");
+
+    for value in ["\"\"", "\"  \"", "\"\\n\\t\""] {
+        assert_eq!(
+            invalid_keys(&format!("[extraction]\nguidance = {value}\n")),
+            ["extraction.guidance"],
+            "{value}"
+        );
+    }
+    assert_rejected("[extraction]\nprompt = \"Skip build logs.\"\n");
+}
+
+#[test]
 fn embedding_floors_must_be_cosines() {
     // floors inside the model's score range.
     for value in ["1.5", "-1.01", "nan", "inf"] {

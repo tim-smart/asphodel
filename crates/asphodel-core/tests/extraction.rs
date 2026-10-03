@@ -37,6 +37,7 @@ use jiff::{SignedDuration, Timestamp};
 use rusqlite::OptionalExtension;
 use rusqlite::types::FromSql;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use asphodel_core::extraction::{
@@ -3260,6 +3261,91 @@ fn the_prompts_state_the_extraction_rules() {
     );
     let second = call1_request(&input(&forced, "main", &[])).system;
     assert_eq!(first, second);
+}
+
+#[test]
+fn call1_leaves_out_questions_and_routine_assistant_work() {
+    let h = Harness::new();
+    ingest(&h, &turn("s1", T1, "Hello.", "Hi."));
+    let request = call1_request(&input(&h, "main", &[]));
+    // Most such claims carried nothing lasting and crowded recall, so the
+    // default prompt leaves them out unless the turn records something.
+    for rule in [
+        "Don't extract that someone asked a question or made a request",
+        "the assistant's routine operations and checks",
+        "unless the text records a decision, a commitment, a date, or where something is stored",
+    ] {
+        assert!(request.system.contains(rule), "{rule}");
+    }
+    // The new rules are a new version: `fast` reuses call 1's claims by
+    // version, and claims made under the old rules mustn't be.
+    assert_eq!(request.template.version, 4);
+}
+
+/// `[extraction] guidance` as it might be written, padded, and the text
+/// call 1's prompt gets.
+const GUIDANCE: &str =
+    "[extraction]\nguidance = \"\"\"\n  Skip build logs.\nKeep release dates.  \n\"\"\"\n";
+const GUIDANCE_TEXT: &str = "Skip build logs.\nKeep release dates.";
+
+#[test]
+fn guidance_is_added_to_the_fixed_prompt_and_keys_the_template() {
+    let request = |h: &Harness| {
+        ingest(h, &turn("s1", T1, "I'm moving to Lisbon.", "Exciting!"));
+        call1_request(&input(h, "main", &[]))
+    };
+    let plain = request(&Harness::new());
+    let guided_h = Harness::with_tuning(GUIDANCE);
+    let guided = request(&guided_h);
+
+    // The text, trimmed, follows the fixed prompt, which it leaves as is:
+    // the rules, the user prompt and the reply schema are unchanged.
+    let added = guided
+        .system
+        .strip_prefix(plain.system.as_str())
+        .unwrap_or_else(|| panic!("the fixed prompt changed: {}", guided.system));
+    assert!(added.trim_end().ends_with(GUIDANCE_TEXT), "{added}");
+    assert!(!plain.system.contains("Skip build logs."));
+    assert_eq!(guided.user, plain.user);
+    assert_eq!(guided.schema_name, plain.schema_name);
+    assert_eq!(guided.schema, plain.schema);
+
+    // The template keeps call 1's name and version, and carries SHA-256 of
+    // the text as inserted, so cassettes and `fast` key on the exact
+    // prompt. Unset adds no field, so call 2's and refreshes' keys stay.
+    let template = |request: &LlmRequest| serde_json::to_value(&request.template).unwrap();
+    assert_eq!(guided.template.name, plain.template.name);
+    assert_eq!(guided.template.version, plain.template.version);
+    assert!(
+        template(&plain).get("guidance").is_none(),
+        "{}",
+        template(&plain)
+    );
+    assert_eq!(
+        template(&guided)["guidance"],
+        format!("{:x}", Sha256::digest(GUIDANCE_TEXT)),
+        "{}",
+        template(&guided)
+    );
+    let other = request(&Harness::with_tuning(
+        "[extraction]\nguidance = \"Skip build logs.\"\n",
+    ));
+    assert_ne!(template(&other)["guidance"], template(&guided)["guidance"]);
+
+    // Like the language rule, it's the same for every chunk.
+    extract(&guided_h, reply(vec![], &[]));
+    ingest(
+        &guided_h,
+        &turn(
+            "s1",
+            "2026-10-01T07:00:00Z",
+            "Ana visits in May.",
+            "Lovely.",
+        ),
+    );
+    let next = call1_request(&input(&guided_h, "main", &[]));
+    assert_eq!(next.system, guided.system);
+    assert_eq!(template(&next), template(&guided));
 }
 
 // Deterministic entity ids: in replay an entity id is UUIDv5 of the

@@ -577,6 +577,84 @@ fn fast_doesnt_reuse_claims_or_refreshes_recorded_without_the_language() {
     );
 }
 
+/// The `[extraction] guidance` the guided runs use.
+const GUIDANCE: &str = "Skip routine checks.";
+
+/// Claims recorded without `[extraction] guidance` came from another
+/// prompt. With it on, every chunk's call 1 is a miss answered live and
+/// recorded under the guidance's hash, and the next `fast` run with it
+/// reuses those. The report records call 1's version and the hash, and so
+/// does the aggregate export, as bytes.
+#[test]
+fn fast_doesnt_reuse_claims_recorded_without_the_guidance_and_reports_it() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let unguided = record(&dir, &corpus).report();
+    assert_eq!(unguided["call1"]["version"], 4, "{unguided}");
+    assert!(unguided["call1"]["guidance_hash"].is_null(), "{unguided}");
+    let call1 = |records: &[Value]| {
+        records
+            .iter()
+            .filter(|record| record["template"]["name"] == "extract_claims")
+            .count() as u64
+    };
+    let recorded = call1(&cassette_records(&dir));
+    assert!(recorded > 0);
+
+    let hash = sha(GUIDANCE.as_bytes());
+    let guidance = dir.private_file(
+        "guidance.toml",
+        &format!("[extraction]\nguidance = \"{GUIDANCE}\"\n"),
+    );
+    let overrides = ["--overrides", guidance.to_str().unwrap()];
+    let script = live_script(&dir);
+    let first = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "fast-guided",
+        Some(&script),
+        &overrides,
+    );
+    assert_ok(&first.output);
+    let report = first.report();
+    assert_eq!(report["llm"]["misses"], recorded, "{report}");
+    assert_eq!(report["llm"]["live"], recorded, "{report}");
+    assert_eq!(report["tuning"]["extraction"]["guidance"], GUIDANCE);
+    assert_eq!(report["call1"]["version"], 4, "{report}");
+    assert_eq!(report["call1"]["guidance_hash"], hash, "{report}");
+    let records = cassette_records(&dir);
+    assert_eq!(call1(&records), 2 * recorded);
+    let guided = records
+        .iter()
+        .filter(|record| record["template"]["guidance"] == hash)
+        .count() as u64;
+    assert_eq!(guided, recorded);
+
+    let aggregate = dir.path("aggregate.json");
+    let mut flags = overrides.to_vec();
+    flags.extend(["--aggregate", aggregate.to_str().unwrap()]);
+    let second = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "fast-guided-again",
+        None,
+        &flags,
+    );
+    assert_ok(&second.output);
+    assert_eq!(second.report()["llm"]["misses"], 0);
+    let export: Value = serde_json::from_slice(&fs::read(&aggregate).unwrap()).unwrap();
+    assert_eq!(export["call1"]["version"], 4, "{export}");
+    assert_eq!(
+        export["call1"]["guidance_hash"],
+        serde_json::json!(Sha256::digest(GUIDANCE.as_bytes()).to_vec()),
+        "{export}"
+    );
+}
+
 // The determinism self-test.
 
 /// `fast` on its own recording needs no LLM, counts zero misses and passes
