@@ -286,10 +286,16 @@ A probe naming a label no claim defines is refused before the run.
   they commit in the order they were claimed: a chunk whose latency ends
   first waits for those claimed before it. A commit that finds a memory or
   an edit since its search that it must reconcile against searches and
-  runs call 2 again at that instant, with no latency of its own (ADR 0005,
-  "Amendment: reconciliation is checked at commit"). That call 2 is shown
-  other neighbours than a serial run's, so it misses the cassette: `live`
-  and `fast` answer it from the LLM and record it, and `replay` stops.
+  runs call 2 again at that instant (ADR 0005, "Amendment: reconciliation
+  is checked at commit"), and commits a latency later. A redo is charged
+  like any chunk: the served latency of the call 2 that answered it, or
+  the `--latency` constant when that's set, so a redo is never free. The
+  chunk keeps its lease and its place at the head of the order while the
+  events in between run, so probes and prefetches meanwhile see the store
+  without it, and the chunks claimed after it wait for it. When the
+  cassette has no recording of that call 2, as when a serial run showed
+  call 2 other neighbours or ran none, it misses: `live` and `fast` answer
+  it from the LLM and record it, and `replay` stops.
   The report counts these redos as `call2_rate.redos` and
   `call2_rate.redo_rate`, per chunk, fields that only appear above 1.
   Scenarios script call 2 against what a serial run shows it, so a

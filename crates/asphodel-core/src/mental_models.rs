@@ -172,6 +172,13 @@ pub enum Outcome {
     /// Nothing changed. The error is recorded on the model, and the
     /// refresh is tried again once [`MIN_REFRESH_INTERVAL`] has passed.
     Failed(FailureKind),
+    /// The LLM is held by a usage limit or a 429 that said when to come
+    /// back, which another caller may have hit: the call never reached it.
+    /// Not a failure. The refresh stays requested and is due again at
+    /// `until`.
+    Held {
+        until: jiff::Timestamp,
+    },
 }
 
 /// The reply's operations, as code applied them.

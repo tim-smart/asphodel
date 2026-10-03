@@ -25,7 +25,10 @@
 //! claimed: one whose latency ends first waits for those claimed before
 //! it. A commit that finds a memory or an edit since its search that it
 //! must reconcile against searches and runs call 2 again at that instant,
-//! through the cassette, and the report counts these redos. Scenarios
+//! through the cassette, and commits a latency later: its call 2's served
+//! latency, or the `--latency` constant, as any chunk is charged. It keeps
+//! its lease and its place in the order meanwhile, and the events in
+//! between run as usual. The report counts these redos. Scenarios
 //! script call 2 against what a serial run shows it, so they run at
 //! concurrency 1.
 //!
@@ -647,16 +650,26 @@ impl<'a> Engine<'a> {
             let Some(ready) = self.done.remove(&ticket) else {
                 break;
             };
-            self.out.pop_front();
             let source = ready.source;
-            self.commit_chunk(ready)?;
+            if let Some(redone) = self.commit_chunk(ready)? {
+                // It keeps its lease and its place at the head of the
+                // order, and everything claimed after it waits for it.
+                self.schedule_redo(redone);
+                break;
+            }
+            self.out.pop_front();
             committed = true;
             if self.out.is_empty() {
                 next = loop {
                     match self.service.next_extraction(&self.settings.bank)? {
                         Some(claimed) if claimed.lease.source == source => {
                             let ready = self.prepare_chunk(claimed)?;
-                            self.commit_chunk(ready)?;
+                            let ticket = ready.ticket;
+                            if let Some(redone) = self.commit_chunk(ready)? {
+                                self.out.push_back(ticket);
+                                self.schedule_redo(redone);
+                                break None;
+                            }
                         }
                         other => break other,
                     }
@@ -674,6 +687,19 @@ impl<'a> Engine<'a> {
             self.schedule_completion(ready)?;
         }
         self.start_worker()
+    }
+
+    /// Holds a stale chunk, redone at this instant, until its redo's
+    /// latency from now, when it commits. It stays out on its lease, at
+    /// the head of the order, while the events in between run.
+    fn schedule_redo(&mut self, ready: Ready) {
+        let at = self
+            .clock
+            .now()
+            .checked_add(ready.latency)
+            .unwrap_or(Timestamp::MAX);
+        self.extend_end(at);
+        self.push(at, 1, EventKind::Completion(Box::new(ready)));
     }
 
     /// Runs the refreshes due with the run's refresh client and counts
@@ -804,29 +830,37 @@ impl<'a> Engine<'a> {
         })
     }
 
-    /// Commits a prepared chunk at its completion.
-    fn commit_chunk(&mut self, ready: Ready) -> Result<(), Failure> {
+    /// Commits a prepared chunk at its completion. A chunk the commit finds
+    /// stale is redone now and handed back, with the redo's latency, to
+    /// complete again: `None` when it committed.
+    fn commit_chunk(&mut self, ready: Ready) -> Result<Option<Ready>, Failure> {
         let Ready {
+            ticket,
             prepared,
             source,
             position,
             mine,
             ..
         } = ready;
+        let extracted = match self.service.try_commit_extraction(prepared)? {
+            Committed::Extracted(extracted) => extracted,
+            Committed::Stale(stale) => {
+                self.redos += 1;
+                let (prepared, latency) = self.redo_chunk(*stale)?;
+                return Ok(Some(Ready {
+                    ticket,
+                    prepared,
+                    source,
+                    position,
+                    mine,
+                    latency,
+                }));
+            }
+        };
         let mut pending = self
             .pending
             .remove(&source)
             .ok_or_else(|| internal(format!("no pending extraction for source {source}")))?;
-        let mut prepared = prepared;
-        let extracted = loop {
-            match self.service.try_commit_extraction(prepared)? {
-                Committed::Extracted(extracted) => break extracted,
-                Committed::Stale(stale) => {
-                    self.redos += 1;
-                    prepared = self.redo_chunk(*stale)?;
-                }
-            }
-        };
 
         let now = self.clock.now();
         self.note_created(&extracted, source, position, &mine, &pending.name)?;
@@ -843,15 +877,17 @@ impl<'a> Engine<'a> {
                 pending.claims.len()
             )));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Searches and runs call 2 again for a chunk its commit found stale,
-    /// through the cassette, at the commit's instant. A call 2 whose
-    /// neighbours differ from the recording's misses: `live` and `fast` ask
-    /// the LLM, and `replay` stops. Only real history gets here: scenarios
-    /// run at concurrency 1, where nothing is ever stale.
-    fn redo_chunk(&mut self, stale: Prepared) -> Result<Prepared, Failure> {
+    /// through the cassette, at the commit's instant, with the latency the
+    /// redo takes: the served latency of the call 2 that answered it, or
+    /// the settings' constant under `--latency`, as any chunk is charged.
+    /// A call 2 whose neighbours differ from the recording's misses: `live`
+    /// and `fast` ask the LLM, and `replay` stops. Only real history gets
+    /// here: scenarios run at concurrency 1, where nothing is ever stale.
+    fn redo_chunk(&mut self, stale: Prepared) -> Result<(Prepared, SignedDuration), Failure> {
         let Llm::Recorded(recorder, _) = self.llm else {
             return Err(internal("a scenario's chunk went stale at concurrency 1"));
         };
@@ -865,13 +901,19 @@ impl<'a> Engine<'a> {
         );
         recorder.enter(context);
         let result = self.service.redo_extraction(stale, recorder);
+        let served = recorder.served_latency();
         recorder.leave();
         match result {
             Ok(prepared) => {
                 if !had_call2 && prepared.call2_input().is_some() {
                     self.call2_chunks += 1;
                 }
-                Ok(prepared)
+                let latency = if self.settings.latency_from_cassette {
+                    SignedDuration::try_from(served).unwrap_or(SignedDuration::MAX)
+                } else {
+                    self.settings.latency
+                };
+                Ok((prepared, latency))
             }
             Err(error) => Err(match recorder.first_miss() {
                 Some(miss) => Failure::Internal(anyhow::anyhow!(

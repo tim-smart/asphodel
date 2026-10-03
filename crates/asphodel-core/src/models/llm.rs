@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use jiff::Timestamp;
 
 use super::chatgpt::CODEX_ENDPOINT;
+use crate::clock::{Clock, SystemClock};
 use crate::config::{Deployment, LLM_API_KEY_ENV, LlmAuth, Secret, Tuning};
 
 /// Where the LLM is and how to talk to it. The endpoint and model come from
@@ -316,7 +317,9 @@ impl LlmClient for OpenAiCompatible {
         let mut response = call.send_json(self.body(request)).map_err(transport)?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            return Err(status_error(status, response.headers()));
+            // A Retry-After date is the server's wall time, whatever clock
+            // the caller runs on.
+            return Err(status_error(status, response.headers(), SystemClock.now()));
         }
         let text = response
             .body_mut()
@@ -336,21 +339,36 @@ impl LlmClient for OpenAiCompatible {
     }
 }
 
-/// A non-2xx status as an error: a 429 with a `Retry-After` in seconds is
-/// [`LlmError::RateLimited`], anything else [`LlmError::Status`]. A
-/// `Retry-After` given as a date isn't read, since the clients have no
-/// clock: that 429 counts like any other.
-pub(super) fn status_error(status: u16, headers: &ureq::http::HeaderMap) -> LlmError {
+/// A non-2xx status as an error: a 429 with a `Retry-After` is
+/// [`LlmError::RateLimited`], anything else [`LlmError::Status`].
+/// `Retry-After` is seconds or an HTTP date (RFC 9110), read against `now`;
+/// a date already past holds for no time. A value that's neither counts
+/// like no header.
+pub(super) fn status_error(
+    status: u16,
+    headers: &ureq::http::HeaderMap,
+    now: Timestamp,
+) -> LlmError {
     let retry_after = headers
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok());
+        .and_then(|value| retry_after(value.trim(), now));
     match (status, retry_after) {
-        (429, Some(seconds)) => LlmError::RateLimited {
-            retry_after: Duration::from_secs(seconds),
-        },
+        (429, Some(retry_after)) => LlmError::RateLimited { retry_after },
         _ => LlmError::Status { status },
     }
+}
+
+/// A `Retry-After` value as a wait from `now`, or `None` when it's neither
+/// seconds nor an HTTP date.
+fn retry_after(value: &str, now: Timestamp) -> Option<Duration> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let at = jiff::fmt::rfc2822::DateTimeParser::new()
+        .parse_timestamp(value)
+        .ok()?;
+    Some(Duration::try_from(now.duration_until(at)).unwrap_or(Duration::ZERO))
 }
 
 /// Maps a ureq error. The message names the error kind, never the body.

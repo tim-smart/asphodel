@@ -1434,13 +1434,14 @@ impl Service {
                 crate::mental_models::load_models(&conn, bank_id)?
             };
             for model in models.into_iter().filter(|model| model.enabled) {
-                let last_trigger = self.schedule.last_trigger(bank_id);
-                let requested = crate::mental_models::schedule::due(&model, last_trigger, tuning)
+                let requested = self
+                    .refresh_due(&model, bank_id)
                     .is_some_and(|due| due <= now);
                 let run = requested
                     || (sweep && {
                         let held = crate::mental_models::schedule::not_before(&model)
-                            .is_some_and(|floor| floor > now);
+                            .is_some_and(|floor| floor > now)
+                            || self.schedule.held_until(model.id, now).is_some();
                         if held {
                             // Refreshed too recently: the sweep's check
                             // waits for the interval instead.
@@ -1484,6 +1485,22 @@ impl Service {
         })
     }
 
+    /// When a requested refresh of `model` is due: on the schedule, and no
+    /// earlier than a hold the LLM put on it lifts.
+    fn refresh_due(
+        &self,
+        model: &crate::mental_models::ModelRow,
+        bank_id: i64,
+    ) -> Option<Timestamp> {
+        let last_trigger = self.schedule.last_trigger(bank_id);
+        let due =
+            crate::mental_models::schedule::due(model, last_trigger, &self.tuning.mental_models)?;
+        Some(match self.schedule.held_until(model.id, self.now()) {
+            Some(until) => due.max(until),
+            None => due,
+        })
+    }
+
     /// The earliest requested refresh or daily sweep still ahead.
     fn next_refresh_due(&self) -> Result<Option<Timestamp>, ModelError> {
         let tuning = &self.tuning.mental_models;
@@ -1497,9 +1514,7 @@ impl Service {
             let mut any = false;
             for model in models.iter().filter(|model| model.enabled) {
                 any = true;
-                let last_trigger = self.schedule.last_trigger(bank_id);
-                if let Some(due) = crate::mental_models::schedule::due(model, last_trigger, tuning)
-                {
+                if let Some(due) = self.refresh_due(model, bank_id) {
                     earliest(due);
                 }
             }

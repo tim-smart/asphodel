@@ -673,7 +673,7 @@ impl CodexResponses {
                 if let Some(resets_at) = usage_limit(&text, reset_header) {
                     return Err(LlmError::UsageLimited { resets_at }.into());
                 }
-                return Err(super::llm::status_error(status, &headers).into());
+                return Err(super::llm::status_error(status, &headers, self.clock.now()).into());
             }
             _ => return Err(LlmError::Status { status }.into()),
         }
