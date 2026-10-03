@@ -3,8 +3,8 @@
 //!
 //! Nothing here touches the network. The OpenAI-compatible client is tested
 //! against [`StubServer`], a loopback HTTP/1.1 server in this file, and the
-//! model loader against files written into a temp dir. The one exception is
-//! [`real_models_embed_and_rerank`], which is ignored and runs only when the
+//! model loader against files written into a temp dir. The real-model tests
+//! are ignored and run only when the
 //! real models are in `ASPHODEL_MODEL_DIR` (or the XDG cache).
 
 use std::collections::BTreeMap;
@@ -1322,4 +1322,55 @@ fn real_models_embed_and_rerank() {
     assert!(scores[1] > scores[2], "{scores:?}");
     assert!(scores.iter().all(|score| score.is_finite()), "{scores:?}");
     assert!(models.reranker.rerank(query, &[]).unwrap().is_empty());
+}
+
+#[test]
+#[ignore = "needs the real L-6 models: run `asphodel models fetch`, or set ASPHODEL_MODEL_DIR"]
+fn real_model_reranker_matches_l6_reference_logits() {
+    let dir = real_model_dir();
+    let models = Models::load(
+        &dir,
+        &ModelOptions {
+            threads: std::num::NonZeroUsize::new(1),
+        },
+    )
+    .unwrap_or_else(|error| panic!("loading from {}: {error}", dir.path().display()));
+
+    // Independent reference: Python onnxruntime 1.27.1, Xenova L-6 int8,
+    // revision a09144355adeed5f58c8ed011d209bf8ee5a1fec. Keep each batch
+    // intact and in this order: dynamic int8 activation ranges depend on
+    // the other pairs in the batch, so scoring pairs separately differs.
+    let batches: [(&str, &[&str], &[f32]); 2] = [
+        (
+            "where did the cat sit",
+            &[
+                "The cat sat on the mat.",
+                "A cat is sitting on a mat.",
+                "The quarterly tax filing deadline is in April.",
+            ],
+            &[5.9225, 3.2397, -11.1688],
+        ),
+        (
+            "How many people live in Berlin?",
+            &[
+                "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
+                "Berlin is well known for its museums.",
+            ],
+            &[8.3994, -4.6122],
+        ),
+    ];
+    for (batch, (query, documents, expected)) in batches.iter().enumerate() {
+        let scores = models.reranker.rerank(query, documents).unwrap();
+        assert_eq!(
+            scores.len(),
+            expected.len(),
+            "batch {batch}: one logit per document"
+        );
+        for (document, (score, reference)) in scores.iter().zip(*expected).enumerate() {
+            assert!(
+                (score - reference).abs() <= 1e-3,
+                "batch {batch}, document {document}: logit {score}, reference {reference}"
+            );
+        }
+    }
 }
