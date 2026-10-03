@@ -48,3 +48,31 @@ test("a memory's page shows when it fades and when it can be purged", async (t) 
   assert.match(textOf(page.root), /no sooner than/i);
   assert.match(textOf(page.root), /purge/i);
 });
+
+// A retracted or forgotten memory is out of use already, so its row makes
+// no promise about fading: it says where it stands, and a retracted one
+// when it can be purged.
+
+test("a retracted memory's row shows when it can be purged instead of when it fades", async (t) => {
+  const page = await open(t, new FakeDaemon(), { hash: MEMORIES, token: TOKEN });
+
+  const row = await findRow(page.root, sentences.berlin);
+
+  assert.match(textOf(row), /\bretracted\b/i);
+  assert.doesNotMatch(textOf(row), /fades in|never fades|faded/i);
+  assert.equal(row.querySelector('time[datetime="2026-11-02T09:00:00Z"]'), null, "no fade date");
+  assert.match(textOf(row), /purge/i);
+  assert.ok(row.querySelector('time[datetime="2026-12-02T09:00:00Z"]'), row.innerHTML);
+});
+
+test("a memory being forgotten says so instead of when it fades", async (t) => {
+  const daemon = new FakeDaemon();
+  daemon.state.memories.find((m) => m.id === ids.job).status = "forgetting";
+  const page = await open(t, daemon, { hash: MEMORIES, token: TOKEN });
+
+  const row = await findRow(page.root, sentences.job);
+
+  assert.match(textOf(row), /forgetting|being forgotten/i);
+  assert.doesNotMatch(textOf(row), /fades in|never fades|faded/i);
+  assert.equal(row.querySelector('time[datetime="2026-11-02T09:00:00Z"]'), null, "no fade date");
+});

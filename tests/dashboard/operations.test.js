@@ -142,3 +142,40 @@ test("a confirmed acknowledgement quotes this daemon's fingerprint and resumes p
   assert.deepEqual(sent.body, { hash: "f1f1f1" });
   await waitFor(() => !queryText(page.root, "purge.delta"), "the purge card to go");
 });
+
+// The daemon's own wording for a bank's failed chunks.
+const FAILED_LINE = "main: 3 failed chunks; see `asphodel chunks --bank main --failed`";
+
+function banner(page, line) {
+  return waitFor(
+    () =>
+      [...page.document.querySelectorAll('[role="alert"], [role="status"]')].find((el) =>
+        textOf(el).includes(line),
+      ),
+    `a banner with "${line}"`,
+  );
+}
+
+test("a bank's failed chunks in the banner link to that bank's ingestion page, from any bank", async (t) => {
+  const daemon = new FakeDaemon();
+  daemon.state.status.attention = [FAILED_LINE];
+  const page = await open(t, daemon, { hash: "#/banks/work/memories", token: TOKEN });
+
+  const shown = await banner(page, "3 failed chunks");
+  const link = shown.querySelector('a[href$="#/banks/main/chunks"]');
+  assert.ok(link, shown.innerHTML);
+  click(link);
+
+  await findRow(page.root, "llm_timeout");
+});
+
+test("on a bank's ingestion page the banner doesn't point at the page itself", async (t) => {
+  const daemon = new FakeDaemon();
+  daemon.state.status.attention = [FAILED_LINE, "the last backup is more than 7 days old"];
+  const page = await open(t, daemon, { hash: "#/banks/main/chunks", token: TOKEN });
+  await findRow(page.root, "llm_timeout");
+
+  const shown = await banner(page, "the last backup is more than 7 days old");
+  assert.ok(!textOf(shown).includes("3 failed chunks"), textOf(shown));
+  assert.equal(shown.querySelector('a[href$="#/banks/main/chunks"]'), null);
+});
