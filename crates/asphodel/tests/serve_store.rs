@@ -398,7 +398,7 @@ fn a_second_daemon_on_the_same_data_dir_is_refused() {
 
 #[test]
 fn the_lock_does_not_outlive_a_crashed_daemon() {
-    // A supervisor restarts a crashed daemon at once (ADR 0006), so a lock
+    // A supervisor restarts a crashed daemon at once, so a lock
     // that needs cleanup code to release it would turn every crash into a
     // crash loop. SIGKILL runs no cleanup.
     let dir = TestDir::new();
@@ -434,7 +434,7 @@ fn a_data_dir_that_is_a_regular_file_is_refused_and_preserved() {
 
 #[test]
 fn a_pre_migration_copy_is_deleted_at_its_deadline_while_the_daemon_runs() {
-    // ADR 0010: the copy is deleted 7 days after its migration completes,
+    // The copy is deleted 7 days after its migration completes,
     // and forget reaches it within 7 days. A daemon started just before
     // that deadline keeps the copy at open, so the deletion has to come from
     // a wake at the deadline itself, not from the next hourly poll.

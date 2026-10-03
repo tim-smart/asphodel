@@ -1,5 +1,5 @@
 //! The ChatGPT/Codex subscription client follows the authentication and
-//! transport contracts in ADR 0009.
+//! transport contracts of the `chatgpt` auth mode.
 //!
 //! The protocol follows `openai/codex`; the Codex backend is undocumented:
 //!
@@ -543,7 +543,7 @@ fn client(server: &StubServer, store: TokenStore, clock: Arc<SimulatedClock>) ->
     CodexResponses::new(chatgpt_settings(&server.url), store, clock).with_issuer(&server.url)
 }
 
-// Config (ADR 0009).
+// Config.
 
 #[test]
 fn chatgpt_mode_defaults_to_the_codex_backend_and_still_pins_the_model() {
@@ -568,7 +568,7 @@ fn chatgpt_mode_defaults_to_the_codex_backend_and_still_pins_the_model() {
     assert_eq!(settings.endpoint, "https://proxy.internal/codex");
 
     // The model stays required: calibration runs against one model, and
-    // the subscription doesn't choose it for us (ADR 0009).
+    // the subscription doesn't choose it for us.
     let no_model = Tuning::from_toml("[llm]\nauth = \"chatgpt\"\n").unwrap();
     let error = LlmSettings::from_config(&no_model, &deployment(None)).unwrap_err();
     assert!(

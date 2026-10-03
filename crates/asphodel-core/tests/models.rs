@@ -1,5 +1,5 @@
 //! Local embedding and reranking models and the OpenAI-compatible LLM client
-//! follow the loading and transport contracts in ADR 0009.
+//! follow their loading and transport contracts.
 //!
 //! Nothing here touches the network. The OpenAI-compatible client is tested
 //! against [`StubServer`], a loopback HTTP/1.1 server in this file, and the
@@ -655,7 +655,7 @@ fn the_fake_reranker_scores_by_query_words_in_the_document() {
 
 #[test]
 fn a_missing_floor_for_a_loaded_model_stops_the_service_opening() {
-    // ADR 0009: a missing floor for a configured model stops the daemon.
+    // A missing floor for a configured model stops the daemon.
     // The check lives in the service so replay gets it too.
     let dir = TestDir::new();
     let error = Service::with_models(clock(), open_store(&dir), Tuning::default(), Models::fake())
@@ -708,7 +708,7 @@ fn a_new_bank_records_the_loaded_models() {
     assert_eq!(again.reranker_model, FakeReranker::MODEL_ID);
 }
 
-// LLM settings (ADR 0009).
+// LLM settings.
 
 #[test]
 fn llm_settings_come_from_the_tuning_file_and_the_environment() {

@@ -1,6 +1,6 @@
 //! `asphodel serve`'s deployment flags and tuning file, run as a process.
 //!
-//! ADR 0009: each deployment flag has an `ASPHODEL_*` environment variable,
+//! Each deployment flag has an `ASPHODEL_*` environment variable,
 //! secrets come from the environment only, and an unknown key or
 //! out-of-range value in the tuning file stops the daemon starting.
 
@@ -15,7 +15,7 @@ const TOKEN: &str = "tok-7f3a9c-secret";
 const LLM_KEY: &str = "sk-live-41b2e8-secret";
 
 /// A floor for each fake model. The daemon loads its models before it is
-/// ready and refuses a model without floors (ADR 0009), so every daemon
+/// ready and refuses a model without floors, so every daemon
 /// here that is meant to start runs on the fakes with these.
 const FLOORS_FOR_FAKES: &str = "[injection.reranker_floors]\n\"fake-reranker:v1\" = 0.0\n\
                                 [reconcile.embedding_floors]\n\"fake-embedder:v1\" = 0.5\n";

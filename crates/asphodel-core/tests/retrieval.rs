@@ -1,5 +1,5 @@
-//! Hybrid recall, reranking, injection gates and recall logs follow ADRs
-//! 0001 and 0010.
+//! Hybrid recall, reranking, injection gates and recall logs. Being
+//! recalled or injected is logged but never strengthens a memory.
 //!
 //! The API under test is `asphodel_core::retrieval` and the `Service`
 //! methods over it: `prefetch`, `recall`, `in_context`, `clear_session` and
@@ -1091,7 +1091,7 @@ fn interleaved_syncs_commit_each_acknowledged_injection() {
 
 #[test]
 fn a_resent_turn_leaves_the_pending_injection_alone() {
-    // Ingest is idempotent (ADR 0002): a turn resent from the spool
+    // Ingest is idempotent: a turn resent from the spool
     // or retried is a duplicate and settles nothing.
     let h = Harness::new();
     let pottery = h.insert(fact("Tim takes a pottery class."));
@@ -1167,7 +1167,7 @@ fn the_idle_timeout_is_tunable() {
     );
 }
 
-// The recall log and accesses (ADR 0001)
+// The recall log and accesses: a recall is logged, never counted as an access
 
 #[test]
 fn a_prefetch_logs_one_row_with_what_was_injected() {
@@ -1495,7 +1495,7 @@ fn recall_returns_ten_results_unless_asked_for_up_to_thirty() {
     assert_eq!(asked(30), 30);
 }
 
-// A queued turn's in-context set (ADR 0001)
+// A queued turn's in-context set
 //
 // Extraction checks a turn for use against the memories the agent could see
 // when it wrote the reply: the session's in-context set as the turn's sync

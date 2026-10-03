@@ -869,8 +869,8 @@ fn the_diff_lists_fates_by_id_and_numbers_beyond_the_tolerance_by_path() {
     );
 }
 
-// Refreshes. Every bank is seeded with "User profile"
-// (ADR 0007); the corpus here adds `home` from the manifest, within the
+// Refreshes. Every bank is seeded with "User profile";
+// the corpus here adds `home` from the manifest, within the
 // budget the profile leaves. The live stand-in answers every call with a
 // reply call 1 and a refresh can both read, so the order of calls doesn't
 // matter.
@@ -1131,7 +1131,7 @@ fn assert_refused_without(output: &std::process::Output, sentinel: &str, words: 
     }
 }
 
-/// (ADR 0010, "Logging"): A probes file that doesn't parse is
+/// Content is logged only at `trace`: a probes file that doesn't parse is
 /// refused naming the file and the line, never quoting it.
 #[test]
 fn a_malformed_probes_file_is_refused_without_quoting_it() {

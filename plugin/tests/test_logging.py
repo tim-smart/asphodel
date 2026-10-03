@@ -1,4 +1,4 @@
-"""ADR 0010's logging rule, as ``docs/logging.md`` states it for the plugin:
+"""The logging rule, as ``docs/logging.md`` states it for the plugin:
 content (queries, user and assistant text, injections, sentences) appears
 only at ``TRACE``, never at ``DEBUG`` or above."""
 

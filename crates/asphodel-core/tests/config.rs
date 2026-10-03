@@ -1,5 +1,6 @@
-//! Configuration validation, layering and deletion fingerprints follow ADRs
-//! 0007, 0008 and 0009.
+//! Configuration validation, layering and deletion fingerprints. Every
+//! setting is daemon-wide, a bank never overrides tuning, and the values that
+//! decide an irreversible deletion are fingerprinted.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,7 +82,8 @@ impl Drop for TestDir {
 
 #[test]
 fn fixed_constants_are_not_tuning_keys() {
-    // ADR 0009: none of these is ever in a config struct.
+    // Calibrated strength constants are fixed in code: none of these is ever
+    // in a config struct.
     for (section, key) in [
         ("strength", "s"),
         ("strength", "tau"),
@@ -240,7 +242,7 @@ fn load_reads_a_file_and_fails_on_a_missing_or_invalid_one() {
 
 #[test]
 fn a_tuning_written_as_toml_loads_back_unchanged() {
-    // ADR 0009: the replay overrides file has exactly the shape of
+    // The replay overrides file has exactly the shape of
     // `Tuning`, so a resolved tuning written out must load back as itself,
     // including a null δ, which TOML can't spell as null.
     let mut changed = load(
@@ -279,7 +281,7 @@ fn unknown_keys_are_rejected_in_every_section() {
 
 #[test]
 fn secrets_bank_identity_and_deployment_settings_are_not_tuning_keys() {
-    // ADR 0009: secrets come from the environment only, and bank settings,
+    // Secrets come from the environment only, and bank settings,
     // deployment and tuning never share a key.
     for text in [
         "[llm]\napi_key = \"sk-123\"\n",
@@ -311,7 +313,7 @@ fn delta_must_be_finite_and_not_negative() {
 
 #[test]
 fn quiet_rate_must_keep_bank_time_moving() {
-    // Bank time slows down when a bank is quiet (ADR 0004): it never stops
+    // Bank time slows down when a bank is quiet: it never stops
     // or runs backwards.
     for value in ["0.0", "-0.1", "nan"] {
         assert_rejected(&format!("[clock]\nquiet_rate = {value}\n"));
@@ -365,7 +367,7 @@ fn embedding_floors_must_be_cosines() {
 
 #[test]
 fn strong_cutoff_must_sit_above_the_faded_boundary() {
-    // ADR 0009: the faded/fading boundary is τ by definition, and only the
+    // The faded/fading boundary is τ by definition, and only the
     // strong cut-off is tunable, so it can't fall to or below τ.
     assert_rejected(&format!("[recall]\nstrong_cutoff = {}\n", constants::TAU));
     assert_rejected("[recall]\nstrong_cutoff = -2.0\n");
@@ -390,7 +392,7 @@ fn every_invalid_value_is_reported_together() {
 
 #[test]
 fn a_missing_floor_for_a_configured_model_is_an_error() {
-    // ADR 0009: a missing floor for a configured model stops the daemon.
+    // A missing floor for a configured model stops the daemon.
     let t = Tuning::default();
     assert!(
         t.check_floors("bge-small-en-v1.5:int8", "jina-reranker-v1-turbo-en:int8")
@@ -449,7 +451,7 @@ const PRODUCTION: &str = "[clock]\nquiet_rate = 0.2\n[purge]\ndelta = 1.5\n\
 
 #[test]
 fn layers_apply_defaults_then_production_then_overrides() {
-    // ADR 0009: replay layers code defaults, then the production file,
+    // Replay layers code defaults, then the production file,
     // then the overrides.
     let t = layers(&[PRODUCTION, "[purge]\ndelta = 0.75\n"]).unwrap();
     assert_eq!(t.purge.delta, Some(0.75)); // override
@@ -527,7 +529,7 @@ fn secret_from_env_reads_the_variable() {
 
 #[test]
 fn the_resolved_config_carries_tuning_deployment_constants_and_purge_state() {
-    // ADR 0009: `GET /v1/config` returns the resolved config, the fixed
+    // `GET /v1/config` returns the resolved config, the fixed
     // constants and the purge-pause state.
     let tuning = load("[clock]\nquiet_rate = 0.3\n").unwrap();
     let config = ResolvedConfig::new(tuning.clone(), deployment(Some("t"), None));
@@ -605,7 +607,7 @@ fn single_input_changes() -> Vec<(&'static str, DeletionInputs)> {
 
 #[test]
 fn the_fingerprint_is_printable_for_an_ack() {
-    // ADR 0010: `asphodel purge ack --hash <h>` quotes it.
+    // `asphodel purge ack --hash <h>` quotes it.
     let fingerprint = Tuning::default().deletion_fingerprint();
     let text = fingerprint.to_string();
     assert!(!text.is_empty());
@@ -654,8 +656,8 @@ fn null_delta_differs_from_every_number() {
 
 #[test]
 fn each_fingerprinted_tuning_value_changes_the_fingerprint() {
-    // ADR 0009: `quiet_rate`, `delta`, `agenda.overdue_days` and
-    // `purge.source_horizon_days`.
+    // The fingerprinted tuning values: `quiet_rate`, `delta`,
+    // `agenda.overdue_days` and `purge.source_horizon_days`.
     let base = Tuning::default().deletion_fingerprint();
     for text in [
         "[clock]\nquiet_rate = 0.11\n",
@@ -690,7 +692,7 @@ fn setting_a_fingerprinted_value_to_its_default_keeps_the_fingerprint() {
 
 #[test]
 fn excluded_tuning_values_leave_the_fingerprint_alone() {
-    // Only the values ADR 0009 lists decide an irreversible deletion; a
+    // Only the fingerprinted values decide an irreversible deletion; a
     // change to anything else must not pause purge.
     let base = Tuning::default().deletion_fingerprint();
     for text in [

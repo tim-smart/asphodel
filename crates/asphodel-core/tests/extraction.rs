@@ -1,5 +1,5 @@
 //! Extraction call 1 contracts cover claims, significance, validity windows,
-//! entities and used verdicts, following ADRs 0001, 0002, 0005, 0008 and 0010.
+//! entities and used verdicts.
 //!
 //! These are golden tests against `FakeLlm`: each scripts call 1's reply and
 //! checks what's committed, or checks the input and request call 1 is given.
@@ -585,7 +585,7 @@ impl Harness {
         );
     }
 
-    /// Hides a memory as forget does before its erase runs (ADR 0010).
+    /// Hides a memory as forget does before its erase runs.
     fn hide(&self, memory: Uuid) {
         self.execute(
             "UPDATE memories SET hidden_at = ?2 WHERE uuid = ?1",
@@ -2195,7 +2195,7 @@ fn a_known_link_resolves_through_a_merge_made_while_call_1_ran() {
         .extract_chunk(lease(&h, "main"), &llm, &[])
         .unwrap();
 
-    // ADR 0010: commit resolves links through `merged_into` for a chunk whose
+    // Commit resolves links through `merged_into` for a chunk whose
     // first call ran before the merge.
     assert_eq!(
         h.links(extracted.memories[0]),
@@ -2596,7 +2596,7 @@ fn a_closed_window_ranks_a_candidates_memories() {
         h.link(memory, ana);
     }
     // An event said 400 days ago that ended three days ago. Its window's
-    // close restarts recent use (ADR 0003), which lifts it above the fresh
+    // close restarts recent use, which lifts it above the fresh
     // minor and trivial memories; on its old created access alone it would
     // rank last.
     let exhibition = h.insert_memory_of_kind(

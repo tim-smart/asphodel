@@ -1,4 +1,4 @@
-"""The forget request turn (ADR 0010): ``sync_turn`` finds
+"""The forget request turn: ``sync_turn`` finds
 a ``memory_forget`` call in this turn's ``messages`` and sends
 ``forget_requested: true``; the tool call also drops the session's stored
 previous query."""

@@ -1,5 +1,6 @@
 //! Reconciliation (call 2) contracts cover neighbour search, labels,
-//! supersession and accesses, following ADRs 0001, 0003 and 0005.
+//! supersession and accesses. A repeat becomes an access on the memory that
+//! already exists, never a second copy of it.
 //!
 //! These are golden tests against `FakeLlm`: each scripts call 1's reply and
 //! then call 2's, and checks what's committed, or checks the input and
@@ -1151,7 +1152,7 @@ fn neighbours_are_capped_per_claim_and_per_unit() {
 fn faded_and_ended_memories_are_neighbours() {
     let h = Harness::new();
     // Trivial and untouched for two years: long faded out, but reconcile
-    // still matches against it (ADR 0005, ADR 0008).
+    // still matches against it, so a re-mention strengthens it.
     let surfing = h.insert_memory("main", SURFING, "event", "trivial");
     h.execute(
         "UPDATE accesses SET at = ?2 WHERE memory_id = (SELECT id FROM memories WHERE uuid = ?1)",
@@ -1241,7 +1242,7 @@ fn a_memory_past_the_knn_limit_is_still_a_neighbour() {
     // More versions of one fact than sqlite-vec returns from one KNN query
     // all sit nearer the claim than another matching memory. Stopping at the
     // limit would leave that memory out of call 2 and bring back the
-    // crowding the 22-version regression covers, just later (ADR 0005).
+    // crowding the 22-version regression covers, just later.
     let h = Harness::new();
     let head = h.insert_chain(TEA, KNN_K_MAX + 4);
     let lot = h.fact(TEA_A_LOT);
@@ -1256,7 +1257,7 @@ fn a_long_chain_doesnt_crowd_out_another_neighbour() {
     // The top five are distinct shown memories, not raw hits: 22 versions of
     // one refined memory collapse to its head, and the next memory that
     // matches still reaches call 2, or a repeat of it would become a
-    // duplicate rather than an access (ADR 0005).
+    // duplicate rather than an access.
     let h = Harness::new();
     let versions: Vec<Uuid> = (0..22).map(|_| h.fact(TEA)).collect();
     for pair in versions.windows(2) {
@@ -1301,7 +1302,7 @@ fn the_request_is_the_input_and_the_call_2_schema() {
     assert!(request.user.contains(&neighbour_handle(&input, tea)));
     // The six reconciliation labels, `denies` among them. Code
     // decides direction from observed_at, so the prompt never asks the LLM
-    // which of the two is newer (ADR 0005).
+    // which of the two is newer.
     let labels: BTreeSet<&str> = request.schema["properties"]["claims"]["items"]["properties"]
         ["labels"]["items"]["properties"]["label"]["enum"]
         .as_array()
@@ -1792,7 +1793,7 @@ fn a_label_on_an_unknown_neighbour_is_ignored() {
 
 #[test]
 fn an_older_claim_arriving_after_a_newer_one_is_created_already_ended() {
-    // ADR 0005: code, not the LLM, decides which is newer, so an old
+    // Code, not the LLM, decides which is newer, so an old
     // document can't overrule a newer memory. An older claim labelled ends
     // is created ended by the neighbour.
     let h = Harness::new();
@@ -2227,7 +2228,7 @@ fn denies_on_an_ended_or_retracted_neighbour_is_rejected() {
     assert_eq!(h.edits_on(dentist, EDIT_RETRACTED), 1);
 }
 
-// A forget's queued chunks (ADR 0010). Forget hides the chain at once and erases it
+// A forget's queued chunks. Forget hides the chain at once and erases it
 // behind the chunks already queued. Those chunks reconcile against the
 // hidden memory, which is still there, so what they say joins its chain
 // and is erased with it. `hidden_at` is set here as forget sets it.
@@ -2517,7 +2518,9 @@ fn call_2_and_the_commit_run_in_observed_at_order() {
     assert_eq!(shown(&input), BTreeSet::from([berlin]));
 }
 
-// Chunks in flight together (`[llm] concurrency`, ADR 0005's amendment).
+// Chunks in flight together (`[llm] concurrency`). Reconciliation is checked
+// at commit against what the search saw, so two chunks stating the same fact
+// make one memory.
 
 /// The owner says `user` in session `s1` at `message_at`. Returns the source.
 fn owner_says_at(h: &Harness, message_at: &str, user: &str) -> Uuid {

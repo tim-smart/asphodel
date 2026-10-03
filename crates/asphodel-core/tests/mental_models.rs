@@ -1,5 +1,6 @@
-//! Agenda, mental models and the system prompt block follow ADRs 0001 and
-//! 0007, including refresh scheduling and memory precedence.
+//! Agenda, mental models and the system prompt block, including refresh
+//! scheduling and memory precedence. A mental model is a cache over
+//! memories: reading or injecting it never counts as an access.
 //!
 //! These tests drive the service on a `SimulatedClock` and refresh models
 //! with `FakeLlm`. Triggers go through the write paths that exist:
@@ -667,7 +668,7 @@ fn plans_model() -> ModelSpec {
     }
 }
 
-// Refresh triggers and scheduling (ADR 0007)
+// Refresh triggers and scheduling
 
 #[test]
 fn a_notable_memory_triggers_a_refresh_five_minutes_later() {
@@ -1143,7 +1144,7 @@ fn the_fingerprint_follows_the_selection_only() {
 
 #[test]
 fn a_faded_memory_leaves_the_model_at_the_next_sweep() {
-    // ADR 0007: when a cited memory fades below τ it leaves the input set,
+    // When a cited memory fades below τ it leaves the input set,
     // and so leaves the model. A model can't keep a memory alive by itself.
     // Here the owner keeps a long-faded memory, the model cites it, and the
     // owner takes the keep back.
@@ -1271,7 +1272,7 @@ fn untouched_entries_are_copied_byte_for_byte_and_edits_keep_their_id() {
 fn invalid_operations_are_rejected_and_the_rest_apply() {
     // Code refuses an entry whose citations aren't in the refresh's input,
     // an entry that cites nothing, and an edit or remove of an entry that
-    // doesn't exist (ADR 0007).
+    // doesn't exist.
     let h = Harness::new();
     let tea = h.insert(fact(TEA));
     let gone = h.insert(faded(fact("Tim once tried surfing in Raglan.")));
@@ -1504,7 +1505,7 @@ fn entries_past_max_tokens_are_trimmed_lowest_ranked_first() {
     assert!(tokens <= 30, "{tokens} tokens");
 }
 
-// Memories win (ADR 0007)
+// Memories win
 
 #[test]
 fn an_entry_citing_a_retracted_memory_is_dropped_from_the_block() {
@@ -1686,11 +1687,7 @@ fn building_the_block_or_the_agenda_never_writes_an_access() {
     h.block(Some("s1"));
     h.block(Some("s2"));
     h.agenda();
-    assert_eq!(
-        h.accesses(),
-        accesses,
-        "being injected never counts (ADR 0001)"
-    );
+    assert_eq!(h.accesses(), accesses, "being injected never counts");
 }
 
 #[test]
@@ -2431,7 +2428,7 @@ fn a_stated_end_holds_through_its_unit_on_the_agenda() {
 
 #[test]
 fn the_whole_block_stays_within_the_budget_and_records_only_what_it_renders() {
-    // ADR 0007: every model "shares about 800 tokens of
+    // Every model "shares about 800 tokens of
     // `system_prompt_block()` with the agenda". The agenda keeps its own
     // caps and is laid out first, so today's appointment can't be pushed
     // out by a model; the models get what's left. What the block lists or

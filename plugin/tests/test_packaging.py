@@ -1,5 +1,5 @@
 """The package is what Hermes' discovery and loader expect, and it depends
-on nothing outside the standard library and Hermes itself (ADR 0006)."""
+on nothing outside the standard library and Hermes itself."""
 
 import ast
 import importlib.util

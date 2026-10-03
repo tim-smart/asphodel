@@ -1,6 +1,6 @@
 //! The daemon over HTTP, and the CLI as its client, run as processes.
 //!
-//! Under ADR 0006, the HTTP contract includes routes under `/v1`,
+//! The HTTP contract includes routes under `/v1`,
 //! the bearer token off loopback, `/v1/health` answering
 //! 503 until the store and models are ready, SIGTERM finishing the chunk in
 //! flight and checkpointing the WAL, and every CLI subcommand reaching the
@@ -1014,7 +1014,7 @@ fn two_chunks_in_flight_stating_one_fact_make_one_memory_and_a_mention() {
     // neighbour. The second to commit finds a memory made since its search
     // at or above the floor for its claim, so it searches again and runs
     // call 2, which labels the claim a mention: one memory plus one access,
-    // never a second copy (ADR 0005). Each call 1 takes 3 s, so both
+    // never a second copy. Each call 1 takes 3 s, so both
     // finishing within 5 s of the start means they ran together.
     let dir = TestDir::new();
     let tuning = pool(2);
@@ -1208,7 +1208,7 @@ fn a_429_with_retry_after_pauses_every_caller_and_counts_no_failure() {
     );
 }
 
-// The CLI as a client (ADR 0006, ADR 0010).
+// The CLI as a client. Every operator command is an HTTP client of the daemon.
 
 /// `asphodel` with a clean environment and `ASPHODEL_URL` pointing at
 /// `daemon`, without its token.
@@ -1538,7 +1538,7 @@ fn a_refresh_held_by_an_extraction_limit_answers_held_over_http_and_the_cli() {
     assert!(!text.contains("failed"), "{text}");
 }
 
-// Forget and the purge pause (ADR 0009; ADR 0010).
+// Forget and the purge pause.
 
 #[test]
 fn forget_erases_over_http_and_the_cli() {
@@ -1699,10 +1699,9 @@ fn a_ready_erase_runs_after_a_restart_without_an_llm() {
     second.wait_for_line("erased a chain");
 }
 
-// Backup, restore, status and the audit lists (ADR 0010,
-// "Backup and restore" and "Sweeps, pauses and failures").
+// Backup, restore, status and the audit lists.
 //
-// The contract these tests pin, beyond what the ADR says:
+// The contract these tests pin:
 //
 // - `POST /v1/backup` answers 200 with the copy as its body and the
 // copy's SHA-256 (lowercase hex) and length in bytes in
@@ -2006,10 +2005,10 @@ fn a_backup_restores_offline_and_writes_a_restored_edit_row() {
     assert!(piped.status.success(), "{}", stderr(&piped));
     assert!(piped.stdout.starts_with(SQLITE_MAGIC), "not a SQLite file");
 
-    // Forgotten after the backup, so a restore brings it back (ADR 0010,
-    // "Consequences"). SIGKILL leaves the forget in the WAL: the restore
-    // has to move the WAL aside with the database, or SQLite would replay
-    // the old store's frames onto the restored one.
+    // Forgotten after the backup, so a restore brings it back: forget never
+    // reaches backups taken before it. SIGKILL leaves the forget in the WAL:
+    // the restore has to move the WAL aside with the database, or SQLite
+    // would replay the old store's frames onto the restored one.
     let forgotten = daemon.ok(daemon.post("/v1/banks/main/forget", &json!({"ids": [id]})));
     assert_eq!(forgotten["forgotten"], json!([id]));
     let data = daemon.data_dir.clone();
@@ -2293,7 +2292,7 @@ fn the_audit_lists_hold_no_content_except_recalls() {
 fn a_restored_store_keeps_its_fingerprint_and_pauses_purge_under_another() {
     // The stored fingerprint travels in the copy: a backup taken under
     // `purge.delta = 0.5`, restored over a store whose fingerprint matches
-    // this daemon's, pauses purge at the next start (ADR 0009, ADR 0010).
+    // this daemon's, pauses purge at the next start.
     let source = TestDir::new();
     let delta = Serve::new(&source).tuning("[purge]\ndelta = 0.5\n").ready();
     delta.create_bank("main");

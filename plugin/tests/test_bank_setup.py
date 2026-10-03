@@ -1,4 +1,4 @@
-"""Bank setup that ``initialize`` couldn't finish (ADR 0010): until a ``PUT``
+"""Bank setup that ``initialize`` couldn't finish: until a ``PUT``
 succeeds, every bank operation retries it first and
 turns are spooled, not dropped. Once the bank exists, a 404 never recreates
 it: ``bank delete`` expects the plugin to be disabled first."""
