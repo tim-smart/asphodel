@@ -506,12 +506,11 @@ fn a_fast_claims_miss_calls_live_with_an_llm_and_counts_it() {
     assert_eq!(report["llm"]["live"], 1, "{report}");
 }
 
-/// `fast` reuses call 1's claims by chunk, but claims recorded without
-/// `[llm] language` are in the text's language. With the setting on, every
-/// chunk's call 1 is a miss answered live, and the next `fast` run with it
-/// reuses those.
+/// Claims and refreshes recorded without `[llm] language` cannot be reused
+/// with the setting on. Both are misses answered live, even with
+/// `--refresh recorded`; the next run in the same language reuses both.
 #[test]
-fn fast_doesnt_reuse_claims_recorded_without_the_language() {
+fn fast_doesnt_reuse_claims_or_refreshes_recorded_without_the_language() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
     record(&dir, &corpus);
@@ -523,9 +522,19 @@ fn fast_doesnt_reuse_claims_recorded_without_the_language() {
     };
     let recorded = call1(cassette_records(&dir));
     assert!(recorded > 0);
+    let recorded_refreshes = cassette_records(&dir)
+        .iter()
+        .filter(|r| is_refresh(r))
+        .count() as u64;
+    assert!(recorded_refreshes > 0, "the fixture must record a refresh");
 
     let english = dir.private_file("english.toml", "[llm]\nlanguage = \"English\"\n");
-    let overrides = ["--overrides", english.to_str().unwrap()];
+    let overrides = [
+        "--overrides",
+        english.to_str().unwrap(),
+        "--refresh",
+        "recorded",
+    ];
     let script = live_script(&dir);
     let first = replay_history(
         &dir,
@@ -538,9 +547,16 @@ fn fast_doesnt_reuse_claims_recorded_without_the_language() {
     );
     assert_ok(&first.output);
     let report = first.report();
-    assert_eq!(report["llm"]["misses"], recorded, "{report}");
-    assert_eq!(report["llm"]["live"], recorded, "{report}");
+    let expected_misses = recorded + recorded_refreshes;
+    assert_eq!(report["llm"]["misses"], expected_misses, "{report}");
+    assert_eq!(report["llm"]["live"], expected_misses, "{report}");
     assert_eq!(call1(cassette_records(&dir)), 2 * recorded);
+    let english_refreshes = cassette_records(&dir)
+        .into_iter()
+        .filter(|r| is_refresh(r) && r["language"] == "English")
+        .count() as u64;
+    assert_eq!(english_refreshes, recorded_refreshes);
+    let cassette = fs::read(dir.private_path("cassettes/main.jsonl")).unwrap();
 
     let second = replay_history(
         &dir,
@@ -553,6 +569,12 @@ fn fast_doesnt_reuse_claims_recorded_without_the_language() {
     );
     assert_ok(&second.output);
     assert_eq!(second.report()["llm"]["misses"], 0);
+    assert_eq!(second.report()["llm"]["live"], 0);
+    assert_eq!(
+        fs::read(dir.private_path("cassettes/main.jsonl")).unwrap(),
+        cassette,
+        "same-language claims and refreshes are reused without recording anything"
+    );
 }
 
 // The determinism self-test.
