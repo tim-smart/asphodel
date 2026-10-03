@@ -144,3 +144,16 @@ keeps counting into the same progress, so its run row counts every attempt
 and keeps the first attempt's start time.
 
 The migration only adds the table. No action is needed.
+
+## Schema version 11: a prefetch logs its raw query
+
+Prefetch now recalls for the user's message without the note Hermes'
+Discord gateway puts in front of it (`[Triggering message id: …]`) and
+without the `[Name] ` speaker prefix of a shared thread. `recalls.query`
+holds that cleaned query, and the new `recalls.raw_query` holds the message
+as it was sent. The sweep clears both at the 90-day horizon.
+
+The migration only adds the column. Recalls logged before it, and recall
+tool and refresh rows, have no raw query. No action is needed, but a
+reranker floor calibrated on recalls from before version 11 was calibrated
+on uncleaned queries.

@@ -23,7 +23,7 @@ use std::path::Path;
 
 use anyhow::{Context as _, bail};
 use asphodel_core::extraction::Call2List;
-use asphodel_core::retrieval::GateCandidate;
+use asphodel_core::retrieval::ScoredPrefetch;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -43,14 +43,19 @@ pub struct Material {
     pub call2: Vec<Call2Sample>,
 }
 
-/// A sampled turn's prefetch: the query the reranker scored against, and
-/// its candidates in ranked order.
+/// A sampled turn's prefetch: the query the reranker scored against, the
+/// message it was cleaned from, and its candidates in ranked order.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecallSample {
     pub sample: String,
     pub at: Timestamp,
     pub session: String,
+    /// The cleaned query, which calibration uses.
     pub query: String,
+    /// The message as Hermes sent it. Material written before it was
+    /// recorded has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_query: Option<String>,
     pub candidates: Vec<Candidate>,
 }
 
@@ -77,6 +82,7 @@ struct Turn {
     at: Timestamp,
     session: String,
     query: String,
+    raw_query: String,
     candidates: Vec<(Uuid, String, f64)>,
 }
 
@@ -93,11 +99,13 @@ impl Collector {
     /// A synced turn's prefetch. A candidate the reranker didn't score has
     /// no logit to label against and is left out; replay never skips the
     /// reranker, so there are none in practice.
-    pub fn turn(&mut self, at: Timestamp, session: &str, query: &str, shown: &[GateCandidate]) {
+    pub fn turn(&mut self, at: Timestamp, session: &str, scored: &ScoredPrefetch) {
+        let shown = &scored.candidates;
         self.turns.push(Turn {
             at,
             session: session.to_owned(),
-            query: query.to_owned(),
+            query: scored.query.clone(),
+            raw_query: scored.raw_query.clone(),
             candidates: shown
                 .iter()
                 .filter_map(|candidate| {
@@ -142,6 +150,7 @@ impl Collector {
                     at: turn.at,
                     session: turn.session,
                     query: turn.query,
+                    raw_query: Some(turn.raw_query),
                 }
             })
             .collect();

@@ -21,7 +21,7 @@ use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
 
 /// The schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// How long a pre-migration copy is kept after its migration completes.
 pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
@@ -48,7 +48,14 @@ const MIGRATIONS: &[(u32, &str)] = &[
     ),
     (9, include_str!("../../migrations/0009_sweep_progress.sql")),
     (10, include_str!("../../migrations/0010_reembed.sql")),
+    (11, include_str!("../../migrations/0011_raw_query.sql")),
 ];
+
+/// The column a migration adds, by version. Every migration is safe to run
+/// again over a store that already has what it adds, and SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so a migration whose column is already there
+/// is skipped.
+const ADDED_COLUMNS: &[(u32, &str, &str)] = &[(11, "recalls", "raw_query")];
 
 /// What one open applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +160,13 @@ pub fn apply(
         if to <= current {
             continue;
         }
-        tx.execute_batch(sql)?;
+        let added = match ADDED_COLUMNS.iter().find(|(version, ..)| *version == to) {
+            Some((_, table, column)) => has_column(&tx, table, column)?,
+            None => false,
+        };
+        if !added {
+            tx.execute_batch(sql)?;
+        }
         current = to;
     }
     if current > from {
@@ -176,6 +189,16 @@ pub fn apply(
         to: current,
         copy,
     })
+}
+
+/// Whether `table` has `column`.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        (table, column),
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count > 0)
 }
 
 /// Deletes pre-migration copies whose migration completed more than

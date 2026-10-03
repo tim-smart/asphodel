@@ -300,7 +300,10 @@ chunks past the 90-day horizon.
 Purge and forget rows hold ids, times, chunks and spans, never content. A
 sweep row holds counts, plus the fingerprint and δ it ran under, and is kept
 indefinitely. `recalls` shows each recall's query, which is content, so
-treat its output like the store.
+treat its output like the store. For a prefetch the query is the cleaned
+message, and `raw_query` is the message as Hermes sent it, which the text
+output prints on a `raw:` line when cleaning changed it. The sweep clears
+both.
 
 ### Models
 
