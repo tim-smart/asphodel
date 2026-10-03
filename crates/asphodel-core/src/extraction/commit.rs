@@ -28,7 +28,7 @@ struct Written {
 }
 
 impl Written {
-    /// Direct endings close tasks when the claim was said, not at its event time.
+    /// Task endings use when the claim was said, not its event time.
     fn end_for(&self, task: bool) -> (Stamp, bool) {
         if task {
             (self.said_at, false)
@@ -593,8 +593,8 @@ fn end(
 
 /// The memories `superseded` had ended, now that a claim supersedes it. After a `retracts` or
 /// `refines` their end follows the successor, which still ended them, except
-/// task refinements preserve the original closing boundary. Retractions and
-/// state refinements keep event-time endings. After
+/// task refinements preserve the original closing boundary and task corrections
+/// use the successor observation time. States keep event-time endings. After
 /// a `denies` (`denied`) the ending never happened, so they're open again.
 /// The label decides whether to reopen. Either way the edit is logged.
 fn reopen(
@@ -643,7 +643,7 @@ fn reopen(
                     false,
                 )
             } else {
-                successor.end
+                successor.end_for(task)
             };
             end(
                 tx,
