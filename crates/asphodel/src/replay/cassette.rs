@@ -9,11 +9,11 @@
 //!
 //! - `live` answers from the cassette and calls and records on a miss.
 //! - `replay` answers from the cassette and fails on a miss.
-//! - `fast` reuses call 1's claims by chunk and `used` verdicts by (reply
-//!   hash, sentence hash) pair, judges the pairs nobody has judged with one
-//!   short top-up call, and answers call 2 and refreshes by request key,
-//!   calling the LLM on a miss when one is configured. `--refresh` says
-//!   how refreshes are answered.
+//! - `fast` reuses call 1's claims by chunk and `[llm] language` and
+//!   `used` verdicts by (reply hash, sentence hash) pair, judges the pairs
+//!   nobody has judged with one short top-up call, and answers call 2 and
+//!   refreshes by request key, calling the LLM on a miss when one is
+//!   configured. `--refresh` says how refreshes are answered.
 //!
 //! A record carries prompt text, so the cassette never leaves the private
 //! dir. Nothing here logs content.
@@ -84,6 +84,11 @@ pub struct Record {
     /// so a substituted reply can be carried over by identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub identities: Vec<(String, Uuid)>,
+    /// The run's `[llm] language`, which call 1 claims and refresh entries
+    /// are written in. A record from before the setting has none, as did
+    /// the run that made it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     pub request: LlmRequest,
     pub response: LlmResponse,
 }
@@ -162,8 +167,8 @@ impl ChunkContext {
 struct Index {
     records: Vec<Record>,
     by_key: BTreeMap<String, usize>,
-    /// Call 1 records by chunk, template version and model.
-    claims: BTreeMap<(ChunkKey, u32, String), usize>,
+    /// Call 1 records by chunk, template version, model and language.
+    claims: BTreeMap<(ChunkKey, u32, String, Option<String>), usize>,
     /// `used` verdicts by (reply hash, sentence hash).
     pairs: BTreeMap<(String, String), bool>,
     /// Refresh records, for the nearest-in-time substitution.
@@ -178,7 +183,12 @@ impl Index {
             && record.template.name == CALL1_TEMPLATE
         {
             self.claims.insert(
-                (chunk.clone(), record.template.version, record.model.clone()),
+                (
+                    chunk.clone(),
+                    record.template.version,
+                    record.model.clone(),
+                    record.language.clone(),
+                ),
                 index,
             );
         }
@@ -245,6 +255,9 @@ pub struct Recorder {
     no_cache: bool,
     live: Option<Arc<dyn LlmClient>>,
     model: String,
+    /// The run's `[llm] language`. Call 1 claims recorded in another
+    /// language are never reused by chunk.
+    language: Option<String>,
     clock: Arc<SimulatedClock>,
     index: Mutex<Index>,
     chunk: Mutex<Option<ChunkContext>>,
@@ -270,6 +283,7 @@ impl Recorder {
         refresh: RefreshMode,
         no_cache: bool,
         live: Option<Arc<dyn LlmClient>>,
+        language: Option<String>,
         clock: Arc<SimulatedClock>,
     ) -> anyhow::Result<Self> {
         super::refuse_symlink(path)?;
@@ -321,6 +335,7 @@ impl Recorder {
             no_cache,
             live,
             model,
+            language,
             clock,
             index: Mutex::new(index),
             chunk: Mutex::new(None),
@@ -387,7 +402,12 @@ impl Recorder {
     pub fn compose_call1(&self, context: &ChunkContext) -> Result<Option<Value>, LlmError> {
         let (claims, mut used, unknown) = {
             let index = lock(&self.index);
-            let key = (context.key.clone(), CALL1_VERSION, self.model.clone());
+            let key = (
+                context.key.clone(),
+                CALL1_VERSION,
+                self.model.clone(),
+                self.language.clone(),
+            );
             let Some(&position) = index.claims.get(&key) else {
                 return Ok(None);
             };
@@ -564,6 +584,7 @@ impl Recorder {
                 .filter(|_| request.template.name != CALL2_TEMPLATE)
                 .map(|context| context.reply_hash.clone()),
             identities: identities.to_vec(),
+            language: self.language.clone(),
             request: request.clone(),
             response: response.clone(),
         };
@@ -599,7 +620,7 @@ impl Recorder {
 
     /// `fast` with `--refresh recorded`: the recorded refresh of the same
     /// mental model, by the question line the request starts with, nearest
-    /// in simulated time, among those made with this run's LLM model and
+    /// in simulated time, among those made with this run's LLM model, language, and
     /// the request's template version. Its operations are carried over by
     /// identity: each handle goes to the memory or entry it stood for when
     /// recorded, then to that one's handle now, and an operation whose
@@ -619,6 +640,7 @@ impl Recorder {
             .map(|&position| &index.records[position])
             .filter(|record| {
                 record.model == self.model
+                    && record.language == self.language
                     && record.template.version == request.template.version
                     && record.request.user.lines().next().unwrap_or("") == question
             })

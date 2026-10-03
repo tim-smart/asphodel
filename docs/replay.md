@@ -497,8 +497,9 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   afresh, so a re-recording leaves one record per call, and the report's
   cassette hash is of the empty cassette it started from. `replay` answers from
   the cassette and fails on a miss, with exit 2 and no report. `fast`
-  reuses call 1's claims by chunk (source id and chunk position) and `used`
-  verdicts by (reply hash, sentence hash) pair, judges the pairs nobody has
+  reuses call 1's claims by chunk (source id and chunk position) and
+  `[llm] language`, so claims recorded in one language never answer a run
+  set to another, and `used` verdicts by (reply hash, sentence hash) pair, judges the pairs nobody has
   judged with one short `judge_used` call, and answers call 2 and refreshes
   by request key, calling the LLM on a miss when one is configured. The
   report counts every miss, so "fast with zero misses" is a number.

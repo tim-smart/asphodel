@@ -97,7 +97,7 @@ pub use prompt::call1_request;
 
 /// Call 1's template name and version, which replay's cassette keys include.
 pub const CALL1_TEMPLATE: &str = "extract_claims";
-pub const CALL1_VERSION: u32 = 2;
+pub const CALL1_VERSION: u32 = 3;
 
 /// Call 2's template name and version, which replay's cassette keys include.
 pub const CALL2_TEMPLATE: &str = "reconcile_claims";
@@ -196,6 +196,9 @@ pub struct Call1Input {
     /// `used` on every memory it cites. Always empty
     /// for a document.
     pub entries: Vec<InContextEntry>,
+    /// `[llm] language`: the language every claim is written in. `None`
+    /// writes each in the language of the passage it quotes.
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

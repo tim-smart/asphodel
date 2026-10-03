@@ -295,6 +295,11 @@ pub struct LlmTuning {
     /// How many LLM calls may be in flight at once, daemon-wide, and how
     /// many chunks each bank extracts at once. At 1, extraction is serial.
     pub concurrency: u32,
+
+    /// The language every memory and mental model entry is written in, such
+    /// as `"English"`, translating from the text when it's in another one.
+    /// Unset writes each in the language of what it comes from.
+    pub language: Option<String>,
 }
 
 impl Default for LlmTuning {
@@ -305,6 +310,7 @@ impl Default for LlmTuning {
             endpoint: None,
             reasoning_effort: None,
             concurrency: 1,
+            language: None,
         }
     }
 }
@@ -570,6 +576,11 @@ impl Tuning {
             && model.trim().is_empty()
         {
             fail("llm.model", "must not be empty".into());
+        }
+        if let Some(language) = &self.llm.language
+            && language.trim().is_empty()
+        {
+            fail("llm.language", "must not be empty".into());
         }
         if let Some(endpoint) = &self.llm.endpoint {
             // Keep the raw spelling: URL parsing silently repairs missing

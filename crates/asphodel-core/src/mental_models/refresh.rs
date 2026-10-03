@@ -119,6 +119,7 @@ fn select(cx: &Context<'_>, model: &ModelRow, log: bool) -> Result<Selection, Mo
         });
     let input = RefreshInput {
         question: model.question.clone(),
+        language: cx.tuning.llm.language.clone(),
         max_tokens: model.max_tokens,
         memories: selected
             .iter()
@@ -349,7 +350,7 @@ fn failed(cx: &Context<'_>, model: &ModelRow, kind: FailureKind) -> Result<Outco
 const SYSTEM: &str = "You keep a mental model: a short list of entries that answers a standing \
 question about the user, built only from their memories. Each entry is one plain sentence of \
 about 25 words at most, and cites by handle every memory it rests on. Say nothing the cited \
-memories don't support, and use names, not pronouns.
+memories don't support, and use names, not pronouns. {language_rule}
 
 Reply with operations on the current entries:
 - add: a new entry, with its text and cites;
@@ -361,6 +362,18 @@ Leave an entry that's still right alone: don't edit it to reword it. Cite only t
 listed (m1, m2, ...); every entry must cite at least one. Keep all the entries together within the \
 token budget, about four characters to a token, and put what matters most first. Reply with no \
 operations when nothing needs to change.";
+
+/// The system prompt, with the language rule for `language`.
+fn system(language: Option<&str>) -> String {
+    let rule = match language {
+        None => "Write the entries in the language of the memories they cite.".to_owned(),
+        Some(language) => format!(
+            "Write every entry in {}, translating if the memories are in another language.",
+            language.trim()
+        ),
+    };
+    SYSTEM.replace("{language_rule}", &rule)
+}
 
 fn request(input: &RefreshInput) -> LlmRequest {
     let mut user = format!(
@@ -390,7 +403,7 @@ fn request(input: &RefreshInput) -> LlmRequest {
             name: REFRESH_TEMPLATE.into(),
             version: REFRESH_VERSION,
         },
-        system: SYSTEM.to_owned(),
+        system: system(input.language.as_deref()),
         user,
         schema_name: "mental_model_edits".into(),
         schema: schema(),

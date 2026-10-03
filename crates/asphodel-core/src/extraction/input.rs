@@ -289,6 +289,7 @@ pub(super) fn assemble(
         candidates,
         in_context: in_context_memories,
         entries: in_context_entries,
+        language: tuning.llm.language.clone(),
     };
     Ok((input, unit))
 }

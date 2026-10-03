@@ -332,6 +332,27 @@ fn llm_concurrency_defaults_to_one_and_is_at_least_one() {
 }
 
 #[test]
+fn llm_language_is_unset_by_default_and_must_not_be_empty() {
+    // Unset keeps the language inferred from the text; set, it's the
+    // language every claim is written in.
+    assert_eq!(Tuning::default().llm.language, None);
+    let tuning = load("[llm]\nlanguage = \"English\"\n").unwrap();
+    assert_eq!(tuning.llm.language.as_deref(), Some("English"));
+    // `GET /v1/config` shows the resolved value.
+    let config = ResolvedConfig::new(tuning, deployment(None, None));
+    let json = serde_json::to_value(&config).unwrap();
+    assert_eq!(json["tuning"]["llm"]["language"], "English");
+
+    for value in ["\"\"", "\"  \"", "\"\\t\""] {
+        assert_eq!(
+            invalid_keys(&format!("[llm]\nlanguage = {value}\n")),
+            ["llm.language"],
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn embedding_floors_must_be_cosines() {
     // floors inside the model's score range.
     for value in ["1.5", "-1.01", "nan", "inf"] {

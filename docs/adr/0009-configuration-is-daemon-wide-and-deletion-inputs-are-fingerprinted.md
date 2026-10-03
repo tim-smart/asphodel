@@ -75,3 +75,27 @@ This adds one tuning key and one file; the decision above stands.
 - A usage limit on the subscription is not a failure. The daemon reports
   when the window resets, and the extraction queue holds until then
   instead of failing chunks or counting retries.
+
+## Amendment: the language memories are written in (2026-10-03)
+
+The local models are English-only, so a store in another language embeds
+and reranks badly against floors set on English. One tuning key lets the
+operator force the language the LLM writes in. The decision above stands.
+
+- `[llm] language`, a language name such as `"English"`, unset by default.
+  It's daemon-wide like the rest of `Tuning`: a bank can't override it, and
+  it takes effect on restart. An empty or whitespace-only value stops the
+  daemon.
+- Unset, call 1 writes each claim in the language of the passage it quotes,
+  as before, and a refresh writes entries in the language of the memories
+  they cite. Set, both write in that language and translate. Quotes and
+  surface forms stay exactly as the text has them, and entity names keep
+  the text's form.
+- The rule goes in the system prompt, which is still the same for every
+  chunk on a daemon, so provider prompt caching keeps working.
+- It isn't a deletion input, so changing it doesn't pause purge. Memories
+  already stored aren't re-extracted, and a store that changes the setting
+  holds both languages.
+- `GET /v1/config` shows the resolved value. Cassette records keep the
+  run's language, and `fast` reuses call 1's claims only from a recording
+  made with the same one.

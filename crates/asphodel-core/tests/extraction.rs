@@ -101,9 +101,14 @@ impl Drop for TestDir {
 
 /// A floor for each fake model, so a service opens on the fakes.
 fn tuning_for_fakes() -> Tuning {
+    tuning_for_fakes_and("")
+}
+
+/// [`tuning_for_fakes`] with `extra` tuning TOML appended.
+fn tuning_for_fakes_and(extra: &str) -> Tuning {
     Tuning::from_toml(&format!(
         "[injection.reranker_floors]\n\"{}\" = 0.0\n\
-         [reconcile.embedding_floors]\n\"{}\" = 0.5\n",
+         [reconcile.embedding_floors]\n\"{}\" = 0.5\n{extra}",
         FakeReranker::MODEL_ID,
         FakeEmbedder::MODEL_ID,
     ))
@@ -155,12 +160,24 @@ impl Harness {
         )
     }
 
+    /// `extra` is more tuning TOML, appended to the floors the fakes need.
+    fn with_tuning(extra: &str) -> Self {
+        Self::build(
+            Models::fake(),
+            OpenOptions::default(),
+            tuning_for_fakes_and(extra),
+        )
+    }
+
     fn with_options(models: Models, options: OpenOptions) -> Self {
+        Self::build(models, options, tuning_for_fakes())
+    }
+
+    fn build(models: Models, options: OpenOptions, tuning: Tuning) -> Self {
         let dir = TestDir::new();
         let clock = Arc::new(SimulatedClock::new(at(START)));
         let store = Store::open(&dir.data(), options, clock.clone()).unwrap();
-        let service =
-            Service::with_models(clock.clone(), store, tuning_for_fakes(), models).unwrap();
+        let service = Service::with_models(clock.clone(), store, tuning, models).unwrap();
         service
             .ensure_bank_with_models("main", &identity())
             .unwrap();
@@ -3209,6 +3226,40 @@ fn the_prompts_state_the_extraction_rules() {
     let user = call1_request(&input(&h, "main", &[])).user;
     assert!(user.contains("Reference date: unknown"), "{user}");
     assert!(user.contains("Don't resolve relative times."), "{user}");
+
+    // `[llm] language` forces the claims' language. The rule is in the
+    // system prompt, which stays the same for every chunk.
+    let forced = Harness::with_tuning("[llm]\nlanguage = \"English\"\n");
+    ingest(&forced, &turn("s1", T1, "Hola.", "Hola."));
+    let first = call1_request(&input(&forced, "main", &[])).system;
+    assert!(
+        first.contains(
+            "Write every claim in English, translating if the text is in another language."
+        ),
+        "{first}"
+    );
+    assert!(!first.contains("never translate"), "{first}");
+    // Quotes and surface forms stay as the text has them.
+    assert!(
+        first.contains("`quote` is the exact passage of the text"),
+        "{first}"
+    );
+    assert!(
+        first.contains("`surface_form` is how the text names the entity"),
+        "{first}"
+    );
+    extract(&forced, reply(vec![], &[]));
+    ingest(
+        &forced,
+        &turn(
+            "s1",
+            "2026-10-01T07:00:00Z",
+            "Me mudo a Lisboa.",
+            "¡Qué bien!",
+        ),
+    );
+    let second = call1_request(&input(&forced, "main", &[])).system;
+    assert_eq!(first, second);
 }
 
 // Deterministic entity ids: in replay an entity id is UUIDv5 of the

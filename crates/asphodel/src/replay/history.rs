@@ -183,6 +183,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             refresh,
             args.no_cache,
             live.clone(),
+            tuning.llm.language.clone(),
             Arc::clone(&clock),
         )?;
         let settings = Settings {
