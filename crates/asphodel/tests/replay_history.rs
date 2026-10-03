@@ -201,6 +201,63 @@ fn a_stale_commit_redoes_call_2_through_the_cassette_and_replays() {
     assert_eq!(simulation(&live), simulation(&replay));
 }
 
+/// A redo takes as long as the call 2 that answers it. With every call 1
+/// recorded at 20 minutes and the redo's call 2 at 10, the repeat (synced
+/// ten minutes after the home turn, so out with it) completes at 30
+/// minutes, finds itself stale and commits after its redo, 30 minutes
+/// after its sync: never at the completion it had before the redo.
+#[test]
+fn a_redo_is_charged_the_latency_of_its_call_2() {
+    let dir = TestDir::new();
+    let corpus = imported_with_home_twice(&dir);
+    let script = mention_script(&dir);
+    let flags = pooled_flags(&dir);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let live = replay_history(
+        &dir,
+        &corpus,
+        "live",
+        PASSING_PROBES,
+        "live",
+        Some(&script),
+        &flags,
+    );
+    assert_ok(&live.output);
+    let minutes = |n: u64| n * 60 * 1000;
+    let timed: Vec<Value> = cassette_records(&dir)
+        .into_iter()
+        .map(|mut record| {
+            record["latency_ms"] = if is_call2(&record) {
+                minutes(10).into()
+            } else {
+                minutes(20).into()
+            };
+            record
+        })
+        .collect();
+    write_cassette(&dir, &timed);
+
+    // Latency from the cassette: no --latency.
+    let replay = replay_history(
+        &dir,
+        &corpus,
+        "replay",
+        PASSING_PROBES,
+        "timed",
+        None,
+        &flags[..2],
+    );
+    assert_ok(&replay.output);
+    let report = replay.report();
+    assert_eq!(report["call2_rate"]["redos"], 1, "{report}");
+    assert_eq!(report["extraction_lag"]["p50_ms"], minutes(20), "{report}");
+    assert_eq!(
+        report["extraction_lag"]["p95_ms"],
+        minutes(30),
+        "the repeat commits after its redo's call 2: {report}"
+    );
+}
+
 /// Without the redo's call 2 in the cassette, `replay` stops on the miss
 /// and `fast` answers it from the LLM and records it.
 #[test]

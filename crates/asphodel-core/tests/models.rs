@@ -914,10 +914,9 @@ fn http_statuses_map_to_retryable_or_not() {
 }
 
 #[test]
-fn a_429_with_retry_after_in_seconds_is_a_rate_limit_and_a_date_is_not() {
+fn a_429_with_retry_after_in_seconds_is_a_rate_limit() {
     // Seconds say when to come back, so every caller holds for that long
-    // and nothing is counted. The client has no clock to read a date by,
-    // so that 429 counts like one with no Retry-After.
+    // and nothing is counted.
     let server = StubServer::start(StubResponse::status(429).with_header("Retry-After", "30"));
     let error = OpenAiCompatible::new(server.settings(None))
         .complete(&request())
@@ -928,17 +927,15 @@ fn a_429_with_retry_after_in_seconds_is_a_rate_limit_and_a_date_is_not() {
     );
     assert!(!error.is_retryable(), "deferral, not a retry");
 
-    for header in ["Wed, 21 Oct 2026 07:28:00 GMT", "soon"] {
-        let server =
-            StubServer::start(StubResponse::status(429).with_header("Retry-After", header));
-        let error = OpenAiCompatible::new(server.settings(None))
-            .complete(&request())
-            .unwrap_err();
-        assert!(
-            matches!(error, LlmError::Status { status: 429 }),
-            "{header}: {error:?}"
-        );
-    }
+    // A header that's neither seconds nor a date counts like none.
+    let server = StubServer::start(StubResponse::status(429).with_header("Retry-After", "soon"));
+    let error = OpenAiCompatible::new(server.settings(None))
+        .complete(&request())
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::Status { status: 429 }),
+        "{error:?}"
+    );
 
     // Retry-After on any other status changes nothing.
     let server = StubServer::start(StubResponse::status(503).with_header("Retry-After", "30"));
@@ -947,6 +944,45 @@ fn a_429_with_retry_after_in_seconds_is_a_rate_limit_and_a_date_is_not() {
         .unwrap_err();
     assert!(
         matches!(error, LlmError::Status { status: 503 }),
+        "{error:?}"
+    );
+}
+
+/// `Retry-After` as an HTTP date, the header's other form (RFC 9110).
+fn retry_after_date(from_now: jiff::SignedDuration) -> String {
+    let at = asphodel_core::clock::SystemClock.now() + from_now;
+    jiff::fmt::rfc2822::DateTimePrinter::new()
+        .timestamp_to_rfc9110_string(&at)
+        .unwrap()
+}
+
+#[test]
+fn a_429_with_retry_after_as_a_date_is_a_rate_limit_too() {
+    // A future date holds every caller until then, like seconds would; a
+    // date already past holds no time at all. Neither is counted.
+    let server = StubServer::start(StubResponse::status(429).with_header(
+        "Retry-After",
+        &retry_after_date(SignedDuration::from_mins(10)),
+    ));
+    let error = OpenAiCompatible::new(server.settings(None))
+        .complete(&request())
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::RateLimited { retry_after }
+            if retry_after > Duration::from_secs(8 * 60) && retry_after <= Duration::from_secs(10 * 60)),
+        "{error:?}"
+    );
+    assert!(!error.is_retryable(), "deferral, not a retry");
+
+    let server = StubServer::start(StubResponse::status(429).with_header(
+        "Retry-After",
+        &retry_after_date(SignedDuration::from_mins(-10)),
+    ));
+    let error = OpenAiCompatible::new(server.settings(None))
+        .complete(&request())
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::ZERO),
         "{error:?}"
     );
 }

@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use asphodel_core::ingest::Turn;
 use asphodel_core::models::{
-    Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest, LlmResponse,
-    ModelError as EmbedError, Models,
+    Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmGate, LlmRequest,
+    LlmResponse, ModelError as EmbedError, Models, Template,
 };
 use asphodel_core::retrieval::{PrefetchRequest, estimate_tokens};
 use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME};
@@ -869,6 +869,79 @@ fn a_failed_refresh_is_retried_after_thirty_minutes_not_at_the_next_trigger() {
     let status = h.service.status().unwrap();
     assert_eq!(status.banks[BANK].failed_refreshes, 0);
     assert_eq!(status.attention, Vec::<String>::new());
+}
+
+/// The daemon's gate holds every call once any call hits a limit,
+/// extraction's included. A refresh it holds never reached the LLM, so it
+/// isn't a failure: nothing needs attention, and it runs once the hold
+/// lifts rather than thirty minutes after.
+fn a_refresh_held_by_the_gate_waits_for_the_hold_not_thirty_minutes(
+    limit: Value,
+    lifts: Timestamp,
+) {
+    let h = Harness::new();
+    h.says(notable(TEA));
+    h.advance(minutes(5));
+    let inner = Arc::new(
+        FakeLlm::from_script(MODEL, &json!([limit, {"reply": reply(vec![])}]).to_string()).unwrap(),
+    );
+    let gate = LlmGate::new(inner.clone(), 1, h.clock.clone());
+    let extraction = LlmRequest {
+        template: Template {
+            name: "extract_claims".into(),
+            version: 2,
+        },
+        system: String::new(),
+        user: String::new(),
+        schema_name: "claims".into(),
+        schema: json!({}),
+        max_tokens: None,
+    };
+    gate.complete(&extraction)
+        .expect_err("the extraction call hits the limit");
+
+    let held = h.service.run_refreshes(&gate).unwrap();
+    assert_eq!(
+        inner.requests().len(),
+        1,
+        "the refresh never reached the LLM"
+    );
+    assert!(
+        held.ran
+            .iter()
+            .all(|run| !matches!(run.outcome, Outcome::Failed(_))),
+        "{:?}",
+        held.ran
+    );
+    assert_eq!(h.profile().last_error, None);
+    let status = h.service.status().unwrap();
+    assert_eq!(status.banks[BANK].failed_refreshes, 0);
+    assert_eq!(status.attention, Vec::<String>::new());
+    assert_eq!(held.next_due, Some(lifts), "due again when the hold lifts");
+
+    h.set(lifts);
+    let ran = h.service.run_refreshes(&gate).unwrap();
+    assert_eq!(ran.ran.len(), 1);
+    assert_eq!(refresh_calls(&inner), 1);
+    assert_eq!(h.profile().last_refreshed_at, Some(lifts));
+}
+
+#[test]
+fn a_refresh_held_by_a_usage_limit_on_extraction_waits_for_the_reset() {
+    let resets_at = at(START) + minutes(7);
+    a_refresh_held_by_the_gate_waits_for_the_hold_not_thirty_minutes(
+        json!({"fail": "usage_limited", "resets_at": resets_at.to_string()}),
+        resets_at,
+    );
+}
+
+#[test]
+fn a_refresh_held_by_a_rate_limit_on_extraction_waits_for_retry_after() {
+    // The limit is hit five minutes after the start, after the fact said.
+    a_refresh_held_by_the_gate_waits_for_the_hold_not_thirty_minutes(
+        json!({"fail": "status", "status": 429, "retry_after_secs": 120}),
+        at(START) + minutes(5) + minutes(2),
+    );
 }
 
 #[test]
