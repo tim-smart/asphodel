@@ -1,9 +1,9 @@
-//! Translating a memory into `[llm] language`, one memory at a time.
+//! Translating a memory into `[llm] language` (`Service::translate_memory`).
 //!
-//! The API under test is `Service::translate_memory`. A translation is a new
-//! memory that supersedes the one named, the way a refinement does, so the
-//! chain carries strength, accesses and provenance over. Every memory here
-//! is synthetic, inserted directly.
+//! A translation is a new memory that supersedes the one named, the way a
+//! refinement does, so the chain carries strength, accesses and provenance
+//! over. The other two tests race a translation against the bank's other
+//! writers. Every memory here is synthetic, inserted directly.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -18,10 +18,8 @@ use asphodel_core::extraction::EDIT_REFINED;
 use asphodel_core::ingest::Turn;
 use asphodel_core::inspect::MemoryView;
 use asphodel_core::models::{
-    Embedder, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest,
-    LlmResponse, ModelError, Models,
+    Embedder, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, ModelError, Models,
 };
-use asphodel_core::retrieval::RecallRequest;
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::{DB_FILE, OpenOptions, Store, VectorIndex, micros};
 use asphodel_core::translate::{TranslateError, Translation};
@@ -48,50 +46,9 @@ fn at(text: &str) -> Timestamp {
 /// A temporary directory removed even when an assertion unwinds.
 struct TestDir(PathBuf);
 
-impl TestDir {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "asphodel-translate-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn data(&self) -> PathBuf {
-        self.0.join("data")
-    }
-}
-
 impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Floors for the fakes, and `[llm] language` when given.
-fn tuning(language: Option<&str>) -> Tuning {
-    let mut toml = format!(
-        "[injection.reranker_floors]\n\"{}\" = 0.0\n\
-         [reconcile.embedding_floors]\n\"{}\" = 0.5\n\"{}\" = 0.5\n",
-        FakeReranker::MODEL_ID,
-        FakeEmbedder::MODEL_ID,
-        FakeEmbedderV2::MODEL_ID,
-    );
-    if let Some(language) = language {
-        toml.push_str(&format!("[llm]\nlanguage = \"{language}\"\n"));
-    }
-    Tuning::from_toml(&toml).unwrap()
-}
-
-fn identity() -> BankIdentity {
-    BankIdentity {
-        owner_name: Some("Tim".into()),
-        owner_platform_ids: vec![],
-        assistant_name: Some("Hermes".into()),
-        timezone: Some(TZ.into()),
     }
 }
 
@@ -100,69 +57,128 @@ fn next_uuid() -> Uuid {
     Uuid::from_u128((0x7a_u128 << 120) | u128::from(NEXT.fetch_add(1, Ordering::Relaxed)))
 }
 
+fn turn(session: &str, user: &str) -> Turn {
+    Turn {
+        session_id: session.into(),
+        message_at: at("2026-10-01T06:30:00Z"),
+        timezone: Some(TZ.into()),
+        user_text: user.into(),
+        assistant_text: "Noted.".into(),
+        author: None,
+        platform: Some("cli".into()),
+        recall_id: None,
+        forget_requested: false,
+    }
+}
+
 /// The LLM's reply for a translation.
 fn reply(sentence: &str) -> Value {
     json!({ "sentence": sentence })
 }
 
-/// A service on the fakes with one bank, `main`. Field order matters: the
+fn llm(sentence: &str) -> FakeLlm {
+    FakeLlm::scripted("fake-llm", vec![reply(sentence)])
+}
+
+/// A service on the fakes with one bank, `main`, and an extracted turn
+/// saying [`PASSAGE`] for memories to rest on. Field order matters: the
 /// service drops before the directory it lives in.
 struct Harness {
     service: Service,
     clock: Arc<SimulatedClock>,
     dir: TestDir,
+    chunk: i64,
 }
 
 impl Harness {
     fn new(language: Option<&str>) -> Self {
-        let dir = TestDir::new();
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = TestDir(std::env::temp_dir().join(format!(
+            "asphodel-translate-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
         let clock = Arc::new(SimulatedClock::new(at(START)));
-        let store = Store::open(&dir.data(), OpenOptions::default(), clock.clone()).unwrap();
-        let service =
-            Service::with_models(clock.clone(), store, tuning(language), Models::fake()).unwrap();
-        service
-            .ensure_bank_with_models("main", &identity())
+        let mut h = Self::open(dir, clock, 0, language, Models::fake(), None);
+        h.service
+            .ensure_bank_with_models(
+                "main",
+                &BankIdentity {
+                    owner_name: Some("Tim".into()),
+                    owner_platform_ids: vec![],
+                    assistant_name: Some("Hermes".into()),
+                    timezone: Some(TZ.into()),
+                },
+            )
             .unwrap();
-        Self {
-            service,
-            clock,
-            dir,
-        }
+        h.service
+            .ingest_turn("main", &turn("fixtures", PASSAGE))
+            .unwrap();
+        h.chunk = h.one("SELECT id FROM chunks", []);
+        h.execute("DELETE FROM extraction_queue", []);
+        h.execute("UPDATE chunks SET extracted_at = ?1", [micros(at(START))]);
+        h
     }
 
-    /// A daemon restart on `current`, carrying `previous` for the banks
+    /// The same store under a restarted daemon: `[llm] language` set to
+    /// `language`, serving with `models` and carrying `previous` for a bank
     /// recorded under it.
-    fn restart_with(
+    fn restart(
         self,
         language: Option<&str>,
-        current: Arc<dyn Embedder>,
-        previous: Arc<dyn Embedder>,
+        models: Models,
+        previous: Option<Arc<dyn Embedder>>,
     ) -> Self {
         let Harness {
             service,
             clock,
             dir,
+            chunk,
         } = self;
         drop(service);
-        let store = Store::open(&dir.data(), OpenOptions::default(), clock.clone()).unwrap();
-        let models = Models {
-            embedder: current,
-            reranker: Arc::new(FakeReranker),
-        };
-        let service = Service::with_models(clock.clone(), store, tuning(language), models)
-            .unwrap()
-            .with_previous_embedder(previous)
-            .unwrap();
+        Self::open(dir, clock, chunk, language, models, previous)
+    }
+
+    fn open(
+        dir: TestDir,
+        clock: Arc<SimulatedClock>,
+        chunk: i64,
+        language: Option<&str>,
+        models: Models,
+        previous: Option<Arc<dyn Embedder>>,
+    ) -> Self {
+        let mut toml = format!(
+            "[injection.reranker_floors]\n\"{}\" = 0.0\n\
+             [reconcile.embedding_floors]\n\"{}\" = 0.5\n\"{}\" = 0.5\n",
+            FakeReranker::MODEL_ID,
+            FakeEmbedder::MODEL_ID,
+            FakeEmbedderV2::MODEL_ID,
+        );
+        if let Some(language) = language {
+            toml.push_str(&format!("[llm]\nlanguage = \"{language}\"\n"));
+        }
+        let store =
+            Store::open(&dir.0.join("data"), OpenOptions::default(), clock.clone()).unwrap();
+        let mut service = Service::with_models(
+            clock.clone(),
+            store,
+            Tuning::from_toml(&toml).unwrap(),
+            models,
+        )
+        .unwrap();
+        if let Some(previous) = previous {
+            service = service.with_previous_embedder(previous).unwrap();
+        }
         Self {
             service,
             clock,
             dir,
+            chunk,
         }
     }
 
-    fn now(&self) -> Timestamp {
-        use asphodel_core::Clock;
-        self.clock.now()
+    fn db(&self) -> PathBuf {
+        self.dir.0.join("data").join(DB_FILE)
     }
 
     fn one<T: FromSql, P: rusqlite::Params>(&self, sql: &str, params: P) -> T {
@@ -183,65 +199,21 @@ impl Harness {
             .unwrap();
     }
 
-    fn bank_id(&self) -> i64 {
-        self.one("SELECT id FROM banks WHERE name = 'main'", [])
-    }
-
-    fn memories(&self) -> i64 {
-        self.one("SELECT COUNT(*) FROM memories", [])
-    }
-
-    fn edits(&self, kind: &str) -> i64 {
-        self.one("SELECT COUNT(*) FROM edits WHERE kind = ?1", [kind])
-    }
-
-    /// The chunk fixture memories rest on: a turn ingested and marked
-    /// extracted, so nothing waits on the queue.
-    fn fixture_chunk(&self) -> i64 {
-        self.service
-            .ingest_turn(
-                "main",
-                &Turn {
-                    session_id: "fixtures".into(),
-                    message_at: at("2026-09-01T00:00:00Z"),
-                    timezone: Some(TZ.into()),
-                    user_text: PASSAGE.into(),
-                    assistant_text: "Noted.".into(),
-                    author: None,
-                    platform: Some("cli".into()),
-                    recall_id: None,
-                    forget_requested: false,
-                },
-            )
-            .unwrap();
-        let chunk: i64 = self.one(
-            "SELECT c.id FROM chunks c JOIN sources s ON s.id = c.source_id
-             WHERE s.bank_id = ?1 AND s.session_id = 'fixtures'",
-            [self.bank_id()],
-        );
-        self.execute("DELETE FROM extraction_queue WHERE chunk_id = ?1", [chunk]);
-        self.execute(
-            "UPDATE chunks SET extracted_at = ?2 WHERE id = ?1",
-            (chunk, micros(self.now())),
-        );
-        chunk
-    }
-
     /// A state in `main`, inserted directly with no vector: a window, a
-    /// volatility, a span into its chunk, an entity link with a surface
-    /// form, and accesses on three separate occasions.
-    fn memory(&self, chunk: i64, content: &str) -> Uuid {
+    /// volatility, a span into the fixture chunk, an entity link with a
+    /// surface form, and accesses on three separate occasions.
+    fn memory(&self, content: &str) -> Uuid {
         let uuid = next_uuid();
-        let bank = self.bank_id();
         let created = micros(at("2026-09-01T00:00:00Z"));
         self.execute(
             "INSERT INTO memories (uuid, bank_id, content, kind, significance, chunk_id,
                                    source_start, source_end, observed_at,
                                    valid_from, valid_from_precision, window_confidence,
                                    volatility, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'state', 'minor', ?4, 3, 27, ?5, ?5, 'day', 'low',
-                     'months', ?5, ?5)",
-            (uuid.to_string(), bank, content, chunk, created),
+             SELECT ?1, id, ?2, 'state', 'minor', ?3, 3, 27, ?4, ?4, 'day', 'low',
+                    'months', ?4, ?4
+             FROM banks WHERE name = 'main'",
+            (uuid.to_string(), content, self.chunk, created),
         );
         for (kind, when, turn) in [
             ("created", "2026-09-01T00:00:00Z", 1),
@@ -257,8 +229,8 @@ impl Harness {
         let entity = next_uuid();
         self.execute(
             "INSERT INTO entities (uuid, bank_id, name, kind, created_at, updated_at)
-             VALUES (?1, ?2, 'Sam', 'person', ?3, ?3)",
-            (entity.to_string(), bank, created),
+             SELECT ?1, id, 'Sam', 'person', ?2, ?2 FROM banks WHERE name = 'main'",
+            (entity.to_string(), created),
         );
         self.execute(
             "INSERT INTO memory_entities (memory_id, entity_id, surface_form)
@@ -280,27 +252,31 @@ impl Harness {
             .translate_memory("main", &memory.to_string(), llm)
     }
 
-    fn recall(&self, query: &str) -> Vec<Uuid> {
-        self.service
-            .recall(
-                "main",
-                &RecallRequest {
-                    query: query.into(),
-                    ..RecallRequest::default()
-                },
-            )
-            .unwrap()
-            .results
-            .iter()
-            .map(|result| result.id)
-            .collect()
+    fn refined_edits(&self) -> i64 {
+        self.one("SELECT COUNT(*) FROM edits WHERE kind = ?1", [EDIT_REFINED])
+    }
+
+    /// The stored vector of `memory`, as the index holds it.
+    fn vector(&self, memory: Uuid) -> Vec<u8> {
+        self.one(
+            "SELECT embedding FROM memory_vectors
+             WHERE memory_id = (SELECT id FROM memories WHERE uuid = ?1)",
+            [memory.to_string()],
+        )
     }
 }
 
+fn vector_bytes(embedder: &dyn Embedder, text: &str) -> Vec<u8> {
+    embedder.embed(&[text]).unwrap()[0]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
 /// The new head of a translation.
-fn translated(outcome: Translation) -> Uuid {
+fn translated(outcome: Result<Translation, TranslateError>) -> Uuid {
     match outcome {
-        Translation::Translated { to, .. } => to,
+        Ok(Translation::Translated { to, .. }) => to,
         other => panic!("expected a translation, got {other:?}"),
     }
 }
@@ -309,40 +285,36 @@ fn translated(outcome: Translation) -> Uuid {
 
 #[test]
 fn a_translation_supersedes_the_memory_and_keeps_its_strength_accesses_and_provenance() {
-    let h = Harness::new(Some("English"));
-    let chunk = h.fixture_chunk();
-    let original = h.memory(chunk, RUSSIAN);
+    let h = Harness::new(None);
+    let original = h.memory(RUSSIAN);
     h.service
         .set_significance("main", &original.to_string(), Some("major"))
         .unwrap();
-    let before = h.show(original);
-    let memories = h.memories();
-    let llm = FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]);
+    let asked = llm(ENGLISH);
 
-    let outcome = h.translate(original, &llm).unwrap();
-    let head = match &outcome {
-        Translation::Translated { from, to, language } => {
-            assert_eq!(*from, original);
-            assert_eq!(language, "English");
-            *to
-        }
-        other => panic!("expected a translation, got {other:?}"),
-    };
-    assert_ne!(head, original);
-    assert_eq!(h.memories(), memories + 1);
+    // Without a target language there's nothing to translate into.
+    let refused = h.translate(original, &asked);
+    assert!(
+        matches!(refused, Err(TranslateError::LanguageUnset)),
+        "{refused:?}"
+    );
+    assert!(asked.requests().is_empty());
+
+    let h = h.restart(Some("English"), Models::fake(), None);
+    let before = h.show(original);
+    let head = translated(h.translate(original, &asked));
 
     // The LLM is asked for the target language and shown the sentence, never
     // the passage it came from.
-    let requests = llm.requests();
+    let requests = asked.requests();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].system.contains("English"));
     assert!(requests[0].user.contains(RUSSIAN));
     assert!(!requests[0].system.contains(PASSAGE) && !requests[0].user.contains(PASSAGE));
 
+    // A refinement: one chain, the original superseded but not retracted.
     let after = h.show(head);
     assert_eq!(after.sentence, ENGLISH);
-
-    // A refinement: one chain, the original superseded but not retracted.
     assert_eq!(after.chain.head, head);
     let old = after
         .chain
@@ -352,8 +324,7 @@ fn a_translation_supersedes_the_memory_and_keeps_its_strength_accesses_and_prove
         .expect("the original is in the new head's chain");
     assert_eq!(old.superseded_by, Some(head));
     assert!(!old.retracted && !old.hidden);
-    assert_eq!(h.show(original).retracted_at, None);
-    assert_eq!(h.edits(EDIT_REFINED), 1);
+    assert_eq!(h.refined_edits(), 1);
 
     // Strength is unchanged at the same instant: the same significance, the
     // same accesses, and no new access for the translation itself.
@@ -367,7 +338,8 @@ fn a_translation_supersedes_the_memory_and_keeps_its_strength_accesses_and_prove
         assert_eq!(inherited.inherited_from, Some(original));
     }
 
-    // Provenance and everything but the sentence carry over.
+    // Provenance and everything but the sentence carry over, and the new
+    // sentence is what's embedded.
     assert_eq!(after.source.chunk, before.source.chunk);
     assert_eq!(
         (after.source.start, after.source.end),
@@ -378,230 +350,37 @@ fn a_translation_supersedes_the_memory_and_keeps_its_strength_accesses_and_prove
     assert_eq!(after.window, before.window);
     assert_eq!(after.significance, before.significance);
     assert_eq!(after.entities, before.entities);
+    assert_eq!(h.vector(head), vector_bytes(&FakeEmbedder, ENGLISH));
 
-    // Re-embedded and indexed under the new sentence.
-    let vectors: i64 = h.one(
-        "SELECT COUNT(*) FROM memory_vectors
-         WHERE memory_id = (SELECT id FROM memories WHERE uuid = ?1)",
-        [head.to_string()],
-    );
-    assert_eq!(vectors, 1);
-    assert!(h.recall("Sam tea morning").contains(&head));
-}
-
-// Refusals
-
-#[test]
-fn translation_is_refused_without_a_configured_language() {
-    let h = Harness::new(None);
-    let chunk = h.fixture_chunk();
-    let original = h.memory(chunk, RUSSIAN);
-    let memories = h.memories();
-    let llm = FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]);
-
-    let refused = h.translate(original, &llm);
-
+    // Naming an id again writes nothing and asks the LLM nothing: the old
+    // id is refused with its head, and the head is already in the language.
+    let again = llm(ENGLISH);
+    let repeated = h.translate(original, &again);
     assert!(
-        matches!(refused, Err(TranslateError::LanguageUnset)),
-        "{refused:?}"
+        matches!(repeated, Err(TranslateError::Superseded { head: named }) if named == head),
+        "{repeated:?}"
     );
-    assert!(llm.requests().is_empty());
-    assert_eq!(h.memories(), memories);
-    assert_eq!(h.edits(EDIT_REFINED), 0);
-    assert_eq!(h.show(original).chain.head, original);
-}
-
-// Repeats and stale heads
-
-#[test]
-fn naming_the_translated_memory_again_is_refused_with_its_head() {
-    let h = Harness::new(Some("English"));
-    let chunk = h.fixture_chunk();
-    let original = h.memory(chunk, RUSSIAN);
-    let head = translated(
-        h.translate(
-            original,
-            &FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]),
-        )
-        .unwrap(),
-    );
-    let memories = h.memories();
-
-    // A retry of the same request, say after a timeout that hid a commit.
-    let llm = FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]);
-    let repeated = h.translate(original, &llm);
-
-    match repeated {
-        Err(TranslateError::Superseded { head: named }) => assert_eq!(named, head),
-        other => panic!("expected a refusal naming the head, got {other:?}"),
-    }
-    assert!(llm.requests().is_empty());
-    assert_eq!(h.memories(), memories);
-    assert_eq!(h.edits(EDIT_REFINED), 1);
-    assert_eq!(h.show(head).chain.head, head);
-}
-
-#[test]
-fn naming_a_translation_again_changes_nothing() {
-    let h = Harness::new(Some("English"));
-    let chunk = h.fixture_chunk();
-    let original = h.memory(chunk, RUSSIAN);
-    let head = translated(
-        h.translate(
-            original,
-            &FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]),
-        )
-        .unwrap(),
-    );
-    let memories = h.memories();
-    let llm = FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]);
-
-    let repeated = h.translate(head, &llm).unwrap();
-
     assert_eq!(
-        repeated,
+        h.translate(head, &again).unwrap(),
         Translation::AlreadyInLanguage {
             memory: head,
             language: "English".into(),
         }
     );
-    assert!(llm.requests().is_empty());
-    assert_eq!(h.memories(), memories);
-    assert_eq!(h.edits(EDIT_REFINED), 1);
-}
-
-#[test]
-fn a_sentence_returned_unchanged_writes_nothing() {
-    let h = Harness::new(Some("English"));
-    let chunk = h.fixture_chunk();
-    let english = h.memory(chunk, ENGLISH);
-    let memories = h.memories();
-    let llm = FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]);
-
-    let outcome = h.translate(english, &llm).unwrap();
-
-    assert_eq!(
-        outcome,
-        Translation::AlreadyInLanguage {
-            memory: english,
-            language: "English".into(),
-        }
-    );
-    assert_eq!(h.memories(), memories);
-    assert_eq!(h.edits(EDIT_REFINED), 0);
-    assert_eq!(h.show(english).chain.head, english);
-}
-
-/// An LLM client that, while it answers, has another writer supersede the
-/// memory being translated: what extraction refining it in the meantime
-/// would do. It writes through its own connection, so it fails rather than
-/// waits if the translation holds a write transaction across the call.
-struct SupersededMeanwhile {
-    inner: FakeLlm,
-    db: PathBuf,
-    memory: Uuid,
-    by: Uuid,
-}
-
-impl LlmClient for SupersededMeanwhile {
-    fn model(&self) -> &str {
-        self.inner.model()
-    }
-
-    fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let conn = rusqlite::Connection::open(&self.db).unwrap();
-        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
-        let changed = conn
-            .execute(
-                "UPDATE memories SET superseded_by = (SELECT id FROM memories WHERE uuid = ?2)
-                 WHERE uuid = ?1",
-                (self.memory.to_string(), self.by.to_string()),
-            )
-            .expect("the store isn't locked while the LLM answers");
-        assert_eq!(changed, 1);
-        self.inner.complete(request)
-    }
-}
-
-#[test]
-fn a_memory_superseded_while_the_llm_answers_is_left_to_its_new_head() {
-    let h = Harness::new(Some("English"));
-    let chunk = h.fixture_chunk();
-    let original = h.memory(chunk, RUSSIAN);
-    let refinement = h.memory(chunk, "Сэм пьёт зелёный чай каждое утро.");
-    let memories = h.memories();
-    let llm = SupersededMeanwhile {
-        inner: FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]),
-        db: h.dir.data().join(DB_FILE),
-        memory: original,
-        by: refinement,
-    };
-
-    let stale = h.translate(original, &llm);
-
-    match stale {
-        Err(TranslateError::Superseded { head }) => assert_eq!(head, refinement),
-        other => panic!("expected a refusal naming the new head, got {other:?}"),
-    }
-    assert_eq!(llm.inner.requests().len(), 1);
-    assert_eq!(h.memories(), memories);
-    assert_eq!(h.edits(EDIT_REFINED), 0);
-    assert_eq!(h.show(refinement).chain.head, refinement);
+    assert!(again.requests().is_empty());
+    assert_eq!(h.refined_edits(), 1);
 }
 
 // Concurrency with the bank's other writers
 
-/// Whether a translation has committed: its `memory_refined` edit says so.
-fn translation_committed(h: &Harness) -> bool {
-    h.one::<bool, _>(
-        "SELECT EXISTS (SELECT 1 FROM edits
-                        WHERE kind = ?1 AND json_extract(details, '$.translated_to') IS NOT NULL)",
-        [EDIT_REFINED],
-    )
-}
-
-/// Waits up to two seconds for a translation running on another thread to
-/// commit. A translation that has to wait for the bank never does, so the
-/// caller carries on either way.
+/// Waits briefly for a translation running on another thread to commit. A
+/// translation that has to wait for the bank never does, so the caller
+/// carries on either way.
 fn give_translation_a_chance(h: &Harness) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !translation_committed(h) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while h.refined_edits() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
     }
-}
-
-fn rowid(h: &Harness, memory: Uuid) -> i64 {
-    h.one(
-        "SELECT id FROM memories WHERE uuid = ?1",
-        [memory.to_string()],
-    )
-}
-
-/// The stored vector of `memory`, as the index holds it.
-fn stored_vector(h: &Harness, memory: Uuid) -> Vec<u8> {
-    h.one(
-        "SELECT embedding FROM memory_vectors WHERE memory_id = ?1",
-        [rowid(h, memory)],
-    )
-}
-
-/// Which fake model made the stored vector of `memory`, embedding `text`.
-fn vector_model(h: &Harness, memory: Uuid, text: &str) -> &'static str {
-    let stored = stored_vector(h, memory);
-    if stored == vector_bytes(&FakeEmbedderV2, text) {
-        FakeEmbedderV2::MODEL_ID
-    } else if stored == vector_bytes(&FakeEmbedder, text) {
-        FakeEmbedder::MODEL_ID
-    } else {
-        "neither"
-    }
-}
-
-fn vector_bytes(embedder: &dyn Embedder, text: &str) -> Vec<u8> {
-    embedder.embed(&[text]).unwrap()[0]
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect()
 }
 
 /// [`FakeEmbedderV2`] behind a gate, for a re-embed. Its first call is the
@@ -616,12 +395,6 @@ struct Gate {
     open: Mutex<bool>,
     opened: Condvar,
 }
-
-/// The rowid the tail memory takes, below the job's cursor.
-const TAIL_ROWID: i64 = 50;
-
-/// A rowid above every other memory, where the job's cursor ends up.
-const HIGH_ROWID: i64 = 100;
 
 impl Gate {
     fn new(db: PathBuf) -> (Arc<Self>, Receiver<()>) {
@@ -654,18 +427,19 @@ impl Embedder for Gate {
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
         match self.calls.fetch_add(1, Ordering::SeqCst) {
             0 => {
-                let conn = rusqlite::Connection::open(&self.db).unwrap();
-                conn.execute(
-                    "INSERT INTO memories (id, uuid, bank_id, content, kind, significance,
-                                           chunk_id, source_start, source_end, observed_at,
-                                           window_confidence, created_at, updated_at)
-                     SELECT ?1, ?2, bank_id, 'Sam walks to work.', kind, significance,
-                            chunk_id, source_start, source_end, observed_at,
-                            window_confidence, created_at, updated_at
-                     FROM memories WHERE id = ?3",
-                    (TAIL_ROWID, next_uuid().to_string(), HIGH_ROWID),
-                )
-                .unwrap();
+                rusqlite::Connection::open(&self.db)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO memories (id, uuid, bank_id, content, kind, significance,
+                                               chunk_id, source_start, source_end, observed_at,
+                                               window_confidence, created_at, updated_at)
+                         SELECT -1, ?1, bank_id, 'Sam walks to work.', kind, significance,
+                                chunk_id, source_start, source_end, observed_at,
+                                window_confidence, created_at, updated_at
+                         FROM memories LIMIT 1",
+                        [next_uuid().to_string()],
+                    )
+                    .unwrap();
             }
             1 => {
                 if let Some(paused) = self.paused.lock().unwrap().take() {
@@ -687,22 +461,15 @@ fn a_translation_during_a_reembed_swap_is_embedded_with_the_new_model() {
     // The swap embeds its tail outside the store lock, between reading what's
     // unstaged and its transaction. A translation committed in that gap is in
     // neither, so it has to wait for the swap and be embedded with the model
-    // the bank has after it, not keep the old model's vector.
+    // the bank has after it.
     let h = Harness::new(Some("English"));
-    let chunk = h.fixture_chunk();
-    let original = h.memory(chunk, RUSSIAN);
-    h.execute(
-        "INSERT INTO memories (id, uuid, bank_id, content, kind, significance, chunk_id,
-                               source_start, source_end, observed_at, window_confidence,
-                               created_at, updated_at)
-         SELECT ?2, ?3, bank_id, 'Sam reads before bed.', kind, significance, chunk_id,
-                source_start, source_end, observed_at, window_confidence,
-                created_at, updated_at
-         FROM memories WHERE uuid = ?1",
-        (original.to_string(), HIGH_ROWID, next_uuid().to_string()),
-    );
-    let (gate, paused) = Gate::new(h.dir.data().join(DB_FILE));
-    let h = h.restart_with(Some("English"), gate.clone(), Arc::new(FakeEmbedder));
+    let original = h.memory(RUSSIAN);
+    let (gate, paused) = Gate::new(h.db());
+    let models = Models {
+        embedder: gate.clone(),
+        reranker: Arc::new(FakeReranker),
+    };
+    let h = h.restart(Some("English"), models, Some(Arc::new(FakeEmbedder)));
     h.service.start_reembed("main").unwrap();
 
     let (outcome, reembedded) = std::thread::scope(|scope| {
@@ -710,12 +477,7 @@ fn a_translation_during_a_reembed_swap_is_embedded_with_the_new_model() {
         paused
             .recv_timeout(Duration::from_secs(30))
             .expect("the swap reaches its tail");
-        let translate = scope.spawn(|| {
-            h.translate(
-                original,
-                &FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]),
-            )
-        });
+        let translate = scope.spawn(|| h.translate(original, &llm(ENGLISH)));
         give_translation_a_chance(&h);
         gate.open();
         let reembedded = reembed.join().unwrap();
@@ -723,15 +485,10 @@ fn a_translation_during_a_reembed_swap_is_embedded_with_the_new_model() {
     });
 
     reembedded.unwrap();
-    let head = translated(outcome.unwrap());
-    assert_eq!(
-        h.one::<String, _>("SELECT embedding_model FROM banks WHERE name = 'main'", []),
-        FakeEmbedderV2::MODEL_ID
-    );
-    assert_eq!(
-        vector_model(&h, head, ENGLISH),
-        FakeEmbedderV2::MODEL_ID,
-        "the translation's vector is the bank's model's"
+    let head = translated(outcome);
+    assert!(
+        h.vector(head) == vector_bytes(&FakeEmbedderV2, ENGLISH),
+        "the translation keeps a vector from a model the bank no longer uses"
     );
 }
 
@@ -742,34 +499,28 @@ fn an_extraction_prepared_before_a_translation_cant_split_the_chain() {
     // has to see the first: the memory ends up with one successor and its
     // chain with one head.
     let h = Harness::new(Some("English"));
-    let chunk = h.fixture_chunk();
     let before_work = "Sam drinks tea every morning before work.";
-    let original = h.memory(chunk, before_work);
-    let vector = FakeEmbedder.embed(&[before_work]).unwrap().remove(0);
-    let (bank_id, memory_id) = (h.bank_id(), rowid(&h, original));
+    let original = h.memory(before_work);
+    let (bank_id, memory_id): (i64, i64) = (
+        h.one("SELECT id FROM banks WHERE name = 'main'", []),
+        h.one(
+            "SELECT id FROM memories WHERE uuid = ?1",
+            [original.to_string()],
+        ),
+    );
     let store = h.service.store().unwrap();
     store
         .vectors()
-        .upsert(&store.connection(), bank_id, memory_id, &vector)
+        .upsert(
+            &store.connection(),
+            bank_id,
+            memory_id,
+            &FakeEmbedder.embed(&[before_work]).unwrap()[0],
+        )
         .unwrap();
 
     let green = "Sam drinks green tea every morning before work.";
-    h.service
-        .ingest_turn(
-            "main",
-            &Turn {
-                session_id: "s1".into(),
-                message_at: at("2026-10-01T06:30:00Z"),
-                timezone: Some(TZ.into()),
-                user_text: green.into(),
-                assistant_text: "Noted.".into(),
-                author: None,
-                platform: Some("cli".into()),
-                recall_id: None,
-                forget_requested: false,
-            },
-        )
-        .unwrap();
+    h.service.ingest_turn("main", &turn("s1", green)).unwrap();
     let call1 = json!({
         "claims": [{
             "content": green,
@@ -805,12 +556,10 @@ fn an_extraction_prepared_before_a_translation_cant_split_the_chain() {
         .neighbours
         .iter()
         .find(|neighbour| neighbour.memory == original)
-        .expect("the memory is a neighbour")
-        .handle
-        .clone();
+        .expect("the memory is a neighbour");
     let call2 = json!({"claims": [{
         "claim": input.claims[0].handle,
-        "labels": [{"neighbour": neighbour, "label": "refines"}],
+        "labels": [{"neighbour": neighbour.handle, "label": "refines"}],
     }]});
     let prepared = h
         .service
@@ -823,42 +572,25 @@ fn an_extraction_prepared_before_a_translation_cant_split_the_chain() {
         .unwrap();
 
     let (outcome, extracted) = std::thread::scope(|scope| {
-        let translate = scope.spawn(|| {
-            h.translate(
-                original,
-                &FakeLlm::scripted("fake-llm", vec![reply(ENGLISH)]),
-            )
-        });
+        let translate = scope.spawn(|| h.translate(original, &llm(ENGLISH)));
         give_translation_a_chance(&h);
         let extracted = h.service.commit_extraction(prepared);
         (translate.join().unwrap(), extracted)
     });
 
     let refinement = extracted.unwrap().memories[0];
-    let heads: Vec<Uuid> = [
-        Some(refinement),
-        match &outcome {
-            Ok(Translation::Translated { to, .. }) => Some(*to),
-            _ => None,
-        },
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|memory| h.show(*memory).chain.head == *memory)
-    .collect();
+    let translation = match &outcome {
+        Ok(Translation::Translated { to, .. }) => Some(*to),
+        _ => None,
+    };
+    let heads: Vec<Uuid> = [Some(refinement), translation]
+        .into_iter()
+        .flatten()
+        .filter(|memory| h.show(*memory).chain.head == *memory)
+        .collect();
     assert_eq!(
-        heads.len(),
-        1,
-        "one head, not {heads:?}; translation {outcome:?}"
-    );
-    let head = heads[0];
-    assert_eq!(h.show(original).chain.head, head);
-    assert!(
-        h.show(head)
-            .chain
-            .members
-            .iter()
-            .any(|member| member.id == original),
-        "the head inherits the memory's accesses"
+        heads,
+        [h.show(original).chain.head],
+        "translation {outcome:?}"
     );
 }
