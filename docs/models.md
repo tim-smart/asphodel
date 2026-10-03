@@ -138,7 +138,7 @@ question or made a request, or the assistant's routine operations and
 checks, such as running a command or verifying a fix, unless the text
 records a decision, a commitment, a date, or where something is stored. On
 real history these were nearly half of what it extracted, and few held
-anything lasting (ADR 0009).
+anything lasting (`docs/operations.md`, "The tuning file").
 
 **Guidance.** `[extraction] guidance` is added, trimmed, after call 1's fixed
 system prompt under its own heading. The rules, the user prompt and the reply
