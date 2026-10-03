@@ -83,3 +83,33 @@ id = "p18-5"
 at = "2026-01-10T09:00:00Z"
 kind = "agenda_lacks"
 memory = "p18-1"
+
+[[turn]]
+at = "2026-01-11T09:00:00Z"
+session = "p18"
+user = "18 1 4"
+assistant = "18"
+
+[[turn.claim]]
+label = "p18-4"
+content = "18 1 4"
+quote = "18 1 4"
+kind = "event"
+significance = "minor"
+changes_something = true
+valid_from = { at = "2026-01-22T14:00", precision = "minute" }
+reconcile = [{ memory = "p18-3", outcome = "retracts" }]
+
+[[probe]]
+id = "p18-6"
+at = "2026-01-12T09:00:00Z"
+kind = "exists"
+memory = "p18-1"
+ended = true
+phase = "recently_past"
+
+[[probe]]
+id = "p18-7"
+at = "2026-01-12T09:00:00Z"
+kind = "agenda_lacks"
+memory = "p18-1"
