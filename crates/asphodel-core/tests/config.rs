@@ -402,6 +402,30 @@ fn embedding_floors_must_be_cosines() {
 }
 
 #[test]
+fn relevance_scales_must_be_positive_divisors() {
+    // The scale divides the reranker logit into relevance, so zero, a
+    // negative or a non-finite one is rejected.
+    for value in ["0.0", "-1.0", "nan", "inf"] {
+        assert_eq!(
+            invalid_keys(&format!("[ranking.relevance_scales]\nm = {value}\n")),
+            ["ranking.relevance_scales.\"m\""],
+            "{value}"
+        );
+    }
+    for value in ["0.25", "1.0", "3.2"] {
+        let t = load(&format!("[ranking.relevance_scales]\nm = {value}\n")).unwrap();
+        assert_eq!(
+            t.ranking.relevance_scales["m"],
+            value.parse::<f64>().unwrap()
+        );
+    }
+    assert_eq!(
+        invalid_keys("[ranking.relevance_scales]\n\"\" = 1.0\n"),
+        ["ranking.relevance_scales"]
+    );
+}
+
+#[test]
 fn strong_cutoff_must_sit_above_the_faded_boundary() {
     // The faded/fading boundary is τ by definition, and only the
     // strong cut-off is tunable, so it can't fall to or below τ.

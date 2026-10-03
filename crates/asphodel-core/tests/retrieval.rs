@@ -286,6 +286,19 @@ impl Harness {
         harness
     }
 
+    /// A gate floor of `floor` and a relevance scale of `scale` for the
+    /// fake reranker.
+    fn with_scale(floor: f64, scale: f64) -> Self {
+        Self::with(
+            floor,
+            &format!(
+                "\n---\n[ranking.relevance_scales]\n\"{}\" = {scale:?}\n",
+                FakeReranker::MODEL_ID
+            ),
+            Arc::new(FakeReranker),
+        )
+    }
+
     fn with_deadline(self, deadline: Duration) -> Self {
         let Self {
             service,
@@ -962,6 +975,96 @@ fn injected_memories_are_in_score_order() {
             "- A pottery note.",
         ]
     );
+}
+
+// The relevance scale
+
+#[test]
+fn the_floor_gates_on_the_raw_logit_whatever_the_relevance_scale() {
+    // At 4.0, a gate on relevance would stop the two-word memory
+    // (1.5 / 4 < 1.0), and at 0.25 it would pass the one-word one
+    // (0.5 / 0.25 >= 1.0).
+    for scale in [0.25, 4.0] {
+        let h = Harness::with_scale(1.0, scale);
+        let pottery = h.insert(fact("Tim takes a pottery class."));
+        let one_word = h.insert(fact("The class was cancelled."));
+        let scored = h
+            .service
+            .scored_prefetch(
+                BANK,
+                &PrefetchRequest {
+                    session_id: "s".into(),
+                    query: "pottery class schedule".into(),
+                    previous_query: None,
+                    block_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(scored.prefetch.injected, vec![pottery], "scale {scale}");
+        // The labelling material shows the raw logit too.
+        let logit = |memory: Uuid| {
+            scored
+                .candidates
+                .iter()
+                .find(|c| c.memory == memory)
+                .unwrap()
+                .logit
+        };
+        assert_eq!(logit(pottery), Some(1.5), "scale {scale}");
+        assert_eq!(logit(one_word), Some(0.5), "scale {scale}");
+    }
+}
+
+#[test]
+fn the_relevance_scale_leaves_the_phase_term_alone_in_injection() {
+    // A long-past memory sharing four query words, against a current one
+    // sharing two. At scale 1.0 the extra words outweigh the full phase
+    // penalty (3.5 - 1.0 > 1.5). At 10.0 they don't (0.35 - 1.0 < 0.15),
+    // unless the penalty were scaled too.
+    let order = |scale: f64| {
+        let h = Harness::with_scale(0.0, scale);
+        let past = h.insert(Memory {
+            kind: "event",
+            valid_from: Some((local("2026-07-20T00:00"), "day")),
+            valid_until: Some((local("2026-08-01T00:00"), "day")),
+            ..fact("Tim's pottery class schedule changed at the studio.")
+        });
+        let current = h.insert(fact("Tim's pottery class meets weekly."));
+        let injected = h.prefetch("s", "pottery class schedule studio").injected;
+        (injected, past, current)
+    };
+    let (injected, past, current) = order(1.0);
+    assert_eq!(injected, vec![past, current]);
+    let (injected, past, current) = order(10.0);
+    assert_eq!(injected, vec![current, past]);
+}
+
+#[test]
+fn the_relevance_scale_leaves_the_strength_term_alone_in_recall() {
+    // A faded memory sharing three query words, against a fresh one sharing
+    // two. At scale 1.0 the extra word outweighs w_s_recall·strength; at
+    // 100.0 strength decides, unless it were scaled too.
+    let order = |scale: f64| {
+        let h = Harness::with_scale(1.0, scale);
+        let faded = h.insert(Memory {
+            significance: "trivial",
+            observed_at: at("2021-01-01T00:00:00Z"),
+            ..fact("Tim's pottery class schedule note.")
+        });
+        let fresh = h.insert(Memory {
+            observed_at: h.service.now(),
+            ..fact("Tim's pottery class note.")
+        });
+        (
+            ids(&h.recall(query("pottery class schedule"))),
+            faded,
+            fresh,
+        )
+    };
+    let (ranked, faded, fresh) = order(1.0);
+    assert_eq!(ranked[..2], [faded, fresh]);
+    let (ranked, faded, fresh) = order(100.0);
+    assert_eq!(ranked[..2], [fresh, faded]);
 }
 
 // The reranker deadline
