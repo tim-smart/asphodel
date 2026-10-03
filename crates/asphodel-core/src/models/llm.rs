@@ -30,6 +30,8 @@ pub struct LlmSettings {
     pub endpoint: String,
     /// The exact model string, sent as `model`.
     pub model: String,
+    /// Sent as the request's reasoning effort when set.
+    pub reasoning_effort: Option<String>,
     /// Sent as a bearer token when set. Local endpoints have none.
     pub api_key: Option<Secret>,
     /// The whole-request timeout.
@@ -60,6 +62,7 @@ impl LlmSettings {
                     auth: LlmAuth::ApiKey,
                     endpoint: endpoint.clone(),
                     model: model.clone(),
+                    reasoning_effort: llm.reasoning_effort.clone(),
                     api_key: deployment.llm_api_key.clone(),
                     timeout: Self::DEFAULT_TIMEOUT,
                 })),
@@ -81,6 +84,7 @@ impl LlmSettings {
                         .clone()
                         .unwrap_or_else(|| CODEX_ENDPOINT.to_string()),
                     model,
+                    reasoning_effort: llm.reasoning_effort.clone(),
                     api_key: None,
                     timeout: Self::DEFAULT_TIMEOUT,
                 }))
@@ -206,6 +210,11 @@ pub trait LlmClient: Send + Sync {
     /// The model string sent with every request.
     fn model(&self) -> &str;
 
+    /// The reasoning effort sent with every request, if any.
+    fn reasoning_effort(&self) -> Option<&str> {
+        None
+    }
+
     fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
 
     /// [`LlmClient::complete`] for a request whose handles (`m1`, `e1`, …)
@@ -273,6 +282,9 @@ impl OpenAiCompatible {
         if let Some(max_tokens) = request.max_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
+        if let Some(effort) = &self.settings.reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
+        }
         body
     }
 }
@@ -280,6 +292,10 @@ impl OpenAiCompatible {
 impl LlmClient for OpenAiCompatible {
     fn model(&self) -> &str {
         &self.settings.model
+    }
+
+    fn reasoning_effort(&self) -> Option<&str> {
+        self.settings.reasoning_effort.as_deref()
     }
 
     fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {

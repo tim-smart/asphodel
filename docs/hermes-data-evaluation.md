@@ -101,7 +101,7 @@ asphodel import --state-db "$ASPHODEL_REPLAY_DIR/state.db" --manifest "$ASPHODEL
 
 The dry run prints counts only; they are safe to report. The corpus is
 `$ASPHODEL_REPLAY_DIR/corpus/state.jsonl`. Import accepts Hermes schema
-version 31 only (hermes-agent `bfc71526`) and refuses anything else by name:
+versions 30 (hermes-agent 0.21.5) and 31 (`bfc71526`) and refuses anything else by name:
 if it refuses, report the message verbatim and stop.
 
 ## 3. Backend configuration
@@ -458,7 +458,7 @@ from a report, any query, any name: if one is there, remove it.
 ## Asphodel evaluation feedback
 
 - branch / commit: asphodel-v1 @ <git sha from the report>
-- corpus_hash: <first 12 hex> · cassette_hash: <first 12 hex> · hermes schema: 31
+- corpus_hash: <first 12 hex> · cassette_hash: <first 12 hex> · hermes schema: <30|31>
 - import counts (dry run): <sessions / turns / cron / skipped>
 - LLM: auth=<api_key|chatgpt> model=<model> · approved by Tim on <date>
 - modes run: live <y/n>, replay --self-test <passed/failed>, fast <n runs>
@@ -506,7 +506,7 @@ from a report, any query, any name: if one is there, remove it.
 - Floors must be set before the run that calibrates them; one re-run is
   expected.
 - Reranker versus rank fusion has no tooling.
-- Import is pinned to Hermes schema 31.
+- Import is pinned to Hermes schemas 30 and 31.
 - ChatGPT subscription mode is unverified against the real backend and
   throttles on usage windows.
 - A daemon serving a bank whose embedding model it doesn't carry refuses

@@ -194,4 +194,4 @@ Asphodel sends none).
 
 **Settings that aren't exposed.** `ASPHODEL_LLM_API_KEY` set together with
 `auth = "chatgpt"` stops the daemon. `ASPHODEL_LLM_ISSUER` points the
-login at another issuer; it exists for tests and is not in `--help`. Reasoning effort is left to the backend's default.
+login at another issuer; it exists for tests and is not in `--help`. `llm.reasoning_effort` (for example `"low"`) is sent as `reasoning.effort`, or `reasoning_effort` in `api_key` mode; unset leaves it to the backend's default. A cassette records the effort with the model, so recordings at another effort are never replayed.

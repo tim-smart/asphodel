@@ -300,6 +300,7 @@ impl StubServer {
             auth: LlmAuth::ApiKey,
             endpoint: format!("{}/v1", self.url),
             model: "some-model:q4_K_M".into(),
+            reasoning_effort: None,
             api_key: api_key.map(Secret::new),
             timeout: Duration::from_secs(5),
         }
@@ -924,6 +925,7 @@ fn a_dead_endpoint_is_a_retryable_transport_error() {
         auth: LlmAuth::ApiKey,
         endpoint: format!("http://127.0.0.1:{port}/v1"),
         model: "some-model".into(),
+        reasoning_effort: None,
         api_key: None,
         timeout: Duration::from_secs(2),
     };

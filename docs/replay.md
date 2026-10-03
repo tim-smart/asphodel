@@ -413,8 +413,8 @@ started_at)` and `messages(role, content, timestamp, active, compacted,
 _compressed_summary, tool_calls)`, and never the system prompt or
 `api_content`. It checks `PRAGMA table_info` for each of those columns,
 with the type Hermes declares it with, and the `schema_version` table
-against the versions it was written against (31, hermes-agent
-`bfc71526`), and refuses the file naming everything wrong: a missing
+against the versions it was written against (30, hermes-agent 0.21.5,
+and 31, hermes-agent `bfc71526`), and refuses the file naming everything wrong: a missing
 column, a column declared with another type, or another version.
 
 It reads only rows with `active = 1 OR compacted = 1`, the predicate

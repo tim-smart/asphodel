@@ -405,6 +405,35 @@ fn a_schema_version_the_importer_wasnt_written_against_fails_the_import() {
     assert!(!corpus.exists(), "a refused import writes no corpus");
 }
 
+/// Schema 30 is 31 without seven columns the importer doesn't read, so
+/// the same history imports to the same events at either version.
+#[test]
+fn a_schema_30_state_db_imports_like_31() {
+    let dir = TestDir::new();
+    let v31 = dir.private_path("state-31.db");
+    drop(hermes::small_history(&v31));
+    let v30 = dir.private_path("state-30.db");
+    let db = hermes::small_history(&v30);
+    db.conn()
+        .execute_batch(
+            "ALTER TABLE sessions DROP COLUMN created_source;
+             ALTER TABLE sessions DROP COLUMN compression_overload_streak;
+             ALTER TABLE sessions DROP COLUMN auto_archived;
+             ALTER TABLE messages DROP COLUMN message_uid;
+             ALTER TABLE messages DROP COLUMN absorbed_message_uids;
+             ALTER TABLE messages DROP COLUMN tool_call_uids;
+             ALTER TABLE messages DROP COLUMN tool_call_uid;
+             UPDATE schema_version SET version = 30;",
+        )
+        .unwrap();
+    drop(db);
+    let corpus_31 = dir.private_path("corpus/state-31.jsonl");
+    assert_ok(&import(&dir, &v31, &corpus_31));
+    let corpus_30 = dir.private_path("corpus/state-30.jsonl");
+    assert_ok(&import(&dir, &v30, &corpus_30));
+    assert_eq!(events(&corpus_30), events(&corpus_31));
+}
+
 /// A column with the right name and the wrong declared type is a changed
 /// column: refused, naming the column and the type expected.
 #[test]

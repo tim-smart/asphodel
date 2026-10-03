@@ -604,7 +604,7 @@ impl CodexResponses {
     }
 
     fn body(&self, request: &LlmRequest) -> Value {
-        json!({
+        let mut body = json!({
             "model": self.settings.model,
             "instructions": request.system,
             "input": [{
@@ -626,7 +626,11 @@ impl CodexResponses {
                     "schema": request.schema,
                 },
             },
-        })
+        });
+        if let Some(effort) = &self.settings.reasoning_effort {
+            body["reasoning"] = json!({ "effort": effort });
+        }
+        body
     }
 
     /// One streamed request with `tokens`.
@@ -751,6 +755,10 @@ impl CodexResponses {
 impl LlmClient for CodexResponses {
     fn model(&self) -> &str {
         &self.settings.model
+    }
+
+    fn reasoning_effort(&self) -> Option<&str> {
+        self.settings.reasoning_effort.as_deref()
     }
 
     /// Load the token file; refresh first if the access token is due; post;

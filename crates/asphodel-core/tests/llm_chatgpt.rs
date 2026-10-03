@@ -219,6 +219,7 @@ fn chatgpt_settings(endpoint: &str) -> LlmSettings {
         auth: LlmAuth::Chatgpt,
         endpoint: endpoint.to_string(),
         model: "gpt-5.1".into(),
+        reasoning_effort: None,
         api_key: None,
         timeout: Duration::from_secs(5),
     }
@@ -839,9 +840,39 @@ fn the_client_streams_a_structured_responses_request_with_the_codex_headers() {
     assert_eq!(body["text"]["format"]["schema"], request().schema);
     // GPT-5 rejects temperature, and the Responses API has no max_tokens;
     // neither is sent. Chat Completions' response_format isn't either.
-    for absent in ["temperature", "max_tokens", "response_format", "messages"] {
+    for absent in [
+        "temperature",
+        "max_tokens",
+        "response_format",
+        "messages",
+        "reasoning",
+    ] {
         assert!(body.get(absent).is_none(), "{absent} in {body}");
     }
+}
+
+/// `llm.reasoning_effort` reaches the request as `reasoning.effort`.
+#[test]
+fn a_configured_reasoning_effort_is_sent() {
+    let tuning = Tuning::from_toml(
+        "[llm]\nauth = \"chatgpt\"\nmodel = \"gpt-5.1\"\nreasoning_effort = \"low\"\n",
+    )
+    .unwrap();
+    let backend = StubServer::backend(StubResponse::stream(sse_completion("{\"claims\":[]}")));
+    let mut settings = LlmSettings::from_config(&tuning, &deployment(None))
+        .unwrap()
+        .unwrap();
+    settings.endpoint = backend.url.clone();
+    let dir = TestDir::new();
+    let client =
+        CodexResponses::new(settings, logged_in_store(&dir), clock()).with_issuer(&backend.url);
+    assert_eq!(client.reasoning_effort(), Some("low"));
+
+    client.complete(&request()).unwrap();
+    assert_eq!(
+        backend.only_request().json()["reasoning"],
+        json!({"effort": "low"})
+    );
 }
 
 #[test]
@@ -1682,6 +1713,7 @@ fn real_backend_answers_a_structured_request() {
         auth: LlmAuth::Chatgpt,
         endpoint: CODEX_ENDPOINT.into(),
         model,
+        reasoning_effort: std::env::var("ASPHODEL_LLM_REASONING_EFFORT").ok(),
         api_key: None,
         timeout: Duration::from_secs(120),
     };

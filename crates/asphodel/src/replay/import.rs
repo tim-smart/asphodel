@@ -33,7 +33,7 @@ use crate::cli::ImportArgs;
 
 /// The Hermes schema versions the importer was written against. A
 /// `state.db` at any other version is refused rather than guessed at.
-pub const HERMES_SCHEMA_VERSIONS: [i64; 1] = [31];
+pub const HERMES_SCHEMA_VERSIONS: [i64; 2] = [30, 31];
 
 /// The columns the importer reads, and nothing else, per table, with the
 /// type each is declared with in Hermes' DDL.

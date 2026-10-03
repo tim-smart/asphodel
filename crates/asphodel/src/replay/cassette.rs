@@ -303,7 +303,11 @@ impl Recorder {
             index.insert(record);
         }
         let model = match &live {
-            Some(live) => live.model().to_string(),
+            // Recordings at another effort are another model's answers.
+            Some(live) => match live.reasoning_effort() {
+                Some(effort) => format!("{} reasoning={effort}", live.model()),
+                None => live.model().to_string(),
+            },
             None => index
                 .records
                 .last()

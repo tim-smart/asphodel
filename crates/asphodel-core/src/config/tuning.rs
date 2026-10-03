@@ -286,6 +286,11 @@ pub struct LlmTuning {
 
     /// The base URL of the LLM's HTTP API.
     pub endpoint: Option<String>,
+
+    /// The reasoning effort sent with every request, such as `"low"`.
+    /// Unset leaves it to the backend's default. Part of what calibration
+    /// is pinned to, like the model.
+    pub reasoning_effort: Option<String>,
 }
 
 /// One TOML layer of tuning, named for error messages.
