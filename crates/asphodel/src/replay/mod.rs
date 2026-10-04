@@ -27,6 +27,7 @@
 //! itself failed, with no report.
 
 pub mod cassette;
+pub mod claims_agreement;
 pub mod corpus;
 pub mod diff;
 pub mod engine;

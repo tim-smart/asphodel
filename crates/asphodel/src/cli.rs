@@ -988,6 +988,9 @@ pub struct ImportArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ReportCommand {
+    /// Numbers-only comparison of serial and primed call 1 claims.
+    ClaimsAgreement(ClaimsAgreementArgs),
+
     /// The A/B diff of two replay reports.
     Diff(DiffArgs),
 
@@ -996,6 +999,21 @@ pub enum ReportCommand {
 
     /// The precision curve of the labelled labelling material.
     Precision(PrecisionArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ClaimsAgreementArgs {
+    /// Private directory holding both cassettes.
+    #[arg(long, env = "ASPHODEL_REPLAY_DIR")]
+    pub replay_dir: Option<PathBuf>,
+
+    /// Serial cassette, relative to the private directory or absolute.
+    #[arg(long)]
+    pub serial: PathBuf,
+
+    /// Primed cassette, relative to the private directory or absolute.
+    #[arg(long)]
+    pub primed: PathBuf,
 }
 
 /// `asphodel report html`: the page goes beside the report unless `--out` says
@@ -1117,6 +1135,9 @@ impl Cli {
             Command::Llm(LlmCommand::Login { data_dir }) => llm_login(&data_dir),
             Command::Import(args) => crate::replay::import::run(args),
             Command::Replay(args) => crate::replay::run(args),
+            Command::Report(ReportCommand::ClaimsAgreement(args)) => {
+                crate::replay::claims_agreement::run(args)
+            }
             Command::Report(ReportCommand::Diff(args)) => crate::replay::diff::run(args),
             Command::Report(ReportCommand::Html(args)) => crate::replay::html::run(args),
             Command::Report(ReportCommand::Precision(args)) => crate::replay::labelling::run(args),

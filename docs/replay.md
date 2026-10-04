@@ -598,6 +598,48 @@ integers, and the hashes and the git SHA are byte arrays. It carries
 `call1` as the report has it, `prime_concurrency`, the probe results, the purge, fade and band series, the token, lag and call
 counts, and the histograms.
 
+### Claims agreement
+
+Compare serial and primed call 1 cassettes before relying on priming:
+
+```sh
+asphodel report claims-agreement \
+  --serial cassettes/state.jsonl \
+  --primed cassettes/state-primed.jsonl
+```
+
+Set `ASPHODEL_REPLAY_DIR` or pass `--replay-dir`. Both input files must
+stay inside that private directory; relative paths resolve against it.
+Use a separate, fresh cassette for priming, not the serial cassette.
+The command reads without changing either file and holds the replay lock
+so it cannot compare a cassette while replay is appending to it.
+
+Stdout is one JSON object containing integer counts only, safe to attach
+to the PR. `chunks` contains `serial`, `primed`, `compared`, `serial_only`
+and `primed_only`. Chunks match by source UUID and position, not request
+key, file order or context. `agreement.claim_count` counts matched chunks
+with equal claim counts; `agreement.kind_multiset` counts those with equal
+kind multiplicities, regardless of claim order or wording. `claims` and
+`kinds` each have `serial` and `primed` totals over matched chunks only.
+Kinds with zero claims are omitted. Empty claims can agree; no shared
+chunks produces zero agreement counts, not a percentage.
+
+Non-call-1 and chunkless records are ignored. All compared extraction
+records, including unmatched chunks, must share template version, guidance
+hash, model and language. Record and request templates must agree. Duplicate
+call 1 records for a chunk are refused, even when identical; use a cassette
+with one extraction per chunk. Malformed records, missing claims arrays,
+unknown kinds or incompatible metadata exit 2 with no report. Errors name
+only the input side and line number, never claim text, prompts, source IDs
+or metadata values. Kind keys are restricted to `fact`, `preference`,
+`event`, `state`, `task` and `recurring`; arbitrary response strings cannot
+escape through the report.
+
+This measures count and kind agreement, not semantic equivalence. Tim must
+run the Hermes comparison where the private corpus and cassettes live.
+
+### Report diff
+
 `asphodel report diff A B [--force]` compares two reports: it refuses runs
 on a different corpus or cassette unless forced, lists probes whose result
 changed, numbers that differ beyond a tolerance of one in a million, and
