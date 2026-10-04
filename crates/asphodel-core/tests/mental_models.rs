@@ -2370,27 +2370,27 @@ fn a_malformed_plan_writes_nothing_and_records_an_error() {
 
 #[test]
 fn creating_a_model_past_the_budget_is_refused() {
-    // The profile takes 500 of the 800.
+    // The profile takes 2048 of the 2560.
     let h = Harness::new();
     let refused = h.service.create_model(
         BANK,
         &ModelSpec {
-            max_tokens: 301,
+            max_tokens: 513,
             ..plans_model()
         },
     );
     assert!(matches!(
         refused,
         Err(ModelError::OverBudget {
-            requested: 801,
-            budget: 800
+            requested: 2561,
+            budget: 2560
         })
     ));
     h.service
         .create_model(
             BANK,
             &ModelSpec {
-                max_tokens: 300,
+                max_tokens: 512,
                 ..plans_model()
             },
         )
@@ -2416,7 +2416,7 @@ fn resizing_or_enabling_past_the_budget_is_refused() {
             BANK,
             PROFILE_NAME,
             &ModelEdit {
-                max_tokens: Some(800),
+                max_tokens: Some(2560),
                 ..ModelEdit::default()
             },
         )
@@ -2436,12 +2436,12 @@ fn resizing_or_enabling_past_the_budget_is_refused() {
         BANK,
         PROFILE_NAME,
         &ModelEdit {
-            max_tokens: Some(801),
+            max_tokens: Some(2561),
             ..ModelEdit::default()
         },
     );
     assert!(matches!(resizing, Err(ModelError::OverBudget { .. })));
-    assert_eq!(h.profile().max_tokens, 800);
+    assert_eq!(h.profile().max_tokens, 2560);
 }
 
 /// A fact-only model asking what Tim drinks in the morning, in
