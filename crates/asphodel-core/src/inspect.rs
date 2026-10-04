@@ -124,6 +124,8 @@ pub struct WindowView {
     pub volatility: Option<String>,
     pub recurrence: Option<String>,
     pub recurrence_rrule: Option<String>,
+    /// The first occurrence, with its recorded precision.
+    pub recurrence_start: Option<WorldTime>,
     pub timezone: String,
 }
 
@@ -341,7 +343,8 @@ pub(crate) fn memory(
                 m.source_start, m.source_end, m.ended_by,
                 c.uuid, c.text, c.tombstoned_at,
                 s.uuid, s.kind, s.session_id, s.document_id, s.message_at, s.timezone,
-                s.secret_kinds, s.tombstoned_at, s.tombstone_reason, s.removed_at
+                s.secret_kinds, s.tombstoned_at, s.tombstone_reason, s.removed_at,
+                m.recurrence_start, m.recurrence_start_precision
          FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
          WHERE m.id = ?1",
         [memory_id],
@@ -363,6 +366,7 @@ pub(crate) fn memory(
                 volatility: row.get(16)?,
                 recurrence_text: row.get(17)?,
                 recurrence_rrule: row.get(18)?,
+                recurrence_start: world_time(row.get(35)?, row.get(36)?),
                 start: row.get(19)?,
                 end: row.get(20)?,
                 ended_by: row.get(21)?,
@@ -492,6 +496,7 @@ pub(crate) fn memory(
             volatility: row.volatility.clone(),
             recurrence: row.recurrence_text.clone(),
             recurrence_rrule: row.recurrence_rrule.clone(),
+            recurrence_start: row.recurrence_start,
             timezone: tz.iana_name().unwrap_or(&row.timezone).to_string(),
         },
         observed_at: row.observed_at,
@@ -695,6 +700,7 @@ struct MemoryRow {
     volatility: Option<String>,
     recurrence_text: Option<String>,
     recurrence_rrule: Option<String>,
+    recurrence_start: Option<WorldTime>,
     start: i64,
     end: i64,
     ended_by: Option<i64>,
@@ -742,6 +748,36 @@ fn passage(row: &MemoryRow) -> (Option<String>, Option<Gone>) {
         return (None, Some(Gone::Redacted));
     }
     (Some(passage), None)
+}
+
+/// An entity in a bank, including seeded and merged entities.
+/// Use its id with [`crate::Service::show_entity`] for the full view.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EntitySummary {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub merged_into: Option<Uuid>,
+}
+
+pub(crate) fn entities(store: &Store, bank: &str) -> Result<Vec<EntitySummary>, InspectError> {
+    let conn = store.connection();
+    let (bank_id, _) = find_bank(&conn, bank)?.ok_or(InspectError::UnknownBank)?;
+    let mut statement = conn.prepare(
+        "SELECT e.uuid, e.name, e.kind, target.uuid
+         FROM entities e LEFT JOIN entities target ON target.id = e.merged_into
+         WHERE e.bank_id = ?1 ORDER BY e.name, e.uuid",
+    )?;
+    Ok(statement
+        .query_map([bank_id], |row| {
+            Ok(EntitySummary {
+                id: parse(&row.get::<_, String>(0)?),
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                merged_into: row.get::<_, Option<String>>(3)?.map(|id| parse(&id)),
+            })
+        })?
+        .collect::<Result<_, _>>()?)
 }
 
 /// `entity show`.
