@@ -154,12 +154,22 @@ tuning file, guidance is daemon-wide and takes effect on restart. It is
 trimmed before insertion, and the user prompt, reply schema and fixed rules
 are unchanged. Every chunk uses the same system prompt.
 
-Call 1's version 4 prompt leaves out questions, requests and routine
-assistant operations unless the text records a decision, a commitment, a
-date, or where something is stored. This followed a ten-day evaluation
-(436 turns, 451 memories): 129 memories recorded assistant operations or
-reports and 91 recorded user questions. These crowded recall, while the
-49 memories rated trivial still took 7 to 13 weeks to fade.
+Call 1's version 6 prompt leaves out questions, requests and routine
+assistant operations, including note and file edits. It extracts durable
+content, decisions and commitments rather than the operations that record
+them. A date or path alone is not an exception. Where a durable thing is
+kept is extracted as a fact about that thing only when the supplied context
+does not already state the location. This is a context-local check, not a
+guarantee that the location has never been mentioned in the bank.
+
+The earlier version 4 rule followed a ten-day evaluation (436 turns,
+451 memories): 129 memories recorded assistant operations or reports and
+91 recorded user questions. These crowded recall, while the 49 memories
+rated trivial still took 7 to 13 weeks to fade. In the Hermes version 5
+evaluation, 115 of 377 memories (31%) began with "Hermes" or "The assistant";
+62 of those named a note, path, skill or the vault. Version 6 removes the
+broad date/storage exception that admitted routine edits. Its effect on
+that share and on fact-targeting probes still needs a fresh recording.
 
 The SHA-256 of the trimmed guidance is recorded alongside the template
 version in cassette keys, replay reports and aggregate exports. Without
