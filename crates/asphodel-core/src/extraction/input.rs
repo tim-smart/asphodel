@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use super::{
     CALENDAR_DAYS, CANDIDATE_MEMORIES, CONTEXT_CHARS, CONTEXT_TURNS, Call1Input, Candidate,
-    ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, InContextEntry, InContextMemory,
-    PREVIOUS_CHUNK_CHARS, SpeakerRef,
+    ContextTurnTime, ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, InContextEntry,
+    InContextMemory, PREVIOUS_CHUNK_CHARS, SpeakerRef,
 };
 use crate::config::Tuning;
 use crate::ingest::TURN_SEPARATOR;
@@ -138,10 +138,10 @@ pub(super) fn assemble(
         source.source_text.as_deref().unwrap_or("").chars().count() + TURN_SEPARATOR.chars().count()
     });
 
-    let context = if is_turn {
-        earlier_turns(conn, bank_id, &source)?
+    let (context, context_times) = if is_turn {
+        earlier_turns(conn, bank_id, &source)?.into_iter().unzip()
     } else {
-        text_before(&source)
+        (text_before(&source), Vec::new())
     };
 
     let user = seeded(conn, bank_id, "user")?;
@@ -286,6 +286,7 @@ pub(super) fn assemble(
         calendar,
         speaker: speaker_ref,
         context,
+        context_times,
         candidates,
         in_context: in_context_memories,
         entries: in_context_entries,
@@ -307,29 +308,36 @@ fn earlier_turns(
     conn: &Connection,
     bank_id: i64,
     source: &Source,
-) -> Result<Vec<String>, rusqlite::Error> {
+) -> Result<Vec<(String, ContextTurnTime)>, rusqlite::Error> {
     let (Some(session_id), Some(message_at)) = (&source.session_id, source.message_at) else {
         return Ok(Vec::new());
     };
     let mut statement = conn.prepare_cached(
-        "SELECT text, reply FROM sources
+        "SELECT text, reply, observed_at, timezone FROM sources
          WHERE bank_id = ?1 AND kind = 'turn' AND session_id = ?2 AND message_at < ?3
            AND text IS NOT NULL
          ORDER BY message_at DESC, ingested_at DESC, id DESC
          LIMIT ?4",
     )?;
-    let mut turns: Vec<String> = statement
+    let mut turns: Vec<(String, ContextTurnTime)> = statement
         .query_map(
             (bank_id, session_id, message_at, CONTEXT_TURNS as i64),
             |row| {
                 let text: String = row.get(0)?;
                 let reply: Option<String> = row.get(1)?;
-                Ok([
+                let passage = [
                     text.as_str(),
                     TURN_SEPARATOR,
                     reply.as_deref().unwrap_or(""),
                 ]
-                .concat())
+                .concat();
+                Ok((
+                    passage,
+                    ContextTurnTime {
+                        observed_at: timestamp(row.get(2)?),
+                        timezone: row.get(3)?,
+                    },
+                ))
             },
         )?
         .collect::<Result<_, _>>()?;
@@ -339,20 +347,20 @@ fn earlier_turns(
 
 /// Takes characters off the start of the oldest passages until the total is
 /// at most `cap`, leaving out any passage clipped to nothing.
-fn clip(passages: Vec<String>, cap: usize) -> Vec<String> {
-    let total: usize = passages.iter().map(|p| p.chars().count()).sum();
+fn clip(passages: Vec<(String, ContextTurnTime)>, cap: usize) -> Vec<(String, ContextTurnTime)> {
+    let total: usize = passages.iter().map(|(p, _)| p.chars().count()).sum();
     let mut excess = total.saturating_sub(cap);
     passages
         .into_iter()
-        .filter_map(|passage| {
+        .filter_map(|(passage, time)| {
             if excess == 0 {
-                return Some(passage);
+                return Some((passage, time));
             }
             let length = passage.chars().count();
             let cut = excess.min(length);
             excess -= cut;
             let kept: String = passage.chars().skip(cut).collect();
-            (!kept.is_empty()).then_some(kept)
+            (!kept.is_empty()).then_some((kept, time))
         })
         .collect()
 }

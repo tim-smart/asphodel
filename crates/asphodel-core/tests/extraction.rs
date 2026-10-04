@@ -932,6 +932,127 @@ fn up_to_three_earlier_turns_of_the_session_are_context() {
 }
 
 #[test]
+fn occasion_context_keeps_its_own_date_for_relative_times() {
+    let h = Harness::new();
+    // The open day is tomorrow relative to the earlier turn (2 October),
+    // not tomorrow relative to the task request (4 October).
+    ingest(
+        &h,
+        &turn(
+            "open-day",
+            T1,
+            "The school open day is tomorrow at 2pm.",
+            "Noted.",
+        ),
+    );
+    let current = ingest(
+        &h,
+        &turn(
+            "open-day",
+            "2026-10-03T06:30:00Z",
+            "Remember to bring the visitor badge to that open day.",
+            "Noted the task.",
+        ),
+    );
+    h.focus(h.chunk_of(current.source, 0));
+
+    let input = input(&h, "main", &[]);
+    assert_eq!(input.reference_date, Some(date(2026, 10, 3)));
+    assert_eq!(input.context.len(), 1);
+    let request = call1_request(&input);
+    let context = request.user.split("<context>").nth(1).unwrap();
+    let context = context.split("</context>").next().unwrap();
+    assert!(context.contains("The school open day is tomorrow at 2pm."));
+    assert!(
+        context.contains("2026-10-01"),
+        "Call 1 needs the earlier turn's local date to ground tomorrow, not just the current reference date. Context: {context}"
+    );
+}
+
+#[test]
+fn occasion_context_windows_expire_without_ending_overdue_or_unknown_date_tasks() {
+    let h = Harness::new();
+    ingest(
+        &h,
+        &turn(
+            "open-day",
+            T1,
+            "The school open day is on 3 October 2026 at 2pm. The neighbourhood picnic has no date yet.",
+            "Noted.",
+        ),
+    );
+    h.advance(24);
+    let user = "Remember to bring the visitor badge to the open day. Renew my library card by 3 October at noon. Bring a blanket to the neighbourhood picnic.";
+    let current = ingest(
+        &h,
+        &turn("open-day", "2026-10-02T06:30:00Z", user, "Noted the tasks."),
+    );
+    h.focus(h.chunk_of(current.source, 0));
+    let input = input(&h, "main", &[]);
+    let request = call1_request(&input);
+    assert!(
+        request
+            .user
+            .contains("The school open day is on 3 October 2026 at 2pm.")
+    );
+    assert!(!input.text.contains("open day is on 3 October"));
+
+    // Script the external LLM's correctly grounded answer. This checks
+    // quote validation, time conversion and the public agenda, not whether
+    // the model itself can infer a window from the context.
+    let memories = extract(
+        &h,
+        reply(
+            vec![
+                claim(
+                    "Tim needs to bring the visitor badge to the school open day on 3 October 2026 at 14:00.",
+                    "task",
+                    "Remember to bring the visitor badge to the open day.",
+                )
+                .with("due_at", time("2026-10-03T14:00", "minute"))
+                .with("valid_until", time("2026-10-03T14:00", "minute")),
+                claim(
+                    "Tim needs to renew his library card by 3 October 2026 at noon.",
+                    "task",
+                    "Renew my library card by 3 October at noon.",
+                )
+                .with("due_at", time("2026-10-03T12:00", "minute")),
+                claim(
+                    "Tim needs to bring a blanket to the neighbourhood picnic, whose date is unknown.",
+                    "task",
+                    "Bring a blanket to the neighbourhood picnic.",
+                ),
+            ],
+            &[],
+        ),
+    )
+    .memories;
+    assert_eq!(memories.len(), 3);
+    let [badge, library, blanket] = memories.as_slice() else {
+        unreachable!()
+    };
+    // 13:00 Auckland on 3 October: the renewal is already overdue.
+    h.advance(17);
+    let before = h.service.agenda("main").unwrap().listed();
+    assert!(before.contains(badge));
+    assert!(before.contains(library));
+    assert!(before.contains(blanket));
+
+    // 15:00 Auckland: the occasion passed, but the obligation and the
+    // occasion with an unknown date must not acquire an invented expiry.
+    h.advance(2);
+    let after = h.service.agenda("main").unwrap().listed();
+    assert!(!after.contains(badge));
+    assert!(after.contains(library));
+    assert!(after.contains(blanket));
+    h.advance(22 * 24);
+    let later = h.service.agenda("main").unwrap().listed();
+    assert!(!later.contains(badge));
+    assert!(later.contains(library));
+    assert!(later.contains(blanket));
+}
+
+#[test]
 fn context_is_clipped_oldest_first() {
     let h = Harness::new();
     // Three earlier turns of 2,500 characters each: 7,500 in all.
@@ -960,6 +1081,73 @@ fn context_is_clipped_oldest_first() {
             chars(&passages[0], 1_500, 2_500),
             passages[1].clone(),
             passages[2].clone(),
+        ]
+    );
+    // Clipping the oldest passage must not remove or shift its time anchor.
+    let request = call1_request(&input);
+    let contexts: Vec<&str> = request
+        .user
+        .split("<context>\n")
+        .skip(1)
+        .map(|block| block.split("</context>").next().unwrap())
+        .collect();
+    assert_eq!(contexts.len(), 3);
+    for (index, local_time) in ["19:00:00", "19:01:00", "19:02:00"].iter().enumerate() {
+        assert_eq!(
+            contexts[index],
+            format!(
+                "Context turn reference date/time: 2026-10-01T{local_time} Thursday, in Pacific/Auckland.\n{}\n",
+                input.context[index]
+            )
+        );
+    }
+}
+
+#[test]
+fn fully_clipped_context_drops_its_anchor_and_retained_turns_use_their_own_timezones() {
+    let h = Harness::new();
+    let turns = [
+        ("2026-09-30T23:00:00Z", "Pacific/Auckland", 2_000),
+        ("2026-10-01T00:00:00Z", "Europe/London", 3_000),
+        ("2026-10-01T01:00:00Z", "America/Los_Angeles", 3_000),
+    ];
+    let mut passages = Vec::new();
+    for (index, (observed_at, timezone, length)) in turns.iter().enumerate() {
+        let user = format!("TURN{index}{}", "x".repeat(length - 5 - 4));
+        passages.push(turn_text(&user, "ok"));
+        ingest(
+            &h,
+            &Turn {
+                timezone: Some((*timezone).into()),
+                ..turn("s1", observed_at, &user, "ok")
+            },
+        );
+    }
+    let current = ingest(&h, &turn("s1", T1, "Remember those occasions.", "Noted."));
+    h.focus(h.chunk_of(current.source, 0));
+
+    let input = input(&h, "main", &[]);
+    assert_eq!(input.context, passages[1..]);
+    let request = call1_request(&input);
+    let contexts: Vec<&str> = request
+        .user
+        .split("<context>\n")
+        .skip(1)
+        .map(|block| block.split("</context>").next().unwrap())
+        .collect();
+    // London is on 1 October, while the later LA turn is still on 30 September.
+    // Neither inherits Auckland time from the current or removed turn.
+    assert_eq!(
+        contexts,
+        vec![
+            format!(
+                "Context turn reference date/time: 2026-10-01T01:00:00 Thursday, in Europe/London.\n{}\n",
+                passages[1]
+            ),
+            format!(
+                "Context turn reference date/time: 2026-09-30T18:00:00 Wednesday, in America/Los_Angeles.\n{}\n",
+                passages[2]
+            ),
         ]
     );
 }
@@ -3251,7 +3439,7 @@ fn call1_uses_the_new_template_version() {
     let request = call1_request(&input(&h, "main", &[]));
     // The new rules are a new version: `fast` reuses call 1's claims by
     // version, and claims made under the old rules mustn't be.
-    assert_eq!(request.template.version, 6);
+    assert_eq!(request.template.version, 7);
 }
 
 /// `[extraction] guidance` as it might be written, padded, and the text
