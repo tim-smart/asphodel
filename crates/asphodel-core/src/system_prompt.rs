@@ -35,8 +35,17 @@
 //!   and the session is mapped to that block then, even if the cache has
 //!   rebuilt since. The block's entries are also what a turn's snapshot
 //!   takes, so call 1 is shown the entries the session could see.
+//! - **The agenda update.** Hermes rebuilds the prompt only on compaction,
+//!   so a long-lived session's agenda goes stale. Prefetch, which runs every
+//!   turn, puts an `Agenda update for <date>` section ahead of relevance
+//!   injection when the session's block maps to an earlier bank-local day
+//!   than today, or the agenda lists items the session's in-context set
+//!   doesn't hold ([`agenda_update`]). It lists only those items, within
+//!   `agenda.update_budget` tokens, and is held and committed through the
+//!   prefetch's `recall_id` like the injection. A stale day with nothing
+//!   missing gets the date alone, once. A session with no mapping gets none.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use jiff::civil::Date;
@@ -424,6 +433,121 @@ pub(crate) fn mapped(
         return Ok(None);
     }
     Ok(Some(serde_json::from_str(&ids).unwrap_or_default()))
+}
+
+/// When the session's block was built, or `None` when the session has no
+/// live mapping.
+pub(crate) fn mapped_built_at(
+    conn: &Connection,
+    bank_id: i64,
+    session: &str,
+    now: Timestamp,
+    expiry: SignedDuration,
+) -> Result<Option<Timestamp>, rusqlite::Error> {
+    let found: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT built_at, last_turn_at FROM session_blocks
+             WHERE bank_id = ?1 AND session_id = ?2",
+            (bank_id, session),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(found
+        .filter(|(_, last_turn_at)| !expired(timestamp(*last_turn_at), now, expiry))
+        .map(|(built_at, _)| timestamp(built_at)))
+}
+
+/// An agenda update for prefetch to send ahead of relevance injection.
+#[derive(Debug)]
+pub(crate) struct AgendaUpdate {
+    pub text: String,
+    /// The memories it lists, which join the in-context set once a turn
+    /// commits it.
+    pub memories: Vec<Uuid>,
+    /// The bank-local date it brings the session's agenda up to.
+    pub date: Date,
+}
+
+/// The agenda update for a session whose agenda is current as of `as_of`,
+/// the later of the day its block was built for and the date of the last
+/// update it committed. `None` when the agenda lists nothing outside
+/// `in_context` and `as_of` is today.
+///
+/// It lists the agenda's items missing from `in_context` in the block's
+/// order and groups, until the next line would take it past
+/// `agenda.update_budget` tokens, and counts the rest. The first line is
+/// always listed, so an update always moves the session forward. With
+/// nothing missing on a later day, it says so under the date.
+pub(crate) fn agenda_update(
+    conn: &Connection,
+    tuning: &Tuning,
+    bank_id: i64,
+    tz: &TimeZone,
+    now: Timestamp,
+    as_of: Date,
+    in_context: &BTreeSet<Uuid>,
+) -> Result<Option<AgendaUpdate>, rusqlite::Error> {
+    let today = now.to_zoned(tz.clone()).date();
+    let built = crate::agenda::build(conn, tuning, bank_id, tz, now)?;
+    let missing = |ids: &[Uuid], lines: &[String]| -> Vec<(Uuid, String)> {
+        ids.iter()
+            .zip(lines)
+            .filter(|(id, _)| !in_context.contains(id))
+            .map(|(id, line)| (*id, line.clone()))
+            .collect()
+    };
+    let groups = [
+        (None, missing(&built.agenda.dated, &built.dated)),
+        (
+            Some("Routines"),
+            missing(&built.agenda.routines, &built.routines),
+        ),
+        (
+            Some("Open tasks"),
+            missing(&built.agenda.undated_tasks, &built.undated_tasks),
+        ),
+    ];
+    let total: usize = groups.iter().map(|(_, items)| items.len()).sum();
+    if total == 0 && as_of >= today {
+        return Ok(None);
+    }
+
+    let budget = tuning.agenda.update_budget as usize;
+    let mut lines = vec![format!(
+        "Agenda update for {}",
+        now.to_zoned(tz.clone()).strftime("%a %-d %b")
+    )];
+    let mut memories = Vec::new();
+    'groups: for (heading, items) in &groups {
+        let mut headed = false;
+        for (id, line) in items {
+            let mut with = lines.clone();
+            if let (Some(heading), false) = (heading, headed) {
+                with.push((*heading).to_owned());
+            }
+            with.push(line.clone());
+            if !memories.is_empty() && estimate_tokens(&with.join("\n")) > budget {
+                break 'groups;
+            }
+            lines = with;
+            headed = true;
+            memories.push(*id);
+        }
+    }
+    let rest = total - memories.len();
+    if total == 0 {
+        lines.push("- Nothing new since this session's agenda.".to_owned());
+    } else if rest > 0 {
+        lines.push(format!(
+            "- and {rest} more agenda item{}",
+            if rest == 1 { "" } else { "s" }
+        ));
+    }
+    Ok(Some(AgendaUpdate {
+        text: lines.join("\n"),
+        memories,
+        date: today,
+    }))
 }
 
 /// The block-id fallback: when Hermes gave no session

@@ -275,6 +275,10 @@ pub struct AgendaTuning {
 
     /// The cap on undated open tasks.
     pub undated_tasks: u32,
+
+    /// At most about this many tokens for the agenda update prefetch puts
+    /// ahead of relevance injection, apart from `injection.token_budget`.
+    pub update_budget: u32,
 }
 
 impl Default for AgendaTuning {
@@ -286,6 +290,7 @@ impl Default for AgendaTuning {
             dated_lines: 15,
             routines: 4,
             undated_tasks: 5,
+            update_budget: 200,
         }
     }
 }
@@ -650,6 +655,7 @@ impl Tuning {
             ("agenda.overdue_days", agenda.overdue_days),
             ("agenda.undated_days", agenda.undated_days),
             ("agenda.dated_lines", agenda.dated_lines),
+            ("agenda.update_budget", agenda.update_budget),
         ] {
             if value == 0 {
                 fail(key, "must be at least 1".into());

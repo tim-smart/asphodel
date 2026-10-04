@@ -28,8 +28,10 @@
 //!
 //! Injection then gates on the reranker floor for the loaded model and
 //! takes at most `injection.cap` memories in about `injection.token_budget`
-//! tokens. Every recall writes one row to the recall log ([`log`]) and none
-//! writes an access: being recalled never strengthens a memory. "Now" is
+//! tokens. Prefetch puts the session's agenda update, if it has one, ahead
+//! of it, under its own budget
+//! ([`agenda_update`](crate::system_prompt::agenda_update)). Every recall
+//! writes one row to the recall log ([`log`]) and none writes an access: being recalled never strengthens a memory. "Now" is
 //! always the service's clock.
 //!
 //! Recall and prefetch each work out their result in one function with no
@@ -594,8 +596,9 @@ pub struct ScoredPrefetch {
 }
 
 /// Prefetch: recalls for the current message and injects what passes the
-/// gate, holding the injection as the session's pending set. The
-/// candidates the gate was shown come back beside it.
+/// gate, after the session's agenda update if it has one, holding both as
+/// the session's pending set. The candidates the gate was shown come back
+/// beside it.
 pub(crate) fn scored_prefetch(
     cx: &Context<'_>,
     bank: &str,
@@ -623,6 +626,10 @@ pub(crate) fn scored_prefetch(
         &in_context,
         Aside::Nothing,
     )?;
+    // What this prefetch injects needn't be listed again.
+    let mut seen = in_context.clone();
+    seen.extend(&run.injected);
+    let update = agenda_update(cx, bank_id, &bank_tz, now, &request.session_id, &seen)?;
 
     let logged: Vec<Logged> = run
         .ranked
@@ -659,11 +666,24 @@ pub(crate) fn scored_prefetch(
             results: &logged,
         },
     )?;
+    let mut held = run.injected.clone();
+    let text = match &update {
+        Some(update) => {
+            held.extend(&update.memories);
+            if run.text.is_empty() {
+                update.text.clone()
+            } else {
+                format!("{}\n\n{}", update.text, run.text)
+            }
+        }
+        None => run.text,
+    };
     cx.sessions.hold(
         bank_id,
         &request.session_id,
         recall_id,
-        run.injected.clone(),
+        held,
+        update.as_ref().map(|update| update.date),
         now,
     );
     tracing::debug!(
@@ -671,13 +691,14 @@ pub(crate) fn scored_prefetch(
         recall = %recall_id,
         candidates = logged.len(),
         injected = run.injected.len(),
+        agenda_update = update.as_ref().map(|update| update.memories.len()),
         reranked = run.reranked,
         "prefetched"
     );
     Ok(ScoredPrefetch {
         prefetch: Prefetch {
             recall_id,
-            text: run.text,
+            text,
             injected: run.injected,
             reranked: run.reranked,
         },
@@ -686,6 +707,37 @@ pub(crate) fn scored_prefetch(
         raw_query: request.query.clone(),
         candidates: shown,
     })
+}
+
+/// The session's agenda update, when its block is mapped: the agenda is
+/// current as of the later of the day the block was built for and the date
+/// of the last update the session committed. A session with no mapping
+/// gets none.
+fn agenda_update(
+    cx: &Context<'_>,
+    bank_id: i64,
+    bank_tz: &TimeZone,
+    now: Timestamp,
+    session_id: &str,
+    in_context: &BTreeSet<Uuid>,
+) -> Result<Option<crate::system_prompt::AgendaUpdate>, RecallError> {
+    let expiry =
+        jiff::SignedDuration::from_hours(24 * i64::from(cx.tuning.sessions.mapping_expiry_days));
+    let conn = cx.store.connection();
+    let Some(built_at) =
+        crate::system_prompt::mapped_built_at(&conn, bank_id, session_id, now, expiry)?
+    else {
+        return Ok(None);
+    };
+    let built_for = built_at.to_zoned(bank_tz.clone()).date();
+    let as_of = built_for.max(
+        cx.sessions
+            .agenda_date(bank_id, session_id, now)
+            .unwrap_or(built_for),
+    );
+    Ok(crate::system_prompt::agenda_update(
+        &conn, cx.tuning, bank_id, bank_tz, now, as_of, in_context,
+    )?)
 }
 
 /// Explicit recall: the same pipeline with no τ gate, no in-context skip,
