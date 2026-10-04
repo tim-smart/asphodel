@@ -24,5 +24,5 @@ pub use resolved::{ModelsConfig, PurgePause, ResolvedConfig};
 pub use tuning::{
     AgendaTuning, ClockTuning, ConfigError, ExtractionTuning, InjectionTuning, InvalidValue, Layer,
     LlmAuth, LlmTuning, MentalModelsTuning, PurgeTuning, RankingTuning, RecallTuning,
-    ReconcileTuning, SessionsTuning, Tuning,
+    ReconcileTuning, SessionsTuning, SignificanceTuning, StrengthTuning, Tuning,
 };

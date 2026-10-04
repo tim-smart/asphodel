@@ -338,7 +338,7 @@ pub(crate) fn candidates(
         return Ok(Vec::new());
     }
     let conn = store.connection();
-    let loader = StrengthLoader::new(&conn, bank_id, tuning.clock.quiet_rate, now)?;
+    let loader = StrengthLoader::new(&conn, bank_id, tuning, now)?;
     let heads: Vec<i64> = {
         let mut statement = conn.prepare(
             "SELECT id FROM memories
@@ -419,7 +419,7 @@ pub(crate) fn purge_chain(
             return Ok(None);
         }
     }
-    let loader = StrengthLoader::new(&tx, bank_id, tuning.clock.quiet_rate, now)?;
+    let loader = StrengthLoader::new(&tx, bank_id, tuning, now)?;
     if !is_eligible(&tx, &loader, &rule, head, now)? {
         return Ok(None);
     }

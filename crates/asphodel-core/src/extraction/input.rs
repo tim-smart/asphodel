@@ -610,12 +610,7 @@ fn strongest_memories(
     }
     let loader = match loader {
         Some(loader) => loader,
-        None => loader.insert(StrengthLoader::new(
-            conn,
-            bank_id,
-            tuning.clock.quiet_rate,
-            now,
-        )?),
+        None => loader.insert(StrengthLoader::new(conn, bank_id, tuning, now)?),
     };
 
     let mut scored = Vec::with_capacity(linked.len());

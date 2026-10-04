@@ -167,6 +167,29 @@ guidance there is no hash; call 2, refresh and judge keys are unchanged.
 Changing guidance does not pause purge because it is not a deletion input,
 and stored memories are not re-extracted.
 
+`[strength.significance]` sets the significance value of each level in
+`strength = S·significance + max(recent_use, lasting_floor)`, with S fixed
+at 2.5:
+
+```toml
+[strength.significance]
+trivial = 0.1
+minor = 0.3
+notable = 0.5
+major = 0.7
+critical = 0.9
+```
+
+Those are the defaults. Lowering a level makes the memories at it fade
+sooner; trivial at 0.1 starts 0.25 above a memory with significance 0.
+Each value is between 0 and 1, and each level must be strictly above the
+one below it, so critical can be 1.0. A kept memory's significance is fixed
+at 1.0 and isn't a key: it never fades. The values are deletion inputs, so
+changing one pauses purge and the sweep until you acknowledge it ("Purge
+pauses" below). Measure a change in replay with `--mode fast` first: it
+changes what's injected, and so the in-context set call 1 sees
+(`docs/replay.md`).
+
 An unknown key or an out-of-range value stops the daemon too. The LLM's two
 modes, an API key or a ChatGPT subscription, are in `docs/models.md`. For
 the subscription, log in once the pod is up:
@@ -576,7 +599,10 @@ from you.
 
 The store keeps a fingerprint of every setting that decides an
 irreversible deletion: the fixed strength constants, `clock.quiet_rate`,
-`purge.delta`, `agenda.overdue_days` and `purge.source_horizon_days`.
+`strength.significance`, `purge.delta`, `agenda.overdue_days` and
+`purge.source_horizon_days`. A significance change alters every memory's
+strength at once, so it pauses purge like the others, and nothing purges
+under the new values until you acknowledge them.
 When the daemon starts with a fingerprint that differs from the stored one,
 purge and the sweep of sources and recall rows pause. Forget never pauses.
 

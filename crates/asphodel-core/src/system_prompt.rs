@@ -358,7 +358,7 @@ fn entry_line(
         }
     }
     let keep_all = |_: &crate::retrieval::candidates::Candidate| true;
-    let mut cleanup = Cleanup::new(conn, bank_id, tuning.clock.quiet_rate, now, &keep_all)?;
+    let mut cleanup = Cleanup::new(conn, bank_id, tuning, now, &keep_all)?;
     let ids: Vec<i64> = entry.cites.iter().map(|(memory, _)| *memory).collect();
     cleanup.list(&ids)?;
     let age = cleanup

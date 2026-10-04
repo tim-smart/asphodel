@@ -850,7 +850,7 @@ pub(crate) fn select(
     };
     let (found, cited) = {
         let conn = conn;
-        let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning.clock.quiet_rate, now, keep)?;
+        let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning, now, keep)?;
         let mut ids = match &vector {
             Some(vector) => {
                 let lists = [
@@ -1069,7 +1069,7 @@ fn gather(
     // The vector search runs on the connection the query's model was
     // checked under, so a re-embed's swap can't come between them.
     let (vector, conn) = cx.embed_query(bank_id, query)?;
-    let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning.clock.quiet_rate, now, keep)?;
+    let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning, now, keep)?;
     let vector_hits = arms::vector(&conn, bank_id, &vector, CANDIDATES_PER_ARM)?;
     let bm25_hits = arms::bm25(&conn, bank_id, query, CANDIDATES_PER_ARM)?;
     let entity_hits = match linked {

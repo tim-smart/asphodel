@@ -1,7 +1,8 @@
 //! Settings fixed in code.
 //!
 //! Every constant the strength model was calibrated with lives here, apart
-//! from the quiet-time rate, which is [`Tuning`](crate::config::Tuning). None
+//! from the quiet-time rate and the significance value of each level, which
+//! are [`Tuning`](crate::config::Tuning). None
 //! of these ever appears in a config struct: strength is never stored, so
 //! editing one changes every memory at once. Changing a value here is a code
 //! change that reopens the strength model's calibration.
@@ -79,12 +80,14 @@ pub const FULL_SPEED_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// the close.
 pub const RECENTLY_PAST_DAYS: f64 = 30.0;
 
-/// A kept memory's significance. It never fades.
+/// A kept memory's significance. It never fades. Unlike the levels'
+/// values, which are tuning and at most 1.0, it isn't tunable.
 pub const SIGNIFICANCE_KEPT: f64 = 1.0;
 
 /// How much a memory matters on its own terms, judged at extraction. Each
-/// level maps to a fixed significance value; kept is
-/// [`SIGNIFICANCE_KEPT`], above every level.
+/// level maps to a significance value set in
+/// [`SignificanceTuning`](crate::config::SignificanceTuning); kept is
+/// [`SIGNIFICANCE_KEPT`], at least every level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Significance {
@@ -105,7 +108,8 @@ impl Significance {
         Significance::Critical,
     ];
 
-    /// The significance value this level stands for.
+    /// The default significance value this level stands for. Strength uses
+    /// the tuned value, [`SignificanceTuning`](crate::config::SignificanceTuning).
     pub const fn value(self) -> f64 {
         match self {
             Significance::Trivial => 0.0,
@@ -235,7 +239,7 @@ pub struct FixedConstants {
     pub window_close_weight: f64,
     pub full_speed_window_hours: f64,
     pub recently_past_days: f64,
-    pub significance: SignificanceValues,
+    pub significance_kept: f64,
     pub volatility_rate_days: VolatilityRates,
     pub reranker_deadline_ms: u128,
     pub retrieval: RetrievalConstants,
@@ -263,16 +267,6 @@ pub struct AccessWeights {
     pub used: f64,
     pub mentioned_again: f64,
     pub confirmed: f64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct SignificanceValues {
-    pub trivial: f64,
-    pub minor: f64,
-    pub notable: f64,
-    pub major: f64,
-    pub critical: f64,
-    pub kept: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -306,14 +300,7 @@ impl FixedConstants {
             window_close_weight: WEIGHT_WINDOW_CLOSE,
             full_speed_window_hours: FULL_SPEED_WINDOW.as_secs_f64() / 3600.0,
             recently_past_days: RECENTLY_PAST_DAYS,
-            significance: SignificanceValues {
-                trivial: Significance::Trivial.value(),
-                minor: Significance::Minor.value(),
-                notable: Significance::Notable.value(),
-                major: Significance::Major.value(),
-                critical: Significance::Critical.value(),
-                kept: SIGNIFICANCE_KEPT,
-            },
+            significance_kept: SIGNIFICANCE_KEPT,
             volatility_rate_days: VolatilityRates {
                 hours: Volatility::Hours.rate_days(),
                 days: Volatility::Days.rate_days(),

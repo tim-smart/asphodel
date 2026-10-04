@@ -520,6 +520,44 @@ fn ids(recall: &Recall) -> Vec<Uuid> {
 // Browsing
 
 #[test]
+fn a_significance_override_changes_the_strength_shown_for_an_existing_memory() {
+    let h = Harness::new();
+    let memory = h.insert(Memory {
+        content: TEA,
+        significance: "trivial",
+        ..Memory::default()
+    });
+    let before = h.service.show_memory(BANK, &memory.to_string()).unwrap();
+    let base = toml::to_string(h.service.tuning()).unwrap();
+    let tuning = Tuning::from_layers(&[
+        asphodel_core::config::Layer {
+            origin: "base",
+            text: &base,
+        },
+        asphodel_core::config::Layer {
+            origin: "override",
+            text: "[strength.significance]\ntrivial = 0.0\n",
+        },
+    ])
+    .unwrap();
+    let Harness {
+        service,
+        clock,
+        dir,
+        ..
+    } = h;
+    drop(service);
+    let store = Store::open(&dir.0, OpenOptions::default(), clock.clone()).unwrap();
+    let service = Service::with_models(clock, store, tuning, Models::fake()).unwrap();
+    let after = service.show_memory(BANK, &memory.to_string()).unwrap();
+
+    assert_eq!(before.significance.value, 0.1);
+    assert_eq!(after.significance.value, 0.0);
+    // S = 2.5: lowering trivial from 0.1 to 0.0 removes 0.25 strength.
+    assert!((before.strength.value - after.strength.value - 0.25).abs() < 1e-9);
+}
+
+#[test]
 fn browsing_documents_and_memories_writes_nothing() {
     // Looking at a memory must not strengthen it, and the dashboard's reads
     // must not show up as recalls.

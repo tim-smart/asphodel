@@ -21,6 +21,7 @@ use crate::constants::{Significance, TAU};
 #[serde(default, deny_unknown_fields)]
 pub struct Tuning {
     pub clock: ClockTuning,
+    pub strength: StrengthTuning,
     pub purge: PurgeTuning,
     pub ranking: RankingTuning,
     pub recall: RecallTuning,
@@ -39,13 +40,66 @@ pub struct Tuning {
 #[serde(default, deny_unknown_fields)]
 pub struct ClockTuning {
     /// The speed of bank time while a bank is quiet, as a fraction of full
-    /// speed. The one strength constant the replay harness may tune.
+    /// speed.
     pub quiet_rate: f64,
 }
 
 impl Default for ClockTuning {
     fn default() -> Self {
         Self { quiet_rate: 0.1 }
+    }
+}
+
+/// `[strength]`: the strength model's tunable inputs. Every other strength
+/// constant is fixed in [`crate::constants`].
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StrengthTuning {
+    pub significance: SignificanceTuning,
+}
+
+/// `[strength.significance]`: the significance value of each level, in
+/// `strength = S·significance + max(recent_use, lasting_floor)`. Each is in
+/// [0, 1] and higher levels count for strictly more. A kept memory's
+/// significance is [`SIGNIFICANCE_KEPT`](crate::constants::SIGNIFICANCE_KEPT),
+/// 1.0, and isn't tunable.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignificanceTuning {
+    pub trivial: f64,
+    pub minor: f64,
+    pub notable: f64,
+    pub major: f64,
+    pub critical: f64,
+}
+
+impl Default for SignificanceTuning {
+    fn default() -> Self {
+        Self {
+            trivial: Significance::Trivial.value(),
+            minor: Significance::Minor.value(),
+            notable: Significance::Notable.value(),
+            major: Significance::Major.value(),
+            critical: Significance::Critical.value(),
+        }
+    }
+}
+
+impl SignificanceTuning {
+    /// The value `level` stands for.
+    pub fn value(&self, level: Significance) -> f64 {
+        match level {
+            Significance::Trivial => self.trivial,
+            Significance::Minor => self.minor,
+            Significance::Notable => self.notable,
+            Significance::Major => self.major,
+            Significance::Critical => self.critical,
+        }
+    }
+
+    /// The values of [`Significance::ALL`], lowest first.
+    pub fn values(&self) -> [f64; 5] {
+        Significance::ALL.map(|level| self.value(level))
     }
 }
 
@@ -456,6 +510,31 @@ impl Tuning {
             );
         }
 
+        let significance = &self.strength.significance;
+        let key = |level: Significance| format!("strength.significance.{}", level_name(level));
+        for level in Significance::ALL {
+            let value = significance.value(level);
+            if !(0.0..=1.0).contains(&value) {
+                fail(
+                    &key(level),
+                    format!("must be a number between 0 and 1, got {value}"),
+                );
+            }
+        }
+        for pair in Significance::ALL.windows(2) {
+            let (lower, higher) = (pair[0], pair[1]);
+            let (below, value) = (significance.value(lower), significance.value(higher));
+            if value <= below {
+                fail(
+                    &key(higher),
+                    format!(
+                        "must be above strength.significance.{} ({below}), got {value}",
+                        level_name(lower)
+                    ),
+                );
+            }
+        }
+
         if let Some(delta) = self.purge.delta
             && !(delta.is_finite() && delta >= 0.0)
         {
@@ -690,6 +769,17 @@ impl Tuning {
         } else {
             Err(ConfigError::Invalid(errors))
         }
+    }
+}
+
+/// A level as its TOML key.
+fn level_name(level: Significance) -> &'static str {
+    match level {
+        Significance::Trivial => "trivial",
+        Significance::Minor => "minor",
+        Significance::Notable => "notable",
+        Significance::Major => "major",
+        Significance::Critical => "critical",
     }
 }
 
