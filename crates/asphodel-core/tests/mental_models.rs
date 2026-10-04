@@ -2834,7 +2834,8 @@ fn an_empty_bank_still_opens_with_memory_guidance() {
 
 #[test]
 fn budget_folding_keeps_memory_guidance_and_counts_it_in_the_budget() {
-    let h = Harness::new();
+    // Keep folding independent of the default block and profile caps.
+    let h = Harness::with_tuning("[mental_models]\nbudget = 800\nprofile_max_tokens = 800\n");
     let tasks: Vec<Uuid> = (0..5)
         .map(|n| {
             h.insert(task(sentence(format!(
@@ -3428,7 +3429,8 @@ fn after_a_restart_an_acknowledged_update_is_sent_at_most_once_more() {
 
 #[test]
 fn items_the_block_left_out_for_its_budget_arrive_in_the_first_update() {
-    let h = Harness::with_tuning("[mental_models]\nbudget = 80\nprofile_max_tokens = 80\n");
+    // Leave room for mandatory guidance, but not for both tasks.
+    let h = Harness::with_tuning("[mental_models]\nbudget = 160\nprofile_max_tokens = 160\n");
     let tasks = [
         "Tim needs to sort out the paperwork for renewing the car registration before it lapses.",
         "Tim needs to book a plumber to look at the dripping tap in the upstairs bathroom soon.",
