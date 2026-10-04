@@ -1,0 +1,48 @@
+name = "reminder-adds-date"
+group = "ci"
+description = "An undated errand gains a dated reminder despite a mentioned_again label, then leaves the agenda after the event."
+
+[bank]
+timezone = "UTC"
+
+[[turn]]
+at = "2026-02-09T09:00:00Z"
+session = "errand"
+user = "I need to bring my insurance card to the dentist."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "errand"
+content = "Tim needs to bring his insurance card to the dentist."
+quote = "I need to bring my insurance card to the dentist"
+kind = "task"
+significance = "minor"
+
+[[probe]]
+id = "undated-errand-on-agenda"
+at = "2026-02-09T10:00:00Z"
+kind = "agenda_has"
+memory = "errand"
+
+[[turn]]
+at = "2026-02-10T09:00:00Z"
+session = "errand"
+user = "Remind me to bring my insurance card to the dentist at 2pm today."
+assistant = "I'll remind you."
+
+[[turn.claim]]
+# No label: the current loader assumes mentioned_again always absorbs a
+# claim. Probe the original errand and inspect its chain head in the test.
+content = "Tim needs to bring his insurance card to the dentist."
+quote = "Remind me to bring my insurance card to the dentist at 2pm today"
+kind = "task"
+significance = "minor"
+due_at = { at = "2026-02-10T14:00", precision = "minute" }
+valid_until = { at = "2026-02-10T14:00", precision = "minute" }
+reconcile = [{ memory = "errand", outcome = "mentioned_again" }]
+
+[[probe]]
+id = "original-errand-off-agenda-after-event"
+at = "2026-02-10T14:01:00Z"
+kind = "agenda_lacks"
+memory = "errand"
