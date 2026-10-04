@@ -9,7 +9,16 @@
 //!   reranker logit the gate floor compares, and call 2's candidate lists,
 //!   scored with the cosine similarity the reconcile floor compares.
 //! - `asphodel report precision --labels L --material M` prints the
-//!   precision curve for each list as JSON.
+//!   precision curve for each list as JSON, with how many labels matched a
+//!   candidate, how many found nothing and how many candidates have none.
+//! - Labels are keyed by what they judge: a recall label by the cleaned
+//!   query and the memory, a call 2 label by the claim's chunk and ordinal
+//!   and the neighbour. So labels written against one run's material score
+//!   the same judgements in another run's. A file of candidate ids, the old
+//!   form, is still read against the material it was written for, and
+//!   `--convert` rewrites it in the keyed form.
+//! - `--labels L` beside `--labelling` makes sampling prefer turns whose
+//!   queries already have labels.
 //!
 //! Everything these read or write is derived from history, so all of it
 //! stays under the private dir and errors never quote it.
@@ -681,6 +690,34 @@ fn precision(dir: &TestDir, labels: &Path, material: &Path) -> Output {
         .unwrap()
 }
 
+/// The curve's points for `list`, each (floor, kept, relevant, precision),
+/// match `want`.
+fn assert_points(curve: &Value, list: &str, want: &[(f64, u64, u64, f64)]) {
+    let got: Vec<(f64, u64, u64, f64)> = curve[list]["curve"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a {list} curve: {curve}"))
+        .iter()
+        .map(|point| {
+            (
+                point["floor"].as_f64().unwrap(),
+                point["kept"].as_u64().unwrap(),
+                point["relevant"].as_u64().unwrap(),
+                point["precision"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(got.len(), want.len(), "{list}: {got:?}");
+    for (got, want) in got.iter().zip(want) {
+        assert!(
+            (got.0 - want.0).abs() < 1e-9
+                && got.1 == want.1
+                && got.2 == want.2
+                && (got.3 - want.3).abs() < 1e-9,
+            "{list}: {got:?} should be {want:?}"
+        );
+    }
+}
+
 /// Words the hand-written material holds that must never be printed.
 const MATERIAL_SENTINEL: &str = "SENTINEL-MATERIAL-TEXT-4c1b";
 
@@ -787,35 +824,9 @@ fn the_precision_curve_matches_a_hand_computed_example() {
     let out = stdout(&output);
     let curve: Value = serde_json::from_str(&out).expect("the curve is JSON on stdout");
 
-    let points = |list: &str| -> Vec<(f64, u64, u64, f64)> {
-        curve[list]["curve"]
-            .as_array()
-            .unwrap_or_else(|| panic!("a {list} curve: {curve}"))
-            .iter()
-            .map(|point| {
-                (
-                    point["floor"].as_f64().unwrap(),
-                    point["kept"].as_u64().unwrap(),
-                    point["relevant"].as_u64().unwrap(),
-                    point["precision"].as_f64().unwrap(),
-                )
-            })
-            .collect()
-    };
-    let close = |got: Vec<(f64, u64, u64, f64)>, want: &[(f64, u64, u64, f64)]| {
-        assert_eq!(got.len(), want.len(), "{got:?}");
-        for (got, want) in got.iter().zip(want) {
-            assert!(
-                (got.0 - want.0).abs() < 1e-9
-                    && got.1 == want.1
-                    && got.2 == want.2
-                    && (got.3 - want.3).abs() < 1e-9,
-                "{got:?} should be {want:?}"
-            );
-        }
-    };
-    close(
-        points("recall"),
+    assert_points(
+        &curve,
+        "recall",
         &[
             (-0.5, 5, 3, 0.6),
             (0.5, 4, 3, 0.75),
@@ -823,14 +834,21 @@ fn the_precision_curve_matches_a_hand_computed_example() {
             (2.5, 1, 1, 1.0),
         ],
     );
-    close(
-        points("call2"),
+    assert_points(
+        &curve,
+        "call2",
         &[(0.4, 4, 2, 0.5), (0.6, 3, 2, 2.0 / 3.0), (0.9, 1, 1, 1.0)],
     );
     assert_eq!(curve["recall"]["labelled"], 5, "{curve}");
     assert_eq!(curve["recall"]["unlabelled"], 1, "{curve}");
     assert_eq!(curve["call2"]["labelled"], 4, "{curve}");
     assert_eq!(curve["call2"]["unlabelled"], 0, "{curve}");
+    // Labels in the old form, read against the material they name, all
+    // match.
+    for (list, matched) in [("recall", 5), ("call2", 4)] {
+        assert_eq!(curve[list]["matched"], matched, "{list}: {curve}");
+        assert_eq!(curve[list]["unmatched"], 0, "{list}: {curve}");
+    }
 
     // The curve is numbers: nothing of the material is printed.
     assert!(!out.contains(MATERIAL_SENTINEL), "{out}");
@@ -898,4 +916,386 @@ fn malformed_labels_and_material_are_refused_without_quoting_them() {
         MATERIAL_SENTINEL,
         &["broken.json", &format!("line {line}")],
     );
+}
+
+// Labels that survive a re-record.
+
+/// A chunk id in the hand-written material.
+fn hand_chunk(n: u32) -> String {
+    format!("00000000-0000-4000-9000-{n:012}")
+}
+
+/// Another run's material over the same corpus, in the shape a keyed
+/// `--labelling` writes: call 2 samples name the claim's chunk and
+/// ordinal. It holds the same judgements as [`hand_material`] under new
+/// sample numbers and in a new order, with one recall pair and one call 2
+/// pair gone, and new candidates no label judges: a memory under a query it
+/// wasn't labelled for, and a neighbour of another claim in the same chunk.
+fn rerecorded_material() -> Value {
+    let memory = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+    let candidate = |id: &str, n: u32, score: f64| {
+        json!({
+            "id": id,
+            "memory": memory(n),
+            "score": score,
+            "sentence": format!("{MATERIAL_SENTINEL} sentence {n}")
+        })
+    };
+    json!({
+        "version": 2,
+        "recall": [
+            {
+                "sample": "r01",
+                "at": "2026-01-06T09:00:00Z",
+                "session": "s2",
+                "query": format!("{MATERIAL_SENTINEL} query two"),
+                "candidates": [
+                    candidate("r01.1", 5, 0.7),
+                    candidate("r01.2", 4, 1.2),
+                    candidate("r01.3", 7, -1.0)
+                ]
+            },
+            {
+                "sample": "r02",
+                "at": "2026-01-05T09:00:00Z",
+                "session": "s1",
+                "query": format!("{MATERIAL_SENTINEL} query one"),
+                "candidates": [
+                    candidate("r02.1", 3, -0.2),
+                    candidate("r02.2", 1, 2.0)
+                ]
+            },
+            {
+                "sample": "r03",
+                "at": "2026-01-07T09:00:00Z",
+                "session": "s3",
+                "query": format!("{MATERIAL_SENTINEL} query three"),
+                "candidates": [candidate("r03.1", 1, 0.1)]
+            }
+        ],
+        "call2": [
+            {
+                "sample": "c01",
+                "at": "2026-01-06T09:00:30Z",
+                "chunk": hand_chunk(2),
+                "ordinal": 1,
+                "claim": format!("{MATERIAL_SENTINEL} claim two"),
+                "candidates": [candidate("c01.1", 4, 0.55)]
+            },
+            {
+                "sample": "c02",
+                "at": "2026-01-05T09:00:30Z",
+                "chunk": hand_chunk(1),
+                "ordinal": 0,
+                "claim": format!("{MATERIAL_SENTINEL} claim one, worded anew"),
+                "candidates": [
+                    candidate("c02.1", 2, 0.65),
+                    candidate("c02.2", 1, 0.85)
+                ]
+            },
+            {
+                "sample": "c03",
+                "at": "2026-01-05T09:00:30Z",
+                "chunk": hand_chunk(1),
+                "ordinal": 1,
+                "claim": format!("{MATERIAL_SENTINEL} claim three"),
+                "candidates": [candidate("c03.1", 3, 0.5)]
+            }
+        ]
+    })
+}
+
+/// [`HAND_LABELS`] keyed by what they judge, with the chunks and ordinals
+/// [`hand_material`]'s claims had: claim one is ordinal 0 of chunk 1, claim
+/// two ordinal 1 of chunk 2.
+fn keyed_hand_labels() -> String {
+    let memory = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+    let query = |text: &str| format!("{MATERIAL_SENTINEL} query {text}");
+    let recall = [
+        ("one", 1, true),
+        ("one", 2, false),
+        ("one", 3, false),
+        ("two", 4, true),
+        ("two", 5, true),
+    ]
+    .map(|(text, n, relevant)| {
+        json!({ "query": query(text), "memory": memory(n), "relevant": relevant })
+    });
+    let call2 = [
+        (1, 0, 1, true),
+        (1, 0, 2, false),
+        (1, 0, 3, false),
+        (2, 1, 4, true),
+    ]
+    .map(|(chunk, ordinal, n, relevant)| {
+        json!({
+            "chunk": hand_chunk(chunk),
+            "ordinal": ordinal,
+            "memory": memory(n),
+            "relevant": relevant
+        })
+    });
+    toml::to_string(&json!({ "recall": recall, "call2": call2 })).unwrap()
+}
+
+/// The recall curve of [`HAND_LABELS`]' judgements over
+/// [`rerecorded_material`], worked by hand.
+///
+/// Matched (4): query one with memories 1 and 3, query two with 4 and 5.
+/// Unmatched (1): query one with memory 2, which the run no longer shows.
+/// Unlabelled (2): memory 7 under query two, and memory 1 under query
+/// three, labelled only for query one.
+/// Scores: 0.7 T, 1.2 T, -0.2 F, 2.0 T.
+/// - floor -0.2: 4 kept, 3 relevant, 0.75
+/// - floor 0.7: 3 kept, 3 relevant, 1.0
+/// - floor 1.2: 2 kept, 2 relevant, 1.0
+/// - floor 2.0: 1 kept, 1 relevant, 1.0
+fn assert_rerecorded_recall(curve: &Value) {
+    assert_eq!(curve["recall"]["matched"], 4, "{curve}");
+    assert_eq!(curve["recall"]["unmatched"], 1, "{curve}");
+    assert_eq!(curve["recall"]["labelled"], 4, "{curve}");
+    assert_eq!(curve["recall"]["unlabelled"], 2, "{curve}");
+    assert_points(
+        curve,
+        "recall",
+        &[
+            (-0.2, 4, 3, 0.75),
+            (0.7, 3, 3, 1.0),
+            (1.2, 2, 2, 1.0),
+            (2.0, 1, 1, 1.0),
+        ],
+    );
+}
+
+/// Labels keyed by query and memory, and by the claim's chunk and ordinal
+/// and the neighbour, score the same judgements in a re-recorded run's
+/// material whatever its candidates are numbered. A pair the new run
+/// doesn't show is counted as unmatched rather than refused, and the same
+/// memory under another query, or under another claim of the same chunk,
+/// is unlabelled. The claim's wording isn't part of the key. Nothing of
+/// the labels or the material is printed.
+///
+/// Call 2, worked by hand. Matched (3): chunk 2 ordinal 1 with memory 4,
+/// chunk 1 ordinal 0 with memories 1 and 2. Unmatched (1): chunk 1 ordinal
+/// 0 with memory 3. Unlabelled (1): memory 3 under chunk 1 ordinal 1.
+/// Scores: 0.55 T, 0.65 F, 0.85 T.
+/// - floor 0.55: 3 kept, 2 relevant, 2/3
+/// - floor 0.65: 2 kept, 1 relevant, 0.5
+/// - floor 0.85: 1 kept, 1 relevant, 1.0
+#[test]
+fn keyed_labels_score_the_same_judgements_in_a_rerecorded_runs_material() {
+    let dir = TestDir::new();
+    let material = dir.private_file(
+        "labelling/rerecorded.json",
+        &serde_json::to_string_pretty(&rerecorded_material()).unwrap(),
+    );
+    let labels = dir.private_file("labelling/keyed.toml", &keyed_hand_labels());
+    let output = precision(&dir, &labels, &material);
+    assert_ok(&output);
+    let out = stdout(&output);
+    let curve: Value = serde_json::from_str(&out).expect("the curve is JSON on stdout");
+
+    assert_rerecorded_recall(&curve);
+    assert_eq!(curve["call2"]["matched"], 3, "{curve}");
+    assert_eq!(curve["call2"]["unmatched"], 1, "{curve}");
+    assert_eq!(curve["call2"]["labelled"], 3, "{curve}");
+    assert_eq!(curve["call2"]["unlabelled"], 1, "{curve}");
+    assert_points(
+        &curve,
+        "call2",
+        &[
+            (0.55, 3, 2, 2.0 / 3.0),
+            (0.65, 2, 1, 0.5),
+            (0.85, 1, 1, 1.0),
+        ],
+    );
+
+    assert!(!out.contains(MATERIAL_SENTINEL), "{out}");
+    assert!(!out.contains("00000000-0000-4000"), "{out}");
+    assert!(!stderr(&output).contains(MATERIAL_SENTINEL));
+}
+
+/// Labels in the old form, candidate ids, carry over once converted:
+/// `--convert` reads them against the material they were written for, a
+/// material from before keys were recorded, and writes them keyed by query
+/// and memory. The converted file then scores the re-recorded material's
+/// recall candidates as if it had been written keyed.
+#[test]
+fn old_id_labels_convert_to_keyed_labels_that_score_another_run() {
+    let dir = TestDir::new();
+    let old_material = dir.private_file(
+        "labelling/material.json",
+        &serde_json::to_string_pretty(&hand_material()).unwrap(),
+    );
+    let old_labels = dir.private_file("labelling/labels.toml", HAND_LABELS);
+    let converted = dir.private_path("labelling/converted.toml");
+    let output = asphodel(&dir)
+        .args(["report", "precision", "--labels"])
+        .arg(&old_labels)
+        .arg("--material")
+        .arg(&old_material)
+        .arg("--convert")
+        .arg(&converted)
+        .output()
+        .unwrap();
+    assert_ok(&output);
+    assert!(converted.exists(), "the keyed labels are written");
+    assert!(!stdout(&output).contains(MATERIAL_SENTINEL));
+
+    let material = dir.private_file(
+        "labelling/rerecorded.json",
+        &serde_json::to_string_pretty(&rerecorded_material()).unwrap(),
+    );
+    let output = precision(&dir, &converted, &material);
+    assert_ok(&output);
+    let curve: Value = serde_json::from_str(&stdout(&output)).expect("the curve is JSON");
+    assert_rerecorded_recall(&curve);
+}
+
+/// The query of a turn of [`labelling_history`], as cleaned for the
+/// reranker.
+fn labelling_query(turn: usize) -> String {
+    match turn {
+        0 | 1 => unreachable!("the home turns aren't questions"),
+        n if n % 2 == 0 => format!("Is Auckland sunny today, question {n}?"),
+        n => format!("What is on the radio, question {n}?"),
+    }
+}
+
+/// A re-recorded run carries labels over: one run's material is labelled
+/// by key, plus a label for a turn its even spread skipped, and a second
+/// run given those labels with `--labels` samples the labelled turns in
+/// preference, the skipped one included, still 50 of them. Every
+/// candidate the second run shows is labelled; recall labels it no longer
+/// shows are unmatched, and every call 2 label matches, keyed by the
+/// chunk and ordinal the material records for each claim.
+#[test]
+fn sampling_prefers_labelled_queries_so_labels_carry_over() {
+    let dir = TestDir::new();
+    let corpus = labelling_history(&dir);
+    let script = labelling_script(&dir);
+    let live = replay_history(
+        &dir,
+        &corpus,
+        "live",
+        PASSING_PROBES,
+        "live",
+        Some(&script),
+        &[],
+    );
+    assert_ok(&live.output);
+    let first_path = dir.private_path("labelling/first.json");
+    let first = replay_history(
+        &dir,
+        &corpus,
+        "replay",
+        PASSING_PROBES,
+        "first",
+        None,
+        &["--labelling", first_path.to_str().unwrap()],
+    );
+    assert_ok(&first.output);
+    let report = first.report();
+    let home = report["memories"][0]["id"]
+        .as_str()
+        .expect("the history makes a memory");
+    let first_material: Value = serde_json::from_slice(&fs::read(&first_path).unwrap()).unwrap();
+    let queries = |material: &Value| -> BTreeSet<String> {
+        material["recall"]
+            .as_array()
+            .expect("a recall list")
+            .iter()
+            .map(|sample| sample["query"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let first_queries = queries(&first_material);
+    let skipped = (2..TURNS)
+        .map(labelling_query)
+        .find(|query| !first_queries.contains(query))
+        .expect("the even spread skips a question turn");
+
+    let mut recall: Vec<Value> = first_material["recall"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|sample| {
+            candidates(sample).iter().map(|candidate| {
+                json!({
+                    "query": sample["query"],
+                    "memory": candidate["memory"],
+                    "relevant": candidate["memory"] == home
+                })
+            })
+        })
+        .collect();
+    recall.push(json!({ "query": skipped, "memory": home, "relevant": false }));
+    let call2: Vec<Value> = first_material["call2"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|sample| {
+            let chunk = sample["chunk"].as_str().expect("a call 2 sample's chunk");
+            assert!(uuid::Uuid::parse_str(chunk).is_ok(), "{sample}");
+            let ordinal = sample["ordinal"]
+                .as_u64()
+                .expect("a call 2 sample's claim ordinal");
+            candidates(sample).iter().map(move |candidate| {
+                json!({
+                    "chunk": chunk,
+                    "ordinal": ordinal,
+                    "memory": candidate["memory"],
+                    "relevant": candidate["memory"] == home
+                })
+            })
+        })
+        .collect();
+    assert!(!call2.is_empty(), "call 2 ran: {first_material}");
+    let (recall_labels, call2_labels) = (recall.len(), call2.len());
+    let labels = dir.private_file(
+        "labelling/keyed.toml",
+        &toml::to_string(&json!({ "recall": recall, "call2": call2 })).unwrap(),
+    );
+
+    let second_path = dir.private_path("labelling/second.json");
+    let second = replay_history(
+        &dir,
+        &corpus,
+        "replay",
+        PASSING_PROBES,
+        "second",
+        None,
+        &[
+            "--labelling",
+            second_path.to_str().unwrap(),
+            "--labels",
+            labels.to_str().unwrap(),
+        ],
+    );
+    assert_ok(&second.output);
+    let second_material: Value = serde_json::from_slice(&fs::read(&second_path).unwrap()).unwrap();
+    let second_queries = queries(&second_material);
+    assert_eq!(
+        second_material["recall"].as_array().unwrap().len(),
+        50,
+        "still 50 sampled turns"
+    );
+    assert!(
+        second_queries.contains(&skipped),
+        "the labelled turn the first run skipped is sampled"
+    );
+
+    let output = precision(&dir, &labels, &second_path);
+    assert_ok(&output);
+    let curve: Value = serde_json::from_str(&stdout(&output)).expect("the curve is JSON");
+    assert_eq!(curve["recall"]["unlabelled"], 0, "{curve}");
+    assert!(curve["recall"]["matched"].as_u64().unwrap() > 0, "{curve}");
+    assert_eq!(
+        curve["recall"]["matched"].as_u64().unwrap()
+            + curve["recall"]["unmatched"].as_u64().unwrap(),
+        recall_labels as u64,
+        "every recall label either matched or found nothing: {curve}"
+    );
+    assert_eq!(curve["call2"]["matched"], call2_labels as u64, "{curve}");
+    assert_eq!(curve["call2"]["unmatched"], 0, "{curve}");
+    assert_eq!(curve["call2"]["unlabelled"], 0, "{curve}");
 }
