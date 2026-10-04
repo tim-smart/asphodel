@@ -3,9 +3,9 @@
 This page is a handoff for a local agent that evaluates Asphodel against
 Tim's real Hermes history, on Tim's machine, with the replay harness
 (`docs/replay.md`). Hand the agent everything from "Who does what" down.
-It covers the commands, how the agent drafts probes and labels for Tim to
-approve, what to measure, and a feedback template that carries numbers and
-ids but never content.
+It covers the commands, how the agent drafts probes for independent Fable
+sub-agent review and labels for Tim to approve, what to measure, and a
+feedback template that carries numbers and ids but never content.
 
 Every `asphodel` command here exists in `--help` on this branch. The build,
 the model fetch, the scripted replay and the report commands were run while
@@ -18,11 +18,14 @@ Route future live comparisons to Mac Developer, running locally on Tim's
 machine. You run commands, draft the evaluation data, collect numbers, and
 prepare material. Follow these rules:
 
-1. **Tim approves the probes and the labels.** You draft them: you propose
-   the questions, the expected answers and the labels, grounded in what the
+1. **Fable independently reviews probes; Tim approves labels.** Ask Mac
+   Developer to arrange the probe review, including any re-anchors. You draft
+   the questions, expected answers and labels, grounded in what the
    replayed store actually holds, and you keep every draft in
    `$ASPHODEL_REPLAY_DIR/drafts/`. Nothing reaches `probes.toml` or
-   `labels.toml` until Tim has approved that exact entry in this session.
+   `labels.toml` without independent Fable review of that exact probe or
+   Tim's approval of that exact label in this session, respectively.
+   If the probe review is unavailable, keep the entry pending in drafts.
    Those two files are the evaluation data; the drafts are not. Only runs on
    the approved files go into the feedback.
 2. **Live comparisons have standing authorization while the data stays
@@ -46,8 +49,9 @@ prepare material. Follow these rules:
    restrictions in rule 3: share only the permitted aggregate export and
    feedback template, never private content. If that review is unavailable,
    leave the decision pending rather than bypassing it. This review does
-   not replace Tim's approval of exact labels, probes or probe re-anchors,
-   or his floor selection and other review decisions.
+   replace Tim's probe-approval gate, including re-anchors, but does not
+   replace his approval of exact labels, floor selection or other review
+   decisions.
 
 These rules guide agents; they are not a technical privacy guarantee. Raw
 history, memory text, queries and cassettes remain private even when a run
@@ -265,7 +269,7 @@ the evaluation: it is a second copy of the history. Never point this at a
 window, phase, the source passage, the supersession chain, the access log,
 and the projected fade date.
 
-## 6. Probes: drafted by you, approved by Tim
+## 6. Probes: drafted by you, independently reviewed by Fable
 
 A probe pins a time and an expectation (`docs/replay.md`, "Probes"). The
 kinds are `band`, `faded_at`, `exists`, `absent`, `agenda_has`,
@@ -349,26 +353,33 @@ Exit 2 means the file was refused: a duplicate id, a regex that doesn't
 parse, a `faded_at` range that ends after its `at`. Fix and re-run. Exit 0
 or 1 gives a report whose `probes` list has `observed` for every probe:
 the band and strength, the ids recall returned, the agenda's ids, the
-fade instant. Read it before the review, so you can tell Tim what the
-system actually did next to what you expected. Resolved probes report
+fade instant. Read it before the review, so you can compare what the
+system actually did with what you expected in the permitted IDs-and-numbers
+summary. Resolved probes report
 `resolved_by` (`id` or `regex`) and `regex_matches`. Review any
 `regex_matches = false`: re-recording may have shifted claim ordinals
 so the grounding id now names a different fact. This flag does not fail
 the check by itself. `resolved: false` fails the probe and contributes
 to exit 1; it is not evidence that a negative expectation was met.
 
-**Review.** Walk Tim through the draft in batches of about ten. For each
-probe show the question, your expected answer, the grounding memory's
-sentence, and what the draft run observed. Tim approves, edits or rejects.
-An approved probe moves into `$ASPHODEL_REPLAY_DIR/probes.toml` with its
-comment block and `# status: approved by Tim <date>`. An edited probe is
-re-shown before it moves. A rejected probe stays in the draft marked
-`rejected`, so it isn't proposed again. Never write anything else into
-`probes.toml`.
+**Review.** Ask Mac Developer to arrange independent Fable sub-agent review
+of the draft in batches of about ten, including new probes and re-anchors.
+Keep questions, expected-answer text, grounding sentences and full draft
+observations in the private directory. Share only the permitted aggregate
+export and feedback template with the reviewer, using probe and memory IDs
+and numbers, never private content. If review is unavailable or the
+permitted material is insufficient to decide, leave the probe pending.
 
-A failing probe is not a reason to change its expectation. If Tim says the
-expectation is right and the observation is wrong, that is a finding:
-approve the probe as written and it goes into the feedback as a failed id.
+A probe that passes review moves into `$ASPHODEL_REPLAY_DIR/probes.toml`
+with its comment block and `# status: reviewed by Fable <date>`. Record the
+review outcome in the private drafts. An edited or re-anchored probe needs
+independent review again before it moves. A rejected probe stays in the
+draft marked `rejected`, so it isn't proposed again. Never write unreviewed
+entries into `probes.toml`. Tim's probe approval is no longer required.
+
+A failing probe is not a reason to change its expectation. If independent
+review finds the expectation right and the observation wrong, that is a
+finding: retain the probe as written and report its failed id.
 
 **Run the approved set.** This is the run the feedback reports.
 
@@ -628,7 +639,7 @@ from a report, any query, any name: if one is there, remove it.
 - LLM: endpoint=<endpoint> auth=<api_key|chatgpt> model=<model> reasoning=<effort> · authorization=<standing 2026-10-04 | separately approved by Tim on date>
 - modes run: live <y/n>, replay --self-test <passed/failed>, fast <n runs>
 - overrides tried: <key = value, ...> (or none)
-- probes: <n> approved by Tim (<n> drafted, <n> rejected) · labels: <n> approved by Tim over <n> samples
+- probes: <n> independently reviewed by Fable (<n> drafted, <n> rejected, <n> pending) · labels: <n> approved by Tim over <n> samples
 
 ### Retrieval
 - probes: <passed>/<total>; failed ids: <p003, p007>

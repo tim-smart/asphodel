@@ -17,14 +17,17 @@ Share only the typed aggregate export and the feedback template
 (IDs and numbers, no private content). This guidance is a rule for agents,
 not a technical privacy guarantee.
 
-Standing authorization does not approve labels, probes or probe re-anchors.
-Tim must still approve each exact entry as required by the evaluation guide;
-floor selection and other review decisions remain his.
+Standing authorization does not approve evaluation data. Tim must still
+approve each exact label as required by the evaluation guide; floor selection
+and other review decisions remain his. Before accepting probes, including
+probe re-anchors, ask Mac Developer to arrange independent Fable sub-agent
+review instead of seeking Tim's probe approval.
 
 Before making decisions based on evaluation results, ask Mac Developer to
 obtain an independent review from a Fable sub-agent. The review must follow
 the same privacy restrictions above; share only the permitted aggregate
 export and feedback template, never private content. If that review is
 unavailable, leave the decision pending rather than bypassing it. This
-review does not replace Tim's approval of exact labels, probes or probe
-re-anchors, or his floor selection and other review decisions.
+review replaces Tim's probe-approval gate, including re-anchors, but does not
+replace his approval of exact labels, floor selection or other review
+decisions.
