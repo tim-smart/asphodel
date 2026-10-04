@@ -2,9 +2,9 @@
 # occasions, then corrected. The correction retracts Maya, makes Mia the head of
 # the chain, hides Maya from recall, and Mia inherits Maya's accesses: created
 # on day 0, mentioned again on days 4 and 8, plus her own creation on day 12. On
-# those four accesses she's still in recall 100 days on (strength 0.10, fading),
-# where a fresh minor memory from day 12 would have faded on day 75, and she
-# fades on day 547, with 5% either side.
+# those four accesses she's still in recall 100 days on (strength −0.15, fading),
+# where a fresh minor memory from day 12 would have faded on day 42.83, and she
+# fades on day 315.55, with 5% either side.
 
 name = "maya-to-mia"
 group = "ci"
@@ -112,4 +112,4 @@ id = "mia-fades-on-the-inherited-log"
 at = "2027-08-28T09:00:00Z"
 kind = "faded_at"
 memory = "mia"
-between = ["2027-06-09T01:09:55Z", "2027-08-02T18:01:30Z"]
+between = ["2026-11-01T03:37:24Z", "2026-12-02T16:57:08Z"]

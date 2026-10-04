@@ -3,9 +3,9 @@
 # weeks. Bank time runs at full speed for 24 hours after each turn and at
 # the quiet rate (0.1) otherwise, so the gap counts for 2.1 bank days and
 # the memory is still in recall when the conversation resumes on world day
-# 24 (5.1 bank days), where a world clock would have faded it on day 15.
+# 24 (5.1 bank days), where a world clock would have faded it on day 7.39.
 # Daily chatter then keeps the bank at full speed, and the memory fades on
-# bank day 15.09, which is world day 24 + (15.09 − 5.1) = 33.99, with 5%
+# bank day 7.39, which is world day 24 + (7.39 − 5.1) = 26.29, with 5%
 # of the lifetime either side.
 
 name = "three-week-holiday"
@@ -40,7 +40,7 @@ from = "2026-01-29T09:00:00Z"
 every = "1d"
 count = 22
 
-# World day 16, quiet since day 3: 4.3 bank days, strength −0.26.
+# World day 16, quiet since day 3: 4.3 bank days, strength −0.51.
 [[probe]]
 id = "still-in-recall-on-world-day-16"
 at = "2026-01-21T09:00:00Z"
@@ -48,7 +48,7 @@ kind = "band"
 memory = "biscuit"
 band = "fading"
 
-# An hour before the first turn back: 5.1 bank days, strength −0.32.
+# An hour before the first turn back: 5.1 bank days, strength −0.57.
 [[probe]]
 id = "still-in-recall-after-the-holiday"
 at = "2026-01-29T08:00:00Z"
@@ -57,8 +57,8 @@ memory = "biscuit"
 band = "fading"
 
 [[probe]]
-id = "fades-on-bank-day-15"
+id = "fades-on-bank-day-7"
 at = "2026-02-20T09:00:00Z"
 kind = "faded_at"
 memory = "biscuit"
-between = ["2026-02-07T14:43:59Z", "2026-02-09T02:58:23Z"]
+between = ["2026-01-31T07:04:13Z", "2026-02-01T00:48:15Z"]

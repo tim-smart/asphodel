@@ -12,9 +12,9 @@
 //! - [`EXACT`] (1e-9, on the log scale strength lives on) for values worked
 //!   by hand from the formula. Each test shows the arithmetic.
 //! - [`TABLE`] (5% relative) for the rounded figures in the lifetimes
-//!   table and the purge table: "15 days", "2 months", "9 months",
-//!   "3 years", "12 years" and "12.5 years" are 15.09 d, 63.0 d, 262.8 d,
-//!   1096.6 d, 4576 d and 4576 d, and the worst of them is 4.5% off.
+//!   table and the purge table. Trivial fades at 7.39 d and purges at
+//!   128.66 d; minor fades at 30.83 d and purges at 536.85 d. The rounded
+//!   targets use 7.4 days and 4.2 months to stay inside the 5% tolerance.
 //! - [`ABOUT`] (10% relative) for how long one mention lasts in an abandoned
 //!   bank at the 0.1 quiet rate, "about 10 weeks, 1.7 years and 7 years" at
 //!   significance 0, 0.3 and 0.5, which are 9.3 weeks, 1.70 years and 7.17
@@ -193,20 +193,20 @@ fn one_mention_days(significance: f64, threshold: f64) -> f64 {
 
 /// Lifetime figures: significance, and how long one mention stays
 /// in recall, in bank days.
-const LIFETIMES: [(f64, f64); 5] = [
-    (0.1, 15.0),
-    (0.3, 2.0 * DAYS_PER_MONTH),
-    (0.5, 9.0 * DAYS_PER_MONTH),
-    (0.7, 3.0 * DAYS_PER_YEAR),
-    (0.9, 12.0 * DAYS_PER_YEAR),
+const LIFETIMES: [(Significance, f64); 5] = [
+    (Significance::Trivial, 7.4),
+    (Significance::Minor, DAYS_PER_MONTH),
+    (Significance::Notable, 9.0 * DAYS_PER_MONTH),
+    (Significance::Major, 3.0 * DAYS_PER_YEAR),
+    (Significance::Critical, 12.0 * DAYS_PER_YEAR),
 ];
 
 /// The purge table at δ = 1.0: significance, how long until one mention is
 /// purged in bank days (`None` for never), and the separate occasions that
 /// make it unpurgeable.
 const PURGES: [(Significance, Option<f64>, u32); 5] = [
-    (Significance::Trivial, Some(9.0 * DAYS_PER_MONTH), 4),
-    (Significance::Minor, Some(3.0 * DAYS_PER_YEAR), 3),
+    (Significance::Trivial, Some(4.2 * DAYS_PER_MONTH), 6),
+    (Significance::Minor, Some(1.5 * DAYS_PER_YEAR), 3),
     (Significance::Notable, Some(12.5 * DAYS_PER_YEAR), 2),
     (Significance::Major, None, 1),
     (Significance::Critical, None, 1),
@@ -214,7 +214,11 @@ const PURGES: [(Significance, Option<f64>, u32); 5] = [
 
 /// Permanence figures: significance and the separate occasions
 /// that lift the floor to τ.
-const PERMANENCE: [(f64, u32); 3] = [(0.0, 18), (0.3, 8), (0.5, 4)];
+const PERMANENCE: [(Significance, u32); 3] = [
+    (Significance::Trivial, 18),
+    (Significance::Minor, 10),
+    (Significance::Notable, 4),
+];
 
 /// Significance, and how long one mention lasts in an abandoned bank, in
 /// world days. Bank time runs at the 0.1 quiet rate once a day has passed
@@ -372,7 +376,8 @@ fn floor_spacing_is_world_time_even_in_a_quiet_bank() {
 
 #[test]
 fn one_mention_lifetimes_reproduce_reference_table() {
-    for (significance, days) in LIFETIMES {
+    for (level, days) in LIFETIMES {
+        let significance = level.value();
         let fades = crossing(0.0, 200.0 * DAYS_PER_YEAR, TAU, |day| {
             strength_at(significance, &[created(0.0)], day).value
         });
@@ -395,7 +400,8 @@ fn one_mention_lifetimes_in_an_abandoned_bank_reproduce_adr_0004() {
 
 #[test]
 fn enough_separate_occasions_make_a_memory_permanent() {
-    for (significance, n) in PERMANENCE {
+    for (level, n) in PERMANENCE {
+        let significance = level.value();
         let held = strength_at(significance, &occasions(n), FAR_DAYS);
         assert!(
             held.value >= TAU,
@@ -596,11 +602,11 @@ fn a_past_appointment_comes_back_to_recall_when_its_window_closes() {
     let accesses = [created(0.0)];
     let before = closed_strength(trivial, &accesses, close(90.0, 0.0), 89.0);
     assert!(before.value < TAU, "{before:?}");
-    assert_near(before.value, 0.25 - A * 89f64.ln(), EXACT);
+    assert_near(before.value, -A * 89f64.ln(), EXACT);
     let after = closed_strength(trivial, &accesses, close(90.0, 0.0), 91.0);
-    assert_near(after.value, 0.25, EXACT);
+    assert_near(after.value, 0.0, EXACT);
 
-    // Then it fades like any fresh trivial memory, about 15 days later.
+    // Then it fades like any fresh trivial memory, about a week later.
     let fades = crossing(91.0, 200.0, TAU, |day| {
         closed_strength(trivial, &accesses, close(90.0, 0.0), day).value
     });
@@ -629,7 +635,7 @@ fn a_state_used_for_three_months_stays_in_history_after_it_ends() {
     let s = closed_strength(minor, &accesses, close(95.0, 100.0), FAR_DAYS);
     assert_eq!(s.occasions, 10);
     assert!(s.value >= TAU, "{s:?}");
-    assert_near(s.value, 0.75 + floor_with(10), EXACT);
+    assert_near(s.value, 0.5 + floor_with(10), EXACT);
 }
 
 // Inheritance.
@@ -1052,9 +1058,9 @@ fn separate_occasions_make_a_memory_unpurgeable() {
             );
         }
     }
-    // Minor with two occasions misses by 0.007.
+    // Minor with two occasions misses by 0.257.
     let minor = strength_at(Significance::Minor.value(), &occasions(2), FAR_DAYS);
-    assert_near(minor.value, -1.707_779_661_868_975_1, EXACT);
+    assert_near(minor.value, -1.957_779_661_868_975_1, EXACT);
 }
 
 #[test]
