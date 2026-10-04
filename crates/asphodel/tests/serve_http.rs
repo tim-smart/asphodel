@@ -1399,9 +1399,10 @@ fn the_cli_reaches_a_tcp_daemon_with_the_token_from_the_environment() {
 
 // Mental models and the system prompt block.
 
-/// A refresh reply adding one entry citing the first memory in its input.
+/// A refresh's write: one sentence under "Home" citing the first memory in
+/// its input.
 fn adds_entry(text: &str) -> Value {
-    json!({"operations": [{"op": "add", "entry": null, "text": text, "cites": ["m1"]}]})
+    json!({"sections": [{"heading": "Home", "sentences": [{"text": text, "cites": ["m1"]}]}]})
 }
 
 const ENTRY: &str = "Tim lives in Auckland.";
@@ -1477,8 +1478,11 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
 
     let profile = &daemon.ok(daemon.get("/v1/banks/main/models"))[0];
     assert_eq!(profile["entries"][0]["text"], ENTRY);
+    assert_eq!(profile["entries"][0]["section"], "Home");
     assert_eq!(profile["entries"][0]["cites"], json!([memory]));
     assert!(profile["last_refreshed_at"].is_string());
+    let shown = daemon.ok(daemon.get("/v1/banks/main/models/User%20profile"));
+    assert_eq!(shown["entry_views"][0]["section"], "Home", "{shown}");
 
     // The block holds the entry and the pointer line, and a session's fetch
     // puts the cited memory in context, so prefetch doesn't inject it.
@@ -1488,6 +1492,14 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
         text.contains("User profile") && text.contains(ENTRY),
         "{text}"
     );
+    let mut lines = text.lines();
+    assert!(
+        lines
+            .by_ref()
+            .any(|line| line.trim_start_matches('#').trim() == "Home"),
+        "the section's heading isn't rendered: {text}"
+    );
+    assert_eq!(lines.next(), Some(ENTRY), "{text}");
     assert!(text.contains("memory_recall"), "{text}");
     assert!(!text.contains("Plans"), "a disabled model was rendered");
     assert_eq!(block["cited"], json!([memory]));

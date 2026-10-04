@@ -151,6 +151,33 @@ fn an_agenda_update_budget_too_small_for_the_date_alone_is_rejected() {
 }
 
 #[test]
+fn a_refresh_recalls_up_to_six_facets_of_twenty_within_ninety_or_a_hundred_with_cited() {
+    // Up to six facets of 20 candidates each, at most 90 after removing
+    // duplicates, and room up to 100 for the memories the model cites.
+    let defaults = serde_json::to_value(Tuning::default().mental_models).unwrap();
+    for (key, value) in [
+        ("max_facets", 6),
+        ("facet_budget", 20),
+        ("input_budget", 90),
+        ("input_budget_with_cited", 100),
+    ] {
+        assert_eq!(defaults[key], value, "{key}");
+    }
+    let set = load("[mental_models]\nmax_facets = 4\nfacet_budget = 15\n").unwrap();
+    let set = serde_json::to_value(set.mental_models).unwrap();
+    assert_eq!(
+        (&set["max_facets"], &set["facet_budget"]),
+        (&4.into(), &15.into())
+    );
+    for key in ["max_facets", "facet_budget"] {
+        assert_eq!(
+            invalid_keys(&format!("[mental_models]\n{key} = 0\n")),
+            [format!("mental_models.{key}")]
+        );
+    }
+}
+
+#[test]
 fn no_file_and_an_empty_file_give_the_defaults() {
     assert_eq!(Tuning::load(None).unwrap(), Tuning::default());
     assert_eq!(load("").unwrap(), Tuning::default());
@@ -955,6 +982,8 @@ fn excluded_tuning_values_leave_the_fingerprint_alone() {
         "[mental_models]\nsweep_time = \"02:00\"\n",
         "[mental_models]\ninput_budget = 40\n",
         "[mental_models]\ninput_budget_with_cited = 80\n",
+        "[mental_models]\nmax_facets = 4\n",
+        "[mental_models]\nfacet_budget = 10\n",
         "[sessions]\nmapping_expiry_days = 7\n",
         "[llm]\nmodel = \"other-model\"\n",
         "[llm]\nendpoint = \"https://other.example/v1\"\n",
