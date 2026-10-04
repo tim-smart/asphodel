@@ -563,7 +563,7 @@ pub(crate) fn memories(
     // Strength and the projections cost a few queries a row, so they're
     // taken for every match only when the sort or the fade filter needs
     // them, and otherwise for the page alone.
-    let loader = StrengthLoader::new(&conn, bank_id, tuning.clock.quiet_rate, now)?;
+    let loader = StrengthLoader::new(&conn, bank_id, tuning, now)?;
     let summarise = |(row, status, phase): (Row, MemoryStatus, Option<Phase>)| {
         let strength = loader.strength(&conn, row.id)?.value;
         let Outlook { fade, purge, .. } = outlook(&conn, tuning, pause, &loader, row.id, now)?;
@@ -578,7 +578,7 @@ pub(crate) fn memories(
             phase,
             status,
             significance: SignificanceView {
-                value: significance_value(&effective),
+                value: significance_value(&effective, &tuning.strength.significance),
                 extracted: row.significance,
                 owner: row.owner,
                 effective,

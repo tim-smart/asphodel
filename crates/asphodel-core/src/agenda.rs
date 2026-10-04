@@ -31,7 +31,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::config::Tuning;
+use crate::config::{SignificanceTuning, Tuning};
 use crate::constants::TAU;
 use crate::retrieval::candidates::Cleanup;
 use crate::retrieval::format;
@@ -127,7 +127,7 @@ pub(crate) fn build(
         .unwrap_or(now);
     let local = |at: Timestamp| at.to_zoned(tz.clone()).date();
 
-    let rows = rows(conn, bank_id)?;
+    let rows = rows(conn, bank_id, &tuning.strength.significance)?;
     let mut dated: Vec<Dated> = Vec::new();
     let mut routines: Vec<usize> = Vec::new();
     let mut undated: Vec<usize> = Vec::new();
@@ -187,7 +187,7 @@ pub(crate) fn build(
         }
     }
 
-    let loader = StrengthLoader::new(conn, bank_id, tuning.clock.quiet_rate, now)?;
+    let loader = StrengthLoader::new(conn, bank_id, tuning, now)?;
     let strength =
         |row: &Row| -> Result<f64, rusqlite::Error> { Ok(loader.strength(conn, row.id)?.value) };
 
@@ -248,7 +248,7 @@ pub(crate) fn build(
         .map(|index| rows[*index].id)
         .collect();
     let keep_all = |_: &crate::retrieval::candidates::Candidate| true;
-    let mut cleanup = Cleanup::new(conn, bank_id, tuning.clock.quiet_rate, now, &keep_all)?;
+    let mut cleanup = Cleanup::new(conn, bank_id, tuning, now, &keep_all)?;
     cleanup.list(&all)?;
     let mut lines = |indices: &[usize]| -> Vec<String> {
         let ids: Vec<i64> = indices.iter().map(|index| rows[*index].id).collect();
@@ -273,7 +273,11 @@ pub(crate) fn build(
     Ok(built)
 }
 
-fn rows(conn: &Connection, bank_id: i64) -> Result<Vec<Row>, rusqlite::Error> {
+fn rows(
+    conn: &Connection,
+    bank_id: i64,
+    significance: &SignificanceTuning,
+) -> Result<Vec<Row>, rusqlite::Error> {
     let mut statement = conn.prepare_cached(
         "SELECT m.id, m.uuid, m.kind, COALESCE(m.owner_significance, m.significance),
                 m.valid_from, m.valid_until, m.due_at, m.recurrence_rrule, m.recurrence_start,
@@ -293,7 +297,7 @@ fn rows(conn: &Connection, bank_id: i64) -> Result<Vec<Row>, rusqlite::Error> {
                 id: row.get(0)?,
                 uuid: uuid.parse().unwrap_or_default(),
                 kind: memory_kind(&kind).unwrap_or(Kind::Fact),
-                level: significance_value(&level),
+                level: significance_value(&level, significance),
                 valid_from: row.get::<_, Option<i64>>(4)?.map(timestamp),
                 valid_until: world_time(row.get(5)?, row.get(10)?),
                 due_at: row.get::<_, Option<i64>>(6)?.map(timestamp),

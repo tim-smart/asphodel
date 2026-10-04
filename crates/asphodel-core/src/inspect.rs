@@ -385,7 +385,7 @@ pub(crate) fn memory(
 
     let tz = TimeZone::get(&row.timezone).unwrap_or(TimeZone::UTC);
     let phase = window(&conn, memory_id)?.map(|(window, tz)| window.phase(&tz, now));
-    let loader = StrengthLoader::new(&conn, bank_id, tuning.clock.quiet_rate, now)?;
+    let loader = StrengthLoader::new(&conn, bank_id, tuning, now)?;
     let links = loader.links().to_vec();
     let inputs = loader.inputs(&conn, memory_id)?;
     let strength = loader.strength(&conn, memory_id)?;
@@ -1037,7 +1037,7 @@ pub(crate) fn faded_at(
         )
         .optional()?
         .ok_or(InspectError::UnknownMemory)?;
-    let loader = StrengthLoader::new(&conn, bank_id, tuning.clock.quiet_rate, now)?;
+    let loader = StrengthLoader::new(&conn, bank_id, tuning, now)?;
     let inputs = loader.inputs(&conn, memory_id)?;
     let bank_time = loader.bank_time();
     let value = |at: Timestamp| {
@@ -1104,7 +1104,7 @@ pub(crate) fn strengths(
     let now = store.now();
     let conn = store.connection();
     let (bank_id, _) = find_bank(&conn, bank)?.ok_or(InspectError::UnknownBank)?;
-    let loader = StrengthLoader::new(&conn, bank_id, tuning.clock.quiet_rate, now)?;
+    let loader = StrengthLoader::new(&conn, bank_id, tuning, now)?;
     let mut statement = conn.prepare_cached(
         "SELECT id, uuid FROM memories
          WHERE bank_id = ?1 AND hidden_at IS NULL AND invalidated_at IS NULL

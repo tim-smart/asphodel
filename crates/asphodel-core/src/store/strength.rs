@@ -5,7 +5,8 @@
 //! A memory's strength takes:
 //!
 //! - its significance: the owner's setting when there is one (kept is
-//!   [`SIGNIFICANCE_KEPT`]), otherwise the level extraction gave;
+//!   [`SIGNIFICANCE_KEPT`]), otherwise the level extraction gave, as its
+//!   tuned value;
 //! - its own accesses and those it inherits along `superseded_by`, never
 //!   along `ended_by` ([`inherits_from`]);
 //! - its window's close, when it has one, with the end known at the
@@ -17,6 +18,7 @@ use jiff::tz::TimeZone;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::timestamp;
+use crate::config::{SignificanceTuning, Tuning};
 use crate::constants::{SIGNIFICANCE_KEPT, Significance};
 use crate::strength::{
     Access, AccessKind, BankTime, Kind, Link, Strength, TimePrecision, Window, WindowClose,
@@ -24,20 +26,21 @@ use crate::strength::{
 };
 
 /// One bank's strength inputs that every memory shares: its clock, its
-/// supersession links and the instant strength is taken at. Build it once
-/// per bank and operation.
+/// supersession links, the significance values and the instant strength is
+/// taken at. Build it once per bank and operation.
 pub(crate) struct StrengthLoader {
     bank_time: BankTime,
     links: Vec<Link>,
+    significance: SignificanceTuning,
     now: Timestamp,
 }
 
 impl StrengthLoader {
-    /// `quiet_rate` is `Tuning::clock.quiet_rate`.
+    /// Reads `clock.quiet_rate` and `strength.significance` from `tuning`.
     pub(crate) fn new(
         conn: &Connection,
         bank_id: i64,
-        quiet_rate: f64,
+        tuning: &Tuning,
         now: Timestamp,
     ) -> Result<Self, rusqlite::Error> {
         // Tombstoned turns still happened, so they keep bank time running.
@@ -62,8 +65,9 @@ impl StrengthLoader {
             })?
             .collect::<Result<_, _>>()?;
         Ok(Self {
-            bank_time: BankTime::new(&turns, quiet_rate),
+            bank_time: BankTime::new(&turns, tuning.clock.quiet_rate),
             links,
+            significance: tuning.strength.significance,
             now,
         })
     }
@@ -124,6 +128,7 @@ impl StrengthLoader {
                 .owner_significance
                 .as_deref()
                 .unwrap_or(&memory.significance),
+            &self.significance,
         );
 
         let accesses = self.accesses(conn, memory_id)?;
@@ -263,15 +268,15 @@ fn access_kind(text: &str) -> Option<AccessKind> {
     }
 }
 
-/// A stored significance level, or `kept`, as its value.
-pub(crate) fn significance_value(level: &str) -> f64 {
+/// A stored significance level, or `kept`, as its tuned value.
+pub(crate) fn significance_value(level: &str, values: &SignificanceTuning) -> f64 {
     match level {
         "kept" => SIGNIFICANCE_KEPT,
-        "trivial" => Significance::Trivial.value(),
-        "minor" => Significance::Minor.value(),
-        "notable" => Significance::Notable.value(),
-        "major" => Significance::Major.value(),
-        _ => Significance::Critical.value(),
+        "trivial" => values.value(Significance::Trivial),
+        "minor" => values.value(Significance::Minor),
+        "notable" => values.value(Significance::Notable),
+        "major" => values.value(Significance::Major),
+        _ => values.value(Significance::Critical),
     }
 }
 

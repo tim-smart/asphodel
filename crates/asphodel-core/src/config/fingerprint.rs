@@ -34,7 +34,7 @@ pub struct DeletionInputs {
     pub weight_confirmed: f64,
     pub weight_window_close: f64,
     pub full_speed_window_secs: u64,
-    /// The values of [`Significance::ALL`], lowest first.
+    /// The tuned values of [`Significance::ALL`], lowest first.
     pub significance: [f64; 5],
     pub significance_kept: f64,
     pub quiet_rate: f64,
@@ -63,7 +63,7 @@ impl DeletionInputs {
             weight_confirmed: constants::WEIGHT_CONFIRMED,
             weight_window_close: constants::WEIGHT_WINDOW_CLOSE,
             full_speed_window_secs: constants::FULL_SPEED_WINDOW.as_secs(),
-            significance: Significance::ALL.map(Significance::value),
+            significance: tuning.strength.significance.values(),
             significance_kept: constants::SIGNIFICANCE_KEPT,
             quiet_rate: tuning.clock.quiet_rate,
             delta: tuning.purge.delta,
@@ -79,6 +79,7 @@ impl DeletionInputs {
     pub fn changed_from(&self, stored: &DeletionInputs) -> Vec<String> {
         let mut changed = Vec::new();
         let constants = |inputs: &DeletionInputs| DeletionInputs {
+            significance: [0.0; 5],
             quiet_rate: 0.0,
             delta: None,
             overdue_days: 0,
@@ -87,6 +88,9 @@ impl DeletionInputs {
         };
         if constants(self) != constants(stored) {
             changed.push("constants".to_string());
+        }
+        if self.significance != stored.significance {
+            changed.push("strength.significance".to_string());
         }
         if self.quiet_rate != stored.quiet_rate {
             changed.push("clock.quiet_rate".to_string());

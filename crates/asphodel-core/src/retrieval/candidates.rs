@@ -17,6 +17,7 @@ use jiff::tz::TimeZone;
 use rusqlite::Connection;
 use uuid::Uuid;
 
+use crate::config::Tuning;
 use crate::constants::Volatility;
 use crate::store::strength::{StrengthLoader, memory_kind, world_time};
 use crate::store::timestamp;
@@ -65,11 +66,11 @@ impl<'a> Cleanup<'a> {
     pub(crate) fn new(
         conn: &'a Connection,
         bank_id: i64,
-        quiet_rate: f64,
+        tuning: &Tuning,
         now: Timestamp,
         keep: &'a dyn Fn(&Candidate) -> bool,
     ) -> Result<Self, rusqlite::Error> {
-        let strength = StrengthLoader::new(conn, bank_id, quiet_rate, now)?;
+        let strength = StrengthLoader::new(conn, bank_id, tuning, now)?;
         Ok(Self {
             conn,
             chains: Chains::new(strength.links()),
