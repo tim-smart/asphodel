@@ -94,7 +94,7 @@ def test_a_dry_run_prints_the_importers_counts_and_posts_nothing(history, daemon
 def test_posts_every_owner_turn_at_its_original_time_in_order(history, daemon):
     """Only ``active = 1 OR compacted = 1`` rows: the archived turn posts,
     the carried tail once, at its original time. Cron and subagent sessions
-    post nothing, and a compaction summary is a clear where it sits."""
+    post nothing, and a compaction summary posts nothing either."""
     assert run("--all-history") == 0
     assert posted(daemon) == [
         ("s-main", at("2026-01-05T09:00:00Z"), "I live in Auckland, near the harbour."),
@@ -103,7 +103,6 @@ def test_posts_every_owner_turn_at_its_original_time_in_order(history, daemon):
         ("s-later", at("2026-01-10T09:00:00Z"), "Any plans for the weekend?"),
         ("s-compacted", at("2026-01-11T09:00:00Z"), "Archived question."),
         ("s-compacted", at("2026-01-11T09:10:00Z"), "Carried question."),
-        ("s-compacted", "clear"),
         ("s-compacted", at("2026-01-11T09:30:00Z"), "After the compaction."),
         ("s-mixed", at("2026-01-12T09:00:00Z"), "What's on my calendar tomorrow?"),
         ("s-mixed", at("2026-01-12T09:10:00Z"), "I started learning the cello."),
@@ -174,6 +173,33 @@ def test_stops_at_the_first_daemon_error_and_a_rerun_resumes(history, daemon, ca
     assert run("--all-history") == 0
     printed = json.loads(capsys.readouterr().out)
     assert (printed["stored"], printed["duplicates"]) == (0, 13)
+
+
+def test_a_rerun_leaves_a_live_sessions_state_alone(history, daemon):
+    """A session clear touches only live injection state, which historical
+    turns never made, so the backfill never sends one. A session that went
+    live after the first run keeps its state through a rerun."""
+    live = {}
+
+    def clear(request):
+        live.pop(request.session, None)
+        return 204, None
+
+    daemon.set_handler("turns", deduping())
+    daemon.set_handler("clear", clear)
+    assert run("--all-history") == 0
+    live["s-compacted"] = {"injected-after-the-first-run"}
+    assert run("--all-history") == 0
+    assert live == {"s-compacted": {"injected-after-the-first-run"}}
+
+
+def test_a_clear_whose_answer_is_lost_cannot_change_the_run(history, daemon, capsys):
+    """Nothing about a clear decides the run: with the clear route dropping
+    connections, every turn still posts and the run finishes."""
+    daemon.drop_connections("clear", 1)
+    assert run("--all-history") == 0
+    assert json.loads(capsys.readouterr().out)["stored"] == IMPORT_COUNTS["turns"]
+    assert daemon.requests_for("clear") == []
 
 
 def setup_with(hermes_home, *answers):
