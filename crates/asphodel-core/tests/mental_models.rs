@@ -1170,6 +1170,35 @@ fn a_startless_anniversary_is_a_dated_agenda_occasion_not_a_routine() {
 }
 
 #[test]
+fn a_startless_anniversary_learned_at_noon_starts_today_and_is_on_todays_agenda() {
+    let h = Harness::new();
+    h.set(local("2026-10-05T12:00"));
+    let memory = extract_startless_anniversary(&h);
+    // The public memory view does not expose DTSTART. Read just the stored
+    // stamp here; extraction and the dated agenda still use Service APIs.
+    let start: Option<i64> = h.one(
+        "SELECT recurrence_start FROM memories WHERE uuid = ?1",
+        [memory.to_string()],
+    );
+    let precision: Option<String> = h.one(
+        "SELECT recurrence_start_precision FROM memories WHERE uuid = ?1",
+        [memory.to_string()],
+    );
+    let agenda = h.agenda();
+    // 5 October midnight in Auckland is 4 October 11:00 UTC. A day-only
+    // occasion remains relevant at noon even though midnight has passed.
+    assert_eq!(
+        (start, precision.as_deref(), agenda.dated, agenda.routines),
+        (
+            Some(micros(at("2026-10-04T11:00:00Z"))),
+            Some("day"),
+            vec![memory],
+            vec![],
+        ),
+    );
+}
+
+#[test]
 fn startless_rules_with_unknown_dates_or_interval_phase_keep_only_their_text() {
     for rule in [
         "FREQ=WEEKLY;INTERVAL=2",
