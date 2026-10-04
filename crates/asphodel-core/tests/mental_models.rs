@@ -2672,6 +2672,176 @@ fn the_smallest_accepted_update_budget_fits_the_date_alone() {
     );
 }
 
+// Shortened lines. The first item always goes in; when it can't go in
+// whole, its sentence is cut and ends in "…", and its annotations stay,
+// giving way only when they'd leave too little of the sentence.
+
+/// The update's line for the memory whose sentence starts with `start`.
+fn line_starting<'a>(update: &'a str, start: &str) -> &'a str {
+    update
+        .lines()
+        .find(|line| line.starts_with(&format!("- {start}")))
+        .unwrap_or_else(|| panic!("no line for {start:?}:\n{update}"))
+}
+
+/// What a shortened `line` kept of its sentence: the text between "- " and
+/// the "…" that comes just before `suffix`.
+fn kept<'a>(line: &'a str, suffix: &str) -> &'a str {
+    line.strip_prefix("- ")
+        .and_then(|body| body.strip_suffix(suffix))
+        .and_then(|body| body.strip_suffix('…'))
+        .unwrap_or_else(|| panic!("{line:?} isn't \"- <start>…{suffix}\""))
+}
+
+#[test]
+fn an_oversized_first_item_is_cut_at_a_word_and_keeps_its_date() {
+    let h = Harness::new();
+    h.block(Some("s1"));
+    let long = long_sentence("3", 1200);
+    h.insert(event(long, "2026-10-03T00:00"));
+    h.insert(event(CONCERT, "2026-10-09T00:00"));
+    h.set(local("2026-10-02T09:00"));
+
+    let update = update_section(&prefetch(&h, "s1", "hello there").text).to_owned();
+    let budget = h.tuning.agenda.update_budget as usize;
+    assert!(estimate_tokens(&update) <= budget, "{update}");
+    assert!(update.ends_with("\n- and 1 more agenda item"), "{update}");
+
+    let start = kept(
+        line_starting(&update, "Tim has an appointment on 3"),
+        " [upcoming Sat 3 Oct]",
+    );
+    assert!(
+        long.starts_with(start),
+        "{start:?} isn't the sentence's start"
+    );
+    assert!(start.len() < long.len());
+    assert!(
+        long[start.len()..].starts_with(' '),
+        "the cut isn't at a word boundary: {start:?}"
+    );
+    assert!(
+        estimate_tokens(&update) >= budget - 10,
+        "the cut left far more room than one word needs:\n{update}"
+    );
+}
+
+#[test]
+fn a_word_with_no_boundary_is_cut_safely_in_any_script() {
+    // One long word after a short start, in ASCII and in multi-byte text:
+    // the cut falls inside the word, on a character, keeping the date.
+    for (prefix, word) in [("Tim's code is ", "X"), ("Tim lives in ", "東京")] {
+        let h = Harness::with_tuning("[agenda]\nupdate_budget = 40\n");
+        h.block(Some("s1"));
+        let sentence = sentence(format!("{prefix}{}.", word.repeat(200)));
+        h.insert(event(sentence, "2026-10-03T00:00"));
+
+        let update = update_section(&prefetch(&h, "s1", "hello there").text).to_owned();
+        assert!(estimate_tokens(&update) <= 40, "{update}");
+        let start = kept(line_starting(&update, prefix), " [upcoming Sat 3 Oct]");
+        assert!(
+            sentence.starts_with(start),
+            "{start:?} isn't the sentence's start"
+        );
+        assert!(
+            start.len() > prefix.len(),
+            "the cut dropped the whole word: {start:?}"
+        );
+    }
+}
+
+#[test]
+fn annotations_that_leave_too_little_sentence_give_way_date_last() {
+    let recurrence = "every Monday morning before work, unless it rained overnight, \
+                      in which case on Tuesday, and never during the school holidays \
+                      or the weeks Tim is travelling for work";
+
+    // A routine's only annotation is its recurrence: it goes, and the
+    // sentence, now fitting, is whole with no "…".
+    let h = Harness::with_tuning("[agenda]\nupdate_budget = 40\n");
+    h.block(Some("s1"));
+    h.insert(Memory {
+        content: "Tim waters the garden.",
+        kind: "recurring",
+        recurrence_text: Some(recurrence),
+        recurrence_rrule: Some("FREQ=WEEKLY;BYDAY=MO"),
+        recurrence_start: Some((local("2026-09-28T00:00"), "day")),
+        ..Memory::default()
+    });
+    h.insert(recurring(
+        "Tim swims on Tuesdays.",
+        Some("FREQ=WEEKLY;BYDAY=TU"),
+        "2026-09-29T00:00",
+    ));
+    let update = update_section(&prefetch(&h, "s1", "hello there").text).to_owned();
+    assert!(estimate_tokens(&update) <= 40, "{update}");
+    assert_eq!(
+        line_starting(&update, "Tim waters"),
+        "- Tim waters the garden.",
+        "{update}"
+    );
+
+    // Across recurrences that fit beside some of the sentence, the line
+    // keeps the annotation only with at least 20 characters of sentence.
+    let watering = "Tim waters the vegetable garden behind the house.";
+    for chars in (30..=120).step_by(3) {
+        let mut recurrence = String::from("every Monday");
+        while recurrence.len() < chars {
+            recurrence.push_str(" unless it rains");
+        }
+        recurrence.truncate(chars);
+        let recurrence = recurrence.trim_end().to_owned();
+        let h = Harness::with_tuning("[agenda]\nupdate_budget = 40\n");
+        h.block(Some("s1"));
+        h.insert(Memory {
+            content: watering,
+            kind: "recurring",
+            recurrence_text: Some(sentence(recurrence.clone())),
+            recurrence_rrule: Some("FREQ=WEEKLY;BYDAY=MO"),
+            recurrence_start: Some((local("2026-09-28T00:00"), "day")),
+            ..Memory::default()
+        });
+        h.insert(recurring(
+            "Tim swims on Tuesdays.",
+            Some("FREQ=WEEKLY;BYDAY=TU"),
+            "2026-09-29T00:00",
+        ));
+        let update = update_section(&prefetch(&h, "s1", "hello there").text).to_owned();
+        assert!(estimate_tokens(&update) <= 40, "{update}");
+        let line = line_starting(&update, "Tim waters");
+        let suffix = format!(" [recurring: {recurrence}]");
+        if line != format!("- {watering}") && line != format!("- {watering}{suffix}") {
+            let start = kept(line, &suffix);
+            assert!(
+                start.chars().count() >= 20,
+                "a {chars}-character recurrence left {start:?}:\n{update}"
+            );
+        }
+    }
+
+    // With the date first, the date stays and the recurrence goes.
+    let h = Harness::with_tuning("[agenda]\nupdate_budget = 40\n");
+    h.block(Some("s1"));
+    h.insert(Memory {
+        content: "Tim starts swimming lessons.",
+        kind: "recurring",
+        valid_from: Some((local("2026-10-03T00:00"), "day")),
+        recurrence_text: Some(recurrence),
+        recurrence_rrule: Some("FREQ=MONTHLY;BYMONTHDAY=3"),
+        recurrence_start: Some((local("2026-10-03T00:00"), "day")),
+        ..Memory::default()
+    });
+    h.insert(event(CONCERT, "2026-10-04T00:00"));
+    let full = h.block(None).text;
+    let update = update_section(&prefetch(&h, "s1", "hello there").text).to_owned();
+    assert!(estimate_tokens(&update) <= 40, "{update}");
+    assert_eq!(
+        line_starting(&update, "Tim starts"),
+        "- Tim starts swimming lessons. [upcoming Sat 3 Oct]",
+        "{update}\n\nthe block renders it as:\n{full}"
+    );
+}
+
 // The agenda
 
 #[test]

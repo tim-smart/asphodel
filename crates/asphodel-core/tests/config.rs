@@ -132,20 +132,22 @@ fn undated_days_must_be_at_least_one() {
 #[test]
 fn an_agenda_update_budget_too_small_for_the_date_alone_is_rejected() {
     // The date-only update is about 18 tokens, so 1 can't hold it.
-    for budget in [0, 1] {
+    for budget in [0, 1, 39] {
         assert_eq!(
             invalid_keys(&format!("[agenda]\nupdate_budget = {budget}\n")),
             ["agenda.update_budget"],
             "{budget}"
         );
     }
-    assert_eq!(
-        load("[agenda]\nupdate_budget = 200\n")
-            .unwrap()
-            .agenda
-            .update_budget,
-        200
-    );
+    for budget in [40, 200] {
+        assert_eq!(
+            load(&format!("[agenda]\nupdate_budget = {budget}\n"))
+                .unwrap()
+                .agenda
+                .update_budget,
+            budget
+        );
+    }
 }
 
 #[test]
