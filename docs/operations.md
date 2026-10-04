@@ -299,11 +299,24 @@ HERMES_HOME=~/.hermes python3 backfill.py --all-history --speaker Sam=discord:12
 
 It reads an online-backup copy of `state.db`, never the live file, using
 the rules of `asphodel import`. Only turns Hermes still keeps for search are
-read. Tool rows, cron sessions and subagent sessions are skipped, and a
-compaction becomes a session clear. The injected memory block (Hindsight's
-`<memory-context>`) is cut from the user's text, so Hindsight's memories
-aren't extracted as the user's own words. A schema version other than 30 or
-31 is refused.
+read. Tool rows, cron sessions and subagent sessions are skipped. The
+injected memory block (Hindsight's `<memory-context>`) is cut from the
+user's text, so Hindsight's memories aren't extracted as the user's own
+words. A schema version other than 30 or 31 is refused.
+
+Compactions are counted but send nothing. Unlike `asphodel import`, the
+backfill never clears a session. A clear changes only live injection state
+(the in-context set, pending injections and the session's prompt block),
+which historical turns never built up. On a session that's live in Hermes,
+a clear would wipe that state, on the first run or on any rerun.
+
+One limit applies to the session Hermes is in while the backfill runs. The
+daemon stores each new turn with the session's in-context set at the moment
+it arrives, and extraction judges which memories a turn `used` against it.
+A backfilled turn from that session's history, before the switch, gets the
+live set rather than the empty one it had. Turns from every other session
+are unaffected. Running it from setup, before Hermes has used Asphodel,
+avoids it.
 
 It stops at the first daemon error and names the session and time it
 stopped at. The daemon dedupes turns, so rerunning the same command

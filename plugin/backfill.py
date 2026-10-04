@@ -9,8 +9,9 @@ live writer is never read mid-transaction:
 - only rows with ``active = 1 OR compacted = 1`` are read, in timestamp order;
 - each user message is paired with the final assistant reply, and tool rows
   and assistant rows that only call tools are skipped;
-- a ``_compressed_summary`` row is skipped and becomes a session clear at its
-  time;
+- a ``_compressed_summary`` row is skipped and counted, and posts nothing:
+  a session clear changes only live injection state, which historical turns
+  never made, so a backfilled one could only wipe a live session's;
 - cron sessions and subagent sessions (``parent_session_id`` set) post
   nothing;
 - the injected memory block is cut from the text, multimodal content is
@@ -127,13 +128,12 @@ class Refused(Exception):
 
 @dataclass
 class Event:
-    """A turn to post or a clear, at the user message's time or the summary
-    row's."""
+    """A turn to post, at the user message's time."""
 
     at: float
     seq: int
     session: str
-    turn: Optional[Dict[str, Any]] = None
+    turn: Dict[str, Any]
 
 
 @dataclass
@@ -186,14 +186,14 @@ def _run(args: argparse.Namespace, home: Path) -> int:
     counts = dict(history.counts)
     events = [event for event in history.events if since is None or event.at >= since]
     if since is not None:
-        counts["turns_before_since"] = counts["turns"] - sum(1 for event in events if event.turn is not None)
+        counts["turns_before_since"] = counts["turns"] - len(events)
     if args.dry_run:
         print(json.dumps(counts, indent=2))
         return 0
 
     client = DaemonClient(config.url, token=config.token)
     stored = duplicates = 0
-    total = sum(1 for event in events if event.turn is not None)
+    total = len(events)
     try:
         identity = {
             "owner_name": config.owner_name,
@@ -207,14 +207,10 @@ def _run(args: argparse.Namespace, home: Path) -> int:
         return EXIT_STOPPED
     for event in events:
         try:
-            if event.turn is None:
-                client.clear_session(bank, event.session, timeout=TURN_TIMEOUT)
-                continue
             reply = client.ingest_turn(bank, event.turn, timeout=TURN_TIMEOUT)
         except (DaemonUnavailable, DaemonError) as error:
-            what = "the clear" if event.turn is None else "the turn"
             print(
-                f"error: stopped at {what} in session {event.session} at {turns.epoch_to_rfc3339(event.at)}: "
+                f"error: stopped at the turn in session {event.session} at {turns.epoch_to_rfc3339(event.at)}: "
                 f"{error}. {stored} stored and {duplicates} already there before it; "
                 "rerun the same command to resume.",
                 file=sys.stderr,
@@ -370,17 +366,14 @@ def _walk(conn: sqlite3.Connection, *, speakers: Dict[str, str], timezone_name: 
 
         open_turn = None
         for row in rows:
-            role, _, stamp, summary, tool_calls = row
+            role, _, _, summary, tool_calls = row
             if summary:
-                # Hermes replaced the turns before here with this summary, and
-                # the session's context started over.
+                # Hermes replaced the turns before here with this summary. The
+                # importer replays a clear here; the backfill only counts it.
                 emit(open_turn)
                 open_turn = None
                 counts["compactions"] += 1
                 counts["summary_rows_skipped"] += 1
-                if not cron:
-                    seq += 1
-                    history.events.append(Event(at=_epoch(stamp), seq=seq, session=session))
                 continue
             if role == "user":
                 emit(open_turn)
