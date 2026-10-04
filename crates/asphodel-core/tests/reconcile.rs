@@ -1461,11 +1461,12 @@ fn an_undated_retraction_inherits_the_dated_window() {
 
 #[test]
 fn an_undated_retraction_with_a_new_kind_keeps_its_own_window() {
+    // A dated state rather than a task: only another task can replace an
+    // open task, so a deadline never crosses kinds this way.
     for kind in ["event", "fact"] {
-        let initial = claim(PASSPORT, "task", "renew my passport")
+        let initial = claim(PASSPORT, "state", "renew my passport")
             .with("valid_from", time("2026-10-11", "day"))
-            .with("valid_until", time("2026-10-15", "day"))
-            .with("due_at", time("2026-10-15T08:00", "minute"));
+            .with("valid_until", time("2026-10-15", "day"));
         let (h, old, extracted) = window_repeat(
             initial,
             claim(PASSPORT, kind, "renew my passport"),
@@ -1480,17 +1481,16 @@ fn an_undated_retraction_with_a_new_kind_keeps_its_own_window() {
         assert!(old_view.retracted_at.is_some());
         assert_eq!(head.kind, kind);
         assert!(
-            head.window.due_at.is_none(),
-            "{kind} cannot inherit a task deadline"
+            head.window.valid_until.is_none(),
+            "{kind} cannot inherit a state's end"
         );
-        assert!(head.window.valid_until.is_none());
         assert_eq!(
             head.window.valid_from.map(|stamp| stamp.at),
             match kind {
                 "event" => Some(local("2026-10-02T00:00")),
                 _ => None,
             },
-            "the replacement keeps its own start rather than the old task's start"
+            "the replacement keeps its own start rather than the old state's start"
         );
     }
 }
