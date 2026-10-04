@@ -247,6 +247,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             extraction_lag: outcome.extraction_lag,
             refresh_calls_per_day: outcome.refresh_calls_per_day,
             injected_tokens: outcome.injected_tokens,
+            injection_usage: outcome.injection_usage,
             profile_tokens: outcome.profile_tokens,
             call2_rate: outcome.call2_rate,
             agenda_lines_per_day: outcome.agenda_lines_per_day,

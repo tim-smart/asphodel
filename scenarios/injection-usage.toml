@@ -1,0 +1,51 @@
+# Two injected memories per question, one used across four judgements.
+name = "injection-usage"
+group = "ci"
+
+[bank]
+timezone = "UTC"
+
+[[turn]]
+at = "2026-01-05T09:00:00Z"
+session = "seed"
+user = "The orchard grows apples. The orchard grows pears."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "apples"
+content = "The orchard grows apples."
+quote = "The orchard grows apples"
+kind = "fact"
+significance = "minor"
+
+[[turn.claim]]
+label = "pears"
+content = "The orchard grows pears."
+quote = "The orchard grows pears"
+kind = "fact"
+significance = "minor"
+
+[[turn]]
+at = "2026-01-05T10:00:00Z"
+session = "question-one"
+user = "What grows in the orchard?"
+assistant = "Apples grow in the orchard."
+used = ["apples"]
+
+[[turn]]
+at = "2026-01-05T11:00:00Z"
+session = "question-two"
+user = "What grows in the orchard?"
+assistant = "I cannot answer that."
+
+[[probe]]
+id = "apples-exist"
+at = "2026-01-05T12:00:00Z"
+kind = "exists"
+memory = "apples"
+
+[[probe]]
+id = "pears-exist"
+at = "2026-01-05T12:00:00Z"
+kind = "exists"
+memory = "pears"
