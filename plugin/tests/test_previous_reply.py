@@ -76,3 +76,50 @@ def test_clearing_discards_reply_context(make_provider, daemon, clear):
     body = daemon.requests_for("prefetch")[-1].body
     assert body["previous_query"] == "after clear"
     assert body.get("previous_reply") is None
+
+
+@pytest.mark.parametrize("delayed_sync", [False, True], ids=["unsynced-next-turn", "late-sync"])
+def test_reply_is_not_paired_with_a_different_query(make_provider, daemon, delayed_sync):
+    provider = make_provider()
+    provider.prefetch("first")
+    if not delayed_sync:
+        provider.sync_turn("first", "Answer to first.")
+    provider.prefetch("second")
+    if delayed_sync:
+        provider.sync_turn("first", "Answer to first.")
+    provider.prefetch("third")
+    body = daemon.requests_for("prefetch")[-1].body
+    assert body["previous_query"] == "second"
+    assert body.get("previous_reply") is None
+    # A reply that actually belongs to the current previous query still works.
+    provider.sync_turn("third", "Answer to third.")
+    provider.prefetch("fourth")
+    body = daemon.requests_for("prefetch")[-1].body
+    assert body["previous_query"] == "third"
+    assert body.get("previous_reply") == "Answer to third."
+
+
+@pytest.mark.parametrize("clear", ["forget", "compression", "reset", "rewind"])
+@pytest.mark.parametrize("repeated_query", [False, True], ids=["distinct-query", "repeated-query"])
+def test_late_sync_cannot_restore_cleared_reply_context(make_provider, daemon, clear, repeated_query):
+    provider = make_provider()
+    provider.prefetch("old query")
+    if clear == "forget":
+        result = json.loads(provider.handle_tool_call("memory_forget", {"ids": ["m1"]}))
+        assert result == {"forgotten": ["m1"], "unknown": []}
+    else:
+        kwargs = {"compression": {"reason": "compression"}, "reset": {"reset": True}, "rewind": {"rewound": True}}
+        provider.on_session_switch(SESSION, **kwargs[clear])
+        assert daemon.requests_for("clear")[-1].session == SESSION
+    fresh_query = "old query" if repeated_query else "fresh query"
+    provider.prefetch(fresh_query)
+    body = daemon.requests_for("prefetch")[-1].body
+    assert body.get("previous_query") is None
+    assert body.get("previous_reply") is None
+    # This completion belongs to the turn before the clear, even when its
+    # text matches a new turn. Query-text equality alone cannot establish that.
+    provider.sync_turn("old query", "Answer from before the clear.")
+    provider.prefetch("next query")
+    body = daemon.requests_for("prefetch")[-1].body
+    assert body["previous_query"] == fresh_query
+    assert body.get("previous_reply") is None
