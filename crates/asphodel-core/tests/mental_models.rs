@@ -1979,7 +1979,7 @@ fn an_entry_citing_a_low_confidence_state_shows_its_age() {
 // The block
 
 #[test]
-fn the_block_holds_the_agenda_each_enabled_model_and_the_pointer_line() {
+fn the_block_opens_with_memory_guidance_before_the_agenda_and_models() {
     let h = Harness::new();
     let tea = h.insert(fact(TEA));
     let dentist = h.insert(event(
@@ -1998,6 +1998,7 @@ fn the_block_holds_the_agenda_each_enabled_model_and_the_pointer_line() {
         .unwrap();
 
     let block = h.block(None);
+    assert_memory_guidance(&block);
     assert_eq!(block.built_at, h.now());
     assert_eq!(block.agenda, vec![dentist]);
     assert_eq!(block.cited, vec![tea]);
@@ -2015,15 +2016,120 @@ fn the_block_holds_the_agenda_each_enabled_model_and_the_pointer_line() {
         !block.text.contains("Plans"),
         "a disabled model was rendered"
     );
-    // The header stays one line: the label goes into the pointer line.
-    assert_eq!(
-        block
-            .text
-            .lines()
-            .filter(|l| l.contains("memory_recall"))
-            .count(),
-        1
+}
+
+/// Check the usage contract without requiring the entire draft verbatim.
+fn assert_memory_guidance(block: &Block) {
+    assert!(
+        block.text.starts_with("## Long-term memory (Asphodel)\n"),
+        "the block must open with its memory heading:\n{}",
+        block.text
     );
+    let guidance = block.text.split("Agenda for ").next().unwrap();
+    for needle in [
+        "saved automatically",
+        "never need to save",
+        "<memory-context>",
+        "Thu 1 Oct 20:00",
+        "disagree",
+        "Before saying",
+        "don't know",
+        "don't remember",
+        "memory_recall",
+        "upcoming",
+        "session_search",
+        "exact wording",
+    ] {
+        assert!(guidance.contains(needle), "the guidance lacks {needle:?}");
+    }
+    assert!(!block.text.contains("memories win:"));
+}
+
+#[test]
+fn an_empty_bank_still_opens_with_memory_guidance() {
+    let h = Harness::new();
+    let block = h.block(None);
+    assert!(block.agenda.is_empty());
+    assert!(block.cited.is_empty());
+    assert_memory_guidance(&block);
+}
+
+#[test]
+fn budget_folding_keeps_memory_guidance_and_counts_it_in_the_budget() {
+    let h = Harness::new();
+    let tasks: Vec<Uuid> = (0..5)
+        .map(|n| {
+            h.insert(task(sentence(format!(
+                "Tim needs to complete job {n}. {}",
+                "There are many details to handle before this job is complete. ".repeat(20)
+            ))))
+        })
+        .collect();
+    let block = h.block(None);
+    assert!(block.agenda.len() < tasks.len(), "the agenda did not fold");
+    assert!(estimate_tokens(&block.text) <= h.tuning.mental_models.budget as usize);
+    assert_memory_guidance(&block);
+}
+
+#[test]
+fn budgets_below_the_memory_guidance_minimum_are_rejected() {
+    // The fixture guidance alone needs 117 estimated tokens. Neither the
+    // reported 100-token budget nor the token immediately below it can fit.
+    let mut accepted = Vec::new();
+    for budget in [100, 116] {
+        let result = Tuning::from_toml(&format!(
+            "[mental_models]\nbudget = {budget}\nprofile_max_tokens = {budget}\n"
+        ));
+        match result {
+            Ok(_) => accepted.push(budget),
+            Err(error) => assert!(error.to_string().contains("mental_models.budget")),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "accepted budgets below the guidance minimum: {accepted:?}"
+    );
+}
+
+#[test]
+fn accepted_boundary_budgets_fit_memory_guidance_and_the_dated_fold_summary() {
+    // The safe minimum is 134 tokens on 64-bit targets (131 on 32-bit):
+    // guidance with a two-digit day, an agenda heading, and a fold summary
+    // with the largest representable count, including their separators.
+    let minimum = if usize::BITS == 64 { 134 } else { 131 };
+    let below = minimum - 1;
+    let error = Tuning::from_toml(&format!(
+        "[mental_models]\nbudget = {below}\nprofile_max_tokens = {below}\n"
+    ))
+    .expect_err("the token immediately below the safe minimum must be rejected");
+    assert!(error.to_string().contains("mental_models.budget"));
+
+    for budget in [minimum, minimum + 1] {
+        let extra = format!("[mental_models]\nbudget = {budget}\nprofile_max_tokens = {budget}\n");
+        Tuning::from_toml(&extra).expect("the safe minimum and higher budgets must be accepted");
+        let h = Harness::with_tuning(&extra);
+        let empty = h.block(None);
+        assert_memory_guidance(&empty);
+        assert!(estimate_tokens(&empty.text) <= budget);
+
+        let h = Harness::with_tuning(&extra);
+        h.insert(event(
+            sentence(format!(
+                "Tim has a planning appointment. {}",
+                "There are many details to discuss. ".repeat(30)
+            )),
+            "2026-10-01T00:00",
+        ));
+        let folded = h.block(None);
+        assert!(folded.agenda.is_empty(), "the dated item did not fold");
+        assert_memory_guidance(&folded);
+        assert!(folded.text.contains("- and 1 more dated item"));
+        let tokens = estimate_tokens(&folded.text);
+        assert!(
+            tokens <= budget,
+            "folded block uses {tokens} tokens with budget {budget}"
+        );
+    }
 }
 
 #[test]

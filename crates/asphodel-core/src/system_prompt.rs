@@ -1,13 +1,13 @@
 //! The block `system_prompt_block()` returns.
 //!
-//! It holds the agenda, every enabled model's entries, and one pointer line
-//! with the build time. Building it costs queries only, never an LLM call,
-//! so the plugin's 2 s fetch never waits on a refresh.
+//! It opens with memory usage guidance and the build time, followed by the
+//! agenda and every enabled model's entries. Building it costs queries only,
+//! never an LLM call, so the plugin's 2 s fetch never waits on a refresh.
 //!
 //! - **The budget.** The whole text stays within `mental_models.budget`
-//!   tokens, which the agenda and every model share. The pointer line is
+//!   tokens, which the agenda and every model share. The guidance is
 //!   always there. The agenda is laid out first and whole, and folds
-//!   only when it and the pointer alone are over: undated tasks, then
+//!   only when it and the guidance alone are over: undated tasks, then
 //!   routines, least-ranked first, then dated lines in the agenda's fold
 //!   order. The models fill what's left, oldest first, each with its
 //!   entries in stored order until the next doesn't fit. What the block
@@ -133,14 +133,43 @@ impl Blocks {
     }
 }
 
-/// The pointer line, with the build time. Sessions are frozen, so it says
+/// Memory usage guidance, with the build time. Sessions are frozen, so it says
 /// how to reach anything added since.
-fn pointer(now: Timestamp, tz: &TimeZone) -> String {
+fn guidance(built_at: &str) -> String {
     format!(
-        "Built {}; memories win: use memory_recall for history and detail, and for anything \
-         added since, call memory_recall with phase upcoming.",
-        now.to_zoned(tz.clone()).strftime("%a %-d %b %H:%M")
+        "## Long-term memory (Asphodel)\n\
+         Memories from past conversations are saved automatically, so you never need to save anything. \
+         Relevant ones arrive with user messages inside `<memory-context>`. \
+         The lists below were built {}, and a memory beats them where they disagree. \
+         Before saying you don't know or don't remember something, call memory_recall \
+         (with phase \"upcoming\" for plans added since). \
+         Use it ahead of session_search unless you need exact wording.",
+        built_at
     )
+}
+
+fn agenda_heading(date: &str) -> String {
+    format!("Agenda for {date}")
+}
+
+fn fold_summary(count: usize) -> String {
+    format!(
+        "- and {count} more dated item{}",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+/// Reserve the mandatory guidance and the agenda after every dated item folds.
+/// English abbreviated weekdays/months have three characters; a two-digit day
+/// and the largest representable fold count cover any date and bank contents.
+/// Measure the same renderers and separators as the block, not a token constant.
+pub(crate) fn minimum_budget() -> usize {
+    estimate_tokens(&format!(
+        "{}\n\n{}\n{}",
+        guidance("Wed 30 Sep 23:59"),
+        agenda_heading("Wed 30 Sep"),
+        fold_summary(usize::MAX)
+    ))
 }
 
 /// Builds the bank's block at `now`.
@@ -154,22 +183,26 @@ pub(crate) fn build(
     let conn = store.connection();
     let agenda = crate::agenda::build(&conn, tuning, bank_id, tz, now)?;
     let budget = tuning.mental_models.budget as usize;
-    let pointer = pointer(now, tz);
-    // The agenda and every enabled model share the budget, with the pointer
-    // line always kept. Each try lays the sections out as they'd be rendered
+    let guidance = guidance(
+        &now.to_zoned(tz.clone())
+            .strftime("%a %-d %b %H:%M")
+            .to_string(),
+    );
+    // The agenda and every enabled model share the budget, with the guidance
+    // always kept. Each try lays the sections out as they'd be rendered
     // and measures the whole text.
     let fits = |sections: &[String]| -> bool {
-        let mut text = sections.join("\n\n");
-        if !text.is_empty() {
+        let mut text = guidance.clone();
+        if !sections.is_empty() {
             text.push_str("\n\n");
+            text.push_str(&sections.join("\n\n"));
         }
-        text.push_str(&pointer);
         estimate_tokens(&text) <= budget
     };
 
     // The agenda first, whole when it fits: its dated lines are chosen by
     // time so an item can't drop out on the day it matters. Only when the
-    // agenda and the pointer alone are over the budget does it fold, the
+    // agenda and the guidance alone are over the budget does it fold, the
     // least-ranked undated task first, then the least-ranked routine, then
     // dated lines in the agenda's own fold order.
     let mut shown = Shown {
@@ -236,7 +269,7 @@ pub(crate) fn build(
             sections.push(format!("{}\n{}", model.name, lines.join("\n")));
         }
     }
-    sections.push(pointer);
+    sections.insert(0, guidance);
 
     let block = Block {
         id: store.new_id(),
@@ -282,17 +315,12 @@ impl Shown {
             .filter_map(|(line, shown)| shown.then_some(line))
             .collect();
         if !dated.is_empty() || self.folded > 0 {
-            lines.push(format!(
-                "Agenda for {}",
-                now.to_zoned(tz.clone()).strftime("%a %-d %b")
+            lines.push(agenda_heading(
+                &now.to_zoned(tz.clone()).strftime("%a %-d %b").to_string(),
             ));
             lines.extend(dated.into_iter().cloned());
             if self.folded > 0 {
-                lines.push(format!(
-                    "- and {} more dated item{}",
-                    self.folded,
-                    if self.folded == 1 { "" } else { "s" }
-                ));
+                lines.push(fold_summary(self.folded));
             }
         }
         if self.routines > 0 {

@@ -32,7 +32,8 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "description": (
             "Search Asphodel's long-term memory for what the user has said or done. "
             "Use it for anything from an earlier conversation, and with phase "
-            "'upcoming' for what is coming up after the agenda in the system prompt was built."
+            "'upcoming' for what is coming up after the agenda in the system prompt was built. "
+            "Results join the session's context. Use entity to filter for a person or place."
         ),
         "parameters": {
             "type": "object",
@@ -50,7 +51,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "type": "array",
                     "items": {"type": "string", "enum": ["fact", "event", "state", "task", "recurring"]},
                 },
-                "entity": {"type": "string", "description": "A person, place or thing, by name or alias."},
+                "entity": {"type": "string", "description": "Filter for a person, place or thing, by name or alias."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": RECALL_LIMIT_MAX, "default": RECALL_LIMIT_DEFAULT},
             },
             "required": ["query"],
@@ -60,18 +61,25 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "name": FORGET_TOOL,
         "description": (
             "Irreversibly erase memories and every version of them. Only when the owner "
-            "explicitly asks to forget something; only the owner may call it."
+            "explicitly asks to forget something; only the owner may call it. "
+            "Get ids from memory_recall; injected memories carry no ids."
         ),
         "parameters": {"type": "object", "properties": {"ids": _IDS_PARAMETER}, "required": ["ids"]},
     },
     {
         "name": KEEP_TOOL,
-        "description": "Mark memories to keep so they never fade. Only the owner may call it.",
+        "description": (
+            "Mark memories to keep so they never fade. Only the owner may call it. "
+            "Get ids from memory_recall; injected memories carry no ids."
+        ),
         "parameters": {"type": "object", "properties": {"ids": _IDS_PARAMETER}, "required": ["ids"]},
     },
     {
         "name": UNKEEP_TOOL,
-        "description": "Undo memory_keep, returning memories to the significance extraction gave them. Only the owner may call it.",
+        "description": (
+            "Undo memory_keep, returning memories to the significance extraction gave them. Only the owner may call it. "
+            "Get ids from memory_recall; injected memories carry no ids."
+        ),
         "parameters": {"type": "object", "properties": {"ids": _IDS_PARAMETER}, "required": ["ids"]},
     },
 ]

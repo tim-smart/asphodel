@@ -295,7 +295,8 @@ impl Default for AgendaTuning {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MentalModelsTuning {
-    /// Tokens shared by every enabled model in `system_prompt_block()`.
+    /// Tokens shared by the guidance, agenda and every enabled model in
+    /// `system_prompt_block()`. Must fit its mandatory guidance and fold summary.
     pub budget: u32,
 
     /// `max_tokens` for the seeded "User profile".
@@ -657,6 +658,16 @@ impl Tuning {
         }
 
         let models = &self.mental_models;
+        let minimum_budget = crate::system_prompt::minimum_budget();
+        if (models.budget as usize) < minimum_budget {
+            fail(
+                "mental_models.budget",
+                format!(
+                    "must be at least {minimum_budget} to fit memory guidance and the agenda fold summary, got {}",
+                    models.budget
+                ),
+            );
+        }
         for (key, value) in [
             ("mental_models.budget", models.budget),
             (
