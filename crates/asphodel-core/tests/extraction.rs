@@ -3251,7 +3251,7 @@ fn call1_uses_the_new_template_version() {
     let request = call1_request(&input(&h, "main", &[]));
     // The new rules are a new version: `fast` reuses call 1's claims by
     // version, and claims made under the old rules mustn't be.
-    assert_eq!(request.template.version, 5);
+    assert_eq!(request.template.version, 6);
 }
 
 /// `[extraction] guidance` as it might be written, padded, and the text
