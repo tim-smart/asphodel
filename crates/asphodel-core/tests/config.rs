@@ -458,8 +458,8 @@ fn strong_cutoff_must_sit_above_the_faded_boundary() {
 #[test]
 fn significance_values_default_to_the_calibrated_levels() {
     let significance = Tuning::default().strength.significance;
-    assert_eq!(significance.trivial, 0.1);
-    assert_eq!(significance.minor, 0.3);
+    assert_eq!(significance.trivial, 0.0);
+    assert_eq!(significance.minor, 0.2);
     assert_eq!(significance.notable, 0.5);
     assert_eq!(significance.major, 0.7);
     assert_eq!(significance.critical, 0.9);
@@ -467,18 +467,18 @@ fn significance_values_default_to_the_calibrated_levels() {
 
 #[test]
 fn a_significance_override_sets_only_the_levels_it_names() {
-    let t = load("[strength.significance]\ntrivial = 0.02\nminor = 0.2\n").unwrap();
+    let t = load("[strength.significance]\ntrivial = 0.02\nminor = 0.25\n").unwrap();
     let significance = t.strength.significance;
     assert_eq!(significance.trivial, 0.02);
-    assert_eq!(significance.minor, 0.2);
+    assert_eq!(significance.minor, 0.25);
     assert_eq!(significance.notable, 0.5);
     assert_eq!(significance.major, 0.7);
     assert_eq!(significance.critical, 0.9);
 
     // The inline-table spelling is the same key.
-    let inline = load("[strength]\nsignificance = { trivial = 0.0 }\n").unwrap();
-    assert_eq!(inline.strength.significance.trivial, 0.0);
-    assert_eq!(inline.strength.significance.minor, 0.3);
+    let inline = load("[strength]\nsignificance = { trivial = 0.1 }\n").unwrap();
+    assert_eq!(inline.strength.significance.trivial, 0.1);
+    assert_eq!(inline.strength.significance.minor, 0.2);
 }
 
 #[test]
@@ -501,7 +501,7 @@ fn significance_values_must_increase_with_the_level() {
     // A higher level never counts for less than a lower one: equal or
     // swapped values are both rejected.
     for text in [
-        "[strength.significance]\nminor = 0.1\n",
+        "[strength.significance]\nminor = 0.0\n",
         "[strength.significance]\nnotable = 0.2\n",
         "[strength.significance]\nmajor = 0.9\ncritical = 0.7\n",
     ] {
@@ -632,7 +632,7 @@ fn an_unknown_key_in_any_layer_is_rejected() {
 
 #[test]
 fn an_override_can_lower_one_significance_level_over_production() {
-    let production = "[strength.significance]\nminor = 0.25\n";
+    let production = "[strength.significance]\ntrivial = 0.1\nminor = 0.25\n";
     let t = layers(&[production, "[strength.significance]\ntrivial = 0.05\n"]).unwrap();
     assert_eq!(t.strength.significance.trivial, 0.05); // override
     assert_eq!(t.strength.significance.minor, 0.25); // production
@@ -641,13 +641,13 @@ fn an_override_can_lower_one_significance_level_over_production() {
 
 #[test]
 fn significance_order_is_checked_on_the_layered_result() {
-    // Production lowers minor below the default trivial; the override
-    // lowers trivial to match, so the merged result is in order.
-    let production = "[strength.significance]\nminor = 0.08\n";
+    // Production raises trivial above the default minor; the override
+    // lowers trivial again, so the merged result is in order.
+    let production = "[strength.significance]\ntrivial = 0.3\n";
     assert!(layers(&[production]).is_err());
     let t = layers(&[production, "[strength.significance]\ntrivial = 0.04\n"]).unwrap();
     assert_eq!(t.strength.significance.trivial, 0.04);
-    assert_eq!(t.strength.significance.minor, 0.08);
+    assert_eq!(t.strength.significance.minor, 0.2);
 }
 
 #[test]
@@ -851,7 +851,7 @@ fn setting_a_fingerprinted_value_to_its_default_keeps_the_fingerprint() {
     let explicit = load(
         "[clock]\nquiet_rate = 0.1\n[purge]\ndelta = 1.0\nsource_horizon_days = 90\n\
          [agenda]\noverdue_days = 30\n\
-         [strength.significance]\ntrivial = 0.1\nminor = 0.3\nnotable = 0.5\nmajor = 0.7\n\
+         [strength.significance]\ntrivial = 0.0\nminor = 0.2\nnotable = 0.5\nmajor = 0.7\n\
          critical = 0.9\n",
     )
     .unwrap();
