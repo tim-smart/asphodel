@@ -112,6 +112,18 @@ fn defaults_are_valid() {
 }
 
 #[test]
+fn profile_output_defaults_to_2048_tokens() {
+    assert_eq!(Tuning::default().mental_models.profile_max_tokens, 2048);
+    assert_eq!(load("").unwrap().mental_models.profile_max_tokens, 2048);
+}
+
+#[test]
+fn shared_model_block_defaults_to_2560_tokens() {
+    assert_eq!(Tuning::default().mental_models.budget, 2560);
+    assert_eq!(load("").unwrap().mental_models.budget, 2560);
+}
+
+#[test]
 fn undated_days_defaults_to_thirty_and_accepts_overrides() {
     let days =
         |tuning: &Tuning| serde_json::to_value(tuning).unwrap()["agenda"]["undated_days"].clone();
@@ -974,7 +986,7 @@ fn excluded_tuning_values_leave_the_fingerprint_alone() {
         "[agenda]\ndated_lines = 20\n",
         "[agenda]\nroutines = 0\n",
         "[agenda]\nundated_tasks = 9\n",
-        "[mental_models]\nbudget = 1200\n",
+        "[mental_models]\nbudget = 3000\n",
         "[mental_models]\nprofile_max_tokens = 300\n",
         "[mental_models]\ntrigger_level = \"major\"\n",
         "[mental_models]\nrefresh_debounce_minutes = 2\n",
