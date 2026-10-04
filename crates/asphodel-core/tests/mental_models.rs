@@ -1798,6 +1798,10 @@ fn resizing_or_enabling_past_the_budget_is_refused() {
     );
     assert!(matches!(resizing, Err(ModelError::OverBudget { .. })));
     assert_eq!(h.profile().max_tokens, 800);
+    assert!(
+        !h.model("Plans").enabled,
+        "a refused enable changed the model"
+    );
 }
 
 #[test]
@@ -2063,6 +2067,44 @@ fn the_block_is_cached_until_its_content_changes() {
     assert_ne!(refreshed.id, first.id);
     assert_eq!(refreshed.built_at, h.now());
     assert!(refreshed.text.contains("Tim likes green tea."));
+}
+
+#[test]
+fn taking_a_model_out_of_the_prompt_and_back_shows_in_the_next_block_and_survives_a_restart() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+    assert!(h.block(None).text.contains("Tim likes green tea."));
+
+    let toggle = |h: &Harness, enabled: bool| {
+        h.service
+            .edit_model(
+                BANK,
+                PROFILE_NAME,
+                &ModelEdit {
+                    enabled: Some(enabled),
+                    ..ModelEdit::default()
+                },
+            )
+            .unwrap();
+    };
+
+    // The cached block goes with the edit.
+    toggle(&h, false);
+    assert!(
+        !h.block(None).text.contains("Tim likes green tea."),
+        "a model taken out of the prompt was rendered"
+    );
+    let h = h.restart();
+    assert!(!h.profile().enabled);
+    assert!(!h.block(None).text.contains("Tim likes green tea."));
+
+    // Its entries were kept, so they're back as soon as it is.
+    toggle(&h, true);
+    assert!(h.block(None).text.contains("Tim likes green tea."));
+    let h = h.restart();
+    assert!(h.profile().enabled);
+    assert!(h.block(None).text.contains("Tim likes green tea."));
 }
 
 #[test]

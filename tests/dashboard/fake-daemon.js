@@ -25,6 +25,10 @@ export const ids = {
   chunkHome: "01a10400-0000-7000-8000-0000000000c1",
   chunkWork: "01a10400-0000-7000-8000-0000000000c2",
   chunkTurn: "01a10400-0000-7000-8000-0000000000c3",
+  profile: "01a10400-0000-7000-8000-0000000000d1",
+  plans: "01a10400-0000-7000-8000-0000000000d2",
+  travel: "01a10400-0000-7000-8000-0000000000d3",
+  profileEntry: "01a10400-0000-7000-8000-0000000000e1",
 };
 
 export const sentences = {
@@ -36,6 +40,31 @@ export const sentences = {
   oldJob: "Sam works at Acme.",
   berlin: "Sam visited Berlin in May.",
 };
+
+/// The questions the fixture models answer.
+export const questions = {
+  profile: "Who is Sam, and what matters to them?",
+  plans: "What is Sam planning, and when?",
+  travel: "Where has Sam travelled?",
+};
+
+function model(key, name, fields) {
+  return {
+    id: ids[key],
+    name,
+    question: questions[key],
+    kinds: [],
+    entity: null,
+    min_volatility: null,
+    max_tokens: 100,
+    enabled: true,
+    entries: [],
+    last_refreshed_at: null,
+    last_error: null,
+    last_error_at: null,
+    ...fields,
+  };
+}
 
 function memory(key, fields) {
   return {
@@ -182,6 +211,24 @@ export function fixtures() {
     memories,
     views,
     sources,
+    // The enabled models take 700 of the 800 tokens.
+    models: [
+      model("profile", "User profile", {
+        max_tokens: 500,
+        entries: [{ id: ids.profileEntry, text: sentences.auckland, cites: [ids.auckland] }],
+        last_refreshed_at: "2026-10-03T08:30:00Z",
+      }),
+      model("plans", "Plans", {
+        kinds: ["event", "task"],
+        max_tokens: 200,
+        last_refreshed_at: "2026-10-01T06:00:00Z",
+        last_error: "malformed",
+        last_error_at: "2026-10-02T06:00:00Z",
+      }),
+      model("travel", "Travel", { kinds: ["event"], max_tokens: 150, enabled: false }),
+    ],
+    /// `mental_models.budget`.
+    budget: 800,
     queued: [],
     failed: [
       {
@@ -236,7 +283,7 @@ function bank(name, counts) {
     last_turn_at: "2026-10-02T08:00:00Z",
     kinds: { fact: 100, event: 12 },
     significance: { notable: 80, major: 20 },
-    models: 2,
+    models: 3,
     ...counts,
   };
 }
@@ -450,6 +497,10 @@ export class FakeDaemon {
       return json(200, { queued: failedOnly ? [] : state.queued, failed: state.failed });
     }
     if (collection === "chunks" && id === "retry" && method === "POST") return this.retry(body?.chunks);
+    if (collection === "models" && id === undefined && method === "GET") {
+      return json(200, { models: state.models, budget: state.budget });
+    }
+    if (collection === "models" && action === undefined && method === "PATCH") return this.editModel(id, body);
     return error(404, "no such route");
   }
 
@@ -465,6 +516,7 @@ export class FakeDaemon {
     }
     if (collection === "sources" && method === "GET") return json(200, { sources: [], total: 0, next_cursor: null });
     if (collection === "chunks" && method === "GET") return json(200, { queued: [], failed: [] });
+    if (collection === "models" && method === "GET") return json(200, { models: [], budget: 800 });
     return error(404, "no such route");
   }
 
@@ -568,6 +620,23 @@ export class FakeDaemon {
       this.state.views[id].hidden_at = "2026-10-03T09:05:00Z";
     }
     return json(200, { document_id: documentId, sources: versions.map((s) => s.id), forgotten, dequeued: 0 });
+  }
+
+  /// Only `enabled` is edited here. Enabling is refused, changing nothing,
+  /// when the enabled models' `max_tokens` would sum past the budget.
+  editModel(name, edit) {
+    const found = this.state.models.find((m) => m.name === name);
+    if (!found) return error(404, "no such model");
+    if (edit?.enabled === true && !found.enabled) {
+      const requested = this.state.models
+        .filter((m) => m.enabled || m === found)
+        .reduce((sum, m) => sum + m.max_tokens, 0);
+      if (requested > this.state.budget) {
+        return error(422, `${requested} tokens is over the ${this.state.budget}-token budget for mental models`);
+      }
+    }
+    if (typeof edit?.enabled === "boolean") found.enabled = edit.enabled;
+    return json(200, found);
   }
 
   retry(chunks) {
