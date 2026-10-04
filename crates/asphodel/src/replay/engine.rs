@@ -1242,27 +1242,52 @@ impl<'a> Engine<'a> {
             .to_string()
     }
 
-    /// The memory a probe names: by label in a scenario, or the earliest
-    /// created memory whose sentence its regex matches in real history.
-    fn probe_memory(&self, index: usize) -> Option<Uuid> {
-        let memory = self.timeline.probes[index].check.memory();
-        match &self.regexes[index] {
-            None => self.labels.get(memory).copied(),
-            Some(regex) => self
-                .created
-                .iter()
-                .filter(|created| regex.is_match(&created.content))
-                .min_by_key(|created| (created.created_at, created.memory))
-                .map(|created| created.memory),
+    /// Resolve history probes by an id still in the store, then by regex
+    /// over the created list (which retains purged memories).
+    fn probe_memory(&self, index: usize) -> Result<(Option<Uuid>, Value), Failure> {
+        let probe = &self.timeline.probes[index];
+        let memory = probe.check.memory();
+        if let Some(regex) = &self.regexes[index]
+            && let Some(id) = probe.memory_id
+            && let Some(view) = self.view(Some(id))?
+        {
+            return Ok((
+                Some(id),
+                json!({ "resolved_by": "id", "regex_matches": regex.is_match(&view.sentence) }),
+            ));
         }
+        let (memory, resolution) = match &self.regexes[index] {
+            // Scenario labels are validated against declared claims before
+            // the run, and may intentionally be probed before extraction.
+            None => (self.labels.get(memory).copied(), json!({})),
+            Some(regex) => (
+                self.created
+                    .iter()
+                    .filter(|created| regex.is_match(&created.content))
+                    .min_by_key(|created| (created.created_at, created.memory))
+                    .map(|created| created.memory),
+                json!({ "resolved_by": "regex", "regex_matches": true }),
+            ),
+        };
+        Ok((memory, resolution))
     }
 
     fn probe(&mut self, index: usize) -> Result<(), Failure> {
         let probe = &self.timeline.probes[index];
         let id = probe.id(index);
         let bank = &self.settings.bank;
-        let memory = self.probe_memory(index);
-        let (passed, observed) = match &probe.check {
+        let (memory, resolution) = self.probe_memory(index)?;
+        if memory.is_none() && self.regexes[index].is_some() {
+            self.probes.push(ProbeResult {
+                id,
+                at: probe.at,
+                kind: probe.check.kind(),
+                passed: false,
+                observed: json!({ "resolved": false }),
+            });
+            return Ok(());
+        }
+        let (passed, mut observed) = match &probe.check {
             Check::Band { band: expected, .. } => match self.view(memory)? {
                 Some(view) => {
                     let got = band(view.strength.value, self.tuning.recall.strong_cutoff);
@@ -1378,6 +1403,15 @@ impl<'a> Engine<'a> {
                 (has == wants, json!({ "id": memory, "cited": cited }))
             }
         };
+        observed
+            .as_object_mut()
+            .expect("probe observation is an object")
+            .extend(
+                resolution
+                    .as_object()
+                    .expect("resolution is an object")
+                    .clone(),
+            );
         self.probes.push(ProbeResult {
             id,
             at: probe.at,
