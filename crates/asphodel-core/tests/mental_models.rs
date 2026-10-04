@@ -2193,6 +2193,23 @@ fn a_long_period_routine_joins_the_dated_lines_when_it_next_occurs_within_a_week
 }
 
 #[test]
+fn an_undated_task_can_fade_out_before_the_last_mention_cap() {
+    let h = Harness::with_tuning("[clock]\nquiet_rate = 1.0\n");
+    let task = h.insert(Memory {
+        significance: "trivial",
+        observed_at: at(START),
+        ..task("Tim wants to try a new tea.")
+    });
+    assert_eq!(h.agenda().undated_tasks, vec![task]);
+
+    // Twenty bank days put this single trivial mention below τ, while
+    // it is still inside the default 30-day last-mention window. There
+    // are no other tasks to exclude it through ranking or the list cap.
+    h.advance(SignedDuration::from_hours(20 * 24));
+    assert!(h.agenda().undated_tasks.is_empty());
+}
+
+#[test]
 fn undated_open_tasks_are_gated_on_tau_and_capped() {
     let h = Harness::with_tuning("[agenda]\nundated_tasks = 2\n");
     let passport = h.insert(Memory {
