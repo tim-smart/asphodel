@@ -222,6 +222,115 @@ export function fixtures() {
     },
     /// Rows per memory page.
     pageSize: 50,
+    /// What `recall/explain` answers in each mode, for any query.
+    explain: { recall: explainedRecall(), injection: explainedInjection() },
+  };
+}
+
+/// One explained candidate: `key`'s memory, found by the vector arm at
+/// `rank` and fused at `rank`, scored from `logit`, and included.
+function explained(key, rank, logit, fields = {}) {
+  const relevance = logit;
+  const strengthTerm = 0.4;
+  const confidenceTerm = -0.1;
+  return {
+    id: ids[key],
+    sentence: sentences[key],
+    kind: "fact",
+    phase: "current",
+    arms: [{ arm: "vector", rank }],
+    rrf_rank: rank,
+    logit,
+    score: {
+      relevance,
+      w_s: 1,
+      strength_term: strengthTerm,
+      confidence_term: confidenceTerm,
+      phase_term: 0,
+      total: Math.round((relevance + strengthTerm + confidenceTerm) * 100) / 100,
+    },
+    strength: "strong",
+    kept: false,
+    included: true,
+    reason: null,
+    ...fields,
+  };
+}
+
+/// A candidate below τ: the arms found it, but it never reached fusion.
+function belowTau(key) {
+  return {
+    ...explained(key, 0, 0),
+    arms: [{ arm: "bm25", rank: null }],
+    rrf_rank: null,
+    logit: null,
+    score: null,
+    strength: "faded",
+    included: false,
+    reason: "below_tau",
+  };
+}
+
+/// Recall mode with `limit: 2`: two returned, Ada's past the limit.
+function explainedRecall() {
+  return {
+    mode: "recall",
+    query: "where does Sam live",
+    rerank_query: "where does Sam live",
+    reranked: true,
+    latency: { embed_ms: 12, retrieve_ms: 34, rerank_ms: 56, total_ms: 108 },
+    candidates: [
+      // The reranker lifted it from third in the fused list.
+      explained("auckland", 3, 2.75, {
+        arms: [
+          { arm: "vector", rank: 4 },
+          { arm: "bm25", rank: 7 },
+        ],
+      }),
+      explained("job", 1, 1.25),
+      explained("ada", 2, 0.5, { kept: true, included: false, reason: "over_limit" }),
+    ],
+    injection: null,
+  };
+}
+
+/// Injection mode with a cap of 1: Auckland injected, and one candidate
+/// left out for each reason a reranked injection can leave one out.
+function explainedInjection() {
+  const text = "Recalled Sat 3 Oct 22:00\n- Sam lives in Auckland.";
+  return {
+    mode: "injection",
+    query: "where does Sam live",
+    rerank_query: "where does Sam live",
+    reranked: true,
+    latency: { embed_ms: 12, retrieve_ms: 34, rerank_ms: 56, total_ms: 108 },
+    candidates: [
+      explained("auckland", 1, 2.75),
+      explained("job", 2, 1.25, { included: false, reason: "over_cap" }),
+      explained("oldJob", 3, 1.1, { included: false, reason: "over_budget" }),
+      explained("ada", 4, -0.5, { kept: true, included: false, reason: "under_floor" }),
+      belowTau("dentist"),
+    ],
+    injection: { text, tokens: 17, injected: [ids.auckland], floor: 0, cap: 1, token_budget: 400 },
+  };
+}
+
+/// The injection explained when the reranker missed its deadline: nothing
+/// passes the gate, and the candidates stay in RRF order without logits.
+export function missedReranker() {
+  const late = (key, rank) => ({
+    ...explained(key, rank, 0),
+    logit: null,
+    score: null,
+    included: false,
+    reason: "not_reranked",
+  });
+  return {
+    ...explainedInjection(),
+    reranked: false,
+    latency: { embed_ms: 12, retrieve_ms: 34, rerank_ms: 250, total_ms: 296 },
+    candidates: [late("auckland", 1), late("job", 2)],
+    injection: { text: "", tokens: 0, injected: [], floor: 0, cap: 1, token_budget: 400 },
   };
 }
 
@@ -425,6 +534,7 @@ export class FakeDaemon {
     if (!state.banks.some((b) => b.name === bank)) return error(404, "unknown bank");
     if (bank !== "main") return this.emptyBank(collection, method);
 
+    if (collection === "recall" && id === "explain" && method === "POST") return this.explain(body);
     if (collection === "memories" && id === undefined && method === "GET") return this.memories(query);
     if (collection === "memories" && action === undefined && method === "GET") {
       const found = state.views[id];
@@ -466,6 +576,15 @@ export class FakeDaemon {
     if (collection === "sources" && method === "GET") return json(200, { sources: [], total: 0, next_cursor: null });
     if (collection === "chunks" && method === "GET") return json(200, { queued: [], failed: [] });
     return error(404, "no such route");
+  }
+
+  // Explain answers the same for any query: the tests check what the
+  // dashboard sends and what it makes of the answer, not the ranking.
+  explain(body) {
+    const answer = this.state.explain[body?.mode];
+    if (!answer) return error(400, "mode must be recall or injection");
+    if (typeof body.query !== "string" || body.query.trim() === "") return error(400, "query is required");
+    return json(200, answer);
   }
 
   memories(query) {
