@@ -11,241 +11,152 @@ mod support;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use support::hermes::{self, StateDb, epoch};
+use support::hermes::{self, StateDb, epoch, start};
 use support::{
-    HOME_QUESTION, PASSING_PROBES, PROBES_WITH_A_FAILURE, TestDir, asphodel, assert_ok,
-    assert_refused, cassette_records, imported_small_history, imported_with_a_model, judge_script,
-    live_script, record, replay_history, said, stderr, universal_script, write_cassette,
-    write_reply,
+    HOME_MEMORY, PASSING_PROBES, Run, TestDir, add_entry, asphodel, assert_ok, assert_refused,
+    assert_refused_without, cassette_bytes, cassette_path, cassette_records, claim, home_claim,
+    import_history, imported_small_history, imported_with_a_model, live_script, overrides, probe,
+    probe_in, record, replay_history, script_answering_everything, script_steps, simulation,
+    stderr, universal_script, write_cassette,
 };
 
-/// What a run simulated, without what identifies the run: the mode
-/// (`kind`), the flags it was invoked with, where its LLM replies came
-/// from (`llm`) and the cassette hash it started from. A `live` run and a
-/// `replay` of its cassette differ in exactly those, so everything else in
-/// their reports must match.
-fn simulation(report: &Value) -> Value {
-    let mut report = report.clone();
-    let object = report.as_object_mut().expect("the report is an object");
-    for key in ["kind", "flags", "llm", "cassette_hash"] {
-        object.remove(key);
-    }
-    report
+fn sha(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// A probe at noon on `day` of January 2026.
+fn probe_on(id: &str, day: u8, kind: &str, fields: &str) -> String {
+    probe(id, &format!("2026-01-{day:02}T12:00:00Z"), kind, fields)
+}
+
+/// The id of the memory probe `id` observed.
+fn observed_id(report: &Value, id: &str) -> Value {
+    probe_in(report, id)["observed"]["id"].clone()
+}
+
+fn is_call1(record: &Value) -> bool {
+    record["template"]["name"] == "extract_claims"
+}
+
+fn is_call2(record: &Value) -> bool {
+    record["template"]["name"] == "reconcile_claims"
+}
+
+fn is_refresh(record: &Value) -> bool {
+    record["template"]["name"] == "refresh_model"
 }
 
 // Probe identity and unresolved-memory regressions, through the CLI report.
 
-fn resolution_probe(report: &Value, id: &str) -> Value {
-    report["probes"]
-        .as_array()
-        .expect("the report lists probes")
-        .iter()
-        .find(|probe| probe["id"] == id)
-        .unwrap_or_else(|| panic!("no probe {id}: {report}"))
-        .clone()
-}
+/// A regex no memory's sentence matches.
+const UNSEEN: &str = "never recorded wording";
 
-/// Obtain grounding ids from a successful CLI run, not UUID derivation or
-/// direct store inspection. Both claims are grounded in the synthetic turn.
-fn resolution_history(dir: &TestDir) -> (std::path::PathBuf, String, String) {
-    let corpus = imported_small_history(dir);
-    let script = support::script_answering_everything(
-        dir,
-        "resolution",
-        vec![
-            support::home_claim(),
-            support::claim("Tim lives near the harbour.", "near the harbour", "fact"),
-        ],
-        Vec::new(),
-    );
-    let probes = r#"
-[[probe]]
-id = "home"
-at = "2026-01-05T12:00:00Z"
-kind = "exists"
-memory = "lives in Auckland"
-
-[[probe]]
-id = "harbour"
-at = "2026-01-05T12:00:00Z"
-kind = "exists"
-memory = "near the harbour"
-"#;
-    let run = replay_history(
-        dir,
-        &corpus,
-        "live",
-        probes,
-        "grounding",
-        Some(&script),
-        &[],
-    );
-    assert_ok(&run.output);
-    let report = run.report();
-    let home = resolution_probe(&report, "home")["observed"]["id"]
-        .as_str()
-        .expect("home resolved")
-        .to_owned();
-    let harbour = resolution_probe(&report, "harbour")["observed"]["id"]
-        .as_str()
-        .expect("harbour resolved")
-        .to_owned();
-    assert_ne!(home, harbour, "the fixture must create distinct memories");
-    (corpus, home, harbour)
-}
-
-fn assert_id_resolution(pattern: &str, regex_matches: bool) {
-    let dir = TestDir::new();
-    let (corpus, _, harbour) = resolution_history(&dir);
-    let probes = format!(
-        r#"
-[[probe]]
-id = "anchored"
-at = "2026-01-05T12:00:00Z"
-kind = "exists"
-memory_id = "{harbour}"
-memory = "{pattern}"
-"#
-    );
-    let run = replay_history(&dir, &corpus, "replay", &probes, "anchored", None, &[]);
-    let probe = resolution_probe(&run.report(), "anchored");
-    assert_eq!(probe["observed"]["id"], harbour, "{probe}");
-    assert_eq!(probe["observed"]["resolved_by"], "id", "{probe}");
-    assert_eq!(probe["observed"]["regex_matches"], regex_matches, "{probe}");
-    assert_eq!(probe["passed"], true, "{probe}");
-    assert_ok(&run.output);
-}
-
+/// A probe naming a `memory_id` that exists resolves by it, whatever its
+/// regex matches, and reports whether the regex agrees; one naming none,
+/// or an id that doesn't exist, resolves by the regex. A probe whose memory
+/// resolves to nothing fails whatever its kind, even one that expects an
+/// absence, and fails the run. The grounding ids come from a `live` run's
+/// report, not from UUID derivation or the store.
 #[test]
-fn probe_resolution_id_wins_when_regex_matches_another_memory() {
-    assert_id_resolution("lives in Auckland", false);
-}
-
-#[test]
-fn probe_resolution_id_survives_a_regex_that_matches_nothing() {
-    assert_id_resolution("never recorded wording", false);
-}
-
-#[test]
-fn probe_resolution_reports_when_regex_agrees_with_id() {
-    assert_id_resolution("near the harbour", true);
-}
-
-#[test]
-fn probe_resolution_missing_id_falls_back_to_regex() {
-    let dir = TestDir::new();
-    let (corpus, home, _) = resolution_history(&dir);
-    let probes = r#"
-[[probe]]
-id = "fallback"
-at = "2026-01-05T12:00:00Z"
-kind = "exists"
-memory_id = "00000000-0000-0000-0000-000000000000"
-memory = "lives in Auckland"
-
-[[probe]]
-id = "regex-only"
-at = "2026-01-05T12:00:00Z"
-kind = "exists"
-memory = "lives in Auckland"
-"#;
-    let run = replay_history(&dir, &corpus, "replay", probes, "fallback", None, &[]);
-    for id in ["fallback", "regex-only"] {
-        let probe = resolution_probe(&run.report(), id);
-        assert_eq!(probe["observed"]["id"], home, "{probe}");
-        assert_eq!(probe["observed"]["resolved_by"], "regex", "{probe}");
-        assert_eq!(probe["observed"]["regex_matches"], true, "{probe}");
-        assert_eq!(probe["passed"], true, "{probe}");
-    }
-    assert_ok(&run.output);
-}
-
-fn assert_unresolved_probe_fails(kind: &str, fields: &str) {
+fn probes_resolve_by_id_then_regex_and_an_unresolved_probe_fails() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-    let probes = format!(
-        r#"
-[[probe]]
-id = "unresolved"
-at = "2026-01-08T12:00:00Z"
-kind = "{kind}"
-memory = "never recorded wording"
-{fields}
-"#
+    let harbour = claim("Tim lives near the harbour.", "near the harbour", "fact");
+    let script =
+        script_answering_everything(&dir, "resolution", vec![home_claim(), harbour], vec![]);
+    let grounding = probe_on("home", 8, "exists", HOME_MEMORY)
+        + &probe_on("harbour", 8, "exists", "memory = \"near the harbour\"");
+    let report = replay_history(&dir, &corpus, "live", &grounding, Some(&script), &[]).ok();
+    let (home, harbour) = (
+        observed_id(&report, "home"),
+        observed_id(&report, "harbour"),
     );
-    let run = replay_history(&dir, &corpus, "replay", &probes, "unresolved", None, &[]);
-    let probe = resolution_probe(&run.report(), "unresolved");
+    assert!(home.is_string() && harbour.is_string(), "{report}");
+    assert_ne!(home, harbour, "the fixture must create distinct memories");
+
+    let anchored = |pattern: &str| format!("memory_id = {harbour}\nmemory = \"{pattern}\"");
+    let unknown = "memory_id = \"00000000-0000-0000-0000-000000000000\"";
+    // (probe, its fields, resolved by id rather than regex, the regex agrees)
+    let resolved = [
+        ("id-beats-regex", anchored("lives in Auckland"), true, false),
+        ("id-only", anchored(UNSEEN), true, false),
+        ("id-and-regex", anchored("near the harbour"), true, true),
+        (
+            "unknown-id",
+            format!("{unknown}\n{HOME_MEMORY}"),
+            false,
+            true,
+        ),
+        ("regex-only", HOME_MEMORY.into(), false, true),
+    ];
+    let unresolved = [
+        ("agenda_lacks", ""),
+        ("recall_lacks", "query = \"Tim lives in Auckland\""),
+        ("profile_lacks", "model = \"User profile\""),
+        ("absent", ""),
+    ];
+    let mut probes = String::new();
+    for (id, fields, ..) in &resolved {
+        probes += &probe_on(id, 8, "exists", fields);
+    }
+    for (kind, fields) in unresolved {
+        probes += &probe_on(kind, 8, kind, &format!("memory = \"{UNSEEN}\"\n{fields}"));
+    }
+    let run = replay_history(&dir, &corpus, "replay", &probes, None, &[]);
     assert_eq!(
-        (
-            &probe["passed"],
-            &probe["observed"]["resolved"],
-            run.output.status.code()
-        ),
-        (
-            &serde_json::json!(false),
-            &serde_json::json!(false),
-            Some(1)
-        ),
-        "{probe}"
+        run.output.status.code(),
+        Some(1),
+        "the unresolved probes fail the run: {}",
+        stderr(&run.output)
     );
-}
-
-#[test]
-fn probe_resolution_unresolved_agenda_lacks_fails() {
-    assert_unresolved_probe_fails("agenda_lacks", "");
-}
-
-#[test]
-fn probe_resolution_unresolved_recall_lacks_fails() {
-    assert_unresolved_probe_fails("recall_lacks", "query = \"Tim lives in Auckland\"");
-}
-
-#[test]
-fn probe_resolution_unresolved_profile_lacks_fails() {
-    assert_unresolved_probe_fails("profile_lacks", "model = \"User profile\"");
-}
-
-#[test]
-fn probe_resolution_unresolved_absent_fails() {
-    assert_unresolved_probe_fails("absent", "");
+    let report = run.report();
+    for (id, _, by_id, agrees) in resolved {
+        let probe = probe_in(&report, id);
+        let (memory, by) = if by_id {
+            (&harbour, "id")
+        } else {
+            (&home, "regex")
+        };
+        let observed = &probe["observed"];
+        assert_eq!(
+            (
+                &probe["passed"],
+                &observed["id"],
+                &observed["resolved_by"],
+                &observed["regex_matches"]
+            ),
+            (&json!(true), memory, &json!(by), &json!(agrees)),
+            "{probe}"
+        );
+    }
+    for (kind, _) in unresolved {
+        let probe = probe_in(&report, kind);
+        assert_eq!(
+            (&probe["passed"], &probe["observed"]["resolved"]),
+            (&json!(false), &json!(false)),
+            "{probe}"
+        );
+    }
 }
 
 #[test]
 fn probe_resolution_absent_passes_after_a_created_memory_is_purged() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
-    let mut claim = support::home_claim();
-    claim["significance"] = serde_json::json!("trivial");
-    let script = support::script_answering_everything(&dir, "purge", vec![claim], Vec::new());
-    let overrides = dir.private_file("purge-overrides.toml", "[clock]\nquiet_rate = 1.0\n");
-    let flags = ["--overrides", overrides.to_str().unwrap()];
-    let recorded = replay_history(
-        &dir,
-        &corpus,
-        "live",
-        PASSING_PROBES,
-        "grounding",
-        Some(&script),
-        &flags,
-    );
-    assert_ok(&recorded.output);
-    let grounding = recorded.report();
-    let home = resolution_probe(&grounding, "p001")["observed"]["id"].clone();
-    let probes = r#"
-[[probe]]
-id = "purged"
-at = "2026-11-05T12:00:00Z"
-kind = "absent"
-memory = "lives in Auckland"
-"#;
-    let run = replay_history(&dir, &corpus, "replay", probes, "purged", None, &flags);
-    assert_ok(&run.output);
-    let report = run.report();
+    let mut claim = home_claim();
+    claim["significance"] = json!("trivial");
+    let script = script_answering_everything(&dir, "purge", vec![claim], vec![]);
+    let quiet = overrides(&dir, "[clock]\nquiet_rate = 1.0\n");
+    let flags = ["--overrides", &quiet];
+    let grounding = replay_history(&dir, &corpus, "live", PASSING_PROBES, Some(&script), &flags);
+    let home = observed_id(&grounding.ok(), "p001");
+    let probes = probe("purged", "2026-11-05T12:00:00Z", "absent", HOME_MEMORY);
+    let report = replay_history(&dir, &corpus, "replay", &probes, None, &flags).ok();
     let memory = report["memories"]
         .as_array()
         .unwrap()
@@ -253,7 +164,7 @@ memory = "lives in Auckland"
         .find(|memory| memory["id"] == home)
         .expect("the created list retains home");
     assert!(memory["purged_at"].is_string(), "{memory}");
-    let probe = resolution_probe(&report, "purged");
+    let probe = probe_in(&report, "purged");
     assert_eq!(probe["passed"], true, "{probe}");
     assert_eq!(probe["observed"]["id"], home, "{probe}");
     assert_eq!(probe["observed"]["present"], false, "{probe}");
@@ -261,73 +172,26 @@ memory = "lives in Auckland"
 
 // Recording modes.
 
-#[test]
-fn live_report_hashes_the_completed_cassette() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    let script = live_script(&dir);
-    let aggregate = dir.path("aggregate.json");
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "live",
-        PASSING_PROBES,
-        "live",
-        Some(&script),
-        &["--aggregate", aggregate.to_str().unwrap()],
-    );
-    assert_ok(&run.output);
-    let cassette = fs::read(dir.private_path("cassettes/main.jsonl")).unwrap();
-    assert!(!cassette.is_empty(), "the live run must record calls");
-    let expected = format!("{:x}", Sha256::digest(&cassette));
-    let report = run.report();
-    let aggregate: Value = serde_json::from_slice(&fs::read(aggregate).unwrap()).unwrap();
-    assert_eq!(
-        (&report["cassette_hash"], &aggregate["cassette_hash"]),
-        (
-            &serde_json::json!(expected),
-            &serde_json::json!(Sha256::digest(&cassette).to_vec())
-        )
-    );
-}
-
-/// `live` calls the LLM and records; `replay` of that cassette needs no
-/// LLM and simulates the same run.
+/// `live` calls the LLM, records, and reports the hash of the completed
+/// cassette. `replay` of that cassette needs no LLM, simulates the same
+/// run, and writes a byte-identical report each time.
 #[test]
 fn replay_of_a_live_cassette_simulates_the_same_run_without_an_llm() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
-    let live = record(&dir, &corpus);
-    let replay = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "replay", None, &[]);
-    assert_ok(&replay.output);
+    let live = record(&dir, &corpus).report();
+    let cassette = cassette_bytes(&dir);
+    assert!(!cassette.is_empty(), "the live run must record calls");
+    assert_eq!(live["cassette_hash"], sha(&cassette));
 
-    let live = live.report();
-    let replay = replay.report();
-    assert_eq!(live["kind"], "live");
-    assert_eq!(replay["kind"], "replay");
-    assert!(
-        live["llm"]["live"].as_u64().is_some_and(|n| n > 0),
-        "{live}"
-    );
-    assert_eq!(replay["llm"]["live"], 0, "{replay}");
-    assert!(
-        replay["llm"]["cache"].as_u64().is_some_and(|n| n > 0),
-        "{replay}"
-    );
-    assert_eq!(simulation(&live), simulation(&replay));
-}
-
-/// With the same corpus, cassette and overrides,
-/// `replay` writes a byte-identical report.
-#[test]
-fn repeated_replay_runs_write_byte_identical_reports() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-    let first = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "first", None, &[]);
-    let second = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "second", None, &[]);
-    assert_ok(&first.output);
+    let [first, second] =
+        [(); 2].map(|()| replay_history(&dir, &corpus, "replay", PASSING_PROBES, None, &[]));
+    let replay = first.ok();
     assert_ok(&second.output);
+    assert!(live["llm"]["live"].as_u64().unwrap() > 0, "{live}");
+    assert_eq!(replay["llm"]["live"], 0, "{replay}");
+    assert!(replay["llm"]["cache"].as_u64().unwrap() > 0, "{replay}");
+    assert_eq!(simulation(&live), simulation(&replay));
     assert_eq!(
         first.report_bytes(),
         second.report_bytes(),
@@ -344,97 +208,45 @@ fn replay_at_concurrency_five_ends_with_the_memories_of_a_serial_run() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
     let serial = record(&dir, &corpus).report();
-    let five = dir.private_file("five.toml", "[llm]\nconcurrency = 5\n");
-    let pooled = replay_history(
-        &dir,
-        &corpus,
-        "replay",
-        PASSING_PROBES,
-        "five",
-        None,
-        &["--overrides", five.to_str().unwrap()],
-    );
-    assert_ok(&pooled.output);
-    let pooled = pooled.report();
+    let five = overrides(&dir, "[llm]\nconcurrency = 5\n");
+    let flags = ["--overrides", &five];
+    let pooled = replay_history(&dir, &corpus, "replay", PASSING_PROBES, None, &flags).ok();
     assert_eq!(pooled["llm"]["misses"], 0, "{pooled}");
     assert_eq!(pooled["memories"], serial["memories"], "{pooled}");
 }
 
-/// The small history with the home turn said again ten minutes later in
-/// the same session, imported to `corpus/twice.jsonl`.
-fn imported_with_home_twice(dir: &TestDir) -> std::path::PathBuf {
-    let state_db = dir.private_path("state-twice.db");
-    let db: StateDb = hermes::small_history(&state_db);
-    db.turn(
-        "s-main",
-        epoch("2026-01-05T09:10:00Z"),
-        &format!("{}, still.", hermes::HOME_QUOTE),
-        "Noted again.",
-    );
-    drop(db);
-    let corpus = dir.private_path("corpus/twice.jsonl");
-    assert_ok(&support::import(dir, &state_db, &corpus));
-    corpus
-}
-
 /// A script whose every step answers any call: call 1 with the home
 /// claim, call 2 labelling it a mention of the one neighbour, and a
-/// refresh with no edits. Neither parser refuses the others' fields.
-fn mention_script(dir: &TestDir) -> std::path::PathBuf {
-    let mut claim = support::home_claim();
-    claim["claim"] = serde_json::json!("c1");
-    claim["labels"] = serde_json::json!([{"neighbour": "n1", "label": "mentioned_again"}]);
-    support::script_answering_everything(dir, "mention-script", vec![claim], Vec::new())
+/// refresh with no edits.
+fn mention_script(dir: &TestDir) -> PathBuf {
+    let mut claim = home_claim();
+    claim["claim"] = json!("c1");
+    claim["labels"] = json!([{"neighbour": "n1", "label": "mentioned_again"}]);
+    script_answering_everything(dir, "mention-script", vec![claim], vec![])
 }
 
-/// Two chunks out at once in simulated time, with an hour's latency: the
-/// home turn and its repeat ten minutes later.
-fn pooled_flags(dir: &TestDir) -> Vec<String> {
-    let pooled = dir.private_file("pooled.toml", "[llm]\nconcurrency = 2\n");
-    vec![
-        "--overrides".into(),
-        pooled.to_str().unwrap().into(),
-        "--latency".into(),
-        "1h".into(),
-    ]
-}
-
-fn is_call2(record: &Value) -> bool {
-    record["template"]["name"] == "reconcile_claims"
-}
-
-/// The passing probes, plus the home memory's strength a second before and
-/// at 11:10:30, when the repeat's redo commits under `--latency 1h`.
-fn redo_probes() -> String {
-    format!(
-        "{PASSING_PROBES}
-[[probe]]
-id = \"p003\"
-at = \"2026-01-05T11:10:29Z\"
-kind = \"band\"
-memory = \"lives in Auckland\"
-band = \"strong\"
-
-[[probe]]
-id = \"p004\"
-at = \"2026-01-05T11:10:30Z\"
-kind = \"band\"
-memory = \"lives in Auckland\"
-band = \"strong\"
-"
-    )
-}
-
-/// A probe's observed strength, by id.
-fn strength(report: &Value, id: &str) -> f64 {
-    report["probes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|probe| probe["id"] == id)
-        .unwrap_or_else(|| panic!("no probe {id}: {report}"))["observed"]["strength"]
-        .as_f64()
-        .unwrap()
+/// The small history with the home turn said again ten minutes later in
+/// the same session, recorded `live` with `probes` and [`mention_script`],
+/// two chunks out at once in simulated time with an hour's latency.
+/// Returns the corpus, the overrides that pool the chunks, and the live
+/// report.
+fn record_pooled(dir: &TestDir, probes: &str) -> (PathBuf, String, Value) {
+    let corpus = import_history(dir, |path| {
+        let db = hermes::small_history(path);
+        let again = format!("{}, still.", hermes::HOME_QUOTE);
+        db.turn(
+            "s-main",
+            epoch("2026-01-05T09:10:00Z"),
+            &again,
+            "Noted again.",
+        );
+        db
+    });
+    let pooled = overrides(dir, "[llm]\nconcurrency = 2\n");
+    let flags = ["--overrides", &pooled, "--latency", "1h"];
+    let script = mention_script(dir);
+    let live = replay_history(dir, &corpus, "live", probes, Some(&script), &flags).ok();
+    (corpus, pooled, live)
 }
 
 /// At concurrency 2 the repeat is claimed before the first home turn
@@ -450,23 +262,13 @@ fn strength(report: &Value, id: &str) -> f64 {
 #[test]
 fn a_stale_commit_redoes_call_2_through_the_cassette_and_replays() {
     let dir = TestDir::new();
-    let corpus = imported_with_home_twice(&dir);
-    let script = mention_script(&dir);
-    let flags = pooled_flags(&dir);
-    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-
-    let probes = redo_probes();
-    let live = replay_history(
-        &dir,
-        &corpus,
-        "live",
-        &probes,
-        "live",
-        Some(&script),
-        &flags,
+    let strong = format!("{HOME_MEMORY}\nband = \"strong\"");
+    let probes = format!(
+        "{PASSING_PROBES}{}{}",
+        probe("p003", "2026-01-05T11:10:29Z", "band", &strong),
+        probe("p004", "2026-01-05T11:10:30Z", "band", &strong)
     );
-    assert_ok(&live.output);
-    let live = live.report();
+    let (corpus, pooled, live) = record_pooled(&dir, &probes);
     assert_eq!(live["call2_rate"]["redos"], 1, "{live}");
     assert_eq!(live["call2_rate"]["call2"], 1, "{live}");
     let hours = |n: u64| n * 60 * 60 * 1000;
@@ -476,8 +278,13 @@ fn a_stale_commit_redoes_call_2_through_the_cassette_and_replays() {
         hours(2),
         "the redo is charged the constant latency again: {live}"
     );
+    let strength = |id| {
+        probe_in(&live, id)["observed"]["strength"]
+            .as_f64()
+            .unwrap()
+    };
     assert!(
-        strength(&live, "p004") > strength(&live, "p003"),
+        strength("p004") > strength("p003"),
         "the mention lands at 11:10:30, not before: {live}"
     );
     assert_eq!(
@@ -485,15 +292,11 @@ fn a_stale_commit_redoes_call_2_through_the_cassette_and_replays() {
         1,
         "a mention, not a copy: {live}"
     );
-    let call2: Vec<Value> = cassette_records(&dir)
-        .into_iter()
-        .filter(is_call2)
-        .collect();
-    assert_eq!(call2.len(), 1, "the redo's call 2 is recorded");
+    let call2 = cassette_records(&dir).into_iter().filter(is_call2).count();
+    assert_eq!(call2, 1, "the redo's call 2 is recorded");
 
-    let replay = replay_history(&dir, &corpus, "replay", &probes, "replay", None, &flags);
-    assert_ok(&replay.output);
-    let replay = replay.report();
+    let flags = ["--overrides", &pooled, "--latency", "1h"];
+    let replay = replay_history(&dir, &corpus, "replay", &probes, None, &flags).ok();
     assert_eq!(replay["llm"]["misses"], 0, "{replay}");
     assert_eq!(simulation(&live), simulation(&replay));
 }
@@ -506,46 +309,21 @@ fn a_stale_commit_redoes_call_2_through_the_cassette_and_replays() {
 #[test]
 fn a_redo_is_charged_the_latency_of_its_call_2() {
     let dir = TestDir::new();
-    let corpus = imported_with_home_twice(&dir);
-    let script = mention_script(&dir);
-    let flags = pooled_flags(&dir);
-    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let live = replay_history(
-        &dir,
-        &corpus,
-        "live",
-        PASSING_PROBES,
-        "live",
-        Some(&script),
-        &flags,
-    );
-    assert_ok(&live.output);
+    let (corpus, pooled, _) = record_pooled(&dir, PASSING_PROBES);
     let minutes = |n: u64| n * 60 * 1000;
     let timed: Vec<Value> = cassette_records(&dir)
         .into_iter()
         .map(|mut record| {
-            record["latency_ms"] = if is_call2(&record) {
-                minutes(10).into()
-            } else {
-                minutes(20).into()
-            };
+            let latency = if is_call2(&record) { 10 } else { 20 };
+            record["latency_ms"] = minutes(latency).into();
             record
         })
         .collect();
     write_cassette(&dir, &timed);
 
     // Latency from the cassette: no --latency.
-    let replay = replay_history(
-        &dir,
-        &corpus,
-        "replay",
-        PASSING_PROBES,
-        "timed",
-        None,
-        &flags[..2],
-    );
-    assert_ok(&replay.output);
-    let report = replay.report();
+    let flags = ["--overrides", &pooled];
+    let report = replay_history(&dir, &corpus, "replay", PASSING_PROBES, None, &flags).ok();
     assert_eq!(report["call2_rate"]["redos"], 1, "{report}");
     assert_eq!(report["extraction_lag"]["p50_ms"], minutes(20), "{report}");
     assert_eq!(
@@ -560,52 +338,23 @@ fn a_redo_is_charged_the_latency_of_its_call_2() {
 #[test]
 fn a_redo_that_misses_stops_replay_and_is_answered_live_in_fast() {
     let dir = TestDir::new();
-    let corpus = imported_with_home_twice(&dir);
-    let script = mention_script(&dir);
-    let flags = pooled_flags(&dir);
-    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let live = replay_history(
-        &dir,
-        &corpus,
-        "live",
-        PASSING_PROBES,
-        "live",
-        Some(&script),
-        &flags,
-    );
-    assert_ok(&live.output);
+    let (corpus, pooled, _) = record_pooled(&dir, PASSING_PROBES);
     let without: Vec<Value> = cassette_records(&dir)
         .into_iter()
         .filter(|record| !is_call2(record))
         .collect();
     write_cassette(&dir, &without);
+    let flags = ["--overrides", &pooled, "--latency", "1h"];
 
-    let replay = replay_history(
-        &dir,
-        &corpus,
-        "replay",
-        PASSING_PROBES,
-        "replay",
-        None,
-        &flags,
-    );
+    let replay = replay_history(&dir, &corpus, "replay", PASSING_PROBES, None, &flags);
     assert_refused(&replay.output, "miss");
     assert!(
         !replay.report_path.exists(),
         "a failed run writes no report"
     );
 
-    let fast = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "fast",
-        Some(&script),
-        &flags,
-    );
-    assert_ok(&fast.output);
-    let fast = fast.report();
+    let script = mention_script(&dir);
+    let fast = replay_history(&dir, &corpus, "fast", PASSING_PROBES, Some(&script), &flags).ok();
     assert_eq!(fast["call2_rate"]["redos"], 1, "{fast}");
     assert_eq!(fast["llm"]["misses"], 1, "{fast}");
     assert_eq!(fast["llm"]["live"], 1, "{fast}");
@@ -616,16 +365,8 @@ fn a_redo_that_misses_stops_replay_and_is_answered_live_in_fast() {
     );
 }
 
-/// `replay` fails on a miss.
-#[test]
-fn replay_fails_on_a_cassette_miss() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    fs::write(dir.private_path("cassettes/main.jsonl"), b"").unwrap();
-    let run = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "miss", None, &[]);
-    assert_refused(&run.output, "miss");
-    assert!(!run.report_path.exists(), "a failed run writes no report");
-}
+/// Overrides that shut the reranker gate, so nothing is injected.
+const SHUT_GATE: &str = "[injection.reranker_floors]\n\"fake-reranker:v1\" = 1000000.0\n";
 
 /// `used` verdicts are cached per (reply, sentence)
 /// pair, and in `fast` the pairs nobody has judged get one short top-up
@@ -640,43 +381,21 @@ fn replay_fails_on_a_cassette_miss() {
 fn fast_tops_up_unjudged_pairs_once_per_chunk_and_records_them() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
-    let shut = dir.private_file(
-        "shut-gate.toml",
-        "[injection.reranker_floors]\n\"fake-reranker:v1\" = 1000000.0\n",
-    );
+    let shut = overrides(&dir, SHUT_GATE);
     let script = live_script(&dir);
-    let live = replay_history(
-        &dir,
-        &corpus,
-        "live",
-        PASSING_PROBES,
-        "live",
-        Some(&script),
-        &["--overrides", shut.to_str().unwrap()],
-    );
-    assert_ok(&live.output);
-    let judged = |records: &[Value]| -> Vec<Value> {
-        records
-            .iter()
+    let flags = ["--overrides", &shut];
+    replay_history(&dir, &corpus, "live", PASSING_PROBES, Some(&script), &flags).ok();
+    let judged = || -> Vec<Value> {
+        cassette_records(&dir)
+            .into_iter()
             .filter(|record| record["template"]["name"] == "judge_used")
-            .cloned()
             .collect()
     };
-    assert!(judged(&cassette_records(&dir)).is_empty());
+    assert!(judged().is_empty());
 
-    let judge = judge_script(&dir);
-    let first = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "fast-first",
-        Some(&judge),
-        &[],
-    );
-    assert_ok(&first.output);
-    let report = first.report();
-    let top_ups = judged(&cassette_records(&dir));
+    let judge = support::script(&dir, "judge-script", json!({ "used": [] }));
+    let report = replay_history(&dir, &corpus, "fast", PASSING_PROBES, Some(&judge), &[]).ok();
+    let top_ups = judged();
     assert!(
         !top_ups.is_empty(),
         "an injected memory nobody judged gets a top-up: {report}"
@@ -691,222 +410,87 @@ fn fast_tops_up_unjudged_pairs_once_per_chunk_and_records_them() {
         top_ups.len(),
         "one top-up per chunk: {top_ups:#?}"
     );
-    assert!(
-        report["llm"]["used_verdicts"]["top_up"]
-            .as_u64()
-            .is_some_and(|n| n > 0),
-        "{report}"
-    );
+    let verdicts = &report["llm"]["used_verdicts"]["top_up"];
+    assert!(verdicts.as_u64().unwrap() > 0, "{report}");
 
-    let cassette = fs::read(dir.private_path("cassettes/main.jsonl")).unwrap();
-    let second = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "fast-second",
-        None,
-        &[],
-    );
-    assert_ok(&second.output);
-    let report = second.report();
+    let cassette = cassette_bytes(&dir);
+    let report = replay_history(&dir, &corpus, "fast", PASSING_PROBES, None, &[]).ok();
     assert_eq!(report["llm"]["top_up"], 0, "{report}");
     assert_eq!(report["llm"]["misses"], 0, "{report}");
     assert_eq!(
-        fs::read(dir.private_path("cassettes/main.jsonl")).unwrap(),
+        cassette_bytes(&dir),
         cassette,
         "a fast run with nothing to judge records nothing"
-    );
-}
-
-/// The small history with one more turn at the end, imported to
-/// `corpus/extra.jsonl` beside the original.
-fn imported_with_an_extra_turn(dir: &TestDir) -> std::path::PathBuf {
-    let state_db = dir.private_path("state-extra.db");
-    let db: StateDb = hermes::small_history(&state_db);
-    db.turn(
-        "s-later",
-        epoch("2026-01-11T09:00:00Z"),
-        "One more question.",
-        "One more answer.",
-    );
-    drop(db);
-    let corpus = dir.private_path("corpus/extra.jsonl");
-    assert_ok(&support::import(dir, &state_db, &corpus));
-    corpus
-}
-
-/// A chunk with no recorded claims is a miss in `fast`: with an LLM it's
-/// called live and counted.
-#[test]
-fn a_fast_claims_miss_calls_live_with_an_llm_and_counts_it() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-    let extra = imported_with_an_extra_turn(&dir);
-    let script = live_script(&dir);
-    let run = replay_history(
-        &dir,
-        &extra,
-        "fast",
-        PASSING_PROBES,
-        "fast-extra",
-        Some(&script),
-        &[],
-    );
-    assert_ok(&run.output);
-    let report = run.report();
-    assert_eq!(report["llm"]["misses"], 1, "{report}");
-    assert_eq!(report["llm"]["live"], 1, "{report}");
-}
-
-/// Claims and refreshes recorded without `[llm] language` cannot be reused
-/// with the setting on. Both are misses answered live, even with
-/// `--refresh recorded`; the next run in the same language reuses both.
-#[test]
-fn fast_doesnt_reuse_claims_or_refreshes_recorded_without_the_language() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-    let call1 = |records: Vec<Value>| {
-        records
-            .into_iter()
-            .filter(|record| record["template"]["name"] == "extract_claims")
-            .count() as u64
-    };
-    let recorded = call1(cassette_records(&dir));
-    assert!(recorded > 0);
-    let recorded_refreshes = cassette_records(&dir)
-        .iter()
-        .filter(|r| is_refresh(r))
-        .count() as u64;
-    assert!(recorded_refreshes > 0, "the fixture must record a refresh");
-
-    let english = dir.private_file("english.toml", "[llm]\nlanguage = \"English\"\n");
-    let overrides = [
-        "--overrides",
-        english.to_str().unwrap(),
-        "--refresh",
-        "recorded",
-    ];
-    let script = live_script(&dir);
-    let first = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "fast-english",
-        Some(&script),
-        &overrides,
-    );
-    assert_ok(&first.output);
-    let report = first.report();
-    let expected_misses = recorded + recorded_refreshes;
-    assert_eq!(report["llm"]["misses"], expected_misses, "{report}");
-    assert_eq!(report["llm"]["live"], expected_misses, "{report}");
-    assert_eq!(call1(cassette_records(&dir)), 2 * recorded);
-    let english_refreshes = cassette_records(&dir)
-        .into_iter()
-        .filter(|r| is_refresh(r) && r["language"] == "English")
-        .count() as u64;
-    assert_eq!(english_refreshes, recorded_refreshes);
-    let cassette = fs::read(dir.private_path("cassettes/main.jsonl")).unwrap();
-
-    let second = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "fast-english-again",
-        None,
-        &overrides,
-    );
-    assert_ok(&second.output);
-    assert_eq!(second.report()["llm"]["misses"], 0);
-    assert_eq!(second.report()["llm"]["live"], 0);
-    assert_eq!(
-        fs::read(dir.private_path("cassettes/main.jsonl")).unwrap(),
-        cassette,
-        "same-language claims and refreshes are reused without recording anything"
     );
 }
 
 /// The `[extraction] guidance` the guided runs use.
 const GUIDANCE: &str = "Skip routine checks.";
 
-/// Claims recorded without `[extraction] guidance` came from another
-/// prompt. With it on, every chunk's call 1 is a miss answered live and
-/// recorded under the guidance's hash, and the next `fast` run with it
-/// reuses those. The report records call 1's version and the hash, and so
-/// does the aggregate export, as bytes.
+/// Call 1 claims recorded under other rules came from another prompt, so
+/// `fast` doesn't reuse them: claims and refreshes recorded without
+/// `[llm] language` (even with `--refresh recorded`), claims recorded
+/// without `[extraction] guidance`, and claims recorded under another
+/// version of call 1's template. Each is a miss answered live and recorded
+/// under the run's rules, and the next `fast` run under them reuses
+/// everything without recording more. The report carries the guidance's
+/// hash.
 #[test]
-fn fast_doesnt_reuse_claims_recorded_without_the_guidance_and_reports_it() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    let unguided = record(&dir, &corpus).report();
-    assert_eq!(unguided["call1"]["version"], 7, "{unguided}");
-    assert!(unguided["call1"]["guidance_hash"].is_null(), "{unguided}");
-    let call1 = |records: &[Value]| {
-        records
-            .iter()
-            .filter(|record| record["template"]["name"] == "extract_claims")
-            .count() as u64
-    };
-    let recorded = call1(&cassette_records(&dir));
-    assert!(recorded > 0);
+fn fast_doesnt_reuse_claims_recorded_under_other_rules() {
+    let call1 = |records: &[Value]| records.iter().filter(|r| is_call1(r)).count() as u64;
+    for case in ["language", "guidance", "template version"] {
+        let dir = TestDir::new();
+        let corpus = imported_small_history(&dir);
+        record(&dir, &corpus);
+        let mut records = cassette_records(&dir);
+        let recorded = call1(&records);
+        let refreshes = records.iter().filter(|r| is_refresh(r)).count() as u64;
+        assert!(recorded > 0, "the fixture must record call 1");
+        assert!(refreshes > 0, "the fixture must record a refresh");
+        let (toml, misses) = match case {
+            "language" => (
+                "[llm]\nlanguage = \"English\"\n".into(),
+                recorded + refreshes,
+            ),
+            "guidance" => (
+                format!("[extraction]\nguidance = \"{GUIDANCE}\"\n"),
+                recorded,
+            ),
+            _ => {
+                // As if recorded before the template changed: another
+                // version, and so another request key.
+                for record in records.iter_mut().filter(|record| is_call1(record)) {
+                    let other = record["template"]["version"].as_u64().unwrap() + 1;
+                    record["template"]["version"] = other.into();
+                    record["request"]["template"]["version"] = other.into();
+                    record["key"] = format!("{}-old", record["key"].as_str().unwrap()).into();
+                }
+                write_cassette(&dir, &records);
+                (String::new(), recorded)
+            }
+        };
+        let overrides = overrides(&dir, &toml);
+        let flags = ["--overrides", &overrides, "--refresh", "recorded"];
+        let script = live_script(&dir);
+        let report =
+            replay_history(&dir, &corpus, "fast", PASSING_PROBES, Some(&script), &flags).ok();
+        assert_eq!(report["llm"]["misses"], misses, "{case}: {report}");
+        assert_eq!(report["llm"]["live"], misses, "{case}: {report}");
+        assert_eq!(call1(&cassette_records(&dir)), 2 * recorded, "{case}");
+        if case == "guidance" {
+            let hash = &report["call1"]["guidance_hash"];
+            assert_eq!(*hash, sha(GUIDANCE.as_bytes()), "{report}");
+        }
+        let cassette = cassette_bytes(&dir);
 
-    let hash = sha(GUIDANCE.as_bytes());
-    let guidance = dir.private_file(
-        "guidance.toml",
-        &format!("[extraction]\nguidance = \"{GUIDANCE}\"\n"),
-    );
-    let overrides = ["--overrides", guidance.to_str().unwrap()];
-    let script = live_script(&dir);
-    let first = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "fast-guided",
-        Some(&script),
-        &overrides,
-    );
-    assert_ok(&first.output);
-    let report = first.report();
-    assert_eq!(report["llm"]["misses"], recorded, "{report}");
-    assert_eq!(report["llm"]["live"], recorded, "{report}");
-    assert_eq!(report["tuning"]["extraction"]["guidance"], GUIDANCE);
-    assert_eq!(report["call1"]["version"], 7, "{report}");
-    assert_eq!(report["call1"]["guidance_hash"], hash, "{report}");
-    let records = cassette_records(&dir);
-    assert_eq!(call1(&records), 2 * recorded);
-    let guided = records
-        .iter()
-        .filter(|record| record["template"]["guidance"] == hash)
-        .count() as u64;
-    assert_eq!(guided, recorded);
-
-    let aggregate = dir.path("aggregate.json");
-    let mut flags = overrides.to_vec();
-    flags.extend(["--aggregate", aggregate.to_str().unwrap()]);
-    let second = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "fast-guided-again",
-        None,
-        &flags,
-    );
-    assert_ok(&second.output);
-    assert_eq!(second.report()["llm"]["misses"], 0);
-    let export: Value = serde_json::from_slice(&fs::read(&aggregate).unwrap()).unwrap();
-    assert_eq!(export["call1"]["version"], 7, "{export}");
-    assert_eq!(
-        export["call1"]["guidance_hash"],
-        serde_json::json!(Sha256::digest(GUIDANCE.as_bytes()).to_vec()),
-        "{export}"
-    );
+        let second = replay_history(&dir, &corpus, "fast", PASSING_PROBES, None, &flags).ok();
+        assert_eq!(second["llm"]["misses"], 0, "{case}");
+        assert_eq!(
+            cassette_bytes(&dir),
+            cassette,
+            "{case}: claims and refreshes recorded under the run's rules are reused"
+        );
+    }
 }
 
 // The determinism self-test.
@@ -918,139 +502,66 @@ fn the_self_test_passes_for_fast_with_zero_misses() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
     record(&dir, &corpus);
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "self-test",
-        None,
-        &["--self-test"],
-    );
-    assert_ok(&run.output);
-    assert_eq!(run.report()["llm"]["misses"], 0);
+    let flags = ["--self-test"];
+    let report = replay_history(&dir, &corpus, "fast", PASSING_PROBES, None, &flags).ok();
+    assert_eq!(report["llm"]["misses"], 0);
 }
 
 // Priming call 1.
 
-/// Omission keeps priming off; an explicit value wins over the bare
-/// flag's default of ten. All three forms are visible in the report.
-#[test]
-fn prime_concurrency_is_opt_in_with_a_bare_default_of_ten() {
-    for (name, prime_flags, expected) in [
-        ("omitted", vec![], serde_json::json!(null)),
-        (
-            "explicit",
-            vec!["--prime-concurrency", "2"],
-            serde_json::json!(2),
-        ),
-        ("bare", vec!["--prime-concurrency"], serde_json::json!(10)),
-    ] {
-        let dir = TestDir::new();
-        let corpus = imported_small_history(&dir);
-        let script = live_script(&dir);
-        let flags = call1_only(&dir);
-        let mut flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-        flags.extend(prime_flags);
-        let run = replay_history(
-            &dir,
-            &corpus,
-            "fast",
-            PASSING_PROBES,
-            name,
-            Some(&script),
-            &flags,
-        );
-        assert_ok(&run.output);
-        let report = run.report();
-        assert_eq!(report["flags"]["prime_concurrency"], expected, "{report}");
-        if expected.is_null() {
-            assert_eq!(report["llm"]["primed"], 0, "{report}");
-            assert!(report["llm"]["live"].as_u64().unwrap() > 0, "{report}");
-        } else {
-            assert!(report["llm"]["primed"].as_u64().unwrap() > 0, "{report}");
-            assert_eq!(report["llm"]["misses"], 0, "{report}");
-        }
-    }
-}
-
-#[test]
-fn bare_prime_concurrency_is_refused_outside_fast_and_in_scenarios() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    for mode in ["live", "replay"] {
-        let run = replay_history(
-            &dir,
-            &corpus,
-            mode,
-            PASSING_PROBES,
-            mode,
-            None,
-            &["--prime-concurrency"],
-        );
-        assert_refused(&run.output, "fast");
-        assert!(!run.report_path.exists(), "a refused run writes no report");
-    }
-    for flags in [
-        vec!["--prime-concurrency", "2"],
-        vec!["--prime-concurrency"],
-    ] {
-        let output = asphodel(&dir)
-            .args(["replay", "--scenario", "unused.toml"])
-            .args(flags)
-            .output()
-            .unwrap();
-        assert_refused(&output, "--scenario");
-    }
-}
-
-/// The flags that keep a `fast` run on the small history to call 1 alone:
-/// the reranker gate shut, so nothing is injected and no pair needs a
-/// top-up, and refreshes answered with no edits.
-fn call1_only(dir: &TestDir) -> Vec<String> {
-    let shut = dir.private_file(
-        "shut-gate.toml",
-        "[injection.reranker_floors]\n\"fake-reranker:v1\" = 1000000.0\n",
-    );
-    vec![
-        "--overrides".into(),
-        shut.to_str().unwrap().into(),
-        "--refresh".into(),
-        "off".into(),
-    ]
-}
-
-/// [`call1_only`] with `--prime-concurrency n`.
-fn primed(dir: &TestDir, n: u32) -> Vec<String> {
-    let mut flags = call1_only(dir);
-    flags.extend(["--prime-concurrency".into(), n.to_string()]);
-    flags
+/// A `fast` run kept to call 1 alone, with `extra` flags: the reranker
+/// gate shut, so nothing is injected and no pair needs a top-up, and
+/// refreshes answered with no edits.
+fn fast_call1_only(dir: &TestDir, corpus: &Path, script: Option<&Path>, extra: &[&str]) -> Run {
+    let shut = overrides(dir, SHUT_GATE);
+    let mut flags = vec!["--overrides", &shut, "--refresh", "off"];
+    flags.extend(extra);
+    replay_history(dir, corpus, "fast", PASSING_PROBES, script, &flags)
 }
 
 /// The chunks of the cassette's call 1 records, in file order.
 fn call1_chunks(dir: &TestDir) -> Vec<String> {
     cassette_records(dir)
         .iter()
-        .filter(|record| record["template"]["name"] == "extract_claims")
+        .filter(|record| is_call1(record))
         .map(|record| record["chunk"].to_string())
         .collect()
 }
 
-/// A script answering every call with the home claim, the first called
-/// answering last: step `i` takes `(8 - i) × 100` ms, and from the eighth
-/// on no time at all.
-fn finishing_backwards_script(dir: &TestDir) -> std::path::PathBuf {
-    let reply = serde_json::json!({
-        "claims": [support::home_claim()],
-        "used_injected_ids": [],
-        "operations": []
-    });
-    let steps: Vec<Value> = (0..64u64)
-        .map(|i| serde_json::json!({ "reply": reply, "delay_ms": 800u64.saturating_sub(i * 100) }))
-        .collect();
-    let path = dir.path("backwards-script.json");
-    fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
-    path
+/// The chunks a serial `live` run on the small history records call 1 for.
+fn serial_call1_chunks() -> Vec<String> {
+    let serial = TestDir::new();
+    record(&serial, &imported_small_history(&serial));
+    call1_chunks(&serial)
+}
+
+/// Priming relies on reusing claims by chunk, which only `fast` does, so
+/// `--prime-concurrency`, bare or with a value, is refused in `live`,
+/// `replay` and scenario runs. In `fast` the bare flag primes, and the
+/// report says how many calls at a time.
+#[test]
+fn prime_concurrency_is_fast_only_and_primes_when_bare() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let script = live_script(&dir);
+    for prime in [&["--prime-concurrency"][..], &["--prime-concurrency", "4"]] {
+        for mode in ["live", "replay"] {
+            let run = replay_history(&dir, &corpus, mode, PASSING_PROBES, Some(&script), prime);
+            assert_refused(&run.output, "fast");
+            assert!(!run.report_path.exists(), "a refused run writes no report");
+        }
+        let output = asphodel(&dir)
+            .args(["replay", "--scenario", "unused.toml"])
+            .args(prime)
+            .output()
+            .unwrap();
+        assert_refused(&output, "--scenario");
+    }
+
+    let report = fast_call1_only(&dir, &corpus, Some(&script), &["--prime-concurrency"]).ok();
+    assert!(report["flags"]["prime_concurrency"].is_u64(), "{report}");
+    assert!(report["llm"]["primed"].as_u64().unwrap() > 0, "{report}");
+    assert_eq!(report["llm"]["misses"], 0, "{report}");
 }
 
 /// `--prime-concurrency` records call 1 for every chunk a serial run
@@ -1061,46 +572,26 @@ fn finishing_backwards_script(dir: &TestDir) -> std::path::PathBuf {
 /// no LLM at all, and its report says it wasn't primed.
 #[test]
 fn a_primed_fast_run_records_call_1_for_every_chunk_before_simulating() {
-    let serial = TestDir::new();
-    let serial_corpus = imported_small_history(&serial);
-    record(&serial, &serial_corpus);
-    let expected = call1_chunks(&serial);
+    let expected = serial_call1_chunks();
     assert!(expected.len() > 1, "the fixture needs several chunks");
 
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
-    let script = finishing_backwards_script(&dir);
-    let flags = primed(&dir, 4);
-    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "primed",
-        Some(&script),
-        &flags,
-    );
-    assert_ok(&run.output);
-    let report = run.report();
+    // The first called answers last: step `i` takes `(8 - i) × 100` ms,
+    // and from the eighth on no time at all.
+    let reply = support::reply_to_everything(vec![home_claim()], vec![]);
+    let steps: Vec<Value> = (0..64u64)
+        .map(|i| json!({ "reply": reply, "delay_ms": 800u64.saturating_sub(i * 100) }))
+        .collect();
+    let script = script_steps(&dir, "backwards-script", &steps);
+    let prime = ["--prime-concurrency", "4"];
+    let report = fast_call1_only(&dir, &corpus, Some(&script), &prime).ok();
     assert_eq!(report["flags"]["prime_concurrency"], 4, "{report}");
     assert_eq!(report["llm"]["primed"], expected.len(), "{report}");
     assert_eq!(report["llm"]["misses"], 0, "{report}");
     assert_eq!(call1_chunks(&dir), expected);
 
-    let flags = call1_only(&dir);
-    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let again = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "unprimed",
-        None,
-        &flags,
-    );
-    assert_ok(&again.output);
-    let report = again.report();
+    let report = fast_call1_only(&dir, &corpus, None, &[]).ok();
     assert!(report["flags"]["prime_concurrency"].is_null(), "{report}");
     assert_eq!(report["llm"]["primed"], 0, "{report}");
     assert_eq!(report["llm"]["misses"], 0, "{report}");
@@ -1114,70 +605,34 @@ fn priming_a_recorded_history_calls_nothing() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
     record(&dir, &corpus);
-    let cassette = fs::read(dir.private_path("cassettes/main.jsonl")).unwrap();
+    let cassette = cassette_bytes(&dir);
     let script = live_script(&dir);
-    let flags = primed(&dir, 4);
-    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "primed",
-        Some(&script),
-        &flags,
-    );
-    assert_ok(&run.output);
-    let report = run.report();
+    let prime = ["--prime-concurrency", "4"];
+    let report = fast_call1_only(&dir, &corpus, Some(&script), &prime).ok();
     assert_eq!(report["llm"]["primed"], 0, "{report}");
     assert_eq!(report["llm"]["misses"], 0, "{report}");
-    assert_eq!(
-        fs::read(dir.private_path("cassettes/main.jsonl")).unwrap(),
-        cassette,
-        "nothing needed priming"
-    );
+    assert_eq!(cassette_bytes(&dir), cassette, "nothing needed priming");
 }
 
 /// A failed prime keeps successful in-flight replies, writes no report,
 /// and resumes by calling only chunks still absent from the cassette.
 #[test]
 fn a_failed_prime_preserves_replies_and_resumes_only_missing_chunks() {
-    let serial = TestDir::new();
-    let serial_corpus = imported_small_history(&serial);
-    record(&serial, &serial_corpus);
-    let expected: BTreeSet<String> = call1_chunks(&serial).into_iter().collect();
+    let expected: BTreeSet<String> = serial_call1_chunks().into_iter().collect();
     assert!(expected.len() > 2, "the fixture needs unstarted chunks too");
 
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
-    let reply = serde_json::json!({
-        "claims": [support::home_claim()],
-        "used_injected_ids": [],
-        "operations": []
-    });
+    let reply = support::reply_to_everything(vec![home_claim()], vec![]);
     // Both workers start before the refusal; the successful reply arrives
     // afterwards, so recovery must also preserve work still in flight.
-    let script = dir.path("partial-failure.json");
-    fs::write(
-        &script,
-        serde_json::to_vec(&serde_json::json!([
-            {"reply": reply, "delay_ms": 500},
-            {"fail": "refused", "delay_ms": 100}
-        ]))
-        .unwrap(),
-    )
-    .unwrap();
-    let flags = primed(&dir, 2);
-    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let failed = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "failed-prime",
-        Some(&script),
-        &flags,
-    );
+    let steps = [
+        json!({"reply": reply, "delay_ms": 500}),
+        json!({"fail": "refused", "delay_ms": 100}),
+    ];
+    let script = script_steps(&dir, "partial-failure", &steps);
+    let prime = ["--prime-concurrency", "2"];
+    let failed = fast_call1_only(&dir, &corpus, Some(&script), &prime);
     assert_refused(&failed.output, "priming call 1 failed");
     assert!(
         !failed.report_path.exists(),
@@ -1186,61 +641,22 @@ fn a_failed_prime_preserves_replies_and_resumes_only_missing_chunks() {
     let preserved = cassette_records(&dir);
     assert_eq!(preserved.len(), 1, "{preserved:?}");
     assert_eq!(preserved[0]["response"]["json"], reply);
-    assert_eq!(preserved[0]["primed"], true);
     let completed = call1_chunks(&dir);
     assert_eq!(completed.len(), 1);
     assert!(expected.contains(&completed[0]));
-    let cassette_path = dir.private_path("cassettes/main.jsonl");
-    let before = fs::read(&cassette_path).unwrap();
+    let before = cassette_bytes(&dir);
 
     // Exactly enough replies for the missing chunks. Any redundant call
     // exhausts the script and fails instead of silently duplicating work.
     let missing = expected.len() - completed.len();
-    let script = dir.path("resume.json");
-    fs::write(
-        &script,
-        serde_json::to_vec(&vec![serde_json::json!({"reply": reply}); missing]).unwrap(),
-    )
-    .unwrap();
-    let resumed = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "resumed-prime",
-        Some(&script),
-        &flags,
-    );
-    assert_ok(&resumed.output);
-    let report = resumed.report();
+    let script = script_steps(&dir, "resume", &vec![json!({"reply": reply}); missing]);
+    let report = fast_call1_only(&dir, &corpus, Some(&script), &prime).ok();
     assert_eq!(report["llm"]["primed"], missing, "{report}");
     assert_eq!(report["llm"]["misses"], 0, "{report}");
-    assert!(fs::read(cassette_path).unwrap().starts_with(&before));
+    assert!(cassette_bytes(&dir).starts_with(&before));
     let chunks = call1_chunks(&dir);
     assert_eq!(chunks.len(), expected.len(), "no duplicate recordings");
     assert_eq!(chunks.into_iter().collect::<BTreeSet<_>>(), expected);
-}
-
-/// Priming relies on reusing claims by chunk, which only `fast` does.
-#[test]
-fn priming_is_refused_outside_fast() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-    let script = live_script(&dir);
-    for mode in ["live", "replay"] {
-        let run = replay_history(
-            &dir,
-            &corpus,
-            mode,
-            PASSING_PROBES,
-            &format!("{mode}-primed"),
-            Some(&script),
-            &["--prime-concurrency", "4"],
-        );
-        assert_refused(&run.output, "fast");
-        assert!(!run.report_path.exists(), "a refused run writes no report");
-    }
 }
 
 /// The prime makes its calls `--prime-concurrency` at a time in wall-clock
@@ -1250,45 +666,19 @@ fn priming_is_refused_outside_fast() {
 #[test]
 fn priming_makes_the_call_1s_in_parallel() {
     const DELAY_MS: u64 = 3000;
-
-    let serial = TestDir::new();
-    let serial_corpus = imported_small_history(&serial);
-    let script = support::delayed_script(&serial, DELAY_MS);
-    let flags = call1_only(&serial);
-    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let started = Instant::now();
-    let unprimed = replay_history(
-        &serial,
-        &serial_corpus,
-        "fast",
-        PASSING_PROBES,
-        "unprimed",
-        Some(&script),
-        &flags,
-    );
-    let unprimed_elapsed = started.elapsed();
-    assert_ok(&unprimed.output);
-    let calls = unprimed.report()["llm"]["live"].as_u64().unwrap();
+    let timed = |prime: &[&str]| {
+        let dir = TestDir::new();
+        let corpus = imported_small_history(&dir);
+        let script = support::delayed_script(&dir, DELAY_MS);
+        let started = Instant::now();
+        let report = fast_call1_only(&dir, &corpus, Some(&script), prime).ok();
+        (started.elapsed(), report)
+    };
+    let (unprimed_elapsed, unprimed) = timed(&[]);
+    let calls = unprimed["llm"]["live"].as_u64().unwrap();
     assert!(calls > 1, "the fixture needs several chunks");
-
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    let script = support::delayed_script(&dir, DELAY_MS);
-    let flags = primed(&dir, 4);
-    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let started = Instant::now();
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        PASSING_PROBES,
-        "primed",
-        Some(&script),
-        &flags,
-    );
-    let primed_elapsed = started.elapsed();
-    assert_ok(&run.output);
-    assert_eq!(run.report()["llm"]["primed"], calls);
+    let (primed_elapsed, primed) = timed(&["--prime-concurrency", "4"]);
+    assert_eq!(primed["llm"]["primed"], calls);
 
     let batches = calls.div_ceil(4);
     let saved = Duration::from_millis((calls - batches) * DELAY_MS / 2);
@@ -1300,39 +690,23 @@ fn priming_makes_the_call_1s_in_parallel() {
 
 // The report.
 
-/// Injected tokens per session and per turn, with cron reported apart so
-/// it doesn't skew the percentiles; purges per day next to the
-/// purged-then-re-mentioned rate.
+/// Injected tokens per session, with cron reported apart so it doesn't
+/// skew the percentiles: cron and subagent sessions aren't turn sessions.
 #[test]
-fn the_report_counts_injected_tokens_with_cron_apart_and_purges() {
+fn the_report_counts_injected_tokens_with_cron_apart() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
     record(&dir, &corpus);
-    let run = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "replay", None, &[]);
-    assert_ok(&run.output);
-    let report = run.report();
+    let report = replay_history(&dir, &corpus, "replay", PASSING_PROBES, None, &[]).ok();
     let injected = &report["injected_tokens"];
-
     let sessions: BTreeSet<&str> = injected["sessions"]
         .as_array()
         .unwrap_or_else(|| panic!("injected tokens per session: {report}"))
         .iter()
         .map(|session| session["session"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        sessions,
-        BTreeSet::from(["s-later", "s-main"]),
-        "cron and subagent sessions aren't turn sessions"
-    );
-    assert!(injected["per_turn"]["p50"].is_number(), "{report}");
-    assert!(injected["per_turn"]["p95"].is_number(), "{report}");
+    assert_eq!(sessions, BTreeSet::from(["s-later", "s-main"]));
     assert_eq!(injected["cron"]["prefetches"], 1, "{report}");
-
-    assert!(report["purges_per_day"].is_array(), "{report}");
-    assert!(
-        report["purged_then_re_mentioned"]["rate"].is_number(),
-        "{report}"
-    );
 }
 
 // Privacy.
@@ -1347,15 +721,10 @@ fn the_aggregate_export_holds_no_strings_but_probe_ids() {
     let corpus = imported_small_history(&dir);
     record(&dir, &corpus);
     let aggregate = dir.path("aggregate.json");
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "replay",
-        PROBES_WITH_A_FAILURE,
-        "replay",
-        None,
-        &["--aggregate", aggregate.to_str().unwrap()],
-    );
+    // p003 fails: the memory isn't absent.
+    let probes = PASSING_PROBES.to_owned() + &probe_on("p003", 9, "absent", HOME_MEMORY);
+    let flags = ["--aggregate", aggregate.to_str().unwrap()];
+    let run = replay_history(&dir, &corpus, "replay", &probes, None, &flags);
     assert_eq!(
         run.output.status.code(),
         Some(1),
@@ -1403,46 +772,30 @@ fn the_aggregate_export_holds_no_strings_but_probe_ids() {
 fn real_history_material_is_refused_outside_the_private_dir() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
-    let script = support::live_script(&dir);
+    let script = live_script(&dir);
     let probes = dir.private_file("probes.toml", PASSING_PROBES);
-
-    let report = dir.path("report.json");
-    let output = asphodel(&dir)
-        .arg("replay")
-        .arg("--corpus")
-        .arg(&corpus)
-        .arg("--mode")
-        .arg("live")
-        .arg("--cassette")
-        .arg(dir.private_path("cassettes/main.jsonl"))
-        .arg("--probes")
-        .arg(&probes)
-        .arg("--report")
-        .arg(&report)
-        .env("ASPHODEL_LLM_SCRIPT", &script)
-        .output()
-        .unwrap();
-    assert_refused(&output, "private");
-    assert!(!report.exists());
-
-    let cassette = dir.path("cassette.jsonl");
-    let output = asphodel(&dir)
-        .arg("replay")
-        .arg("--corpus")
-        .arg(&corpus)
-        .arg("--mode")
-        .arg("live")
-        .arg("--cassette")
-        .arg(&cassette)
-        .arg("--probes")
-        .arg(&probes)
-        .arg("--report")
-        .arg(dir.private_path("reports/live.json"))
-        .env("ASPHODEL_LLM_SCRIPT", &script)
-        .output()
-        .unwrap();
-    assert_refused(&output, "private");
-    assert!(!cassette.exists());
+    let (report, cassette) = (dir.path("report.json"), dir.path("cassette.jsonl"));
+    for (report, cassette, outside) in [
+        (&report, &cassette_path(&dir), &report),
+        (&dir.private_path("reports/live.json"), &cassette, &cassette),
+    ] {
+        let output = asphodel(&dir)
+            .arg("replay")
+            .arg("--corpus")
+            .arg(&corpus)
+            .args(["--mode", "live"])
+            .arg("--cassette")
+            .arg(cassette)
+            .arg("--probes")
+            .arg(&probes)
+            .arg("--report")
+            .arg(report)
+            .env("ASPHODEL_LLM_SCRIPT", &script)
+            .output()
+            .unwrap();
+        assert_refused(&output, "private");
+        assert!(!outside.exists());
+    }
 }
 
 // The A/B diff.
@@ -1451,58 +804,35 @@ fn real_history_material_is_refused_outside_the_private_dir() {
 /// and compares runs on the same one.
 #[test]
 fn the_diff_refuses_runs_on_different_corpora_unless_forced() {
+    let replayed = |dir: &TestDir, corpus: &Path| {
+        let run = replay_history(dir, corpus, "replay", PASSING_PROBES, None, &[]);
+        assert_ok(&run.output);
+        run.report_path
+    };
     let a_dir = TestDir::new();
     let a_corpus = imported_small_history(&a_dir);
     record(&a_dir, &a_corpus);
-    let a = replay_history(&a_dir, &a_corpus, "replay", PASSING_PROBES, "a", None, &[]);
-    assert_ok(&a.output);
-    let a_again = replay_history(
-        &a_dir,
-        &a_corpus,
-        "replay",
-        PASSING_PROBES,
-        "a-again",
-        None,
-        &[],
-    );
-    assert_ok(&a_again.output);
+    let [a, a_again] = [(); 2].map(|()| replayed(&a_dir, &a_corpus));
 
-    // The same history with one more turn.
+    // The small history with one more turn at the end.
     let b_dir = TestDir::new();
-    let state_db = b_dir.private_path("state.db");
-    let db: StateDb = hermes::small_history(&state_db);
-    db.turn(
-        "s-later",
-        epoch("2026-01-11T09:00:00Z"),
-        "One more question.",
-        "One more answer.",
-    );
-    drop(db);
-    let b_corpus = b_dir.private_path("corpus/main.jsonl");
-    assert_ok(&support::import(&b_dir, &state_db, &b_corpus));
+    let b_corpus = import_history(&b_dir, |path| {
+        let db = hermes::small_history(path);
+        let at = epoch("2026-01-11T09:00:00Z");
+        db.turn("s-later", at, "One more question.", "One more answer.");
+        db
+    });
     record(&b_dir, &b_corpus);
-    let b = replay_history(&b_dir, &b_corpus, "replay", PASSING_PROBES, "b", None, &[]);
-    assert_ok(&b.output);
-    assert_ne!(
-        sha(&fs::read(&a_corpus).unwrap()),
-        sha(&fs::read(&b_corpus).unwrap())
-    );
+    let b = replayed(&b_dir, &b_corpus);
 
-    let diff = |left: &std::path::Path, right: &std::path::Path, force: bool| {
+    let diff = |right: &Path, force: &[&str]| {
         let mut command = asphodel(&a_dir);
-        command.arg("report").arg("diff").arg(left).arg(right);
-        if force {
-            command.arg("--force");
-        }
-        command.output().unwrap()
+        command.args(["report", "diff"]).arg(&a).arg(right);
+        command.args(force).output().unwrap()
     };
-    assert_ok(&diff(&a.report_path, &a_again.report_path, false));
-    assert_refused(&diff(&a.report_path, &b.report_path, false), "corpus");
-    assert_ok(&diff(&a.report_path, &b.report_path, true));
-}
-
-fn sha(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    assert_ok(&diff(&a_again, &[]));
+    assert_refused(&diff(&b, &[]), "corpus");
+    assert_ok(&diff(&b, &["--force"]));
 }
 
 /// The diff lists a memory that faded in one run and not the other by id,
@@ -1515,46 +845,43 @@ fn the_diff_lists_fates_by_id_and_numbers_beyond_the_tolerance_by_path() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
     record(&dir, &corpus);
-    let run = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "replay", None, &[]);
-    assert_ok(&run.output);
-    let report = run.report();
+    let report = replay_history(&dir, &corpus, "replay", PASSING_PROBES, None, &[]).ok();
     let id = report["memories"][0]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("the report lists each memory by id: {report}"))
         .to_string();
 
-    let mut a = report.clone();
-    let mut b = report;
-    a["memories"][0]["faded_at"] = Value::from("2026-03-01T00:00:00Z");
-    b["memories"][0]["faded_at"] = Value::Null;
-    a["memories"][0]["purged_at"] = Value::Null;
-    b["memories"][0]["purged_at"] = Value::Null;
-    a["injected_tokens"]["per_turn"]["p50"] = Value::from(100.0);
-    b["injected_tokens"]["per_turn"]["p50"] = Value::from(100.000_000_01);
-    a["injected_tokens"]["per_turn"]["p95"] = Value::from(100.0);
-    b["injected_tokens"]["per_turn"]["p95"] = Value::from(150.0);
-    let a_path = dir.private_file("reports/a.json", &a.to_string());
-    let b_path = dir.private_file("reports/b.json", &b.to_string());
+    let (mut a, mut b) = (report.clone(), report);
+    for (pointer, in_a, in_b) in [
+        (
+            "/memories/0/faded_at",
+            json!("2026-03-01T00:00:00Z"),
+            json!(null),
+        ),
+        ("/memories/0/purged_at", json!(null), json!(null)),
+        (
+            "/injected_tokens/per_turn/p50",
+            json!(100.0),
+            json!(100.000_000_01),
+        ),
+        ("/injected_tokens/per_turn/p95", json!(100.0), json!(150.0)),
+    ] {
+        *a.pointer_mut(pointer).unwrap() = in_a;
+        *b.pointer_mut(pointer).unwrap() = in_b;
+    }
+    let a_path = dir.private_json("reports/a.json", &a);
+    let b_path = dir.private_json("reports/b.json", &b);
 
     let output = asphodel(&dir)
-        .arg("report")
-        .arg("diff")
+        .args(["report", "diff"])
         .arg(&a_path)
         .arg(&b_path)
         .output()
         .unwrap();
     assert_ok(&output);
     let diff: Value = serde_json::from_slice(&output.stdout).expect("the diff is JSON");
-    assert_eq!(
-        diff["memories"]["faded_only_in_a"],
-        serde_json::json!([id]),
-        "{diff:#}"
-    );
-    assert_eq!(
-        diff["memories"]["faded_only_in_b"],
-        serde_json::json!([]),
-        "{diff:#}"
-    );
+    assert_eq!(diff["memories"]["faded_only_in_a"], json!([id]), "{diff:#}");
+    assert_eq!(diff["memories"]["faded_only_in_b"], json!([]), "{diff:#}");
     let paths: Vec<&str> = diff["numbers"]
         .as_array()
         .unwrap_or_else(|| panic!("the numbers that differ: {diff:#}"))
@@ -1574,78 +901,26 @@ fn the_diff_lists_fates_by_id_and_numbers_beyond_the_tolerance_by_path() {
 // reply call 1 and a refresh can both read, so the order of calls doesn't
 // matter.
 
-/// Both models have an entry citing the home memory a day in.
-const MODELS_CITE_HOME: &str = r#"
-[[probe]]
-id = "p001"
-at = "2026-01-06T12:00:00Z"
-kind = "profile_has"
-model = "home"
-memory = "lives in Auckland"
+/// The probe fields for `home`'s entry citing the home memory.
+const HOME_IN_HOME: &str = "model = \"home\"\nmemory = \"lives in Auckland\"";
 
-[[probe]]
-id = "p002"
-at = "2026-01-06T12:00:00Z"
-kind = "profile_has"
-model = "User profile"
-memory = "lives in Auckland"
-"#;
-
-/// `home` has no entry citing the home memory, at any of three days.
-const HOME_LACKS_HOME: &str = r#"
-[[probe]]
-id = "p001"
-at = "2026-01-06T12:00:00Z"
-kind = "profile_lacks"
-model = "home"
-memory = "lives in Auckland"
-
-[[probe]]
-id = "p002"
-at = "2026-01-10T12:00:00Z"
-kind = "profile_lacks"
-model = "home"
-memory = "lives in Auckland"
-"#;
-
-const HOME_HAS_HOME: &str = r#"
-[[probe]]
-id = "p001"
-at = "2026-01-06T12:00:00Z"
-kind = "profile_has"
-model = "home"
-memory = "lives in Auckland"
-"#;
-
-/// Whether a record is a refresh's write. A plan is recorded apart, under
-/// `plan_model`, and replays by its key like any other call.
-fn is_refresh(record: &Value) -> bool {
-    record["template"]["name"] == "write_model"
+/// `home` has no entry citing the home memory, at either of two days.
+fn home_lacks_home() -> String {
+    probe_on("p001", 6, "profile_lacks", HOME_IN_HOME)
+        + &probe_on("p002", 10, "profile_lacks", HOME_IN_HOME)
 }
 
-/// Whether a refresh record is `home`'s, by the question line its request
-/// starts with, which is how `--refresh recorded` tells models apart.
-fn is_home_refresh(record: &Value) -> bool {
-    is_refresh(record)
-        && record["request"]["user"]
-            .as_str()
-            .is_some_and(|user| user.starts_with(&format!("Question: {HOME_QUESTION}\n")))
+fn home_has_home() -> String {
+    probe_on("p001", 6, "profile_has", HOME_IN_HOME)
 }
 
-/// A `live` run on the corpus with a manifest model; returns its report.
-fn record_with_models(dir: &TestDir, corpus: &std::path::Path) -> Value {
+/// A `live` run on the corpus with a manifest model, in which both models
+/// refresh and cite the home memory; returns its report.
+fn record_with_models(dir: &TestDir, corpus: &Path) -> Value {
     let script = universal_script(dir);
-    let run = replay_history(
-        dir,
-        corpus,
-        "live",
-        MODELS_CITE_HOME,
-        "live",
-        Some(&script),
-        &[],
-    );
-    assert_ok(&run.output);
-    run.report()
+    let in_profile = format!("model = \"User profile\"\n{HOME_MEMORY}");
+    let probes = home_has_home() + &probe_on("p002", 6, "profile_has", &in_profile);
+    replay_history(dir, corpus, "live", &probes, Some(&script), &[]).ok()
 }
 
 fn refresh_calls(report: &Value) -> u64 {
@@ -1657,25 +932,6 @@ fn refresh_calls(report: &Value) -> u64 {
         .sum()
 }
 
-/// The manifest's model reaches the bank and refreshes beside the seeded
-/// profile in `live`, and both refreshes are recorded.
-#[test]
-fn live_refreshes_the_seeded_profile_and_the_manifest_model_and_records_both() {
-    let dir = TestDir::new();
-    let corpus = imported_with_a_model(&dir);
-    let report = record_with_models(&dir, &corpus);
-    assert!(refresh_calls(&report) > 0, "{report}");
-
-    let records = cassette_records(&dir);
-    assert!(records.iter().any(is_home_refresh), "no refresh of home");
-    assert!(
-        records
-            .iter()
-            .any(|record| is_refresh(record) && !is_home_refresh(record)),
-        "no refresh of the seeded profile"
-    );
-}
-
 /// `--refresh off` answers every refresh with no edits, so `home` stays
 /// empty, but triggers are counted by code, so refresh calls per day match
 /// the recording.
@@ -1685,18 +941,8 @@ fn fast_refresh_off_makes_no_edits_but_counts_every_trigger() {
     let corpus = imported_with_a_model(&dir);
     let live = record_with_models(&dir, &corpus);
     assert!(refresh_calls(&live) > 0, "{live}");
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        HOME_LACKS_HOME,
-        "fast-off",
-        None,
-        &["--refresh", "off"],
-    );
-    assert_ok(&run.output);
-    let report = run.report();
-    assert_eq!(report["flags"]["refresh"], "off", "{report}");
+    let flags = ["--refresh", "off"];
+    let report = replay_history(&dir, &corpus, "fast", &home_lacks_home(), None, &flags).ok();
     assert_eq!(report["llm"]["misses"], 0, "{report}");
     assert_eq!(
         report["refresh_calls_per_day"], live["refresh_calls_per_day"],
@@ -1704,66 +950,58 @@ fn fast_refresh_off_makes_no_edits_but_counts_every_trigger() {
     );
 }
 
-/// The cassette with `home`'s recorded refreshes replaced by two: one at
-/// the first recorded refresh's time answering `near`, and one 200 days
-/// later answering `far`, written first so file order can't pick it.
-fn with_near_and_far_home_refreshes(dir: &TestDir, near: Vec<Value>, far: Vec<Value>) {
-    let records = cassette_records(dir);
-    let first = records
-        .iter()
-        .find(|record| is_home_refresh(record))
-        .expect("the recording refreshed home")
-        .clone();
-    let at: jiff::Timestamp = first["at"].as_str().unwrap().parse().unwrap();
-    let later = at + jiff::SignedDuration::from_hours(24 * 200);
-    let copy = |at: jiff::Timestamp, sentences: Vec<Value>, tag: &str| {
-        let mut record = first.clone();
-        record["at"] = Value::from(at.to_string());
-        record["key"] = Value::from(format!("{}-{tag}", first["key"].as_str().unwrap()));
-        record["response"]["json"] = write_reply(sentences);
-        record
-    };
-    let mut kept: Vec<Value> = records
-        .into_iter()
-        .filter(|record| !is_home_refresh(record))
-        .collect();
-    kept.push(copy(later, far, "far"));
-    kept.push(copy(at, near, "near"));
-    write_cassette(dir, &kept);
+/// A copy of refresh `record` `days` later, under a key of its own,
+/// answering `operations`.
+fn refresh_copy(record: &Value, days: i64, operations: &[Value], tag: &str) -> Value {
+    let at: jiff::Timestamp = record["at"].as_str().unwrap().parse().unwrap();
+    let mut copy = record.clone();
+    copy["at"] = Value::from((at + jiff::SignedDuration::from_hours(24 * days)).to_string());
+    copy["key"] = Value::from(format!("{}-{tag}", record["key"].as_str().unwrap()));
+    copy["response"]["json"] = json!({ "operations": operations });
+    copy
 }
 
-/// `--refresh recorded` substitutes the recorded refresh of the same model
-/// nearest in simulated time, whichever way round the two are.
+/// A `fast --refresh recorded` run whose probes all pass; returns its
+/// report.
+fn recorded_refreshes(dir: &TestDir, corpus: &Path, probes: &str, extra: &[&str]) -> Value {
+    let mut flags = vec!["--refresh", "recorded"];
+    flags.extend(extra);
+    let run = replay_history(dir, corpus, "fast", probes, None, &flags);
+    let report = run.report();
+    let failed: Vec<&Value> = report["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|probe| probe["passed"] != true)
+        .collect();
+    assert!(failed.is_empty(), "failed probes: {failed:#?}");
+    assert_ok(&run.output);
+    report
+}
+
+/// `--refresh recorded` substitutes the recorded refresh nearest in
+/// simulated time, whichever way round the two are. Every recorded
+/// refresh is replaced by two copies: one 200 days later, written first so
+/// file order can't pick it, and one at the refresh's own time.
 #[test]
 fn fast_refresh_recorded_substitutes_the_nearest_recorded_refresh() {
     let dir = TestDir::new();
     let corpus = imported_with_a_model(&dir);
     record_with_models(&dir, &corpus);
-
-    with_near_and_far_home_refreshes(&dir, vec![said("Tim lives in Auckland.", &["m1"])], vec![]);
-    let near_adds = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        HOME_HAS_HOME,
-        "near-adds",
-        None,
-        &["--refresh", "recorded"],
-    );
-    assert_ok(&near_adds.output);
-    assert_eq!(near_adds.report()["flags"]["refresh"], "recorded");
-
-    with_near_and_far_home_refreshes(&dir, vec![], vec![said("Tim lives in Auckland.", &["m1"])]);
-    let far_adds = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        HOME_LACKS_HOME,
-        "far-adds",
-        None,
-        &["--refresh", "recorded"],
-    );
-    assert_ok(&far_adds.output);
+    let (refreshes, others): (Vec<Value>, Vec<Value>) =
+        cassette_records(&dir).into_iter().partition(is_refresh);
+    assert!(!refreshes.is_empty(), "the recording refreshed");
+    let adds = [add_entry("Tim lives in Auckland.", &["m1"])];
+    for (near, far, probes) in [
+        (&adds[..], &[][..], home_has_home()),
+        (&[][..], &adds[..], home_lacks_home()),
+    ] {
+        let mut kept = others.clone();
+        kept.extend(refreshes.iter().map(|r| refresh_copy(r, 200, far, "far")));
+        kept.extend(refreshes.iter().map(|r| refresh_copy(r, 0, near, "near")));
+        write_cassette(&dir, &kept);
+        recorded_refreshes(&dir, &corpus, &probes, &[]);
+    }
 }
 
 /// `--refresh live` calls the LLM for a refresh the cassette has no record
@@ -1780,91 +1018,41 @@ fn fast_refresh_live_calls_the_llm_for_an_unrecorded_refresh() {
     write_cassette(&dir, &unrefreshed);
 
     let script = universal_script(&dir);
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        HOME_HAS_HOME,
-        "fast-live",
-        Some(&script),
-        &["--refresh", "live"],
-    );
-    assert_ok(&run.output);
-    let report = run.report();
+    let flags = ["--refresh", "live"];
+    let probes = home_has_home();
+    let report = replay_history(&dir, &corpus, "fast", &probes, Some(&script), &flags).ok();
     let calls = refresh_calls(&report);
     assert!(calls > 0, "{report}");
     assert_eq!(report["llm"]["live"], calls, "{report}");
-    assert!(cassette_records(&dir).iter().any(is_home_refresh));
+    assert!(cassette_records(&dir).iter().any(is_refresh));
 }
 
 // Input validation, replay timing and cassette substitution.
 
-/// Exit 0 with every probe passed, or the failed probes in the message.
-fn assert_probes_pass(run: &support::Run) {
-    let report = run.report();
-    let failed: Vec<&Value> = report["probes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|probe| probe["passed"] != true)
-        .collect();
-    assert!(failed.is_empty(), "failed probes: {failed:#?}");
-    assert_ok(&run.output);
-}
-
-/// Exit 2, `sentinel` in neither stream, and `words` in stderr.
-fn assert_refused_without(output: &std::process::Output, sentinel: &str, words: &[&str]) {
-    let out = String::from_utf8_lossy(&output.stdout);
-    let err = stderr(output);
-    assert_eq!(output.status.code(), Some(2), "stderr: {err}");
-    assert!(!out.contains(sentinel), "stdout echoes the input");
-    assert!(!err.contains(sentinel), "stderr echoes the input: {err}");
-    for word in words {
-        assert!(err.contains(word), "stderr should name {word:?}: {err}");
-    }
-}
-
-/// Content is logged only at `trace`: a probes file that doesn't parse is
-/// refused naming the file and the line, never quoting it.
+/// Content is logged only at `trace`: a probes file or a corpus line that
+/// doesn't parse is refused naming the file and the line, and a probe
+/// whose regex doesn't compile naming the probe, never quoting either.
 #[test]
-fn a_malformed_probes_file_is_refused_without_quoting_it() {
+fn malformed_inputs_are_refused_without_quoting_them() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
+
     let sentinel = "SENTINEL-PROBE-QUERY-7a2";
     let probes = format!("{PASSING_PROBES}\n[[probe]]\nid = \"p003\"\nquery = {sentinel}\n");
-    let line = probes
-        .lines()
-        .position(|line| line.contains(sentinel))
-        .unwrap()
-        + 1;
-    let run = replay_history(&dir, &corpus, "replay", &probes, "bad-probes", None, &[]);
-    assert_refused_without(
-        &run.output,
-        sentinel,
-        &["probes.toml", &format!("line {line}")],
-    );
-}
+    let line = probes.lines().position(|line| line.contains(sentinel));
+    let line = format!("line {}", line.unwrap() + 1);
+    let run = replay_history(&dir, &corpus, "replay", &probes, None, &[]);
+    assert_refused_without(&run.output, sentinel, &["probes.toml", &line]);
 
-/// A probe whose regex doesn't compile is refused naming the
-/// probe, never the pattern.
-#[test]
-fn a_probe_regex_that_doesnt_compile_is_refused_without_quoting_it() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    let sentinel = "SENTINEL-PROBE-PATTERN-((";
-    let probes = format!(
-        "[[probe]]\nid = \"p001\"\nat = \"2026-01-05T12:00:00Z\"\nkind = \"exists\"\nmemory = \"{sentinel}\"\n"
+    let probes = probe_on(
+        "p001",
+        5,
+        "exists",
+        "memory = \"SENTINEL-PROBE-PATTERN-((\"",
     );
-    let run = replay_history(&dir, &corpus, "replay", &probes, "bad-regex", None, &[]);
+    let run = replay_history(&dir, &corpus, "replay", &probes, None, &[]);
     assert_refused_without(&run.output, "SENTINEL-PROBE-PATTERN", &["p001"]);
-}
 
-/// A corpus line that doesn't parse is refused naming the line,
-/// never quoting it.
-#[test]
-fn a_malformed_corpus_line_is_refused_without_quoting_it() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
     let sentinel = "SENTINEL-CORPUS-VALUE-c40";
     let mut lines: Vec<Value> = fs::read_to_string(&corpus)
         .unwrap()
@@ -1878,15 +1066,7 @@ fn a_malformed_corpus_line_is_refused_without_quoting_it() {
     lines[line]["class"] = Value::from(sentinel);
     let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
     fs::write(&corpus, text).unwrap();
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "replay",
-        PASSING_PROBES,
-        "bad-corpus",
-        None,
-        &[],
-    );
+    let run = replay_history(&dir, &corpus, "replay", PASSING_PROBES, None, &[]);
     assert_refused_without(&run.output, sentinel, &[&format!("line {}", line + 1)]);
 }
 
@@ -1897,54 +1077,34 @@ fn a_malformed_corpus_line_is_refused_without_quoting_it() {
 #[test]
 fn a_prefetch_before_a_live_completion_doesnt_see_the_turn() {
     let dir = TestDir::new();
-    let state_db = dir.private_path("state.db");
-    let db = StateDb::create(&state_db);
-    let t = epoch("2026-01-05T09:00:00Z");
-    for (session, at) in [("s1", t), ("s2", t + 31.0), ("s3", t + 40.0)] {
-        db.session(session, "discord", Some("discord:1"), None, at);
-    }
-    db.turn(
-        "s1",
-        t,
-        &format!("{}, near the harbour.", hermes::HOME_QUOTE),
-        "Noted.",
-    );
-    // Synced at t+30 with a 3 s call 1: complete at t+33.
-    for (session, at) in [("s2", t + 31.0), ("s3", t + 40.0)] {
-        db.message(support::hermes::Message {
-            session,
-            role: "user",
-            content: "Tim lives in Auckland near the harbour?",
-            at,
-            ..Default::default()
-        });
-        db.message(support::hermes::Message {
-            session,
-            role: "assistant",
-            content: "Let me think.",
-            at: at + 1.0,
-            ..Default::default()
-        });
-    }
-    drop(db);
-    let corpus = dir.private_path("corpus/main.jsonl");
-    assert_ok(&support::import(&dir, &state_db, &corpus));
+    let t = start();
+    let corpus = import_history(&dir, |path| {
+        let db = StateDb::create(path);
+        db.owner_session("s1", t);
+        db.home_turn("s1", t);
+        // Synced at t+30 with a 3 s call 1: complete at t+33.
+        for (session, at) in [("s2", t + 31.0), ("s3", t + 40.0)] {
+            db.owner_session(session, at);
+            for (role, content, at) in [
+                ("user", "Tim lives in Auckland near the harbour?", at),
+                ("assistant", "Let me think.", at + 1.0),
+            ] {
+                db.message(hermes::Message {
+                    session,
+                    role,
+                    content,
+                    at,
+                    ..Default::default()
+                });
+            }
+        }
+        db
+    });
 
-    let probes = r#"
-[[probe]]
-id = "p001"
-at = "2026-01-05T09:00:31Z"
-kind = "absent"
-memory = "lives in Auckland"
-
-[[probe]]
-id = "p002"
-at = "2026-01-05T09:00:40Z"
-kind = "exists"
-memory = "lives in Auckland"
-"#;
+    let probes = probe("p001", "2026-01-05T09:00:31Z", "absent", HOME_MEMORY)
+        + &probe("p002", "2026-01-05T09:00:40Z", "exists", HOME_MEMORY);
     let script = support::delayed_script(&dir, 3000);
-    let run = replay_history(&dir, &corpus, "live", probes, "live", Some(&script), &[]);
+    let run = replay_history(&dir, &corpus, "live", &probes, Some(&script), &[]);
     let report = run.report();
     let tokens = |session: &str| -> u64 {
         report["injected_tokens"]["sessions"]
@@ -1961,10 +1121,10 @@ memory = "lives in Auckland"
         "the later prefetch sees the memory: {report}"
     );
     assert_eq!(tokens("s2"), 0, "the earlier prefetch can't: {report}");
-    let early = resolution_probe(&report, "p001");
+    let early = probe_in(&report, "p001");
     assert_eq!(early["passed"], false, "{early}");
     assert_eq!(early["observed"]["resolved"], false, "{early}");
-    let later = resolution_probe(&report, "p002");
+    let later = probe_in(&report, "p002");
     assert_eq!(later["passed"], true, "{later}");
     assert_eq!(
         run.output.status.code(),
@@ -1982,42 +1142,20 @@ fn re_recording_with_no_cache_starts_a_fresh_cassette() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
     let script = support::delayed_script(&dir, 300);
-    let first = replay_history(
-        &dir,
-        &corpus,
-        "live",
-        PASSING_PROBES,
-        "live-1",
-        Some(&script),
-        &[],
-    );
-    assert_ok(&first.output);
+    replay_history(&dir, &corpus, "live", PASSING_PROBES, Some(&script), &[]).ok();
     let recorded = cassette_records(&dir).len();
-    let mut last = None;
-    for n in 2..=3 {
-        let run = replay_history(
-            &dir,
-            &corpus,
-            "live",
-            PASSING_PROBES,
-            &format!("live-{n}"),
-            Some(&script),
-            &["--no-cache"],
-        );
-        assert_ok(&run.output);
-        last = Some(run.report());
+    let mut last = Value::Null;
+    for _ in 0..2 {
+        let flags = ["--no-cache"];
+        last = replay_history(&dir, &corpus, "live", PASSING_PROBES, Some(&script), &flags).ok();
     }
     assert_eq!(
         cassette_records(&dir).len(),
         recorded,
         "a re-recording replaces the cassette"
     );
-    let replay = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "replay", None, &[]);
-    assert_ok(&replay.output);
-    assert_eq!(
-        replay.report()["extraction_lag"],
-        last.unwrap()["extraction_lag"]
-    );
+    let replay = replay_history(&dir, &corpus, "replay", PASSING_PROBES, None, &[]).ok();
+    assert_eq!(replay["extraction_lag"], last["extraction_lag"]);
 }
 
 /// A chunk's latency comes from the records that answered it,
@@ -2029,16 +1167,7 @@ fn replay_lag_counts_only_the_records_that_answered() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
     let script = support::delayed_script(&dir, 300);
-    let live = replay_history(
-        &dir,
-        &corpus,
-        "live",
-        PASSING_PROBES,
-        "live",
-        Some(&script),
-        &[],
-    );
-    assert_ok(&live.output);
+    let live = replay_history(&dir, &corpus, "live", PASSING_PROBES, Some(&script), &[]).ok();
     let records = cassette_records(&dir);
     let mut mixed: Vec<Value> = records
         .iter()
@@ -2053,286 +1182,237 @@ fn replay_lag_counts_only_the_records_that_answered() {
     mixed.extend(records);
     write_cassette(&dir, &mixed);
 
-    let replay = replay_history(&dir, &corpus, "replay", PASSING_PROBES, "replay", None, &[]);
-    assert_ok(&replay.output);
-    assert_eq!(
-        replay.report()["extraction_lag"],
-        live.report()["extraction_lag"]
-    );
-}
-
-/// The manifest for the identity tests: `home` takes `kinds`.
-fn manifest_with_home_kinds(kinds: &str) -> String {
-    format!(
-        "{}\n[[model]]\nname = \"home\"\nquestion = \"{HOME_QUESTION}\"\nkinds = {kinds}\nmax_tokens = 100\n",
-        hermes::MANIFEST
-    )
+    let replay = replay_history(&dir, &corpus, "replay", PASSING_PROBES, None, &[]).ok();
+    assert_eq!(replay["extraction_lag"], live["extraction_lag"]);
 }
 
 const PASSPORT_QUOTE: &str = "I need to renew my passport";
+const LIBRARY_QUOTE: &str = "I work at the library";
 
-/// A history where a passport task (A) is remembered on day 0 and the home
-/// fact (B) on day 3, imported twice: `home` filtered to facts and tasks
-/// (`corpus/both.jsonl`), and to facts only (`corpus/facts.jsonl`), so A
-/// is out of its input. The chunks are the same in both.
-fn identity_corpora(dir: &TestDir) -> (std::path::PathBuf, std::path::PathBuf) {
+/// A history where a passport task (A) is remembered on day 0, the home
+/// fact (B) on day 3 and, with `library`, a library fact (C) on day 7,
+/// imported twice: `home` filtered to facts and tasks (`corpus/both.jsonl`),
+/// and to facts only (`corpus/facts.jsonl`), so A is out of its input. The
+/// chunks are the same in both.
+fn identity_corpora(dir: &TestDir, library: bool) -> (PathBuf, PathBuf) {
     let state_db = dir.private_path("state.db");
-    let db = StateDb::create(&state_db);
-    let t = epoch("2026-01-05T09:00:00Z");
-    db.session("s1", "discord", Some("discord:1"), None, t);
+    let db = hermes::one_session(&state_db);
+    let t = start();
     db.turn("s1", t, &format!("{PASSPORT_QUOTE} soon."), "Noted.");
-    db.turn(
-        "s1",
-        t + 3.0 * 86_400.0,
-        &format!("{}, near the harbour.", hermes::HOME_QUOTE),
-        "Noted.",
-    );
-    db.turn("s1", t + 5.0 * 86_400.0, "Anything else?", "No.");
-    drop(db);
-    let both = dir.private_path("corpus/both.jsonl");
-    let facts = dir.private_path("corpus/facts.jsonl");
-    for (corpus, kinds) in [(&both, r#"["fact", "task"]"#), (&facts, r#"["fact"]"#)] {
-        assert_ok(&support::import_with(
-            dir,
-            &state_db,
-            corpus,
-            &manifest_with_home_kinds(kinds),
-            &[],
-        ));
+    db.home_turn("s1", t + 3.0 * hermes::DAY);
+    if library {
+        let library = format!("{LIBRARY_QUOTE} now.");
+        db.turn("s1", t + 7.0 * hermes::DAY, &library, "Noted.");
+    } else {
+        db.turn("s1", t + 5.0 * hermes::DAY, "Anything else?", "No.");
     }
+    drop(db);
+    let corpora = [("both", r#"["fact", "task"]"#), ("facts", r#"["fact"]"#)].map(|(name, kinds)| {
+        let corpus = dir.private_path(&format!("corpus/{name}.jsonl"));
+        let manifest = format!(
+            "{}\n[[model]]\nname = \"home\"\nquestion = \"{}\"\nkinds = {kinds}\nmax_tokens = 100\n",
+            hermes::MANIFEST,
+            support::HOME_QUESTION
+        );
+        assert_ok(&support::import_with(dir, &state_db, &corpus, &manifest, &[]));
+        corpus
+    });
+    let [both, facts] = corpora;
     (both, facts)
 }
 
-/// The memories a refresh's write lists, `m1: ...` and so on, in the order
-/// it lists them.
-fn listed_memories(record: &Value) -> Vec<String> {
-    let user = record["request"]["user"].as_str().unwrap();
-    user.lines()
-        .filter(|line| {
-            line.strip_prefix('m')
-                .and_then(|rest| rest.split_once(": "))
-                .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-        })
-        .map(str::to_string)
-        .collect()
-}
-
-/// Records the identity history with every refresh adding an entry that
-/// cites `m1`, then keeps only `home`'s refresh recorded when the passport
-/// task was its one memory, so `m1` meant A. Checks the fixture: `home`'s
-/// later recorded refresh lists the home fact as `m1`, so a substitution
-/// by handle name would cite B.
-fn record_with_a_meaning_m1(dir: &TestDir, corpus: &std::path::Path) {
-    let script = support::script_answering_everything(
+/// A `live` run of the identity history on `both` with every refresh adding
+/// an entry that cites `m1`; returns the cassette and the ids of A, B and
+/// C (when there is one), resolved by probes.
+fn record_identities(dir: &TestDir, both: &Path, extra: &[&str]) -> (Vec<Value>, [Value; 3]) {
+    let script = script_answering_everything(
         dir,
         "identity-script",
         vec![
-            support::claim("Tim needs to renew his passport.", PASSPORT_QUOTE, "task"),
-            support::home_claim(),
+            claim("Tim needs to renew his passport.", PASSPORT_QUOTE, "task"),
+            home_claim(),
+            claim("Tim works at the library.", LIBRARY_QUOTE, "fact"),
         ],
-        vec![said("An entry citing m1.", &["m1"])],
+        vec![add_entry("An entry citing m1.", &["m1"])],
     );
-    let live = replay_history(dir, corpus, "live", "", "live", Some(&script), &[]);
-    assert_ok(&live.output);
-    let records = cassette_records(dir);
-    let homes: Vec<&Value> = records.iter().filter(|r| is_home_refresh(r)).collect();
-    let only_a = homes
-        .iter()
-        .find(|record| {
-            let listed = listed_memories(record);
-            listed.len() == 1 && listed[0].contains("passport")
+    let probes: String = [
+        ("a", 5, "renew his passport"),
+        ("b", 8, "lives in Auckland"),
+        ("c", 12, "works at the library"),
+    ]
+    .map(|(id, day, memory)| probe_on(id, day, "exists", &format!("memory = \"{memory}\"")))
+    .concat();
+    let report = replay_history(dir, both, "live", &probes, Some(&script), extra).report();
+    let ids = ["a", "b", "c"].map(|probe| observed_id(&report, probe));
+    assert!(ids[0].is_string() && ids[1].is_string(), "{report}");
+    (cassette_records(dir), ids)
+}
+
+/// The handles a refresh record's request used, each with the memory or
+/// entry it stood for, memories first, in handle order.
+fn identities(record: &Value) -> Vec<(String, Value)> {
+    let mut pairs: Vec<(String, Value)> = record["identities"]
+        .as_array()
+        .map(|pairs| {
+            pairs
+                .iter()
+                .map(|pair| (pair[0].as_str().unwrap().to_string(), pair[1].clone()))
+                .collect()
         })
-        .expect("home refreshed when the passport task was its one memory");
+        .unwrap_or_default();
+    pairs.sort_by(|a, b| {
+        b.0.starts_with('m')
+            .cmp(&a.0.starts_with('m'))
+            .then(a.0.cmp(&b.0))
+    });
+    pairs
+}
+
+/// Whether `record` is a refresh of `home`: the only model that takes
+/// tasks, so the only one shown the passport task `a`.
+fn is_home_refresh(record: &Value, a: &Value) -> bool {
+    is_refresh(record) && identities(record).iter().any(|(_, id)| id == a)
+}
+
+/// A substituted refresh carries its operations over by what each handle
+/// stood for when recorded, not by the handle's name now: on `both` the
+/// entry recorded citing `m1` cites the passport task it meant, and on
+/// `facts`, where the passport task isn't in `home`'s input, the operation
+/// is dropped even though `m1` names the home fact there.
+///
+/// The cassette keeps only `home`'s refresh recorded when the passport
+/// task was its one memory, so `m1` meant A. `home`'s later recorded
+/// refresh had the home fact as `m1`, so a substitution by handle name
+/// would cite B.
+#[test]
+fn a_substituted_refresh_cites_the_memory_it_was_recorded_with_or_none() {
+    let dir = TestDir::new();
+    let (both, facts) = identity_corpora(&dir, false);
+    let (records, [a, b, _]) = record_identities(&dir, &both, &[]);
+    let only_a = records
+        .iter()
+        .find(|record| identities(record) == [("m1".to_string(), a.clone())])
+        .expect("home refreshed when the passport task was its one memory")
+        .clone();
     assert!(
-        homes.iter().any(|record| {
-            let listed = listed_memories(record);
-            listed.len() == 2 && listed[0].starts_with("m1: ") && listed[0].contains("Auckland")
-        }),
-        "fixture: with both memories, home lists the home fact as m1: {:#?}",
-        homes.iter().map(|r| listed_memories(r)).collect::<Vec<_>>()
+        records.iter().any(|record| is_home_refresh(record, &a)
+            && identities(record)[0] == ("m1".into(), b.clone())),
+        "fixture: with both memories, home's m1 is the home fact"
     );
     let kept: Vec<Value> = records
-        .iter()
-        .filter(|record| !is_home_refresh(record) || record == only_a)
-        .cloned()
+        .into_iter()
+        .filter(|record| !is_home_refresh(record, &a) || *record == only_a)
         .collect();
-    write_cassette(dir, &kept);
-}
+    write_cassette(&dir, &kept);
 
-/// A substituted refresh cites the memory
-/// it cited when recorded, not whichever memory holds its handle now.
-#[test]
-fn a_substituted_refresh_cites_the_memory_it_was_recorded_with() {
-    let dir = TestDir::new();
-    let (both, _) = identity_corpora(&dir);
-    record_with_a_meaning_m1(&dir, &both);
-    let probes = r#"
-[[probe]]
-id = "p001"
-at = "2026-01-09T12:00:00Z"
-kind = "profile_has"
-model = "home"
-memory = "renew his passport"
-
-[[probe]]
-id = "p002"
-at = "2026-01-09T12:00:00Z"
-kind = "profile_lacks"
-model = "home"
-memory = "lives in Auckland"
-"#;
-    let run = replay_history(
-        &dir,
-        &both,
-        "fast",
-        probes,
-        "fast",
-        None,
-        &["--refresh", "recorded"],
+    let lacks_b = probe_on("p001", 9, "profile_lacks", HOME_IN_HOME);
+    let has_a = probe_on(
+        "p002",
+        9,
+        "profile_has",
+        "model = \"home\"\nmemory = \"renew his passport\"",
     );
-    assert_probes_pass(&run);
+    recorded_refreshes(&dir, &both, &format!("{lacks_b}{has_a}"), &[]);
+    recorded_refreshes(&dir, &facts, &lacks_b, &[]);
 }
 
-/// When the memory a substituted refresh cited isn't in the
-/// current input, the sentence is dropped, even though its handle names
-/// another memory now.
-#[test]
-fn a_substituted_refresh_citing_an_absent_memory_is_dropped() {
-    let dir = TestDir::new();
-    let (both, facts) = identity_corpora(&dir);
-    record_with_a_meaning_m1(&dir, &both);
-    let probes = r#"
-[[probe]]
-id = "p001"
-at = "2026-01-09T12:00:00Z"
-kind = "profile_lacks"
-model = "home"
-memory = "lives in Auckland"
-"#;
-    let run = replay_history(
-        &dir,
-        &facts,
-        "fast",
-        probes,
-        "fast",
-        None,
-        &["--refresh", "recorded"],
-    );
-    assert_probes_pass(&run);
-}
-
-/// Nearest-refresh substitution only considers records of the
-/// run's own LLM model. A record under another model at the very time of
-/// the refresh loses to the run's own model's record 200 days off.
+/// Nearest-refresh substitution only considers records of the run's own
+/// LLM model. A record under another model at the very time of each
+/// refresh loses to the run's own model's record 200 days off.
 #[test]
 fn a_refresh_recorded_under_another_model_is_never_substituted() {
     let dir = TestDir::new();
     let corpus = imported_with_a_model(&dir);
     record_with_models(&dir, &corpus);
-    let records = cassette_records(&dir);
-    let first = records
-        .iter()
-        .find(|record| is_home_refresh(record))
-        .expect("the recording refreshed home")
-        .clone();
-    let at: jiff::Timestamp = first["at"].as_str().unwrap().parse().unwrap();
-    let mut other = first.clone();
-    other["model"] = Value::from("other-model");
-    other["key"] = Value::from(format!("{}-other", first["key"].as_str().unwrap()));
-    other["response"]["json"] = write_reply(vec![said("Tim lives in Auckland.", &["m1"])]);
-    let mut far = first.clone();
-    far["at"] = Value::from((at + jiff::SignedDuration::from_hours(24 * 200)).to_string());
-    far["key"] = Value::from(format!("{}-far", first["key"].as_str().unwrap()));
-    far["response"]["json"] = write_reply(vec![]);
-    // The other model's record goes first, so the run's model, which
+    let (refreshes, others): (Vec<Value>, Vec<Value>) =
+        cassette_records(&dir).into_iter().partition(is_refresh);
+    let adds = [add_entry("Tim lives in Auckland.", &["m1"])];
+    // The other model's records go first, so the run's model, which
     // `replay` and `fast` take from the last record, stays the original.
-    let mut kept = vec![other];
-    kept.extend(
-        records
-            .into_iter()
-            .filter(|record| !is_home_refresh(record)),
-    );
-    kept.push(far);
-    write_cassette(&dir, &kept);
-
-    let run = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        HOME_LACKS_HOME,
-        "fast",
-        None,
-        &["--refresh", "recorded"],
-    );
-    assert_probes_pass(&run);
-}
-
-// A substituted write is carried over sentence by sentence: one citing a
-// memory absent from this run is dropped, and the rest of its section is
-// kept.
-
-/// Records the identity history on `both` with every write answering two
-/// sentences in one section, one citing `m1` and one `m2`, then keeps only
-/// `home`'s write recorded when it listed the home fact as `m1` and the
-/// passport task as `m2`.
-fn record_with_two_sentences(dir: &TestDir, both: &std::path::Path) {
-    let script = support::script_answering_everything(
-        dir,
-        "two-sentence-script",
-        vec![
-            support::claim("Tim needs to renew his passport.", PASSPORT_QUOTE, "task"),
-            support::home_claim(),
-        ],
-        vec![
-            said("Tim lives in Auckland.", &["m1"]),
-            said("Tim has a passport to renew.", &["m2"]),
-        ],
-    );
-    let live = replay_history(dir, both, "live", "", "live", Some(&script), &[]);
-    assert_ok(&live.output);
-    let records = cassette_records(dir);
-    let both_listed = records
+    let mut kept: Vec<Value> = refreshes
         .iter()
-        .find(|record| {
-            let listed = listed_memories(record);
-            is_home_refresh(record)
-                && listed.len() == 2
-                && listed[0].starts_with("m1: ")
-                && listed[0].contains("Auckland")
-                && listed[1].contains("passport")
+        .map(|record| {
+            let mut other = refresh_copy(record, 0, &adds, "other");
+            other["model"] = Value::from("other-model");
+            other
         })
-        .expect("home refreshed listing the home fact as m1 and the passport as m2")
-        .clone();
-    let kept: Vec<Value> = records
-        .into_iter()
-        .filter(|record| !is_home_refresh(record) || *record == both_listed)
         .collect();
-    write_cassette(dir, &kept);
+    kept.extend(others);
+    kept.extend(refreshes.iter().map(|r| refresh_copy(r, 200, &[], "far")));
+    write_cassette(&dir, &kept);
+    recorded_refreshes(&dir, &corpus, &home_lacks_home(), &[]);
 }
 
+/// A substituted refresh's edit whose recorded entry is absent from this
+/// run is dropped, even though its handle names another entry now.
+///
+/// The identity history with the library fact is recorded on `both`,
+/// where `home`'s refresh after the home fact sees entry A (citing the
+/// passport) as `e1`. The cassette is rewritten so `home` has two
+/// refreshes, both copies of that one and so both recorded with `e1`
+/// meaning A and `m1` the home fact: R_add at its own time, adding an
+/// entry citing `m1`, and R_target at the time of the refresh after the
+/// library fact, answering `target`.
+///
+/// On `facts`, R_add makes entry B citing the home fact, `home`'s only
+/// entry and so `e1`, and R_target then reaches a run where its `e1`
+/// meant A, which never exists, while `e1` names B. B stays in `home`
+/// the day after the library fact, and its text is unchanged.
 #[test]
-fn a_substituted_sentence_citing_an_absent_memory_is_dropped_and_its_section_kept() {
-    // On `facts` the passport task never exists, so the sentence citing it
-    // goes, while the one citing the home fact is written.
-    let dir = TestDir::new();
-    let (both, facts) = identity_corpora(&dir);
-    record_with_two_sentences(&dir, &both);
-    let probes = r#"
-[[probe]]
-id = "p001"
-at = "2026-01-09T12:00:00Z"
-kind = "profile_has"
-model = "home"
-memory = "lives in Auckland"
-"#;
-    let run = replay_history(
-        &dir,
-        &facts,
-        "fast",
-        probes,
-        "fast",
-        None,
-        &["--refresh", "recorded"],
+fn a_substituted_edit_whose_entry_is_absent_is_dropped() {
+    let until = ["--until", "2026-01-14T09:00:00Z"];
+    let substituted = |target: Vec<Value>| {
+        let dir = TestDir::new();
+        let (both, facts) = identity_corpora(&dir, true);
+        let (records, [a, b, c]) = record_identities(&dir, &both, &until);
+        let homes: Vec<&Value> = records
+            .iter()
+            .filter(|record| is_home_refresh(record, &a))
+            .collect();
+        let after_home = homes
+            .iter()
+            .find(|record| {
+                let handles = identities(record);
+                handles.len() == 3
+                    && handles[..2] == [("m1".into(), b.clone()), ("m2".into(), a.clone())]
+            })
+            .expect("home refreshed with the home fact as m1, the passport and one entry");
+        assert_eq!(
+            identities(after_home)[2].0,
+            "e1",
+            "fixture: the record keeps what e1 meant"
+        );
+        let after_library = homes
+            .iter()
+            .find(|record| identities(record).iter().any(|(_, id)| *id == c))
+            .expect("home refreshed after the library fact");
+
+        let adds = [add_entry("Tim lives in Auckland.", &["m1"])];
+        let r_add = refresh_copy(after_home, 0, &adds, "add");
+        let mut r_target = refresh_copy(after_home, 0, &target, "target");
+        r_target["at"] = after_library["at"].clone();
+        let mut kept: Vec<Value> = records
+            .iter()
+            .filter(|record| !is_home_refresh(record, &a))
+            .cloned()
+            .collect();
+        kept.extend([r_target, r_add]);
+        write_cassette(&dir, &kept);
+
+        let b_remains = probe_on("p001", 13, "profile_has", HOME_IN_HOME);
+        recorded_refreshes(&dir, &facts, &b_remains, &until)["profile_tokens"].clone()
+    };
+
+    let control = substituted(vec![]);
+    assert!(
+        control["p95"].as_u64().is_some_and(|tokens| tokens > 0),
+        "fixture: B renders: {control}"
     );
-    assert_probes_pass(&run);
+    let edited = substituted(vec![json!({
+        "op": "edit",
+        "entry": "e1",
+        "text": "Tim lives in Auckland, in a tall blue house above the harbour with a view over the whole city and the gulf.",
+        "cites": ["m1"],
+    })]);
+    assert_eq!(edited, control, "B's text is unchanged");
 }

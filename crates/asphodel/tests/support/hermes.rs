@@ -255,11 +255,100 @@ impl StateDb {
             ..Message::default()
         });
     }
+
+    /// A session of the owner's on Discord.
+    pub fn owner_session(&self, id: &str, at: f64) {
+        self.session(id, "discord", Some("discord:1"), None, at);
+    }
+
+    /// The turn that says [`HOME_QUOTE`].
+    pub fn home_turn(&self, session: &str, at: f64) {
+        self.turn(
+            session,
+            at,
+            &format!("{HOME_QUOTE}, near the harbour."),
+            "Noted.",
+        );
+    }
+
+    /// A turn whose assistant calls a tool before it answers: the
+    /// intermediate text and the tool's result are rows of their own.
+    pub fn tool_call_turn(&self, session: &str, t: f64) {
+        let calls =
+            r#"[{"id":"c1","type":"function","function":{"name":"calendar","arguments":"{}"}}]"#;
+        let rows = [
+            ("user", "What's on my calendar tomorrow?", 0.0, None),
+            ("assistant", "INTERMEDIATE-ASSISTANT-TEXT", 5.0, Some(calls)),
+            ("tool", "TOOL-RESULT-TEXT", 6.0, None),
+            ("assistant", "A dentist appointment at ten.", 20.0, None),
+        ];
+        for (role, content, offset, tool_calls) in rows {
+            let at = t + offset;
+            self.message(Message {
+                session,
+                role,
+                content,
+                at,
+                tool_calls,
+                ..Message::default()
+            });
+        }
+    }
+
+    /// The shape a compaction that carries a verbatim tail leaves, in row
+    /// id order: the turn before the tail archived (`active=0,
+    /// compacted=1`), the tail's originals rewound (`active=0,
+    /// compacted=0`), then the summary and the tail's clones as fresh
+    /// active rows at the tail's times.
+    pub fn carried_tail_compaction(&self, session: &str, t: f64) {
+        let rows = [
+            ("user", "Archived question.", 0.0, false, true, false),
+            ("assistant", "Archived answer.", 30.0, false, true, false),
+            ("user", "Carried question.", 600.0, false, false, false),
+            ("assistant", "Carried answer.", 630.0, false, false, false),
+            (
+                "user",
+                "HERMES-COMPACTION-SUMMARY",
+                1200.0,
+                true,
+                false,
+                true,
+            ),
+            ("user", "Carried question.", 600.0, true, false, false),
+            ("assistant", "Carried answer.", 630.0, true, false, false),
+        ];
+        for (role, content, offset, active, compacted, summary) in rows {
+            self.message(Message {
+                session,
+                role,
+                content,
+                at: t + offset,
+                active,
+                compacted,
+                summary,
+                ..Message::default()
+            });
+        }
+    }
 }
 
 /// Epoch seconds of an RFC 3339 instant.
 pub fn epoch(at: &str) -> f64 {
     at.parse::<jiff::Timestamp>().unwrap().as_second() as f64
+}
+
+/// When the synthetic histories start.
+pub fn start() -> f64 {
+    epoch("2026-01-05T09:00:00Z")
+}
+
+pub const DAY: f64 = 24.0 * 60.0 * 60.0;
+
+/// A fresh `state.db` with one owner session, `s1`, from [`start`].
+pub fn one_session(path: &Path) -> StateDb {
+    let db = StateDb::create(path);
+    db.owner_session("s1", start());
+    db
 }
 
 /// The manifest every test imports with: Tim owns the
@@ -285,65 +374,46 @@ pub const HOME_QUOTE: &str = "I live in Auckland";
 pub const HOME_SENTENCE: &str = "Tim lives in Auckland.";
 
 /// A small history over a week: a primary session with the home turn and a
-/// few more, a session compacted in place, a cron session and a subagent
-/// session.
+/// few more, a cron session and a subagent session.
 pub fn small_history(path: &Path) -> StateDb {
     let db = StateDb::create(path);
-    let day = 24.0 * 60.0 * 60.0;
-    let start = epoch("2026-01-05T09:00:00Z");
-
-    db.session("s-main", "discord", Some("discord:1"), None, start);
+    let start = start();
+    db.owner_session("s-main", start);
+    db.home_turn("s-main", start);
     db.turn(
         "s-main",
-        start,
-        &format!("{HOME_QUOTE}, near the harbour."),
-        "Noted.",
-    );
-    db.turn(
-        "s-main",
-        start + day,
+        start + DAY,
         "What should I cook tonight?",
         "Try a curry.",
     );
     db.turn(
         "s-main",
-        start + 2.0 * day,
+        start + 2.0 * DAY,
         "Remind me what the weather does in winter.",
         "It gets wet and windy.",
     );
 
-    db.session("s-cron", "cron", None, None, start + 3.0 * day);
+    db.session("s-cron", "cron", None, None, start + 3.0 * DAY);
     db.turn(
         "s-cron",
-        start + 3.0 * day,
+        start + 3.0 * DAY,
         "Daily digest of upcoming things.",
         "Nothing new today.",
     );
 
-    db.session(
-        "s-sub",
-        "discord",
-        Some("discord:1"),
-        Some("s-main"),
-        start + 4.0 * day,
-    );
+    let sub = start + 4.0 * DAY;
+    db.session("s-sub", "discord", Some("discord:1"), Some("s-main"), sub);
     db.turn(
         "s-sub",
-        start + 4.0 * day,
+        sub,
         "Subagent task: summarise the cooking notes.",
         "Done.",
     );
 
-    db.session(
-        "s-later",
-        "discord",
-        Some("discord:1"),
-        None,
-        start + 5.0 * day,
-    );
+    db.owner_session("s-later", start + 5.0 * DAY);
     db.turn(
         "s-later",
-        start + 5.0 * day,
+        start + 5.0 * DAY,
         "Any plans for the weekend?",
         "A walk, maybe.",
     );
@@ -357,73 +427,9 @@ pub fn small_history(path: &Path) -> StateDb {
 /// it into `plugin/tests/fixtures/`.
 pub fn backfill_history(path: &Path) -> StateDb {
     let db = small_history(path);
-    let day = 24.0 * 60.0 * 60.0;
-    let start = epoch("2026-01-05T09:00:00Z");
-
-    // The shape a compaction that carries a verbatim tail leaves: the turn
-    // before the tail archived, the tail's originals rewound, then the
-    // summary and the tail's clones as fresh rows at the tail's times.
-    let t = start + 6.0 * day;
-    db.session("s-compacted", "discord", Some("discord:1"), None, t);
-    let row = |role, content, at, active, compacted, summary| Message {
-        session: "s-compacted",
-        role,
-        content,
-        at,
-        active,
-        compacted,
-        summary,
-        ..Message::default()
-    };
-    db.message(row("user", "Archived question.", t, false, true, false));
-    db.message(row(
-        "assistant",
-        "Archived answer.",
-        t + 30.0,
-        false,
-        true,
-        false,
-    ));
-    db.message(row(
-        "user",
-        "Carried question.",
-        t + 600.0,
-        false,
-        false,
-        false,
-    ));
-    db.message(row(
-        "assistant",
-        "Carried answer.",
-        t + 630.0,
-        false,
-        false,
-        false,
-    ));
-    db.message(row(
-        "user",
-        "HERMES-COMPACTION-SUMMARY",
-        t + 1200.0,
-        true,
-        false,
-        true,
-    ));
-    db.message(row(
-        "user",
-        "Carried question.",
-        t + 600.0,
-        true,
-        false,
-        false,
-    ));
-    db.message(row(
-        "assistant",
-        "Carried answer.",
-        t + 630.0,
-        true,
-        false,
-        false,
-    ));
+    let t = start() + 6.0 * DAY;
+    db.owner_session("s-compacted", t);
+    db.carried_tail_compaction("s-compacted", t);
     db.turn(
         "s-compacted",
         t + 1800.0,
@@ -431,38 +437,9 @@ pub fn backfill_history(path: &Path) -> StateDb {
         "Still here.",
     );
 
-    let t = start + 7.0 * day;
-    db.session("s-mixed", "discord", Some("discord:1"), None, t);
-    db.message(Message {
-        session: "s-mixed",
-        content: "What's on my calendar tomorrow?",
-        at: t,
-        ..Message::default()
-    });
-    db.message(Message {
-        session: "s-mixed",
-        role: "assistant",
-        content: "INTERMEDIATE-ASSISTANT-TEXT",
-        at: t + 5.0,
-        tool_calls: Some(
-            r#"[{"id":"c1","type":"function","function":{"name":"calendar","arguments":"{}"}}]"#,
-        ),
-        ..Message::default()
-    });
-    db.message(Message {
-        session: "s-mixed",
-        role: "tool",
-        content: "TOOL-RESULT-TEXT",
-        at: t + 6.0,
-        ..Message::default()
-    });
-    db.message(Message {
-        session: "s-mixed",
-        role: "assistant",
-        content: "A dentist appointment at ten.",
-        at: t + 20.0,
-        ..Message::default()
-    });
+    let t = start() + 7.0 * DAY;
+    db.owner_session("s-mixed", t);
+    db.tool_call_turn("s-mixed", t);
     db.turn(
         "s-mixed",
         t + 600.0,

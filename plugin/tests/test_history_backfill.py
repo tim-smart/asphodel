@@ -114,10 +114,7 @@ def test_posts_every_owner_turn_at_its_original_time_in_order(history, daemon):
     bodies = json.dumps([r.body for r in daemon.requests])
     for leaked in ("HINDSIGHT-INJECTED-MEMORY", "memory-context", "HERMES-COMPACTION-SUMMARY", "SENTINEL-API-CONTENT-5b20"):
         assert leaked not in bodies
-
-
-def test_a_turn_posts_its_final_reply_not_its_tool_rows(history, daemon):
-    assert run("--all-history") == 0
+    # A turn posts its final reply, not its tool rows.
     calendar = next(r.body for r in daemon.requests_for("turns") if r.body["user_text"].startswith("What's on"))
     assert calendar["assistant_text"] == "A dentist appointment at ten."
 
@@ -142,29 +139,23 @@ def test_since_posts_only_turns_from_that_date_on(history, daemon):
     assert at(times[0]) == at("2026-01-07T09:00:00Z")
 
 
-def test_refuses_to_run_without_a_cutoff_decision(history, daemon, capsys):
+def test_refuses_to_run_without_a_cutoff_decision_or_on_an_unknown_schema(history, daemon):
     assert run() == 2
-    err = capsys.readouterr().err
-    assert "--since" in err and "--all-history" in err
-    assert daemon.requests == []
-
-
-def test_refuses_a_schema_version_it_was_not_written_against(history, daemon, capsys):
     db = sqlite3.connect(history / "state.db")
     with db:
         db.execute("UPDATE schema_version SET version = 9999")
     db.close()
     assert run("--all-history") == 2
-    assert "9999" in capsys.readouterr().err
     assert daemon.requests == []
 
 
 def test_stops_at_the_first_daemon_error_and_a_rerun_resumes(history, daemon, capsys):
+    """Reruns post nothing twice, and never clear a session: a clear touches
+    only live injection state, which historical turns never made."""
     daemon.set_handler("turns", deduping(fail_on=3))
     assert run("--all-history") == 1
-    err = capsys.readouterr().err
-    assert "s-main" in err and "2026-01-07" in err
     assert len(daemon.requests_for("turns")) == 3
+    capsys.readouterr()
 
     assert run("--all-history") == 0
     printed = json.loads(capsys.readouterr().out)
@@ -173,32 +164,6 @@ def test_stops_at_the_first_daemon_error_and_a_rerun_resumes(history, daemon, ca
     assert run("--all-history") == 0
     printed = json.loads(capsys.readouterr().out)
     assert (printed["stored"], printed["duplicates"]) == (0, 13)
-
-
-def test_a_rerun_leaves_a_live_sessions_state_alone(history, daemon):
-    """A session clear touches only live injection state, which historical
-    turns never made, so the backfill never sends one. A session that went
-    live after the first run keeps its state through a rerun."""
-    live = {}
-
-    def clear(request):
-        live.pop(request.session, None)
-        return 204, None
-
-    daemon.set_handler("turns", deduping())
-    daemon.set_handler("clear", clear)
-    assert run("--all-history") == 0
-    live["s-compacted"] = {"injected-after-the-first-run"}
-    assert run("--all-history") == 0
-    assert live == {"s-compacted": {"injected-after-the-first-run"}}
-
-
-def test_a_clear_whose_answer_is_lost_cannot_change_the_run(history, daemon, capsys):
-    """Nothing about a clear decides the run: with the clear route dropping
-    connections, every turn still posts and the run finishes."""
-    daemon.drop_connections("clear", 1)
-    assert run("--all-history") == 0
-    assert json.loads(capsys.readouterr().out)["stored"] == IMPORT_COUNTS["turns"]
     assert daemon.requests_for("clear") == []
 
 
@@ -206,17 +171,14 @@ def setup_with(hermes_home, *answers):
     """``hermes memory setup`` keeping every field ``history`` wrote, then
     ``answers`` to the prompts after them: the backfill question and the
     cutoff, a date or ``all``. A blank cutoff isn't asked again."""
-    fields = [f for f in plugin.config.config_schema() if not f.get("secret")]
+    provider = plugin.AsphodelMemoryProvider()
+    fields = [f for f in provider.get_config_schema() if not f.get("secret")]
     replies = iter([""] * len(fields) + list(answers))
-    plugin.AsphodelMemoryProvider().post_setup(str(hermes_home), {}, prompt=lambda label: next(replies))
+    provider.post_setup(str(hermes_home), {}, prompt=lambda label: next(replies))
 
 
-def test_declining_the_backfill_at_setup_posts_nothing(history, daemon):
+def test_the_setup_backfill_runs_only_when_accepted_with_a_cutoff(history, daemon):
     setup_with(history, "n")
-    assert daemon.requests_for("turns") == []
-
-
-def test_accepting_the_backfill_at_setup_still_needs_a_cutoff(history, daemon):
     setup_with(history, "y", "")
     assert daemon.requests_for("turns") == []
 

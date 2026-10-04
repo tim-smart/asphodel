@@ -9,11 +9,12 @@ mod support;
 use std::fs;
 
 use support::{
-    TestDir, asphodel, assert_ok, assert_refused, imported_small_history, record, stderr,
+    TestDir, asphodel, assert_ok, assert_refused, imported_small_history, read_json, record, stderr,
 };
 
-/// The bench never touches the store it copies, and reports latency
-/// percentiles and the reranked fraction for each concurrency level.
+/// The bench never touches the store it copies, takes an explicit config
+/// without one in the environment, and reports latency percentiles and the
+/// reranked fraction for each concurrency level.
 #[test]
 fn bench_runs_on_a_copy_of_the_replayed_store() {
     let dir = TestDir::new();
@@ -23,11 +24,14 @@ fn bench_runs_on_a_copy_of_the_replayed_store() {
     let before = fs::read(&db).expect("the live run left a replayed store");
     let modified = fs::metadata(&db).unwrap().modified().unwrap();
 
+    let config = dir.private_file("bench.toml", "[purge]\ndelta = \"never\"\n");
     let report = dir.private_path("reports/bench.json");
     let output = asphodel(&dir)
         .arg("bench")
         .arg("--corpus")
         .arg(&corpus)
+        .arg("--config")
+        .arg(&config)
         .args(["--concurrency", "1", "--concurrency", "4"])
         .args(["--requests", "8"])
         .args(["--listen", "127.0.0.1:0"])
@@ -40,96 +44,56 @@ fn bench_runs_on_a_copy_of_the_replayed_store() {
     assert!(fs::read(&db).unwrap() == before, "bench changed the store");
     assert_eq!(fs::metadata(&db).unwrap().modified().unwrap(), modified);
 
-    let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(&report).expect("bench writes its report")).unwrap();
+    let report = read_json(&report);
     let levels = report["levels"]
         .as_array()
         .unwrap_or_else(|| panic!("one entry per concurrency level: {report}"));
-    let concurrency: Vec<u64> = levels
-        .iter()
-        .map(|level| level["concurrency"].as_u64().unwrap())
-        .collect();
+    let concurrency: Vec<&serde_json::Value> =
+        levels.iter().map(|level| &level["concurrency"]).collect();
     assert_eq!(concurrency, [1, 4]);
     for level in levels {
         for field in ["p50_ms", "p95_ms", "p99_ms"] {
             assert!(level[field].is_number(), "{field}: {level}");
         }
-        let reranked = level["reranked_fraction"]
-            .as_f64()
-            .unwrap_or_else(|| panic!("the reranked fraction: {level}"));
+        let reranked = level["reranked_fraction"].as_f64().expect("a fraction");
         assert!((0.0..=1.0).contains(&reranked), "{level}");
     }
 }
 
-/// The bench daemon listens on loopback only. The
-/// address is checked before anything else, so no store is needed.
+/// The bench daemon listens on loopback only, checked before anything
+/// else; it runs only on a copy of a store replay made, never creating
+/// one; and a daemon that fails to open the copy after binding is reported
+/// as a refusal rather than left waiting for health.
 #[test]
-fn bench_refuses_a_listen_address_off_loopback() {
+fn bench_refuses_what_it_cant_run_on() {
     let dir = TestDir::new();
     let output = asphodel(&dir)
-        .arg("bench")
-        .args(["--listen", "0.0.0.0:0"])
-        .output()
-        .unwrap();
-    assert_refused(&output, "loopback");
-}
+        .args(["bench", "--listen", "0.0.0.0:0"])
+        .output();
+    assert_refused(&output.unwrap(), "loopback");
 
-/// The bench runs only on a copy of a store replay made, never on any
-/// other.
-#[test]
-fn bench_refuses_a_private_dir_without_a_replayed_store() {
-    let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
-    let output = asphodel(&dir)
-        .arg("bench")
-        .arg("--corpus")
-        .arg(&corpus)
-        .output()
-        .unwrap();
+    let bench = || {
+        asphodel(&dir)
+            .arg("bench")
+            .arg("--corpus")
+            .arg(&corpus)
+            .args(["--requests", "1", "--concurrency", "1"])
+            .output()
+            .unwrap()
+    };
+    let output = bench();
     assert_refused(&output, "store");
     assert!(
         !dir.private().join("store").exists(),
         "bench created a store: {}",
         stderr(&output)
     );
-}
 
-#[test]
-fn bench_accepts_explicit_config_without_environment_config() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
     record(&dir, &corpus);
-    let config = dir.private_file("bench.toml", "[purge]\ndelta = \"never\"\n");
-    let output = asphodel(&dir)
-        .arg("bench")
-        .arg("--corpus")
-        .arg(&corpus)
-        .arg("--config")
-        .arg(&config)
-        .args(["--requests", "1", "--concurrency", "1"])
-        .output()
-        .unwrap();
-    assert_ok(&output);
-}
-
-#[test]
-fn bench_reports_the_daemon_error_after_binding() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
-    record(&dir, &corpus);
-    // The replay marker is still present, but opening the copied store must
-    // fail after serve has bound its listener, before health becomes ready.
-    fs::write(
-        dir.private().join("store/asphodel.db"),
-        b"not a SQLite database",
-    )
-    .unwrap();
-    let output = asphodel(&dir)
-        .arg("bench")
-        .arg("--corpus")
-        .arg(&corpus)
-        .args(["--requests", "1", "--concurrency", "1"])
-        .output()
-        .unwrap();
-    assert_refused(&output, "file is not a database");
+    // The replay marker is still present, but the copied store isn't a
+    // database.
+    dir.private_file("store/asphodel.db", "not a SQLite database");
+    let output = bench();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
 }

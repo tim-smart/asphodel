@@ -32,6 +32,13 @@ impl TestDir {
         self.0.join(name)
     }
 
+    /// A file outside the private directory.
+    pub fn file(&self, name: &str, text: &str) -> PathBuf {
+        let path = self.path(name);
+        fs::write(&path, text).unwrap();
+        path
+    }
+
     /// The private directory (`ASPHODEL_REPLAY_DIR`).
     pub fn private(&self) -> PathBuf {
         let path = self.path("private");
@@ -51,6 +58,11 @@ impl TestDir {
         let path = self.private_path(name);
         fs::write(&path, text).unwrap();
         path
+    }
+
+    /// `value` as pretty JSON in a file under the private directory.
+    pub fn private_json(&self, name: &str, value: &Value) -> PathBuf {
+        self.private_file(name, &serde_json::to_string_pretty(value).unwrap())
     }
 }
 
@@ -103,6 +115,17 @@ pub fn assert_refused(output: &Output, word: &str) {
     );
 }
 
+/// Exit 2, `sentinel` in neither stream, and `words` in stderr.
+pub fn assert_refused_without(output: &Output, sentinel: &str, words: &[&str]) {
+    let (out, err) = (stdout(output), stderr(output));
+    assert_eq!(output.status.code(), Some(2), "stderr: {err}");
+    assert!(!out.contains(sentinel), "stdout echoes the input: {out}");
+    assert!(!err.contains(sentinel), "stderr echoes the input: {err}");
+    for word in words {
+        assert!(err.contains(word), "stderr should name {word:?}: {err}");
+    }
+}
+
 /// `asphodel import` of `state_db` with the test manifest, the corpus to
 /// `out` under the private dir.
 pub fn import(dir: &TestDir, state_db: &Path, out: &Path) -> Output {
@@ -119,6 +142,18 @@ pub fn import_with(
     extra: &[&str],
 ) -> Output {
     let manifest = dir.private_file("manifest.toml", manifest);
+    import_paths(dir, state_db, &manifest, out, extra)
+}
+
+/// `asphodel import` with the given manifest and `state.db` paths, as
+/// they are.
+pub fn import_paths(
+    dir: &TestDir,
+    state_db: &Path,
+    manifest: &Path,
+    out: &Path,
+    extra: &[&str],
+) -> Output {
     asphodel(dir)
         .arg("import")
         .arg("--state-db")
@@ -132,46 +167,43 @@ pub fn import_with(
         .unwrap()
 }
 
-/// The private dir holding [`hermes::small_history`] imported to
+/// The history `build` writes to a fresh private `state.db`, imported to
 /// `corpus/main.jsonl`; returns the corpus path.
-pub fn imported_small_history(dir: &TestDir) -> PathBuf {
+pub fn import_history(dir: &TestDir, build: impl FnOnce(&Path) -> hermes::StateDb) -> PathBuf {
     let state_db = dir.private_path("state.db");
-    hermes::small_history(&state_db);
+    drop(build(&state_db));
     let corpus = dir.private_path("corpus/main.jsonl");
     assert_ok(&import(dir, &state_db, &corpus));
     corpus
 }
 
-/// A script for the live stand-in (`ASPHODEL_LLM_SCRIPT`): every call 1
-/// reply claims [`hermes::HOME_SENTENCE`] quoting [`hermes::HOME_QUOTE`],
-/// so the claim survives only in the turn that says it and the rest of the
-/// history extracts nothing, and no call 2 or refresh is ever needed.
-pub fn live_script(dir: &TestDir) -> PathBuf {
-    let reply = json!({
-        "claims": [{
-            "content": hermes::HOME_SENTENCE,
-            "kind": "fact",
-            "quote": hermes::HOME_QUOTE,
-            "significance": "notable",
-            "remember_this": false,
-            "changes_something": false,
-            "valid_from": null,
-            "valid_until": null,
-            "window_confidence": "high",
-            "until_event": null,
-            "due_at": null,
-            "volatility": null,
-            "recurrence_text": null,
-            "recurrence_rrule": null,
-            "recurrence_start": null,
-            "entities": []
-        }],
-        "used_injected_ids": []
-    });
-    let steps: Vec<Value> = (0..32).map(|_| json!({ "reply": reply })).collect();
-    let path = dir.path("llm-script.json");
-    fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
+/// The private dir holding [`hermes::small_history`] imported to
+/// `corpus/main.jsonl`; returns the corpus path.
+pub fn imported_small_history(dir: &TestDir) -> PathBuf {
+    import_history(dir, hermes::small_history)
+}
+
+/// Writes `steps` as a script for the live stand-in
+/// (`ASPHODEL_LLM_SCRIPT`).
+pub fn script_steps(dir: &TestDir, name: &str, steps: &[Value]) -> PathBuf {
+    let path = dir.path(&format!("{name}.json"));
+    fs::write(&path, serde_json::to_vec(steps).unwrap()).unwrap();
     path
+}
+
+/// A script answering every call, up to more than any test makes, with
+/// `reply`.
+pub fn script(dir: &TestDir, name: &str, reply: Value) -> PathBuf {
+    script_steps(dir, name, &vec![json!({ "reply": reply }); 256])
+}
+
+/// A script for the live stand-in: every call 1 reply claims
+/// [`hermes::HOME_SENTENCE`] quoting [`hermes::HOME_QUOTE`], so the claim
+/// survives only in the turn that says it and the rest of the history
+/// extracts nothing.
+pub fn live_script(dir: &TestDir) -> PathBuf {
+    let reply = json!({ "claims": [home_claim()], "used_injected_ids": [] });
+    script(dir, "llm-script", reply)
 }
 
 /// The test manifest with one mental model of its own beside the "User
@@ -193,65 +225,23 @@ pub fn imported_with_a_model(dir: &TestDir) -> PathBuf {
     let state_db = dir.private_path("state.db");
     hermes::small_history(&state_db);
     let corpus = dir.private_path("corpus/main.jsonl");
-    assert_ok(&import_with(
-        dir,
-        &state_db,
-        &corpus,
-        &model_manifest(HOME_QUESTION),
-        &[],
-    ));
+    let manifest = model_manifest(HOME_QUESTION);
+    assert_ok(&import_with(dir, &state_db, &corpus, &manifest, &[]));
     corpus
 }
 
-/// A sentence of a refresh's write, citing memory handles.
-pub fn said(text: &str, cites: &[&str]) -> Value {
-    json!({ "text": text, "cites": cites })
-}
-
-/// A refresh's write: the whole summary, one section holding `sentences`.
-pub fn write_reply(sentences: Vec<Value>) -> Value {
-    json!({ "sections": [{ "heading": "Home", "sentences": sentences }] })
-}
-
-/// A refresh's plan: one facet recalling [`HOME_QUESTION`], so `home`
-/// selects as one retrieval for its question would.
-pub fn home_facets() -> Value {
-    json!([{ "heading": "Home", "query": HOME_QUESTION }])
+/// A refresh operation adding one entry that cites `cites`.
+pub fn add_entry(text: &str, cites: &[&str]) -> Value {
+    json!({ "op": "add", "entry": null, "text": text, "cites": cites })
 }
 
 /// A script whose every step answers any call: call 1 reads `claims` and
-/// `used_injected_ids` (the home claim, as [`live_script`]), a refresh's
-/// plan reads `facets`, and its write reads `sections`, one sentence citing
-/// `m1`, the only memory the history makes. No reply type refuses the
-/// others' fields, so the order calls come in doesn't matter.
+/// `used_injected_ids` (the home claim, as [`live_script`]), and a refresh
+/// reads `operations`, which add one entry citing `m1`, the only memory the
+/// history makes.
 pub fn universal_script(dir: &TestDir) -> PathBuf {
-    let reply = json!({
-        "claims": [{
-            "content": hermes::HOME_SENTENCE,
-            "kind": "fact",
-            "quote": hermes::HOME_QUOTE,
-            "significance": "notable",
-            "remember_this": false,
-            "changes_something": false,
-            "valid_from": null,
-            "valid_until": null,
-            "window_confidence": "high",
-            "until_event": null,
-            "due_at": null,
-            "volatility": null,
-            "recurrence_text": null,
-            "recurrence_rrule": null,
-            "recurrence_start": null,
-            "entities": []
-        }],
-        "used_injected_ids": [],
-        "facets": home_facets(),
-        "sections": write_reply(vec![said("Tim lives in Auckland.", &["m1"])])["sections"]
-    });
-    let steps: Vec<Value> = (0..64).map(|_| json!({ "reply": reply })).collect();
-    let path = dir.path("universal-script.json");
-    fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
-    path
+    let operations = vec![add_entry("Tim lives in Auckland.", &["m1"])];
+    script_answering_everything(dir, "universal-script", vec![home_claim()], operations)
 }
 
 /// The call 1 claim [`live_script`] makes, as JSON.
@@ -262,93 +252,73 @@ pub fn home_claim() -> Value {
 /// A call 1 claim of `kind`, notable, with nothing else set.
 pub fn claim(content: &str, quote: &str, kind: &str) -> Value {
     json!({
-        "content": content,
-        "kind": kind,
-        "quote": quote,
-        "significance": "notable",
-        "remember_this": false,
-        "changes_something": false,
-        "valid_from": null,
-        "valid_until": null,
-        "window_confidence": "high",
-        "until_event": null,
-        "due_at": null,
-        "volatility": null,
-        "recurrence_text": null,
-        "recurrence_rrule": null,
-        "recurrence_start": null,
-        "entities": []
+        "content": content, "kind": kind, "quote": quote, "significance": "notable",
+        "remember_this": false, "changes_something": false, "valid_from": null,
+        "valid_until": null, "window_confidence": "high", "until_event": null, "due_at": null,
+        "volatility": null, "recurrence_text": null, "recurrence_rrule": null,
+        "recurrence_start": null, "entities": []
     })
 }
 
-/// [`live_script`] with every step taking `delay_ms` to answer, so a
-/// `live` run measures that latency. The reply also reads as a plan and
-/// as an empty write, so the seeded profile's refreshes succeed.
-pub fn delayed_script(dir: &TestDir, delay_ms: u64) -> PathBuf {
-    let reply = json!({
-        "claims": [home_claim()],
-        "used_injected_ids": [],
-        "facets": home_facets(),
-        "sections": []
-    });
-    let steps: Vec<Value> = (0..64)
-        .map(|_| json!({ "reply": reply, "delay_ms": delay_ms }))
-        .collect();
-    let path = dir.path(&format!("delayed-script-{delay_ms}.json"));
-    fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
-    path
+/// The reply of [`script_answering_everything`].
+pub fn reply_to_everything(claims: Vec<Value>, operations: Vec<Value>) -> Value {
+    json!({ "claims": claims, "used_injected_ids": [], "operations": operations })
 }
 
-/// A script whose every step answers any call with `claims`, the home
-/// facet and a write of `sentences`, as [`universal_script`] does.
+/// [`live_script`] with every step taking `delay_ms` to answer, so a
+/// `live` run measures that latency. The reply also reads as a refresh
+/// with no edits, so the seeded profile's refreshes succeed.
+pub fn delayed_script(dir: &TestDir, delay_ms: u64) -> PathBuf {
+    let reply = reply_to_everything(vec![home_claim()], vec![]);
+    let steps = vec![json!({ "reply": reply, "delay_ms": delay_ms }); 64];
+    script_steps(dir, &format!("delayed-script-{delay_ms}"), &steps)
+}
+
+/// A script whose every step answers any call with `claims` and
+/// `operations`. Neither reply type refuses the other's fields, so the
+/// order calls come in doesn't matter.
 pub fn script_answering_everything(
     dir: &TestDir,
     name: &str,
     claims: Vec<Value>,
-    sentences: Vec<Value>,
+    operations: Vec<Value>,
 ) -> PathBuf {
-    let reply = json!({
-        "claims": claims,
-        "used_injected_ids": [],
-        "facets": home_facets(),
-        "sections": write_reply(sentences)["sections"]
-    });
-    let steps: Vec<Value> = (0..64).map(|_| json!({ "reply": reply })).collect();
-    let path = dir.path(&format!("{name}.json"));
-    fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
-    path
+    script(dir, name, reply_to_everything(claims, operations))
+}
+
+/// The cassette every real-history run here records to and reads from.
+pub fn cassette_path(dir: &TestDir) -> PathBuf {
+    dir.private_path("cassettes/main.jsonl")
+}
+
+/// The cassette's bytes.
+pub fn cassette_bytes(dir: &TestDir) -> Vec<u8> {
+    fs::read(cassette_path(dir)).expect("a cassette was recorded")
 }
 
 /// Replaces the cassette with `records`, one per line.
 pub fn write_cassette(dir: &TestDir, records: &[Value]) {
-    let mut text = String::new();
-    for record in records {
-        text.push_str(&serde_json::to_string(record).unwrap());
-        text.push('\n');
-    }
-    fs::write(dir.private_path("cassettes/main.jsonl"), text).unwrap();
-}
-
-/// A script for the `judge_used` top-up: every step
-/// judges that the reply relied on nothing.
-pub fn judge_script(dir: &TestDir) -> PathBuf {
-    let steps: Vec<Value> = (0..32)
-        .map(|_| json!({ "reply": { "used": [] } }))
-        .collect();
-    let path = dir.path("judge-script.json");
-    fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
-    path
+    let text: String = records.iter().map(|record| format!("{record}\n")).collect();
+    fs::write(cassette_path(dir), text).unwrap();
 }
 
 /// The cassette's records, in file order.
 pub fn cassette_records(dir: &TestDir) -> Vec<Value> {
-    fs::read_to_string(dir.private_path("cassettes/main.jsonl"))
-        .expect("a cassette was recorded")
+    String::from_utf8(cassette_bytes(dir))
+        .unwrap()
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("every cassette line is JSON"))
         .collect()
 }
+
+/// One `[[probe]]` table, `fields` its lines after `kind`.
+pub fn probe(id: &str, at: &str, kind: &str, fields: &str) -> String {
+    format!("\n[[probe]]\nid = \"{id}\"\nat = \"{at}\"\nkind = \"{kind}\"\n{fields}\n")
+}
+
+/// The probe field naming the home memory by its sentence.
+pub const HOME_MEMORY: &str = "memory = \"lives in Auckland\"";
 
 /// Real-history probes: opaque ids, memories matched
 /// by a regex on the sentence. Every one passes on the small history.
@@ -365,28 +335,6 @@ at = "2026-01-08T12:00:00Z"
 kind = "recall_finds"
 memory = "lives in Auckland"
 query = "Tim lives in Auckland"
-"#;
-
-/// The passing probes plus one that fails: the memory isn't absent.
-pub const PROBES_WITH_A_FAILURE: &str = r#"
-[[probe]]
-id = "p001"
-at = "2026-01-05T12:00:00Z"
-kind = "exists"
-memory = "lives in Auckland"
-
-[[probe]]
-id = "p002"
-at = "2026-01-08T12:00:00Z"
-kind = "recall_finds"
-memory = "lives in Auckland"
-query = "Tim lives in Auckland"
-
-[[probe]]
-id = "p003"
-at = "2026-01-09T12:00:00Z"
-kind = "absent"
-memory = "lives in Auckland"
 "#;
 
 /// One real-history `asphodel replay` run.
@@ -410,12 +358,33 @@ impl Run {
     pub fn report_bytes(&self) -> Vec<u8> {
         fs::read(&self.report_path).unwrap()
     }
+
+    /// Exit 0 with the report it wrote.
+    pub fn ok(&self) -> Value {
+        assert_ok(&self.output);
+        self.report()
+    }
 }
 
 /// `asphodel replay --corpus <corpus> --mode <mode> --cassette <private
-/// cassette> --probes <private probes> --report <report>` plus `extra`.
-/// `script` makes the live stand-in available; without it no LLM is.
+/// cassette> --probes <private probes>` with the report to a fresh file
+/// under `reports/`, plus `extra`. `script` makes the live stand-in
+/// available; without it no LLM is.
 pub fn replay_history(
+    dir: &TestDir,
+    corpus: &Path,
+    mode: &str,
+    probes: &str,
+    script: Option<&Path>,
+    extra: &[&str],
+) -> Run {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let report = format!("run-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    replay_history_to(dir, corpus, mode, probes, &report, script, extra)
+}
+
+/// [`replay_history`] with the report to `reports/<report>.json`.
+pub fn replay_history_to(
     dir: &TestDir,
     corpus: &Path,
     mode: &str,
@@ -431,10 +400,9 @@ pub fn replay_history(
         .arg("replay")
         .arg("--corpus")
         .arg(corpus)
-        .arg("--mode")
-        .arg(mode)
+        .args(["--mode", mode])
         .arg("--cassette")
-        .arg(dir.private_path("cassettes/main.jsonl"))
+        .arg(cassette_path(dir))
         .arg("--probes")
         .arg(probes)
         .arg("--report")
@@ -453,15 +421,42 @@ pub fn replay_history(
 /// cassette every later mode reads.
 pub fn record(dir: &TestDir, corpus: &Path) -> Run {
     let script = live_script(dir);
-    let run = replay_history(
-        dir,
-        corpus,
-        "live",
-        PASSING_PROBES,
-        "live",
-        Some(&script),
-        &[],
-    );
+    let run = replay_history(dir, corpus, "live", PASSING_PROBES, Some(&script), &[]);
     assert_ok(&run.output);
     run
+}
+
+/// `toml` in an overrides file of its own under the private dir; returns
+/// its path for `--overrides`.
+pub fn overrides(dir: &TestDir, toml: &str) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = format!("overrides/{}.toml", NEXT.fetch_add(1, Ordering::Relaxed));
+    dir.private_file(&name, toml).to_str().unwrap().to_owned()
+}
+
+/// What a run simulated, without what identifies the run: the mode
+/// (`kind`), the flags it was invoked with, where its LLM replies came
+/// from (`llm`) and the cassette hash it started from.
+pub fn simulation(report: &Value) -> Value {
+    let mut report = report.clone();
+    let object = report.as_object_mut().expect("the report is an object");
+    for key in ["kind", "flags", "llm", "cassette_hash"] {
+        object.remove(key);
+    }
+    report
+}
+
+/// The probe `id` in a report.
+pub fn probe_in<'a>(report: &'a Value, id: &str) -> &'a Value {
+    report["probes"]
+        .as_array()
+        .expect("the report lists probes")
+        .iter()
+        .find(|probe| probe["id"] == id)
+        .unwrap_or_else(|| panic!("no probe {id}: {report}"))
+}
+
+/// The JSON file at `path`.
+pub fn read_json(path: &Path) -> Value {
+    serde_json::from_slice(&fs::read(path).expect("the file is written")).expect("it is JSON")
 }

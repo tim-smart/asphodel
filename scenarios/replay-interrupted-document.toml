@@ -1,0 +1,78 @@
+# The simulated worker claims the head of the queue, which production orders
+# by priority (turns before documents), not in arrival order. A two-chunk
+# document arrives at 09:00 and its first chunk is extracted at 09:10. The
+# turn at 09:05 goes before the document's second chunk, so the turn's
+# memory exists from 09:20 and the second chunk's only from 09:30.
+
+name = "replay-interrupted-document"
+group = "ci"
+latency = "10m"
+
+[[document]]
+at = "2026-01-05T09:00:00Z"
+id = "notes"
+reference_date = "2026-01-05"
+text = "# Home\nTim lives in Auckland.\n\n# Transport\nTim's bicycle is blue."
+
+[[document.claim]]
+label = "bicycle"
+content = "Tim's bicycle is blue."
+quote = "Tim's bicycle is blue"
+kind = "fact"
+significance = "minor"
+
+[[document.claim]]
+label = "home"
+content = "Tim lives in Auckland."
+quote = "Tim lives in Auckland"
+kind = "fact"
+significance = "minor"
+
+[[turn]]
+at = "2026-01-05T09:05:00Z"
+session = "s1"
+user = "My favourite tea is Earl Grey."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "tea"
+content = "Tim's favourite tea is Earl Grey."
+quote = "My favourite tea is Earl Grey"
+kind = "fact"
+significance = "minor"
+
+[[probe]]
+id = "first-chunk-extracted"
+at = "2026-01-05T09:15:00Z"
+kind = "exists"
+memory = "home"
+
+[[probe]]
+id = "second-chunk-waits"
+at = "2026-01-05T09:15:00Z"
+kind = "absent"
+memory = "bicycle"
+
+[[probe]]
+id = "turn-waits-for-the-first-chunk"
+at = "2026-01-05T09:15:00Z"
+kind = "absent"
+memory = "tea"
+
+[[probe]]
+id = "turn-extracted-before-the-second-chunk"
+at = "2026-01-05T09:25:00Z"
+kind = "exists"
+memory = "tea"
+
+[[probe]]
+id = "second-chunk-still-waits"
+at = "2026-01-05T09:25:00Z"
+kind = "absent"
+memory = "bicycle"
+
+[[probe]]
+id = "second-chunk-extracted"
+at = "2026-01-05T09:35:00Z"
+kind = "exists"
+memory = "bicycle"

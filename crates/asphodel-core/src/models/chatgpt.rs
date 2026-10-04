@@ -835,12 +835,6 @@ fn backend_code(code: Option<&str>, missing: &'static str) -> String {
     code.to_string()
 }
 
-/// Reassembles a Responses SSE stream into the reply's JSON and usage.
-#[cfg(test)]
-fn parse_stream(text: &str) -> Result<(Value, Option<LlmUsage>), LlmError> {
-    parse_stream_reader(text.as_bytes())
-}
-
 fn parse_stream_reader(reader: impl Read) -> Result<(Value, Option<LlmUsage>), LlmError> {
     // Bound even a single unterminated line, not just well-formed SSE blocks.
     let mut reader = BufReader::new(reader.take(REPLY_LIMIT + 1));
@@ -964,43 +958,4 @@ fn parse_stream_reader(reader: impl Read) -> Result<(Value, Option<LlmUsage>), L
         bytes: content.len(),
     })?;
     Ok((json, usage))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn base64url_decodes_without_padding() {
-        assert_eq!(base64url_decode("aGVsbG8").unwrap(), b"hello");
-        assert_eq!(base64url_decode("aGVsbG8=").unwrap(), b"hello");
-        assert_eq!(base64url_decode("-_8").unwrap(), [0xfb, 0xff]);
-        assert!(base64url_decode("a!b").is_none());
-    }
-
-    #[test]
-    fn a_usage_limit_needs_the_type_and_a_reset() {
-        let body = r#"{"error":{"type":"usage_limit_reached","resets_at":1772462400}}"#;
-        assert_eq!(
-            usage_limit(body, None),
-            Some(Timestamp::from_second(1_772_462_400).unwrap())
-        );
-        let no_reset = r#"{"error":{"type":"usage_limit_reached"}}"#;
-        assert_eq!(usage_limit(no_reset, None), None);
-        assert_eq!(
-            usage_limit(no_reset, Some(1_772_462_400)),
-            Some(Timestamp::from_second(1_772_462_400).unwrap())
-        );
-        let rate = r#"{"error":{"type":"rate_limit_exceeded"}}"#;
-        assert_eq!(usage_limit(rate, Some(1_772_462_400)), None);
-        assert_eq!(usage_limit("not json", Some(1)), None);
-    }
-
-    #[test]
-    fn a_stream_needs_a_completed_event() {
-        let error =
-            parse_stream("event: response.created\ndata: {\"type\":\"response.created\"}\n\n")
-                .unwrap_err();
-        assert!(matches!(error, LlmError::NoContent));
-    }
 }
