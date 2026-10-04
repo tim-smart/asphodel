@@ -605,12 +605,19 @@ fn sample_for<'a>(material: &'a Value, message: &str) -> &'a Value {
 
 /// Each sample records both queries: `query`, the message the vector and
 /// BM25 arms searched, and `rerank_query`, what the reranker scored
-/// against. By default they're the same.
+/// against. In explicit message mode they're the same.
 #[test]
-fn by_default_the_material_records_the_message_as_the_rerank_query() {
+fn in_message_mode_the_material_records_the_message_as_the_rerank_query() {
     let dir = TestDir::new();
     let corpus = conversation_history(&dir);
-    let (_, material) = material_of(&dir, &corpus, "message", &[]);
+    let overrides = dir.private_file("message.toml", "[injection]\nrerank_query = \"message\"\n");
+    let (report, material) = material_of(
+        &dir,
+        &corpus,
+        "message",
+        &["--overrides", overrides.to_str().unwrap()],
+    );
+    assert_eq!(report["tuning"]["injection"]["rerank_query"], "message");
     for sample in material["recall"].as_array().unwrap() {
         assert_eq!(sample["rerank_query"], sample["query"], "{sample}");
     }
@@ -618,25 +625,15 @@ fn by_default_the_material_records_the_message_as_the_rerank_query() {
     assert_eq!(leaning["query"], LEANING);
 }
 
-/// With `[injection] rerank_query = "conversation"` in the overrides, replay
-/// reranks against the previous message, the start of the assistant's reply
-/// to it from the corpus, and the message. The material records that query
-/// beside the message, and scores candidates against it, so the existing
+/// By default replay reranks against the message, the previous message,
+/// and the start of the assistant's reply to it from the corpus. The material
+/// records that query beside the message, and scores candidates against it, so the existing
 /// labels, keyed by memory, can be read against either run.
 #[test]
-fn replay_can_rerank_against_the_conversation_and_records_both_queries() {
+fn by_default_replay_reranks_against_the_conversation_and_records_both_queries() {
     let dir = TestDir::new();
     let corpus = conversation_history(&dir);
-    let overrides = dir.private_file(
-        "conversation.toml",
-        "[injection]\nrerank_query = \"conversation\"\n",
-    );
-    let (report, material) = material_of(
-        &dir,
-        &corpus,
-        "conversation",
-        &["--overrides", overrides.to_str().unwrap()],
-    );
+    let (report, material) = material_of(&dir, &corpus, "conversation", &[]);
     assert_eq!(
         report["tuning"]["injection"]["rerank_query"], "conversation",
         "the report says which query the reranker scored against"
@@ -1648,7 +1645,7 @@ fn assert_rescored<'a>(before: &Value, after: &'a Value) -> &'a str {
     rerank_query
 }
 
-/// In message mode, rescoring reranks against the query the default
+/// In message mode, rescoring reranks against the query a message-mode
 /// replay did, so every score comes back as it was, now in logit order.
 /// Sample and candidate ids are kept, so labels written for the material
 /// apply to the rescored one, and call 2's lists are copied unchanged.
@@ -1656,7 +1653,13 @@ fn assert_rescored<'a>(before: &Value, after: &'a Value) -> &'a str {
 fn rescoring_by_the_message_reproduces_the_replay_logits_in_logit_order() {
     let dir = TestDir::new();
     let corpus = conversation_history(&dir);
-    let (_, material) = material_of(&dir, &corpus, "message", &[]);
+    let overrides = dir.private_file("message.toml", "[injection]\nrerank_query = \"message\"\n");
+    let (_, material) = material_of(
+        &dir,
+        &corpus,
+        "message",
+        &["--overrides", overrides.to_str().unwrap()],
+    );
     let out = dir.private_path("labelling/rescored-message.json");
     assert_ok(&rescore(
         &dir,

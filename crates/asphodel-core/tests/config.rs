@@ -410,15 +410,16 @@ fn extraction_guidance_is_unset_by_default_and_must_not_be_empty() {
 }
 
 #[test]
-fn the_rerank_query_is_the_message_by_default_and_can_be_the_conversation() {
+fn the_rerank_query_is_the_conversation_by_default_and_can_be_the_message() {
     let rerank_query = |tuning: &Tuning| {
         serde_json::to_value(tuning).unwrap()["injection"]["rerank_query"].clone()
     };
-    // Unset, the reranker scores against the message, as it always has.
-    assert_eq!(rerank_query(&Tuning::default()), "message");
+    // Unset, the reranker scores against the conversation.
+    assert_eq!(rerank_query(&Tuning::default()), "conversation");
+    assert_eq!(rerank_query(&layers(&[""]).unwrap()), "conversation");
     // The overrides file switches it, as replay's A/B runs need.
-    let layered = layers(&["", "[injection]\nrerank_query = \"conversation\"\n"]).unwrap();
-    assert_eq!(rerank_query(&layered), "conversation");
+    let layered = layers(&["", "[injection]\nrerank_query = \"message\"\n"]).unwrap();
+    assert_eq!(rerank_query(&layered), "message");
     assert_rejected("[injection]\nrerank_query = \"thread\"\n");
 }
 

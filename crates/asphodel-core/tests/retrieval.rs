@@ -1034,11 +1034,26 @@ fn a_short_follow_up_in_conversation_holds_the_previous_message_once() {
     assert_eq!(scored.prefetch.injected, vec![dentist]);
 }
 
-/// The default stays as it was: a message of eight words or more is
-/// reranked alone, whatever came before it.
+/// By default, context can make a memory relevant even when a message
+/// of eight words or more doesn't name its subject.
 #[test]
-fn by_default_the_reranker_sees_only_the_message() {
+fn by_default_the_reranker_sees_the_conversation() {
     let h = Harness::new();
+    let passkey = h.insert(fact("Tim signs in to Fastmail with a passkey."));
+    let prefetch = h.prefetch_in_conversation(
+        "s",
+        "go ahead and do that for me right now please",
+        Some("Can you sign in to Fastmail for me?"),
+        Some("Sure, signing in to Fastmail now."),
+    );
+    assert_eq!(prefetch.injected, vec![passkey], "{prefetch:?}");
+}
+
+/// Explicit message mode ignores context for a message of eight words
+/// or more, preserving the message-only comparison.
+#[test]
+fn in_message_mode_the_reranker_sees_only_the_message() {
+    let h = Harness::with(1.0, "rerank_query = \"message\"", Arc::new(FakeReranker));
     let _passkey = h.insert(fact("Tim signs in to Fastmail with a passkey."));
     let prefetch = h.prefetch_in_conversation(
         "s",
