@@ -137,11 +137,16 @@ returns only handles and labels, so it has no rule. In replay, `fast` reuses
 call 1's claims only from a recording made with the same language.
 
 **What call 1 leaves out.** Call 1 doesn't extract that someone asked a
-question or made a request, or the assistant's routine operations and
-checks, such as running a command or verifying a fix, unless the text
-records a decision, a commitment, a date, or where something is stored. On
-real history these were nearly half of what it extracted, and few held
-anything lasting (`docs/operations.md`, "The tuning file").
+question or made a request, or the assistant's routine operations, including
+note and file edits. It keeps the durable content, decisions and commitments
+instead of events about adding, updating or saving them. A date or path
+alone does not make a routine operation worth extracting. A durable storage
+location is a fact about the thing, not an edit event, and is extracted only
+when it is not already stated in the supplied context. Assistant replies
+can supply those claims while carrying out the speaker's request; requested
+assistant tasks still need a due date or an until-event beyond the turn.
+Suggestions, general knowledge and tool findings remain excluded. See
+`docs/operations.md`, "The tuning file", for the evaluation behind these rules.
 
 **Guidance.** `[extraction] guidance` is added, trimmed, after call 1's fixed
 system prompt under its own heading. The rules, the user prompt and the reply
