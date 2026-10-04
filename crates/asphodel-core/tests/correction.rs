@@ -922,6 +922,7 @@ fn a_bank_whose_recorded_model_isnt_loaded_is_refused_without_embedding() {
             session_id: "s1".into(),
             query: "What does Tim drink?".into(),
             previous_query: None,
+            previous_reply: None,
             block_id: None,
         },
     ) {

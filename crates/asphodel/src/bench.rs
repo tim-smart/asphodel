@@ -341,6 +341,7 @@ fn level(
                     session_id: format!("bench:{concurrency}:{worker}"),
                     query: queries[index % queries.len()].clone(),
                     previous_query: None,
+                    previous_reply: None,
                     block_id: None,
                 };
                 let started = Instant::now();

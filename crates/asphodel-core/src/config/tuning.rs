@@ -199,6 +199,22 @@ pub struct InjectionTuning {
     /// The relevance gate on the reranker logit, keyed by the exact reranker
     /// model string, quantisation included.
     pub reranker_floors: BTreeMap<String, f64>,
+
+    /// What the reranker scores candidates against. The retrievers search
+    /// the message either way.
+    pub rerank_query: RerankQuery,
+}
+
+/// What prefetch's reranker scores candidates against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankQuery {
+    /// The message, after a short follow-up borrowed the previous one.
+    #[default]
+    Message,
+    /// The start of the previous message and of the assistant's reply to
+    /// it, then the message, for every prefetch.
+    Conversation,
 }
 
 impl Default for InjectionTuning {
@@ -207,6 +223,7 @@ impl Default for InjectionTuning {
             cap: 8,
             token_budget: 600,
             reranker_floors: BTreeMap::new(),
+            rerank_query: RerankQuery::Message,
         }
     }
 }

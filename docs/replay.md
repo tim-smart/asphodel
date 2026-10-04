@@ -487,7 +487,9 @@ Hermes uses for search, in `timestamp` order, not row id. Then, per primary sess
   `user` row; assistant rows that only call tools, and `tool` rows, are
   skipped. The turn is a `prefetch` event at the user row's time and a
   `sync` event at the reply's time, with the previous user message as the
-  prefetch's `previous_query`;
+  prefetch's `previous_query`. Replay takes the reply to that message from
+  its `sync` event, when it came before this prefetch, as the prefetch's
+  `previous_reply`;
 - compacted rows (`active=0, compacted=1`) are replayed. Hermes' summary
   row (`_compressed_summary=1`) is skipped, and a `clear` is emitted at its
   time;
@@ -648,7 +650,8 @@ The material is one JSON object:
   "version": 2,
   "recall": [
     { "sample": "r1", "at": "<prefetch time>", "session": "<session id>",
-      "query": "<the query the reranker scored against>",
+      "query": "<the query the retrievers searched>",
+      "rerank_query": "<the query the reranker scored against>",
       "raw_query": "<the message as Hermes sent it>",
       "candidates": [
         { "id": "r1.1", "memory": "<uuid>", "score": 1.5, "sentence": "..." } ] } ],
@@ -669,11 +672,17 @@ The material is one JSON object:
   reranked candidates in ranked order before the gate, including those
   the gate turned away, scored with the raw reranker logit the gate floor
   compares, not the logit divided by the relevance scale. `query` is
-  what the reranker scored against: the message without the Discord message-id note and the
+  what vector search and BM25 searched: the message without the Discord message-id note and the
   `[Name] ` speaker prefix, after a short follow-up borrowed the previous
-  message. Calibration uses it. `raw_query` is the message as Hermes sent
-  it, for reading beside it. Material written before it was recorded has
-  no `raw_query`, and `report precision` still reads it.
+  message. Keyed recall labels name it. `rerank_query` is what the
+  reranker scored against, which the scores and so calibration follow.
+  It's `query` by default; with `[injection]
+  rerank_query = "conversation"` in `--overrides` it's the start of the
+  previous message, the start of the assistant's reply to it, and the
+  message, one per line (see "Reranking against the conversation" below).
+  `raw_query` is the message as Hermes sent it, for reading beside it.
+  Material written before they were recorded has no `rerank_query` or
+  `raw_query`, and `report precision` still reads it.
 - `call2` holds every candidate list call 2 was shown, one per claim:
   the claim and its neighbours, scored with the cosine similarity of the
   claim to each. Only what call 2 was shown is here. Flagged claims bypass
@@ -763,6 +772,25 @@ as it can. With more labelled turns than the sample holds, it spreads the
 over the other turns. Old-form labels are refused there; convert them
 first. Every file must be inside the private dir, and an error names the
 file and line, never the text.
+
+### Reranking against the conversation
+
+`[injection] rerank_query` decides what prefetch's reranker scores
+candidates against. `"message"`, the default, is the message itself, or
+for a short follow-up the previous message and then the message.
+`"conversation"` is, for every prefetch, the previous message, the start of
+the assistant's reply to it, and the message, one per line, leaving out any
+that's missing. The previous message and the reply are each cut to their
+first 300 characters at a word boundary, so the reranker's 512-token pair
+keeps room for the message and the memory. Vector search and BM25 search
+the message under either setting.
+
+The plugin doesn't send the reply yet, so in production the conversation
+query has the previous message only. Replay takes the reply from the
+corpus.
+
+A conversation run injects differently, so call 1's requests change and
+`replay` misses the cassette. Run it in `fast`.
 
 ### Bench
 

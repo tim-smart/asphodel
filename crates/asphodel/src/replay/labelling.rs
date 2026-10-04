@@ -49,15 +49,21 @@ pub struct Material {
     pub call2: Vec<Call2Sample>,
 }
 
-/// A sampled turn's prefetch: the query the reranker scored against, the
-/// message it was cleaned from, and its candidates in ranked order.
+/// A sampled turn's prefetch: the query the retrievers searched, the query
+/// the reranker scored against, the message they were cleaned from, and its
+/// candidates in ranked order.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecallSample {
     pub sample: String,
     pub at: Timestamp,
     pub session: String,
-    /// The cleaned query, which calibration uses.
+    /// The cleaned query the retrievers searched.
     pub query: String,
+    /// The query the reranker scored against, which calibration uses: the
+    /// same as `query` unless the run reranked against the conversation.
+    /// Material written before it was recorded has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_query: Option<String>,
     /// The message as Hermes sent it. Material written before it was
     /// recorded has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,6 +100,7 @@ struct Turn {
     at: Timestamp,
     session: String,
     query: String,
+    rerank_query: String,
     raw_query: String,
     candidates: Vec<(Uuid, String, f64)>,
 }
@@ -126,6 +133,7 @@ impl Collector {
             at,
             session: session.to_owned(),
             query: scored.query.clone(),
+            rerank_query: scored.rerank_query.clone(),
             raw_query: scored.raw_query.clone(),
             candidates: shown
                 .iter()
@@ -171,6 +179,7 @@ impl Collector {
                     at: turn.at,
                     session: turn.session,
                     query: turn.query,
+                    rerank_query: Some(turn.rerank_query),
                     raw_query: Some(turn.raw_query),
                 }
             })
