@@ -620,7 +620,7 @@ fn fast_doesnt_reuse_claims_recorded_without_the_guidance_and_reports_it() {
     let dir = TestDir::new();
     let corpus = imported_small_history(&dir);
     let unguided = record(&dir, &corpus).report();
-    assert_eq!(unguided["call1"]["version"], 5, "{unguided}");
+    assert_eq!(unguided["call1"]["version"], 6, "{unguided}");
     assert!(unguided["call1"]["guidance_hash"].is_null(), "{unguided}");
     let call1 = |records: &[Value]| {
         records
@@ -652,7 +652,7 @@ fn fast_doesnt_reuse_claims_recorded_without_the_guidance_and_reports_it() {
     assert_eq!(report["llm"]["misses"], recorded, "{report}");
     assert_eq!(report["llm"]["live"], recorded, "{report}");
     assert_eq!(report["tuning"]["extraction"]["guidance"], GUIDANCE);
-    assert_eq!(report["call1"]["version"], 5, "{report}");
+    assert_eq!(report["call1"]["version"], 6, "{report}");
     assert_eq!(report["call1"]["guidance_hash"], hash, "{report}");
     let records = cassette_records(&dir);
     assert_eq!(call1(&records), 2 * recorded);
@@ -677,7 +677,7 @@ fn fast_doesnt_reuse_claims_recorded_without_the_guidance_and_reports_it() {
     assert_ok(&second.output);
     assert_eq!(second.report()["llm"]["misses"], 0);
     let export: Value = serde_json::from_slice(&fs::read(&aggregate).unwrap()).unwrap();
-    assert_eq!(export["call1"]["version"], 5, "{export}");
+    assert_eq!(export["call1"]["version"], 6, "{export}");
     assert_eq!(
         export["call1"]["guidance_hash"],
         serde_json::json!(Sha256::digest(GUIDANCE.as_bytes()).to_vec()),
