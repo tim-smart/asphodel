@@ -21,7 +21,7 @@ use crate::config::Tuning;
 use crate::constants::Volatility;
 use crate::store::strength::{StrengthLoader, memory_kind, world_time};
 use crate::store::timestamp;
-use crate::strength::{AccessKind, Chains, Kind, Phase, Window, state_confidence};
+use crate::strength::{AccessKind, Chains, Kind, Phase, Window, state_confidence, strength};
 
 /// A memory that survived clean-up, with what ranking and rendering need.
 #[derive(Debug, Clone)]
@@ -215,12 +215,20 @@ fn load(
         due_at,
     };
     let tz = TimeZone::get(&row.timezone).unwrap_or(TimeZone::UTC);
-    let strength = loader.strength(conn, id)?.value;
+    let inputs = loader.inputs(conn, id)?;
+    let strength = strength(
+        inputs.significance,
+        &inputs.accesses,
+        inputs.close,
+        loader.bank_time(),
+        now,
+    )
+    .value;
 
     let volatility = row.volatility.as_deref().and_then(volatility);
     let (state_confidence, last_observed) = match volatility {
         Some(_) => {
-            let accesses = loader.accesses(conn, id)?;
+            let accesses = &inputs.accesses;
             let last_observed = accesses
                 .iter()
                 .filter(|a| a.at <= now)
@@ -228,7 +236,7 @@ fn load(
                 .map(|a| a.at)
                 .fold(row.observed_at, Timestamp::max);
             (
-                state_confidence(volatility, row.observed_at, &accesses, now),
+                state_confidence(volatility, row.observed_at, accesses, now),
                 last_observed,
             )
         }

@@ -185,9 +185,10 @@ fn occasions(sorted: &[Access]) -> u32 {
 /// `ln Σ w_j · age_j^(−d_j)` over weighted accesses sorted by time ascending,
 /// then weight descending.
 ///
-/// Each `d_j` needs the recent use at the time of access j, so this is
-/// quadratic in the number of accesses. One access per memory per turn keeps
-/// that small.
+/// Each `d_j` needs the recent use at the time of access j. Sum newest-first
+/// and stop once the decay cap is reached: all remaining terms are positive
+/// and cannot change `d_j`. Frequently used memories reach the cap quickly;
+/// cold histories still take quadratic work in the worst case.
 fn recent_use(sorted: &[(f64, Timestamp)], bank_time: &BankTime, now: Timestamp) -> f64 {
     let age =
         |from: Timestamp, to: Timestamp| bank_time.elapsed_days(from, to).max(MIN_ACCESS_AGE_DAYS);
@@ -195,11 +196,13 @@ fn recent_use(sorted: &[(f64, Timestamp)], bank_time: &BankTime, now: Timestamp)
     for (j, &(_, at)) in sorted.iter().enumerate() {
         // e^m, where m is recent use just before this access: the sum
         // itself. It's 0 before the first access, so that one's d is a.
-        let before: f64 = sorted[..j]
-            .iter()
-            .zip(&decays)
-            .map(|(&(weight, earlier), &d)| weight * age(earlier, at).powf(-d))
-            .sum();
+        let mut before = 0.0;
+        for (&(weight, earlier), &d) in sorted[..j].iter().zip(&decays).rev() {
+            before += weight * age(earlier, at).powf(-d);
+            if before >= (D_MAX - A) / C {
+                break;
+            }
+        }
         decays.push((A + C * before).min(D_MAX));
     }
     sorted
