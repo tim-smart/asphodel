@@ -1549,6 +1549,76 @@ fn annotations_give_absolute_dates() {
     assert!(sister_line.contains("date uncertain"), "{sister_line}");
 }
 
+#[test]
+fn explicit_recall_text_uses_the_source_local_day_and_preserves_json() {
+    let h = Harness::new();
+    // The bank is UTC, but the source date was recorded in Sydney.
+    h.execute("UPDATE banks SET timezone = 'UTC'", []);
+    h.execute("UPDATE sources SET timezone = 'Australia/Sydney'", []);
+    let id = h.insert(Memory {
+        kind: "event",
+        valid_from: Some((at("2026-10-03T14:00:00Z"), "day")),
+        low_confidence: true,
+        owner_significance: Some("kept"),
+        ..fact("Maya has a concert.")
+    });
+    let recall = serde_json::to_value(h.recall(RecallRequest {
+        query: "Maya concert".into(),
+        ..RecallRequest::default()
+    }))
+    .unwrap();
+    // CLI/dashboard callers must retain the structured result unchanged.
+    assert_eq!(recall["results"][0]["id"], id.to_string());
+    assert_eq!(
+        recall["results"][0]["window"]["valid_from"]["at"],
+        "2026-10-03T14:00:00Z"
+    );
+    let text = recall["text"]
+        .as_str()
+        .expect("recall includes rendered text");
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.starts_with(&id.to_string()), "{text}");
+    for expected in [
+        "Maya has a concert.",
+        "event",
+        "upcoming Sun 4 Oct",
+        "kept",
+        "date uncertain",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in {text}");
+    }
+    assert!(!text.contains("Sat 3 Oct"), "{text}");
+    assert!(
+        !text.contains("00:00"),
+        "day precision must not show a time: {text}"
+    );
+    assert!(!text.contains("2026-10-03T14:00:00Z"), "{text}");
+    assert!(!text.contains("null"), "{text}");
+}
+
+#[test]
+fn explicit_recall_text_describes_empty_results() {
+    let h = Harness::new();
+    let recall = serde_json::to_value(h.recall(RecallRequest {
+        query: "concert".into(),
+        ..RecallRequest::default()
+    }))
+    .unwrap();
+    assert_eq!(recall["results"], serde_json::json!([]));
+    let text = recall["text"]
+        .as_str()
+        .expect("empty recall includes rendered text");
+    assert!(!text.trim().is_empty());
+    assert!(
+        text.chars().any(char::is_alphabetic),
+        "empty recall needs words: {text}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(text).is_err(),
+        "{text}"
+    );
+}
+
 // The in-context skip and per-session state
 
 #[test]

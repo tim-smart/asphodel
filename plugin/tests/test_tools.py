@@ -86,15 +86,54 @@ def test_the_author_is_read_per_turn(make_provider, daemon):
 # -- recall ----------------------------------------------------------------------
 
 
-def test_anyone_may_recall_and_gets_the_results_list(make_provider, daemon):
+def test_anyone_may_recall_and_gets_plain_lines(make_provider, daemon):
     provider = make_provider()
     provider.on_turn_start(1, "x", author_id="222", author_name="Maya", author_is_bot=False)
+    text = "m9 Maya lives in Wellington.\nm10 Maya has a concert. [event; upcoming Sun 4 Oct; kept]"
+    concert = recalled("Maya has a concert.", id="m10", kind="event", kept=True)
+    concert["window"]["valid_from"] = {"at": "2026-10-03T14:00:00Z", "precision": "day"}
     daemon.set_response(
-        "recall", 200, {"recall_id": "r1", "results": [recalled("Maya lives in Wellington.", id="m9")], "reranked": True}
+        "recall",
+        200,
+        {
+            "recall_id": "r1",
+            "results": [recalled("Maya lives in Wellington.", id="m9"), concert],
+            "text": text,
+            "reranked": True,
+        },
     )
-    result = json.loads(provider.handle_tool_call("memory_recall", {"query": "where does Maya live?"}))
-    assert isinstance(result, list) and result[0]["id"] == "m9"
-    assert set(result[0]) == {"id", "sentence", "kind", "window", "phase", "observed_at", "strength", "kept"}
+    result = provider.handle_tool_call("memory_recall", {"query": "Maya"})
+    assert result == text
+    assert "2026-10-03T14:00:00Z" not in result
+    assert "null" not in result
+
+
+def test_empty_recall_says_so_in_words(make_provider, daemon):
+    provider = make_provider()
+    daemon.set_response("recall", 200, {"recall_id": "r1", "results": [], "text": "No memories recalled.", "reranked": True})
+    assert provider.handle_tool_call("memory_recall", {"query": "concert"}) == "No memories recalled."
+
+
+@pytest.mark.parametrize("tool, route", [("memory_forget", "forget"), ("memory_keep", "keep"), ("memory_unkeep", "unkeep")])
+def test_recalled_line_id_can_be_used_unchanged_by_owner_tools(make_provider, daemon, tool, route):
+    provider = make_provider()
+    memory_id = "7d0a9ac0-2b6d-4e89-93be-3ea8f1ae7b2f"
+    daemon.set_response(
+        "recall",
+        200,
+        {
+            "recall_id": "r1",
+            "results": [recalled("Maya lives in Wellington.", id=memory_id)],
+            "text": f"{memory_id} Maya lives in Wellington.",
+            "reranked": True,
+        },
+    )
+    result = provider.handle_tool_call("memory_recall", {"query": "Maya"})
+    recalled_id = result.splitlines()[0].split()[0]
+    provider.on_turn_start(1, "keep it", author_id="111", author_is_bot=False)
+    response = provider.handle_tool_call(tool, {"ids": [recalled_id]})
+    assert not error_of(response)
+    assert daemon.requests_for(route)[0].body["ids"] == [memory_id]
 
 
 def test_recall_forwards_the_arguments_and_session(make_provider, daemon):
