@@ -271,6 +271,41 @@ change made with `asphodel bank config`.
 Turns are ingested only from primary agents. Cron runs get injection and
 the prompt block but are never ingested.
 
+### Plugin prefetch contract
+
+The plugin sends `POST /v1/banks/{bank}/prefetch` with `session_id` and
+`query` (the current Hermes message). Optional context fields are:
+
+- `previous_query`, the session's last successful prefetch query.
+- `previous_reply`, the first 300 Unicode characters of the assistant reply
+  received by `sync_turn` for exactly the selected `previous_query`. It is
+  omitted when empty, not yet synced, or ambiguously attributed. The plugin
+  keeps only this prefix, even with ingestion disabled or a failed turn delivery.
+- `block_id`, a prompt block fetched before the session id was known,
+  sent until a prefetch succeeds.
+
+With the default `rerank_query = "conversation"`, the daemon reranks
+against the current message plus bounded starts of the previous query
+and reply. It trims context and cuts each start to `RERANK_CONTEXT_CHARS`
+(300), cutting back to whitespace where possible.
+
+Query and reply context are isolated by session, including an explicit
+`session_id` on a delayed `sync_turn`. An ordinary session switch retains
+each session's context for a later return. Compression, reset and rewind
+drop the old session's query and reply along with its pending recalls;
+a successful `memory_forget` drops the current session's query and reply.
+Hermes syncs on a background worker, so a prefetch that arrives before
+the preceding turn syncs cannot include that turn's reply yet. It proceeds
+without waiting and never substitutes a reply from an older query.
+
+`sync_turn` provides session and user text, but no originating turn ID.
+The plugin therefore suppresses reply context for repeated query text within
+the same session for the provider's lifetime, including repeats across clears
+and failed prefetch attempts. It retains query digests across clears so a
+delayed pre-clear sync cannot restore reply context for a repeated query.
+Distinct new queries remain eligible. A sync without a matching successful
+prefetch contributes no reply context; turn ingestion is unaffected.
+
 ## Commands
 
 Every command below except `serve`, `restore`, `models fetch` and `llm

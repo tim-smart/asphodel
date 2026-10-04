@@ -12,9 +12,11 @@ ids, counts and status codes only. Content is logged only at :data:`TRACE`.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -48,6 +50,8 @@ BUILTIN_MEMORY_FLAGS = ("memory_enabled", "user_profile_enabled")
 HERMES_TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
 #: Pending recalls kept per session, the daemon's ``PENDING_PER_SESSION``.
 PENDING_RECALLS_PER_SESSION = 4
+#: Reply prefix sent for conversation reranking, matching RERANK_CONTEXT_CHARS.
+RERANK_CONTEXT_CHARS = 300
 #: What the daemon's ``clean_query`` strips from the front of a prefetch
 #: query: Hermes' Discord message-id note, then the ``[Name] `` speaker
 #: prefix. The daemon does the cleaning; the plugin only uses this to skip a
@@ -107,6 +111,14 @@ class AsphodelMemoryProvider(MemoryProvider):
         # dropped on memory_forget.
         self._pending_recalls: Dict[str, List[Tuple[str, str]]] = {}
         self._last_query: Dict[str, str] = {}
+        self._last_reply: Dict[str, str] = {}
+        # sync_turn has no turn id. Repeated text can name an older turn,
+        # even after a clear, so only a first occurrence is reply-eligible.
+        # Keep digests, not message bodies, for the provider lifetime.
+        self._reply_queries: Dict[str, set[bytes]] = {}
+        self._reply_eligible: Dict[str, bool] = {}
+        self._context_versions: Dict[str, int] = {}
+        self._context_lock = threading.Lock()
         self._last_injected: int = 0
         # A block fetched before the session id was known.
         self._pending_block_id: Optional[str] = None
@@ -271,13 +283,13 @@ class AsphodelMemoryProvider(MemoryProvider):
         (``reason="compression"``), ``reset`` or ``rewound`` it also clears the
         old session's in-context set through
         ``POST /v1/banks/{bank}/sessions/{id}/clear`` and drops the pending
-        recall id, last query and block mapping."""
+        recall id, last query, last reply and block mapping."""
         old_session = self._session_id or parent_session_id
         clear = reset or rewound or kwargs.get("reason") == "compression"
         try:
             if clear and old_session:
                 self._pending_recalls.pop(old_session, None)
-                self._last_query.pop(old_session, None)
+                self._clear_reply_context(old_session)
                 self._pending_block_id = None
                 if self.client is not None and self.bank:
                     try:
@@ -298,6 +310,14 @@ class AsphodelMemoryProvider(MemoryProvider):
     def backup_paths(self) -> List[str]:
         """``[]``: the data lives in the daemon's container."""
         return []
+
+    def _clear_reply_context(self, session: str) -> None:
+        with self._context_lock:
+            self._last_query.pop(session, None)
+            self._last_reply.pop(session, None)
+            self._reply_eligible.pop(session, None)
+            self._context_versions[session] = self._context_versions.get(session, 0) + 1
+            # Do not forget seen queries: an old sync can arrive after a clear.
 
     # -- the reply path ------------------------------------------------------
 
@@ -341,8 +361,9 @@ class AsphodelMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """``POST /v1/banks/{bank}/prefetch`` with the query, the session's
-        last prefetch query as ``previous_query`` and, once, a pending block
-        id. Stores the ``recall_id`` for ``sync_turn`` and the injected count
+        last prefetch query as ``previous_query``, its bounded assistant reply
+        as ``previous_reply`` only when attribution is unambiguous and, once,
+        a pending block id. Stores the ``recall_id`` for ``sync_turn`` and the injected count
         for ``recall_status``. The query goes as Hermes gave it, for the daemon
         to clean, but one that cleans to nothing isn't sent. "" then and on
         any failure."""
@@ -358,9 +379,23 @@ class AsphodelMemoryProvider(MemoryProvider):
             if not self._session_id:
                 self._session_id = session
             request: Dict[str, Any] = {"session_id": session, "query": query}
-            previous = self._last_query.get(session)
-            if previous:
-                request["previous_query"] = previous
+            with self._context_lock:
+                previous = self._last_query.get(session)
+                if previous:
+                    request["previous_query"] = previous
+                    reply = self._last_reply.get(session)
+                    if reply:
+                        request["previous_reply"] = reply
+                version = self._context_versions.get(session, 0)
+                seen = self._reply_queries.setdefault(session, set())
+                fingerprint = hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).digest()
+                eligible = fingerprint not in seen
+                # Record attempts too: a turn may sync despite a failed prefetch.
+                seen.add(fingerprint)
+                if not eligible and query == previous:
+                    # Even if this request fails, a later sync with this text
+                    # cannot be attributed to the last successful turn.
+                    self._reply_eligible[session] = False
             block_id = self._pending_block_id
             if block_id:
                 request["block_id"] = block_id
@@ -384,7 +419,12 @@ class AsphodelMemoryProvider(MemoryProvider):
             return ""
         if block_id and self._pending_block_id == block_id:
             self._pending_block_id = None
-        self._last_query[session] = query
+        with self._context_lock:
+            # A clear during the HTTP request must not restore local context.
+            if self._context_versions.get(session, 0) == version:
+                self._last_query[session] = query
+                self._last_reply.pop(session, None)
+                self._reply_eligible[session] = eligible
         result = result if isinstance(result, dict) else {}
         recall_id = result.get("recall_id")
         if recall_id:
@@ -414,16 +454,26 @@ class AsphodelMemoryProvider(MemoryProvider):
         messages: Optional[List[Dict[str, Any]]] = None,
         turn_author: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Ingests the turn when ``agent_context`` is ``primary`` and
+        """Keeps the bounded reply prefix only for an unambiguous latest query.
+        Ingests the turn when ``agent_context`` is ``primary`` and
         ``ingest`` is on. Builds the ``Turn`` body with :func:`build_turn`,
         ``POST``s it, and spools it on a connection failure or 5xx. After a
         2xx it replays the spool."""
         try:
+            session = session_id or self._session_id
+            # Never attach a late reply to a newer query. Text alone cannot
+            # distinguish repeated turns, including ones invalidated by a clear.
+            # This local capture is independent of ingestion and takes no I/O lock.
+            with self._context_lock:
+                if (
+                    self._last_query.get(session) == user_content
+                    and self._reply_eligible.get(session, False)
+                ):
+                    self._last_reply[session] = (assistant_content or "")[:RERANK_CONTEXT_CHARS]
             if self.client is None or self.config is None or not self.bank:
                 return
             if self._agent_context != PRIMARY_CONTEXT or not self.config.ingest:
                 return
-            session = session_id or self._session_id
             turn = self.build_turn(
                 user_content,
                 assistant_content,
@@ -543,7 +593,7 @@ class AsphodelMemoryProvider(MemoryProvider):
         without a request on a non-owner's turn. ``memory_recall`` returns the
         daemon's ``results`` list as JSON. A daemon error or an unreachable
         daemon returns ``tool_error``; ``memory_forget`` drops the session's
-        last prefetch query on success."""
+        last prefetch query and assistant reply on success."""
         try:
             return self._handle_tool_call(tool_name, args)
         except DaemonUnavailable:
@@ -595,7 +645,7 @@ class AsphodelMemoryProvider(MemoryProvider):
             result = self.client.forget(self.bank, ids, session, timeout=timeout)
             # The forget request isn't sent again as the next previous query.
             if session:
-                self._last_query.pop(session, None)
+                self._clear_reply_context(session)
         elif tool_name == tools.KEEP_TOOL:
             result = self.client.keep(self.bank, ids, timeout=timeout)
         else:
