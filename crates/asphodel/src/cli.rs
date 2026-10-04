@@ -1736,7 +1736,13 @@ fn print_model_view(view: &Value) {
             text(view, "last_error_at")
         );
     }
+    let mut heading: Option<&str> = None;
     for entry in list(view, "entry_views") {
+        let section = entry.get("section").and_then(Value::as_str);
+        if section.is_some() && section != heading {
+            println!("  ### {}", section.unwrap_or_default());
+        }
+        heading = section;
         let renders = if entry.get("renders").and_then(Value::as_bool) == Some(true) {
             ""
         } else {
@@ -1780,7 +1786,13 @@ fn print_model(model: &Value) {
             text(model, "last_error_at")
         );
     }
+    let mut heading: Option<&str> = None;
     for entry in list(model, "entries") {
+        let section = entry.get("section").and_then(Value::as_str);
+        if section.is_some() && section != heading {
+            println!("  ### {}", section.unwrap_or_default());
+        }
+        heading = section;
         let cites: Vec<&str> = list(entry, "cites")
             .iter()
             .filter_map(Value::as_str)

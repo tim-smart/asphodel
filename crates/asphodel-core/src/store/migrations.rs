@@ -21,7 +21,7 @@ use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
 
 /// The schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// How long a pre-migration copy is kept after its migration completes.
 pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
@@ -53,14 +53,19 @@ const MIGRATIONS: &[(u32, &str)] = &[
         12,
         include_str!("../../migrations/0012_document_removal.sql"),
     ),
+    (13, include_str!("../../migrations/0013_model_plans.sql")),
 ];
 
-/// The column a migration adds, by version. Every migration is safe to run
+/// The columns a migration adds, by version. Every migration is safe to run
 /// again over a store that already has what it adds, and SQLite has no
-/// `ADD COLUMN IF NOT EXISTS`, so a migration whose column is already there
-/// is skipped.
-const ADDED_COLUMNS: &[(u32, &str, &str)] =
-    &[(11, "recalls", "raw_query"), (12, "sources", "removed_at")];
+/// `ADD COLUMN IF NOT EXISTS`, so a migration whose columns are all already
+/// there is skipped.
+const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
+    (11, "recalls", "raw_query"),
+    (12, "sources", "removed_at"),
+    (13, "mental_models", "plan"),
+    (13, "mental_model_entries", "section"),
+];
 
 /// What one open applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,10 +170,13 @@ pub fn apply(
         if to <= current {
             continue;
         }
-        let added = match ADDED_COLUMNS.iter().find(|(version, ..)| *version == to) {
-            Some((_, table, column)) => has_column(&tx, table, column)?,
-            None => false,
-        };
+        let mut added = false;
+        for (_, table, column) in ADDED_COLUMNS.iter().filter(|(version, ..)| *version == to) {
+            added = has_column(&tx, table, column)?;
+            if !added {
+                break;
+            }
+        }
         if !added {
             tx.execute_batch(sql)?;
         }

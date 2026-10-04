@@ -187,3 +187,29 @@ on uncleaned queries.
 clear a document's text and mark each of its versions with the new
 `sources.removed_at`. The migration only adds the column. No action is
 needed.
+
+## Schema version 13: mental models in sections
+
+A refresh now plans the model's question into facets, recalls each one,
+and writes the whole summary as sections of cited sentences
+(`docs/operations.md`, "Mental models"). The migration adds
+`mental_models.plan` and `mental_model_entries.section`. Existing entries
+have no section and render as lines, as before, until their model's next
+refresh.
+
+The refresh fingerprint now includes the plan, so every model's next
+refresh writes again: one `write_model` call per model, plus one
+`plan_model` call for a model whose question isn't the seeded profile's.
+Those replace the `refresh_model` v2 call. Each refresh now logs one
+`refresh` recall row per facet, five for the seeded profile.
+
+The `[mental_models]` defaults change: `input_budget` 60 to 90 and
+`input_budget_with_cited` 70 to 100, with the new `max_facets` (6) and
+`facet_budget` (20). A tuning file that sets `input_budget_with_cited`
+below 90 without setting `input_budget` no longer validates.
+
+Replay: no recorded `refresh_model` record can stand in for a
+`write_model` call, so `--refresh recorded` finds nothing to substitute in
+a cassette recorded before this version. The first replay of private
+history after upgrading needs live refresh calls, which need their own
+authorization.

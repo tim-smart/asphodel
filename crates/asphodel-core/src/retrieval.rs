@@ -531,6 +531,50 @@ impl Reranking {
 const QUERY_EMBED_ATTEMPTS: usize = 2;
 
 impl Context<'_> {
+    /// Whether a query for `bank_id` could be embedded now: the bank's
+    /// recorded embedding model is one the daemon serves. A refresh checks
+    /// this before spending an LLM call on a plan it couldn't recall for.
+    pub(crate) fn check_serving(&self, bank_id: i64) -> Result<(), RecallError> {
+        let recorded = {
+            let conn = self.store.connection();
+            crate::reembed::recorded_model(&conn, bank_id)?
+        };
+        match crate::models::serving(self.models, self.previous, &recorded) {
+            Some(_) => Ok(()),
+            None => Err(RecallError::ModelUnavailable { model: recorded }),
+        }
+    }
+
+    /// [`Context::embed_query`] for several queries in one embedder call.
+    pub(crate) fn embed_queries(
+        &self,
+        bank_id: i64,
+        queries: &[&str],
+    ) -> Result<(Vec<Vec<f32>>, MutexGuard<'_, Connection>), RecallError> {
+        for _ in 0..QUERY_EMBED_ATTEMPTS {
+            let recorded = {
+                let conn = self.store.connection();
+                crate::reembed::recorded_model(&conn, bank_id)?
+            };
+            let embedder = crate::models::serving(self.models, self.previous, &recorded)
+                .ok_or_else(|| RecallError::ModelUnavailable {
+                    model: recorded.clone(),
+                })?;
+            let vectors = embedder
+                .embed(queries)
+                .map_err(|error| RecallError::Model { error })?;
+            let conn = self.store.connection();
+            if crate::reembed::recorded_model(&conn, bank_id)? == recorded {
+                return Ok((vectors, conn));
+            }
+            tracing::debug!(
+                bank_id,
+                "a re-embed swapped the bank while its queries were embedded"
+            );
+        }
+        Err(RecallError::ModelChanged)
+    }
+
     /// Embeds `query` with the model `bank_id` is served with, and returns
     /// the vector together with the store's connection, held, under which
     /// that model is still the one the bank records. The model
@@ -1252,10 +1296,11 @@ fn arm_ranks(id: i64, lists: &[Vec<i64>; 3], ranked: bool) -> Vec<ArmRank> {
         .collect()
 }
 
-/// How long a refresh waits for the reranker. A refresh is a daemon job
-/// and never runs inside a request, so it can wait its
-/// turn behind prefetch; past this it scores on strength alone.
-const REFRESH_RERANK_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a refresh waits for the reranker, across all of its facets. A
+/// refresh is a daemon job and never runs inside a request, so it can wait
+/// its turn behind prefetch; a facet reranked past this scores on strength
+/// alone, and the refresh goes on.
+pub(crate) const REFRESH_RERANK_DEADLINE: Duration = Duration::from_secs(60);
 
 /// A memory a mental model's refresh selected, with its score.
 pub(crate) struct Selected {
@@ -1263,83 +1308,139 @@ pub(crate) struct Selected {
     pub score: f64,
 }
 
-/// A refresh's selection: the model's question runs
-/// through the pipeline with injection's weighting, over the memories
-/// `keep` admits. Every fused candidate is reranked and scored, the best
-/// `budget` are taken, and then the memories in `cited` that `keep` still
-/// admits, best first, until there are `with_cited`. Keeping cited
-/// memories stops one that slips from 60th to 61st from leaving and coming
-/// back on alternate refreshes.
+/// A refresh's selection, one facet per query: each query runs through the
+/// pipeline with injection's weighting, over the memories `keep` admits.
+/// Every fused candidate is reranked and scored, the best `budget` are
+/// taken, and then the memories in `cited` that `keep` still admits, best
+/// first, until there are `with_cited`.
 ///
-/// The result is in score order, and the recall log gets one `refresh` row
-/// when `log` is set. A missed reranker scores every candidate as if its
-/// relevance were 0, so strength decides.
+/// The queries are embedded in one call and their candidates cleaned up
+/// in one pass over the bank, so a facet costs its search and its rerank.
+/// Each result is in score order, and the recall log gets one `refresh` row
+/// per query when `log` is set, with the query in `query` and `raw_query`
+/// alike. The facets share `deadline`: one whose rerank misses it scores
+/// every candidate as if its relevance were 0, so strength decides.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select(
     cx: &Context<'_>,
     bank_id: i64,
-    question: &str,
+    queries: &[&str],
     keep: &dyn Fn(&Candidate) -> bool,
     cited: &[i64],
     budget: usize,
     with_cited: usize,
     log: bool,
-) -> Result<Vec<Selected>, RecallError> {
+    deadline: Instant,
+) -> Result<Vec<Vec<Selected>>, RecallError> {
     let started = Instant::now();
     let now = cx.store.now();
-    let query = question.trim();
-    // The vector search runs on the connection the query's model was
+    let queries: Vec<&str> = queries.iter().map(|query| query.trim()).collect();
+    let asked: Vec<&str> = queries
+        .iter()
+        .copied()
+        .filter(|query| !query.is_empty())
+        .collect();
+    // The vector searches run on the connection the queries' model was
     // checked under, so a re-embed's swap can't come between them.
-    let (vector, conn) = if query.is_empty() {
-        (None, cx.store.connection())
+    let (mut vectors, conn) = if asked.is_empty() {
+        (Vec::new(), cx.store.connection())
     } else {
-        let (vector, conn) = cx.embed_query(bank_id, query)?;
-        (Some(vector), conn)
+        cx.embed_queries(bank_id, &asked)?
     };
-    let (found, cited) = {
+    vectors.reverse();
+    let found: Vec<(Vec<Candidate>, BTreeSet<i64>)> = {
         let conn = conn;
         let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning, now, keep)?;
-        let mut ids = match &vector {
-            Some(vector) => {
-                let lists = [
-                    cleanup.list(&arms::vector(&conn, bank_id, vector, CANDIDATES_PER_ARM)?)?,
-                    cleanup.list(&arms::bm25(&conn, bank_id, query, CANDIDATES_PER_ARM)?)?,
-                    cleanup.list(&arms::entity(
-                        &conn,
-                        bank_id,
-                        query,
-                        vector,
-                        CANDIDATES_PER_ARM,
-                    )?)?,
-                ];
-                fuse(&[
-                    lists[0].as_slice(),
-                    lists[1].as_slice(),
-                    lists[2].as_slice(),
-                ])
+        let cited_heads: BTreeSet<i64> = cleanup.list(cited)?.into_iter().collect();
+        let mut found = Vec::with_capacity(queries.len());
+        for query in &queries {
+            let vector = if query.is_empty() {
+                None
+            } else {
+                vectors.pop()
+            };
+            let mut ids = match &vector {
+                Some(vector) => {
+                    let lists = [
+                        cleanup.list(&arms::vector(&conn, bank_id, vector, CANDIDATES_PER_ARM)?)?,
+                        cleanup.list(&arms::bm25(&conn, bank_id, query, CANDIDATES_PER_ARM)?)?,
+                        cleanup.list(&arms::entity(
+                            &conn,
+                            bank_id,
+                            query,
+                            vector,
+                            CANDIDATES_PER_ARM,
+                        )?)?,
+                    ];
+                    fuse(&[
+                        lists[0].as_slice(),
+                        lists[1].as_slice(),
+                        lists[2].as_slice(),
+                    ])
+                }
+                None => Vec::new(),
+            };
+            for id in &cited_heads {
+                if !ids.contains(id) {
+                    ids.push(*id);
+                }
             }
-            None => Vec::new(),
-        };
-        let cited: BTreeSet<i64> = cleanup.list(cited)?.into_iter().collect();
-        for id in &cited {
-            if !ids.contains(id) {
-                ids.push(*id);
-            }
+            found.push((cleanup.take(&ids), cited_heads.clone()));
         }
-        (cleanup.take(&ids), cited)
+        found
     };
 
+    let mut selections = Vec::with_capacity(queries.len());
+    for (query, (found, cited)) in queries.iter().zip(found) {
+        let selected = rank_facet(cx, query, found, &cited, budget, with_cited, now, deadline);
+        if log {
+            let logged: Vec<Logged> = selected
+                .iter()
+                .map(|item| Logged {
+                    memory_id: item.candidate.id,
+                    score: Some(item.score),
+                    injected: false,
+                })
+                .collect();
+            log::write(
+                &mut cx.store.connection(),
+                &Entry {
+                    uuid: cx.store.new_id(),
+                    bank_id,
+                    kind: RecallKind::Refresh,
+                    session_id: None,
+                    query,
+                    raw_query: Some(query),
+                    latency_ms: elapsed_ms(started),
+                    at: now,
+                    results: &logged,
+                },
+            )?;
+        }
+        selections.push(selected);
+    }
+    Ok(selections)
+}
+
+/// One facet's candidates reranked for `query` and scored, best first:
+/// the best `budget`, then the memories in `cited`, best first, until
+/// there are `with_cited`.
+#[allow(clippy::too_many_arguments)]
+fn rank_facet(
+    cx: &Context<'_>,
+    query: &str,
+    found: Vec<Candidate>,
+    cited: &BTreeSet<i64>,
+    budget: usize,
+    with_cited: usize,
+    now: Timestamp,
+    deadline: Instant,
+) -> Vec<Selected> {
     let logits = if query.is_empty() {
         None
     } else {
         let documents = found.iter().map(|c| c.content.clone()).collect();
-        rerank::logits(
-            &cx.models.reranker,
-            cx.permit,
-            query,
-            documents,
-            Instant::now() + REFRESH_RERANK_DEADLINE,
-        )
+        rerank::logits(&cx.models.reranker, cx.permit, query, documents, deadline)
     };
     let ranking = &cx.tuning.ranking;
     let mut scored: Vec<(usize, Selected)> = found
@@ -1384,32 +1485,7 @@ pub(crate) fn select(
     }
     let room = with_cited.saturating_sub(selected.len());
     selected.extend(extras.into_iter().take(room));
-
-    if log {
-        let logged: Vec<Logged> = selected
-            .iter()
-            .map(|item| Logged {
-                memory_id: item.candidate.id,
-                score: Some(item.score),
-                injected: false,
-            })
-            .collect();
-        log::write(
-            &mut cx.store.connection(),
-            &Entry {
-                uuid: cx.store.new_id(),
-                bank_id,
-                kind: RecallKind::Refresh,
-                session_id: None,
-                query,
-                raw_query: None,
-                latency_ms: elapsed_ms(started),
-                at: now,
-                results: &logged,
-            },
-        )?;
-    }
-    Ok(selected)
+    selected
 }
 
 /// The memories linked to `entity` or to an entity merged into it, with the

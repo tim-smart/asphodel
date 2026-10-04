@@ -331,7 +331,15 @@ pub struct MentalModelsTuning {
     /// The daily sweep's bank-local time.
     pub sweep_time: Time,
 
-    /// Memories a refresh selects by score.
+    /// The most facets a planned question is split into. A plan with more
+    /// keeps the first this many.
+    pub max_facets: u32,
+
+    /// Memories each facet's retrieval takes, best first.
+    pub facet_budget: u32,
+
+    /// Memories a refresh selects in all, once duplicates are removed,
+    /// taking each facet's next best in turn.
     pub input_budget: u32,
 
     /// The input cap once the memories the model cites now are added.
@@ -347,8 +355,10 @@ impl Default for MentalModelsTuning {
             refresh_debounce_minutes: 5,
             refresh_max_delay_minutes: 30,
             sweep_time: Time::constant(4, 0, 0, 0),
-            input_budget: 60,
-            input_budget_with_cited: 70,
+            max_facets: 6,
+            facet_budget: 20,
+            input_budget: 90,
+            input_budget_with_cited: 100,
         }
     }
 }
@@ -703,6 +713,8 @@ impl Tuning {
                 "mental_models.refresh_debounce_minutes",
                 models.refresh_debounce_minutes,
             ),
+            ("mental_models.max_facets", models.max_facets),
+            ("mental_models.facet_budget", models.facet_budget),
             ("mental_models.input_budget", models.input_budget),
         ] {
             if value == 0 {

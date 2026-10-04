@@ -504,8 +504,50 @@ Only the owner defines mental models, through these commands or the API.
 - `asphodel model refresh --bank B <name> [--force]` refreshes now. It's
   skipped when the inputs haven't changed, unless `--force`.
 - `asphodel model show --bank B <name> [--entry ID]` answers "why does the
-  profile say X?": each entry with the memories it cites, and whether the
-  prompt block shows it.
+  profile say X?": each entry under its section heading, with the memories
+  it cites, and whether the prompt block shows it.
+
+A refresh asks one narrow question per part of the model's question, its
+facets, instead of one compound question, so a memory about one part isn't
+lost beneath results for the others:
+
+1. **Plan.** The seeded profile's question has its five facets built in:
+   preferences, people (with personal dates such as anniversaries), work
+   and home, platforms, and how to help. It costs no LLM call. Any other
+   question, including an edited profile question, is planned once by a
+   `plan_model` call that holds only the question and `[llm] language`, so
+   replay answers it by key. The plan, at most `mental_models.max_facets`
+   facets (6), is stored on the model before anything is recalled and made
+   again only when the question changes. A bank whose embedding model
+   isn't served fails the refresh before the plan call.
+2. **Recall.** Each facet runs one retrieval with the model's filters and
+   takes its best `mental_models.facet_budget` (20). Reranker scores for
+   different queries aren't comparable, so the input takes each facet's
+   next best in turn, skipping duplicates, up to `input_budget` (90), and
+   then the memories the model cites that still qualify, up to
+   `input_budget_with_cited` (100). The facets share one 60-second
+   reranker deadline; a facet past it is scored on strength alone and the
+   refresh goes on. Each facet writes one `refresh` row to the recall log,
+   its query in both `query` and `raw_query`, and no access.
+3. **Write.** One `write_model` call gets the question, the facets, the
+   memories under the facet that found each, and the current entries as
+   the previous summary, and returns the whole summary as sections of
+   sentences citing memories. Code refuses a sentence citing outside the
+   input, citing nothing, or with no text. A sentence whose text matches
+   an entry keeps that entry's id, and one citing exactly what an entry
+   cited keeps its id under new words, but citations and section always
+   come from the write. What the write leaves out is removed. Over
+   `max_tokens`, headings included, the lowest-ranked entries are trimmed.
+
+A refresh is skipped, unless forced, when its inputs haven't changed: the
+selection, the question, the plan, the filters and the size. A changed
+question always writes again, even when it plans the same facets.
+
+The prompt block renders each section as a heading and a paragraph. A
+sentence citing a low-confidence state says how old it is after it, as
+"(as of 30 days ago, Tue 1 Sep)". The token caps are unchanged, so the
+500-token profile is a few short paragraphs. An entry written before
+sections renders as a line until its model's next refresh.
 
 ### Health and failures
 
