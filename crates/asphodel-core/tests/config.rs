@@ -327,11 +327,17 @@ fn quiet_rate_must_keep_bank_time_moving() {
 }
 
 #[test]
-fn llm_concurrency_defaults_to_one_and_is_at_least_one() {
-    // At 1, extraction runs one LLM call at a time, as before the pool.
+fn llm_concurrency_defaults_to_ten() {
+    assert_eq!(Tuning::default().llm.concurrency, 10);
+    assert_eq!(load("").unwrap().llm.concurrency, 10);
+    assert_eq!(load("[llm]\n").unwrap().llm.concurrency, 10);
+}
+
+#[test]
+fn llm_concurrency_accepts_explicit_overrides_and_is_at_least_one() {
     let concurrency =
         |tuning: &Tuning| serde_json::to_value(tuning).unwrap()["llm"]["concurrency"].clone();
-    assert_eq!(concurrency(&Tuning::default()), 1);
+    assert_eq!(concurrency(&load("[llm]\nconcurrency = 1\n").unwrap()), 1);
     assert_eq!(concurrency(&load("[llm]\nconcurrency = 5\n").unwrap()), 5);
     for value in ["0", "-1", "1.5"] {
         assert_rejected(&format!("[llm]\nconcurrency = {value}\n"));

@@ -710,6 +710,77 @@ fn the_self_test_passes_for_fast_with_zero_misses() {
 
 // Priming call 1.
 
+/// Omission keeps priming off; an explicit value wins over the bare
+/// flag's default of ten. All three forms are visible in the report.
+#[test]
+fn prime_concurrency_is_opt_in_with_a_bare_default_of_ten() {
+    for (name, prime_flags, expected) in [
+        ("omitted", vec![], serde_json::json!(null)),
+        (
+            "explicit",
+            vec!["--prime-concurrency", "2"],
+            serde_json::json!(2),
+        ),
+        ("bare", vec!["--prime-concurrency"], serde_json::json!(10)),
+    ] {
+        let dir = TestDir::new();
+        let corpus = imported_small_history(&dir);
+        let script = live_script(&dir);
+        let flags = call1_only(&dir);
+        let mut flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+        flags.extend(prime_flags);
+        let run = replay_history(
+            &dir,
+            &corpus,
+            "fast",
+            PASSING_PROBES,
+            name,
+            Some(&script),
+            &flags,
+        );
+        assert_ok(&run.output);
+        let report = run.report();
+        assert_eq!(report["flags"]["prime_concurrency"], expected, "{report}");
+        if expected.is_null() {
+            assert_eq!(report["llm"]["primed"], 0, "{report}");
+            assert!(report["llm"]["live"].as_u64().unwrap() > 0, "{report}");
+        } else {
+            assert!(report["llm"]["primed"].as_u64().unwrap() > 0, "{report}");
+            assert_eq!(report["llm"]["misses"], 0, "{report}");
+        }
+    }
+}
+
+#[test]
+fn bare_prime_concurrency_is_refused_outside_fast_and_in_scenarios() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    for mode in ["live", "replay"] {
+        let run = replay_history(
+            &dir,
+            &corpus,
+            mode,
+            PASSING_PROBES,
+            mode,
+            None,
+            &["--prime-concurrency"],
+        );
+        assert_refused(&run.output, "fast");
+        assert!(!run.report_path.exists(), "a refused run writes no report");
+    }
+    for flags in [
+        vec!["--prime-concurrency", "2"],
+        vec!["--prime-concurrency"],
+    ] {
+        let output = asphodel(&dir)
+            .args(["replay", "--scenario", "unused.toml"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert_refused(&output, "--scenario");
+    }
+}
+
 /// The flags that keep a `fast` run on the small history to call 1 alone:
 /// the reranker gate shut, so nothing is injected and no pair needs a
 /// top-up, and refreshes answered with no edits.
