@@ -1152,6 +1152,67 @@ fn old_id_labels_convert_to_keyed_labels_that_score_another_run() {
     assert_rerecorded_recall(&curve);
 }
 
+/// A conversion can keep nothing: every call 2 label on material from
+/// before keys were recorded is dropped, and so are recall labels judging
+/// one query and memory both ways. Each loss is counted, and the file it
+/// writes is still keyed labels, which `replay --labels` accepts rather
+/// than asking for another conversion.
+#[test]
+fn a_conversion_that_keeps_nothing_counts_its_losses_and_stays_keyed() {
+    let dir = TestDir::new();
+    // The second recall sample asks the first's query, and its first
+    // candidate is the first's memory, so r01.1 and r02.1 judge one key.
+    let mut material = hand_material();
+    material["recall"][1]["query"] = material["recall"][0]["query"].clone();
+    material["recall"][1]["candidates"][0]["memory"] =
+        material["recall"][0]["candidates"][0]["memory"].clone();
+    let old_material = dir.private_file(
+        "labelling/material.json",
+        &serde_json::to_string_pretty(&material).unwrap(),
+    );
+    let old_labels = dir.private_file(
+        "labelling/labels.toml",
+        "\"r01.1\" = true\n\"r02.1\" = false\n\"c01.1\" = true\n\"c01.2\" = false\n\"c02.1\" = true\n",
+    );
+    let converted = dir.private_path("labelling/converted.toml");
+    let output = asphodel(&dir)
+        .args(["report", "precision", "--labels"])
+        .arg(&old_labels)
+        .arg("--material")
+        .arg(&old_material)
+        .arg("--convert")
+        .arg(&converted)
+        .output()
+        .unwrap();
+    assert_ok(&output);
+    let curve: Value = serde_json::from_str(&stdout(&output)).expect("the curve is JSON");
+    assert_eq!(
+        curve["converted"],
+        json!({ "recall": 0, "call2": 0, "dropped_call2": 3, "conflicting": 2 }),
+        "{curve}"
+    );
+
+    let corpus = imported_small_history(&dir);
+    record(&dir, &corpus);
+    let material_path = dir.private_path("labelling/next.json");
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "replay",
+        PASSING_PROBES,
+        "next",
+        None,
+        &[
+            "--labelling",
+            material_path.to_str().unwrap(),
+            "--labels",
+            converted.to_str().unwrap(),
+        ],
+    );
+    assert_ok(&run.output);
+    assert!(material_path.exists(), "the material is written");
+}
+
 /// The query of a turn of [`labelling_history`], as cleaned for the
 /// reranker.
 fn labelling_query(turn: usize) -> String {
