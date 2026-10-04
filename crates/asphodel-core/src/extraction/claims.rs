@@ -595,7 +595,8 @@ fn infer_annual_start(rule: &str, tz_name: &str, tz: &TimeZone, from: Timestamp)
         return None;
     }
     let anchor = start_of_day(from, tz)?;
-    next_occurrence(rule, anchor, tz_name, tz, from).map(|at| Stamp {
+    // Day-precision occasions include today, even when learned after midnight.
+    next_occurrence(rule, anchor, tz_name, tz, anchor).map(|at| Stamp {
         at,
         precision: Precision::Day,
     })
