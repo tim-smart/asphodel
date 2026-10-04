@@ -201,6 +201,89 @@ significance = "minor"
 
 // The fixtures, checked now.
 
+// Usage is counted per injected memory, not per turn or LLM call. Unjudged
+// memories are excluded from the fraction; zero judged is reported as 0.0.
+#[test]
+fn injection_usage_counts_mixed_verdicts_in_report_and_aggregate() {
+    let dir = TestDir::new();
+    let aggregate = dir.path("usage-aggregate.json");
+    let run = replay(
+        &dir,
+        &scenario("injection-usage"),
+        &["--aggregate", aggregate.to_str().unwrap()],
+    );
+    run.assert_passed();
+    let export: Value = serde_json::from_slice(&fs::read(aggregate).unwrap()).unwrap();
+    let expected = serde_json::json!({
+        "used": 1, "not_used": 3, "unjudged": 0, "used_fraction": 0.25
+    });
+    for (name, report) in [("report", run.report()), ("aggregate", &export)] {
+        assert_eq!(report["injection_usage"], expected, "{name}");
+    }
+}
+
+#[test]
+fn injection_usage_with_zero_judged_memories_has_a_finite_zero_fraction() {
+    let dir = TestDir::new();
+    let path = inline(&dir, "no-injection", HOME_TURN);
+    let aggregate = dir.path("empty-aggregate.json");
+    let run = replay(&dir, &path, &["--aggregate", aggregate.to_str().unwrap()]);
+    run.assert_passed();
+    let export: Value = serde_json::from_slice(&fs::read(aggregate).unwrap()).unwrap();
+    let expected = serde_json::json!({
+        "used": 0, "not_used": 0, "unjudged": 0, "used_fraction": 0.0
+    });
+    for (name, report) in [("report", run.report()), ("aggregate", &export)] {
+        assert_eq!(report["injection_usage"], expected, "{name}");
+    }
+}
+
+#[test]
+fn report_diff_includes_injection_usage_counts_and_fraction() {
+    let dir = TestDir::new();
+    // Synthetic reports isolate the diff contract. In B, two unjudged
+    // injections do not dilute the fraction: 1 / (1 + 3) = 0.25, not 1/6.
+    let a = dir.file(
+        "usage-a.json",
+        r#"{
+        "injection_usage": {"used": 0, "not_used": 0, "unjudged": 0, "used_fraction": 0.0}
+    }"#,
+    );
+    let b = dir.file(
+        "usage-b.json",
+        r#"{
+        "injection_usage": {"used": 1, "not_used": 3, "unjudged": 2, "used_fraction": 0.25}
+    }"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_asphodel"))
+        .args(["report", "diff"])
+        .arg(a)
+        .arg(b)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let diff: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let numbers = diff["numbers"].as_array().unwrap();
+    for (field, before, after) in [
+        ("used", 0.0, 1.0),
+        ("not_used", 0.0, 3.0),
+        ("unjudged", 0.0, 2.0),
+        ("used_fraction", 0.0, 0.25),
+    ] {
+        let path = format!("injection_usage.{field}");
+        let change = numbers
+            .iter()
+            .find(|change| change["path"] == path)
+            .unwrap_or_else(|| panic!("diff omits {path}: {diff}"));
+        assert_eq!(change["a"].as_f64(), Some(before));
+        assert_eq!(change["b"].as_f64(), Some(after));
+    }
+}
+
 #[test]
 fn every_checked_in_scenario_parses_and_resolves_its_labels() {
     let mut seen = 0;
