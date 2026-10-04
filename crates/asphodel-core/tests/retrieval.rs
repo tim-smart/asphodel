@@ -171,6 +171,85 @@ impl Reranker for KeywordReranker {
     }
 }
 
+/// A reranker that scores like `FakeReranker`, but only on what reaches
+/// the model: the query and the document as one pair of at most 512 tokens,
+/// three of them special, the longer side truncated first and from its end,
+/// as fastembed sets up the real one. Each CJK character is a token, as the
+/// real tokenizer splits them; otherwise each run of letters and digits and
+/// each other character is one. `real_reranker_truncates_a_long_query_from_its_end`
+/// in `tests/models.rs` checks the real one behaves this way.
+struct TruncatingReranker;
+
+impl TruncatingReranker {
+    const MAX_TOKENS: usize = 512 - 3;
+
+    fn tokens(text: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut word = String::new();
+        for c in text.chars() {
+            let cjk = matches!(c, '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}');
+            if c.is_alphanumeric() && !cjk {
+                word.extend(c.to_lowercase());
+                continue;
+            }
+            if !word.is_empty() {
+                tokens.push(std::mem::take(&mut word));
+            }
+            if !c.is_whitespace() {
+                tokens.push(c.to_string());
+            }
+        }
+        if !word.is_empty() {
+            tokens.push(word);
+        }
+        tokens
+    }
+
+    /// How many of each side's tokens survive: the longer side is cut to
+    /// fit, or both to half when even the shorter is more than half.
+    fn kept(query: usize, document: usize) -> (usize, usize) {
+        let max = Self::MAX_TOKENS;
+        if query + document <= max {
+            return (query, document);
+        }
+        let short = query.min(document);
+        let (short, long) = if short > max / 2 {
+            (max / 2, max / 2 + max % 2)
+        } else {
+            (short, max - short)
+        };
+        if query <= document {
+            (short, long)
+        } else {
+            (long, short)
+        }
+    }
+}
+
+impl Reranker for TruncatingReranker {
+    fn model_id(&self) -> &str {
+        FakeReranker::MODEL_ID
+    }
+
+    fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, ModelError> {
+        let query = Self::tokens(query);
+        Ok(documents
+            .iter()
+            .map(|document| {
+                let document = Self::tokens(document);
+                let (q, d) = Self::kept(query.len(), document.len());
+                let seen: std::collections::BTreeSet<&String> = query[..q].iter().collect();
+                let shared: std::collections::BTreeSet<&String> = document[..d]
+                    .iter()
+                    .filter(|token| token.chars().any(char::is_alphanumeric))
+                    .filter(|token| seen.contains(token))
+                    .collect();
+                shared.len() as f32 - 0.5
+            })
+            .collect())
+    }
+}
+
 /// A memory to insert. `Default` is a notable fact said at [`EARLIER`],
 /// with high window confidence and its `created` access then.
 #[derive(Clone)]
@@ -907,6 +986,26 @@ fn a_long_context_without_spaces_or_in_another_script_is_cut_to_whole_characters
         );
         assert!(text.starts_with(start), "{start:?}");
     }
+}
+
+/// However long the previous message and the reply, the message still
+/// reaches the reranker: the conversation's context gives way to it within
+/// the reranker's 512 tokens. 300 characters of CJK are 300 tokens, so two
+/// such parts alone are more than the pair holds.
+#[test]
+fn the_message_reaches_the_reranker_past_a_long_conversation() {
+    let h = Harness::with(
+        1.0,
+        "rerank_query = \"conversation\"",
+        Arc::new(TruncatingReranker),
+    );
+    let pottery = h.insert(fact("Tim takes a pottery class."));
+    let message = "pottery class schedule please";
+    assert_eq!(h.prefetch("alone", message).injected, vec![pottery]);
+
+    let context = "東京".repeat(150);
+    let prefetch = h.prefetch_in_conversation("s", message, Some(&context), Some(&context));
+    assert_eq!(prefetch.injected, vec![pottery], "{prefetch:?}");
 }
 
 /// A short follow-up still borrows the previous message for the retrievers,
