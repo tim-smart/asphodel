@@ -287,6 +287,7 @@ fn check_claim(
     let mut valid_from = time(claim.valid_from);
     let mut valid_until = time(claim.valid_until);
     let mut due_at = time(claim.due_at);
+    let has_recurrence_start = claim.recurrence_start.is_some();
     let mut recurrence_start = time(claim.recurrence_start);
     let mut until_event = non_empty(claim.until_event);
     let mut volatility = claim.volatility;
@@ -320,6 +321,13 @@ fn check_claim(
     }
 
     if claim.kind == Kind::Recurring {
+        // Do not repair an explicit but invalid start or guess an interval
+        // phase. Only a fully specified annual calendar date can start itself.
+        if !has_recurrence_start {
+            recurrence_start = recurrence_rrule
+                .as_deref()
+                .and_then(|rule| infer_annual_start(rule, &input.timezone, tz, input.observed_at));
+        }
         // The RRULE is kept only when it parses and recurs in the
         // year after the reference date, from a first occurrence.
         let recurs = match (&recurrence_rrule, recurrence_start) {
@@ -552,36 +560,87 @@ fn strip_rrule_prefix(rule: &str) -> &str {
     rule.strip_prefix("RRULE:").unwrap_or(rule)
 }
 
+/// A deliberately narrow inference: one month and one positive month day,
+/// every year. Other selectors, counts, time-of-day fields and interval
+/// phases need a stated start. Midnight is a day-precision anchor, not an
+/// inferred appointment time. The recurrence library still validates the rule
+/// and finds the next real date (rather than normalizing an impossible date).
+fn infer_annual_start(rule: &str, tz_name: &str, tz: &TimeZone, from: Timestamp) -> Option<Stamp> {
+    let mut seen = BTreeSet::new();
+    for part in strip_rrule_prefix(rule).split(';') {
+        let (key, value) = part.split_once('=')?;
+        if !seen.insert(key) {
+            return None;
+        }
+        match key {
+            "FREQ" if value == "YEARLY" => {}
+            "INTERVAL" if value == "1" => {}
+            "BYMONTH"
+                if value
+                    .parse::<u8>()
+                    .ok()
+                    .is_some_and(|n| (1..=12).contains(&n)) => {}
+            "BYMONTHDAY"
+                if value
+                    .parse::<u8>()
+                    .ok()
+                    .is_some_and(|n| (1..=31).contains(&n)) => {}
+            _ => return None,
+        }
+    }
+    if !["FREQ", "BYMONTH", "BYMONTHDAY"]
+        .iter()
+        .all(|key| seen.contains(key))
+    {
+        return None;
+    }
+    let anchor = start_of_day(from, tz)?;
+    // Day-precision occasions include today, even when learned after midnight.
+    next_occurrence(rule, anchor, tz_name, tz, anchor).map(|at| Stamp {
+        at,
+        precision: Precision::Day,
+    })
+}
+
 /// Whether `rule`, starting at `start` in the source's timezone, parses and
 /// has an occurrence in the year from `from`.
 fn recurs(rule: &str, start: Timestamp, tz_name: &str, tz: &TimeZone, from: Timestamp) -> bool {
+    next_occurrence(rule, start, tz_name, tz, from).is_some()
+}
+
+fn next_occurrence(
+    rule: &str,
+    start: Timestamp,
+    tz_name: &str,
+    tz: &TimeZone,
+    from: Timestamp,
+) -> Option<Timestamp> {
     let rule = strip_rrule_prefix(rule);
     // One RRULE line and nothing else: no DTSTART, EXRULE or RDATE smuggled
     // in on another line.
     if rule.is_empty() || rule.contains(['\n', '\r', ':']) {
-        return false;
+        return None;
     }
     let local = start.to_zoned(tz.clone()).datetime();
     let text = format!(
         "DTSTART;TZID={tz_name}:{}\nRRULE:{rule}",
         local.strftime("%Y%m%dT%H%M%S")
     );
-    let Ok(set) = text.parse::<rrule::RRuleSet>() else {
-        return false;
-    };
-    let Some(until) = from
+    let set = text.parse::<rrule::RRuleSet>().ok()?;
+    let until = from
         .to_zoned(tz.clone())
         .checked_add(1.year())
         .ok()
-        .map(|zoned| zoned.timestamp())
-    else {
-        return false;
-    };
+        .map(|zoned| zoned.timestamp())?;
     let utc = |at: Timestamp| rrule::Tz::UTC.timestamp_opt(at.as_second(), 0).single();
-    let (Some(after), Some(before)) = (utc(from), utc(until)) else {
-        return false;
-    };
-    !set.after(after).before(before).all(1).dates.is_empty()
+    let next = set
+        .after(utc(from)?)
+        .before(utc(until)?)
+        .all(1)
+        .dates
+        .into_iter()
+        .next()?;
+    Timestamp::from_second(next.timestamp()).ok()
 }
 
 /// A link as code resolved it. Names and surface forms are composed (NFC)
