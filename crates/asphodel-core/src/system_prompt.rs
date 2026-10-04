@@ -35,8 +35,18 @@
 //!   and the session is mapped to that block then, even if the cache has
 //!   rebuilt since. The block's entries are also what a turn's snapshot
 //!   takes, so call 1 is shown the entries the session could see.
+//! - **The agenda update.** Hermes rebuilds the prompt only on compaction,
+//!   so a long-lived session's agenda goes stale. Prefetch, which runs every
+//!   turn, puts an `Agenda update for <date>` section ahead of relevance
+//!   injection when the session's block maps to an earlier bank-local day
+//!   than today, or the agenda lists items the session's in-context set
+//!   doesn't hold ([`agenda_update`]). It lists only those items, the
+//!   whole section within `agenda.update_budget` tokens, shortening the
+//!   first item if it must, and is held and committed through the
+//!   prefetch's `recall_id` like the injection. A stale day with nothing
+//!   missing gets the date alone, once. A session with no mapping gets none.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use jiff::civil::Date;
@@ -51,7 +61,7 @@ use crate::config::Tuning;
 use crate::mental_models::{load_entries, load_models};
 use crate::retrieval::candidates::Cleanup;
 use crate::retrieval::estimate_tokens;
-use crate::retrieval::format;
+use crate::retrieval::format::{self, Line};
 use crate::store::strength::world_time;
 use crate::store::{Store, micros, timestamp};
 
@@ -308,7 +318,7 @@ impl Shown {
     /// The agenda's section, or `None` when it lists nothing.
     fn section(&self, agenda: &Built, now: Timestamp, tz: &TimeZone) -> Option<String> {
         let mut lines = Vec::new();
-        let dated: Vec<&String> = agenda
+        let dated: Vec<&Line> = agenda
             .dated
             .iter()
             .zip(&self.dated)
@@ -318,18 +328,22 @@ impl Shown {
             lines.push(agenda_heading(
                 &now.to_zoned(tz.clone()).strftime("%a %-d %b").to_string(),
             ));
-            lines.extend(dated.into_iter().cloned());
+            lines.extend(dated.into_iter().map(Line::render));
             if self.folded > 0 {
                 lines.push(fold_summary(self.folded));
             }
         }
         if self.routines > 0 {
             lines.push("Routines".to_owned());
-            lines.extend(agenda.routines[..self.routines].iter().cloned());
+            lines.extend(agenda.routines[..self.routines].iter().map(Line::render));
         }
         if self.undated_tasks > 0 {
             lines.push("Open tasks".to_owned());
-            lines.extend(agenda.undated_tasks[..self.undated_tasks].iter().cloned());
+            lines.extend(
+                agenda.undated_tasks[..self.undated_tasks]
+                    .iter()
+                    .map(Line::render),
+            );
         }
         (!lines.is_empty()).then(|| lines.join("\n"))
     }
@@ -452,6 +466,221 @@ pub(crate) fn mapped(
         return Ok(None);
     }
     Ok(Some(serde_json::from_str(&ids).unwrap_or_default()))
+}
+
+/// When the session's block was built, or `None` when the session has no
+/// live mapping.
+pub(crate) fn mapped_built_at(
+    conn: &Connection,
+    bank_id: i64,
+    session: &str,
+    now: Timestamp,
+    expiry: SignedDuration,
+) -> Result<Option<Timestamp>, rusqlite::Error> {
+    let found: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT built_at, last_turn_at FROM session_blocks
+             WHERE bank_id = ?1 AND session_id = ?2",
+            (bank_id, session),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(found
+        .filter(|(_, last_turn_at)| !expired(timestamp(*last_turn_at), now, expiry))
+        .map(|(built_at, _)| timestamp(built_at)))
+}
+
+/// An agenda update for prefetch to send ahead of relevance injection.
+#[derive(Debug)]
+pub(crate) struct AgendaUpdate {
+    pub text: String,
+    /// The memories it lists, which join the in-context set once a turn
+    /// commits it.
+    pub memories: Vec<Uuid>,
+    /// The bank-local date it brings the session's agenda up to.
+    pub date: Date,
+}
+
+/// The agenda update for a session whose agenda is current as of `as_of`,
+/// the later of the day its block was built for and the date of the last
+/// update it committed. `None` when the agenda lists nothing outside
+/// `in_context` and `as_of` is today.
+///
+/// It lists the agenda's items missing from `in_context` in the block's
+/// order and groups, and counts the rest, all within
+/// `agenda.update_budget` tokens: header, headings, lines and count. The
+/// first item is always listed, shortened to fit if it must
+/// ([`shorten`]), so an update always moves the session forward. With
+/// nothing missing on a later day, it says so under the date; validation
+/// keeps the budget large enough for that.
+pub(crate) fn agenda_update(
+    conn: &Connection,
+    tuning: &Tuning,
+    bank_id: i64,
+    tz: &TimeZone,
+    now: Timestamp,
+    as_of: Date,
+    in_context: &BTreeSet<Uuid>,
+) -> Result<Option<AgendaUpdate>, rusqlite::Error> {
+    let today = now.to_zoned(tz.clone()).date();
+    let built = crate::agenda::build(conn, tuning, bank_id, tz, now)?;
+    let missing = |ids: &[Uuid], lines: &[Line]| -> Vec<(Uuid, Line)> {
+        ids.iter()
+            .zip(lines)
+            .filter(|(id, _)| !in_context.contains(id))
+            .map(|(id, line)| (*id, line.clone()))
+            .collect()
+    };
+    let groups = [
+        (None, missing(&built.agenda.dated, &built.dated)),
+        (
+            Some("Routines"),
+            missing(&built.agenda.routines, &built.routines),
+        ),
+        (
+            Some("Open tasks"),
+            missing(&built.agenda.undated_tasks, &built.undated_tasks),
+        ),
+    ];
+    let total: usize = groups.iter().map(|(_, items)| items.len()).sum();
+    if total == 0 && as_of >= today {
+        return Ok(None);
+    }
+
+    let budget = tuning.agenda.update_budget as usize;
+    // Whether `lines`, with the count of the `rest` left out, fit.
+    let fits = |lines: &[String], rest: usize| -> bool {
+        let mut text = lines.join("\n");
+        if rest > 0 {
+            text.push('\n');
+            text.push_str(&more(rest));
+        }
+        estimate_tokens(&text) <= budget
+    };
+    let mut lines = vec![format!(
+        "Agenda update for {}",
+        now.to_zoned(tz.clone()).strftime("%a %-d %b")
+    )];
+    let mut memories = Vec::new();
+    'groups: for (heading, items) in &groups {
+        let mut headed = false;
+        for (id, line) in items {
+            let mut with = lines.clone();
+            if let (Some(heading), false) = (heading, headed) {
+                with.push((*heading).to_owned());
+            }
+            let rest = total - memories.len() - 1;
+            let mut whole = with.clone();
+            whole.push(line.render());
+            if fits(&whole, rest) {
+                lines = whole;
+            } else if memories.is_empty() {
+                let shortened = shorten(line, |candidate| {
+                    let mut tried = with.clone();
+                    tried.push(candidate.to_owned());
+                    fits(&tried, rest)
+                });
+                with.push(shortened);
+                lines = with;
+            } else {
+                break 'groups;
+            }
+            headed = true;
+            memories.push(*id);
+        }
+    }
+    let rest = total - memories.len();
+    if total == 0 {
+        lines.push("- Nothing new since this session's agenda.".to_owned());
+    } else if rest > 0 {
+        lines.push(more(rest));
+    }
+    Ok(Some(AgendaUpdate {
+        text: lines.join("\n"),
+        memories,
+        date: today,
+    }))
+}
+
+/// The update's count of the items it left for a later turn.
+fn more(rest: usize) -> String {
+    format!(
+        "- and {rest} more agenda item{}",
+        if rest == 1 { "" } else { "s" }
+    )
+}
+
+/// The fewest characters of the sentence worth keeping beside annotations.
+/// Below it, annotations give way to the sentence.
+const SHORTENED_SENTENCE_MIN: usize = 20;
+
+/// `line` shortened until `fits` takes it: the sentence is cut, at a word
+/// boundary when one keeps at least half of what fits and mid-word when
+/// none does, and ends in "…". The annotations stay whole, since the date
+/// is what an update carries. When they leave too little of the sentence,
+/// only the first (the phase and its date) is kept, and then none. With no
+/// room even for that, it's "- …".
+fn shorten(line: &Line, fits: impl Fn(&str) -> bool) -> String {
+    let mut counts = vec![line.annotations.len()];
+    if line.annotations.len() > 1 {
+        counts.push(1);
+    }
+    if !line.annotations.is_empty() {
+        counts.push(0);
+    }
+    for count in counts {
+        let suffix = line.suffix(count);
+        let min = if count == 0 {
+            1
+        } else {
+            SHORTENED_SENTENCE_MIN
+        };
+        if let Some(text) = cut(&line.sentence, &suffix, min, &fits) {
+            return text;
+        }
+    }
+    "- …".to_owned()
+}
+
+/// The longest `- <start of sentence>…<suffix>` that `fits` takes, keeping
+/// at least `min` characters of the sentence, or `None`.
+fn cut(sentence: &str, suffix: &str, min: usize, fits: &impl Fn(&str) -> bool) -> Option<String> {
+    let whole = format!("- {sentence}{suffix}");
+    if fits(&whole) {
+        return Some(whole);
+    }
+    let chars: Vec<char> = sentence.chars().collect();
+    let render = |kept: &[char]| -> String {
+        let start: String = kept.iter().collect();
+        let start = start.trim_end_matches(|c: char| c.is_whitespace() || ",;:-".contains(c));
+        format!("- {start}…{suffix}")
+    };
+    // A longer start never renders shorter, so the most that fits is
+    // found by bisection.
+    let (mut low, mut high) = (0, chars.len());
+    if !fits(&render(&chars[..0])) {
+        return None;
+    }
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if fits(&render(&chars[..middle])) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    // The text after the last space would be a broken word, unless the
+    // cut falls just before a space. With no space in the second half of
+    // what fits, the cut is mid-word.
+    let end = if low == chars.len() || chars[low].is_whitespace() {
+        low
+    } else {
+        match chars[..low].iter().rposition(|c| c.is_whitespace()) {
+            Some(at) if at * 2 >= low => at,
+            _ => low,
+        }
+    };
+    (end >= min.min(chars.len())).then(|| render(&chars[..end]))
 }
 
 /// The block-id fallback: when Hermes gave no session

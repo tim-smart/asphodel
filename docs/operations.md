@@ -343,6 +343,24 @@ against the current message plus bounded starts of the previous query
 and reply. It trims context and cuts each start to `RERANK_CONTEXT_CHARS`
 (300), cutting back to whitespace where possible.
 
+Hermes freezes the prompt block for a session and rebuilds it only on
+compaction, so a long-lived chat's agenda goes stale. When the session
+holds a block, prefetch's `text` can start with an `Agenda update for
+<date>` section ahead of the `Recalled …` injection. It appears when the
+bank-local day has moved past the day the block was built for, or when
+the agenda lists items the session hasn't seen. It lists only those
+items, and counts any that don't fit for a later turn, with the whole
+section (header and count included) within `agenda.update_budget` tokens.
+The default is 200 and the minimum is 40. The first item is always
+listed, so each update makes progress. When that item doesn't fit whole,
+its sentence is shortened, at a word boundary where one keeps enough of
+it and mid-word otherwise, and ends in "…". Its annotations, such as
+`[upcoming Sat 3 Oct]`, stay. If they leave too little of the sentence,
+only the date is kept, then nothing. On a later day with nothing new, the
+update carries the date alone. Like the injection, it joins the session's in-context set only
+when a `sync_turn` echoes the prefetch's `recall_id`, so it's sent once.
+A session with no block mapping never gets one.
+
 Query and reply context are isolated by session, including an explicit
 `session_id` on a delayed `sync_turn`. An ordinary session switch retains
 each session's context for a later return. Compression, reset and rewind

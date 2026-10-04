@@ -38,7 +38,7 @@ use uuid::Uuid;
 use crate::config::{SignificanceTuning, Tuning};
 use crate::constants::TAU;
 use crate::retrieval::candidates::Cleanup;
-use crate::retrieval::format;
+use crate::retrieval::format::{self, Line};
 use crate::store::strength::{StrengthLoader, memory_kind, significance_value, world_time};
 use crate::store::timestamp;
 use crate::strength::{AccessKind, Kind, WorldTime, unit_end};
@@ -70,9 +70,9 @@ impl Agenda {
 /// are in the same order as the agenda's ids.
 pub(crate) struct Built {
     pub agenda: Agenda,
-    pub dated: Vec<String>,
-    pub routines: Vec<String>,
-    pub undated_tasks: Vec<String>,
+    pub dated: Vec<Line>,
+    pub routines: Vec<Line>,
+    pub undated_tasks: Vec<Line>,
     /// Indexes into `dated`, in the order they'd fold next: faded first,
     /// then the least significant, then the furthest from today. The block
     /// folds in this order when the agenda alone is over its budget.
@@ -272,12 +272,12 @@ pub(crate) fn build(
     let keep_all = |_: &crate::retrieval::candidates::Candidate| true;
     let mut cleanup = Cleanup::new(conn, bank_id, tuning, now, &keep_all)?;
     cleanup.list(&all)?;
-    let mut lines = |indices: &[usize]| -> Vec<String> {
+    let mut lines = |indices: &[usize]| -> Vec<Line> {
         let ids: Vec<i64> = indices.iter().map(|index| rows[*index].id).collect();
         cleanup
             .take(&ids)
             .iter()
-            .map(|candidate| format::line(candidate, now))
+            .map(|candidate| format::line_parts(candidate, now))
             .collect()
     };
     let built = Built {
