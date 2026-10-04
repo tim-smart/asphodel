@@ -747,8 +747,15 @@ ascending order. At each point's `floor`, `kept` counts the labelled
 candidates scoring at or above it, `relevant` counts those labelled
 `true`, and `precision` is `relevant / kept`. For recall this matches the
 gate's logit comparison. For call 2 it is a score-threshold curve over
-observed candidates, not a prediction for another reconcile floor. The
-curve is numbers only.
+observed candidates, not a prediction for another reconcile floor.
+
+For `recall` it also prints `top8`: `found` counts the candidates labelled
+`true` that rank in their sample's top 8 by score (logit), highest first
+and ties in the material's order, and `relevant` counts every candidate
+labelled `true`. Unlabelled candidates take places in the top 8 but aren't
+counted. Both forms of label count it the same way; a keyed label counts
+in every sample whose query it judges, and one that finds nothing counts
+in neither. The output is numbers only.
 
 A keyed label that finds nothing is counted as unmatched, since a
 re-recorded run is expected to lose some. An old-form label naming no
@@ -791,6 +798,59 @@ corpus.
 
 A conversation run injects differently, so call 1's requests change and
 `replay` misses the cassette. Run it in `fast`.
+
+### Rescoring fixed pools
+
+```
+asphodel report rescore --material <file> --corpus <file> \
+    --rerank-query message|conversation --out <file> \
+    [--model-dir DIR] [--onnx-threads N]
+```
+
+scores each recall sample's candidates in the material again with the
+reranker, against the query `--rerank-query` gives, and writes the material
+again with the candidates in logit order, highest first, ties in the order
+they were listed. Each sample is found in the corpus by its session and
+time, and its query rebuilt from the corpus as replay builds it: `message`
+is the query a default run reranked against, and `conversation` the
+conversation query, with the reply from the corpus. Each sample records it
+as `rerank_query`. Sample and candidate ids, memories, sentences and each
+sample's `query` are kept, so labels apply unchanged in either form:
+candidate ids name the same candidates, and keyed labels match the same
+query and memory. Call 2's lists, with their chunks and ordinals, are
+copied as they were.
+
+The pools are the ones the material's run gathered, so the comparison
+isolates the reranker's query. Ordering is by logit alone, so it says
+nothing about prefetch's final ranking, which adds strength, state
+confidence and phase.
+
+A sample with no prefetch at its session and time in the corpus is
+refused, naming the sample, and nothing is written. The material, the
+corpus and the output must be inside the private dir, and the output may
+not be either input.
+
+To compare the two queries on Tim's labels, rescore the labelled material
+both ways, with the corpus its run replayed and the real models, and read
+each against the same labels:
+
+```
+R=$ASPHODEL_REPLAY_DIR
+for query in message conversation; do
+  asphodel report rescore --material "$R/labelling.json" \
+      --corpus "$R/corpus/state.jsonl" --rerank-query $query \
+      --out "$R/rescored-$query.json"
+  asphodel report precision --labels "$R/labels.toml" \
+      --material "$R/rescored-$query.json"
+done
+```
+
+`message` reproduces the labelled run's logits, so its curve matches
+`report precision` on `labelling.json` itself; if it doesn't, the models or
+the corpus aren't the ones that run used. Compare `recall.top8` and the
+recall curves. Only the labelled candidates count, and they're the same in
+both, so a relevant memory the conversation query would have pulled into a
+pool from outside it isn't measured.
 
 ### Bench
 

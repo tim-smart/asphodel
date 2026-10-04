@@ -995,6 +995,10 @@ pub enum ReportCommand {
 
     /// The precision curve of the labelled labelling material.
     Precision(PrecisionArgs),
+
+    /// The labelling material's recall pools scored again against another
+    /// rerank query, in logit order.
+    Rescore(RescoreArgs),
 }
 
 /// `asphodel report html`: the page goes beside the report unless `--out` says
@@ -1035,6 +1039,56 @@ pub struct PrecisionArgs {
     /// read through the material they were written for.
     #[arg(long)]
     pub convert: Option<PathBuf>,
+}
+
+/// `asphodel report rescore`: the material's recall pools scored again
+/// against the query `--rerank-query` gives, written under the private dir.
+#[derive(Debug, Args)]
+pub struct RescoreArgs {
+    /// The private directory the material, corpus and output are in.
+    #[arg(long, env = "ASPHODEL_REPLAY_DIR")]
+    pub replay_dir: Option<PathBuf>,
+
+    /// The material `asphodel replay --labelling` wrote.
+    #[arg(long)]
+    pub material: PathBuf,
+
+    /// The corpus that run replayed, for each sample's messages.
+    #[arg(long)]
+    pub corpus: PathBuf,
+
+    /// What the reranker scores against: the message, or the previous
+    /// message, the start of the reply and the message.
+    #[arg(long, value_enum)]
+    pub rerank_query: RescoreQuery,
+
+    /// Where to write the rescored material.
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Where the real models are.
+    #[arg(long, env = "ASPHODEL_MODEL_DIR")]
+    pub model_dir: Option<PathBuf>,
+
+    /// ONNX Runtime's intra-op threads; 1 by default.
+    #[arg(long, env = "ASPHODEL_ONNX_THREADS")]
+    pub onnx_threads: Option<NonZeroUsize>,
+}
+
+/// `--rerank-query`, as `[injection] rerank_query` spells it.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum RescoreQuery {
+    Message,
+    Conversation,
+}
+
+impl From<RescoreQuery> for asphodel_core::config::RerankQuery {
+    fn from(query: RescoreQuery) -> Self {
+        match query {
+            RescoreQuery::Message => Self::Message,
+            RescoreQuery::Conversation => Self::Conversation,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1126,6 +1180,7 @@ impl Cli {
             Command::Report(ReportCommand::Diff(args)) => crate::replay::diff::run(args),
             Command::Report(ReportCommand::Html(args)) => crate::replay::html::run(args),
             Command::Report(ReportCommand::Precision(args)) => crate::replay::labelling::run(args),
+            Command::Report(ReportCommand::Rescore(args)) => crate::replay::rescore::run(args),
             Command::Bench(args) => crate::bench::run(args),
         }
     }
