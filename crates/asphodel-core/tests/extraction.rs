@@ -1083,6 +1083,73 @@ fn context_is_clipped_oldest_first() {
             passages[2].clone(),
         ]
     );
+    // Clipping the oldest passage must not remove or shift its time anchor.
+    let request = call1_request(&input);
+    let contexts: Vec<&str> = request
+        .user
+        .split("<context>\n")
+        .skip(1)
+        .map(|block| block.split("</context>").next().unwrap())
+        .collect();
+    assert_eq!(contexts.len(), 3);
+    for (index, local_time) in ["19:00:00", "19:01:00", "19:02:00"].iter().enumerate() {
+        assert_eq!(
+            contexts[index],
+            format!(
+                "Context turn reference date/time: 2026-10-01T{local_time} Thursday, in Pacific/Auckland.\n{}\n",
+                input.context[index]
+            )
+        );
+    }
+}
+
+#[test]
+fn fully_clipped_context_drops_its_anchor_and_retained_turns_use_their_own_timezones() {
+    let h = Harness::new();
+    let turns = [
+        ("2026-09-30T23:00:00Z", "Pacific/Auckland", 2_000),
+        ("2026-10-01T00:00:00Z", "Europe/London", 3_000),
+        ("2026-10-01T01:00:00Z", "America/Los_Angeles", 3_000),
+    ];
+    let mut passages = Vec::new();
+    for (index, (observed_at, timezone, length)) in turns.iter().enumerate() {
+        let user = format!("TURN{index}{}", "x".repeat(length - 5 - 4));
+        passages.push(turn_text(&user, "ok"));
+        ingest(
+            &h,
+            &Turn {
+                timezone: Some((*timezone).into()),
+                ..turn("s1", observed_at, &user, "ok")
+            },
+        );
+    }
+    let current = ingest(&h, &turn("s1", T1, "Remember those occasions.", "Noted."));
+    h.focus(h.chunk_of(current.source, 0));
+
+    let input = input(&h, "main", &[]);
+    assert_eq!(input.context, passages[1..]);
+    let request = call1_request(&input);
+    let contexts: Vec<&str> = request
+        .user
+        .split("<context>\n")
+        .skip(1)
+        .map(|block| block.split("</context>").next().unwrap())
+        .collect();
+    // London is on 1 October, while the later LA turn is still on 30 September.
+    // Neither inherits Auckland time from the current or removed turn.
+    assert_eq!(
+        contexts,
+        vec![
+            format!(
+                "Context turn reference date/time: 2026-10-01T01:00:00 Thursday, in Europe/London.\n{}\n",
+                passages[1]
+            ),
+            format!(
+                "Context turn reference date/time: 2026-09-30T18:00:00 Wednesday, in America/Los_Angeles.\n{}\n",
+                passages[2]
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -3372,7 +3439,7 @@ fn call1_uses_the_new_template_version() {
     let request = call1_request(&input(&h, "main", &[]));
     // The new rules are a new version: `fast` reuses call 1's claims by
     // version, and claims made under the old rules mustn't be.
-    assert_eq!(request.template.version, 6);
+    assert_eq!(request.template.version, 7);
 }
 
 /// `[extraction] guidance` as it might be written, padded, and the text
