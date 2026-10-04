@@ -271,6 +271,60 @@ change made with `asphodel bank config`.
 Turns are ingested only from primary agents. Cron runs get injection and
 the prompt block but are never ingested.
 
+### Backfilling Hermes' history
+
+Hermes' history in `$HERMES_HOME/state.db` can be posted to the daemon, so
+Asphodel starts out knowing what Hermes knew. `hermes memory setup` offers
+it as its last question. Answer yes, then give a date or `all`. A blank date
+skips it. Or run it on its own from the plugin directory:
+
+```
+HERMES_HOME=~/.hermes python3 backfill.py --since 2026-01-01
+HERMES_HOME=~/.hermes python3 backfill.py --all-history --speaker Sam=discord:1234
+```
+
+- **A cutoff is required.** Give either `--since YYYY-MM-DD` (the start of
+  that day in the configured timezone, or UTC) or `--all-history`. Each
+  turn keeps its original time, so its memories arrive already aged. A
+  memory from six months ago that was never reinforced lands near the floor,
+  and the first purge will take many of those.
+- **`--dry-run`** prints the counts and posts nothing. They're the counts
+  `asphodel import --dry-run` prints for the same database, plus, with
+  `--since`, `turns_before_since`, the turns the cutoff leaves out.
+- **`--speaker NAME=PLATFORM:ID`**, repeatable, names a speaker other than
+  the owner: a turn starting `[NAME] ` is theirs. Any other turn is the
+  owner's. Setup's prompt passes no speakers.
+- **`--bank`** overrides the config's `bank`. With neither set it refuses,
+  because outside Hermes there's no profile name to default to.
+
+It reads an online-backup copy of `state.db`, never the live file, using
+the rules of `asphodel import`. Only turns Hermes still keeps for search are
+read. Tool rows, cron sessions and subagent sessions are skipped. The
+injected memory block (Hindsight's `<memory-context>`) is cut from the
+user's text, so Hindsight's memories aren't extracted as the user's own
+words. A schema version other than 30 or 31 is refused.
+
+Compactions are counted but send nothing. Unlike `asphodel import`, the
+backfill never clears a session. A clear changes only live injection state
+(the in-context set, pending injections and the session's prompt block),
+which historical turns never built up. On a session that's live in Hermes,
+a clear would wipe that state, on the first run or on any rerun.
+
+One limit applies to the session Hermes is in while the backfill runs. The
+daemon stores each new turn with the session's in-context set at the moment
+it arrives, and extraction judges which memories a turn `used` against it.
+A backfilled turn from that session's history, before the switch, gets the
+live set rather than the empty one it had. Turns from every other session
+are unaffected. Running it from setup, before Hermes has used Asphodel,
+avoids it.
+
+It stops at the first daemon error and names the session and time it
+stopped at. The daemon dedupes turns, so rerunning the same command
+resumes, and a finished run rerun reports every turn under `duplicates`.
+Posting takes minutes. Extraction is the long part, especially under
+subscription windows (`docs/models.md`). The queue is durable, and
+`asphodel status` shows how far it has got.
+
 ### Plugin prefetch contract
 
 The plugin sends `POST /v1/banks/{bank}/prefetch` with `session_id` and

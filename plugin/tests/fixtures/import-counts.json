@@ -1,0 +1,16 @@
+{
+  "backfills_stripped": 1,
+  "compactions": 1,
+  "cron_sessions": 1,
+  "image_parts_dropped": 1,
+  "inactive_rows_skipped": 2,
+  "memory_blocks_stripped": 1,
+  "multimodal_rows": 1,
+  "non_owner_turns": 2,
+  "prefetch_only_turns": 1,
+  "primary_sessions": 4,
+  "subagent_sessions_skipped": 1,
+  "summary_rows_skipped": 1,
+  "tool_rows_skipped": 2,
+  "turns": 13
+}

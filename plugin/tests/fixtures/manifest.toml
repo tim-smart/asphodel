@@ -1,0 +1,11 @@
+timezone = "Pacific/Auckland"
+bank = "main"
+assistant = "Hermes"
+
+[owner]
+name = "Tim"
+platform_ids = ["discord:1"]
+
+[[speaker]]
+name = "Sam"
+id = "discord:2"

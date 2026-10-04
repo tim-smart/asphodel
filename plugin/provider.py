@@ -25,7 +25,7 @@ from agent.memory_provider import MemoryProvider, RecallStatus
 from tools.registry import tool_error
 
 from . import config as plugin_config
-from . import tools, turns
+from . import backfill, tools, turns
 from .breaker import CircuitBreaker
 from .client import DaemonClient, DaemonError, DaemonUnavailable
 from .config import PluginConfig
@@ -689,8 +689,9 @@ class AsphodelMemoryProvider(MemoryProvider):
         """``hermes memory setup``: prompts for each schema field (empty keeps
         the default), writes ``config.json``, sets ``memory.provider`` to
         ``asphodel`` and ``memory.memory_enabled`` and
-        ``memory.user_profile_enabled`` to false, and saves Hermes' config
-        through ``hermes_cli.config.save_config``."""
+        ``memory.user_profile_enabled`` to false, saves Hermes' config
+        through ``hermes_cli.config.save_config``, and offers the history
+        backfill."""
         from hermes_cli.config import save_config as save_hermes_config
 
         values: Dict[str, Any] = {}
@@ -711,6 +712,24 @@ class AsphodelMemoryProvider(MemoryProvider):
             memory[flag] = False
         save_hermes_config(config)
         print(f"Set {plugin_config.TOKEN_ENV_VAR} in $HERMES_HOME/.env if the daemon needs a bearer token.")
+        self._offer_backfill(hermes_home, prompt)
+
+    @staticmethod
+    def _offer_backfill(hermes_home: str, prompt: Callable[[str], str]) -> None:
+        """Asks whether to post Hermes' history in ``state.db`` to the daemon
+        now. Yes needs a cutoff, a date or ``all``; a blank one skips it."""
+        answer = prompt("Backfill Hermes' history from state.db into Asphodel now? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            return
+        cutoff = prompt("Backfill from which date (YYYY-MM-DD), or 'all' for all of it? ").strip()
+        if not cutoff:
+            print("No cutoff given, so nothing was backfilled. Run backfill.py from the plugin directory later.")
+            return
+        argv = ["--all-history"] if cutoff.lower() == "all" else ["--since", cutoff]
+        try:
+            backfill.main(argv, hermes_home=hermes_home)
+        except Exception as error:
+            print(f"The backfill failed ({type(error).__name__}). Run backfill.py from the plugin directory to retry.")
 
 
 def _hermes_truthy(value: Any, *, default: bool) -> bool:
