@@ -333,20 +333,17 @@ impl ModelRow {
         volatility: Option<Volatility>,
         rrule: Option<&str>,
     ) -> bool {
-        // The profile excludes routines, not all recurring memories. Use the
-        // agenda's classification, including its conservative unknown-rule case.
-        if self.name == crate::store::bank::PROFILE_NAME && kind == Kind::Recurring {
-            if rrule.and_then(crate::agenda::period_within_a_week) != Some(false) {
-                return false;
-            }
-            // Extend the seeded filter without rewriting existing profiles or
-            // overriding an owner's custom kind selection.
-            if self.kinds.len() == 2
-                && self.kinds.contains(&Kind::Fact)
-                && self.kinds.contains(&Kind::State)
-            {
-                return true;
-            }
+        // Extend only the seeded profile filter. Custom kind selections keep
+        // their existing behavior, including explicit recurring and all kinds.
+        if self.name == crate::store::bank::PROFILE_NAME
+            && kind == Kind::Recurring
+            && self.kinds.len() == 2
+            && self.kinds.contains(&Kind::Fact)
+            && self.kinds.contains(&Kind::State)
+        {
+            // The default profile excludes routines, not all recurring memories.
+            // Use the agenda's conservative classification for unknown rules.
+            return rrule.and_then(crate::agenda::period_within_a_week) == Some(false);
         }
         let kind_passes = self.kinds.is_empty() || self.kinds.contains(&kind);
         let volatility_passes = match (self.min_volatility, kind, volatility) {
