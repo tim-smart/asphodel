@@ -61,6 +61,8 @@ skips that last step.
 - `docs/logging.md`: what's logged, and the rule that keeps memory content
   out of logs.
 - `docs/replay.md`: the replay harness, and calibrating the floors.
+- `docs/mental-model-answer.md`: why a mental model is one prose answer
+  with one set of citations, and what that trades away.
 - `docs/hermes-data-evaluation.md`: evaluating against real Hermes history
   with a local agent, and the feedback to send back.
 
