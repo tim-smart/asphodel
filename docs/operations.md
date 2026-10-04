@@ -127,11 +127,12 @@ p02/p04 remain to be accepted. The relevance scale stays `3.564211`.
 These are configuration values, not built-in defaults: floors and scales
 must still be supplied for the exact model id.
 
-`[llm] concurrency` (default 1) is how many LLM calls may be in flight at
+`[llm] concurrency` (default 10) is how many LLM calls may be in flight at
 once across the daemon, refreshes included, and how many chunks each bank
 extracts at once. Chunks still commit in queue order, and a chunk whose
 search missed a memory another chunk committed reconciles again, so a
-repeat stays one memory. Measure it in replay before raising it
+repeat stays one memory. Set it to 1 for serial extraction. Measure changes
+in replay before applying them
 (`docs/replay.md`, "Concurrency").
 
 `[llm] language` (unset by default) is the language memories and mental

@@ -34,7 +34,8 @@ asphodel replay --scenario scenarios/maya-to-mia.toml \
   derives from a checked-in fixture; a real-history report never leaves
   it.
 - `--config` is the production tuning file and `--overrides` a file in the
-  shape of `Tuning`. The layers, lowest first: code defaults, the fake
+  shape of `Tuning`. The layers, lowest first: code defaults, the serial
+  scenario default (`[llm] concurrency = 1`), the fake
   floors (group `ci` only, below), `--config`, the scenario's own
   `[tuning]`, then `--overrides`. Each layer must have the shape of
   `Tuning` on its own; an unknown key is refused before anything runs.
@@ -262,7 +263,7 @@ A probe naming a label no claim defines is refused before the run.
   were scheduled in. So a probe at a turn's `at` sees that turn's prefetch
   and, with zero latency, its memories.
 - **Extraction** is queued at a source's sync. Each bank has one simulated
-  worker with room for `[llm] concurrency` chunks, 1 by default. Whenever
+  worker with room for `[llm] concurrency` chunks, 10 by default. Whenever
   it has room, at a sync or at a completion, it
   claims the head of the production queue (turns before documents, then
   observed time), runs its LLM calls and neighbour search at once, as
@@ -282,7 +283,8 @@ A probe naming a label no claim defines is refused before the run.
   store without those memories. Accesses are stamped with the source's
   ingest time, as in production. The run ends at the latest of the last
   event, `--until` and the last completion.
-- **Concurrency.** Above `[llm] concurrency = 1` (set it in `--overrides`)
+- **Concurrency.** Above `[llm] concurrency = 1` (10 by default for real
+  history, adjustable in `--overrides`)
   the worker keeps that many chunks out, each prepared at its claim, and
   they commit in the order they were claimed: a chunk whose latency ends
   first waits for those claimed before it. A commit that finds a memory or
@@ -299,7 +301,7 @@ A probe naming a label no claim defines is refused before the run.
   The report counts these redos as `call2_rate.redos` and
   `call2_rate.redo_rate`, per chunk, fields that only appear above 1.
   Scenarios script call 2 against what a serial run shows it, so a
-  scenario refuses to run above 1.
+  scenario defaults to 1 and refuses explicit values above 1.
 - **Sweeps** run at `mental_models.sweep_time` bank-local (04:00) on the
   simulated clock, purge first, then the source and recall-log sweep, and
   then the refreshes due. Replay records the deletion fingerprint on its
@@ -487,7 +489,7 @@ writes nothing; the counts hold no text, so they can be shared.
 asphodel replay --corpus <file> --mode live|replay|fast \
     [--cassette <file>] [--probes <file>] [--report <file>] [--aggregate <file>] \
     [--labelling <file>] [--no-cache] [--refresh live|recorded|off] [--self-test] \
-    [--prime-concurrency N] \
+    [--prime-concurrency [N]] \
     [--config FILE] [--overrides FILE] [--latency DURATION] [--until TIMESTAMP] \
     [--onnx-threads N] [--token-dir DIR]
 ```
@@ -520,9 +522,12 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   kept carries nothing over. Triggers are counted
   by code in every mode. The mental models to refresh are the manifest's
   `[[model]]` tables, carried in the corpus header.
-- **Priming** (`--prime-concurrency N`, `fast` only) records call 1 for
+- **Priming** (`--prime-concurrency [N]`, `fast` only) records call 1 for
   every chunk before the simulation starts, N calls at a time in
-  wall-clock time. The simulation is single-threaded, and `[llm]
+  wall-clock time. Priming is off when the flag is omitted. A bare
+  `--prime-concurrency` selects 10; an explicit N overrides that value
+  and must be at least 1. Priming is refused in `live`, `replay` and
+  scenario runs. The simulation is single-threaded, and `[llm]
   concurrency` only changes simulated time, so without it a re-record
   makes its call 1s one after another. The prime ingests the corpus into
   the run's store in the order the simulation syncs it, takes each chunk

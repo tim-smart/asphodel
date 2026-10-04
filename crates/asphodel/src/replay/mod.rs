@@ -672,8 +672,8 @@ fn reset_store(store_dir: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Code defaults, the fake floors (on the fakes), `--config`, a scenario's
-/// `[tuning]`, then `--overrides`.
+/// Code defaults, the serial scenario default, the fake floors (on the
+/// fakes), `--config`, a scenario's `[tuning]`, then `--overrides`.
 pub(crate) fn layered_tuning(
     args: &ReplayArgs,
     scenario_tuning: Option<&toml::Table>,
@@ -681,6 +681,14 @@ pub(crate) fn layered_tuning(
     fake: bool,
 ) -> anyhow::Result<Tuning> {
     let mut layers: Vec<(String, String)> = Vec::new();
+    if args.scenario.is_some() {
+        // Scripted call 2 expects serial extraction. Keep that default
+        // without masking explicit config, scenario or override values.
+        layers.push((
+            "the serial scenario default".into(),
+            "[llm]\nconcurrency = 1\n".into(),
+        ));
+    }
     if fake {
         layers.push(("the fake floors".into(), fake_floors()));
     }

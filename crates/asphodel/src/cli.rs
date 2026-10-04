@@ -882,8 +882,9 @@ pub struct ReplayArgs {
 
     /// Record call 1 for every chunk the cassette has no claims for, this
     /// many at a time, before the simulation (`fast` only). Primed calls
-    /// are shown no in-context memories or mental model entries.
-    #[arg(long, conflicts_with = "scenario")]
+    /// are shown no in-context memories or mental model entries. Omit the
+    /// flag to leave priming off; use it without a value for 10 calls at once.
+    #[arg(long, num_args = 0..=1, default_missing_value = "10", conflicts_with = "scenario")]
     pub prime_concurrency: Option<NonZeroUsize>,
 
     /// The real-history probes file, under the private dir.
