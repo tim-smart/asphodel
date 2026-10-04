@@ -1979,7 +1979,7 @@ fn an_entry_citing_a_low_confidence_state_shows_its_age() {
 // The block
 
 #[test]
-fn the_block_holds_the_agenda_each_enabled_model_and_the_pointer_line() {
+fn the_block_opens_with_memory_guidance_before_the_agenda_and_models() {
     let h = Harness::new();
     let tea = h.insert(fact(TEA));
     let dentist = h.insert(event(
@@ -1998,6 +1998,7 @@ fn the_block_holds_the_agenda_each_enabled_model_and_the_pointer_line() {
         .unwrap();
 
     let block = h.block(None);
+    assert_memory_guidance(&block);
     assert_eq!(block.built_at, h.now());
     assert_eq!(block.agenda, vec![dentist]);
     assert_eq!(block.cited, vec![tea]);
@@ -2015,15 +2016,59 @@ fn the_block_holds_the_agenda_each_enabled_model_and_the_pointer_line() {
         !block.text.contains("Plans"),
         "a disabled model was rendered"
     );
-    // The header stays one line: the label goes into the pointer line.
-    assert_eq!(
-        block
-            .text
-            .lines()
-            .filter(|l| l.contains("memory_recall"))
-            .count(),
-        1
+}
+
+/// Check the usage contract without requiring the entire draft verbatim.
+fn assert_memory_guidance(block: &Block) {
+    assert!(
+        block.text.starts_with("## Long-term memory (Asphodel)\n"),
+        "the block must open with its memory heading:\n{}",
+        block.text
     );
+    let guidance = block.text.split("Agenda for ").next().unwrap();
+    for needle in [
+        "saved automatically",
+        "never need to save",
+        "<memory-context>",
+        "Thu 1 Oct 20:00",
+        "disagree",
+        "Before saying",
+        "don't know",
+        "don't remember",
+        "memory_recall",
+        "upcoming",
+        "session_search",
+        "exact wording",
+    ] {
+        assert!(guidance.contains(needle), "the guidance lacks {needle:?}");
+    }
+    assert!(!block.text.contains("memories win:"));
+}
+
+#[test]
+fn an_empty_bank_still_opens_with_memory_guidance() {
+    let h = Harness::new();
+    let block = h.block(None);
+    assert!(block.agenda.is_empty());
+    assert!(block.cited.is_empty());
+    assert_memory_guidance(&block);
+}
+
+#[test]
+fn budget_folding_keeps_memory_guidance_and_counts_it_in_the_budget() {
+    let h = Harness::new();
+    let tasks: Vec<Uuid> = (0..5)
+        .map(|n| {
+            h.insert(task(sentence(format!(
+                "Tim needs to complete job {n}. {}",
+                "There are many details to handle before this job is complete. ".repeat(20)
+            ))))
+        })
+        .collect();
+    let block = h.block(None);
+    assert!(block.agenda.len() < tasks.len(), "the agenda did not fold");
+    assert!(estimate_tokens(&block.text) <= h.tuning.mental_models.budget as usize);
+    assert_memory_guidance(&block);
 }
 
 #[test]
