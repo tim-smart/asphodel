@@ -688,6 +688,19 @@ pub(super) fn plan(
             } else {
                 label
             };
+            // Related events and facts cannot replace an outstanding task.
+            // Completion and cancellation still use ends or denies.
+            if newer
+                && neighbour.kind == Kind::Task
+                && !ended[n]
+                && matches!(label, Label::Retracts | Label::Refines)
+                && !matches!(
+                    memory.kind,
+                    super::claims::Kind::Task | super::claims::Kind::Recurring
+                )
+            {
+                continue;
+            }
             match label {
                 Label::MentionedAgain | Label::Confirmed => {
                     if newer && ended[n] {

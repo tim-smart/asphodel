@@ -1461,11 +1461,12 @@ fn an_undated_retraction_inherits_the_dated_window() {
 
 #[test]
 fn an_undated_retraction_with_a_new_kind_keeps_its_own_window() {
+    // A dated state rather than a task: only another task can replace an
+    // open task, so a deadline never crosses kinds this way.
     for kind in ["event", "fact"] {
-        let initial = claim(PASSPORT, "task", "renew my passport")
+        let initial = claim(PASSPORT, "state", "renew my passport")
             .with("valid_from", time("2026-10-11", "day"))
-            .with("valid_until", time("2026-10-15", "day"))
-            .with("due_at", time("2026-10-15T08:00", "minute"));
+            .with("valid_until", time("2026-10-15", "day"));
         let (h, old, extracted) = window_repeat(
             initial,
             claim(PASSPORT, kind, "renew my passport"),
@@ -1480,17 +1481,81 @@ fn an_undated_retraction_with_a_new_kind_keeps_its_own_window() {
         assert!(old_view.retracted_at.is_some());
         assert_eq!(head.kind, kind);
         assert!(
-            head.window.due_at.is_none(),
-            "{kind} cannot inherit a task deadline"
+            head.window.valid_until.is_none(),
+            "{kind} cannot inherit a state's end"
         );
-        assert!(head.window.valid_until.is_none());
         assert_eq!(
             head.window.valid_from.map(|stamp| stamp.at),
             match kind {
                 "event" => Some(local("2026-10-02T00:00")),
                 _ => None,
             },
-            "the replacement keeps its own start rather than the old task's start"
+            "the replacement keeps its own start rather than the old state's start"
+        );
+    }
+}
+
+#[test]
+fn a_related_claim_of_another_kind_never_replaces_an_open_task() {
+    // A status event and a general preference on the same topic say
+    // nothing about whether the renewal is done or was wrong. Whatever call
+    // 2 labels them, the task stays the head of its chain and on the agenda.
+    // Only `ends` or a corrected task replaces it.
+    for label in ["retracts", "refines"] {
+        let h = Harness::new();
+        owner_says(&h, "I need to renew my passport by 9 October.");
+        let task = extract_alone(
+            &h,
+            reply(vec![
+                claim(PASSPORT, "task", "I need to renew my passport")
+                    .with("due_at", time("2026-10-09T08:00", "minute")),
+            ]),
+        )
+        .memories[0];
+        h.advance(24);
+        h.service
+            .ingest_turn(
+                "main",
+                &turn(
+                    "s1",
+                    "2026-10-02T06:30:00Z",
+                    "I asked the post office how to renew my passport. \
+                     I prefer to renew my passport online.",
+                    "Noted.",
+                ),
+            )
+            .unwrap();
+        let call1 = reply(vec![
+            claim(
+                "Tim asked the post office how to renew his passport.",
+                "event",
+                "I asked the post office how to renew my passport",
+            ),
+            claim(
+                "Tim prefers to renew his passport online.",
+                "fact",
+                "I prefer to renew my passport online",
+            ),
+        ]);
+        let input = call2(&h, &call1).expect("call 2 runs");
+        let n = neighbour_handle(&input, task);
+        let extracted = reconcile(
+            &h,
+            call1,
+            call2_reply(vec![
+                labelled(&input.claims[0].handle, &[(n.clone(), label)]),
+                labelled(&input.claims[1].handle, &[(n, label)]),
+            ]),
+        );
+
+        assert_eq!(extracted.memories.len(), 2, "{label}: both claims are new");
+        let view = h.service.show_memory("main", &task.to_string()).unwrap();
+        assert!(view.retracted_at.is_none(), "{label}");
+        assert_eq!(view.chain.head, task, "{label}");
+        assert_eq!(view.chain.ended_by, None, "{label}");
+        assert!(
+            h.service.agenda("main").unwrap().listed().contains(&task),
+            "{label}: the renewal is still outstanding"
         );
     }
 }
