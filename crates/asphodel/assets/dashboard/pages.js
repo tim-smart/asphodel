@@ -47,7 +47,9 @@ export function route(hash) {
           ? "source"
           : section === "chunks" && !id
             ? "chunks"
-            : "missing";
+            : section === "recall" && !id
+              ? "recall"
+              : "missing";
   return { page, bank, section, id, params };
 }
 
@@ -1039,6 +1041,453 @@ async function chunks(ctx) {
   return { title: `Ingestion · ${bank}`, content: [heading(h, "Ingestion"), failed, queued] };
 }
 
+// The Recall page: one query through recall or injection, with the working
+// shown. It calls explain, never `/recall` or `/prefetch`, so a test query
+// writes no recall row, credits no use and touches no session.
+
+const RECALL_LIMIT_DEFAULT = 10;
+const RECALL_LIMIT_MAX = 30;
+const PHASES = [
+  ["any", "Any phase"],
+  ["upcoming", "Upcoming"],
+  ["current", "Current"],
+  ["past", "Past"],
+];
+const ON = [
+  ["happened", "When it happened"],
+  ["said", "When it was said"],
+];
+
+/// Why explain left a candidate out, in words.
+function cutReason(reason, { injection, limit }) {
+  switch (reason) {
+    case "below_tau":
+      return "Strength below τ, so it never reached fusion.";
+    case "not_reranked":
+      return "The reranker missed its deadline, so nothing passes the gate.";
+    case "under_floor":
+      return `Logit under the reranker's floor of ${figure(injection?.floor)}.`;
+    case "over_cap":
+      return `Over the cap of ${memoryCount(injection?.cap ?? 0)}: higher-scoring ones took every place.`;
+    case "over_budget":
+      return `Over the budget: its line would take the block past ${injection?.token_budget ?? "the"} tokens.`;
+    case "over_limit":
+      return `Ranked past the limit of ${limit}.`;
+    case "outside_rerank_pool":
+      return "Fused too far down for the reranker to see it.";
+    default:
+      return reason;
+  }
+}
+
+/// How far `timeZone`'s wall clock runs ahead of UTC at the instant `ms`,
+/// in milliseconds.
+function zoneOffset(ms, timeZone) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    })
+      .formatToParts(new Date(ms))
+      .map((part) => [part.type, part.value]),
+  );
+  const wall = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second));
+  return wall - Math.floor(ms / 1000) * 1000;
+}
+
+/// The calendar day the instant `ms` falls on in `timeZone`, as
+/// "2026-10-03".
+function zoneDate(ms, timeZone) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+}
+
+/// The first instant of the calendar day `date` in `timeZone`, as epoch
+/// milliseconds: midnight, or the end of a clock change that skips it.
+function startOfDay(date, timeZone) {
+  const [year, month, dayOfMonth] = date.split("-").map(Number);
+  const wall = Date.UTC(year, month - 1, dayOfMonth);
+  const hours = 60 * 60 * 1000;
+  const candidates = [-36, 0, 36].map((shift) => wall - zoneOffset(wall + shift * hours, timeZone));
+  const onTheDay = candidates.filter((ms) => zoneDate(ms, timeZone) === date).sort((a, b) => a - b);
+  return onTheDay[0] ?? wall - zoneOffset(wall, timeZone);
+}
+
+/// The day after `date`, as a date.
+function nextDay(date) {
+  const [year, month, dayOfMonth] = date.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, dayOfMonth + 1)).toISOString().slice(0, 10);
+}
+
+/// A From day as the instant it starts, in the bank's timezone.
+function rangeStart(date, timeZone) {
+  return date ? new Date(startOfDay(date, timeZone)).toISOString().replace(".000Z", "Z") : null;
+}
+
+/// A To day as the last instant before the next day starts, so the range
+/// takes the whole day.
+function rangeEnd(date, timeZone) {
+  if (!date) return null;
+  const next = startOfDay(nextDay(date), timeZone);
+  return new Date(next - 1000).toISOString().replace(".000Z", ".999999999Z");
+}
+
+function milliseconds(ms) {
+  return `${ms} ms`;
+}
+
+async function recall(ctx) {
+  const { api, ui, bank } = ctx;
+  const { h } = ui;
+  const { banks: list } = await api.banks();
+  const timeZone = list.find((b) => b.name === bank)?.timezone ?? "UTC";
+
+  let mode = "recall";
+  let generation = 0;
+
+  const field = (id, label, control, hint) =>
+    h("div", { class: "field" }, h("label", { for: id }, label), control, hint ? h("p", { class: "hint" }, hint) : null);
+
+  // The one box both modes share: the recall tool's query, or the user's
+  // message injection would answer.
+  const queryLabel = h("label", { for: "explain-query" }, "Query");
+  const query = h("textarea", {
+    id: "explain-query",
+    rows: 2,
+    required: true,
+    autocomplete: "off",
+    onkeydown: (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        form.requestSubmit();
+      }
+    },
+  });
+
+  const modes = h(
+    "fieldset",
+    { class: "segmented" },
+    h("legend", {}, "Run it through"),
+    [
+      ["recall", "Recall", "What the memory_recall tool returns"],
+      ["injection", "Injection", "What prefetch puts in the prompt"],
+    ].map(([value, label, detail]) =>
+      h(
+        "label",
+        { class: "segment" },
+        h("input", { type: "radio", name: "explain-mode", value, checked: value === mode, onchange: () => setMode(value) }),
+        h("span", {}, h("strong", {}, label), h("span", { class: "segment-detail" }, detail)),
+      ),
+    ),
+  );
+
+  const on = h("select", { id: "explain-on" }, ON.map(([value, text]) => h("option", { value }, text)));
+  const from = h("input", { id: "explain-from", type: "date", onchange: () => (to.min = from.value) });
+  const to = h("input", { id: "explain-to", type: "date", onchange: () => (from.max = to.value) });
+  const phase = h("select", { id: "explain-phase" }, PHASES.map(([value, text]) => h("option", { value }, text)));
+  const kinds = KINDS.map((kind) => h("input", { type: "checkbox", value: kind }));
+  const entity = h("input", { id: "explain-entity", type: "text", autocomplete: "off", placeholder: "A name or alias" });
+  const limit = h("input", {
+    id: "explain-limit",
+    type: "number",
+    min: 1,
+    max: RECALL_LIMIT_MAX,
+    inputmode: "numeric",
+    placeholder: String(RECALL_LIMIT_DEFAULT),
+  });
+
+  // Each mode's fields sit in a fieldset that's disabled, not just hidden,
+  // while the other mode is on: a disabled control keeps its value but isn't
+  // validated, so a recall filter left invalid can't block an injection.
+  const recallFilters = h(
+    "fieldset",
+    { class: "explain-filters", "aria-label": "Recall filters" },
+    field("explain-from", "From", from),
+    field("explain-to", "To", to),
+    field("explain-on", "Dates match", on),
+    h("p", { class: "hint range-hint" }, `Whole days in the bank's timezone, ${timeZone}. Leave either end open.`),
+    field("explain-phase", "Phase", phase),
+    field("explain-entity", "Entity", entity),
+    field("explain-limit", "Limit", limit),
+    h(
+      "fieldset",
+      { class: "kinds" },
+      h("legend", {}, "Kinds"),
+      kinds.map((box) => h("label", { class: "check" }, box, capitalize(box.value))),
+      h("p", { class: "hint" }, "None ticked means every kind."),
+    ),
+  );
+
+  const previousQuery = h("textarea", { id: "explain-previous-query", rows: 3, autocomplete: "off" });
+  const previousReply = h("textarea", { id: "explain-previous-reply", rows: 3, autocomplete: "off" });
+  const injectionFields = h(
+    "fieldset",
+    { class: "explain-filters", "aria-label": "Conversation", hidden: true },
+    field("explain-previous-query", "Previous message", previousQuery, "The user's message before this one, if any."),
+    field("explain-previous-reply", "Previous reply", previousReply, "The agent's reply to it. A short follow-up borrows from both."),
+    h(
+      "p",
+      { class: "notice", "data-tone": "info" },
+      "There's no session here, so nothing counts as already in context, and nothing is held for a later turn.",
+    ),
+  );
+
+  const run = h("button", { type: "submit" }, "Explain");
+  const results = h("div", { class: "explain-results", "aria-live": "polite" });
+
+  function setMode(next) {
+    mode = next;
+    queryLabel.textContent = mode === "recall" ? "Query" : "Message";
+    query.placeholder = mode === "recall" ? "What the agent would search for" : "What the user just said";
+    recallFilters.hidden = recallFilters.disabled = mode !== "recall";
+    injectionFields.hidden = injectionFields.disabled = mode !== "injection";
+  }
+  setMode(mode);
+
+  function request() {
+    const text = query.value.trim();
+    if (mode === "injection") {
+      return {
+        mode,
+        query: text,
+        previous_query: previousQuery.value.trim() || null,
+        previous_reply: previousReply.value.trim() || null,
+      };
+    }
+    return {
+      mode,
+      query: text,
+      on: on.value,
+      from: rangeStart(from.value, timeZone),
+      to: rangeEnd(to.value, timeZone),
+      phase: phase.value,
+      kinds: kinds.filter((box) => box.checked).map((box) => box.value),
+      entity: entity.value.trim() || null,
+      limit: limit.value ? Number(limit.value) : null,
+    };
+  }
+
+  const form = h(
+    "form",
+    {
+      class: "panel explain-form",
+      "aria-label": "Explain a query",
+      onsubmit: async (event) => {
+        event.preventDefault();
+        const sent = request();
+        if (!sent.query) return;
+        const mine = ++generation;
+        run.disabled = true;
+        results.setAttribute("aria-busy", "true");
+        try {
+          const explained = await api.explain(bank, sent);
+          if (mine !== generation) return;
+          results.replaceChildren(...explainResults(ctx, explained, sent, timeZone));
+        } catch (error) {
+          if (mine !== generation) return;
+          results.replaceChildren(h("p", { class: "notice", "data-tone": "error", role: "alert" }, error.message));
+        } finally {
+          if (mine === generation) {
+            run.disabled = false;
+            results.setAttribute("aria-busy", "false");
+          }
+        }
+      },
+    },
+    modes,
+    h("div", { class: "field explain-query" }, queryLabel, query),
+    recallFilters,
+    injectionFields,
+    h("div", { class: "explain-run" }, run, h("p", { class: "hint" }, "Logs no recall, credits no use and touches no session.")),
+  );
+
+  return {
+    title: `Recall · ${bank}`,
+    content: [
+      heading(h, "Recall", h("p", { class: "quiet-text" }, "See what a query brings back, and why a memory didn't.")),
+      form,
+      results,
+    ],
+  };
+}
+
+/// What explain answered: the summary, the injected text, then what made
+/// the cut and, greyed under it, what didn't.
+function explainResults(ctx, explained, sent, timeZone) {
+  const { h } = ctx.ui;
+  const injection = explained.injection;
+  const isInjection = explained.mode === "injection";
+  const limit = sent.limit ?? RECALL_LIMIT_DEFAULT;
+  const kept = explained.candidates.filter((c) => c.included);
+  const cut = explained.candidates.filter((c) => !c.included);
+  const latency = explained.latency;
+
+  const summary = h(
+    "section",
+    { class: "panel explain-summary", "aria-label": "How it ran" },
+    explained.reranked
+      ? null
+      : h(
+          "p",
+          { class: "notice", "data-tone": "error" },
+          isInjection
+            ? "The reranker missed its deadline, so nothing passes the gate and nothing would be injected."
+            : "The reranker missed its deadline, so these are in fusion order, as recall returns them.",
+        ),
+    h(
+      "dl",
+      { class: "facts" },
+      h("div", {}, h("dt", {}, "Searched for"), h("dd", {}, explained.query)),
+      explained.rerank_query !== explained.query ? h("div", {}, h("dt", {}, "Reranked against"), h("dd", {}, explained.rerank_query)) : null,
+      sent.from || sent.to
+        ? h(
+            "div",
+            {},
+            h("dt", {}, sent.on === "said" ? "Said" : "Happened"),
+            h(
+              "dd",
+              {},
+              sent.from ? ["from ", h("code", {}, sent.from)] : null,
+              sent.from && sent.to ? " " : null,
+              sent.to ? ["up to ", h("code", {}, sent.to)] : null,
+              h("span", { class: "quiet-text" }, ` (whole days in ${timeZone})`),
+            ),
+          )
+        : null,
+    ),
+    h(
+      "dl",
+      { class: "latency", "aria-label": "Latency" },
+      [
+        ["Embed", latency.embed_ms],
+        ["Retrieve", latency.retrieve_ms],
+        ["Rerank", latency.rerank_ms],
+        ["Total", latency.total_ms],
+      ].map(([stage, ms]) => h("div", {}, h("dt", {}, stage), " ", h("dd", { class: "num" }, milliseconds(ms)))),
+    ),
+  );
+
+  const injected = isInjection
+    ? h(
+        "section",
+        { class: "panel", "aria-labelledby": "injected-title" },
+        h("h2", { id: "injected-title" }, "Injected text"),
+        injection?.text
+          ? h("pre", { class: "injection-text" }, injection.text)
+          : h("p", { class: "empty" }, "Nothing passed the gate, so nothing would be injected."),
+        injection
+          ? h(
+              "p",
+              { class: "meta" },
+              spaced([
+                h("span", {}, `${injection.tokens} tokens of ${injection.token_budget}`),
+                h("span", {}, `${injection.injected.length} of a cap of ${injection.cap}`),
+                h("span", {}, `floor ${figure(injection.floor)}`),
+              ]),
+            )
+          : null,
+        h("p", { class: "hint" }, "Exactly as the agent gets it."),
+      )
+    : null;
+
+  const reasons = { injection, limit };
+  const table = (rows, { left }) =>
+    h(
+      "div",
+      { class: "table-wrap" },
+      h(
+        "table",
+        { class: left ? "explain-table left-out" : "explain-table" },
+        h(
+          "thead",
+          {},
+          h(
+            "tr",
+            {},
+            ["Memory", "Found by", "Fused", "Logit", "Score", "Strength", left ? "Why not" : null]
+              .filter(Boolean)
+              .map((c) => h("th", { scope: "col" }, c)),
+          ),
+        ),
+        h("tbody", {}, rows.map((c) => candidateRow(ctx, c, left ? cutReason(c.reason, reasons) : null))),
+      ),
+    );
+
+  // With nothing injected, the injected text already says so.
+  const madeIt =
+    isInjection && !kept.length
+      ? null
+      : h(
+          "section",
+          { class: "panel", "aria-labelledby": "made-title" },
+          h("h2", { id: "made-title" }, `${isInjection ? "Injected" : "Returned"} (${kept.length})`),
+          kept.length ? table(kept, { left: false }) : h("p", { class: "empty" }, "Recall returns nothing for this."),
+        );
+
+  const leftOut = h(
+    "section",
+    { class: "panel", "aria-labelledby": "left-title" },
+    h("h2", { id: "left-title" }, `Left out (${cut.length})`),
+    cut.length ? table(cut, { left: true }) : null,
+    h(
+      "p",
+      { class: "hint" },
+      isInjection
+        ? "A memory missing from both lists wasn't in any search arm's top hits."
+        : "A memory missing from both lists wasn't in any search arm's top hits, or the filters dropped it.",
+    ),
+  );
+
+  return [summary, injected, madeIt, leftOut].filter(Boolean);
+}
+
+function candidateRow(ctx, c, reason) {
+  const { h, pill } = ctx.ui;
+  const score = c.score;
+  return h(
+    "tr",
+    { "data-cut": reason ? c.reason : null },
+    h(
+      "td",
+      { class: "explain-memory", "data-label": "Memory" },
+      h("a", { class: "sentence", href: memoryHash(ctx.bank, c.id) }, c.kept ? h("span", { class: "seal", title: "Kept" }, "✻ ") : null, c.sentence),
+      h("div", { class: "meta" }, spaced([h("span", {}, c.kind), h("span", {}, c.phase.replaceAll("_", " "))])),
+    ),
+    h(
+      "td",
+      { "data-label": "Found by" },
+      h(
+        "ul",
+        { class: "inline-list arms" },
+        c.arms.map((a) => h("li", {}, a.arm === "bm25" ? "BM25" : a.arm, a.rank === null ? null : [" ", h("span", { class: "num" }, `#${a.rank}`)])),
+      ),
+    ),
+    h("td", { class: "num", "data-label": "Fused" }, c.rrf_rank === null ? "—" : String(c.rrf_rank)),
+    h("td", { class: "num", "data-label": "Logit" }, figure(c.logit)),
+    h(
+      "td",
+      { "data-label": "Score" },
+      score
+        ? [
+            h("span", { class: "num score-total" }, figure(score.total)),
+            h(
+              "span",
+              { class: "score-parts", title: "relevance + w_s × strength + state confidence + phase" },
+              `${figure(score.relevance)} relevance + ${figure(score.strength_term)} strength (w_s ${figure(score.w_s)}) + ${figure(score.confidence_term)} confidence + ${figure(score.phase_term)} phase`,
+            ),
+          ]
+        : "—",
+    ),
+    h("td", { "data-label": "Strength" }, pill(c.strength, `band-${c.strength}`), c.kept ? [" ", pill("kept", "kept")] : null),
+    reason ? h("td", { class: "why", "data-label": "Why not" }, reason) : null,
+  );
+}
+
 async function missing(ctx) {
   const { h } = ctx.ui;
   return {
@@ -1047,4 +1496,4 @@ async function missing(ctx) {
   };
 }
 
-export const pages = { banks, memories, memory, documents, source, chunks, missing };
+export const pages = { banks, memories, memory, documents, source, chunks, recall, missing };

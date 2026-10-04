@@ -864,7 +864,8 @@ and memories, and for keeping, retracting and forgetting them and removing
 documents. The page itself needs no token, since it holds nothing. It asks
 for the token and sends it on every `/v1` call it makes, which need it like
 any other client. Browsing never goes through recall, so looking at a
-memory doesn't strengthen it or log a recall.
+memory doesn't strengthen it or log a recall. The Recall page doesn't
+either; see below.
 
 It also shows each bank's counts, the `attention` lines from `status` as a
 banner, failed chunks with retry, and the purge pause with its
@@ -883,6 +884,60 @@ there is no build step and nothing to install. Its serif is Source Serif 4,
 Adobe's woff2 release files unmodified, served from the daemon under the SIL
 Open Font License (`OFL.txt` beside them, also at `/dashboard/OFL.txt`). Node runs its tests only:
 `cd tests/dashboard && nix develop ../.. -c sh -c 'npm ci && npm test'`.
+
+### The Recall page
+
+Each bank has a Recall tab, `#/banks/{bank}/recall`, for testing a query
+and answering "why didn't memory X come back?". It runs the query through
+recall, as the `memory_recall` tool would, or through injection, as
+prefetch would, by calling `POST /v1/banks/{bank}/recall/explain`. Explain
+runs the same pipeline code as recall and prefetch, but it writes no recall
+row and no access and doesn't read or write session state. A test query
+never shows up in the recall log, never strengthens a memory, and never
+holds or changes an injection. Since there's no session, nothing counts as
+already in context in injection mode. A memory the agent can already see in
+a live session is injected here but wouldn't be injected there.
+
+Recall mode takes the recall tool's filters: dates, phase, kinds, entity
+and limit. Injection mode takes the user's message and, optionally, the
+previous message and the agent's reply, which a short follow-up borrows
+from. It applies τ, the reranker's floor, `injection.cap` and
+`injection.token_budget`, and shows the injected text exactly as the agent
+gets it, with its token count.
+
+For each candidate, the page shows the search arms that found it and its
+rank in each, its fused (RRF) rank, the reranker logit, the score and its
+parts (relevance, w_s × strength, state confidence, phase), its strength
+band and whether it's kept. Each row links to the memory's page. What made
+the cut comes first. What didn't is greyed out underneath with the reason:
+
+- both modes: fused too far down for the reranker to see it. Only the top
+  of the fused list is reranked; the rest is listed in fusion order with
+  its arm and fused ranks, and no logit or score
+- recall: ranked past the limit
+- injection: strength below τ, a logit under the floor, over the cap, over
+  the token budget, or a reranker that missed its deadline, in which case
+  nothing passes
+
+Each search arm keeps only its top hits, and recall mode doesn't list what
+its filters dropped. So a memory missing from both lists either wasn't in
+any arm's top hits or was filtered out. The page also
+shows how long embedding, retrieval, reranking and the whole run took, so a
+slow reranker is visible.
+
+**Dates.** From and To are calendar days in the bank's timezone. The banks
+page and the hint under the fields both show it. From starts at the first
+instant of its day: midnight, or the end of a clock change that skips
+midnight. To runs to the last instant of its day, so From and To on the
+same date cover that one day. Either end can be left open. The page sends
+the days as RFC 3339 instants in UTC, the same `from` and `to` that
+`/recall` and `asphodel recall` take, and lists the instants it sent above
+the results. "Dates match" is `on`. "When it happened" compares the range
+with a memory's validity window, widening a low-confidence window by one
+unit at each end. A fact with no end matches only if its stated start falls
+in the range. "When it was said" compares the range with `observed_at`. The
+browser converts days with its own timezone database, so a zone whose rules
+changed recently can be off by the change until the browser updates.
 
 ## Deleting a bank
 
