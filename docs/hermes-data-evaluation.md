@@ -273,8 +273,10 @@ the model:
   around the projected fade date `memory show` reports.
 - *Things that should not have faded.* Facts mentioned on several occasions:
   `band` with `strong` at the end of the run.
-- *Upcoming and overdue.* Appointments and tasks: `agenda_has` shortly
-  before the date, `agenda_lacks` well after it.
+- *Upcoming and overdue.* Appointments and occasion-bound tasks:
+  `agenda_has` shortly before the date, `agenda_lacks` well after it.
+  Obligations (payments, renewals): `agenda_has` before the date and as
+  overdue after it, until done or `agenda.overdue_days` passes.
 - *The profile.* `profile_has` with `model = "User profile"` for two or
   three facts about Tim that a profile should carry.
 

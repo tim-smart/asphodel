@@ -297,7 +297,7 @@ fn check_claim(
             valid_until = None;
             until_event = None;
         }
-        // A task tied to a dated event can end when that event passes.
+        // A task for a dated occasion can end when that occasion passes.
         Kind::Task | Kind::Event | Kind::State | Kind::Recurring => {}
     }
 
