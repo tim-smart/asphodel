@@ -271,6 +271,32 @@ change made with `asphodel bank config`.
 Turns are ingested only from primary agents. Cron runs get injection and
 the prompt block but are never ingested.
 
+### Plugin prefetch contract
+
+The plugin sends `POST /v1/banks/{bank}/prefetch` with `session_id` and
+`query` (the current Hermes message). Optional context fields are:
+
+- `previous_query`, the session's last successful prefetch query.
+- `previous_reply`, the first 300 Unicode characters of the session's last
+  assistant reply received by `sync_turn`. It is omitted when empty or
+  when there is no previous query. The plugin keeps only this prefix,
+  even with ingestion disabled or a failed turn delivery.
+- `block_id`, a prompt block fetched before the session id was known,
+  sent until a prefetch succeeds.
+
+With the default `rerank_query = "conversation"`, the daemon reranks
+against the current message plus bounded starts of the previous query
+and reply. It trims context and cuts each start to `RERANK_CONTEXT_CHARS`
+(300), cutting back to whitespace where possible.
+
+Query and reply context are isolated by session, including an explicit
+`session_id` on a delayed `sync_turn`. An ordinary session switch retains
+each session's context for a later return. Compression, reset and rewind
+drop the old session's query and reply along with its pending recalls;
+a successful `memory_forget` drops the current session's query and reply.
+Hermes syncs on a background worker, so a prefetch that arrives before
+the preceding turn syncs cannot include that turn's reply yet.
+
 ## Commands
 
 Every command below except `serve`, `restore`, `models fetch` and `llm

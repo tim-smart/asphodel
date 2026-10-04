@@ -48,6 +48,8 @@ BUILTIN_MEMORY_FLAGS = ("memory_enabled", "user_profile_enabled")
 HERMES_TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
 #: Pending recalls kept per session, the daemon's ``PENDING_PER_SESSION``.
 PENDING_RECALLS_PER_SESSION = 4
+#: Reply prefix sent for conversation reranking, matching RERANK_CONTEXT_CHARS.
+RERANK_CONTEXT_CHARS = 300
 #: What the daemon's ``clean_query`` strips from the front of a prefetch
 #: query: Hermes' Discord message-id note, then the ``[Name] `` speaker
 #: prefix. The daemon does the cleaning; the plugin only uses this to skip a
@@ -107,6 +109,7 @@ class AsphodelMemoryProvider(MemoryProvider):
         # dropped on memory_forget.
         self._pending_recalls: Dict[str, List[Tuple[str, str]]] = {}
         self._last_query: Dict[str, str] = {}
+        self._last_reply: Dict[str, str] = {}
         self._last_injected: int = 0
         # A block fetched before the session id was known.
         self._pending_block_id: Optional[str] = None
@@ -271,13 +274,14 @@ class AsphodelMemoryProvider(MemoryProvider):
         (``reason="compression"``), ``reset`` or ``rewound`` it also clears the
         old session's in-context set through
         ``POST /v1/banks/{bank}/sessions/{id}/clear`` and drops the pending
-        recall id, last query and block mapping."""
+        recall id, last query, last reply and block mapping."""
         old_session = self._session_id or parent_session_id
         clear = reset or rewound or kwargs.get("reason") == "compression"
         try:
             if clear and old_session:
                 self._pending_recalls.pop(old_session, None)
                 self._last_query.pop(old_session, None)
+                self._last_reply.pop(old_session, None)
                 self._pending_block_id = None
                 if self.client is not None and self.bank:
                     try:
@@ -341,7 +345,8 @@ class AsphodelMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """``POST /v1/banks/{bank}/prefetch`` with the query, the session's
-        last prefetch query as ``previous_query`` and, once, a pending block
+        last prefetch query as ``previous_query``, the bounded last synced
+        assistant reply as ``previous_reply`` and, once, a pending block
         id. Stores the ``recall_id`` for ``sync_turn`` and the injected count
         for ``recall_status``. The query goes as Hermes gave it, for the daemon
         to clean, but one that cleans to nothing isn't sent. "" then and on
@@ -361,6 +366,9 @@ class AsphodelMemoryProvider(MemoryProvider):
             previous = self._last_query.get(session)
             if previous:
                 request["previous_query"] = previous
+                reply = self._last_reply.get(session)
+                if reply:
+                    request["previous_reply"] = reply
             block_id = self._pending_block_id
             if block_id:
                 request["block_id"] = block_id
@@ -414,16 +422,20 @@ class AsphodelMemoryProvider(MemoryProvider):
         messages: Optional[List[Dict[str, Any]]] = None,
         turn_author: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Ingests the turn when ``agent_context`` is ``primary`` and
+        """Keeps the bounded reply prefix for the session's next prefetch.
+        Ingests the turn when ``agent_context`` is ``primary`` and
         ``ingest`` is on. Builds the ``Turn`` body with :func:`build_turn`,
         ``POST``s it, and spools it on a connection failure or 5xx. After a
         2xx it replays the spool."""
         try:
+            session = session_id or self._session_id
+            # Retrieval context is local, independent of ingest being enabled
+            # or the daemon accepting this turn. Keep only the bounded prefix.
+            self._last_reply[session] = (assistant_content or "")[:RERANK_CONTEXT_CHARS]
             if self.client is None or self.config is None or not self.bank:
                 return
             if self._agent_context != PRIMARY_CONTEXT or not self.config.ingest:
                 return
-            session = session_id or self._session_id
             turn = self.build_turn(
                 user_content,
                 assistant_content,
@@ -543,7 +555,7 @@ class AsphodelMemoryProvider(MemoryProvider):
         without a request on a non-owner's turn. ``memory_recall`` returns the
         daemon's ``results`` list as JSON. A daemon error or an unreachable
         daemon returns ``tool_error``; ``memory_forget`` drops the session's
-        last prefetch query on success."""
+        last prefetch query and assistant reply on success."""
         try:
             return self._handle_tool_call(tool_name, args)
         except DaemonUnavailable:
@@ -596,6 +608,7 @@ class AsphodelMemoryProvider(MemoryProvider):
             # The forget request isn't sent again as the next previous query.
             if session:
                 self._last_query.pop(session, None)
+                self._last_reply.pop(session, None)
         elif tool_name == tools.KEEP_TOOL:
             result = self.client.keep(self.bank, ids, timeout=timeout)
         else:
