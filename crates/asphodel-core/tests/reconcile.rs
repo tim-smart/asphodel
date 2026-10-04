@@ -1359,6 +1359,106 @@ fn mentioned_again_writes_an_access_and_no_memory() {
     assert!(extracted_at.is_some());
 }
 
+/// Seed through extraction so the window fixture uses the same public contract
+/// as the later claim. The second turn is newer than the seeded memory.
+fn window_repeat(initial: Value, repeated: Value, label: &str) -> (Harness, Uuid, Extracted) {
+    let h = Harness::new();
+    owner_says(&h, "I need to renew my passport.");
+    let old = extract_alone(&h, reply(vec![initial])).memories[0];
+    h.advance(24);
+    h.service
+        .ingest_turn(
+            "main",
+            &turn(
+                "s1",
+                "2026-10-02T06:30:00Z",
+                "I still need to renew my passport.",
+                "Noted.",
+            ),
+        )
+        .unwrap();
+    let extracted = one_label(&h, reply(vec![repeated]), old, label);
+    (h, old, extracted)
+}
+
+#[test]
+fn repeat_labels_preserve_added_or_changed_windows_as_a_dated_head() {
+    for label in ["mentioned_again", "confirmed"] {
+        for field in ["due_at", "valid_from", "valid_until"] {
+            for initial_date in [None, Some("2026-10-08T08:00")] {
+                let mut initial = claim(PASSPORT, "task", "renew my passport");
+                if let Some(date) = initial_date {
+                    initial = initial.with(field, time(date, "minute"));
+                }
+                let repeated = claim(PASSPORT, "task", "renew my passport")
+                    .with(field, time("2026-10-09T08:00", "minute"));
+                let (h, old, extracted) = window_repeat(initial, repeated, label);
+                let old_view = h.service.show_memory("main", &old.to_string()).unwrap();
+                let head = h
+                    .service
+                    .show_memory("main", &old_view.chain.head.to_string())
+                    .unwrap();
+                let window = serde_json::to_value(&head.window).unwrap();
+                assert_eq!(
+                    window[field]["at"],
+                    json!(local("2026-10-09T08:00").to_string()),
+                    "{label}, {field}, initial date {initial_date:?}"
+                );
+                assert_eq!(window[field]["precision"], "minute");
+                assert_eq!(extracted.memories, vec![head.id]);
+                assert_ne!(head.id, old);
+                assert!(
+                    old_view.retracted_at.is_none(),
+                    "adding detail is a refinement"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_undated_mention_of_a_dated_task_is_still_absorbed() {
+    let initial = claim(PASSPORT, "task", "renew my passport")
+        .with("due_at", time("2026-10-09T08:00", "minute"));
+    let (h, old, extracted) = window_repeat(
+        initial,
+        claim(PASSPORT, "task", "renew my passport"),
+        "mentioned_again",
+    );
+    assert!(extracted.memories.is_empty());
+    let view = h.service.show_memory("main", &old.to_string()).unwrap();
+    assert_eq!(view.chain.head, old);
+    assert_eq!(view.window.due_at.unwrap().at, local("2026-10-09T08:00"));
+}
+
+#[test]
+fn an_undated_retraction_inherits_the_dated_window() {
+    // Choose carry-over, not relabelling as mentioned_again: a genuine
+    // correction must still retract its predecessor. Missing times are not
+    // evidence that the previously stated dates were cancelled.
+    let initial = claim(PASSPORT, "task", "renew my passport")
+        .with("valid_from", time("2026-10-11", "day"))
+        .with("valid_until", time("2026-10-15", "day"))
+        .with("due_at", time("2026-10-15T08:00", "minute"));
+    let (h, old, extracted) = window_repeat(
+        initial,
+        claim(PASSPORT, "task", "renew my passport"),
+        "retracts",
+    );
+    let old_view = h.service.show_memory("main", &old.to_string()).unwrap();
+    let head = h
+        .service
+        .show_memory("main", &old_view.chain.head.to_string())
+        .unwrap();
+    assert_eq!(extracted.memories, vec![head.id]);
+    assert_ne!(head.id, old);
+    assert!(old_view.retracted_at.is_some());
+    assert_eq!(
+        head.window, old_view.window,
+        "the replacement retains dates and precision"
+    );
+}
+
 #[test]
 fn mentioned_again_outranks_used_in_the_same_turn() {
     // The reply relied on the memory and the user restated it in the same

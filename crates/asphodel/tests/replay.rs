@@ -383,6 +383,49 @@ fn p18_closes_the_task_before_the_future_event_and_excludes_it_from_agenda() {
 }
 
 #[test]
+fn a_repeated_errand_gains_a_date_and_leaves_the_agenda_after_its_event() {
+    use std::sync::Arc;
+
+    use asphodel_core::clock::SimulatedClock;
+    use asphodel_core::config::Tuning;
+    use asphodel_core::service::Service;
+    use asphodel_core::store::{OpenOptions, Store};
+
+    let dir = TestDir::new();
+    let run = replay(&dir, &scenario("reminder-adds-date"), &[]);
+    let old = run.probe("undated-errand-on-agenda")["observed"]["id"]
+        .as_str()
+        .expect("the original errand exists");
+    let clock = Arc::new(SimulatedClock::new("2026-02-10T14:01:00Z".parse().unwrap()));
+    let store = Store::open(
+        &dir.path("private/store"),
+        OpenOptions::default(),
+        clock.clone(),
+    )
+    .unwrap();
+    let service = Service::open(clock.clone(), store, Tuning::default());
+    let original = service.show_memory("main", old).unwrap();
+    let head = service
+        .show_memory("main", &original.chain.head.to_string())
+        .unwrap();
+    assert_eq!(
+        head.window.due_at.map(|time| time.at),
+        Some("2026-02-10T14:00:00Z".parse().unwrap()),
+        "the repeated reminder must leave a dated head"
+    );
+    assert_eq!(
+        head.window.valid_until.map(|time| time.at),
+        Some("2026-02-10T14:00:00Z".parse().unwrap())
+    );
+    assert!(!service.agenda("main").unwrap().listed().contains(&head.id));
+    // Rewind only the inspection clock: the head must have been actionable
+    // just before its event, not simply dropped from the agenda altogether.
+    clock.set("2026-02-10T13:59:00Z".parse().unwrap());
+    assert!(service.agenda("main").unwrap().listed().contains(&head.id));
+    run.assert_passed();
+}
+
+#[test]
 fn p18_memory_show_has_no_overdue_task_guard_after_completion() {
     use std::sync::Arc;
 
