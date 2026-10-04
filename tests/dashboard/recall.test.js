@@ -253,3 +253,107 @@ test("an explain the daemon refuses shows its error", async (t) => {
 
   await findText(page.root, "mode must be recall or injection");
 });
+
+// From and To are whole days in the bank's timezone, sent as RFC 3339 UTC
+// instants: From's first instant, and To's last (to the second, with any
+// fraction), so the same day in both covers that one day.
+
+/// Sets a date field the way a date picker would.
+async function pickDate(root, label, date) {
+  type(await findField(root, label), date);
+}
+
+/// The last instant of a day, to the second, with or without a fraction.
+function lastSecond(iso) {
+  return new RegExp(`^${iso.replaceAll(".", "\\.")}(\\.\\d+)?Z$`);
+}
+
+test("a day's range runs from its first instant to its last in the bank's timezone", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: RECALL, token: TOKEN });
+  await findQuery(page.root);
+
+  await pickDate(page.root, /^from$/i, "2026-10-01");
+  await pickDate(page.root, /^to$/i, "2026-10-01");
+  const body = await explain(daemon, page.root);
+
+  // Pacific/Auckland is on NZDT, 13 hours ahead, from 27 September.
+  assert.equal(body.from, "2026-09-30T11:00:00Z");
+  assert.match(body.to, lastSecond("2026-10-01T10:59:59"));
+});
+
+test("either end of the range can be left open, and the range can match when it was said", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: RECALL, token: TOKEN });
+  await findQuery(page.root);
+
+  await pickDate(page.root, /^from$/i, "2026-10-01");
+  choose(await findField(page.root, /dates? match|match dates|\bon\b/i), "said");
+  const fromOnly = await explain(daemon, page.root);
+
+  assert.equal(fromOnly.from, "2026-09-30T11:00:00Z");
+  assert.equal(fromOnly.to ?? null, null);
+  assert.equal(fromOnly.on, "said");
+
+  await pickDate(page.root, /^from$/i, "");
+  await pickDate(page.root, /^to$/i, "2026-10-01");
+  const toOnly = await explain(daemon, page.root);
+
+  assert.equal(toOnly.from ?? null, null);
+  assert.match(toOnly.to, lastSecond("2026-10-01T10:59:59"));
+});
+
+test("a day whose midnight a clock change skips starts when the day does", async (t) => {
+  const daemon = new FakeDaemon();
+  daemon.state.banks.find((b) => b.name === "main").timezone = "America/Santiago";
+  const page = await open(t, daemon, { hash: RECALL, token: TOKEN });
+  await findQuery(page.root);
+
+  await pickDate(page.root, /^from$/i, "2026-09-06");
+  await pickDate(page.root, /^to$/i, "2026-09-06");
+  const body = await explain(daemon, page.root);
+
+  // Santiago's clocks go from 00:00 at UTC−4 straight to 01:00 at UTC−3, so
+  // 6 September starts at 01:00 local, and the 7th at midnight, UTC−3.
+  assert.equal(body.from, "2026-09-06T04:00:00Z");
+  assert.match(body.to, lastSecond("2026-09-07T02:59:59"));
+});
+
+test("a recall whose reranker missed its deadline says it's in fusion order, not that nothing passes", async (t) => {
+  const daemon = new FakeDaemon();
+  const late = daemon.state.explain.recall;
+  late.reranked = false;
+  late.latency = { embed_ms: 12, retrieve_ms: 34, rerank_ms: 250, total_ms: 296 };
+  for (const candidate of late.candidates) {
+    candidate.logit = null;
+    candidate.score = null;
+  }
+  const page = await open(t, daemon, { hash: RECALL, token: TOKEN });
+  await explain(daemon, page.root);
+
+  const said = await findText(page.root, /fusion order|rrf order/i);
+  await findResult(page.root, "auckland");
+  assert.doesNotMatch(textOf(said), /inject|gate/i);
+  assert.doesNotMatch(textOf(page.root), /nothing (passes|would be injected)|passes the gate/i);
+});
+
+test("an injection where nothing passed says so, without an empty table of what was injected", async (t) => {
+  const daemon = new FakeDaemon();
+  const none = daemon.state.explain.injection;
+  for (const candidate of none.candidates) {
+    candidate.included = false;
+    candidate.reason ??= "under_floor";
+  }
+  none.injection = { ...none.injection, text: "", tokens: 0, injected: [] };
+  const page = await open(t, daemon, { hash: RECALL, token: TOKEN });
+  await chooseMode(page.root, "injection");
+  await explain(daemon, page.root);
+
+  await findText(page.root, /nothing (passed|would be injected|is injected|to inject)/i);
+  const auckland = await findResult(page.root, "auckland");
+  assert.match(textOf(auckland), /floor/i);
+  const empty = [...page.root.querySelectorAll("table")].filter((table) => !table.querySelector("tbody tr"));
+  assert.deepEqual(empty, [], "no table without rows");
+  const zero = [...page.root.querySelectorAll("h2, h3")].filter((el) => /^injected\D*\b0\b/i.test(textOf(el)));
+  assert.deepEqual(zero, [], "no section counting nothing injected");
+});
