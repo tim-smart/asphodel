@@ -31,10 +31,11 @@ data:
     [reconcile.embedding_floors]
     "bge-small-en-v1.5:int8" = 0.8
 
-    # Recommended in TIM-131 from 10 labelled prefetches. Live-run injection
-    # tokens and probes p02/p04 still need acceptance; the gate uses raw logits.
+    # From 380 labels over 10 prefetches of the call 1 v5 replay: -8.5 keeps
+    # 6 of 18 relevant at precision 0.21 (-8.0 keeps 5 at 0.22) and admits
+    # a clear top answer at -8.2. The gate uses raw logits.
     [injection.reranker_floors]
-    "ms-marco-MiniLM-L-6-v2:int8" = -8.0
+    "ms-marco-MiniLM-L-6-v2:int8" = -8.5
 
     # The reranker logit is divided by this before it's added to the other
     # ranking terms. The other weights were sized for jina-reranker-v1-turbo-en
