@@ -20,3 +20,11 @@ not a technical privacy guarantee.
 Standing authorization does not approve labels, probes or probe re-anchors.
 Tim must still approve each exact entry as required by the evaluation guide;
 floor selection and other review decisions remain his.
+
+Before making decisions based on evaluation results, ask Mac Developer to
+obtain an independent review from a Fable sub-agent. The review must follow
+the same privacy restrictions above; share only the permitted aggregate
+export and feedback template, never private content. If that review is
+unavailable, leave the decision pending rather than bypassing it. This
+review does not replace Tim's approval of exact labels, probes or probe
+re-anchors, or his floor selection and other review decisions.

@@ -40,6 +40,14 @@ prepare material. Follow these rules:
    reply or a file outside `ASPHODEL_REPLAY_DIR`. Memory ids and probe ids
    are fine. The output of `asphodel recall`, `recalls` and `memory show` is
    content: read it, show it to Tim, never quote it anywhere else.
+4. **Decisions based on evaluation results require independent review.**
+   Before making them, ask Mac Developer to obtain an independent review
+   from a Fable sub-agent. The review must follow the same privacy
+   restrictions in rule 3: share only the permitted aggregate export and
+   feedback template, never private content. If that review is unavailable,
+   leave the decision pending rather than bypassing it. This review does
+   not replace Tim's approval of exact labels, probes or probe re-anchors,
+   or his floor selection and other review decisions.
 
 These rules guide agents; they are not a technical privacy guarantee. Raw
 history, memory text, queries and cassettes remain private even when a run
