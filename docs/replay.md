@@ -232,7 +232,11 @@ access, and never a session's set.)
 
 Every probe has `at`, `kind` and an optional `id`; without one the id is
 `p<n>`, counting from 1 in file order, and ids are unique. `memory` is a
-claim label. The prefetch and recall probes run on sessions named
+claim label in a scenario. In real history it is a regex over sentences,
+and every kind also accepts an optional `memory_id` UUID. An id present
+in the store wins; otherwise the earliest created memory matching the
+regex wins, even if it has since been purged. The prefetch and recall
+probes run on sessions named
 `probe:<id>`, which no scenario session may use.
 
 | `kind` | Fields | Passes when |
@@ -240,7 +244,7 @@ claim label. The prefetch and recall probes run on sessions named
 | `band` | `memory`, `band` | The memory's band at `at` is `strong`, `fading` or `faded` as given. |
 | `faded_at` | `memory`, `between = [from, to]` | The first instant strength fell below τ is within the range, inclusive. It's computed at `at` from the access log and bank time, to the minute, as `memory show`'s projection does. Not yet faded by `at` fails. |
 | `exists` | `memory`, and any of `memory_kind`, `ended`, `retracted`, `head`, `phase` | The memory is in the store and every given field matches. `head` is whether it's the head of its supersession chain; `phase` is `upcoming`, `current`, `overdue`, `recently_past` or `long_past`. |
-| `absent` | `memory` | The memory isn't in the store: purged or forgotten. |
+| `absent` | `memory`, optional `memory_id` in real history | The memory isn't in the store. In real history it must resolve to a created memory, then purged or forgotten; scenario labels may also be checked before extraction. |
 | `agenda_has`, `agenda_lacks` | `memory` | The bank's agenda at `at` lists, or doesn't list, the memory. |
 | `recall_finds`, `recall_lacks` | `memory`, `query` | Explicit recall for `query`, with no session, returns, or doesn't return, the memory. |
 | `injects`, `not_injects` | `memory`, `query` | A prefetch for `query` on a session no turn uses injects, or doesn't inject, the memory. Group `models` only. |
@@ -252,6 +256,15 @@ them. Exact strength values are unit tests on the pure function, not
 probes.
 
 A probe naming a label no claim defines is refused before the run.
+
+In real history, a probe whose memory never resolves fails for every
+kind, including negative checks and `absent`, with
+`observed: {"resolved": false}`. Resolved history probes add
+`resolved_by` (`id` or `regex`) and `regex_matches` to `observed`. The
+latter says whether the regex matches the id's current sentence when
+resolved by id, and is true for a regex match. A false value does not
+change the check's result, but flags a possible claim-ordinal shift for
+owner review after re-recording.
 
 ## The simulation
 
@@ -540,8 +553,10 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   pinned to `--onnx-threads` (1 by default). `ASPHODEL_MODELS=fake` runs the
   deterministic fakes, for tests.
 - **Probes** are a TOML file of `[[probe]]` tables with the scripted kinds
-  and fields, opaque ids and `memory` a regex over sentences: the earliest
-  memory whose sentence matches is the one probed. `injects` and
+  and fields, opaque ids, optional `memory_id` grounding UUIDs and
+  `memory` regexes over sentences. An id still in the store takes
+  precedence; otherwise the earliest created regex match is probed.
+  Unresolved memories fail, including negative probes. `injects` and
   `not_injects` need the real models.
 - **`--self-test`** runs the simulation twice under the one lock and
   requires byte-identical reports. It is refused in `live`, which measures

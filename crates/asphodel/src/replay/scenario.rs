@@ -278,6 +278,9 @@ pub struct Probe {
     /// `p<n>` in file order when absent.
     #[serde(default)]
     pub id: Option<String>,
+    /// Preferred grounding id for real-history probes; `memory` is the fallback regex.
+    #[serde(default)]
+    pub memory_id: Option<uuid::Uuid>,
     pub at: Timestamp,
     #[serde(flatten)]
     pub check: Check,

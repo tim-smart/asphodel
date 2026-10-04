@@ -251,7 +251,10 @@ A probe pins a time and an expectation (`docs/replay.md`, "Probes"). The
 kinds are `band`, `faded_at`, `exists`, `absent`, `agenda_has`,
 `agenda_lacks`, `recall_finds`, `recall_lacks`, `injects`, `not_injects`,
 `profile_has`, `profile_lacks`. In real history `memory` is a regex over
-sentences, and the earliest matching memory is the one probed.
+sentences. `memory_id` is an optional grounding UUID: when that id is
+in the store it takes precedence, otherwise the earliest created memory
+matching the regex is probed (including one since purged). A memory that
+never resolves fails every kind, including negative probes and `absent`.
 
 **Propose.** Using the browse daemon and `labelling.json`, draft 20 to 40
 probes. Cover each of these, so the run says something about every part of
@@ -277,8 +280,10 @@ the model:
 
 Write them to `$ASPHODEL_REPLAY_DIR/drafts/probes.draft.toml`. Every probe
 gets a comment block above it with the question, the expected answer in
-plain words, the memory id it was grounded on, and its status. Anchor the
-regex on distinctive words of the sentence, not on the whole sentence, and
+plain words, the memory id it was grounded on, and its status. Every
+drafted probe also carries that grounding id as `memory_id`, not only
+in its comment block. Anchor the regex on distinctive words of the
+sentence, not on the whole sentence, and
 check with the browse daemon that it matches the memory you mean and no
 earlier one.
 
@@ -291,6 +296,7 @@ earlier one.
 id = "p001"
 at = "2026-11-01T00:00:00Z"
 kind = "recall_finds"
+memory_id = "b4ccd45d-80dd-53dd-9b22-b1c8f9f43bc5"
 memory = "(?i)sister.*Mia"
 query = "what is my sister called"
 
@@ -302,6 +308,7 @@ query = "what is my sister called"
 id = "p002"
 at = "2026-11-01T00:00:00Z"
 kind = "exists"
+memory_id = "41c78166-793c-50c2-bca7-c1d7227c222e"
 memory = "(?i)sister.*Maya"
 retracted = true
 head = false
@@ -321,7 +328,12 @@ parse, a `faded_at` range that ends after its `at`. Fix and re-run. Exit 0
 or 1 gives a report whose `probes` list has `observed` for every probe:
 the band and strength, the ids recall returned, the agenda's ids, the
 fade instant. Read it before the review, so you can tell Tim what the
-system actually did next to what you expected.
+system actually did next to what you expected. Resolved probes report
+`resolved_by` (`id` or `regex`) and `regex_matches`. Review any
+`regex_matches = false`: re-recording may have shifted claim ordinals
+so the grounding id now names a different fact. This flag does not fail
+the check by itself. `resolved: false` fails the probe and contributes
+to exit 1; it is not evidence that a negative expectation was met.
 
 **Review.** Walk Tim through the draft in batches of about ten. For each
 probe show the question, your expected answer, the grounding memory's

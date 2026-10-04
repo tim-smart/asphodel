@@ -35,6 +35,228 @@ fn simulation(report: &Value) -> Value {
     report
 }
 
+// Probe identity and unresolved-memory regressions, through the CLI report.
+
+fn resolution_probe(report: &Value, id: &str) -> Value {
+    report["probes"]
+        .as_array()
+        .expect("the report lists probes")
+        .iter()
+        .find(|probe| probe["id"] == id)
+        .unwrap_or_else(|| panic!("no probe {id}: {report}"))
+        .clone()
+}
+
+/// Obtain grounding ids from a successful CLI run, not UUID derivation or
+/// direct store inspection. Both claims are grounded in the synthetic turn.
+fn resolution_history(dir: &TestDir) -> (std::path::PathBuf, String, String) {
+    let corpus = imported_small_history(dir);
+    let script = support::script_answering_everything(
+        dir,
+        "resolution",
+        vec![
+            support::home_claim(),
+            support::claim("Tim lives near the harbour.", "near the harbour", "fact"),
+        ],
+        Vec::new(),
+    );
+    let probes = r#"
+[[probe]]
+id = "home"
+at = "2026-01-05T12:00:00Z"
+kind = "exists"
+memory = "lives in Auckland"
+
+[[probe]]
+id = "harbour"
+at = "2026-01-05T12:00:00Z"
+kind = "exists"
+memory = "near the harbour"
+"#;
+    let run = replay_history(
+        dir,
+        &corpus,
+        "live",
+        probes,
+        "grounding",
+        Some(&script),
+        &[],
+    );
+    assert_ok(&run.output);
+    let report = run.report();
+    let home = resolution_probe(&report, "home")["observed"]["id"]
+        .as_str()
+        .expect("home resolved")
+        .to_owned();
+    let harbour = resolution_probe(&report, "harbour")["observed"]["id"]
+        .as_str()
+        .expect("harbour resolved")
+        .to_owned();
+    assert_ne!(home, harbour, "the fixture must create distinct memories");
+    (corpus, home, harbour)
+}
+
+fn assert_id_resolution(pattern: &str, regex_matches: bool) {
+    let dir = TestDir::new();
+    let (corpus, _, harbour) = resolution_history(&dir);
+    let probes = format!(
+        r#"
+[[probe]]
+id = "anchored"
+at = "2026-01-05T12:00:00Z"
+kind = "exists"
+memory_id = "{harbour}"
+memory = "{pattern}"
+"#
+    );
+    let run = replay_history(&dir, &corpus, "replay", &probes, "anchored", None, &[]);
+    let probe = resolution_probe(&run.report(), "anchored");
+    assert_eq!(probe["observed"]["id"], harbour, "{probe}");
+    assert_eq!(probe["observed"]["resolved_by"], "id", "{probe}");
+    assert_eq!(probe["observed"]["regex_matches"], regex_matches, "{probe}");
+    assert_eq!(probe["passed"], true, "{probe}");
+    assert_ok(&run.output);
+}
+
+#[test]
+fn probe_resolution_id_wins_when_regex_matches_another_memory() {
+    assert_id_resolution("lives in Auckland", false);
+}
+
+#[test]
+fn probe_resolution_id_survives_a_regex_that_matches_nothing() {
+    assert_id_resolution("never recorded wording", false);
+}
+
+#[test]
+fn probe_resolution_reports_when_regex_agrees_with_id() {
+    assert_id_resolution("near the harbour", true);
+}
+
+#[test]
+fn probe_resolution_missing_id_falls_back_to_regex() {
+    let dir = TestDir::new();
+    let (corpus, home, _) = resolution_history(&dir);
+    let probes = r#"
+[[probe]]
+id = "fallback"
+at = "2026-01-05T12:00:00Z"
+kind = "exists"
+memory_id = "00000000-0000-0000-0000-000000000000"
+memory = "lives in Auckland"
+
+[[probe]]
+id = "regex-only"
+at = "2026-01-05T12:00:00Z"
+kind = "exists"
+memory = "lives in Auckland"
+"#;
+    let run = replay_history(&dir, &corpus, "replay", probes, "fallback", None, &[]);
+    for id in ["fallback", "regex-only"] {
+        let probe = resolution_probe(&run.report(), id);
+        assert_eq!(probe["observed"]["id"], home, "{probe}");
+        assert_eq!(probe["observed"]["resolved_by"], "regex", "{probe}");
+        assert_eq!(probe["observed"]["regex_matches"], true, "{probe}");
+        assert_eq!(probe["passed"], true, "{probe}");
+    }
+    assert_ok(&run.output);
+}
+
+fn assert_unresolved_probe_fails(kind: &str, fields: &str) {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    record(&dir, &corpus);
+    let probes = format!(
+        r#"
+[[probe]]
+id = "unresolved"
+at = "2026-01-08T12:00:00Z"
+kind = "{kind}"
+memory = "never recorded wording"
+{fields}
+"#
+    );
+    let run = replay_history(&dir, &corpus, "replay", &probes, "unresolved", None, &[]);
+    let probe = resolution_probe(&run.report(), "unresolved");
+    assert_eq!(
+        (
+            &probe["passed"],
+            &probe["observed"]["resolved"],
+            run.output.status.code()
+        ),
+        (
+            &serde_json::json!(false),
+            &serde_json::json!(false),
+            Some(1)
+        ),
+        "{probe}"
+    );
+}
+
+#[test]
+fn probe_resolution_unresolved_agenda_lacks_fails() {
+    assert_unresolved_probe_fails("agenda_lacks", "");
+}
+
+#[test]
+fn probe_resolution_unresolved_recall_lacks_fails() {
+    assert_unresolved_probe_fails("recall_lacks", "query = \"Tim lives in Auckland\"");
+}
+
+#[test]
+fn probe_resolution_unresolved_profile_lacks_fails() {
+    assert_unresolved_probe_fails("profile_lacks", "model = \"User profile\"");
+}
+
+#[test]
+fn probe_resolution_unresolved_absent_fails() {
+    assert_unresolved_probe_fails("absent", "");
+}
+
+#[test]
+fn probe_resolution_absent_passes_after_a_created_memory_is_purged() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let mut claim = support::home_claim();
+    claim["significance"] = serde_json::json!("trivial");
+    let script = support::script_answering_everything(&dir, "purge", vec![claim], Vec::new());
+    let overrides = dir.private_file("purge-overrides.toml", "[clock]\nquiet_rate = 1.0\n");
+    let flags = ["--overrides", overrides.to_str().unwrap()];
+    let recorded = replay_history(
+        &dir,
+        &corpus,
+        "live",
+        PASSING_PROBES,
+        "grounding",
+        Some(&script),
+        &flags,
+    );
+    assert_ok(&recorded.output);
+    let grounding = recorded.report();
+    let home = resolution_probe(&grounding, "p001")["observed"]["id"].clone();
+    let probes = r#"
+[[probe]]
+id = "purged"
+at = "2026-11-05T12:00:00Z"
+kind = "absent"
+memory = "lives in Auckland"
+"#;
+    let run = replay_history(&dir, &corpus, "replay", probes, "purged", None, &flags);
+    assert_ok(&run.output);
+    let report = run.report();
+    let memory = report["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|memory| memory["id"] == home)
+        .expect("the created list retains home");
+    assert!(memory["purged_at"].is_string(), "{memory}");
+    let probe = resolution_probe(&report, "purged");
+    assert_eq!(probe["passed"], true, "{probe}");
+    assert_eq!(probe["observed"]["id"], home, "{probe}");
+    assert_eq!(probe["observed"]["present"], false, "{probe}");
+}
+
 // Recording modes.
 
 #[test]
@@ -1376,7 +1598,17 @@ memory = "lives in Auckland"
         "the later prefetch sees the memory: {report}"
     );
     assert_eq!(tokens("s2"), 0, "the earlier prefetch can't: {report}");
-    assert_ok(&run.output);
+    let early = resolution_probe(&report, "p001");
+    assert_eq!(early["passed"], false, "{early}");
+    assert_eq!(early["observed"]["resolved"], false, "{early}");
+    let later = resolution_probe(&report, "p002");
+    assert_eq!(later["passed"], true, "{later}");
+    assert_eq!(
+        run.output.status.code(),
+        Some(1),
+        "the pre-creation probe is unresolved: {}",
+        stderr(&run.output)
+    );
 }
 
 /// `--no-cache` re-records from scratch, so re-recording leaves
