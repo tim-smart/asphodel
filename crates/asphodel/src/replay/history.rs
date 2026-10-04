@@ -9,6 +9,7 @@
 //! pinned (`--onnx-threads`, default 1), or `ASPHODEL_MODELS=fake` runs the
 //! fakes.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -87,6 +88,11 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         .as_deref()
         .map(|path| super::inside_private(&dir, path, "the labelling material"))
         .transpose()?;
+    let labels_path = args
+        .labels
+        .as_deref()
+        .map(|path| super::inside_private(&dir, path, "the labels file"))
+        .transpose()?;
     let probes_path = args
         .probes
         .as_deref()
@@ -99,6 +105,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             probes_path.as_ref(),
             Some(&report_path),
             aggregate_path.as_ref(),
+            labels_path.as_ref(),
         ];
         if occupied.into_iter().flatten().any(|other| path == other) {
             bail!(
@@ -107,6 +114,10 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             );
         }
     }
+    let labelled = match &labels_path {
+        Some(path) => super::labelling::labelled_queries(path)?,
+        None => BTreeSet::new(),
+    };
     let shadow_path = dir.join(SHADOW_FILE);
     super::refuse_symlink(&shadow_path)?;
 
@@ -194,7 +205,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             latency: latency.unwrap_or(jiff::SignedDuration::ZERO),
             latency_from_cassette: latency.is_none(),
             until: args.until,
-            labelling: labelling_path.is_some(),
+            labelling: labelling_path.as_ref().map(|_| labelled.clone()),
         };
         let engine = Engine::new(
             &service,

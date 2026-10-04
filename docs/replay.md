@@ -602,7 +602,7 @@ The material is one JSON object:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "recall": [
     { "sample": "r1", "at": "<prefetch time>", "session": "<session id>",
       "query": "<the query the reranker scored against>",
@@ -611,6 +611,7 @@ The material is one JSON object:
         { "id": "r1.1", "memory": "<uuid>", "score": 1.5, "sentence": "..." } ] } ],
   "call2": [
     { "sample": "c1", "at": "<when the worker claimed the chunk>",
+      "chunk": "<uuid>", "ordinal": 0,
       "claim": "<the claim's sentence>",
       "candidates": [
         { "id": "c1.1", "memory": "<uuid>", "score": 0.93, "sentence": "..." } ] } ]
@@ -621,11 +622,11 @@ The material is one JSON object:
   are fewer. Cron prefetches, probes and refreshes aren't turns and are
   never sampled. The sample is spread evenly over the run in time order
   (turn `i × n / 50` of `n`), so the same run always samples the same
-  turns. Each lists the prefetch's reranked candidates in ranked order
-  before the gate, including those the gate turned away, scored with the
-  raw reranker logit the gate floor compares, not the logit divided by the
-  relevance scale. `query` is what the reranker
-  scored against: the message without the Discord message-id note and the
+  turns; `--labels` changes which (below). Each lists the prefetch's
+  reranked candidates in ranked order before the gate, including those
+  the gate turned away, scored with the raw reranker logit the gate floor
+  compares, not the logit divided by the relevance scale. `query` is
+  what the reranker scored against: the message without the Discord message-id note and the
   `[Name] ` speaker prefix, after a short follow-up borrowed the previous
   message. Calibration uses it. `raw_query` is the message as Hermes sent
   it, for reading beside it. Material written before it was recorded has
@@ -638,14 +639,43 @@ The material is one JSON object:
   precision by score threshold over these observed candidates; it does
   not predict what raising or lowering the reconcile floor would retain.
   Unobserved candidates are outside this material.
-- A candidate's `id` is unique in the file and is what a label names;
-  `memory` is the memory's id in the replayed store.
+  `chunk` is the chunk the claim came from and `ordinal` its index in
+  call 1's reply, the two halves of what names the memory the claim
+  makes. Material before version 2 has neither.
+- A candidate's `id` is unique in the file and numbers it within this
+  run; `memory` is the memory's id in the replayed store.
 
-The labels file is TOML, written by Tim inside the private dir: one key
-per candidate id, `true` when the candidate is relevant (for recall, worth
-injecting for the query; for call 2, about the same thing as the claim)
-and `false` when it isn't. Candidates without a label are left out and
-counted.
+The labels file is TOML, written by Tim inside the private dir. Each label
+says whether a candidate is relevant: for recall, worth injecting for the
+query; for call 2, about the same thing as the claim. Labels are keyed by
+what they judge, not by candidate id, so they score another run's material
+over the same corpus.
+
+```toml
+[[recall]]
+query = "<the sample's query>"
+memory = "<uuid>"
+relevant = true
+
+[[call2]]
+chunk = "<the sample's chunk>"
+ordinal = 0
+memory = "<the neighbour's uuid>"
+relevant = false
+```
+
+A recall label matches every candidate with that memory under a sample
+with that query; a call 2 label, every candidate with that memory under a
+sample with that chunk and ordinal. The claim's wording isn't part of the
+key. Memory ids are derived from the source and the claim's position, so
+they survive a re-record while call 1 splits a turn the same way. When it
+splits it differently the ids shift, and the labels on them stop matching.
+Expect partial carry-over; the counts below show how much. The same
+judgement given twice with different answers is refused, naming the
+entries by number.
+
+The old form, one key per candidate id, is still read against the
+material it was written for:
 
 ```toml
 "r1.1" = true
@@ -654,19 +684,42 @@ counted.
 ```
 
 ```
-asphodel report precision --labels <file> --material <file>
+asphodel report precision --labels <file> --material <file> [--convert <file>]
 ```
 
-prints the curve as JSON: for `recall` and for `call2`, `labelled`,
-`unlabelled` and `curve`, one point per distinct score among the labelled
-candidates in ascending order. At each point's `floor`, `kept` counts the
-labelled candidates scoring at or above it, `relevant` counts those
-labelled `true`, and `precision` is `relevant / kept`. For recall this
-matches the gate's logit comparison. For call 2 it is a score-threshold
-curve over observed candidates, not a prediction for another reconcile
-floor. The curve is numbers only. A label naming no candidate
-in the material is refused. Both files must be inside the private dir, and
-an error names the file and line, never the text.
+prints the curve as JSON. For `recall` and for `call2`: `labelled` and
+`unlabelled` count candidates with and without a label, `matched` counts
+labels that scored a candidate and `unmatched` labels that found none, and
+`curve` has one point per distinct score among the labelled candidates in
+ascending order. At each point's `floor`, `kept` counts the labelled
+candidates scoring at or above it, `relevant` counts those labelled
+`true`, and `precision` is `relevant / kept`. For recall this matches the
+gate's logit comparison. For call 2 it is a score-threshold curve over
+observed candidates, not a prediction for another reconcile floor. The
+curve is numbers only.
+
+A keyed label that finds nothing is counted as unmatched, since a
+re-recorded run is expected to lose some. An old-form label naming no
+candidate in the material is refused, since it was written for different
+material.
+
+`--convert <file>` rewrites old-form labels keyed, reading each id
+through the material it was written for, and adds `converted` to the
+output: how many `recall` and `call2` labels it wrote, `dropped_call2`,
+the call 2 labels it couldn't key because the material predates version 2
+and records no chunk or ordinal, and `conflicting`, labels left out
+because another label judged the same key the other way (the same query
+and memory in two samples, say). Recall labels always convert, since every
+material has the query and the memory. Call 2 labels on version 1
+material are lost and have to be labelled again.
+
+`asphodel replay ... --labelling <file> --labels <file>` samples turns
+whose queries the keyed labels judge first, so a re-record reuses as many
+as it can. With more labelled turns than the sample holds, it spreads the
+50 evenly over them; with fewer, it takes them all and spreads the rest
+over the other turns. Old-form labels are refused there; convert them
+first. Every file must be inside the private dir, and an error names the
+file and line, never the text.
 
 ### Bench
 
