@@ -1147,6 +1147,88 @@ fn the_profile_excludes_weekly_or_more_frequent_and_unclassified_routines() {
     assert_eq!(inputs(&h.input(PROFILE_NAME)), BTreeSet::from([fact]));
 }
 
+fn custom_profile(kinds: Vec<Kind>) -> Harness {
+    let h = Harness::new();
+    h.service
+        .edit_model(
+            BANK,
+            PROFILE_NAME,
+            &ModelEdit {
+                question: Some("What are Alex's recurring activities?".into()),
+                kinds: Some(kinds),
+                ..ModelEdit::default()
+            },
+        )
+        .unwrap();
+    h
+}
+
+fn custom_profile_selects_weekly_memories(kinds: Vec<Kind>, includes_facts: bool) {
+    let h = custom_profile(kinds);
+    let weekly = h.insert(recurring(
+        "Alex goes to the gym every Tuesday.",
+        Some("FREQ=WEEKLY;BYDAY=TU"),
+        "2026-06-12T00:00",
+    ));
+    let tea = h.insert(fact("Alex likes green tea."));
+    let expected = if includes_facts {
+        BTreeSet::from([weekly, tea])
+    } else {
+        BTreeSet::from([weekly])
+    };
+    assert_eq!(inputs(&h.input(PROFILE_NAME)), expected);
+}
+
+#[test]
+fn a_custom_recurring_profile_selects_weekly_memories() {
+    custom_profile_selects_weekly_memories(vec![Kind::Recurring], false);
+}
+
+#[test]
+fn a_custom_all_kinds_profile_selects_weekly_memories() {
+    custom_profile_selects_weekly_memories(vec![], true);
+}
+
+fn custom_profile_refreshes_after_a_weekly_memory_is_extracted(kinds: Vec<Kind>) {
+    let h = custom_profile(kinds);
+    // Complete the owner-edit refresh before testing a memory-write trigger.
+    h.advance(minutes(30));
+    h.tick(&quiet_llm(1));
+    // Leave the minimum refresh interval behind as well.
+    h.advance(minutes(30));
+    let llm = quiet_llm(1);
+    assert!(h.tick(&llm).ran.is_empty());
+    assert_eq!(refresh_calls(&llm), 0);
+
+    let content = "Alex goes to the gym every Tuesday.";
+    h.says(
+        claim(content, "recurring", "notable")
+            .with("recurrence_text", json!("every Tuesday"))
+            .with("recurrence_rrule", json!("FREQ=WEEKLY;BYDAY=TU")),
+    );
+    h.advance(minutes(5) - SignedDuration::from_secs(1));
+    assert!(h.tick(&llm).ran.is_empty());
+    h.advance(SignedDuration::from_secs(1));
+    let refreshed = h.tick(&llm);
+    assert_eq!(
+        refreshed.ran.len(),
+        1,
+        "the weekly memory triggers a refresh"
+    );
+    assert_eq!(refresh_calls(&llm), 1);
+    assert!(llm.requests()[0].user.contains(content));
+}
+
+#[test]
+fn a_custom_recurring_profile_refreshes_after_a_weekly_memory_is_extracted() {
+    custom_profile_refreshes_after_a_weekly_memory_is_extracted(vec![Kind::Recurring]);
+}
+
+#[test]
+fn a_custom_all_kinds_profile_refreshes_after_a_weekly_memory_is_extracted() {
+    custom_profile_refreshes_after_a_weekly_memory_is_extracted(vec![]);
+}
+
 #[test]
 fn a_cited_memory_stays_in_the_input_past_the_top_sixty() {
     // Keeping cited memories stops one that slips from 60th to 61st from
