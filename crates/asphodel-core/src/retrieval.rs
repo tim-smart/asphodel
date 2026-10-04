@@ -621,7 +621,7 @@ pub(crate) fn scored_prefetch(
             previous_reply: request.previous_reply.as_deref(),
         },
         &in_context,
-        false,
+        Aside::Nothing,
     )?;
 
     let logged: Vec<Logged> = run
@@ -699,7 +699,7 @@ pub(crate) fn recall(
 ) -> Result<Recall, RecallError> {
     let started = Instant::now();
     let now = cx.store.now();
-    let run = recall_run(cx, bank, now, started, request)?;
+    let run = recall_run(cx, bank, now, started, request, Aside::Nothing)?;
     let mut ranked = run.ranked;
     ranked.truncate(run.limit);
 
@@ -793,7 +793,7 @@ pub(crate) fn explain(
                 entity: filters.entity.clone(),
                 limit: filters.limit,
             };
-            let run = recall_run(cx, bank, now, started, &request)?;
+            let run = recall_run(cx, bank, now, started, &request, Aside::Overflow)?;
             let candidates = run
                 .ranked
                 .iter()
@@ -802,6 +802,7 @@ pub(crate) fn explain(
                     let reason = (index >= run.limit).then_some(Cut::OverLimit);
                     explained_ranked(item, &run.gathered.arms, strong_cutoff, reason)
                 })
+                .chain(explained_overflow(&run.gathered, strong_cutoff))
                 .collect();
             Ok(Explain {
                 mode: ExplainMode::Recall,
@@ -827,7 +828,7 @@ pub(crate) fn explain(
                     previous_reply: conversation.previous_reply.as_deref(),
                 },
                 &BTreeSet::new(),
-                true,
+                Aside::OverflowAndRefused,
             )?;
             let gathered = &run.gathered;
             let mut candidates: Vec<Explained> = run
@@ -835,6 +836,7 @@ pub(crate) fn explain(
                 .iter()
                 .zip(&run.cuts)
                 .map(|(item, cut)| explained_ranked(item, &gathered.arms, strong_cutoff, *cut))
+                .chain(explained_overflow(gathered, strong_cutoff))
                 .collect();
             candidates.extend(gathered.refused_candidates.iter().map(|candidate| {
                 explained(
@@ -891,8 +893,8 @@ struct Injection {
 }
 
 /// The injection for `conversation`, skipping the memories in
-/// `in_context`, with no side effects. `refused` keeps the heads below τ
-/// for explain.
+/// `in_context`, with no side effects. `aside` is what explain wants kept
+/// besides.
 #[allow(clippy::too_many_arguments)]
 fn inject(
     cx: &Context<'_>,
@@ -902,7 +904,7 @@ fn inject(
     started: Instant,
     conversation: &Conversation<'_>,
     in_context: &BTreeSet<Uuid>,
-    refused: bool,
+    aside: Aside,
 ) -> Result<Injection, RecallError> {
     let deadline = started + cx.deadline;
     let message = clean_query(conversation.message);
@@ -917,7 +919,7 @@ fn inject(
 
     let keep =
         |candidate: &Candidate| candidate.strength >= TAU && !in_context.contains(&candidate.uuid);
-    let mut gathered = gather(cx, bank_id, &query, now, &keep, None, refused)?;
+    let mut gathered = gather(cx, bank_id, &query, now, &keep, None, aside)?;
     let found = std::mem::take(&mut gathered.candidates);
     let documents = found.iter().map(|c| c.content.clone()).collect();
     let reranking = Instant::now();
@@ -1011,13 +1013,14 @@ struct RecallRun {
 }
 
 /// Explicit recall's pipeline for `request`, ignoring its session, with no
-/// side effects.
+/// side effects. `aside` is what explain wants kept besides.
 fn recall_run(
     cx: &Context<'_>,
     bank: &str,
     now: Timestamp,
     started: Instant,
     request: &RecallRequest,
+    aside: Aside,
 ) -> Result<RecallRun, RecallError> {
     let deadline = started + cx.deadline;
     if let (Some(from), Some(to)) = (request.from, request.to)
@@ -1044,7 +1047,7 @@ fn recall_run(
             && request.phase.admits(candidate.phase)
             && in_range(candidate, request)
     };
-    let mut gathered = gather(cx, bank_id, &query, now, &keep, linked.as_ref(), false)?;
+    let mut gathered = gather(cx, bank_id, &query, now, &keep, linked.as_ref(), aside)?;
     let found = std::mem::take(&mut gathered.candidates);
     let documents = found.iter().map(|c| c.content.clone()).collect();
     let reranking = Instant::now();
@@ -1118,6 +1121,29 @@ fn explained_ranked(
         strong_cutoff,
         reason,
     )
+}
+
+/// The fused candidates past the rerank pool as explain shows them: with
+/// their arm and RRF ranks, and nothing from the reranker.
+fn explained_overflow(
+    gathered: &Gathered,
+    strong_cutoff: f64,
+) -> impl Iterator<Item = Explained> + '_ {
+    gathered
+        .overflow
+        .iter()
+        .enumerate()
+        .map(move |(index, candidate)| {
+            explained(
+                candidate,
+                arm_ranks(candidate.id, &gathered.arms, true),
+                Some(RERANKED + index + 1),
+                None,
+                None,
+                strong_cutoff,
+                Some(Cut::OutsideRerankPool),
+            )
+        })
 }
 
 fn explained(
@@ -1417,11 +1443,25 @@ fn rank(
     ranked
 }
 
+/// What [`gather`] keeps aside for explain besides the candidates it
+/// passes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Aside {
+    Nothing,
+    /// The fused candidates past the top [`RERANKED`].
+    Overflow,
+    /// The overflow, and the heads the filter refused.
+    OverflowAndRefused,
+}
+
 /// Steps 1 to 3 and what explain shows of them.
 #[derive(Default)]
 struct Gathered {
     /// The top [`RERANKED`] fused candidates, in RRF order.
     candidates: Vec<Candidate>,
+    /// The fused candidates past them, in RRF order, when asked for. They
+    /// never reach the reranker.
+    overflow: Vec<Candidate>,
     /// Each arm's list as fusion took it: vector, BM25, entity.
     arms: [Vec<i64>; 3],
     /// The heads each arm found that the filter refused, when asked for.
@@ -1446,8 +1486,8 @@ impl Gathered {
 
 /// Steps 1 to 3: the retrievers, clean-up and fusion, cut to the top
 /// [`RERANKED`] in RRF order. `linked`, when given, also seeds the entity
-/// arm with the memories of the recall tool's `entity`. With `refused`, the
-/// heads `keep` refused are kept aside too.
+/// arm with the memories of the recall tool's `entity`. `aside` says what
+/// else to keep for explain.
 fn gather(
     cx: &Context<'_>,
     bank_id: i64,
@@ -1455,7 +1495,7 @@ fn gather(
     now: Timestamp,
     keep: &dyn Fn(&Candidate) -> bool,
     linked: Option<&BTreeSet<i64>>,
-    refused: bool,
+    aside: Aside,
 ) -> Result<Gathered, RecallError> {
     if query.is_empty() {
         return Ok(Gathered::default());
@@ -1485,9 +1525,15 @@ fn gather(
         lists[1].as_slice(),
         lists[2].as_slice(),
     ]);
+    let overflow = match aside {
+        Aside::Nothing => Vec::new(),
+        Aside::Overflow | Aside::OverflowAndRefused => {
+            cleanup.take(fused.get(RERANKED..).unwrap_or_default())
+        }
+    };
     fused.truncate(RERANKED);
     let candidates = cleanup.take(&fused);
-    let (refused, refused_candidates) = if refused {
+    let (refused, refused_candidates) = if aside == Aside::OverflowAndRefused {
         let refused = hits.map(|hits| cleanup.refused(&hits));
         let order = fuse(&[
             refused[0].as_slice(),
@@ -1501,6 +1547,7 @@ fn gather(
     };
     Ok(Gathered {
         candidates,
+        overflow,
         arms: lists,
         refused,
         refused_candidates,

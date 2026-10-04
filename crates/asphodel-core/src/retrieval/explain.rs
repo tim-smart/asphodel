@@ -73,9 +73,13 @@ pub struct Explain {
     /// Whether the reranker answered within the deadline.
     pub reranked: bool,
     pub latency: StageLatency,
-    /// The reranked candidates in their final order, then, in injection
-    /// mode, the heads the arms found below τ, in RRF order among
-    /// themselves. Recall mode doesn't list what its filters dropped.
+    /// The reranked candidates in their final order, then the fused
+    /// candidates past the top [`RERANKED`](crate::constants::RERANKED) in
+    /// RRF order, then, in injection mode, the heads the arms found below
+    /// τ, in RRF order among themselves. Recall mode doesn't list what its
+    /// filters dropped, and a memory in no arm's top
+    /// [`CANDIDATES_PER_ARM`](crate::constants::CANDIDATES_PER_ARM) is no
+    /// candidate at all.
     pub candidates: Vec<Explained>,
     /// Injection mode only.
     pub injection: Option<ExplainedInjection>,
@@ -111,7 +115,8 @@ pub struct Explained {
     pub arms: Vec<ArmRank>,
     /// Its 1-based place in the fused list; `None` below τ.
     pub rrf_rank: Option<usize>,
-    /// The raw reranker logit; `None` below τ or when the reranker missed.
+    /// The raw reranker logit; `None` below τ, past the rerank pool, or
+    /// when the reranker missed.
     pub logit: Option<f64>,
     /// `None` wherever `logit` is.
     pub score: Option<ScoreParts>,
@@ -174,6 +179,10 @@ pub enum Cut {
     OverBudget,
     /// Recall: ranked past the limit.
     OverLimit,
+    /// Either mode: fused past the top
+    /// [`RERANKED`](crate::constants::RERANKED), so the reranker never saw
+    /// it. It keeps its arm and RRF ranks.
+    OutsideRerankPool,
 }
 
 /// What injection would put in the prompt.

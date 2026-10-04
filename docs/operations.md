@@ -826,7 +826,9 @@ Neither takes a session; a `session_id` is ignored. The reply has:
 - `latency`: `embed_ms`, `retrieve_ms`, `rerank_ms` and `total_ms`. The
   reranker's deadline runs from the start of the request, so `rerank_ms` is
   at most what was left of it.
-- `candidates`, the reranked candidates in their final order. Each has its
+- `candidates`, the reranked candidates in their final order, then the
+  candidates fused past the top 40, which the reranker never sees, in fusion
+  order. Each has its
   `id`, `sentence`, `kind` and `phase`; `arms`, the retrievers that found it
   (`vector`, `bm25`, `entity`) with its `rank` in each; `rrf_rank`; the raw
   reranker `logit`; `score`, with `relevance`, `w_s`, `strength_term`,
@@ -844,13 +846,16 @@ A candidate left out gives one of these reasons:
 | `reason` | Mode | Meaning |
 |---|---|---|
 | `over_limit` | recall | Ranked past `limit` |
+| `outside_rerank_pool` | both | Fused past the top 40, so never reranked; it keeps its arm ranks and `rrf_rank`, with a null logit and score |
 | `below_tau` | injection | Strength below the recall threshold |
 | `not_reranked` | injection | The reranker missed its deadline, so nothing is injected |
 | `under_floor` | injection | Its logit is under the loaded reranker's floor |
 | `over_cap` | injection | `injection.cap` memories were already taken |
 | `over_budget` | injection | Its line would take the block past `injection.token_budget` |
 
-Recall mode doesn't list memories its filters left out.
+Recall mode doesn't list memories its filters left out. A memory that isn't
+in any retriever's top 100 isn't a candidate at all, so it isn't listed
+either.
 
 ## The dashboard
 
