@@ -30,6 +30,9 @@ import {
 
 const MODELS = "#/banks/main/models";
 
+/// What the page says when nothing is cached.
+const NOTHING_CACHED = /\b(nothing|not|no|isn't)\b[^.]*\bcached\b/i;
+
 function toggleIn(row) {
   return row.querySelector('input[type="checkbox"], [role="switch"], button[aria-pressed]');
 }
@@ -120,13 +123,19 @@ test("budget use is the enabled models' tokens against the budget the daemon sen
 test("a model taken out of the prompt and put back is edited through enabled alone", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon, { hash: MODELS, token: TOKEN });
+  const cached = daemon.state.cachedBlock.text;
   await findUse(page, 700, 800);
+  await waitFor(() => queryBlock(page, cached), "the cached block");
 
   click(await findToggle(page, "Plans"));
   const out = await waitFor(() => patches(daemon, "Plans")[0], "PATCH Plans");
   assert.deepEqual(out.body, { enabled: false });
   await waitFor(() => queryToggle(page, "Plans") && !isOn(queryToggle(page, "Plans")), "Plans out of the prompt");
   await findUse(page, 500, 800);
+  // The edit cleared the daemon's cache, and the page reads it again
+  // rather than keep the block it loaded with.
+  await waitFor(() => !queryBlock(page, cached), "the stale cached block to go");
+  await findText(page.root, NOTHING_CACHED);
 
   click(await findToggle(page, "Plans"));
   const back = await waitFor(() => patches(daemon, "Plans")[1], "a second PATCH Plans");
@@ -134,11 +143,14 @@ test("a model taken out of the prompt and put back is edited through enabled alo
   await findUse(page, 700, 800);
   assert.ok(isOn(await findToggle(page, "Plans")), "Plans back in the prompt");
   assert.equal(daemon.state.models.find((m) => m.name === "Plans").enabled, true);
+  assert.ok(builtNothing(daemon), "a toggle built a block or refreshed a model");
 });
 
 test("enabling past the budget shows the daemon's error and leaves the model out", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon, { hash: MODELS, token: TOKEN });
+  const cached = daemon.state.cachedBlock.text;
+  await waitFor(() => queryBlock(page, cached), "the cached block");
 
   click(await findToggle(page, "Travel"));
 
@@ -147,6 +159,8 @@ test("enabling past the budget shows the daemon's error and leaves the model out
   await stays(() => !isOn(queryToggle(page, "Travel")), "Travel left out");
   assert.ok(queryText(page.root, /(^|\D)700\D{1,16}800(\D|$)/), "the budget use is unchanged");
   assert.equal(daemon.state.models.find((m) => m.name === "Travel").enabled, false);
+  // A refusal changes nothing, so the cache and the block shown stay.
+  assert.ok(queryBlock(page, cached), "a refused enable dropped the cached block");
 });
 
 test("the page says changes reach new Hermes sessions only, and that a model out of the prompt isn't refreshed", async (t) => {
@@ -184,7 +198,7 @@ test("with nothing cached the page says so and builds nothing", async (t) => {
   daemon.state.cachedBlock = null;
   const page = await open(t, daemon, { hash: MODELS, token: TOKEN });
 
-  await findText(page.root, /\b(nothing|not|no|isn't)\b[^.]*\bcached\b/i);
+  await findText(page.root, NOTHING_CACHED);
   assert.equal(page.root.querySelector("pre"), null, page.root.innerHTML);
   await stays(() => builtNothing(daemon) && daemon.state.cachedBlock === null, "no block built");
 });
