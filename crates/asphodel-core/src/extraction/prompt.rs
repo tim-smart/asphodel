@@ -61,14 +61,14 @@ Most claims are trivial or minor. Major is rare; critical is a few per hundred c
 
 # Time
 
-Resolve relative times using the calendar and the text's timezone. Each time has `at` (`YYYY`, `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`) and `precision` (`year`, `month`, `day`, `hour` or `minute`). Match the text's precision: "in March 2024" is `{"at": "2024-03", "precision": "month"}`; "tomorrow at 3pm" specifies a day and hour.
+Resolve relative times in the current text using its reference date, calendar and timezone. Earlier context turns carry their own local date/time and timezone: resolve relative times in a context passage against that passage's date, never the current text's date. If a claim refers to a dated occasion in relevant context or supplied memories, use that occasion to ground its window, while still quoting only the current text. Do not infer a date for an undated occasion. Return times in the current text's timezone, converting a context occasion's time from its own timezone when needed. Each time has `at` (`YYYY`, `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`) and `precision` (`year`, `month`, `day`, `hour` or `minute`). Match the text's precision: "in March 2024" is `{"at": "2024-03", "precision": "month"}`; "tomorrow at 3pm" specifies a day and hour.
 
 - `valid_from` is when the claim starts to hold; `valid_until` is when it stops. Set `valid_until` only for an explicit end or a task tied to a dated occasion, as below. Facts never have `valid_until`, but keep any stated start ("started at Acme in March 2024").
 - Put a task's due date or scheduled time in `due_at`. Being overdue is not an end: "renew my passport by 20 October" and "pay the power bill on 9 October at 9am" have `due_at` but no `valid_until`. Payments, renewals, replies and chores still need doing when overdue.
 - Set a task's `valid_until` only if it is for a separate occasion (an appointment, trip, meeting or departure) and becomes pointless afterward. Use the occasion's time. "Bring my insurance card to the dentist appointment tomorrow at 2pm" and "pack the carrots before we leave for the mountains on Saturday" have both `due_at` and `valid_until` at the appointment or departure. When unsure, leave `valid_until` null.
 - `until_event` is an end condition rather than a date.
 - Set `window_confidence` to `low` if you guessed dates, otherwise `high`. Coarse dates affect precision, not confidence.
-- If the reference date is unknown, use only fully written dates; don't resolve relative times.
+- If a passage's reference date is unknown, use only fully written dates from that passage; don't resolve its relative times.
 
 For recurring claims, always give the schedule in plain words in `recurrence_text`. Set `recurrence_rrule` (an RFC 5545 RRULE such as `FREQ=WEEKLY;BYDAY=TU`) and `recurrence_start` (the first occurrence) only if the wording maps cleanly. Otherwise leave both null.
 
@@ -202,8 +202,20 @@ fn render(input: &Call1Input) -> String {
 
     if !input.context.is_empty() {
         out.push_str("\nContext, for understanding the text only. Never quote from it:\n");
-        for passage in &input.context {
-            let _ = write!(out, "<context>\n{passage}\n</context>\n");
+        for (index, passage) in input.context.iter().enumerate() {
+            out.push_str("<context>\n");
+            if let Some(time) = input.context_times.get(index) {
+                let tz = jiff::tz::TimeZone::get(&time.timezone).unwrap_or(jiff::tz::TimeZone::UTC);
+                let local = time.observed_at.to_zoned(tz);
+                let _ = writeln!(
+                    out,
+                    "Context turn reference date/time: {} {}, in {}.",
+                    local.datetime(),
+                    local.date().strftime("%A"),
+                    time.timezone
+                );
+            }
+            let _ = write!(out, "{passage}\n</context>\n");
         }
     }
 
