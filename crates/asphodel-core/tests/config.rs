@@ -112,6 +112,24 @@ fn defaults_are_valid() {
 }
 
 #[test]
+fn undated_days_defaults_to_thirty_and_accepts_overrides() {
+    let days =
+        |tuning: &Tuning| serde_json::to_value(tuning).unwrap()["agenda"]["undated_days"].clone();
+    assert_eq!(days(&Tuning::default()), 30);
+    assert_eq!(days(&load("").unwrap()), 30);
+    assert_eq!(days(&load("[agenda]\nundated_days = 10\n").unwrap()), 10);
+    assert_eq!(days(&load("[agenda]\nundated_days = 1\n").unwrap()), 1);
+}
+
+#[test]
+fn undated_days_must_be_at_least_one() {
+    assert_eq!(
+        invalid_keys("[agenda]\nundated_days = 0\n"),
+        ["agenda.undated_days"]
+    );
+}
+
+#[test]
 fn no_file_and_an_empty_file_give_the_defaults() {
     assert_eq!(Tuning::load(None).unwrap(), Tuning::default());
     assert_eq!(load("").unwrap(), Tuning::default());
@@ -904,6 +922,7 @@ fn excluded_tuning_values_leave_the_fingerprint_alone() {
         "[injection.reranker_floors]\nm = -1.0\n",
         "[reconcile.embedding_floors]\nm = 0.8\n",
         "[agenda]\nhorizon_days = 14\n",
+        "[agenda]\nundated_days = 60\n",
         "[agenda]\ndated_lines = 20\n",
         "[agenda]\nroutines = 0\n",
         "[agenda]\nundated_tasks = 9\n",

@@ -1,0 +1,31 @@
+name = "undated-task-expiry"
+group = "ci"
+description = "An undated task leaves after 30 local days without another mention, even while above the strength threshold."
+
+[bank]
+timezone = "UTC"
+
+[[turn]]
+at = "2026-02-09T09:00:00Z"
+session = "garage"
+user = "I need to organise the garage, with no deadline."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "garage-task"
+content = "Tim needs to organise the garage, with no deadline."
+quote = "I need to organise the garage, with no deadline."
+kind = "task"
+significance = "minor"
+
+[[probe]]
+id = "undated-task-at-thirty-days"
+at = "2026-03-11T23:59:00Z"
+kind = "agenda_has"
+memory = "garage-task"
+
+[[probe]]
+id = "undated-task-expires-at-thirty-one-days"
+at = "2026-03-12T00:00:00Z"
+kind = "agenda_lacks"
+memory = "garage-task"
