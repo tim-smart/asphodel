@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime
 
 import pytest
-from conftest import PACKAGE_NAME, TESTS_DIR, write_config
+from conftest import PACKAGE_NAME, TESTS_DIR, plugin, write_config
 
 FIXTURES = TESTS_DIR / "fixtures"
 MANIFEST = tomllib.loads((FIXTURES / "manifest.toml").read_text())
@@ -174,3 +174,25 @@ def test_stops_at_the_first_daemon_error_and_a_rerun_resumes(history, daemon, ca
     assert run("--all-history") == 0
     printed = json.loads(capsys.readouterr().out)
     assert (printed["stored"], printed["duplicates"]) == (0, 13)
+
+
+def setup_with(hermes_home, *answers):
+    """``hermes memory setup`` keeping every field ``history`` wrote, then
+    ``answers`` to the prompts after them: the backfill question and the
+    cutoff, a date or ``all``. A blank cutoff isn't asked again."""
+    fields = [f for f in plugin.config.config_schema() if not f.get("secret")]
+    replies = iter([""] * len(fields) + list(answers))
+    plugin.AsphodelMemoryProvider().post_setup(str(hermes_home), {}, prompt=lambda label: next(replies))
+
+
+def test_declining_the_backfill_at_setup_posts_nothing(history, daemon):
+    setup_with(history, "n")
+    assert daemon.requests_for("turns") == []
+
+
+def test_accepting_the_backfill_at_setup_still_needs_a_cutoff(history, daemon):
+    setup_with(history, "y", "")
+    assert daemon.requests_for("turns") == []
+
+    setup_with(history, "y", "all")
+    assert len(daemon.requests_for("turns")) == IMPORT_COUNTS["turns"]

@@ -20,7 +20,8 @@ def test_save_config_writes_non_secret_values(hermes_home):
 def test_post_setup_turns_builtin_memory_off_and_activates_the_provider(hermes_home, hermes):
     provider = plugin.AsphodelMemoryProvider()
     config = {"memory": {"memory_enabled": True, "user_profile_enabled": True, "provider": "hindsight"}}
-    answers = iter(["http://10.0.0.5:7720", "", "Tim", "discord:111", "", "", ""])
+    # The schema's fields, then no to the history backfill.
+    answers = iter(["http://10.0.0.5:7720", "", "Tim", "discord:111", "", "", "", "n"])
     provider.post_setup(str(hermes_home), config, prompt=lambda label: next(answers))
     assert config["memory"]["memory_enabled"] is False
     assert config["memory"]["user_profile_enabled"] is False
