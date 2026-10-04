@@ -37,7 +37,9 @@ use asphodel_core::operations::{
 use asphodel_core::queue::{ChunkList, QueueError, Retried, RetryRequest};
 use asphodel_core::reembed::{ReembedError, ReembedState, ReembedStatus};
 use asphodel_core::retract::{RetractError, Retracted};
-use asphodel_core::retrieval::{Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest};
+use asphodel_core::retrieval::{
+    Explain, ExplainRequest, Prefetch, PrefetchRequest, Recall, RecallError, RecallRequest,
+};
 use asphodel_core::store::StoreError;
 use asphodel_core::store::bank::{Bank, BankError, BankIdentity};
 use asphodel_core::sweep::{PurgeAck, PurgeError, PurgePlan};
@@ -74,6 +76,7 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/v1/banks/{bank}/sources/{source}", get(show_source))
         .route("/v1/banks/{bank}/prefetch", post(prefetch))
         .route("/v1/banks/{bank}/recall", post(recall))
+        .route("/v1/banks/{bank}/recall/explain", post(explain))
         .route("/v1/banks/{bank}/forget", post(forget))
         .route("/v1/banks/{bank}/keep", post(keep))
         .route("/v1/banks/{bank}/unkeep", post(unkeep))
@@ -761,6 +764,20 @@ async fn recall(
         .call(move |service| service.recall(&bank, &request))
         .await?;
     Ok(Json(recall))
+}
+
+/// `POST /v1/banks/{bank}/recall/explain`: the dashboard's Recall page. It
+/// runs recall or injection with the working shown and writes nothing.
+async fn explain(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    body: Result<Json<ExplainRequest>, JsonRejection>,
+) -> Result<Json<Explain>, ApiError> {
+    let Json(request) = body?;
+    let explain = app
+        .call(move |service| service.explain(&bank, &request))
+        .await?;
+    Ok(Json(explain))
 }
 
 /// `POST /v1/banks/{bank}/keep`: `memory_keep`.

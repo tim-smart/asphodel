@@ -20,13 +20,14 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use asphodel_core::config::RankingTuning;
-use asphodel_core::constants::CANDIDATES_PER_ARM;
+use asphodel_core::constants::{CANDIDATES_PER_ARM, RERANKED};
 use asphodel_core::ingest::{Outcome, Turn};
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, ModelError, Models, Reranker,
 };
 use asphodel_core::retrieval::{
-    Band, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, clean_query,
+    Arm, Band, Cut, Explain, ExplainInjection, ExplainMode, ExplainRecall, ExplainRequest,
+    Explained, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, clean_query,
     conversation_query, effective_query, estimate_tokens, fuse, phase_term,
 };
 use asphodel_core::store::bank::BankIdentity;
@@ -2149,4 +2150,361 @@ fn a_turn_queued_across_a_restart_keeps_its_in_context_set() {
         1,
         "the turn's use was lost across the restart"
     );
+}
+
+// Explain: the pipeline's working for one query, with no side effects
+
+impl Harness {
+    fn explain(&self, request: ExplainRequest) -> Explain {
+        self.service.explain(BANK, &request).unwrap()
+    }
+
+    /// The rows a recall or a session's state would leave: recalls, their
+    /// results, accesses and session blocks.
+    fn recall_traces(&self) -> [i64; 4] {
+        ["recalls", "recall_results", "accesses", "session_blocks"]
+            .map(|table| self.one(&format!("SELECT COUNT(*) FROM {table}"), []))
+    }
+}
+
+/// The explain request for the same query and filters as `request`.
+fn explain_recall(request: &RecallRequest) -> ExplainRequest {
+    ExplainRequest::Recall(ExplainRecall {
+        query: request.query.clone(),
+        from: request.from,
+        to: request.to,
+        on: request.on,
+        phase: request.phase,
+        kinds: request.kinds.clone(),
+        entity: request.entity.clone(),
+        limit: request.limit,
+    })
+}
+
+fn explain_injection(message: &str) -> ExplainRequest {
+    ExplainRequest::Injection(ExplainInjection {
+        query: message.into(),
+        ..ExplainInjection::default()
+    })
+}
+
+fn included(explain: &Explain) -> Vec<Uuid> {
+    explain
+        .candidates
+        .iter()
+        .filter(|c| c.included)
+        .map(|c| c.id)
+        .collect()
+}
+
+fn explained(explain: &Explain, memory: Uuid) -> &Explained {
+    explain
+        .candidates
+        .iter()
+        .find(|c| c.id == memory)
+        .unwrap_or_else(|| panic!("{memory} isn't a candidate: {explain:#?}"))
+}
+
+#[test]
+fn explaining_writes_no_recall_or_access_and_leaves_sessions_alone() {
+    let h = Harness::new();
+    let pottery = h.insert(fact("Tim takes a pottery class."));
+    h.insert(fact("Tim owns a canoe."));
+    // Session s has pottery in context; session t holds it pending.
+    let committed = h.prefetch("s", "pottery class schedule");
+    h.sync_turn("s", Some(committed.recall_id.to_string()));
+    let pending = h.prefetch("t", "pottery class schedule");
+    assert_eq!(pending.injected, vec![pottery]);
+    let request = query("pottery class");
+    // Recall can include lower-scoring hits too; take its baseline before
+    // the side-effect snapshot, since a real recall writes a log row.
+    let returned = ids(&h.recall(request.clone()));
+    assert_eq!(returned[0], pottery);
+    let before = h.recall_traces();
+
+    let recall = h.explain(explain_recall(&request));
+    let injection = h.explain(explain_injection("pottery class schedule"));
+
+    assert_eq!(included(&recall), returned);
+    // There's no session, so what s has in context is injected anyway.
+    assert_eq!(
+        injection.injection.as_ref().unwrap().injected,
+        vec![pottery]
+    );
+    assert_eq!(h.recall_traces(), before);
+    assert_eq!(h.in_context("s"), vec![pottery]);
+    assert!(h.in_context("t").is_empty());
+    // t's pending injection is still the one its turn commits.
+    h.sync_turn("t", Some(pending.recall_id.to_string()));
+    assert_eq!(h.in_context("t"), vec![pottery]);
+}
+
+#[test]
+fn explaining_a_recall_includes_what_recall_returns_in_its_order() {
+    let h = Harness::with_floor(0.0);
+    let lee = h.entity("Sam Lee", &["Sam"]);
+    h.insert(Memory {
+        kind: "event",
+        valid_from: Some((local("2026-10-10T00:00"), "day")),
+        ..fact("Tim's garden tour is on 10 October 2026.")
+    });
+    h.insert(Memory {
+        kind: "event",
+        observed_at: at("2026-09-12T00:00:00Z"),
+        valid_from: Some((local("2026-09-10T00:00"), "day")),
+        ..fact("Tim's garden party was on 10 September 2026.")
+    });
+    let shared = h.insert(fact("Tim shares the garden with Sam."));
+    h.link(shared, lee);
+    h.insert(Memory {
+        significance: "trivial",
+        observed_at: at("2021-01-01T00:00:00Z"),
+        ..fact("Tim once grew tomatoes in the garden.")
+    });
+    h.insert(Memory {
+        kind: "task",
+        due_at: Some((local("2026-09-30T00:00"), "day")),
+        ..fact("Tim needs to weed the garden.")
+    });
+    h.insert(fact("Tim's garden has a lemon tree and a garden shed."));
+
+    for request in [
+        query("garden"),
+        RecallRequest {
+            limit: Some(2),
+            ..query("garden")
+        },
+        RecallRequest {
+            phase: PhaseFilter::Current,
+            ..query("garden shed")
+        },
+        RecallRequest {
+            kinds: vec![Kind::Event],
+            ..query("garden")
+        },
+        RecallRequest {
+            entity: Some("Sam".into()),
+            ..query("garden")
+        },
+        RecallRequest {
+            on: On::Said,
+            from: Some(at("2026-09-11T00:00:00Z")),
+            to: Some(at("2026-09-13T00:00:00Z")),
+            ..query("garden")
+        },
+    ] {
+        let returned = ids(&h.recall(request.clone()));
+        let explain = h.explain(explain_recall(&request));
+        assert!(!returned.is_empty(), "{request:?}");
+        assert_eq!(included(&explain), returned, "{request:?}");
+        assert_eq!(explain.mode, ExplainMode::Recall);
+        assert!(explain.injection.is_none());
+    }
+
+    // What the limit cut is listed under the results, saying so.
+    let explain = h.explain(explain_recall(&RecallRequest {
+        limit: Some(2),
+        ..query("garden")
+    }));
+    let cut: Vec<&Explained> = explain.candidates.iter().filter(|c| !c.included).collect();
+    assert!(!cut.is_empty(), "{explain:#?}");
+    assert!(cut.iter().all(|c| c.reason == Some(Cut::OverLimit)));
+    assert!(explain.candidates[..2].iter().all(|c| c.included));
+}
+
+#[test]
+fn explaining_an_injection_injects_what_a_fresh_session_prefetch_would() {
+    let h = Harness::with(1.0, "cap = 2", Arc::new(FakeReranker));
+    for note in ["one", "two", "three"] {
+        h.insert(fact(leak(format!("Pottery class note {note}."))));
+    }
+    h.insert(fact("A pottery class schedule note."));
+    h.insert(fact("The class was cancelled."));
+    h.insert(Memory {
+        significance: "trivial",
+        observed_at: at("2021-01-01T00:00:00Z"),
+        ..fact("Tim once tried a pottery class.")
+    });
+
+    for (session, message, previous, reply) in [
+        ("fresh-1", "pottery class schedule", None, None),
+        (
+            "fresh-2",
+            "and the notes?",
+            Some("pottery class"),
+            Some("The pottery class meets on Tuesdays."),
+        ),
+    ] {
+        let explain = h.explain(ExplainRequest::Injection(ExplainInjection {
+            query: message.into(),
+            previous_query: previous.map(Into::into),
+            previous_reply: reply.map(Into::into),
+        }));
+        let prefetch = h.prefetch_in_conversation(session, message, previous, reply);
+        assert!(!prefetch.injected.is_empty(), "{message}");
+
+        let injection = explain.injection.clone().unwrap();
+        assert_eq!(injection.injected, prefetch.injected, "{message}");
+        assert_eq!(injection.text, prefetch.text, "{message}");
+        assert_eq!(injection.tokens, estimate_tokens(&prefetch.text));
+        assert_eq!(included(&explain), prefetch.injected, "{message}");
+        assert_eq!(explain.mode, ExplainMode::Injection);
+    }
+}
+
+#[test]
+fn an_explained_injection_says_why_each_candidate_was_left_out() {
+    let h = Harness::with(1.0, "cap = 1", Arc::new(FakeReranker));
+    // FakeReranker: shared query words minus a half; the floor is 1.0.
+    let best = h.insert(fact("A pottery class schedule note.")); // 2.5
+    let capped = h.insert(fact("A pottery class note.")); // 1.5
+    let weak = h.insert(fact("The class was cancelled.")); // 0.5
+    let faded = h.insert(Memory {
+        significance: "trivial",
+        observed_at: at("2021-01-01T00:00:00Z"),
+        ..fact("Tim once tried a pottery class schedule.")
+    });
+
+    let explain = h.explain(explain_injection("pottery class schedule"));
+    assert!(explain.reranked);
+    assert_eq!(explain.query, "pottery class schedule");
+
+    let shown = explained(&explain, best);
+    assert!(shown.included);
+    assert_eq!(shown.reason, None);
+    assert_eq!(shown.logit, Some(2.5));
+    assert_eq!(shown.score.unwrap().relevance, 2.5);
+    assert!(shown.rrf_rank.is_some());
+    assert!(
+        shown
+            .arms
+            .iter()
+            .any(|arm| arm.arm == Arm::Bm25 && arm.rank.is_some()),
+        "{shown:#?}"
+    );
+
+    assert_eq!(explained(&explain, capped).reason, Some(Cut::OverCap));
+    assert_eq!(explained(&explain, weak).reason, Some(Cut::UnderFloor));
+    let below = explained(&explain, faded);
+    assert_eq!(below.reason, Some(Cut::BelowTau));
+    assert_eq!(below.strength, Band::Faded);
+    assert_eq!((below.rrf_rank, below.logit), (None, None));
+    assert_eq!(explain.candidates.last().unwrap().id, faded);
+}
+
+#[test]
+fn an_explained_injection_shows_a_reranker_that_missed_its_deadline() {
+    let deadline = Duration::from_millis(100);
+    let h = Harness::with(1.0, "", Arc::new(SlowReranker(Duration::from_secs(2))))
+        .with_deadline(deadline);
+    let pottery = h.insert(fact("Tim takes a pottery class."));
+
+    let explain = h.explain(explain_injection("pottery class schedule"));
+    assert!(!explain.reranked);
+    // Embedding and retrieval consume part of the request-wide deadline.
+    assert!(explain.latency.total_ms >= deadline.as_millis() as u64);
+    assert!(explain.latency.total_ms >= explain.latency.rerank_ms);
+    assert_eq!(explain.injection.as_ref().unwrap().text, "");
+    let shown = explained(&explain, pottery);
+    assert_eq!(shown.reason, Some(Cut::NotReranked));
+    assert_eq!(shown.logit, None);
+}
+
+/// A reranker that answers like `FakeReranker` and records how many
+/// documents each call was sent.
+#[derive(Default)]
+struct CountingReranker(Mutex<Vec<usize>>);
+
+impl Reranker for CountingReranker {
+    fn model_id(&self) -> &str {
+        FakeReranker::MODEL_ID
+    }
+
+    fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, ModelError> {
+        self.0.lock().unwrap().push(documents.len());
+        FakeReranker.rerank(query, documents)
+    }
+}
+
+/// A cut's reason as the response names it.
+fn reason_name(candidate: &Explained) -> Option<String> {
+    serde_json::to_value(candidate.reason)
+        .unwrap()
+        .as_str()
+        .map(str::to_owned)
+}
+
+#[test]
+fn fused_candidates_past_the_rerank_pool_are_listed_and_never_reranked() {
+    let reranker = Arc::new(CountingReranker::default());
+    let h = Harness::with(1.0, "", reranker.clone());
+    // More eligible matches than the reranker takes, and one below τ.
+    let notes: Vec<Uuid> = (0..RERANKED + 5)
+        .map(|n| h.insert(fact(leak(format!("Pottery class note {n}.")))))
+        .collect();
+    let faded = h.insert(Memory {
+        significance: "trivial",
+        observed_at: at("2021-01-01T00:00:00Z"),
+        ..fact("Tim once tried a pottery class.")
+    });
+
+    let recall_request = RecallRequest {
+        limit: Some(30),
+        ..query("pottery class")
+    };
+    let recall = h.explain(explain_recall(&recall_request));
+    let injection = h.explain(explain_injection("pottery class"));
+    // Explain sent the reranker no more than production does.
+    assert_eq!(*reranker.0.lock().unwrap(), vec![RERANKED, RERANKED]);
+
+    for (explain, eligible) in [
+        (&recall, [notes.clone(), vec![faded]].concat()),
+        (&injection, notes.clone()),
+    ] {
+        let reranked = &explain.candidates[..RERANKED];
+        assert!(reranked.iter().all(|c| c.logit.is_some()));
+        let overflow: Vec<&Explained> = explain
+            .candidates
+            .iter()
+            .filter(|c| reason_name(c).as_deref() == Some("outside_rerank_pool"))
+            .collect();
+        assert_eq!(overflow.len(), eligible.len() - RERANKED, "{explain:#?}");
+        let mut listed: Vec<Uuid> = reranked
+            .iter()
+            .chain(overflow.iter().copied())
+            .map(|c| c.id)
+            .collect();
+        listed.sort();
+        let mut eligible = eligible;
+        eligible.sort();
+        assert_eq!(listed, eligible, "{:?}", explain.mode);
+
+        // The overflow follows the reranked candidates in RRF order, with
+        // the ranks fusion gave it and nothing from the reranker.
+        let ranks: Vec<usize> = overflow.iter().map(|c| c.rrf_rank.unwrap()).collect();
+        assert_eq!(ranks, (RERANKED + 1..=eligible.len()).collect::<Vec<_>>());
+        assert_eq!(explain.candidates[RERANKED].id, overflow[0].id);
+        for c in &overflow {
+            assert!(!c.included);
+            assert_eq!((c.logit, c.score), (None, None));
+            assert!(!c.arms.is_empty());
+            assert!(c.arms.iter().all(|arm| arm.rank.is_some()), "{c:#?}");
+        }
+    }
+    // Below τ still comes last, after the overflow.
+    assert_eq!(injection.candidates.last().unwrap().id, faded);
+    assert_eq!(
+        injection.candidates.len(),
+        notes.len() + 1,
+        "{injection:#?}"
+    );
+
+    // Production selection is unchanged: the same results and injection,
+    // from the same number of reranked documents.
+    assert_eq!(included(&recall), ids(&h.recall(recall_request)));
+    assert_eq!(
+        injection.injection.as_ref().unwrap().injected,
+        h.prefetch("fresh", "pottery class").injected
+    );
+    assert_eq!(*reranker.0.lock().unwrap(), vec![RERANKED; 4]);
 }

@@ -548,6 +548,17 @@ impl Service {
         crate::retrieval::recall(&self.retrieval()?, bank, request)
     }
 
+    /// Explain: one query through the recall or injection pipeline with
+    /// its working shown, writing no recall row or access and touching no
+    /// session, not even to restore one ([`crate::retrieval::Explain`]).
+    pub fn explain(
+        &self,
+        bank: &str,
+        request: &crate::retrieval::ExplainRequest,
+    ) -> Result<crate::retrieval::Explain, RecallError> {
+        crate::retrieval::explain(&self.retrieval()?, bank, request)
+    }
+
     /// The session's in-context set: the public ids of the memories the
     /// agent can already see, oldest first. It's what
     /// [`Service::call1_input`] and [`Service::extract_chunk`] take.
