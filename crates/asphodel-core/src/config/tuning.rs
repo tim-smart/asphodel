@@ -248,6 +248,16 @@ pub struct ExtractionTuning {
     pub guidance: Option<String>,
 }
 
+/// The smallest `agenda.update_budget`. The date-only update takes 71
+/// characters at most (18 tokens): "Agenda update for Wed 30 Sep" and
+/// "- Nothing new since this session's agenda.". With items, the header, a
+/// group heading ("Open tasks"), a three-digit count ("- and 100 more
+/// agenda items") and the newlines between them take 68, so 40 tokens (160
+/// characters) leaves 92 for the first line: room for its date annotation,
+/// such as " [upcoming Wed 30 Sep 2027 15:00]", and over 50 characters of
+/// its sentence.
+pub const UPDATE_BUDGET_MIN: u32 = 40;
+
 /// `[agenda]`: the list in `system_prompt_block()` chosen by world time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -275,6 +285,11 @@ pub struct AgendaTuning {
 
     /// The cap on undated open tasks.
     pub undated_tasks: u32,
+
+    /// At most about this many tokens for the agenda update prefetch puts
+    /// ahead of relevance injection, apart from `injection.token_budget`.
+    /// At least [`UPDATE_BUDGET_MIN`].
+    pub update_budget: u32,
 }
 
 impl Default for AgendaTuning {
@@ -286,6 +301,7 @@ impl Default for AgendaTuning {
             dated_lines: 15,
             routines: 4,
             undated_tasks: 5,
+            update_budget: 200,
         }
     }
 }
@@ -295,7 +311,8 @@ impl Default for AgendaTuning {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MentalModelsTuning {
-    /// Tokens shared by every enabled model in `system_prompt_block()`.
+    /// Tokens shared by the guidance, agenda and every enabled model in
+    /// `system_prompt_block()`. Must fit its mandatory guidance and fold summary.
     pub budget: u32,
 
     /// `max_tokens` for the seeded "User profile".
@@ -314,7 +331,15 @@ pub struct MentalModelsTuning {
     /// The daily sweep's bank-local time.
     pub sweep_time: Time,
 
-    /// Memories a refresh selects by score.
+    /// The most facets a planned question is split into. A plan with more
+    /// keeps the first this many.
+    pub max_facets: u32,
+
+    /// Memories each facet's retrieval takes, best first.
+    pub facet_budget: u32,
+
+    /// Memories a refresh selects in all, once duplicates are removed,
+    /// taking each facet's next best in turn.
     pub input_budget: u32,
 
     /// The input cap once the memories the model cites now are added.
@@ -324,14 +349,16 @@ pub struct MentalModelsTuning {
 impl Default for MentalModelsTuning {
     fn default() -> Self {
         Self {
-            budget: 800,
-            profile_max_tokens: 500,
+            budget: 2560,
+            profile_max_tokens: 2048,
             trigger_level: Significance::Notable,
             refresh_debounce_minutes: 5,
             refresh_max_delay_minutes: 30,
             sweep_time: Time::constant(4, 0, 0, 0),
-            input_budget: 60,
-            input_budget_with_cited: 70,
+            max_facets: 6,
+            facet_budget: 20,
+            input_budget: 90,
+            input_budget_with_cited: 100,
         }
     }
 }
@@ -655,8 +682,27 @@ impl Tuning {
                 fail(key, "must be at least 1".into());
             }
         }
+        if agenda.update_budget < UPDATE_BUDGET_MIN {
+            fail(
+                "agenda.update_budget",
+                format!(
+                    "must be at least {UPDATE_BUDGET_MIN}, got {}",
+                    agenda.update_budget
+                ),
+            );
+        }
 
         let models = &self.mental_models;
+        let minimum_budget = crate::system_prompt::minimum_budget();
+        if (models.budget as usize) < minimum_budget {
+            fail(
+                "mental_models.budget",
+                format!(
+                    "must be at least {minimum_budget} to fit memory guidance and the agenda fold summary, got {}",
+                    models.budget
+                ),
+            );
+        }
         for (key, value) in [
             ("mental_models.budget", models.budget),
             (
@@ -667,6 +713,8 @@ impl Tuning {
                 "mental_models.refresh_debounce_minutes",
                 models.refresh_debounce_minutes,
             ),
+            ("mental_models.max_facets", models.max_facets),
+            ("mental_models.facet_budget", models.facet_budget),
             ("mental_models.input_budget", models.input_budget),
         ] {
             if value == 0 {

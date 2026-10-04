@@ -50,6 +50,7 @@ use std::time::Duration;
 use asphodel_core::extraction::{Call1Input, Committed, DropReason, Extracted, Prepared};
 use asphodel_core::ingest::{Document, Outcome as IngestOutcome, Turn, TurnAuthor};
 use asphodel_core::inspect::InspectError;
+use asphodel_core::mental_models::PLAN_TEMPLATE;
 use asphodel_core::models::{FakeLlm, LlmClient, LlmError, LlmRequest, LlmResponse};
 use asphodel_core::retrieval::{Band, PrefetchRequest, RecallRequest, band, estimate_tokens};
 use asphodel_core::service::Claimed;
@@ -223,9 +224,12 @@ struct Snapshot {
     fade_outs: u64,
 }
 
-/// Answers every refresh with no edits, counting the calls.
+/// Answers every refresh without writing anything: a plan of one facet,
+/// the question itself, and an empty summary. Counts the writes, which are
+/// the refresh calls, and the plans.
 pub struct NoEdits {
     calls: Mutex<Vec<Timestamp>>,
+    plans: Mutex<u64>,
     clock: Arc<SimulatedClock>,
 }
 
@@ -234,13 +238,28 @@ impl LlmClient for NoEdits {
         MODEL
     }
 
-    fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        self.calls
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(self.clock.now());
+    fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        let json = if request.template.name == PLAN_TEMPLATE {
+            *self
+                .plans
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+            let question = request
+                .user
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("Question: "))
+                .unwrap_or_default();
+            json!({ "facets": [{ "heading": "Answer", "query": question }] })
+        } else {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(self.clock.now());
+            json!({ "sections": [] })
+        };
         Ok(LlmResponse {
-            json: json!({ "operations": [] }),
+            json,
             usage: None,
             latency: Duration::ZERO,
         })
@@ -370,6 +389,7 @@ impl<'a> Engine<'a> {
             redos: 0,
             refresh_llm: NoEdits {
                 calls: Mutex::new(Vec::new()),
+                plans: Mutex::new(0),
                 clock,
             },
             probes: Vec::new(),
@@ -722,7 +742,14 @@ impl<'a> Engine<'a> {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()),
                 );
-                self.llm_calls += calls.len() as u64;
+                let plans = std::mem::take(
+                    &mut *self
+                        .refresh_llm
+                        .plans
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+                self.llm_calls += calls.len() as u64 + plans;
                 (refreshes.next_due, calls)
             }
             Llm::Recorded(recorder, _) => {

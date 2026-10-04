@@ -24,6 +24,36 @@ pub const PROFILE_NAME: &str = "User profile";
 pub const PROFILE_QUESTION: &str = "Who is the user: their preferences, important people, work and home, \
      the platforms they use, and how they like to be helped. Not upcoming events, tasks or routines.";
 
+/// The seeded question's plan, built in: one facet per part of it, each a
+/// heading and the query its retrieval runs. A model asking exactly
+/// [`PROFILE_QUESTION`] uses it and makes no plan call, so it replays
+/// exactly. No query repeats the question's "not upcoming events", so a
+/// personal date such as an anniversary is still asked for under People.
+pub const PROFILE_FACETS: &[(&str, &str)] = &[
+    (
+        "Preferences",
+        "The user's preferences: what they like and dislike, their tastes and habits.",
+    ),
+    (
+        "People",
+        "The important people in the user's life, such as family, partner, friends and \
+         colleagues, and personal dates such as birthdays and anniversaries.",
+    ),
+    (
+        "Work and home",
+        "Where the user lives and works: their home, their job and their projects.",
+    ),
+    (
+        "Platforms",
+        "The devices, platforms, apps, tools and services the user uses.",
+    ),
+    (
+        "How to help",
+        "How the user likes to be helped: the style, format and language of replies, and \
+         what to avoid.",
+    ),
+];
+
 /// The seeded profile's stored filters: facts, plus states of
 /// volatility weeks or slower. A memory with no volatility passes, and there
 /// is no entity filter, since the profile is about the whole bank. The default

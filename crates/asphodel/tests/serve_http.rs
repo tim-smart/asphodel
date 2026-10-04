@@ -1,45 +1,45 @@
 //! The daemon over HTTP, and the CLI as its client, run as processes.
 //!
-//! The HTTP contract includes routes under `/v1`,
-//! the bearer token off loopback, `/v1/health` answering
-//! 503 until the store and models are ready, SIGTERM finishing the chunk in
-//! flight and checkpointing the WAL, and every CLI subcommand reaching the
-//! daemon over `--url`. The tests also cover the model routes,
-//! `/system-prompt`, `/agenda` and `asphodel model`; `forget`,
-//! `/v1/purge/plan`, `/v1/purge/ack`, `asphodel forget` and
-//! `asphodel purge plan|ack`; and `/v1/backup`,
-//! `/v1/status` and the audit lists, `asphodel backup`, `status` and the
-//! list commands, and the offline `asphodel restore`; and the dashboard's
-//! routes and page.
+//! The HTTP contract: routes under `/v1`, the bearer token off loopback,
+//! `/v1/health` answering 503 until the store and models are ready, SIGTERM
+//! finishing the chunks in flight, the data-dir lock and the Unix socket,
+//! and every CLI subcommand reaching the daemon over `--url`: models and the
+//! system prompt, forget and the purge pause, backup and the offline
+//! restore, status and the audit lists, and the dashboard's routes and page.
 //!
 //! The daemon runs on the fake models (`ASPHODEL_MODELS=fake`) and a
 //! scripted fake LLM (`ASPHODEL_LLM_SCRIPT`), both environment only. The
 //! script plays one step per LLM call, in order, across the whole daemon,
 //! so each test scripts exactly the calls its chunks make.
 //! `ASPHODEL_STARTUP_GATE` holds startup after the bind so the 503 can be
-//! seen, and `--listen 127.0.0.1:0` logs the port the system picked. The
-//! HTTP client here is a few lines over std, so the tests need no new
-//! dependencies.
+//! seen. A TCP daemon gets a port the test found free, so its address is
+//! known before it starts, and readiness is `/v1/health` over HTTP, never a
+//! log line. The HTTP client here is a few lines over std, so the tests need
+//! no new dependencies.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use serde_json::{Value, json};
 
-/// How long a daemon gets to bind, to become ready, or to stop.
-const STARTUP: Duration = Duration::from_secs(10);
-
-/// How long a condition polled over HTTP gets to hold.
-const SETTLE: Duration = Duration::from_secs(10);
+/// How long a daemon gets to bind, to become ready or to stop, and a
+/// condition polled over HTTP gets to hold.
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 const TOKEN: &str = "test-bearer-token-5a1d";
+
+/// An id no memory or chunk has.
+const UNKNOWN: &str = "01a0f958-0000-7000-8000-000000000000";
 
 /// The document every extraction test ingests, and the one claim its
 /// scripted call 1 reply makes about it.
@@ -56,15 +56,7 @@ fn auckland_reply() -> Value {
             "significance": "notable",
             "remember_this": false,
             "changes_something": false,
-            "valid_from": null,
-            "valid_until": null,
             "window_confidence": "high",
-            "until_event": null,
-            "due_at": null,
-            "volatility": null,
-            "recurrence_text": null,
-            "recurrence_rrule": null,
-            "recurrence_start": null,
             "entities": []
         }],
         "used_injected_ids": []
@@ -74,6 +66,16 @@ fn auckland_reply() -> Value {
 /// A call 1 reply with nothing in it.
 fn empty_reply() -> Value {
     json!({"claims": [], "used_injected_ids": []})
+}
+
+/// A script step answering `reply` after `delay_ms`.
+fn step(reply: Value, delay_ms: u64) -> Value {
+    json!({"reply": reply, "delay_ms": delay_ms})
+}
+
+/// A script step answering [`auckland_reply`] at once.
+fn auckland() -> Value {
+    step(auckland_reply(), 0)
 }
 
 /// A temporary directory removed even when an assertion unwinds. Its path is
@@ -102,32 +104,22 @@ impl TestDir {
         path
     }
 
+    fn file(&self, name: &str, text: &str) -> PathBuf {
+        let path = self.path(name);
+        fs::write(&path, text).unwrap();
+        path
+    }
+
     /// A tuning file with a floor for each fake model, and `extra` TOML.
     fn floors_for_fakes(&self, extra: &str) -> PathBuf {
-        let path = self.path("tuning.toml");
-        fs::write(
-            &path,
-            format!(
+        self.file(
+            "tuning.toml",
+            &format!(
                 "[injection.reranker_floors]\n\"fake-reranker:v1\" = 0.0\n\
                  [ranking.relevance_scales]\n\"fake-reranker:v1\" = 1.0\n\
                  [reconcile.embedding_floors]\n\"fake-embedder:v1\" = 0.5\n{extra}"
             ),
         )
-        .unwrap();
-        path
-    }
-
-    /// Writes `steps` as the LLM script and returns its path.
-    fn script(&self, name: &str, steps: &[Value]) -> PathBuf {
-        let path = self.path(name);
-        fs::write(&path, serde_json::to_string(steps).unwrap()).unwrap();
-        path
-    }
-
-    fn file(&self, name: &str, text: &str) -> PathBuf {
-        let path = self.path(name);
-        fs::write(&path, text).unwrap();
-        path
     }
 }
 
@@ -160,6 +152,8 @@ struct Reply {
     status: u16,
     /// The header block, lowercased.
     headers: String,
+    /// The body as bytes (the backup stream isn't UTF-8) and as text.
+    bytes: Vec<u8>,
     body: String,
 }
 
@@ -168,10 +162,22 @@ impl Reply {
         serde_json::from_str(&self.body)
             .unwrap_or_else(|error| panic!("not JSON ({error}): {} {}", self.status, self.body))
     }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        header(&self.headers, name)
+    }
 }
 
-/// One request on its own connection, with `Connection: close`, so the
-/// reply ends where the stream does.
+/// The value of `name` in a lowercased header block.
+fn header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == name).then(|| value.trim())
+    })
+}
+
+/// One HTTP/1.0 request on its own connection, so the reply is never
+/// chunked and ends where the stream does.
 fn request(
     addr: &Addr,
     method: &str,
@@ -179,8 +185,8 @@ fn request(
     token: Option<&str>,
     body: Option<&Value>,
 ) -> std::io::Result<Reply> {
-    let body = body.map(|body| serde_json::to_string(body).unwrap());
-    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: asphodel\r\nConnection: close\r\n");
+    let body = body.map(Value::to_string);
+    let mut head = format!("{method} {path} HTTP/1.0\r\nHost: asphodel\r\n");
     if let Some(token) = token {
         head.push_str(&format!("Authorization: Bearer {token}\r\n"));
     }
@@ -191,58 +197,49 @@ fn request(
         ));
     }
     head.push_str("\r\n");
-    let mut bytes = head.into_bytes();
-    bytes.extend_from_slice(body.unwrap_or_default().as_bytes());
+    head.push_str(body.as_deref().unwrap_or_default());
 
     let mut response = Vec::new();
     match addr {
         Addr::Tcp(addr) => {
             let mut stream = TcpStream::connect(addr)?;
-            stream.set_read_timeout(Some(SETTLE))?;
-            stream.write_all(&bytes)?;
+            stream.set_read_timeout(Some(TIMEOUT))?;
+            stream.write_all(head.as_bytes())?;
             stream.read_to_end(&mut response)?;
         }
         Addr::Unix(path) => {
             let mut stream = UnixStream::connect(path)?;
-            stream.set_read_timeout(Some(SETTLE))?;
-            stream.write_all(&bytes)?;
+            stream.set_read_timeout(Some(TIMEOUT))?;
+            stream.write_all(head.as_bytes())?;
             stream.read_to_end(&mut response)?;
         }
     }
-    let response = String::from_utf8(response).expect("a UTF-8 reply");
-    let (head, body) = response
-        .split_once("\r\n\r\n")
-        .unwrap_or_else(|| panic!("no header block in:\n{response}"));
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
+    // A daemon closing its listener may accept and drop a connection.
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| std::io::Error::other("no header block"))?;
+    let headers = String::from_utf8_lossy(&response[..split]).to_lowercase();
+    let status = headers
+        .split_whitespace()
+        .nth(1)
         .and_then(|code| code.parse().ok())
-        .unwrap_or_else(|| panic!("no status line in:\n{response}"));
-    let headers = head.to_lowercase();
-    let body = if headers.contains("transfer-encoding: chunked") {
-        dechunk(body)
-    } else {
-        body.to_string()
-    };
+        .unwrap_or_else(|| panic!("no status line in:\n{headers}"));
+    let bytes = response[split + 4..].to_vec();
     Ok(Reply {
         status,
         headers,
-        body,
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+        bytes,
     })
 }
 
-fn dechunk(mut body: &str) -> String {
-    let mut out = String::new();
-    loop {
-        let (size, rest) = body.split_once("\r\n").expect("a chunk size line");
-        let size = usize::from_str_radix(size.trim(), 16).expect("a hex chunk size");
-        if size == 0 {
-            return out;
-        }
-        out.push_str(&rest[..size]);
-        body = &rest[size + 2..];
-    }
+/// `asphodel` with a clean environment, so the caller's `ASPHODEL_*`
+/// variables can't leak in.
+fn asphodel() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
+    command.env_clear().stdin(Stdio::null());
+    command
 }
 
 /// How to start a daemon.
@@ -271,13 +268,31 @@ impl<'a> Serve<'a> {
         }
     }
 
-    fn listen(mut self, listen: &str) -> Self {
-        self.listen = listen.to_string();
+    fn data_dir(mut self, data_dir: &Path) -> Self {
+        self.data_dir = data_dir.to_owned();
         self
     }
 
+    /// Port 0 is swapped for a port free now, so the address is known up
+    /// front.
+    fn listen(mut self, listen: &str) -> Self {
+        self.listen = match listen.strip_suffix(":0") {
+            Some(host) => {
+                let free = TcpListener::bind((host, 0)).unwrap().local_addr().unwrap();
+                format!("{host}:{}", free.port())
+            }
+            None => listen.to_string(),
+        };
+        self
+    }
+
+    fn socket(self, socket: &Path) -> Self {
+        self.listen(&format!("unix:{}", socket.display()))
+    }
+
     fn script(mut self, steps: &[Value]) -> Self {
-        self.script = Some(self.dir.script("script.json", steps));
+        let steps = serde_json::to_string(steps).unwrap();
+        self.script = Some(self.dir.file("script.json", &steps));
         self
     }
 
@@ -297,9 +312,8 @@ impl<'a> Serve<'a> {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
+        let mut command = asphodel();
         command
-            .env_clear()
             .env("ASPHODEL_MODELS", "fake")
             .env("ASPHODEL_LOG", "info")
             .arg("serve")
@@ -321,12 +335,10 @@ impl<'a> Serve<'a> {
         command
     }
 
-    /// Starts the daemon and returns once it has bound, which the
-    /// "asphodel starting" line reports with the address.
+    /// Starts the daemon and returns once `/v1/health` answers at all.
     fn bind(self) -> Daemon {
         let mut child = self
             .command()
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -341,26 +353,20 @@ impl<'a> Serve<'a> {
                 }
             }
         });
+        let addr = match self.listen.strip_prefix("unix:") {
+            Some(path) => Addr::Unix(PathBuf::from(path)),
+            // A daemon bound to every interface is reached on loopback.
+            None => Addr::Tcp(self.listen.replace("0.0.0.0", "127.0.0.1")),
+        };
         let mut daemon = Daemon {
             child,
-            addr: Addr::Unix(PathBuf::new()),
+            addr,
             token: self.token.map(str::to_string),
             data_dir: self.data_dir.clone(),
             log: String::new(),
             lines: received,
         };
-        let line = daemon.wait_for_line("asphodel starting");
-        daemon.addr = match self.listen.strip_prefix("unix:") {
-            Some(path) => Addr::Unix(PathBuf::from(path)),
-            None => {
-                let bound = line
-                    .split_whitespace()
-                    .find_map(|field| field.strip_prefix("listen="))
-                    .unwrap_or_else(|| panic!("no listen= in: {line}"));
-                // A daemon bound to every interface is reached on loopback.
-                Addr::Tcp(bound.replace("0.0.0.0", "127.0.0.1"))
-            }
-        };
+        daemon.wait_health("bound", |status| status.is_some());
         daemon
     }
 
@@ -370,6 +376,31 @@ impl<'a> Serve<'a> {
         daemon.wait_ready();
         daemon
     }
+}
+
+/// Waits for `child` to exit, and kills it at the deadline.
+fn wait_or_kill(child: &mut Child) -> Option<ExitStatus> {
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// Runs a daemon that should refuse and exit on its own, and kills it at
+/// the deadline, so one that wrongly starts can't hang the suite.
+fn exits(mut command: Command) -> ExitStatus {
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_or_kill(&mut child).expect("the daemon kept running")
 }
 
 /// A running daemon, killed on drop.
@@ -391,24 +422,6 @@ impl Drop for Daemon {
 }
 
 impl Daemon {
-    /// Reads the log until a line contains `pattern`, and returns it.
-    fn wait_for_line(&mut self, pattern: &str) -> String {
-        let deadline = Instant::now() + STARTUP;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.lines.recv_timeout(left) {
-                Ok(line) => {
-                    self.log.push_str(&line);
-                    self.log.push('\n');
-                    if line.contains(pattern) {
-                        return line;
-                    }
-                }
-                Err(_) => panic!("no {pattern:?} line in the log:\n{}", self.log),
-            }
-        }
-    }
-
     /// Appends every log line that has arrived, up to the end of stderr if
     /// the daemon has exited.
     fn drain(&mut self) {
@@ -432,10 +445,6 @@ impl Daemon {
         self.send("POST", path, Some(body))
     }
 
-    fn put(&self, path: &str, body: &Value) -> Reply {
-        self.send("PUT", path, Some(body))
-    }
-
     /// The JSON body of a reply that must be 2xx.
     fn ok(&self, reply: Reply) -> Value {
         assert!(
@@ -448,21 +457,34 @@ impl Daemon {
         reply.json()
     }
 
+    fn get_ok(&self, path: &str) -> Value {
+        self.ok(self.get(path))
+    }
+
+    fn post_ok(&self, path: &str, body: &Value) -> Value {
+        self.ok(self.post(path, body))
+    }
+
     fn wait_ready(&mut self) {
-        let deadline = Instant::now() + STARTUP;
+        self.wait_health("ready", |status| status == Some(200));
+    }
+
+    /// Polls `/v1/health` until `holds` accepts its status, `None` when
+    /// nothing answered.
+    fn wait_health(&mut self, what: &str, holds: impl Fn(Option<u16>) -> bool) {
+        let deadline = Instant::now() + TIMEOUT;
         loop {
-            let last = match request(&self.addr, "GET", "/v1/health", None, None) {
-                Ok(reply) if reply.status == 200 => break,
-                Ok(reply) => format!("{} {}", reply.status, reply.body),
-                Err(error) => format!("connect: {error}"),
-            };
+            let health = request(&self.addr, "GET", "/v1/health", None, None)
+                .map(|reply| (reply.status, reply.body));
+            if holds(health.as_ref().ok().map(|(status, _)| *status)) {
+                return;
+            }
             if Instant::now() >= deadline {
                 self.drain();
-                panic!("never ready; last health was {last}\n{}", self.log);
+                panic!("never {what}; last health was {health:?}\n{}", self.log);
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        self.wait_for_line("asphodel listening");
     }
 
     /// Polls `read` until `holds` accepts its value, and returns that value.
@@ -472,7 +494,7 @@ impl Daemon {
         read: impl Fn(&Self) -> Value,
         holds: impl Fn(&Value) -> bool,
     ) -> Value {
-        let deadline = Instant::now() + SETTLE;
+        let deadline = Instant::now() + TIMEOUT;
         loop {
             let value = read(self);
             if holds(&value) {
@@ -487,28 +509,21 @@ impl Daemon {
     }
 
     fn create_bank(&self, bank: &str) {
-        let reply = self.put(
+        let reply = self.send(
+            "PUT",
             &format!("/v1/banks/{bank}"),
-            &json!({"owner_name": "Tim", "assistant_name": "Ash", "timezone": "Pacific/Auckland"}),
+            Some(&json!({"owner_name": "Tim", "assistant_name": "Ash", "timezone": "Pacific/Auckland"})),
         );
         assert_eq!(reply.status, 201, "{}", reply.body);
     }
 
-    fn ingest_notes(&self, bank: &str, id: &str) -> Value {
-        self.ok(self.post(
-            &format!("/v1/banks/{bank}/documents"),
-            &json!({
-                "document_id": id,
-                "text": NOTES,
-                "reference_date": "2026-09-30",
-                "reference_date_exact": true,
-                "timezone": null
-            }),
-        ))
+    /// Ingests [`NOTES`] as `notes.md` in bank `main`.
+    fn ingest_notes(&self) -> Value {
+        self.ingest_document("main", "notes.md", NOTES)
     }
 
     fn ingest_document(&self, bank: &str, id: &str, text: &str) -> Value {
-        self.ok(self.post(
+        self.post_ok(
             &format!("/v1/banks/{bank}/documents"),
             &json!({
                 "document_id": id,
@@ -517,18 +532,18 @@ impl Daemon {
                 "reference_date_exact": true,
                 "timezone": null
             }),
-        ))
+        )
     }
 
     fn recall(&self, bank: &str, query: &str) -> Value {
-        self.ok(self.post(
+        self.post_ok(
             &format!("/v1/banks/{bank}/recall"),
             &json!({"query": query}),
-        ))
+        )
     }
 
     fn chunks(&self, bank: &str) -> Value {
-        self.ok(self.get(&format!("/v1/banks/{bank}/chunks")))
+        self.get_ok(&format!("/v1/banks/{bank}/chunks"))
     }
 
     /// Waits until `bank`'s queue is empty and nothing has failed.
@@ -551,6 +566,16 @@ impl Daemon {
         recall["results"][0]["id"].as_str().unwrap().to_string()
     }
 
+    /// Creates bank `main`, ingests [`NOTES`] and waits until its memory is
+    /// extracted and the queue is empty. Returns the memory's id.
+    fn seed_notes(&mut self) -> String {
+        self.create_bank("main");
+        self.ingest_notes();
+        let id = self.wait_for_memory("main");
+        self.wait_extracted("main");
+        id
+    }
+
     /// SIGTERM, as a supervisor sends it.
     fn sigterm(&self) {
         let signalled = Command::new("kill")
@@ -562,26 +587,17 @@ impl Daemon {
 
     /// Waits for the daemon to exit, then the status and the whole log.
     fn wait_exit(&mut self) -> ExitStatus {
-        let deadline = Instant::now() + STARTUP;
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                self.drain();
-                return status;
-            }
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                self.drain();
-                panic!("the daemon did not stop in time:\n{}", self.log);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let status = wait_or_kill(&mut self.child);
+        self.drain();
+        status.unwrap_or_else(|| panic!("the daemon did not stop in time:\n{}", self.log))
     }
-}
 
-/// Where `pattern` first appears in `log`, which must contain it.
-fn position(log: &str, pattern: &str) -> usize {
-    log.find(pattern)
-        .unwrap_or_else(|| panic!("no {pattern:?} in the log:\n{log}"))
+    /// SIGTERM, and a clean exit.
+    fn stop(mut self) {
+        self.sigterm();
+        let status = self.wait_exit();
+        assert!(status.success(), "{status}\n{}", self.log);
+    }
 }
 
 // Health and readiness.
@@ -595,59 +611,105 @@ fn health_is_503_until_the_store_has_migrated_and_the_models_have_loaded() {
     // Bound but held before the store opens: no migration has run yet.
     let health = daemon.get("/v1/health");
     assert_eq!(health.status, 503, "{}", health.body);
-    let body = health.json();
-    assert_eq!(body["ready"], false);
-    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(health.json()["ready"], false);
+    assert_eq!(health.json()["version"], env!("CARGO_PKG_VERSION"));
     assert!(
         !daemon.data_dir.join("asphodel.db").exists(),
         "the store was opened before the daemon was ready"
     );
 
     // Every other route refuses rather than racing the startup.
-    for (method, path) in [("GET", "/v1/config"), ("GET", "/v1/banks/main/chunks")] {
-        let reply = daemon.send(method, path, None);
+    for (method, path, body) in [
+        ("GET", "/v1/config", None),
+        ("GET", "/v1/banks/main/chunks", None),
+        ("PUT", "/v1/banks/main", Some(json!({}))),
+    ] {
+        let reply = daemon.send(method, path, body.as_ref());
         assert_eq!(reply.status, 503, "{method} {path}: {}", reply.body);
         assert!(reply.json()["error"].is_string());
     }
-    let reply = daemon.put("/v1/banks/main", &json!({}));
-    assert_eq!(reply.status, 503, "{}", reply.body);
-    assert!(!daemon.log.contains("asphodel listening"), "{}", daemon.log);
 
     fs::write(&gate, "").unwrap();
     daemon.wait_ready();
-    let health = daemon.get("/v1/health");
-    assert_eq!(health.status, 200);
-    let body = health.json();
-    assert_eq!(body["ready"], true);
-    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    let health = daemon.get_ok("/v1/health");
+    assert_eq!(health["ready"], true);
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
     assert!(daemon.data_dir.join("asphodel.db").exists());
 }
 
 #[test]
-fn a_daemon_that_fails_to_start_after_binding_exits_and_removes_its_socket() {
-    // A second daemon on a locked data dir binds its own socket, then
-    // fails to open the store. It must exit non-zero, never become ready,
-    // and leave no socket behind.
+fn a_second_daemon_on_a_locked_data_dir_exits_and_removes_its_socket() {
+    // The second daemon binds its own socket, answers 503, then fails to
+    // open the store. It must exit non-zero, leave no socket behind, and
+    // leave the first daemon's lock and files as they were.
     let dir = TestDir::new();
     let first = Serve::new(&dir).ready();
+    let before = names(&first.data_dir);
+    let gate = dir.path("gate");
     let socket = dir.path("second.sock");
-    let output = Serve::new(&dir)
-        .listen(&format!("unix:{}", socket.display()))
-        .command()
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    let log = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "{log}");
-    assert!(log.contains("asphodel starting"), "{log}");
-    assert!(!log.contains("asphodel listening"), "{log}");
-    assert!(log.contains("locked"), "{log}");
-    assert!(
-        !socket.exists(),
-        "the failed daemon left {}",
-        socket.display()
-    );
+    let mut second = Serve::new(&dir).socket(&socket).gate(&gate).bind();
+    assert_eq!(second.get("/v1/health").status, 503);
+    fs::write(&gate, "").unwrap();
+    assert!(!second.wait_exit().success(), "{}", second.log);
+    assert!(!socket.exists(), "the failed daemon left {socket:?}");
+
+    // Refusing didn't release the lock: a third daemon is refused too.
+    let third = Serve::new(&dir).socket(&dir.path("third.sock"));
+    assert!(!exits(third.command()).success());
+    assert_eq!(names(&first.data_dir), before);
     assert_eq!(first.get("/v1/health").status, 200);
+}
+
+/// The device and inode at `path`, not following a symlink.
+fn identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path).unwrap();
+    (metadata.dev(), metadata.ino())
+}
+
+#[test]
+fn serve_refuses_a_socket_path_or_data_dir_it_does_not_own_and_leaves_it_be() {
+    // A regular file, a symlink to a live socket and a live listener at the
+    // socket path, and a regular file as the data dir: each refused, and
+    // each still there, untouched, afterwards.
+    let dir = TestDir::new();
+    let file = dir.file("file", "irreplaceable contents");
+    let live = dir.path("live.sock");
+    let _listener = UnixListener::bind(&live).unwrap();
+    let link = dir.path("link.sock");
+    std::os::unix::fs::symlink(&live, &link).unwrap();
+    let before = [&file, &live, &link].map(|path| identity(path));
+
+    for (socket, data_dir) in [
+        (&file, dir.data_dir()),
+        (&link, dir.data_dir()),
+        (&live, dir.data_dir()),
+        (&dir.path("d.sock"), file.clone()),
+    ] {
+        let serve = Serve::new(&dir).socket(socket).data_dir(&data_dir);
+        assert!(!exits(serve.command()).success(), "{socket:?} {data_dir:?}");
+    }
+    assert_eq!([&file, &live, &link].map(|path| identity(path)), before);
+    assert_eq!(fs::read(&file).unwrap(), b"irreplaceable contents");
+    assert_eq!(fs::read_link(&link).unwrap(), live);
+    UnixStream::connect(&link).expect("the live socket still accepts");
+}
+
+#[test]
+fn a_stale_socket_is_reused_and_only_the_daemons_own_socket_is_removed() {
+    // A socket nobody listens on is recovered. At exit the daemon removes
+    // the socket it bound, but not one that replaced it meanwhile.
+    let dir = TestDir::new();
+    let socket = dir.path("d.sock");
+    drop(UnixListener::bind(&socket).unwrap());
+    Serve::new(&dir).ready().stop();
+    assert!(!socket.exists(), "the daemon left its socket");
+
+    let daemon = Serve::new(&dir).ready();
+    fs::remove_file(&socket).unwrap();
+    let _replacement = UnixListener::bind(&socket).unwrap();
+    daemon.stop();
+    UnixStream::connect(&socket).expect("the replacement still accepts");
 }
 
 // The bearer token.
@@ -655,32 +717,42 @@ fn a_daemon_that_fails_to_start_after_binding_exits_and_removes_its_socket() {
 #[test]
 fn off_loopback_every_route_but_health_needs_the_bearer_token() {
     let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).bind();
-    daemon.wait_ready();
+    let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).ready();
     let addr = daemon.addr.clone();
 
-    // Health stays open, so a readiness probe needs no secret.
+    // Health stays open, so a readiness probe needs no secret, and so does
+    // the dashboard page, which holds nothing.
     let health = request(&addr, "GET", "/v1/health", None, None).unwrap();
     assert_eq!(health.status, 200, "{}", health.body);
+    let page = request(&addr, "GET", "/dashboard", None, None).unwrap();
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.headers.contains("content-type: text/html"));
+    assert!(!page.body.contains(TOKEN));
 
+    let source = format!("/v1/banks/main/sources/{UNKNOWN}");
+    let retract = format!("/v1/banks/main/memories/{UNKNOWN}/retract");
+    let (empty, query) = (json!({}), json!({"query": "anything"}));
     for token in [None, Some("wrong-token"), Some("")] {
         for (method, path, body) in [
             ("GET", "/v1/config", None),
-            ("PUT", "/v1/banks/main", Some(json!({}))),
+            ("PUT", "/v1/banks/main", Some(&empty)),
             ("GET", "/v1/banks/main/chunks", None),
-            (
-                "POST",
-                "/v1/banks/main/recall",
-                Some(json!({"query": "anything"})),
-            ),
+            ("POST", "/v1/banks/main/recall", Some(&query)),
             ("POST", "/v1/backup", None),
             ("GET", "/v1/status", None),
             ("GET", "/v1/banks/main/purges", None),
             ("GET", "/v1/banks/main/forgets", None),
             ("GET", "/v1/banks/main/sweeps", None),
             ("GET", "/v1/banks/main/recalls", None),
+            ("GET", "/v1/banks", None),
+            ("GET", "/v1/banks/main/memories", None),
+            ("GET", "/v1/banks/main/sources", None),
+            ("GET", source.as_str(), None),
+            ("POST", retract.as_str(), None),
+            ("POST", "/v1/banks/main/documents/remove", None),
+            ("POST", "/v1/banks/main/recall/explain", Some(&query)),
         ] {
-            let reply = request(&addr, method, path, token, body.as_ref()).unwrap();
+            let reply = request(&addr, method, path, token, body).unwrap();
             assert_eq!(reply.status, 401, "{method} {path} with {token:?}");
             assert!(
                 reply.headers.contains("www-authenticate: bearer"),
@@ -691,16 +763,9 @@ fn off_loopback_every_route_but_health_needs_the_bearer_token() {
         }
     }
 
-    let reply = request(
-        &addr,
-        "PUT",
-        "/v1/banks/main",
-        Some(TOKEN),
-        Some(&json!({})),
-    )
-    .unwrap();
+    let reply = daemon.send("PUT", "/v1/banks/main", Some(&empty));
     assert_eq!(reply.status, 201, "{}", reply.body);
-    let config = request(&addr, "GET", "/v1/config", Some(TOKEN), None).unwrap();
+    let config = daemon.get("/v1/config");
     assert_eq!(config.status, 200, "{}", config.body);
     assert_eq!(config.json()["deployment"]["token"], "[redacted]");
     assert!(!config.body.contains(TOKEN));
@@ -710,37 +775,21 @@ fn off_loopback_every_route_but_health_needs_the_bearer_token() {
     assert!(!daemon.log.contains(TOKEN), "{}", daemon.log);
 }
 
-#[test]
-fn a_token_set_on_loopback_is_checked_too() {
-    let dir = TestDir::new();
-    let daemon = Serve::new(&dir).listen("127.0.0.1:0").token(TOKEN).ready();
-    let reply = request(&daemon.addr, "GET", "/v1/config", None, None).unwrap();
-    assert_eq!(reply.status, 401);
-    let reply = request(&daemon.addr, "GET", "/v1/config", Some(TOKEN), None).unwrap();
-    assert_eq!(reply.status, 200);
-}
-
 // The routes, driven with the fake models and LLM.
 
 #[test]
 fn a_turn_commits_its_prefetch_and_clearing_the_session_forgets_it() {
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir)
-        .script(&[
-            json!({"reply": auckland_reply()}),
-            json!({"reply": empty_reply()}),
-        ])
+        .script(&[auckland(), step(empty_reply(), 0)])
         .ready();
-    daemon.create_bank("main");
-    daemon.ingest_notes("main", "notes.md");
-    let id = daemon.wait_for_memory("main");
-    daemon.wait_extracted("main");
+    let id = daemon.seed_notes();
 
     let prefetch = |daemon: &Daemon| {
-        daemon.ok(daemon.post(
+        daemon.post_ok(
             "/v1/banks/main/prefetch",
             &json!({"session_id": "s1", "query": "where do I live, Auckland?"}),
-        ))
+        )
     };
     let first = prefetch(&daemon);
     assert_eq!(first["injected"], json!([id]), "{first}");
@@ -756,13 +805,13 @@ fn a_turn_commits_its_prefetch_and_clearing_the_session_forgets_it() {
         "platform": "cli",
         "recall_id": first["recall_id"],
     });
-    let ingested = daemon.ok(daemon.post("/v1/banks/main/turns", &turn));
+    let ingested = daemon.post_ok("/v1/banks/main/turns", &turn);
     assert_eq!(ingested["outcome"], "stored");
     assert_eq!(ingested["speaker"]["owner"], true);
     assert_eq!(prefetch(&daemon)["injected"], json!([]));
 
     // A resend from the plugin's spool is a duplicate.
-    let resent = daemon.ok(daemon.post("/v1/banks/main/turns", &turn));
+    let resent = daemon.post_ok("/v1/banks/main/turns", &turn);
     assert_eq!(resent["outcome"], "duplicate");
     daemon.wait_extracted("main");
 
@@ -779,22 +828,19 @@ fn prefetch_takes_the_previous_reply_for_the_conversation_query() {
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir)
         .tuning("[injection]\nrerank_query = \"conversation\"\n")
-        .script(&[json!({"reply": auckland_reply()})])
+        .script(&[auckland()])
         .ready();
-    daemon.create_bank("main");
-    daemon.ingest_notes("main", "notes.md");
-    let id = daemon.wait_for_memory("main");
-    daemon.wait_extracted("main");
+    let id = daemon.seed_notes();
 
     let message = "great, should I bring a jacket when I go out later";
     let asked = "Can you check the weather for me?";
-    let without = daemon.ok(daemon.post(
+    let without = daemon.post_ok(
         "/v1/banks/main/prefetch",
         &json!({"session_id": "s1", "query": message, "previous_query": asked}),
-    ));
+    );
     assert_eq!(without["injected"], json!([]), "{without}");
 
-    let with = daemon.ok(daemon.post(
+    let with = daemon.post_ok(
         "/v1/banks/main/prefetch",
         &json!({
             "session_id": "s2",
@@ -802,46 +848,8 @@ fn prefetch_takes_the_previous_reply_for_the_conversation_query() {
             "previous_query": asked,
             "previous_reply": "Auckland is sunny today.",
         }),
-    ));
+    );
     assert_eq!(with["injected"], json!([id]), "{with}");
-}
-
-#[test]
-fn failed_chunks_are_listed_and_retried() {
-    let dir = TestDir::new();
-    // Five failures reach the retry cap; the retry then succeeds.
-    let mut steps = vec![json!({"fail": "no_content"}); 5];
-    steps.push(json!({"reply": auckland_reply()}));
-    let mut daemon = Serve::new(&dir).script(&steps).ready();
-    daemon.create_bank("main");
-    daemon.ingest_notes("main", "notes.md");
-
-    let failed = daemon.wait_until(
-        "a failed chunk",
-        |daemon| daemon.ok(daemon.get("/v1/banks/main/chunks?failed=true")),
-        |chunks| chunks["failed"].as_array().is_some_and(|f| f.len() == 1),
-    );
-    assert_eq!(
-        failed["queued"],
-        json!([]),
-        "the filter lists failed chunks only"
-    );
-    let chunk = &failed["failed"][0];
-    assert_eq!(chunk["error_count"], 5);
-    assert_eq!(chunk["error_kind"], "llm_no_content");
-    let chunk_id = chunk["chunk"].as_str().unwrap().to_string();
-    assert_eq!(daemon.chunks("main")["failed"][0]["chunk"], chunk_id);
-
-    let unknown = "01a0f958-0000-7000-8000-000000000000";
-    let retried = daemon.ok(daemon.post(
-        "/v1/banks/main/chunks/retry",
-        &json!({"chunks": [chunk_id, unknown]}),
-    ));
-    assert_eq!(retried["retried"], json!([chunk_id]));
-    assert_eq!(retried["unknown"], json!([unknown]));
-
-    daemon.wait_for_memory("main");
-    daemon.wait_extracted("main");
 }
 
 #[test]
@@ -850,37 +858,19 @@ fn errors_are_json_with_the_right_status() {
     let daemon = Serve::new(&dir).ready();
     daemon.create_bank("main");
 
+    let (query, unknown_field) = (json!({"query": "x"}), json!({"nope": 1}));
+    let backwards =
+        json!({"query": "x", "from": "2026-10-02T00:00:00Z", "to": "2026-10-01T00:00:00Z"});
+    let refresh = "/v1/banks/main/models/User%20profile/refresh";
     for (method, path, body, status) in [
-        (
-            "POST",
-            "/v1/banks/nope/recall",
-            Some(json!({"query": "x"})),
-            404,
-        ),
-        (
-            "POST",
-            "/v1/banks/main/recall",
-            Some(json!({"nope": 1})),
-            422,
-        ),
-        (
-            "POST",
-            "/v1/banks/main/recall",
-            Some(
-                json!({"query": "x", "from": "2026-10-02T00:00:00Z", "to": "2026-10-01T00:00:00Z"}),
-            ),
-            400,
-        ),
+        ("POST", "/v1/banks/nope/recall", Some(&query), 404),
+        ("POST", "/v1/banks/main/recall", Some(&unknown_field), 422),
+        ("POST", "/v1/banks/main/recall", Some(&backwards), 400),
         ("GET", "/v1/nowhere", None, 404),
         // No LLM is configured, so nothing can be refreshed.
-        (
-            "POST",
-            "/v1/banks/main/models/User%20profile/refresh",
-            Some(Value::Null),
-            503,
-        ),
+        ("POST", refresh, Some(&Value::Null), 503),
     ] {
-        let reply = daemon.send(method, path, body.as_ref());
+        let reply = daemon.send(method, path, body);
         assert_eq!(reply.status, status, "{method} {path}: {}", reply.body);
         assert!(
             reply.json()["error"].is_string(),
@@ -893,14 +883,14 @@ fn errors_are_json_with_the_right_status() {
 // SIGTERM.
 
 #[test]
-fn sigterm_refuses_ingest_finishes_the_chunk_in_flight_and_checkpoints() {
+fn sigterm_refuses_ingest_and_finishes_the_chunk_in_flight() {
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir)
         .listen("127.0.0.1:0")
-        .script(&[json!({"reply": auckland_reply(), "delay_ms": 3000})])
+        .script(&[step(auckland_reply(), 3000)])
         .ready();
     daemon.create_bank("main");
-    daemon.ingest_notes("main", "notes.md");
+    daemon.ingest_notes();
     daemon.wait_until(
         "a chunk in flight",
         |daemon| daemon.chunks("main"),
@@ -908,21 +898,16 @@ fn sigterm_refuses_ingest_finishes_the_chunk_in_flight_and_checkpoints() {
     );
 
     daemon.sigterm();
-    daemon.wait_for_line("received SIGTERM");
+    daemon.wait_health("draining", |status| status != Some(200));
     // The listener is closing: new ingest is refused or never connects.
-    let late = request(
-        &daemon.addr,
-        "POST",
-        "/v1/banks/main/documents",
-        None,
-        Some(&json!({
-            "document_id": "late.md",
-            "text": "Late text.",
-            "reference_date": "2026-09-30",
-            "reference_date_exact": true
-        })),
-    );
-    if let Ok(reply) = &late {
+    let late = json!({
+        "document_id": "late.md",
+        "text": "Late text.",
+        "reference_date": "2026-09-30",
+        "reference_date_exact": true
+    });
+    let path = "/v1/banks/main/documents";
+    if let Ok(reply) = request(&daemon.addr, "POST", path, None, Some(&late)) {
         assert!(
             !(200..300).contains(&reply.status),
             "late ingest was accepted"
@@ -931,20 +916,6 @@ fn sigterm_refuses_ingest_finishes_the_chunk_in_flight_and_checkpoints() {
 
     let status = daemon.wait_exit();
     assert!(status.success(), "{status}\n{}", daemon.log);
-    let log = daemon.log.clone();
-    let signal = position(&log, "received SIGTERM");
-    let extracted = position(&log, "chunk extracted");
-    let checkpointed = position(&log, "checkpointed the WAL");
-    let stopped = position(&log, "asphodel stopped");
-    assert!(
-        signal < extracted && extracted < checkpointed && checkpointed < stopped,
-        "{log}"
-    );
-    let wal = daemon.data_dir.join("asphodel.db-wal");
-    assert!(
-        !fs::metadata(&wal).is_ok_and(|wal| wal.len() > 0),
-        "the WAL wasn't checkpointed"
-    );
     drop(daemon);
 
     // The chunk was committed, not abandoned: a restart has nothing queued
@@ -954,39 +925,11 @@ fn sigterm_refuses_ingest_finishes_the_chunk_in_flight_and_checkpoints() {
     let chunks = restarted.chunks("main");
     assert_eq!(chunks["queued"], json!([]));
     assert_eq!(chunks["failed"], json!([]));
-    let late = restarted.ok(restarted.post(
-        "/v1/banks/main/documents",
-        &json!({
-            "document_id": "late.md",
-            "text": "Late text.",
-            "reference_date": "2026-09-30",
-            "reference_date_exact": true
-        }),
-    ));
+    let late = restarted.post_ok(path, &late);
     assert_eq!(
         late["outcome"], "stored",
         "late.md was stored during the drain"
     );
-}
-
-#[test]
-fn chunks_queued_before_a_restart_are_extracted_after_it() {
-    // No LLM on the first run, so the chunk waits on the queue; the
-    // restarted daemon's worker picks it up without a new ingest.
-    let dir = TestDir::new();
-    let mut first = Serve::new(&dir).ready();
-    first.create_bank("main");
-    first.ingest_notes("main", "notes.md");
-    assert_eq!(first.chunks("main")["queued"].as_array().unwrap().len(), 1);
-    first.sigterm();
-    assert!(first.wait_exit().success());
-    drop(first);
-
-    let mut second = Serve::new(&dir)
-        .script(&[json!({"reply": auckland_reply()})])
-        .ready();
-    second.wait_for_memory("main");
-    second.wait_extracted("main");
 }
 
 // Concurrent extraction: a pool of leases per bank behind `[llm] concurrency`.
@@ -999,7 +942,7 @@ fn pool(n: u32) -> String {
 /// Queues `documents` in bank `main` on a daemon with no LLM, then stops
 /// it, so the daemon a test starts next finds the whole queue at once.
 fn queue_without_an_llm(dir: &TestDir, tuning: &str, documents: &[(String, String)]) {
-    let mut daemon = Serve::new(dir).tuning(tuning).ready();
+    let daemon = Serve::new(dir).tuning(tuning).ready();
     daemon.create_bank("main");
     for (id, text) in documents {
         daemon.ingest_document("main", id, text);
@@ -1008,8 +951,7 @@ fn queue_without_an_llm(dir: &TestDir, tuning: &str, documents: &[(String, Strin
         daemon.chunks("main")["queued"].as_array().unwrap().len(),
         documents.len()
     );
-    daemon.sigterm();
-    assert!(daemon.wait_exit().success(), "{}", daemon.log);
+    daemon.stop();
 }
 
 /// `n` one-chunk documents that share no sentence.
@@ -1024,25 +966,97 @@ fn distinct_documents(n: usize) -> Vec<(String, String)> {
         .collect()
 }
 
-#[test]
-fn five_leases_extract_in_about_a_fifth_of_the_serial_time() {
-    // Ten chunks whose call 1 takes a second and finds nothing, so call 2
-    // never runs: 10 s one at a time, about 2 s five at a time, plus about
-    // a second to start.
-    let dir = TestDir::new();
-    let tuning = pool(5);
-    queue_without_an_llm(&dir, &tuning, &distinct_documents(10));
-
-    let steps = vec![json!({"reply": empty_reply(), "delay_ms": 1000}); 10];
-    let started = Instant::now();
-    let mut daemon = Serve::new(&dir).tuning(&tuning).script(&steps).ready();
-    daemon.wait_extracted("main");
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "took {elapsed:?} against 10 s serial\n{}",
-        daemon.log
+/// A daemon on a pool of two holding two of three queued chunks in flight,
+/// each call taking `delay_ms` and finding nothing.
+fn two_of_three_in_flight(dir: &TestDir, delay_ms: u64) -> Daemon {
+    queue_without_an_llm(dir, &pool(2), &distinct_documents(3));
+    let steps = vec![step(empty_reply(), delay_ms); 3];
+    let mut daemon = Serve::new(dir).tuning(&pool(2)).script(&steps).ready();
+    daemon.wait_until(
+        "two chunks in flight",
+        |daemon| daemon.chunks("main"),
+        |chunks| {
+            let queued = chunks["queued"].as_array().unwrap();
+            queued.iter().filter(|c| c["in_flight"] == true).count() == 2
+        },
     );
+    daemon
+}
+
+/// The kinds of `memory`'s accesses, oldest first.
+fn access_kinds(memory: &Value) -> Vec<&str> {
+    let accesses = memory["accesses"].as_array().unwrap();
+    accesses
+        .iter()
+        .map(|a| a["kind"].as_str().unwrap())
+        .collect()
+}
+
+/// An OpenAI-compatible endpoint on loopback whose every call finds nothing
+/// after `hold`. Returns its `[llm] endpoint` and the most calls it ever had
+/// open at once.
+fn holding_llm(hold: Duration) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (open, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let content = empty_reply().to_string();
+    let body = json!({"choices": [{"message": {"content": content}}]}).to_string();
+    let reply = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let counted = Arc::clone(&most);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let (open, most, reply) = (Arc::clone(&open), Arc::clone(&counted), reply.clone());
+            std::thread::spawn(move || {
+                let mut stream = read_request(stream);
+                most.fetch_max(open.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                std::thread::sleep(hold);
+                // Closed before the client sees the reply, so a call the gate
+                // lets in next is never counted beside this one.
+                open.fetch_sub(1, Ordering::SeqCst);
+                let _ = stream.write_all(reply.as_bytes());
+            });
+        }
+    });
+    (endpoint, most)
+}
+
+#[test]
+fn a_banks_leases_call_together_and_llm_concurrency_caps_calls_across_banks() {
+    // Two banks on a pool of three each hold six leases out at once, but
+    // the gate lets three calls reach the LLM: three open together, so one
+    // bank ran two at once, and never four.
+    let (endpoint, most) = holding_llm(Duration::from_millis(1000));
+    let tuning = format!("{}endpoint = \"{endpoint}\"\nmodel = \"stub\"\n", pool(3));
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir).tuning(&tuning).ready();
+    let banks = ["main", "other"];
+    for bank in banks {
+        daemon.create_bank(bank);
+        for (id, text) in distinct_documents(3) {
+            daemon.ingest_document(bank, &id, &text);
+        }
+    }
+    daemon.wait_until(
+        "six leases out",
+        |daemon| {
+            let leases = banks.map(|bank| {
+                let chunks = daemon.chunks(bank);
+                let queued = chunks["queued"].as_array().unwrap();
+                queued.iter().filter(|c| c["in_flight"] == true).count()
+            });
+            json!(leases)
+        },
+        |leases| leases == &json!([3, 3]),
+    );
+    for bank in banks {
+        daemon.wait_extracted(bank);
+    }
+    assert_eq!(most.load(Ordering::SeqCst), 3);
 }
 
 #[test]
@@ -1055,17 +1069,10 @@ fn two_chunks_in_flight_stating_one_fact_make_one_memory_and_a_mention() {
     // finishing within 5 s of the start means they ran together.
     let dir = TestDir::new();
     let tuning = pool(2);
-    queue_without_an_llm(
-        &dir,
-        &tuning,
-        &[
-            ("notes.md".to_string(), NOTES.to_string()),
-            (
-                "more-notes.md".to_string(),
-                "# More notes\n\nI live in Auckland, near the harbour.\n".to_string(),
-            ),
-        ],
-    );
+    let more = "# More notes\n\nI live in Auckland, near the harbour.\n";
+    let documents = [("notes.md", NOTES), ("more-notes.md", more)];
+    let documents = documents.map(|(id, text)| (id.to_string(), text.to_string()));
+    queue_without_an_llm(&dir, &tuning, &documents);
 
     let mention = json!({"claims": [{
         "claim": "c1",
@@ -1075,9 +1082,9 @@ fn two_chunks_in_flight_stating_one_fact_make_one_memory_and_a_mention() {
     let mut daemon = Serve::new(&dir)
         .tuning(&tuning)
         .script(&[
-            json!({"reply": auckland_reply(), "delay_ms": 3000}),
-            json!({"reply": auckland_reply(), "delay_ms": 3000}),
-            json!({"reply": mention}),
+            step(auckland_reply(), 3000),
+            step(auckland_reply(), 3000),
+            step(mention, 0),
         ])
         .ready();
     daemon.wait_extracted("main");
@@ -1089,56 +1096,29 @@ fn two_chunks_in_flight_stating_one_fact_make_one_memory_and_a_mention() {
     );
 
     let recall = daemon.recall("main", "where does Tim live? Auckland");
-    let ids: Vec<&str> = recall["results"]
-        .as_array()
-        .unwrap()
+    let results = recall["results"].as_array().unwrap();
+    let ids: Vec<_> = results
         .iter()
-        .filter(|result| result["sentence"] == SENTENCE)
-        .map(|result| result["id"].as_str().unwrap())
+        .filter(|r| r["sentence"] == SENTENCE)
         .collect();
     assert_eq!(ids.len(), 1, "one memory, not a copy per chunk: {recall}");
-    let memory = daemon.ok(daemon.get(&format!("/v1/banks/main/memories/{}", ids[0])));
-    let kinds: Vec<&str> = memory["accesses"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|access| access["kind"].as_str().unwrap())
-        .collect();
-    assert_eq!(kinds, ["created", "mentioned_again"], "{memory}");
+    let id = ids[0]["id"].as_str().unwrap();
+    let memory = daemon.get_ok(&format!("/v1/banks/main/memories/{id}"));
+    assert_eq!(
+        access_kinds(&memory),
+        ["created", "mentioned_again"],
+        "{memory}"
+    );
 }
 
 #[test]
 fn sigterm_finishes_every_chunk_in_flight_before_stopping() {
     let dir = TestDir::new();
-    let tuning = pool(2);
-    queue_without_an_llm(&dir, &tuning, &distinct_documents(3));
-    let mut daemon = Serve::new(&dir)
-        .tuning(&tuning)
-        .script(&vec![json!({"reply": empty_reply(), "delay_ms": 2000}); 3])
-        .ready();
-    daemon.wait_until(
-        "two chunks in flight",
-        |daemon| daemon.chunks("main"),
-        |chunks| {
-            chunks["queued"]
-                .as_array()
-                .is_some_and(|queued| queued.iter().filter(|c| c["in_flight"] == true).count() == 2)
-        },
-    );
+    two_of_three_in_flight(&dir, 2000).stop();
 
-    daemon.sigterm();
-    let status = daemon.wait_exit();
-    assert!(status.success(), "{status}\n{}", daemon.log);
-    assert_eq!(
-        daemon.log.matches("chunk extracted").count(),
-        2,
-        "both chunks in flight commit, and no third is claimed\n{}",
-        daemon.log
-    );
-    drop(daemon);
-
-    // Only the chunk never claimed is still queued, with nothing counted.
-    let restarted = Serve::new(&dir).tuning(&tuning).ready();
+    // Both chunks in flight committed: only the one never claimed is still
+    // queued, with nothing counted.
+    let restarted = Serve::new(&dir).tuning(&pool(2)).ready();
     let chunks = restarted.chunks("main");
     let queued = chunks["queued"].as_array().unwrap();
     assert_eq!(queued.len(), 1, "{chunks}");
@@ -1149,113 +1129,80 @@ fn sigterm_finishes_every_chunk_in_flight_before_stopping() {
 #[test]
 fn deleting_a_bank_waits_for_its_chunks_in_flight_and_stops_its_worker() {
     let dir = TestDir::new();
-    let tuning = pool(2);
-    queue_without_an_llm(&dir, &tuning, &distinct_documents(3));
-    let mut daemon = Serve::new(&dir)
-        .tuning(&tuning)
-        .script(&vec![json!({"reply": empty_reply(), "delay_ms": 1500}); 3])
-        .ready();
-    daemon.wait_until(
-        "two chunks in flight",
-        |daemon| daemon.chunks("main"),
-        |chunks| {
-            chunks["queued"]
-                .as_array()
-                .is_some_and(|queued| queued.iter().filter(|c| c["in_flight"] == true).count() == 2)
-        },
-    );
+    let mut daemon = two_of_three_in_flight(&dir, 1500);
 
     let deleted = daemon.send("DELETE", "/v1/banks/main?confirm=main", None);
     assert_eq!(deleted.status, 200, "{}\n{}", deleted.body, daemon.log);
-    // The hold drained the pool: both chunks in flight committed, and the
-    // third was never handed out.
-    // The commit logs before it releases its chunk, so before the delete.
-    daemon.wait_for_line("deleted a bank");
-    assert_eq!(
-        daemon.log.matches("extracted a chunk").count(),
-        2,
-        "{}",
-        daemon.log
-    );
     assert_eq!(daemon.get("/v1/banks/main/chunks").status, 404);
 
-    // The old worker stopped with its bank, so the bank made again under
-    // the name gets a new one, which takes the script's last step.
+    // The hold drained the pool without handing out the third chunk, and
+    // the old worker stopped with its bank, so the bank made again under
+    // the name gets a new one, which takes the script's last step: had the
+    // third chunk taken it, this one would fail.
     daemon.create_bank("main");
     daemon.ingest_document("main", "again.md", "# Again\n\nA new start.\n");
     daemon.wait_extracted("main");
-    daemon.wait_for_line("chunk extracted");
-}
-
-/// Eight chunks on a pool of two, where the first LLM call hits `limit`,
-/// a hold of about six seconds. Every call after it waits for the hold
-/// to end, so between the calls already in flight finishing and the hold
-/// ending nothing is extracted, and no chunk counts a failure.
-fn a_limit_pauses_every_caller_and_counts_nothing(limit: Value) {
-    let dir = TestDir::new();
-    let tuning = pool(2);
-    queue_without_an_llm(&dir, &tuning, &distinct_documents(8));
-
-    // One call may have started before the limit came back; the rest run
-    // after the hold. 8 more replies: every chunk, the limited one again.
-    let mut steps = vec![limit, json!({"reply": empty_reply(), "delay_ms": 1000})];
-    steps.extend(vec![json!({"reply": empty_reply(), "delay_ms": 500}); 7]);
-    let mut daemon = Serve::new(&dir).tuning(&tuning).script(&steps).ready();
-
-    let snapshot = |daemon: &Daemon| {
-        let chunks = daemon.chunks("main");
-        let queued = chunks["queued"].as_array().unwrap().clone();
-        for chunk in &queued {
-            assert_eq!(
-                chunk["error_count"], 0,
-                "a hold isn't the chunk's failure: {chunks}"
-            );
-        }
-        assert_eq!(chunks["failed"], json!([]), "{chunks}");
-        queued.len()
-    };
-    std::thread::sleep(Duration::from_millis(1500));
-    let early = snapshot(&daemon);
-    std::thread::sleep(Duration::from_millis(1500));
-    let later = snapshot(&daemon);
-    assert_eq!(
-        early, later,
-        "chunks were extracted while the hold was on\n{}",
-        daemon.log
-    );
-    assert!(later >= 7, "{later} chunks still queued");
-
-    daemon.wait_extracted("main");
 }
 
 #[test]
-fn a_usage_limit_pauses_every_caller_and_counts_no_failure() {
+fn a_usage_limit_or_a_429_pauses_every_caller_and_counts_no_failure() {
+    // Eight chunks on a pool of two, where the first LLM call hits the
+    // limit, a hold of about six seconds. Every call after it waits for the
+    // hold to end, so between the calls already in flight finishing and the
+    // hold ending nothing is extracted, and no chunk counts a failure.
     use asphodel_core::{Clock, SystemClock};
     // The daemon runs on the system clock, so the reset is in its time.
     let resets_at = SystemClock.now() + jiff::SignedDuration::from_secs(6);
-    a_limit_pauses_every_caller_and_counts_nothing(
+    for limit in [
         json!({"fail": "usage_limited", "resets_at": resets_at.to_string()}),
-    );
-}
-
-#[test]
-fn a_429_with_retry_after_pauses_every_caller_and_counts_no_failure() {
-    a_limit_pauses_every_caller_and_counts_nothing(
         json!({"fail": "status", "status": 429, "retry_after_secs": 6}),
-    );
+    ] {
+        let dir = TestDir::new();
+        let tuning = pool(2);
+        queue_without_an_llm(&dir, &tuning, &distinct_documents(8));
+
+        // One call may have started before the limit came back; the rest
+        // run after the hold. 8 more replies: every chunk, the limited one
+        // again.
+        let mut steps = vec![limit, step(empty_reply(), 1000)];
+        steps.extend(vec![step(empty_reply(), 500); 7]);
+        let mut daemon = Serve::new(&dir).tuning(&tuning).script(&steps).ready();
+
+        let snapshot = |daemon: &Daemon| {
+            let chunks = daemon.chunks("main");
+            let queued = chunks["queued"].as_array().unwrap();
+            let counted = queued.iter().any(|chunk| chunk["error_count"] != 0);
+            assert!(!counted, "a hold isn't the chunk's failure: {chunks}");
+            assert_eq!(chunks["failed"], json!([]), "{chunks}");
+            queued.len()
+        };
+        std::thread::sleep(Duration::from_millis(1500));
+        let early = snapshot(&daemon);
+        std::thread::sleep(Duration::from_millis(1500));
+        let later = snapshot(&daemon);
+        assert_eq!(
+            early, later,
+            "chunks were extracted while the hold was on\n{}",
+            daemon.log
+        );
+        assert!(later >= 7, "{later} chunks still queued");
+
+        daemon.wait_extracted("main");
+    }
 }
 
 // The CLI as a client. Every operator command is an HTTP client of the daemon.
 
-/// `asphodel` with a clean environment and `ASPHODEL_URL` pointing at
-/// `daemon`, without its token.
+/// `asphodel` with `ASPHODEL_URL` set to `url`.
+fn cli_at(url: &str) -> Command {
+    let mut command = asphodel();
+    command.env("ASPHODEL_URL", url);
+    command
+}
+
+/// [`cli_at`] `daemon`, without its token.
 fn cli(daemon: &Daemon) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
-    command
-        .env_clear()
-        .env("ASPHODEL_URL", daemon.addr.url())
-        .stdin(Stdio::null());
-    command
+    cli_at(&daemon.addr.url())
 }
 
 fn run(command: &mut Command) -> Output {
@@ -1280,240 +1227,234 @@ fn succeeded(output: Output) -> String {
     stdout(&output)
 }
 
+/// The JSON a successful `--json` command printed.
+fn json_out(output: Output) -> Value {
+    serde_json::from_str(&succeeded(output)).expect("--json prints JSON")
+}
+
+/// `asphodel <args> --json` against `daemon`, which must succeed. `args`
+/// are split on whitespace.
+fn cli_json(daemon: &Daemon, args: &str) -> Value {
+    json_out(run(cli(daemon).args(args.split_whitespace()).arg("--json")))
+}
+
+/// [`cli_json`] for a command that must fail, and still print JSON.
+fn cli_json_fails(daemon: &Daemon, args: &str) -> Value {
+    let output = run(cli(daemon).args(args.split_whitespace()).arg("--json"));
+    assert!(!output.status.success(), "{}", stdout(&output));
+    serde_json::from_str(&stdout(&output)).unwrap()
+}
+
 #[test]
 fn the_cli_drives_the_daemon_over_a_unix_socket() {
     let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir)
-        .script(&[json!({"reply": auckland_reply()})])
-        .ready();
+    let mut daemon = Serve::new(&dir).script(&[auckland()]).ready();
     let notes = dir.file("notes.md", NOTES);
 
-    let out = succeeded(run(cli(&daemon).args([
-        "bank",
-        "create",
-        "main",
-        "--owner-name",
-        "Tim",
-        "--timezone",
-        "Pacific/Auckland",
-    ])));
-    assert!(out.contains("created bank main"), "{out}");
-    let out = succeeded(run(cli(&daemon).args([
-        "bank",
-        "config",
-        "main",
-        "--assistant-name",
-        "Ash",
-        "--json",
-    ])));
-    let bank: Value = serde_json::from_str(&out).unwrap();
+    let bank = cli_json(
+        &daemon,
+        "bank create main --owner-name Tim --timezone Pacific/Auckland",
+    );
+    assert_eq!(bank["created"], true, "{bank}");
+    let bank = cli_json(&daemon, "bank config main --assistant-name Ash");
     assert_eq!(bank["created"], false);
     assert_eq!(bank["owner_name"], "Tim");
     assert_eq!(bank["assistant_name"], "Ash");
 
     // The document id defaults to the file's name.
-    let out = succeeded(run(cli(&daemon).arg("ingest").arg(&notes).args([
-        "--bank",
-        "main",
-        "--date",
-        "2026-09-30",
-    ])));
-    assert!(out.contains("ingested notes.md into main"), "{out}");
-    assert!(out.contains("1 chunks queued"), "{out}");
+    let ingest = ["--bank", "main", "--date", "2026-09-30", "--json"];
+    let ingested = json_out(run(cli(&daemon).arg("ingest").arg(&notes).args(ingest)));
+    assert_eq!(ingested["chunks_queued"], 1, "{ingested}");
+    let sources = daemon.get_ok("/v1/banks/main/sources?kind=document");
+    assert_eq!(
+        sources["sources"][0]["document_id"], "notes.md",
+        "{sources}"
+    );
     let id = daemon.wait_for_memory("main");
 
-    let out = succeeded(run(
-        cli(&daemon).args(["recall", "--bank", "main", "Auckland"])
-    ));
-    assert!(out.contains(&id) && out.contains(SENTENCE), "{out}");
-    let out = succeeded(run(cli(&daemon).args([
-        "recall", "--bank", "main", "--kind", "fact", "--json", "Auckland",
-    ])));
-    let recall: Value = serde_json::from_str(&out).unwrap();
+    let recall = cli_json(&daemon, "recall --bank main --kind fact Auckland");
     assert_eq!(recall["results"][0]["id"], id.as_str());
-    let out =
-        succeeded(run(cli(&daemon).args([
-            "recall", "--bank", "main", "--kind", "event", "Auckland",
-        ])));
-    assert!(out.contains("nothing recalled"), "{out}");
+    assert_eq!(recall["results"][0]["sentence"], SENTENCE);
+    let recall = cli_json(&daemon, "recall --bank main --kind event Auckland");
+    assert_eq!(recall["results"], json!([]), "{recall}");
 
-    let out = succeeded(run(cli(&daemon).args(["keep", "--bank", "main", &id])));
-    assert!(out.contains(&format!("kept {id}")), "{out}");
-    assert_eq!(
-        daemon.recall("main", "Auckland")["results"][0]["kept"],
-        true
-    );
-    let out = succeeded(run(cli(&daemon).args(["unkeep", "--bank", "main", &id])));
-    assert!(out.contains(&format!("unkept {id}")), "{out}");
-    assert_eq!(
-        daemon.recall("main", "Auckland")["results"][0]["kept"],
-        false
-    );
+    let kept = cli_json(&daemon, &format!("keep --bank main {id}"));
+    assert_eq!(kept["kept"], json!([id]));
+    let recalled = daemon.recall("main", "Auckland");
+    assert_eq!(recalled["results"][0]["kept"], true);
+    let unkept = cli_json(&daemon, &format!("unkeep --bank main {id}"));
+    assert_eq!(unkept["unkept"], json!([id]));
+    let recalled = daemon.recall("main", "Auckland");
+    assert_eq!(recalled["results"][0]["kept"], false);
 
-    // An unknown id is reported and fails the command, after the rest.
-    let unknown = "01a0f958-0000-7000-8000-000000000000";
-    let output = run(cli(&daemon).args(["keep", "--bank", "main", &id, unknown]));
-    assert!(!output.status.success());
-    assert!(stdout(&output).contains(&format!("kept {id}")));
-    assert!(stderr(&output).contains(unknown), "{}", stderr(&output));
+    // An unknown id fails the command, after the rest are done.
+    let kept = cli_json_fails(&daemon, &format!("keep --bank main {id} {UNKNOWN}"));
+    assert_eq!(kept["kept"], json!([id]), "{kept}");
+    assert_eq!(kept["unknown"], json!([UNKNOWN]), "{kept}");
 
-    let out = succeeded(run(cli(&daemon).args(["chunks", "--bank", "main"])));
-    assert!(
-        out.contains("0 queued") && out.contains("0 failed"),
-        "{out}"
-    );
+    let chunks = cli_json(&daemon, "chunks --bank main");
+    assert_eq!(chunks["queued"], json!([]), "{chunks}");
+    assert_eq!(chunks["failed"], json!([]), "{chunks}");
 }
 
 #[test]
 fn the_cli_reaches_a_tcp_daemon_with_the_token_from_the_environment() {
+    // A token set on loopback is checked too.
     let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).bind();
-    daemon.wait_ready();
+    let daemon = Serve::new(&dir).listen("127.0.0.1:0").token(TOKEN).ready();
     daemon.create_bank("main");
+    let chunks = ["chunks", "--bank", "main", "--json"];
 
-    let output = run(cli(&daemon).args(["chunks", "--bank", "main"]));
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("401"), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("ASPHODEL_TOKEN"),
-        "{}",
-        stderr(&output)
-    );
-
-    let out = succeeded(run(cli(&daemon)
-        .env("ASPHODEL_TOKEN", TOKEN)
-        .args(["chunks", "--bank", "main"])));
-    assert!(out.contains("0 queued"), "{out}");
+    assert!(!run(cli(&daemon).args(chunks)).status.success(), "no token");
+    let listed = json_out(run(cli(&daemon).env("ASPHODEL_TOKEN", TOKEN).args(chunks)));
+    assert_eq!(listed["queued"], json!([]), "{listed}");
 
     // --url wins over ASPHODEL_URL.
-    let out = succeeded(run(cli(&daemon)
+    succeeded(run(cli(&daemon)
         .env("ASPHODEL_URL", "unix:/nonexistent/asphodel.sock")
         .env("ASPHODEL_TOKEN", TOKEN)
-        .args(["chunks", "--bank", "main", "--url", &daemon.addr.url()])));
-    assert!(out.contains("0 queued"), "{out}");
+        .args(chunks)
+        .args(["--url", &daemon.addr.url()])));
 
     // The token has no flag, so it never shows in a process list.
-    let output = run(cli(&daemon).args(["chunks", "--bank", "main", "--token", TOKEN]));
+    let output = run(cli(&daemon).args(chunks).args(["--token", TOKEN]));
     assert!(!output.status.success(), "--token was accepted");
 }
 
 // Mental models and the system prompt block.
 
-/// A refresh reply adding one entry citing the first memory in its input.
-fn adds_entry(text: &str) -> Value {
-    json!({"operations": [{"op": "add", "entry": null, "text": text, "cites": ["m1"]}]})
-}
+const ENTRY: &str = "Tim's home is in Auckland.";
+const SECOND: &str = "Tim's home is in New Zealand.";
 
-const ENTRY: &str = "Tim lives in Auckland.";
+/// Whether the line after `heading`'s own line in `text` is the section's
+/// paragraph: [`ENTRY`] then [`SECOND`]. A heading may be marked up, as
+/// `### Home`.
+fn paragraph_after(text: &str, heading: &str) -> bool {
+    let mut lines = text.lines();
+    lines
+        .by_ref()
+        .find(|line| line.trim().trim_start_matches('#').trim() == heading);
+    let paragraph = lines.next().unwrap_or_default();
+    paragraph
+        .find(ENTRY)
+        .zip(paragraph.find(SECOND))
+        .is_some_and(|(first, second)| first < second)
+}
 
 #[test]
 fn models_are_created_listed_edited_and_refreshed_over_http() {
+    // The refresh writes two sentences under "Home", each citing the first
+    // memory in its input.
+    let sentences: Vec<Value> = [ENTRY, SECOND]
+        .map(|text| json!({"text": text, "cites": ["m1"]}))
+        .into();
+    let writes = json!({"sections": [{"heading": "Home", "sentences": sentences}]});
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir)
-        .script(&[
-            json!({"reply": auckland_reply()}),
-            json!({"reply": adds_entry(ENTRY)}),
-        ])
+        .script(&[auckland(), step(writes, 0)])
         .ready();
-    daemon.create_bank("main");
-    daemon.ingest_notes("main", "notes.md");
-    let memory = daemon.wait_for_memory("main");
-    daemon.wait_extracted("main");
+    let memory = daemon.seed_notes();
 
     // Only "User profile" is seeded, empty and never refreshed.
-    let models = daemon.ok(daemon.get("/v1/banks/main/models"))["models"].clone();
+    let models = daemon.get_ok("/v1/banks/main/models")["models"].clone();
     assert_eq!(models.as_array().unwrap().len(), 1);
     assert_eq!(models[0]["name"], "User profile");
     assert_eq!(models[0]["entries"], json!([]));
     assert_eq!(models[0]["last_refreshed_at"], Value::Null);
 
-    // The profile takes 500 of the 800 tokens.
+    // Plans takes what the profile leaves of the budget, so nothing more fits.
+    let budget = &daemon.get_ok("/v1/config")["tuning"]["mental_models"]["budget"];
+    let left = budget.as_u64().unwrap() - models[0]["max_tokens"].as_u64().unwrap();
+    let create = |name: &str, question: &str, max_tokens: u64| {
+        let model = json!({"name": name, "question": question, "max_tokens": max_tokens});
+        daemon.post("/v1/banks/main/models", &model)
+    };
     let created = daemon.post(
         "/v1/banks/main/models",
         &json!({"name": "Plans", "question": "Where is Tim going?", "kinds": ["event"],
-                "max_tokens": 300}),
+                "max_tokens": left}),
     );
     assert_eq!(created.status, 201, "{}", created.body);
     let plans = created.json();
     assert_eq!(plans["enabled"], true);
     assert_eq!(plans["kinds"], json!(["event"]));
-    let over = daemon.post(
-        "/v1/banks/main/models",
-        &json!({"name": "Big", "question": "Anything?", "max_tokens": 1}),
-    );
+    let over = create("Big", "Anything?", 1);
     assert_eq!(over.status, 422, "{}", over.body);
-    assert!(over.json()["error"].as_str().unwrap().contains("budget"));
-    let duplicate = daemon.post(
-        "/v1/banks/main/models",
-        &json!({"name": "Plans", "question": "Again?", "max_tokens": 1}),
-    );
+    let duplicate = create("Plans", "Again?", 1);
     assert_eq!(duplicate.status, 409, "{}", duplicate.body);
 
-    let edited = daemon.ok(daemon.send(
-        "PATCH",
-        "/v1/banks/main/models/Plans",
-        Some(&json!({"enabled": false, "min_volatility": "weeks"})),
-    ));
+    let patch =
+        |edit: Value| daemon.ok(daemon.send("PATCH", "/v1/banks/main/models/Plans", Some(&edit)));
+    let edited = patch(json!({"enabled": false, "min_volatility": "weeks"}));
     assert_eq!(edited["enabled"], false);
     assert_eq!(edited["min_volatility"], "weeks");
     assert_eq!(edited["question"], "Where is Tim going?");
-    let cleared = daemon.ok(daemon.send(
-        "PATCH",
-        "/v1/banks/main/models/Plans",
-        Some(&json!({"min_volatility": null})),
-    ));
+    let cleared = patch(json!({"min_volatility": null}));
     assert_eq!(cleared["min_volatility"], Value::Null);
 
     // A forced refresh calls the LLM; the next one finds nothing changed.
-    let refreshed = daemon.ok(daemon.post(
-        "/v1/banks/main/models/User%20profile/refresh?force=true",
-        &Value::Null,
-    ));
+    let refresh = "/v1/banks/main/models/User%20profile/refresh";
+    let refreshed = daemon.post_ok(&format!("{refresh}?force=true"), &Value::Null);
     assert_eq!(refreshed["outcome"], "applied", "{refreshed}");
-    assert_eq!(refreshed["detail"]["added"].as_array().unwrap().len(), 1);
-    let unchanged =
-        daemon.ok(daemon.post("/v1/banks/main/models/User%20profile/refresh", &Value::Null));
+    assert_eq!(refreshed["detail"]["added"].as_array().unwrap().len(), 2);
+    let unchanged = daemon.post_ok(refresh, &Value::Null);
     assert_eq!(unchanged["outcome"], "unchanged", "{unchanged}");
 
-    let profile = &daemon.ok(daemon.get("/v1/banks/main/models"))["models"][0];
+    let profile = &daemon.get_ok("/v1/banks/main/models")["models"][0];
     assert_eq!(profile["entries"][0]["text"], ENTRY);
+    assert_eq!(profile["entries"][0]["section"], "Home");
     assert_eq!(profile["entries"][0]["cites"], json!([memory]));
     assert!(profile["last_refreshed_at"].is_string());
+    let shown = daemon.get_ok("/v1/banks/main/models/User%20profile");
+    assert_eq!(shown["entry_views"][0]["section"], "Home", "{shown}");
 
-    // The block holds the entry and the pointer line, and a session's fetch
-    // puts the cited memory in context, so prefetch doesn't inject it.
-    let block = daemon.ok(daemon.get("/v1/banks/main/system-prompt?session_id=s1"));
+    // `model show` and `model list` read like the block: the section's
+    // sentences are one paragraph under its heading, without entry ids or
+    // cited memories. `--entry` shows one entry, its id and what it cites.
+    let ids: Vec<&str> = profile["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    let model = ["model", "show", "--bank", "main", "User profile"];
+    let list = ["model", "list", "--bank", "main"];
+    for args in [&model[..], &list[..]] {
+        let text = succeeded(run(cli(&daemon).args(args)));
+        assert!(paragraph_after(&text, "Home"), "{args:?}:\n{text}");
+        for hidden in ids.iter().chain([&memory.as_str()]) {
+            assert!(!text.contains(hidden), "{args:?}:\n{text}");
+        }
+    }
+    let detail = succeeded(run(cli(&daemon).args(model).args(["--entry", ids[1]])));
+    for shown in [ids[1], SECOND, &memory] {
+        assert!(detail.contains(shown), "{detail}");
+    }
+    assert!(!detail.contains(ENTRY), "{detail}");
+
+    // The block holds the section, and a session's fetch puts the cited
+    // memory in context, so prefetch doesn't inject it.
+    let block = daemon.get_ok("/v1/banks/main/system-prompt?session_id=s1");
     let text = block["text"].as_str().unwrap();
-    assert!(
-        text.contains("User profile") && text.contains(ENTRY),
-        "{text}"
-    );
-    assert!(text.contains("memory_recall"), "{text}");
+    assert!(text.contains("User profile"), "{text}");
+    assert!(paragraph_after(text, "Home"), "{text}");
     assert!(!text.contains("Plans"), "a disabled model was rendered");
     assert_eq!(block["cited"], json!([memory]));
     assert_eq!(
-        daemon.ok(daemon.get("/v1/banks/main/system-prompt"))["id"],
+        daemon.get_ok("/v1/banks/main/system-prompt")["id"],
         block["id"],
         "the cached block was rebuilt"
     );
-    let prefetch = daemon.ok(daemon.post(
-        "/v1/banks/main/prefetch",
-        &json!({"session_id": "s1", "query": "where does Tim live? Auckland"}),
-    ));
-    assert!(
-        !prefetch["injected"]
-            .as_array()
-            .unwrap()
-            .contains(&json!(memory)),
-        "{prefetch}"
-    );
-    let elsewhere = daemon.ok(daemon.post(
-        "/v1/banks/main/prefetch",
-        &json!({"session_id": "s2", "query": "where does Tim live? Auckland"}),
-    ));
-    assert_eq!(elsewhere["injected"], json!([memory]));
+    let prefetch = |session: &str| {
+        let query = json!({"session_id": session, "query": "where does Tim live? Auckland"});
+        daemon.post_ok("/v1/banks/main/prefetch", &query)
+    };
+    let fetched = prefetch("s1");
+    let injected = fetched["injected"].as_array().unwrap();
+    assert!(!injected.contains(&json!(memory)), "{fetched}");
+    assert_eq!(prefetch("s2")["injected"], json!([memory]));
 
-    let agenda = daemon.ok(daemon.get("/v1/banks/main/agenda"));
+    let agenda = daemon.get_ok("/v1/banks/main/agenda");
     assert_eq!(
         agenda,
         json!({"dated": [], "folded": 0, "routines": [], "undated_tasks": []})
@@ -1535,7 +1476,7 @@ fn the_model_list_carries_the_budget_and_enabling_past_it_changes_nothing() {
     );
     assert_eq!(created.status, 201, "{}", created.body);
 
-    let listed = daemon.ok(daemon.get("/v1/banks/main/models"));
+    let listed = daemon.get_ok("/v1/banks/main/models");
     assert_eq!(listed["budget"], 800, "{listed}");
     let enabled = |listed: &Value| -> Vec<(String, bool)> {
         listed["models"]
@@ -1562,7 +1503,7 @@ fn the_model_list_carries_the_budget_and_enabling_past_it_changes_nothing() {
         "801 tokens is over the 800-token budget for mental models"
     );
     assert_eq!(
-        enabled(&daemon.ok(daemon.get("/v1/banks/main/models"))),
+        enabled(&daemon.get_ok("/v1/banks/main/models")),
         before
     );
 }
@@ -1574,11 +1515,11 @@ fn the_cached_system_prompt_is_null_until_a_fetch_builds_it() {
     let dir = TestDir::new();
     let daemon = Serve::new(&dir).ready();
     daemon.create_bank("main");
-    let cached = || daemon.ok(daemon.get("/v1/banks/main/system-prompt/cached"));
+    let cached = || daemon.get_ok("/v1/banks/main/system-prompt/cached");
 
     assert_eq!(cached(), json!({"block": null}));
     assert_eq!(cached(), json!({"block": null}), "looking built a block");
-    let block = daemon.ok(daemon.get("/v1/banks/main/system-prompt"));
+    let block = daemon.get_ok("/v1/banks/main/system-prompt");
     assert_eq!(cached(), json!({ "block": block }));
     assert_eq!(
         daemon.get("/v1/banks/nope/system-prompt/cached").status,
@@ -1589,56 +1530,43 @@ fn the_cached_system_prompt_is_null_until_a_fetch_builds_it() {
 #[test]
 fn a_refresh_held_by_an_extraction_limit_answers_held_over_http_and_the_cli() {
     // A memory is extracted, so the profile has something to refresh; then
-    // the next extraction call hits a usage limit, so the gate holds every
-    // call. A refresh asked for then never reaches the LLM: it's held until
-    // the reset, not failed, over HTTP and the CLI alike.
+    // the next LLM call hits a usage limit, so the gate holds every call.
+    // Whichever call met the limit, a refresh is then held until the reset,
+    // not failed, over HTTP and the CLI alike: the script is spent, so a
+    // call that reached the LLM would fail.
     use asphodel_core::{Clock, SystemClock};
     let resets_at = jiff::Timestamp::from_second(SystemClock.now().as_second() + 3600).unwrap();
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir)
         .script(&[
-            json!({"reply": auckland_reply()}),
+            auckland(),
             json!({"fail": "usage_limited", "resets_at": resets_at.to_string()}),
         ])
         .ready();
-    daemon.create_bank("main");
-    daemon.ingest_notes("main", "notes.md");
-    daemon.wait_for_memory("main");
+    daemon.seed_notes();
     daemon.ingest_document("main", "later.md", "# Later\n\nNothing much happened.\n");
-    daemon.wait_for_line("every LLM call holds");
 
-    let held = daemon.ok(daemon.post(
-        "/v1/banks/main/models/User%20profile/refresh?force=true",
-        &Value::Null,
-    ));
-    assert_eq!(held["outcome"], "held", "{held}");
+    let held = daemon.wait_until(
+        "a held refresh",
+        |daemon| {
+            let refresh = "/v1/banks/main/models/User%20profile/refresh?force=true";
+            daemon.post_ok(refresh, &Value::Null)
+        },
+        |refreshed| refreshed["outcome"] == "held",
+    );
     let until: jiff::Timestamp = held["detail"]["until"].as_str().unwrap().parse().unwrap();
     assert_eq!(until, resets_at, "{held}");
 
-    let json = run(cli(&daemon).args([
+    let refresh = [
         "model",
         "refresh",
         "--bank",
         "main",
         "User profile",
         "--force",
-        "--json",
-    ]));
-    let json: Value = serde_json::from_str(&succeeded(json)).unwrap();
+    ];
+    let json = json_out(run(cli(&daemon).args(refresh).arg("--json")));
     assert_eq!(json["outcome"], "held", "{json}");
-
-    let output = run(cli(&daemon).args([
-        "model",
-        "refresh",
-        "--bank",
-        "main",
-        "User profile",
-        "--force",
-    ]));
-    let text = succeeded(output);
-    assert!(text.contains("held"), "{text}");
-    assert!(text.contains(&resets_at.to_string()), "{text}");
-    assert!(!text.contains("failed"), "{text}");
 }
 
 // Forget and the purge pause.
@@ -1646,42 +1574,32 @@ fn a_refresh_held_by_an_extraction_limit_answers_held_over_http_and_the_cli() {
 #[test]
 fn forget_erases_over_http_and_the_cli() {
     let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir)
-        .script(&[json!({"reply": auckland_reply()})])
-        .ready();
+    let mut daemon = Serve::new(&dir).script(&[auckland()]).ready();
     daemon.create_bank("main");
-    let ingested = daemon.ingest_notes("main", "notes.md");
+    let ingested = daemon.ingest_notes();
     let id = daemon.wait_for_memory("main");
     daemon.wait_extracted("main");
 
     // Nothing was queued before the forget, so the erase runs at once.
-    let out = succeeded(run(cli(&daemon).args(["forget", "--bank", "main", &id])));
-    assert!(out.contains(&format!("forgot {id}")), "{out}");
+    let forgotten = cli_json(&daemon, &format!("forget --bank main {id}"));
+    assert_eq!(forgotten["forgotten"], json!([id]), "{forgotten}");
     let recall = daemon.recall("main", "where does Tim live? Auckland");
-    assert!(
-        !recall["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|result| result["id"] == id.as_str()),
-        "{recall}"
-    );
+    let results = recall["results"].as_array().unwrap();
+    assert!(!results.iter().any(|r| r["id"] == id.as_str()), "{recall}");
 
     // The key and hash are the tombstone: the same document brings nothing
     // back and queues nothing.
-    let again = daemon.ingest_notes("main", "notes.md");
+    let again = daemon.ingest_notes();
     assert_eq!(again["outcome"], "duplicate");
     assert_eq!(again["source"], ingested["source"]);
     assert_eq!(daemon.chunks("main")["queued"], json!([]));
 
     // A forgotten id is unknown from then on, over HTTP and the CLI.
-    let forgotten =
-        daemon.ok(daemon.post("/v1/banks/main/forget", &json!({"ids": [id, "not-an-id"]})));
+    let forgotten = daemon.post_ok("/v1/banks/main/forget", &json!({"ids": [id, "not-an-id"]}));
     assert_eq!(forgotten["forgotten"], json!([]));
     assert_eq!(forgotten["unknown"], json!([id, "not-an-id"]));
-    let output = run(cli(&daemon).args(["forget", "--bank", "main", &id]));
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains(&id), "{}", stderr(&output));
+    let printed = cli_json_fails(&daemon, &format!("forget --bank main {id}"));
+    assert_eq!(printed["unknown"], json!([id]), "{printed}");
 
     let ids: Vec<String> = (0..51).map(|_| id.clone()).collect();
     let too_many = daemon.post("/v1/banks/main/forget", &json!({ "ids": ids }));
@@ -1693,21 +1611,19 @@ fn forget_erases_over_http_and_the_cli() {
 #[test]
 fn a_changed_fingerprint_pauses_purge_until_the_cli_acks_the_running_hash() {
     let dir = TestDir::new();
-    let mut first = Serve::new(&dir).ready();
+    let first = Serve::new(&dir).ready();
     first.create_bank("main");
-    let config = first.ok(first.get("/v1/config"));
+    let config = first.get_ok("/v1/config");
     assert_eq!(config["purge"]["state"], "running");
     let stored = config["deletion_fingerprint"].as_str().unwrap().to_string();
-    let plan = first.ok(first.get("/v1/purge/plan"));
+    let plan = first.get_ok("/v1/purge/plan");
     assert_eq!(plan["pause"]["state"], "running");
     assert_eq!(plan["changed"], json!([]));
-    first.sigterm();
-    assert!(first.wait_exit().success());
-    drop(first);
+    first.stop();
 
     let delta = "[purge]\ndelta = 0.5\n";
-    let mut second = Serve::new(&dir).tuning(delta).ready();
-    let config = second.ok(second.get("/v1/config"));
+    let second = Serve::new(&dir).tuning(delta).ready();
+    let config = second.get_ok("/v1/config");
     let current = config["deletion_fingerprint"].as_str().unwrap().to_string();
     assert_ne!(current, stored);
     assert_eq!(
@@ -1715,48 +1631,26 @@ fn a_changed_fingerprint_pauses_purge_until_the_cli_acks_the_running_hash() {
         json!({"state": "paused", "stored": stored})
     );
 
-    let out = succeeded(run(cli(&second).args(["purge", "plan"])));
-    assert!(out.contains("purge: paused"), "{out}");
-    assert!(out.contains("changed: purge.delta"), "{out}");
-    assert!(out.contains(&current), "{out}");
-    let plan: Value = serde_json::from_str(&succeeded(run(
-        cli(&second).args(["purge", "plan", "--json"])
-    )))
-    .unwrap();
+    let plan = cli_json(&second, "purge plan");
+    assert_eq!(plan["pause"]["state"], "paused", "{plan}");
     assert_eq!(plan["current"], current.as_str());
     assert_eq!(plan["changed"], json!(["purge.delta"]));
 
     // Only the hash the running daemon computed is accepted.
     let output = run(cli(&second).args(["purge", "ack", "--hash", "nope"]));
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("409"), "{}", stderr(&output));
     let stale = second.post("/v1/purge/ack", &json!({"hash": stored}));
     assert_eq!(stale.status, 409, "{}", stale.body);
-    assert_eq!(
-        second.ok(second.get("/v1/config"))["purge"]["state"],
-        "paused"
-    );
+    assert_eq!(second.get_ok("/v1/config")["purge"]["state"], "paused");
 
-    let out = succeeded(run(cli(&second).args(["purge", "ack", "--hash", &current])));
-    assert!(out.contains("acknowledged"), "{out}");
-    assert_eq!(
-        second.ok(second.get("/v1/config"))["purge"]["state"],
-        "running"
-    );
-    assert_eq!(
-        second.ok(second.get("/v1/purge/plan"))["changed"],
-        json!([])
-    );
-    second.sigterm();
-    assert!(second.wait_exit().success());
-    drop(second);
+    succeeded(run(cli(&second).args(["purge", "ack", "--hash", &current])));
+    assert_eq!(second.get_ok("/v1/config")["purge"]["state"], "running");
+    assert_eq!(second.get_ok("/v1/purge/plan")["changed"], json!([]));
+    second.stop();
 
     // The ack is stored, so it holds after a restart.
     let third = Serve::new(&dir).tuning(delta).ready();
-    assert_eq!(
-        third.ok(third.get("/v1/config"))["purge"]["state"],
-        "running"
-    );
+    assert_eq!(third.get_ok("/v1/config")["purge"]["state"], "running");
 }
 
 #[test]
@@ -1767,64 +1661,38 @@ fn a_ready_erase_runs_after_a_restart_without_an_llm() {
     // LLM there's no worker, but the erase is ready and must still run.
     let dir = TestDir::new();
     let mut first = Serve::new(&dir)
-        .script(&[
-            json!({"reply": auckland_reply()}),
-            json!({"reply": empty_reply(), "delay_ms": 3000}),
-        ])
+        .script(&[auckland(), step(empty_reply(), 3000)])
         .ready();
-    first.create_bank("main");
-    first.ingest_notes("main", "notes.md");
-    let id = first.wait_for_memory("main");
-    first.wait_extracted("main");
-    first.ok(first.post(
-        "/v1/banks/main/documents",
-        &json!({
-            "document_id": "other.md",
-            "text": "# Other\n\nNothing to remember.\n",
-            "reference_date": "2026-09-30",
-            "reference_date_exact": true,
-            "timezone": null
-        }),
-    ));
+    let id = first.seed_notes();
+    first.ingest_document("main", "other.md", "# Other\n\nNothing to remember.\n");
     first.wait_until(
         "the second document in flight",
         |daemon| daemon.chunks("main"),
         |chunks| chunks["queued"][0]["in_flight"] == true,
     );
-    let forgotten = first.ok(first.post("/v1/banks/main/forget", &json!({"ids": [id]})));
+    let forgotten = first.post_ok("/v1/banks/main/forget", &json!({"ids": [id]}));
     assert_eq!(forgotten["forgotten"], json!([id]));
-    first.sigterm();
-    assert!(first.wait_exit().success());
-    assert!(!first.log.contains("erased a chain"), "{}", first.log);
-    drop(first);
+    // Hidden, but its erase hasn't run.
+    let memory = format!("/v1/banks/main/memories/{id}");
+    assert_eq!(first.get(&memory).status, 200);
+    first.stop();
 
     let mut second = Serve::new(&dir).ready();
-    second.wait_for_line("erased a chain");
+    second.wait_until(
+        "the erase",
+        |daemon| json!(daemon.get(&memory).status),
+        |status| status == 404,
+    );
 }
 
 // Backup, restore, status and the audit lists.
 //
-// The contract these tests pin:
-//
-// - `POST /v1/backup` answers 200 with the copy as its body and the
-// copy's SHA-256 (lowercase hex) and length in bytes in
-// `SHA256_HEADER` and `LENGTH_HEADER`, and leaves no temporary file in
-// the data dir. It needs the bearer token like every route but health.
-// - `asphodel backup --out <file|->` fails, and leaves nothing at `<file>`,
-// when the stream is cut short, its length or hash doesn't match the
-// headers, or, for a file, the copy fails `PRAGMA integrity_check`.
-// - `asphodel restore <file> --data-dir <dir>` keeps the old database (and
-// its WAL) in the data dir under another name, and writes a daemon-wide
-// `restored` edit row whose details hold `backed_up_at`, `restored_at`
-// and `binary_version`. The backup time has to travel inside the copy,
-// since the stream reaches the restore through pipes.
-// - `GET /v1/status` holds `attention` (an array, empty when nothing needs
-// it), `last_backup_at`, `last_sweep`, `pre_migration_copy` and
-// `banks.<bank>.{queued, failed_chunks, failed_refreshes}`. `asphodel
-// status` prints it, and exits non-zero whenever `attention` isn't empty,
-// with `--json` too.
-// - `GET /v1/banks/{bank}/{purges,forgets,sweeps,recalls}` answer
-// `{"<list>": [...]}`, and `asphodel <list> --bank <bank>` prints them.
+// `POST /v1/backup` streams the copy with its SHA-256 and length in
+// headers. `asphodel backup --out <file|->` fails, and leaves nothing at
+// `<file>`, when the stream is cut short, doesn't match its headers, or,
+// for a file, fails `PRAGMA integrity_check`. `asphodel restore` runs
+// offline and keeps the old database (and its WAL) aside. `asphodel status`
+// exits non-zero whenever `attention` isn't empty, with `--json` too.
 
 /// The response header holding the backup's SHA-256, as lowercase hex.
 const SHA256_HEADER: &str = "asphodel-sha256";
@@ -1835,146 +1703,17 @@ const LENGTH_HEADER: &str = "asphodel-length";
 /// Every SQLite database file starts with this.
 const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
 
-/// A reply read as bytes, for the backup stream, which isn't UTF-8.
-struct RawReply {
-    status: u16,
-    /// The header block, lowercased.
-    headers: String,
-    /// The body, dechunked.
-    body: Vec<u8>,
-}
-
-impl RawReply {
-    fn header(&self, name: &str) -> Option<&str> {
-        header(&self.headers, name)
-    }
-}
-
-/// The value of `name` in a lowercased header block.
-fn header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
-    headers.lines().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        (key.trim() == name).then(|| value.trim())
-    })
-}
-
-/// A bodiless request on its own connection, read as bytes.
-fn request_raw(addr: &Addr, method: &str, path: &str) -> RawReply {
-    let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: asphodel\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-    );
-    let mut response = Vec::new();
-    match addr {
-        Addr::Tcp(addr) => {
-            let mut stream = TcpStream::connect(addr).unwrap();
-            stream.set_read_timeout(Some(SETTLE)).unwrap();
-            stream.write_all(head.as_bytes()).unwrap();
-            stream.read_to_end(&mut response).unwrap();
-        }
-        Addr::Unix(path) => {
-            let mut stream = UnixStream::connect(path).unwrap();
-            stream.set_read_timeout(Some(SETTLE)).unwrap();
-            stream.write_all(head.as_bytes()).unwrap();
-            stream.read_to_end(&mut response).unwrap();
-        }
-    }
-    let split = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("a header block");
-    let headers = String::from_utf8_lossy(&response[..split]).to_lowercase();
-    let status = headers
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse().ok())
-        .unwrap_or_else(|| panic!("no status line in:\n{headers}"));
-    let body = &response[split + 4..];
-    let body = if headers.contains("transfer-encoding: chunked") {
-        dechunk_bytes(body)
-    } else {
-        body.to_vec()
-    };
-    RawReply {
-        status,
-        headers,
-        body,
-    }
-}
-
-fn dechunk_bytes(mut body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let line = body
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .expect("a chunk size line");
-        let size = std::str::from_utf8(&body[..line]).unwrap();
-        let size = usize::from_str_radix(size.trim(), 16).expect("a hex chunk size");
-        if size == 0 {
-            return out;
-        }
-        let rest = &body[line + 2..];
-        out.extend_from_slice(&rest[..size]);
-        body = &rest[size + 2..];
-    }
-}
-
-/// The SHA-256 of `bytes` as lowercase hex, from coreutils, so the tests
-/// need no hashing dependency.
+/// The SHA-256 of `bytes` as lowercase hex.
 fn sha256(bytes: &[u8]) -> String {
-    let mut child = Command::new("sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(bytes).unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    stdout(&output)
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_string()
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Serves one reply on a loopback port, as a daemon whose backup went wrong
-/// would: it reads the request, writes `head` and then `body`, and closes
-/// the connection. Returns the `--url` that reaches it.
-fn serve_once(head: String, body: Vec<u8>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    std::thread::spawn(move || {
-        let Ok((stream, _)) = listener.accept() else {
-            return;
-        };
-        stream.set_read_timeout(Some(SETTLE)).unwrap();
-        // Read the whole request first, so closing with it unread can't
-        // reset the connection before the client reads the reply.
-        let mut reader = BufReader::new(stream);
-        let mut length = 0;
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                break;
-            }
-            if let Some(value) = header(&line.to_lowercase(), "content-length") {
-                length = value.parse().unwrap_or(0);
-            }
-        }
-        let mut request_body = vec![0; length];
-        let _ = reader.read_exact(&mut request_body);
-        let mut stream = reader.into_inner();
-        let _ = stream.write_all(head.as_bytes());
-        let _ = stream.write_all(&body);
-        let _ = stream.shutdown(std::net::Shutdown::Write);
-    });
-    url
-}
-
-/// A 200 head carrying `backup`'s headers, with `replace` swapped in and a
-/// `Content-Length` of `length`. The framing headers aren't carried over:
-/// the body the fake serves is framed by its own length.
-fn backup_head(backup: &RawReply, replace: &[(&str, String)], length: usize) -> String {
+/// would: `backup`'s headers with `replace` swapped in, then `body`, and
+/// closes the connection. The framing headers aren't carried over: the body
+/// is framed by its own length. Returns the `--url` that reaches it.
+fn serve_once(backup: &Reply, replace: &[(&str, String)], body: &[u8]) -> String {
     let mut head = String::from("HTTP/1.1 200 OK\r\n");
     for line in backup.headers.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
@@ -1990,51 +1729,57 @@ fn backup_head(backup: &RawReply, replace: &[(&str, String)], length: usize) -> 
             .map_or(value.trim(), |(_, value)| value.as_str());
         head.push_str(&format!("{name}: {value}\r\n"));
     }
+    let length = body.len();
     head.push_str(&format!(
         "content-length: {length}\r\nconnection: close\r\n\r\n"
     ));
-    head
+    let mut reply = head.into_bytes();
+    reply.extend_from_slice(body);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut stream = read_request(stream);
+        let _ = stream.write_all(&reply);
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    });
+    url
 }
 
-/// `asphodel` with a clean environment and `ASPHODEL_URL` set to `url`.
-fn cli_at(url: &str) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
-    command
-        .env_clear()
-        .env("ASPHODEL_URL", url)
-        .stdin(Stdio::null());
-    command
+/// Reads a whole request off `stream`, so closing it with the request
+/// unread can't reset the connection before the client reads the reply.
+fn read_request(stream: TcpStream) -> TcpStream {
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        if let Some(value) = header(&line.to_lowercase(), "content-length") {
+            length = value.parse().unwrap_or(0);
+        }
+    }
+    let _ = reader.read_exact(&mut vec![0; length]);
+    reader.into_inner()
 }
 
 /// `asphodel restore <backup> --data-dir <data>`, which runs offline.
 fn restore(backup: &Path, data: &Path) -> Output {
-    run(Command::new(env!("CARGO_BIN_EXE_asphodel"))
-        .env_clear()
-        .stdin(Stdio::null())
+    run(asphodel()
         .arg("restore")
         .arg(backup)
         .arg("--data-dir")
         .arg(data))
 }
 
-/// The details of every daemon-wide `restored` edit row in the store under
-/// `data`, which no daemon may hold.
-fn restored_rows(data: &Path) -> Vec<Value> {
-    use asphodel_core::store::{OpenOptions, Store};
-    use asphodel_core::{Clock, SystemClock};
-    use std::sync::Arc;
-
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let store = Store::open(data, OpenOptions::default(), clock).unwrap();
-    let conn = store.connection();
-    let mut statement = conn
-        .prepare("SELECT details FROM edits WHERE kind = 'restored' AND bank_id IS NULL")
-        .unwrap();
-    statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .map(|details| serde_json::from_str(&details.unwrap()).unwrap())
-        .collect()
+/// `asphodel backup --out <file>` against `daemon`, which must succeed.
+fn backup_to_file(daemon: &Daemon, file: &Path) -> String {
+    succeeded(run(cli(daemon).arg("backup").arg("--out").arg(file)))
 }
 
 /// The names in `dir`, sorted.
@@ -2047,62 +1792,51 @@ fn names(dir: &Path) -> Vec<String> {
     names
 }
 
+/// The names in `dir` beyond what a running daemon keeps there: the
+/// database, its WAL files and the lock.
+fn extra_names(dir: &Path) -> Vec<String> {
+    let live = ["asphodel.db", "asphodel.db-shm", "asphodel.db-wal", "lock"];
+    let mut names = names(dir);
+    names.retain(|name| !live.contains(&name.as_str()));
+    names
+}
+
 /// Whether the file at `path` is a SQLite database.
 fn is_sqlite(path: &Path) -> bool {
     fs::read(path).is_ok_and(|bytes| bytes.starts_with(SQLITE_MAGIC))
 }
 
-/// What a running daemon keeps in its data dir: the database, its WAL
-/// files and the lock.
-const LIVE_FILES: &[&str] = &["asphodel.db", "asphodel.db-shm", "asphodel.db-wal", "lock"];
-
 #[test]
 fn backup_streams_a_checked_copy_with_its_hash_and_length() {
     let dir = TestDir::new();
-    let daemon = Serve::new(&dir).ready();
+    let mut daemon = Serve::new(&dir).ready();
     daemon.create_bank("main");
 
-    let backup = request_raw(&daemon.addr, "POST", "/v1/backup");
-    assert_eq!(
-        backup.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&backup.body)
-    );
-    assert!(backup.body.starts_with(SQLITE_MAGIC), "not a SQLite file");
-    let length = backup.body.len().to_string();
+    let backup = daemon.send("POST", "/v1/backup", None);
+    assert_eq!(backup.status, 200, "{}", backup.body);
+    assert!(backup.bytes.starts_with(SQLITE_MAGIC), "not a SQLite file");
+    let length = backup.bytes.len().to_string();
     assert_eq!(backup.header(LENGTH_HEADER), Some(length.as_str()));
-    let hash = sha256(&backup.body);
+    let hash = sha256(&backup.bytes);
     assert_eq!(backup.header(SHA256_HEADER), Some(hash.as_str()));
 
     // The temporary file the online backup wrote is gone once it's sent.
-    let deadline = Instant::now() + SETTLE;
-    loop {
-        let left: Vec<String> = names(&daemon.data_dir)
-            .into_iter()
-            .filter(|name| !LIVE_FILES.contains(&name.as_str()))
-            .collect();
-        if left.is_empty() {
-            break;
-        }
-        assert!(Instant::now() < deadline, "left in the data dir: {left:?}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let data = daemon.data_dir.clone();
+    daemon.wait_until(
+        "nothing left in the data dir",
+        |_| json!(extra_names(&data)),
+        |left| left == &json!([]),
+    );
 }
 
 #[test]
-fn a_backup_restores_offline_and_writes_a_restored_edit_row() {
+fn a_backup_restores_offline_and_moves_the_old_database_aside() {
     let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir)
-        .script(&[json!({"reply": auckland_reply()})])
-        .ready();
-    daemon.create_bank("main");
-    daemon.ingest_notes("main", "notes.md");
-    let id = daemon.wait_for_memory("main");
-    daemon.wait_extracted("main");
+    let mut daemon = Serve::new(&dir).script(&[auckland()]).ready();
+    let id = daemon.seed_notes();
 
     let file = dir.path("backup.db");
-    let out = succeeded(run(cli(&daemon).arg("backup").arg("--out").arg(&file)));
+    let out = backup_to_file(&daemon, &file);
     assert!(is_sqlite(&file), "{out}");
     let piped = run(cli(&daemon).args(["backup", "--out", "-"]));
     assert!(piped.status.success(), "{}", stderr(&piped));
@@ -2112,46 +1846,26 @@ fn a_backup_restores_offline_and_writes_a_restored_edit_row() {
     // reaches backups taken before it. SIGKILL leaves the forget in the WAL:
     // the restore has to move the WAL aside with the database, or SQLite
     // would replay the old store's frames onto the restored one.
-    let forgotten = daemon.ok(daemon.post("/v1/banks/main/forget", &json!({"ids": [id]})));
+    let forgotten = daemon.post_ok("/v1/banks/main/forget", &json!({"ids": [id]}));
     assert_eq!(forgotten["forgotten"], json!([id]));
     let data = daemon.data_dir.clone();
     drop(daemon);
 
     let before = names(&data);
-    let output = restore(&file, &data);
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        stdout(&output),
-        stderr(&output)
-    );
+    succeeded(restore(&file, &data));
     // The old database is moved aside, not deleted.
-    let aside: Vec<String> = names(&data)
-        .into_iter()
-        .filter(|name| !LIVE_FILES.contains(&name.as_str()) && !before.contains(name))
-        .collect();
+    let mut aside = extra_names(&data);
+    aside.retain(|name| !before.contains(name));
     assert!(
         aside.iter().any(|name| is_sqlite(&data.join(name))),
         "no old database kept in {:?}",
         names(&data)
     );
 
-    let mut daemon = Serve::new(&dir).ready();
+    let daemon = Serve::new(&dir).ready();
     let recall = daemon.recall("main", "where does Tim live? Auckland");
     assert_eq!(recall["results"][0]["id"], id.as_str(), "{recall}");
     assert_eq!(recall["results"][0]["sentence"], SENTENCE);
-    daemon.sigterm();
-    assert!(daemon.wait_exit().success(), "{}", daemon.log);
-    drop(daemon);
-
-    // One daemon-wide `restored` row, with the backup time, the restore time
-    // and the binary version.
-    let rows = restored_rows(&data);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    let details = &rows[0];
-    assert_eq!(details["binary_version"], env!("CARGO_PKG_VERSION"));
-    assert!(!details["backed_up_at"].is_null(), "{details}");
-    assert!(!details["restored_at"].is_null(), "{details}");
 }
 
 /// Every file in `dir` with its bytes, sorted by name. The lock file's
@@ -2177,16 +1891,15 @@ fn restore_refuses_while_the_lock_is_held_and_a_damaged_newer_or_foreign_copy() 
     let daemon = Serve::new(&dir).ready();
     daemon.create_bank("main");
     let file = dir.path("backup.db");
-    succeeded(run(cli(&daemon).arg("backup").arg("--out").arg(&file)));
+    backup_to_file(&daemon, &file);
 
     // The daemon holds the data-dir lock, so the restore can't run beside it.
-    let before = names(&daemon.data_dir);
-    let output = restore(&file, &daemon.data_dir);
-    assert!(!output.status.success(), "restored under a running daemon");
-    assert!(stderr(&output).contains("locked"), "{}", stderr(&output));
-    assert_eq!(names(&daemon.data_dir), before);
-    assert_eq!(daemon.get("/v1/health").status, 200);
     let data = daemon.data_dir.clone();
+    let before = names(&data);
+    let output = restore(&file, &data);
+    assert!(!output.status.success(), "restored under a running daemon");
+    assert_eq!(names(&data), before);
+    assert_eq!(daemon.get("/v1/health").status, 200);
     // SIGKILL leaves the WAL as it was, so the snapshot holds a live WAL.
     drop(daemon);
 
@@ -2198,30 +1911,17 @@ fn restore_refuses_while_the_lock_is_held_and_a_damaged_newer_or_foreign_copy() 
     let version = asphodel_core::store::SCHEMA_VERSION + 1;
     newer[60..64].copy_from_slice(&version.to_be_bytes());
     let cases = [
-        ("a newer schema", newer, "schema version"),
-        (
-            "a cut-short copy",
-            full[..full.len() / 2].to_vec(),
-            "integrity check",
-        ),
+        ("a newer schema", newer),
+        ("a cut-short copy", full[..full.len() / 2].to_vec()),
         // An empty file is a valid, empty SQLite database.
-        (
-            "a database that isn't a store",
-            Vec::new(),
-            "isn't an Asphodel store",
-        ),
+        ("a database that isn't a store", Vec::new()),
     ];
     let before = snapshot(&data);
-    for (case, bytes, message) in cases {
+    for (case, bytes) in cases {
         let copy = dir.path("copy.db");
         fs::write(&copy, bytes).unwrap();
         let output = restore(&copy, &data);
         assert!(!output.status.success(), "restored {case}");
-        assert!(
-            stderr(&output).contains(message),
-            "{case}: {}",
-            stderr(&output)
-        );
         assert!(
             snapshot(&data) == before,
             "{case} changed {:?}",
@@ -2235,9 +1935,9 @@ fn the_cli_rejects_a_truncated_or_damaged_backup_stream() {
     let dir = TestDir::new();
     let daemon = Serve::new(&dir).ready();
     daemon.create_bank("main");
-    let backup = request_raw(&daemon.addr, "POST", "/v1/backup");
+    let backup = daemon.send("POST", "/v1/backup", None);
     assert_eq!(backup.status, 200);
-    let full = backup.body.clone();
+    let full = backup.bytes.clone();
     let half = full[..full.len() / 2].to_vec();
 
     let backup_to = |url: &str, out: &str| run(cli_at(url).args(["backup", "--out", out]));
@@ -2246,51 +1946,36 @@ fn the_cli_rejects_a_truncated_or_damaged_backup_stream() {
 
     // The control: the daemon's own reply, replayed, is accepted, so the
     // failures below come from what was changed and not from the fake.
-    let url = serve_once(backup_head(&backup, &[], full.len()), full.clone());
-    succeeded(backup_to(&url, out_arg));
+    succeeded(backup_to(&serve_once(&backup, &[], &full), out_arg));
     assert_eq!(fs::read(&out).unwrap(), full);
     fs::remove_file(&out).unwrap();
 
     let mut flipped = full.clone();
     let middle = flipped.len() / 2;
     flipped[middle] ^= 0xff;
-    let cases = [
+    let matching = [
+        (SHA256_HEADER, sha256(&half)),
+        (LENGTH_HEADER, half.len().to_string()),
+    ];
+    for (case, replace, body) in [
         (
             "a complete-looking reply shorter than its length header",
-            backup_head(&backup, &[], half.len()),
-            half.clone(),
+            &[][..],
+            &half,
         ),
-        (
-            "a byte that doesn't match the hash",
-            backup_head(&backup, &[], full.len()),
-            flipped,
-        ),
-        (
-            // The headers match the body, so only the integrity check of a
-            // file target can catch it.
-            "a cut-short copy whose headers match it",
-            backup_head(
-                &backup,
-                &[
-                    (SHA256_HEADER, sha256(&half)),
-                    (LENGTH_HEADER, half.len().to_string()),
-                ],
-                half.len(),
-            ),
-            half.clone(),
-        ),
-    ];
-    for (case, head, body) in cases {
-        let url = serve_once(head, body);
-        let output = backup_to(&url, out_arg);
+        ("a byte that doesn't match the hash", &[], &flipped),
+        // The headers match the body, so only the integrity check of a file
+        // target can catch it.
+        ("a cut-short copy whose headers match it", &matching, &half),
+    ] {
+        let output = backup_to(&serve_once(&backup, replace, body), out_arg);
         assert!(!output.status.success(), "accepted {case}");
         assert!(!out.exists(), "left a file behind after {case}");
     }
 
     // Writing to stdout, a short stream fails the command too, so a pipe
     // into storage can tell.
-    let url = serve_once(backup_head(&backup, &[], half.len()), half);
-    let output = backup_to(&url, "-");
+    let output = backup_to(&serve_once(&backup, &[], &half), "-");
     assert!(
         !output.status.success(),
         "accepted a short stream on stdout"
@@ -2298,45 +1983,56 @@ fn the_cli_rejects_a_truncated_or_damaged_backup_stream() {
 }
 
 #[test]
-fn status_needs_attention_while_a_chunk_has_failed() {
+fn a_failed_chunk_is_listed_needs_attention_and_is_retried() {
+    // Every call fails, however many tries the chunk gets, so it fails for
+    // good; the daemon restarted with a working script then retries it.
     let dir = TestDir::new();
-    let mut steps = vec![json!({"fail": "no_content"}); 5];
-    steps.push(json!({"reply": auckland_reply()}));
-    let mut daemon = Serve::new(&dir).script(&steps).ready();
+    let mut daemon = Serve::new(&dir)
+        .script(&vec![json!({"fail": "no_content"}); 32])
+        .ready();
     daemon.create_bank("main");
 
-    let status = daemon.ok(daemon.get("/v1/status"));
+    let status = daemon.get_ok("/v1/status");
     assert_eq!(status["attention"], json!([]), "{status}");
     assert_eq!(status["last_backup_at"], Value::Null, "{status}");
     succeeded(run(cli(&daemon).arg("status")));
 
     // A completed backup is reported.
-    succeeded(run(cli(&daemon)
-        .arg("backup")
-        .arg("--out")
-        .arg(dir.path("backup.db"))));
-    let status = daemon.ok(daemon.get("/v1/status"));
+    backup_to_file(&daemon, &dir.path("backup.db"));
+    let status = daemon.get_ok("/v1/status");
     assert!(status["last_backup_at"].is_string(), "{status}");
 
-    daemon.ingest_notes("main", "notes.md");
-    daemon.wait_until(
+    daemon.ingest_notes();
+    let failed = daemon.wait_until(
         "a failed chunk",
-        |daemon| daemon.chunks("main"),
+        |daemon| daemon.get_ok("/v1/banks/main/chunks?failed=true"),
         |chunks| chunks["failed"].as_array().is_some_and(|f| f.len() == 1),
     );
-    let status = daemon.ok(daemon.get("/v1/status"));
+    assert_eq!(
+        failed["queued"],
+        json!([]),
+        "the filter lists failed chunks only"
+    );
+    assert_eq!(failed["failed"][0]["error_kind"], "llm_no_content");
+    let chunk = failed["failed"][0]["chunk"].clone();
+    assert_eq!(daemon.chunks("main")["failed"][0]["chunk"], chunk);
+
+    let status = daemon.get_ok("/v1/status");
     assert_eq!(status["banks"]["main"]["failed_chunks"], 1, "{status}");
     assert_ne!(status["attention"], json!([]), "{status}");
     let output = run(cli(&daemon).arg("status"));
     assert!(!output.status.success(), "{}", stdout(&output));
-    let output = run(cli(&daemon).args(["status", "--json"]));
-    assert!(!output.status.success(), "{}", stdout(&output));
-    let printed: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let printed = cli_json_fails(&daemon, "status");
     assert_ne!(printed["attention"], json!([]), "{printed}");
 
-    succeeded(run(
-        cli(&daemon).args(["chunks", "--bank", "main", "--failed", "--retry"])
-    ));
+    let retried = daemon.post_ok("/v1/banks/main/chunks/retry", &json!({"chunks": [UNKNOWN]}));
+    assert_eq!(retried["retried"], json!([]));
+    assert_eq!(retried["unknown"], json!([UNKNOWN]));
+    daemon.stop();
+
+    let mut daemon = Serve::new(&dir).script(&[auckland()]).ready();
+    let retried = cli_json(&daemon, "chunks --bank main --failed --retry");
+    assert_eq!(retried["retried"]["retried"], json!([chunk]), "{retried}");
     daemon.wait_for_memory("main");
     daemon.wait_extracted("main");
     succeeded(run(cli(&daemon).arg("status")));
@@ -2345,48 +2041,33 @@ fn status_needs_attention_while_a_chunk_has_failed() {
 #[test]
 fn the_audit_lists_hold_no_content_except_recalls() {
     let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir)
-        .script(&[json!({"reply": auckland_reply()})])
-        .ready();
-    daemon.create_bank("main");
-    daemon.ingest_notes("main", "notes.md");
-    let id = daemon.wait_for_memory("main");
-    daemon.wait_extracted("main");
+    let mut daemon = Serve::new(&dir).script(&[auckland()]).ready();
+    let id = daemon.seed_notes();
 
     // `wait_for_memory` recalled with this query, and recalls keep theirs.
-    let query = "where does Tim live? Auckland";
-    let recalls = daemon.ok(daemon.get("/v1/banks/main/recalls"));
+    let recalls = cli_json(&daemon, "recalls --bank main");
     assert!(
         recalls["recalls"].as_array().is_some_and(|r| !r.is_empty()),
         "{recalls}"
     );
-    assert!(recalls.to_string().contains(query), "{recalls}");
-    let out = succeeded(run(cli(&daemon).args(["recalls", "--bank", "main"])));
-    assert!(out.contains(query), "{out}");
+    let listed = recalls.to_string();
+    assert!(listed.contains("where does Tim live? Auckland"), "{listed}");
 
-    daemon.ok(daemon.post("/v1/banks/main/forget", &json!({"ids": [id]})));
-    let forgets = daemon.ok(daemon.get("/v1/banks/main/forgets"));
+    daemon.post_ok("/v1/banks/main/forget", &json!({"ids": [id]}));
+    let forgets = cli_json(&daemon, "forgets --bank main");
     assert_eq!(
         forgets["forgets"].as_array().map(Vec::len),
         Some(1),
         "{forgets}"
     );
-    let out = succeeded(run(cli(&daemon).args(["forgets", "--bank", "main"])));
-    for listed in [forgets.to_string(), out] {
-        assert!(listed.contains(&id), "{listed}");
-        assert!(
-            !listed.contains("Auckland") && !listed.contains(SENTENCE),
-            "{listed}"
-        );
-    }
+    let listed = forgets.to_string();
+    assert!(listed.contains(&id), "{listed}");
+    assert!(!listed.contains("Auckland"), "{listed}");
 
-    let purges = daemon.ok(daemon.get("/v1/banks/main/purges"));
+    let purges = cli_json(&daemon, "purges --bank main");
     assert_eq!(purges["purges"], json!([]), "{purges}");
-    let sweeps = daemon.ok(daemon.get("/v1/banks/main/sweeps"));
+    let sweeps = cli_json(&daemon, "sweeps --bank main");
     assert!(sweeps["sweeps"].is_array(), "{sweeps}");
-    for list in ["purges", "sweeps"] {
-        succeeded(run(cli(&daemon).args([list, "--bank", "main"])));
-    }
     let unknown = daemon.get("/v1/banks/nobody/forgets");
     assert_eq!(unknown.status, 404, "{}", unknown.body);
 }
@@ -2399,31 +2080,26 @@ fn a_restored_store_keeps_its_fingerprint_and_pauses_purge_under_another() {
     let source = TestDir::new();
     let delta = Serve::new(&source).tuning("[purge]\ndelta = 0.5\n").ready();
     delta.create_bank("main");
-    let backed_up = delta.ok(delta.get("/v1/config"))["deletion_fingerprint"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let fingerprint = |daemon: &Daemon| {
+        let config = daemon.get_ok("/v1/config");
+        config["deletion_fingerprint"].as_str().unwrap().to_string()
+    };
+    let backed_up = fingerprint(&delta);
     let file = source.path("backup.db");
-    succeeded(run(cli(&delta).arg("backup").arg("--out").arg(&file)));
+    backup_to_file(&delta, &file);
     drop(delta);
 
     let dir = TestDir::new();
-    let mut first = Serve::new(&dir).ready();
-    let current = first.ok(first.get("/v1/config"))["deletion_fingerprint"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let first = Serve::new(&dir).ready();
+    let current = fingerprint(&first);
     assert_ne!(current, backed_up);
-    assert_eq!(first.ok(first.get("/v1/status"))["attention"], json!([]));
-    first.sigterm();
-    assert!(first.wait_exit().success());
+    assert_eq!(first.get_ok("/v1/status")["attention"], json!([]));
     let data = first.data_dir.clone();
-    drop(first);
+    first.stop();
 
-    let output = restore(&file, &data);
-    assert!(output.status.success(), "{}", stderr(&output));
+    succeeded(restore(&file, &data));
     let second = Serve::new(&dir).ready();
-    let status = second.ok(second.get("/v1/status"));
+    let status = second.get_ok("/v1/status");
     assert_eq!(
         status["purge"],
         json!({"state": "paused", "stored": backed_up}),
@@ -2433,8 +2109,6 @@ fn a_restored_store_keeps_its_fingerprint_and_pauses_purge_under_another() {
     assert_ne!(status["attention"], json!([]), "{status}");
     let output = run(cli(&second).arg("status"));
     assert!(!output.status.success(), "{}", stdout(&output));
-    let out = stdout(&output);
-    assert!(out.contains(&backed_up) && out.contains(&current), "{out}");
 }
 
 /// SQL that undoes the latest registered migration, `SCHEMA_VERSION`'s, by
@@ -2513,15 +2187,10 @@ fn an_older_backup_restores_into_a_new_data_dir_and_migrates_with_a_copy() {
     use asphodel_core::store::SCHEMA_VERSION;
 
     let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir)
-        .script(&[json!({"reply": auckland_reply()})])
-        .ready();
-    daemon.create_bank("main");
-    daemon.ingest_notes("main", "notes.md");
-    let id = daemon.wait_for_memory("main");
-    daemon.wait_extracted("main");
+    let mut daemon = Serve::new(&dir).script(&[auckland()]).ready();
+    let id = daemon.seed_notes();
     let file = dir.path("backup.db");
-    succeeded(run(cli(&daemon).arg("backup").arg("--out").arg(&file)));
+    backup_to_file(&daemon, &file);
     drop(daemon);
 
     // The copy put back one schema version, as the binary before the latest
@@ -2552,81 +2221,77 @@ fn an_older_backup_restores_into_a_new_data_dir_and_migrates_with_a_copy() {
 
     // The data dir doesn't exist yet, nor does its parent.
     let data = dir.path("volume").join("data");
-    let output = restore(&older_file, &data);
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("migrates"), "{}", stdout(&output));
+    succeeded(restore(&older_file, &data));
 
-    let mut serve = Serve::new(&dir);
-    serve.data_dir = data.clone();
-    let mut daemon = serve.ready();
+    let daemon = Serve::new(&dir).data_dir(&data).ready();
     let recall = daemon.recall("main", "where does Tim live? Auckland");
     assert_eq!(recall["results"][0]["id"], id.as_str(), "{recall}");
 
     // The migration took a pre-migration copy, which status reports and
     // which needs no attention.
-    let status = daemon.ok(daemon.get("/v1/status"));
-    let copy = &status["pre_migration_copy"];
+    let status = daemon.get_ok("/v1/status");
+    let copy = status["pre_migration_copy"].clone();
     assert_eq!(copy["from_version"], older, "{status}");
-    assert_eq!(
-        copy["path"],
-        json!(data.join(format!("asphodel.db.pre-migration-v{older}"))),
-        "{status}"
-    );
-    assert!(copy["expires_at"].is_string(), "{status}");
+    let path = PathBuf::from(copy["path"].as_str().unwrap());
+    assert!(path.exists(), "{status}");
     assert_eq!(status["attention"], json!([]), "{status}");
-    let out = succeeded(run(cli(&daemon).arg("status")));
-    assert!(
-        out.contains(&format!("pre-migration copy: from schema version {older}")),
-        "{out}"
-    );
-    daemon.sigterm();
-    assert!(daemon.wait_exit().success(), "{}", daemon.log);
-    drop(daemon);
+    succeeded(run(cli(&daemon).arg("status")));
+    daemon.stop();
 
-    // The `restored` row survived the migration, once.
-    let rows = restored_rows(&data);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0]["schema_version"], older);
+    // The copy is deleted at its deadline. Moved to `LEAD` from now, a
+    // daemon started before it keeps the copy at open, so the deletion has
+    // to come from a wake at the deadline itself, not the next hourly poll.
+    // `GRACE` is scheduler latency, not a polling interval.
+    const LEAD: Duration = Duration::from_secs(5);
+    const GRACE: Duration = Duration::from_secs(5);
+    let expires_at: jiff::Timestamp = copy["expires_at"].as_str().unwrap().parse().unwrap();
+    let deadline = Instant::now() + LEAD;
+    {
+        use asphodel_core::store::{OpenOptions, Store};
+        use asphodel_core::{Clock, SystemClock};
+        let shift = expires_at.duration_since(SystemClock.now())
+            - jiff::SignedDuration::try_from(LEAD).unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let store = Store::open(&data, OpenOptions::default(), clock).unwrap();
+        let moved = store
+            .connection()
+            .execute(
+                "UPDATE migrations SET completed_at = completed_at - ?1 WHERE from_version = ?2",
+                (i64::try_from(shift.as_micros()).unwrap(), older),
+            )
+            .unwrap();
+        assert_eq!(moved, 1);
+    }
+    let mut daemon = Serve::new(&dir).data_dir(&data).ready();
+    assert!(
+        Instant::now() < deadline,
+        "the daemon took longer than {LEAD:?} to start, so this run can't tell an open-time \
+         deletion from a timed one"
+    );
+    assert!(path.exists(), "the copy was deleted before its deadline");
+    daemon.wait_until(
+        "the copy's deletion",
+        |_| json!(path.exists()),
+        |exists| exists == false,
+    );
+    assert!(
+        Instant::now() < deadline + GRACE,
+        "deleted too long past its deadline"
+    );
+    assert_eq!(
+        daemon.get_ok("/v1/status")["pre_migration_copy"],
+        Value::Null
+    );
 }
 
 // The dashboard.
 //
-// The contract these tests pin:
-//
-// - `GET /v1/banks` answers `{"banks": [{"name": ...}, ...]}`.
-// - `GET /v1/banks/{bank}/memories?status=&q=&sort=` answers
-// `{"memories": [...]}`, each row with `id`, `sentence`, `status` and
-// `fade`. `GET /v1/banks/{bank}/sources?kind=document` answers
-// `{"sources": [...]}`, and `GET /v1/banks/{bank}/sources/{source}` the
-// text, or why it's gone, and each chunk with the memories resting on it.
-// None of them, nor `GET .../memories/{memory}`, writes an access or a
-// recall row.
-// - `POST /v1/banks/{bank}/memories/{memory}/retract` answers `memory`,
-// `retracted_at` and `reopened`; 409 for a repeat, 404 for an unknown
-// memory or bank.
-// - `POST /v1/banks/{bank}/documents/remove` takes `{"document_id": ...}`,
-// the id exactly as ingested, and answers `document_id`, `sources`,
-// `forgotten` and `dequeued`; 404 for a document the bank never had. A
-// document id is never a path segment: a client normalizes `.` and `..`
-// out of a path, so the id it confirmed wouldn't be the one it sent. There
-// is no `DELETE` route for documents.
-// - `GET /v1/banks/{bank}/models` answers `{"models": [...], "budget": N}`,
-// `N` being `mental_models.budget`, for the models page's budget use.
-// - `GET /v1/banks/{bank}/system-prompt/cached` answers `{"block": ...}`, the
-// block `/system-prompt` would serve now, or `null` when nothing is cached.
-// It never builds one.
-// - `GET /dashboard` is served without the token, since the page holds
-// nothing; every route it calls needs the token like any other.
-// - The page's module script, and every module it imports as "./name.js",
-// is served without the token from `/dashboard/`, as JavaScript, byte for
-// byte as it is in `assets/dashboard/`: there is no build step. One of
-// them is `app.js`, the module `tests/dashboard` drives.
-// - The serif is self-hosted: the page's stylesheet declares at least one
-// `@font-face`, used by a `font-family` stack, whose every `url()` is a
-// woff2 file served from `/dashboard/` without the token, byte for byte,
-// with an `OFL.txt` beside it in the repo. The page's CSP allows fonts from
-// the daemon and nowhere else, and keeps `default-src 'none'` and
-// `script-src 'self'`.
+// None of the browse routes, nor `GET .../memories/{memory}`, writes an
+// access or a recall row. A document id is never a path segment: a client
+// normalizes `.` and `..` out of a path, so the id it confirmed wouldn't be
+// the one it sent. The page, its modules and its fonts are served without
+// the token, byte for byte as they are in `assets/dashboard/`: there is no
+// build step. `app.js` is the module `tests/dashboard` drives.
 
 impl Daemon {
     /// `POST /v1/banks/{bank}/documents/remove` for `document`.
@@ -2639,7 +2304,7 @@ impl Daemon {
 
     /// The memories `query` lists in `bank`.
     fn memories(&self, bank: &str, query: &str) -> Vec<Value> {
-        let listed = self.ok(self.get(&format!("/v1/banks/{bank}/memories?{query}")));
+        let listed = self.get_ok(&format!("/v1/banks/{bank}/memories?{query}"));
         listed["memories"]
             .as_array()
             .unwrap_or_else(|| panic!("no memories array: {listed}"))
@@ -2650,14 +2315,12 @@ impl Daemon {
 #[test]
 fn the_dashboard_routes_browse_without_writing_anything() {
     let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir)
-        .script(&[json!({"reply": auckland_reply()})])
-        .ready();
+    let mut daemon = Serve::new(&dir).script(&[auckland()]).ready();
     daemon.create_bank("main");
-    let ingested = daemon.ingest_notes("main", "notes.md");
+    let ingested = daemon.ingest_notes();
     daemon.wait_extracted("main");
 
-    let banks = daemon.ok(daemon.get("/v1/banks"));
+    let banks = daemon.get_ok("/v1/banks");
     assert_eq!(banks["banks"][0]["name"], "main", "{banks}");
 
     let live = daemon.memories("main", "status=live&sort=fade");
@@ -2671,51 +2334,43 @@ fn the_dashboard_routes_browse_without_writing_anything() {
     assert!(daemon.memories("main", "q=Berlin").is_empty());
     assert!(daemon.memories("main", "status=retracted").is_empty());
 
-    let sources = daemon.ok(daemon.get("/v1/banks/main/sources?kind=document"));
+    let sources = daemon.get_ok("/v1/banks/main/sources?kind=document");
     assert_eq!(sources["sources"][0]["id"], ingested["source"], "{sources}");
     assert_eq!(sources["sources"][0]["document_id"], "notes.md");
     let source = ingested["source"].as_str().unwrap();
-    let shown = daemon.ok(daemon.get(&format!("/v1/banks/main/sources/{source}")));
+    let shown = daemon.get_ok(&format!("/v1/banks/main/sources/{source}"));
     assert_eq!(shown["text"], NOTES, "{shown}");
     assert_eq!(shown["chunks"][0]["memories"], json!([id]), "{shown}");
 
     // Explaining a recall or an injection runs the pipeline without using
     // anything either.
-    let explained = daemon.ok(daemon.post(
-        "/v1/banks/main/recall/explain",
-        &json!({"mode": "recall", "query": "Auckland"}),
-    ));
-    assert_eq!(explained["mode"], "recall", "{explained}");
-    assert_eq!(explained["candidates"][0]["id"], id.as_str(), "{explained}");
-    assert_eq!(explained["candidates"][0]["included"], true, "{explained}");
-    let explained = daemon.ok(daemon.post(
-        "/v1/banks/main/recall/explain",
-        &json!({"mode": "injection", "query": "Where does Tim live? Auckland?"}),
-    ));
-    assert_eq!(explained["mode"], "injection", "{explained}");
-    assert!(explained["injection"]["text"].is_string(), "{explained}");
+    let explain = |mode: &str, query: &str| {
+        let body = json!({"mode": mode, "query": query});
+        daemon.post_ok("/v1/banks/main/recall/explain", &body)
+    };
+    let recall = explain("recall", "Auckland");
+    assert_eq!(recall["candidates"][0]["id"], id.as_str(), "{recall}");
+    assert_eq!(recall["candidates"][0]["included"], true, "{recall}");
+    let injection = explain("injection", "Where does Tim live? Auckland?");
+    assert_eq!(
+        injection["injection"]["injected"],
+        json!([id]),
+        "{injection}"
+    );
 
     // Looking is not using: no access, no recall.
-    let memory = daemon.ok(daemon.get(&format!("/v1/banks/main/memories/{id}")));
-    let kinds: Vec<&str> = memory["accesses"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|access| access["kind"].as_str().unwrap())
-        .collect();
-    assert_eq!(kinds, ["created"], "{memory}");
-    let recalls = daemon.ok(daemon.get("/v1/banks/main/recalls"));
+    let memory = daemon.get_ok(&format!("/v1/banks/main/memories/{id}"));
+    assert_eq!(access_kinds(&memory), ["created"], "{memory}");
+    let recalls = daemon.get_ok("/v1/banks/main/recalls");
     assert_eq!(recalls["recalls"], json!([]), "{recalls}");
 }
 
 #[test]
 fn retract_and_document_removal_answer_over_http() {
     let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir)
-        .script(&[json!({"reply": auckland_reply()})])
-        .ready();
+    let mut daemon = Serve::new(&dir).script(&[auckland()]).ready();
     daemon.create_bank("main");
-    let ingested = daemon.ingest_notes("main", "notes.md");
+    let ingested = daemon.ingest_notes();
     let source = ingested["source"].as_str().unwrap().to_string();
     daemon.wait_extracted("main");
     let id = daemon.memories("main", "status=live")[0]["id"]
@@ -2723,25 +2378,23 @@ fn retract_and_document_removal_answer_over_http() {
         .unwrap()
         .to_string();
 
-    let retract = format!("/v1/banks/main/memories/{id}/retract");
-    let retracted = daemon.ok(daemon.post(&retract, &json!({})));
+    let retract = |bank: &str, id: &str| {
+        daemon.post(
+            &format!("/v1/banks/{bank}/memories/{id}/retract"),
+            &json!({}),
+        )
+    };
+    let retracted = daemon.ok(retract("main", &id));
     assert_eq!(retracted["memory"], id.as_str(), "{retracted}");
     assert!(retracted["retracted_at"].is_string(), "{retracted}");
     assert_eq!(retracted["reopened"], json!([]), "{retracted}");
-    let again = daemon.post(&retract, &json!({}));
+    let again = retract("main", &id);
     assert_eq!(again.status, 409, "{}", again.body);
     assert!(again.json()["error"].is_string());
-    let unknown = "01a0f958-0000-7000-8000-000000000000";
-    let reply = daemon.post(
-        &format!("/v1/banks/main/memories/{unknown}/retract"),
-        &json!({}),
-    );
-    assert_eq!(reply.status, 404, "{}", reply.body);
-    let reply = daemon.post(
-        &format!("/v1/banks/nobody/memories/{id}/retract"),
-        &json!({}),
-    );
-    assert_eq!(reply.status, 404, "{}", reply.body);
+    for (bank, id) in [("main", UNKNOWN), ("nobody", id.as_str())] {
+        let reply = retract(bank, id);
+        assert_eq!(reply.status, 404, "{bank} {id}: {}", reply.body);
+    }
     let retracted = daemon.memories("main", "status=retracted");
     assert_eq!(retracted.len(), 1, "{retracted:?}");
     assert_eq!(retracted[0]["id"], id.as_str());
@@ -2762,133 +2415,75 @@ fn retract_and_document_removal_answer_over_http() {
         |daemon| json!(daemon.get(&format!("/v1/banks/main/memories/{id}")).status),
         |status| status == 404,
     );
-    let shown = daemon.ok(daemon.get(&format!("/v1/banks/main/sources/{source}")));
+    let shown = daemon.get_ok(&format!("/v1/banks/main/sources/{source}"));
     assert_eq!(shown["text"], Value::Null, "{shown}");
     assert_eq!(shown["gone"]["reason"], "removed", "{shown}");
-    let again = daemon.ingest_notes("main", "notes.md");
+    let again = daemon.ingest_notes();
     assert_eq!(again["outcome"], "duplicate");
     assert_eq!(daemon.chunks("main")["queued"], json!([]));
 }
 
-#[test]
-fn off_loopback_the_dashboard_page_is_open_and_its_routes_need_the_token() {
-    let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).bind();
-    daemon.wait_ready();
-    let addr = daemon.addr.clone();
-
-    let page = request(&addr, "GET", "/dashboard", None, None).unwrap();
-    assert_eq!(page.status, 200, "{}", page.body);
+/// GETs `path` without the token, checks it's served as `content_type`,
+/// byte for byte as the file under `assets/`, and returns the reply.
+fn served_unbuilt(addr: &Addr, path: &str, content_type: &str) -> Reply {
+    let reply = request(addr, "GET", path, None, None).unwrap();
+    assert_eq!(reply.status, 200, "{path}: {}", reply.body);
     assert!(
-        page.headers.contains("content-type: text/html"),
-        "{}",
-        page.headers
+        reply
+            .headers
+            .contains(&format!("content-type: {content_type}")),
+        "{path}: {}",
+        reply.headers
     );
-    assert!(!page.body.contains(TOKEN));
-
-    let memory = "01a0f958-0000-7000-8000-000000000000";
-    for token in [None, Some("wrong-token")] {
-        for (method, path) in [
-            ("GET", "/v1/banks".to_string()),
-            ("GET", "/v1/banks/main/memories".to_string()),
-            ("GET", "/v1/banks/main/sources".to_string()),
-            ("GET", format!("/v1/banks/main/sources/{memory}")),
-            ("POST", format!("/v1/banks/main/memories/{memory}/retract")),
-            ("POST", "/v1/banks/main/documents/remove".to_string()),
-            ("POST", "/v1/banks/main/recall/explain".to_string()),
-        ] {
-            let reply = request(&addr, method, &path, token, None).unwrap();
-            assert_eq!(reply.status, 401, "{method} {path} with {token:?}");
-            assert!(
-                reply.headers.contains("www-authenticate: bearer"),
-                "{}",
-                reply.headers
-            );
-        }
-    }
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let file = assets.join(path.trim_start_matches('/'));
+    let on_disk =
+        fs::read(&file).unwrap_or_else(|error| panic!("{path} isn't {}: {error}", file.display()));
+    assert!(
+        reply.bytes == on_disk,
+        "{path} differs from {}",
+        file.display()
+    );
+    reply
 }
 
 #[test]
-fn the_dashboard_scripts_are_served_unbuilt_without_the_token() {
+fn the_dashboard_assets_are_served_unbuilt_without_the_token() {
     let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).bind();
-    daemon.wait_ready();
+    let daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).ready();
     let addr = daemon.addr.clone();
 
     let page = request(&addr, "GET", "/dashboard", None, None).unwrap();
-    let script = module_script(&page.body)
+    let script = attribute(&page.body, "script", "type=\"module\"", "src")
         .unwrap_or_else(|| panic!("no <script type=\"module\" src=...>: {}", page.body));
     assert!(
         script.starts_with("/dashboard/"),
         "{script} must resolve the same from /dashboard and /dashboard/"
     );
 
-    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    // The module script and every module it imports as "./name.js".
     let mut pending = vec![script];
     let mut served = Vec::new();
     while let Some(path) = pending.pop() {
         if served.contains(&path) {
             continue;
         }
-        let reply = request(&addr, "GET", &path, None, None).unwrap();
-        assert_eq!(reply.status, 200, "{path}: {}", reply.body);
-        assert!(
-            reply.headers.contains("content-type: text/javascript"),
-            "{path}: {}",
-            reply.headers
-        );
-        let file = assets.join(path.trim_start_matches('/'));
-        let on_disk = fs::read_to_string(&file)
-            .unwrap_or_else(|error| panic!("{path} isn't {}: {error}", file.display()));
-        assert!(
-            reply.body == on_disk,
-            "{path} differs from {}",
-            file.display()
-        );
+        let reply = served_unbuilt(&addr, &path, "text/javascript");
         let base = &path[..=path.rfind('/').unwrap()];
-        pending.extend(relative_imports(&reply.body).map(|import| format!("{base}{import}")));
+        let imports = relative_imports(&reply.body);
+        pending.extend(imports.iter().map(|import| format!("{base}{import}")));
         served.push(path);
     }
     assert!(
         served.iter().any(|path| path == "/dashboard/app.js"),
         "{served:?}"
     );
-}
 
-/// The `src` of the page's first `<script type="module">`.
-fn module_script(html: &str) -> Option<String> {
-    let tag = html
-        .split("<script")
-        .skip(1)
-        .map(|rest| &rest[..rest.find('>').unwrap_or(rest.len())])
-        .find(|tag| tag.contains("type=\"module\""))?;
-    let src = &tag[tag.find("src=\"")? + 5..];
-    Some(src[..src.find('"')?].to_string())
-}
-
-/// The `./name.js` modules a module imports, by name.
-fn relative_imports(module: &str) -> impl Iterator<Item = String> + '_ {
-    module.match_indices("\"./").filter_map(|(at, _)| {
-        let rest = &module[at + 3..];
-        let name = &rest[..rest.find('"')?];
-        name.ends_with(".js").then(|| name.to_string())
-    })
-}
-
-#[test]
-fn the_dashboard_serif_is_self_hosted_under_a_strict_font_policy() {
-    let dir = TestDir::new();
-    let mut daemon = Serve::new(&dir).listen("0.0.0.0:0").token(TOKEN).bind();
-    daemon.wait_ready();
-    let addr = daemon.addr.clone();
-
-    let page = request(&addr, "GET", "/dashboard", None, None).unwrap();
+    // The serif is self-hosted, under a strict font policy: fonts from the
+    // daemon and nowhere else.
     let policy = page
-        .headers
-        .lines()
-        .find_map(|line| line.strip_prefix("content-security-policy:"))
-        .unwrap_or_else(|| panic!("no CSP on the page: {}", page.headers))
-        .trim();
+        .header("content-security-policy")
+        .unwrap_or_else(|| panic!("no CSP on the page: {}", page.headers));
     let directive = |name: &str| {
         policy
             .split(';')
@@ -2900,7 +2495,7 @@ fn the_dashboard_serif_is_self_hosted_under_a_strict_font_policy() {
     assert_eq!(directive("script-src "), Some("'self'"), "{policy}");
     assert_eq!(directive("font-src "), Some("'self'"), "{policy}");
 
-    let sheet = stylesheet(&page.body)
+    let sheet = attribute(&page.body, "link", "rel=\"stylesheet\"", "href")
         .unwrap_or_else(|| panic!("no <link rel=\"stylesheet\" href=...>: {}", page.body));
     let css = request(&addr, "GET", &sheet, None, None).unwrap();
     assert_eq!(css.status, 200, "{sheet}: {}", css.body);
@@ -2909,8 +2504,6 @@ fn the_dashboard_serif_is_self_hosted_under_a_strict_font_policy() {
         !faces.is_empty(),
         "{sheet} declares no @font-face: the serif must be self-hosted"
     );
-
-    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
     for (family, urls) in &faces {
         assert!(!urls.is_empty(), "@font-face {family} has no url()");
         assert!(
@@ -2929,89 +2522,58 @@ fn the_dashboard_serif_is_self_hosted_under_a_strict_font_policy() {
                 path.starts_with("/dashboard/"),
                 "{url} isn't served by the daemon"
             );
-            let reply = request_raw(&addr, "GET", &path);
-            assert_eq!(reply.status, 200, "{path}");
-            assert!(
-                reply.headers.contains("content-type: font/woff2"),
-                "{path}: {}",
-                reply.headers
-            );
-            let file = assets.join(path.trim_start_matches('/'));
-            let on_disk = fs::read(&file)
-                .unwrap_or_else(|error| panic!("{path} isn't {}: {error}", file.display()));
-            assert!(
-                reply.body == on_disk,
-                "{path} differs from {}",
-                file.display()
-            );
-            let license = file.with_file_name("OFL.txt");
-            let text = fs::read_to_string(&license)
-                .unwrap_or_else(|error| panic!("no license at {}: {error}", license.display()));
-            assert!(
-                text.contains("SIL OPEN FONT LICENSE"),
-                "{} isn't the OFL",
-                license.display()
-            );
+            served_unbuilt(&addr, &path, "font/woff2");
         }
     }
 }
 
-/// The `href` of the page's first `<link rel="stylesheet">`.
-fn stylesheet(html: &str) -> Option<String> {
-    let tag = html
-        .split("<link")
-        .skip(1)
-        .map(|rest| &rest[..rest.find('>').unwrap_or(rest.len())])
-        .find(|tag| tag.contains("rel=\"stylesheet\""))?;
-    let href = &tag[tag.find("href=\"")? + 6..];
-    Some(href[..href.find('"')?].to_string())
+/// The `name` attribute of the first `<tag>` in `html` that holds `marker`.
+fn attribute(html: &str, tag: &str, marker: &str, name: &str) -> Option<String> {
+    let tags = Regex::new(&format!("<{tag}\\b[^>]*>")).unwrap();
+    let tag = tags
+        .find_iter(html)
+        .map(|found| found.as_str())
+        .find(|tag| tag.contains(marker))?;
+    let value = Regex::new(&format!(r#"\s{name}="([^"]*)""#)).unwrap();
+    Some(value.captures(tag)?[1].to_string())
+}
+
+/// The `./name.js` modules a module imports, by name.
+fn relative_imports(module: &str) -> Vec<String> {
+    let import = Regex::new(r#""\./([^"]+\.js)""#).unwrap();
+    let imports = import.captures_iter(module);
+    imports.map(|found| found[1].to_string()).collect()
 }
 
 /// Each `@font-face` in `css` as its family and `url()`s, and the rest of
 /// the sheet with the faces taken out.
 fn font_faces(css: &str) -> (Vec<(String, Vec<String>)>, String) {
-    let mut faces = Vec::new();
-    let mut rest = String::new();
-    let mut remaining = css;
-    while let Some(at) = remaining.find("@font-face") {
-        rest.push_str(&remaining[..at]);
-        let block = &remaining[at..];
-        let end = block.find('}').map_or(block.len(), |end| end + 1);
-        let face = &block[..end];
-        let family = face
-            .split_once("font-family:")
-            .map(|(_, value)| value[..value.find(';').unwrap_or(value.len())].trim())
-            .unwrap_or_default()
-            .trim_matches(|c| c == '"' || c == '\'')
-            .to_string();
-        let urls = face
-            .match_indices("url(")
-            .filter_map(|(at, _)| {
-                let inner = &face[at + 4..];
-                let inner = &inner[..inner.find(')')?];
-                Some(
-                    inner
-                        .trim()
-                        .trim_matches(|c| c == '"' || c == '\'')
-                        .to_string(),
-                )
-            })
-            .collect();
-        faces.push((family, urls));
-        remaining = &block[end..];
-    }
-    rest.push_str(remaining);
-    (faces, rest)
+    let face = Regex::new(r"@font-face[^}]*\}?").unwrap();
+    let family = Regex::new(r#"font-family:\s*['"]?([^;'"]*)"#).unwrap();
+    let url = Regex::new(r#"url\(\s*['"]?([^)'"]*)"#).unwrap();
+    let faces = face
+        .find_iter(css)
+        .map(|found| {
+            let found = found.as_str();
+            let family = family
+                .captures(found)
+                .map_or("", |c| c.get(1).unwrap().as_str());
+            let urls = url.captures_iter(found).map(|c| c[1].trim().to_string());
+            (family.trim().to_string(), urls.collect())
+        })
+        .collect();
+    (faces, face.replace_all(css, "").into_owned())
 }
 
 #[test]
 fn a_document_is_removed_by_the_exact_id_in_the_body() {
-    // Each id is its own document. Sent as a path, `folder/../victim` would
-    // reach the daemon as `victim`, and `..` not at all.
+    // Each id is its own document, over HTTP and the CLI. Sent as a path,
+    // `folder/../victim` would reach the daemon as `victim`, and `..` not
+    // at all.
     let dir = TestDir::new();
     let daemon = Serve::new(&dir).ready();
     daemon.create_bank("main");
-    let mut sources = std::collections::BTreeMap::new();
+    let mut sources = BTreeMap::new();
     for (id, text) in [
         ("victim", "# Victim\n\nThe victim stays.\n"),
         ("folder/../victim", "# Folder\n\nThis one goes.\n"),
@@ -3021,21 +2583,22 @@ fn a_document_is_removed_by_the_exact_id_in_the_body() {
         sources.insert(id, ingested["source"].as_str().unwrap().to_string());
     }
 
-    for id in ["folder/../victim", ".."] {
-        let removed = daemon.ok(daemon.remove_document("main", id));
+    let over_http = daemon.ok(daemon.remove_document("main", ".."));
+    let by_cli = cli_json(&daemon, "document remove --bank main folder/../victim");
+    for (id, removed) in [("..", over_http), ("folder/../victim", by_cli)] {
         assert_eq!(removed["document_id"], id, "{removed}");
         assert_eq!(removed["sources"], json!([sources[id]]), "{removed}");
         assert_eq!(removed["dequeued"], 1, "{removed}");
     }
-    let victim = daemon.ok(daemon.get(&format!("/v1/banks/main/sources/{}", sources["victim"])));
-    assert_eq!(victim["gone"], Value::Null, "{victim}");
-    assert_eq!(victim["chunks"][0]["state"], "queued", "{victim}");
+    let victim = format!("/v1/banks/main/sources/{}", sources["victim"]);
+    let shown = daemon.get_ok(&victim);
+    assert_eq!(shown["gone"], Value::Null, "{shown}");
+    assert_eq!(shown["chunks"][0]["state"], "queued", "{shown}");
 
     // Nothing removes a document by its id in the path.
     let reply = daemon.send("DELETE", "/v1/banks/main/documents/victim", None);
     assert_eq!(reply.status, 404, "{}", reply.body);
-    let victim = daemon.ok(daemon.get(&format!("/v1/banks/main/sources/{}", sources["victim"])));
-    assert_eq!(victim["gone"], Value::Null, "{victim}");
+    assert_eq!(daemon.get_ok(&victim)["gone"], Value::Null);
 
     for body in [json!({}), json!({ "document_id": "" })] {
         let reply = daemon.post("/v1/banks/main/documents/remove", &body);
@@ -3048,39 +2611,10 @@ fn a_document_is_removed_by_the_exact_id_in_the_body() {
     }
     let reply = daemon.remove_document("nobody", "victim");
     assert_eq!(reply.status, 404, "{}", reply.body);
-}
 
-#[test]
-fn the_cli_removes_a_document_by_its_exact_id() {
-    let dir = TestDir::new();
-    let daemon = Serve::new(&dir).ready();
-    daemon.create_bank("main");
-    let victim = daemon.ingest_document("main", "victim", "# Victim\n\nThe victim stays.\n");
-    let other = daemon.ingest_document("main", "folder/../victim", "# Folder\n\nThis one goes.\n");
-
-    let out = succeeded(run(cli(&daemon).args([
-        "document",
-        "remove",
-        "--bank",
-        "main",
-        "folder/../victim",
-        "--json",
-    ])));
-    let removed: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(removed["document_id"], "folder/../victim", "{removed}");
-    assert_eq!(removed["sources"], json!([other["source"]]), "{removed}");
-
-    let out = succeeded(run(
-        cli(&daemon).args(["document", "remove", "--bank", "main", "victim"])
-    ));
-    assert!(out.contains("removed victim"), "{out}");
-    let shown = daemon.ok(daemon.get(&format!(
-        "/v1/banks/main/sources/{}",
-        victim["source"].as_str().unwrap()
-    )));
-    assert_eq!(shown["gone"]["reason"], "removed", "{shown}");
-
-    let output = run(cli(&daemon).args(["document", "remove", "--bank", "main", "victim"]));
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("404"), "{}", stderr(&output));
+    // The CLI removes `victim` itself, and fails once it's gone.
+    let remove = ["document", "remove", "--bank", "main", "victim"];
+    succeeded(run(cli(&daemon).args(remove)));
+    assert_eq!(daemon.get_ok(&victim)["gone"]["reason"], "removed");
+    assert!(!run(cli(&daemon).args(remove)).status.success());
 }

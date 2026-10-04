@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use rusqlite::types::Value as SqlValue;
 use serde_json::Value;
 use support::hermes;
-use support::{TestDir, assert_ok, import_with, stdout};
+use support::{TestDir, assert_ok, import_with, read_json, stdout};
 
 const WRITE_ENV: &str = "ASPHODEL_WRITE_FIXTURES";
 
@@ -94,12 +94,8 @@ fn the_checked_in_counts_are_the_importers_dry_run() {
     let printed: Value = serde_json::from_str(&stdout(&output)).unwrap();
     let counts = fixtures().join("import-counts.json");
     if writing() {
-        fs::write(
-            &counts,
-            serde_json::to_string_pretty(&printed).unwrap() + "\n",
-        )
-        .unwrap();
+        let pretty = serde_json::to_string_pretty(&printed).unwrap();
+        fs::write(&counts, pretty + "\n").unwrap();
     }
-    let checked_in: Value = serde_json::from_str(&fs::read_to_string(&counts).unwrap()).unwrap();
-    assert_eq!(checked_in, printed, "rerun with {WRITE_ENV}=1");
+    assert_eq!(read_json(&counts), printed, "rerun with {WRITE_ENV}=1");
 }

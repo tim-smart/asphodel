@@ -1,17 +1,19 @@
 //! The block `system_prompt_block()` returns.
 //!
-//! It holds the agenda, every enabled model's entries, and one pointer line
-//! with the build time. Building it costs queries only, never an LLM call,
-//! so the plugin's 2 s fetch never waits on a refresh.
+//! It opens with memory usage guidance and the build time, followed by the
+//! agenda and every enabled model's entries. Building it costs queries only,
+//! never an LLM call, so the plugin's 2 s fetch never waits on a refresh.
 //!
 //! - **The budget.** The whole text stays within `mental_models.budget`
-//!   tokens, which the agenda and every model share. The pointer line is
+//!   tokens, which the agenda and every model share. The guidance is
 //!   always there. The agenda is laid out first and whole, and folds
-//!   only when it and the pointer alone are over: undated tasks, then
+//!   only when it and the guidance alone are over: undated tasks, then
 //!   routines, least-ranked first, then dated lines in the agenda's fold
 //!   order. The models fill what's left, oldest first, each with its
-//!   entries in stored order until the next doesn't fit. What the block
-//!   lists, cites and keeps by id is only what it rendered.
+//!   entries in stored order until the next doesn't fit. A model's entries
+//!   render as its sections, each a heading and a paragraph; entries from
+//!   before sections are lines. What the block lists, cites and keeps by
+//!   id is only what it rendered.
 //!
 //! - **The cache.** One block per bank, in memory, rebuilt lazily on the
 //!   next fetch once it's cleared. It's cleared when a model completes a
@@ -21,7 +23,8 @@
 //!   next refresh), and when the bank-local day rolls over.
 //! - **Memories win.** An entry is rendered only while every memory it
 //!   cites is current: not retracted, forgotten or ended. An entry citing a
-//!   state whose confidence is below 0.9 shows its age, as injection does.
+//!   state whose confidence is below 0.9 shows its age, as injection does:
+//!   "(as of …)" after a sentence, "[observed …]" on a line.
 //! - **In context.** A fetch with a session id persists which block the
 //!   session holds and the memories it lists or cites (`session_blocks`),
 //!   and they join the session's in-context set: injection skips them, and
@@ -35,8 +38,18 @@
 //!   and the session is mapped to that block then, even if the cache has
 //!   rebuilt since. The block's entries are also what a turn's snapshot
 //!   takes, so call 1 is shown the entries the session could see.
+//! - **The agenda update.** Hermes rebuilds the prompt only on compaction,
+//!   so a long-lived session's agenda goes stale. Prefetch, which runs every
+//!   turn, puts an `Agenda update for <date>` section ahead of relevance
+//!   injection when the session's block maps to an earlier bank-local day
+//!   than today, or the agenda lists items the session's in-context set
+//!   doesn't hold ([`agenda_update`]). It lists only those items, the
+//!   whole section within `agenda.update_budget` tokens, shortening the
+//!   first item if it must, and is held and committed through the
+//!   prefetch's `recall_id` like the injection. A stale day with nothing
+//!   missing gets the date alone, once. A session with no mapping gets none.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use jiff::civil::Date;
@@ -51,7 +64,7 @@ use crate::config::Tuning;
 use crate::mental_models::{load_entries, load_models};
 use crate::retrieval::candidates::Cleanup;
 use crate::retrieval::estimate_tokens;
-use crate::retrieval::format;
+use crate::retrieval::format::{self, Line};
 use crate::store::strength::world_time;
 use crate::store::{Store, micros, timestamp};
 
@@ -133,14 +146,43 @@ impl Blocks {
     }
 }
 
-/// The pointer line, with the build time. Sessions are frozen, so it says
+/// Memory usage guidance, with the build time. Sessions are frozen, so it says
 /// how to reach anything added since.
-fn pointer(now: Timestamp, tz: &TimeZone) -> String {
+fn guidance(built_at: &str) -> String {
     format!(
-        "Built {}; memories win: use memory_recall for history and detail, and for anything \
-         added since, call memory_recall with phase upcoming.",
-        now.to_zoned(tz.clone()).strftime("%a %-d %b %H:%M")
+        "## Long-term memory (Asphodel)\n\
+         Memories from past conversations are saved automatically, so you never need to save anything. \
+         Relevant ones arrive with user messages inside `<memory-context>`. \
+         The lists below were built {}, and a memory beats them where they disagree. \
+         Before saying you don't know or don't remember something, call memory_recall \
+         (with phase \"upcoming\" for plans added since). \
+         Use it ahead of session_search unless you need exact wording.",
+        built_at
     )
+}
+
+fn agenda_heading(date: &str) -> String {
+    format!("Agenda for {date}")
+}
+
+fn fold_summary(count: usize) -> String {
+    format!(
+        "- and {count} more dated item{}",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+/// Reserve the mandatory guidance and the agenda after every dated item folds.
+/// English abbreviated weekdays/months have three characters; a two-digit day
+/// and the largest representable fold count cover any date and bank contents.
+/// Measure the same renderers and separators as the block, not a token constant.
+pub(crate) fn minimum_budget() -> usize {
+    estimate_tokens(&format!(
+        "{}\n\n{}\n{}",
+        guidance("Wed 30 Sep 23:59"),
+        agenda_heading("Wed 30 Sep"),
+        fold_summary(usize::MAX)
+    ))
 }
 
 /// Builds the bank's block at `now`.
@@ -154,22 +196,26 @@ pub(crate) fn build(
     let conn = store.connection();
     let agenda = crate::agenda::build(&conn, tuning, bank_id, tz, now)?;
     let budget = tuning.mental_models.budget as usize;
-    let pointer = pointer(now, tz);
-    // The agenda and every enabled model share the budget, with the pointer
-    // line always kept. Each try lays the sections out as they'd be rendered
+    let guidance = guidance(
+        &now.to_zoned(tz.clone())
+            .strftime("%a %-d %b %H:%M")
+            .to_string(),
+    );
+    // The agenda and every enabled model share the budget, with the guidance
+    // always kept. Each try lays the sections out as they'd be rendered
     // and measures the whole text.
     let fits = |sections: &[String]| -> bool {
-        let mut text = sections.join("\n\n");
-        if !text.is_empty() {
+        let mut text = guidance.clone();
+        if !sections.is_empty() {
             text.push_str("\n\n");
+            text.push_str(&sections.join("\n\n"));
         }
-        text.push_str(&pointer);
         estimate_tokens(&text) <= budget
     };
 
     // The agenda first, whole when it fits: its dated lines are chosen by
     // time so an item can't drop out on the day it matters. Only when the
-    // agenda and the pointer alone are over the budget does it fold, the
+    // agenda and the guidance alone are over the budget does it fold, the
     // least-ranked undated task first, then the least-ranked routine, then
     // dated lines in the agenda's own fold order.
     let mut shown = Shown {
@@ -207,19 +253,19 @@ pub(crate) fn build(
         .into_iter()
         .filter(|model| model.enabled)
     {
-        let mut lines: Vec<String> = Vec::new();
+        let mut pieces: Vec<Piece> = Vec::new();
         for entry in load_entries(&conn, model.id)? {
-            let Some(line) = entry_line(&conn, tuning, bank_id, now, &entry)? else {
+            let Some(piece) = entry_piece(&conn, tuning, bank_id, now, &entry)? else {
                 continue;
             };
-            let mut with = lines.clone();
-            with.push(line);
+            let mut with = pieces.clone();
+            with.push(piece);
             let mut tried = sections.clone();
-            tried.push(format!("{}\n{}", model.name, with.join("\n")));
+            tried.push(render_model(&model.name, &with));
             if !fits(&tried) {
                 break;
             }
-            lines = with;
+            pieces = with;
             for (_, uuid) in &entry.cites {
                 if !cited.contains(uuid) {
                     cited.push(*uuid);
@@ -232,11 +278,11 @@ pub(crate) fn build(
             });
         }
         // An empty model renders nothing, not even a header.
-        if !lines.is_empty() {
-            sections.push(format!("{}\n{}", model.name, lines.join("\n")));
+        if !pieces.is_empty() {
+            sections.push(render_model(&model.name, &pieces));
         }
     }
-    sections.push(pointer);
+    sections.insert(0, guidance);
 
     let block = Block {
         id: store.new_id(),
@@ -275,33 +321,32 @@ impl Shown {
     /// The agenda's section, or `None` when it lists nothing.
     fn section(&self, agenda: &Built, now: Timestamp, tz: &TimeZone) -> Option<String> {
         let mut lines = Vec::new();
-        let dated: Vec<&String> = agenda
+        let dated: Vec<&Line> = agenda
             .dated
             .iter()
             .zip(&self.dated)
             .filter_map(|(line, shown)| shown.then_some(line))
             .collect();
         if !dated.is_empty() || self.folded > 0 {
-            lines.push(format!(
-                "Agenda for {}",
-                now.to_zoned(tz.clone()).strftime("%a %-d %b")
+            lines.push(agenda_heading(
+                &now.to_zoned(tz.clone()).strftime("%a %-d %b").to_string(),
             ));
-            lines.extend(dated.into_iter().cloned());
+            lines.extend(dated.into_iter().map(Line::render));
             if self.folded > 0 {
-                lines.push(format!(
-                    "- and {} more dated item{}",
-                    self.folded,
-                    if self.folded == 1 { "" } else { "s" }
-                ));
+                lines.push(fold_summary(self.folded));
             }
         }
         if self.routines > 0 {
             lines.push("Routines".to_owned());
-            lines.extend(agenda.routines[..self.routines].iter().cloned());
+            lines.extend(agenda.routines[..self.routines].iter().map(Line::render));
         }
         if self.undated_tasks > 0 {
             lines.push("Open tasks".to_owned());
-            lines.extend(agenda.undated_tasks[..self.undated_tasks].iter().cloned());
+            lines.extend(
+                agenda.undated_tasks[..self.undated_tasks]
+                    .iter()
+                    .map(Line::render),
+            );
         }
         (!lines.is_empty()).then(|| lines.join("\n"))
     }
@@ -325,15 +370,61 @@ impl Shown {
     }
 }
 
-/// An entry's line, or `None` when any memory it cites is retracted,
-/// forgotten, ended or gone.
-fn entry_line(
+/// An entry as the block renders it: a sentence of its section's
+/// paragraph, or, for an entry written before sections, a line of its own.
+#[derive(Clone)]
+struct Piece {
+    section: Option<String>,
+    text: String,
+}
+
+/// A section heading's line, which also counts toward a model's
+/// `max_tokens` when a refresh trims.
+pub(crate) fn heading_line(heading: &str) -> String {
+    format!("### {heading}")
+}
+
+/// A model's text: its name, then each section in the order its heading
+/// first comes, as the heading's line and its sentences joined as one
+/// paragraph. A heading with nothing under it never renders. Entries with
+/// no section are lines, as they were before sections.
+fn render_model(name: &str, pieces: &[Piece]) -> String {
+    let mut groups: Vec<(Option<&str>, Vec<&str>)> = Vec::new();
+    for piece in pieces {
+        let section = piece.section.as_deref();
+        let found = match section {
+            Some(_) => groups.iter_mut().find(|(heading, _)| *heading == section),
+            None => groups.last_mut().filter(|(heading, _)| heading.is_none()),
+        };
+        match found {
+            Some((_, texts)) => texts.push(&piece.text),
+            None => groups.push((section, vec![&piece.text])),
+        }
+    }
+    let mut lines = vec![name.to_owned()];
+    for (heading, texts) in groups {
+        match heading {
+            Some(heading) => {
+                lines.push(heading_line(heading));
+                lines.push(texts.join(" "));
+            }
+            None => lines.extend(texts.iter().map(|text| (*text).to_owned())),
+        }
+    }
+    lines.join("\n")
+}
+
+/// An entry's piece, or `None` when any memory it cites is retracted,
+/// forgotten, ended or gone. A sentence citing a low-confidence state says
+/// how old it is after it, "(as of 30 days ago, Tue 1 Sep)"; a line says
+/// "[observed 30 days ago, Tue 1 Sep]", as injection does.
+fn entry_piece(
     conn: &Connection,
     tuning: &Tuning,
     bank_id: i64,
     now: Timestamp,
     entry: &crate::mental_models::StoredEntry,
-) -> Result<Option<String>, rusqlite::Error> {
+) -> Result<Option<Piece>, rusqlite::Error> {
     if entry.cites.is_empty() {
         return Ok(None);
     }
@@ -364,10 +455,16 @@ fn entry_line(
     let age = cleanup
         .take(&ids)
         .iter()
-        .find_map(|candidate| format::state_age(candidate, now));
-    Ok(Some(match age {
-        Some(age) => format!("- {} [{age}]", entry.text),
-        None => format!("- {}", entry.text),
+        .find_map(|candidate| format::state_observed(candidate, now));
+    let text = match (&entry.section, age) {
+        (Some(_), Some(age)) => format!("{} (as of {age})", entry.text),
+        (Some(_), None) => entry.text.clone(),
+        (None, Some(age)) => format!("- {} [observed {age}]", entry.text),
+        (None, None) => format!("- {}", entry.text),
+    };
+    Ok(Some(Piece {
+        section: entry.section.clone(),
+        text,
     }))
 }
 
@@ -424,6 +521,221 @@ pub(crate) fn mapped(
         return Ok(None);
     }
     Ok(Some(serde_json::from_str(&ids).unwrap_or_default()))
+}
+
+/// When the session's block was built, or `None` when the session has no
+/// live mapping.
+pub(crate) fn mapped_built_at(
+    conn: &Connection,
+    bank_id: i64,
+    session: &str,
+    now: Timestamp,
+    expiry: SignedDuration,
+) -> Result<Option<Timestamp>, rusqlite::Error> {
+    let found: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT built_at, last_turn_at FROM session_blocks
+             WHERE bank_id = ?1 AND session_id = ?2",
+            (bank_id, session),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(found
+        .filter(|(_, last_turn_at)| !expired(timestamp(*last_turn_at), now, expiry))
+        .map(|(built_at, _)| timestamp(built_at)))
+}
+
+/// An agenda update for prefetch to send ahead of relevance injection.
+#[derive(Debug)]
+pub(crate) struct AgendaUpdate {
+    pub text: String,
+    /// The memories it lists, which join the in-context set once a turn
+    /// commits it.
+    pub memories: Vec<Uuid>,
+    /// The bank-local date it brings the session's agenda up to.
+    pub date: Date,
+}
+
+/// The agenda update for a session whose agenda is current as of `as_of`,
+/// the later of the day its block was built for and the date of the last
+/// update it committed. `None` when the agenda lists nothing outside
+/// `in_context` and `as_of` is today.
+///
+/// It lists the agenda's items missing from `in_context` in the block's
+/// order and groups, and counts the rest, all within
+/// `agenda.update_budget` tokens: header, headings, lines and count. The
+/// first item is always listed, shortened to fit if it must
+/// ([`shorten`]), so an update always moves the session forward. With
+/// nothing missing on a later day, it says so under the date; validation
+/// keeps the budget large enough for that.
+pub(crate) fn agenda_update(
+    conn: &Connection,
+    tuning: &Tuning,
+    bank_id: i64,
+    tz: &TimeZone,
+    now: Timestamp,
+    as_of: Date,
+    in_context: &BTreeSet<Uuid>,
+) -> Result<Option<AgendaUpdate>, rusqlite::Error> {
+    let today = now.to_zoned(tz.clone()).date();
+    let built = crate::agenda::build(conn, tuning, bank_id, tz, now)?;
+    let missing = |ids: &[Uuid], lines: &[Line]| -> Vec<(Uuid, Line)> {
+        ids.iter()
+            .zip(lines)
+            .filter(|(id, _)| !in_context.contains(id))
+            .map(|(id, line)| (*id, line.clone()))
+            .collect()
+    };
+    let groups = [
+        (None, missing(&built.agenda.dated, &built.dated)),
+        (
+            Some("Routines"),
+            missing(&built.agenda.routines, &built.routines),
+        ),
+        (
+            Some("Open tasks"),
+            missing(&built.agenda.undated_tasks, &built.undated_tasks),
+        ),
+    ];
+    let total: usize = groups.iter().map(|(_, items)| items.len()).sum();
+    if total == 0 && as_of >= today {
+        return Ok(None);
+    }
+
+    let budget = tuning.agenda.update_budget as usize;
+    // Whether `lines`, with the count of the `rest` left out, fit.
+    let fits = |lines: &[String], rest: usize| -> bool {
+        let mut text = lines.join("\n");
+        if rest > 0 {
+            text.push('\n');
+            text.push_str(&more(rest));
+        }
+        estimate_tokens(&text) <= budget
+    };
+    let mut lines = vec![format!(
+        "Agenda update for {}",
+        now.to_zoned(tz.clone()).strftime("%a %-d %b")
+    )];
+    let mut memories = Vec::new();
+    'groups: for (heading, items) in &groups {
+        let mut headed = false;
+        for (id, line) in items {
+            let mut with = lines.clone();
+            if let (Some(heading), false) = (heading, headed) {
+                with.push((*heading).to_owned());
+            }
+            let rest = total - memories.len() - 1;
+            let mut whole = with.clone();
+            whole.push(line.render());
+            if fits(&whole, rest) {
+                lines = whole;
+            } else if memories.is_empty() {
+                let shortened = shorten(line, |candidate| {
+                    let mut tried = with.clone();
+                    tried.push(candidate.to_owned());
+                    fits(&tried, rest)
+                });
+                with.push(shortened);
+                lines = with;
+            } else {
+                break 'groups;
+            }
+            headed = true;
+            memories.push(*id);
+        }
+    }
+    let rest = total - memories.len();
+    if total == 0 {
+        lines.push("- Nothing new since this session's agenda.".to_owned());
+    } else if rest > 0 {
+        lines.push(more(rest));
+    }
+    Ok(Some(AgendaUpdate {
+        text: lines.join("\n"),
+        memories,
+        date: today,
+    }))
+}
+
+/// The update's count of the items it left for a later turn.
+fn more(rest: usize) -> String {
+    format!(
+        "- and {rest} more agenda item{}",
+        if rest == 1 { "" } else { "s" }
+    )
+}
+
+/// The fewest characters of the sentence worth keeping beside annotations.
+/// Below it, annotations give way to the sentence.
+const SHORTENED_SENTENCE_MIN: usize = 20;
+
+/// `line` shortened until `fits` takes it: the sentence is cut, at a word
+/// boundary when one keeps at least half of what fits and mid-word when
+/// none does, and ends in "…". The annotations stay whole, since the date
+/// is what an update carries. When they leave too little of the sentence,
+/// only the first (the phase and its date) is kept, and then none. With no
+/// room even for that, it's "- …".
+fn shorten(line: &Line, fits: impl Fn(&str) -> bool) -> String {
+    let mut counts = vec![line.annotations.len()];
+    if line.annotations.len() > 1 {
+        counts.push(1);
+    }
+    if !line.annotations.is_empty() {
+        counts.push(0);
+    }
+    for count in counts {
+        let suffix = line.suffix(count);
+        let min = if count == 0 {
+            1
+        } else {
+            SHORTENED_SENTENCE_MIN
+        };
+        if let Some(text) = cut(&line.sentence, &suffix, min, &fits) {
+            return text;
+        }
+    }
+    "- …".to_owned()
+}
+
+/// The longest `- <start of sentence>…<suffix>` that `fits` takes, keeping
+/// at least `min` characters of the sentence, or `None`.
+fn cut(sentence: &str, suffix: &str, min: usize, fits: &impl Fn(&str) -> bool) -> Option<String> {
+    let whole = format!("- {sentence}{suffix}");
+    if fits(&whole) {
+        return Some(whole);
+    }
+    let chars: Vec<char> = sentence.chars().collect();
+    let render = |kept: &[char]| -> String {
+        let start: String = kept.iter().collect();
+        let start = start.trim_end_matches(|c: char| c.is_whitespace() || ",;:-".contains(c));
+        format!("- {start}…{suffix}")
+    };
+    // A longer start never renders shorter, so the most that fits is
+    // found by bisection.
+    let (mut low, mut high) = (0, chars.len());
+    if !fits(&render(&chars[..0])) {
+        return None;
+    }
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if fits(&render(&chars[..middle])) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    // The text after the last space would be a broken word, unless the
+    // cut falls just before a space. With no space in the second half of
+    // what fits, the cut is mid-word.
+    let end = if low == chars.len() || chars[low].is_whitespace() {
+        low
+    } else {
+        match chars[..low].iter().rposition(|c| c.is_whitespace()) {
+            Some(at) if at * 2 >= low => at,
+            _ => low,
+        }
+    };
+    (end >= min.min(chars.len())).then(|| render(&chars[..end]))
 }
 
 /// The block-id fallback: when Hermes gave no session

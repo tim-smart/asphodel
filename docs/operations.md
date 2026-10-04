@@ -343,6 +343,24 @@ against the current message plus bounded starts of the previous query
 and reply. It trims context and cuts each start to `RERANK_CONTEXT_CHARS`
 (300), cutting back to whitespace where possible.
 
+Hermes freezes the prompt block for a session and rebuilds it only on
+compaction, so a long-lived chat's agenda goes stale. When the session
+holds a block, prefetch's `text` can start with an `Agenda update for
+<date>` section ahead of the `Recalled …` injection. It appears when the
+bank-local day has moved past the day the block was built for, or when
+the agenda lists items the session hasn't seen. It lists only those
+items, and counts any that don't fit for a later turn, with the whole
+section (header and count included) within `agenda.update_budget` tokens.
+The default is 200 and the minimum is 40. The first item is always
+listed, so each update makes progress. When that item doesn't fit whole,
+its sentence is shortened, at a word boundary where one keeps enough of
+it and mid-word otherwise, and ends in "…". Its annotations, such as
+`[upcoming Sat 3 Oct]`, stay. If they leave too little of the sentence,
+only the date is kept, then nothing. On a later day with nothing new, the
+update carries the date alone. Like the injection, it joins the session's in-context set only
+when a `sync_turn` echoes the prefetch's `recall_id`, so it's sent once.
+A session with no block mapping never gets one.
+
 Query and reply context are isolated by session, including an explicit
 `session_id` on a delayed `sync_turn`. An ordinary session switch retains
 each session's context for a later return. Compression, reset and rewind
@@ -487,9 +505,64 @@ Only the owner defines mental models, through these commands or the API.
   --disable]`
 - `asphodel model refresh --bank B <name> [--force]` refreshes now. It's
   skipped when the inputs haven't changed, unless `--force`.
-- `asphodel model show --bank B <name> [--entry ID]` answers "why does the
-  profile say X?": each entry with the memories it cites, and whether the
-  prompt block shows it.
+- `asphodel model show --bank B <name> [--entry ID]` prints the summary as
+  the prompt block reads it: each section a heading and one paragraph,
+  with a count of entries the block doesn't show. To answer "why does the
+  profile say X?", find the sentence's entry id with `--json`, then
+  `--entry ID` shows that entry with the memories it cites, their status,
+  and whether the prompt block shows it.
+
+A refresh asks one narrow question per part of the model's question, its
+facets, instead of one compound question, so a memory about one part isn't
+lost beneath results for the others:
+
+1. **Plan.** The seeded profile's question has its five facets built in:
+   preferences, people (with personal dates such as anniversaries), work
+   and home, platforms, and how to help. It costs no LLM call. Any other
+   question, including an edited profile question, is planned once by a
+   `plan_model` call that holds only the question and `[llm] language`, so
+   replay answers it by key. The plan, at most `mental_models.max_facets`
+   facets (6), is stored on the model before anything is recalled and made
+   again only when the question changes. A bank whose embedding model
+   isn't served fails the refresh before the plan call.
+2. **Recall.** Each facet runs one retrieval with the model's filters and
+   takes its best `mental_models.facet_budget` (20). Reranker scores for
+   different queries aren't comparable, so the input takes each facet's
+   next best in turn, skipping duplicates, up to `input_budget` (90), and
+   then the memories the model cites that still qualify, up to
+   `input_budget_with_cited` (100). The facets share one 60-second
+   reranker deadline; a facet past it is scored on strength alone and the
+   refresh goes on. Each facet writes one `refresh` row to the recall log,
+   its query in both `query` and `raw_query`, and no access.
+3. **Write.** One `write_model` call gets the question, the facets, the
+   memories under the facet that found each, and the current entries as
+   the previous summary, and returns the whole summary as sections of
+   sentences citing memories. Code refuses a sentence citing outside the
+   input, citing nothing, or with no text. A sentence whose text matches
+   an entry keeps that entry's id, and one citing exactly what an entry
+   cited keeps its id under new words, but citations and section always
+   come from the write. What the write leaves out is removed. Over
+   `max_tokens`, headings included, the lowest-ranked entries are trimmed.
+
+A refresh is skipped, unless forced, when its inputs haven't changed: the
+selection, the question, the plan, the filters and the size. A changed
+question always writes again, even when it plans the same facets.
+
+The prompt block renders each section as a heading and a paragraph. A
+sentence citing a low-confidence state says how old it is after it, as
+"(as of 30 days ago, Tue 1 Sep)". The seeded profile defaults to a
+2048-token output cap (`mental_models.profile_max_tokens`), within a
+2560-token prompt block (`mental_models.budget`) shared with the agenda
+and every enabled model. Headings count toward these caps, and the block
+still trims entries to fit; the profile is not guaranteed its full cap
+when the agenda or other models use the budget. An entry written before
+sections renders as a line until its model's next refresh.
+
+The profile cap is stored on the model row when the bank is created.
+Changing the default or tuning alone does not resize an existing profile.
+See `docs/upgrading.md`, "Existing banks: opt in to larger summaries", for
+the tuning and model edit needed to opt in. These output caps do not
+change facet recall limits or admission filters.
 
 ### Health and failures
 

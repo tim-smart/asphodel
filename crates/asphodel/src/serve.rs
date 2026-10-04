@@ -54,9 +54,6 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// this keeps that from becoming a run of near-zero waits.
 const HOUSEKEEPING_MIN_WAIT: Duration = Duration::from_secs(1);
 
-#[cfg(test)]
-mod tests;
-
 pub(crate) type Shared = Arc<App>;
 
 /// What the HTTP handlers share. The service only exists once the store is open

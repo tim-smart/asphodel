@@ -591,7 +591,7 @@ class AsphodelMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Dispatches the four tools. Owner-only tools return ``tool_error``
         without a request on a non-owner's turn. ``memory_recall`` returns the
-        daemon's ``results`` list as JSON. A daemon error or an unreachable
+        daemon's rendered ``text``. A daemon error or an unreachable
         daemon returns ``tool_error``; ``memory_forget`` drops the session's
         last prefetch query and assistant reply on success."""
         try:
@@ -630,7 +630,12 @@ class AsphodelMemoryProvider(MemoryProvider):
             result = self.client.recall(self.bank, request, timeout=timeout)
             results = result.get("results", []) if isinstance(result, dict) else []
             log.debug("recall: %d results", len(results))
-            return json.dumps(results, ensure_ascii=False)
+            text = result.get("text") if isinstance(result, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                if not results:
+                    return "No memories recalled."
+                return tool_error("Asphodel did not return recall text; update the daemon and try again.")
+            return text
 
         ids = args.get("ids")
         if (

@@ -3,9 +3,10 @@
 //!
 //! The tests drive the binary as a process, as `serve_http.rs` does, and
 //! read the JSON report, so nothing here depends on how the engine is laid
-//! out inside. The scenario files under `scenarios/` are the fixtures; the
-//! command's own loader (`asphodel::replay::scenario`) parses every
-//! checked-in one here and checks that labels resolve.
+//! out inside. The scenario files under `scenarios/` are the fixtures, and
+//! every checked-in one runs here with its probes.
+
+mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
+use support::TestDir;
 
 /// The checked-in scenarios.
 const SCENARIOS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenarios");
@@ -22,52 +24,10 @@ fn scenario(name: &str) -> PathBuf {
     Path::new(SCENARIOS).join(format!("{name}.toml"))
 }
 
-use asphodel::replay::scenario as contract;
-
-// Test support.
-
-/// A temporary directory removed even when an assertion unwinds.
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "asphodel-replay-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-
-    /// The private directory a run writes under.
-    fn replay_dir(&self) -> PathBuf {
-        let path = self.path("private");
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    fn file(&self, name: &str, text: &str) -> PathBuf {
-        let path = self.path(name);
-        fs::write(&path, text).unwrap();
-        path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 /// One `asphodel replay` run: the process output and the report it wrote,
 /// if it wrote one.
 struct Run {
+    scenario: PathBuf,
     output: Output,
     report_path: PathBuf,
     report: Option<Value>,
@@ -79,13 +39,14 @@ impl Run {
     }
 
     fn stderr(&self) -> String {
-        String::from_utf8_lossy(&self.output.stderr).into_owned()
+        support::stderr(&self.output)
     }
 
     fn report(&self) -> &Value {
         self.report.as_ref().unwrap_or_else(|| {
             panic!(
-                "no report at {}: {}",
+                "{}: no report at {}: {}",
+                self.scenario.display(),
                 self.report_path.display(),
                 self.stderr()
             )
@@ -117,7 +78,8 @@ impl Run {
             .collect();
         assert!(
             self.code() == Some(0) && failed.is_empty(),
-            "exit {:?}, failed probes: {failed:#?}, stderr: {}",
+            "{}: exit {:?}, failed probes: {failed:#?}, stderr: {}",
+            self.scenario.display(),
             self.code(),
             self.stderr()
         );
@@ -125,43 +87,44 @@ impl Run {
 
     /// Exit 2 with `word` in the message and no report.
     fn assert_refused(&self, word: &str) {
-        assert_eq!(self.code(), Some(2), "stderr: {}", self.stderr());
-        assert!(
-            self.stderr().contains(word),
-            "stderr should name {word:?}: {}",
-            self.stderr()
-        );
+        support::assert_refused(&self.output, word);
         assert!(self.report.is_none(), "a refused run writes no report");
     }
 }
 
-/// Runs `asphodel replay` on `scenario` with `ASPHODEL_REPLAY_DIR` set to
-/// the test's private dir, `--report` to a fresh file, and `extra` after.
+/// `asphodel replay --scenario <scenario>` with `ASPHODEL_REPLAY_DIR` set
+/// to the test's private dir.
+fn command(dir: &TestDir, scenario: &Path) -> Command {
+    let mut command = support::asphodel(dir);
+    command.arg("replay").arg("--scenario").arg(scenario);
+    command
+}
+
+/// Runs `command` and reads the report it was to write at `report_path`.
+fn run(scenario: &Path, mut command: Command, report_path: PathBuf) -> Run {
+    let output = command.output().unwrap();
+    let report = fs::read(&report_path)
+        .ok()
+        .map(|bytes| serde_json::from_slice(&bytes).expect("the report is JSON"));
+    Run {
+        scenario: scenario.to_path_buf(),
+        output,
+        report_path,
+        report,
+    }
+}
+
+/// Runs `asphodel replay` on `scenario` with `--report` to a fresh file
+/// and `extra` after.
 fn replay(dir: &TestDir, scenario: &Path, extra: &[&str]) -> Run {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let report_path = dir.path(&format!(
         "report-{}.json",
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
-    command
-        .arg("replay")
-        .arg("--scenario")
-        .arg(scenario)
-        .arg("--report")
-        .arg(&report_path)
-        .args(extra)
-        .env("ASPHODEL_REPLAY_DIR", dir.replay_dir())
-        .env_remove("ASPHODEL_MODEL_DIR");
-    let output = command.output().unwrap();
-    let report = fs::read(&report_path)
-        .ok()
-        .map(|bytes| serde_json::from_slice(&bytes).expect("the report is JSON"));
-    Run {
-        output,
-        report_path,
-        report,
-    }
+    let mut replay = command(dir, scenario);
+    replay.arg("--report").arg(&report_path).args(extra);
+    run(scenario, replay, report_path)
 }
 
 /// The sum of `purges_per_day`.
@@ -174,7 +137,7 @@ fn purges(report: &Value) -> u64 {
         .sum()
 }
 
-/// A scenario written by a test, for the scenario-error cases.
+/// A scenario written by a test.
 fn inline(dir: &TestDir, name: &str, body: &str) -> PathBuf {
     dir.file(
         &format!("{name}.toml"),
@@ -199,279 +162,244 @@ kind = "fact"
 significance = "minor"
 "#;
 
-// The fixtures, checked now.
+// The fixtures.
 
-// Usage is counted per injected memory, not per turn or LLM call. Unjudged
-// memories are excluded from the fraction; zero judged is reported as 0.0.
+/// Every checked-in scenario loads, runs with no LLM, writes its report to
+/// the default path under its own name and passes its probes, so a new
+/// scenario file is covered by adding it. They run side by side, each in a
+/// private dir of its own.
+#[test]
+fn every_checked_in_scenario_passes_its_probes() {
+    let paths: Vec<PathBuf> = fs::read_dir(SCENARIOS)
+        .expect("the scenarios directory exists")
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    assert!(!paths.is_empty(), "no scenarios are checked in");
+    std::thread::scope(|scope| {
+        for path in &paths {
+            scope.spawn(move || {
+                let dir = TestDir::new();
+                let stem = path.file_stem().unwrap().to_str().unwrap();
+                let report_path = dir.private().join(format!("reports/{stem}.json"));
+                let run = run(path, command(&dir, path), report_path);
+                run.assert_passed();
+                let report = run.report();
+                assert_eq!(report["scenario"], stem, "the name is the file stem");
+                assert!(
+                    !run.probes().is_empty(),
+                    "{stem}: a scenario without probes checks nothing"
+                );
+                assert_eq!(report["llm"]["live"], 0, "{stem}");
+                if stem == "purge-table" {
+                    // Purge spares the reinforced memories and the major
+                    // one, not the single minor/notable mentions, and one
+                    // is said again.
+                    let shadow = &report["purged_then_re_mentioned"];
+                    assert_eq!(purges(report), 5, "{}", report["purges_per_day"]);
+                    assert_eq!(shadow["purged"], 5, "{shadow}");
+                    assert_eq!(shadow["re_mentioned"], 1, "{shadow}");
+                }
+            });
+        }
+    });
+}
+
+/// Usage is counted per injected memory, not per turn or LLM call, in the
+/// report and the aggregate export alike. Unjudged memories are excluded
+/// from the fraction; zero judged is reported as 0.0.
 #[test]
 fn injection_usage_counts_mixed_verdicts_in_report_and_aggregate() {
     let dir = TestDir::new();
-    let aggregate = dir.path("usage-aggregate.json");
-    let run = replay(
-        &dir,
-        &scenario("injection-usage"),
-        &["--aggregate", aggregate.to_str().unwrap()],
-    );
-    run.assert_passed();
-    let export: Value = serde_json::from_slice(&fs::read(aggregate).unwrap()).unwrap();
-    let expected = serde_json::json!({
-        "used": 1, "not_used": 3, "unjudged": 0, "used_fraction": 0.25
-    });
-    for (name, report) in [("report", run.report()), ("aggregate", &export)] {
-        assert_eq!(report["injection_usage"], expected, "{name}");
+    fn usage(used: u64, not_used: u64, fraction: f64) -> Value {
+        json!({ "used": used, "not_used": not_used, "unjudged": 0, "used_fraction": fraction })
     }
-}
-
-#[test]
-fn injection_usage_with_zero_judged_memories_has_a_finite_zero_fraction() {
-    let dir = TestDir::new();
-    let path = inline(&dir, "no-injection", HOME_TURN);
-    let aggregate = dir.path("empty-aggregate.json");
-    let run = replay(&dir, &path, &["--aggregate", aggregate.to_str().unwrap()]);
-    run.assert_passed();
-    let export: Value = serde_json::from_slice(&fs::read(aggregate).unwrap()).unwrap();
-    let expected = serde_json::json!({
-        "used": 0, "not_used": 0, "unjudged": 0, "used_fraction": 0.0
-    });
-    for (name, report) in [("report", run.report()), ("aggregate", &export)] {
-        assert_eq!(report["injection_usage"], expected, "{name}");
-    }
-}
-
-#[test]
-fn report_diff_includes_injection_usage_counts_and_fraction() {
-    let dir = TestDir::new();
-    // Synthetic reports isolate the diff contract. In B, two unjudged
-    // injections do not dilute the fraction: 1 / (1 + 3) = 0.25, not 1/6.
-    let a = dir.file(
-        "usage-a.json",
-        r#"{
-        "injection_usage": {"used": 0, "not_used": 0, "unjudged": 0, "used_fraction": 0.0}
-    }"#,
-    );
-    let b = dir.file(
-        "usage-b.json",
-        r#"{
-        "injection_usage": {"used": 1, "not_used": 3, "unjudged": 2, "used_fraction": 0.25}
-    }"#,
-    );
-    let output = Command::new(env!("CARGO_BIN_EXE_asphodel"))
-        .args(["report", "diff"])
-        .arg(a)
-        .arg(b)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let diff: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let numbers = diff["numbers"].as_array().unwrap();
-    for (field, before, after) in [
-        ("used", 0.0, 1.0),
-        ("not_used", 0.0, 3.0),
-        ("unjudged", 0.0, 2.0),
-        ("used_fraction", 0.0, 0.25),
+    for (path, expected) in [
+        (scenario("injection-usage"), usage(1, 3, 0.25)),
+        (inline(&dir, "no-injection", HOME_TURN), usage(0, 0, 0.0)),
     ] {
-        let path = format!("injection_usage.{field}");
-        let change = numbers
-            .iter()
-            .find(|change| change["path"] == path)
-            .unwrap_or_else(|| panic!("diff omits {path}: {diff}"));
-        assert_eq!(change["a"].as_f64(), Some(before));
-        assert_eq!(change["b"].as_f64(), Some(after));
+        let aggregate = dir.path("aggregate.json");
+        let run = replay(&dir, &path, &["--aggregate", aggregate.to_str().unwrap()]);
+        run.assert_passed();
+        let export: Value = serde_json::from_slice(&fs::read(aggregate).unwrap()).unwrap();
+        let path = path.display();
+        assert_eq!(run.report()["injection_usage"], expected, "{path}");
+        assert_eq!(export["injection_usage"], expected, "{path}");
     }
 }
 
-#[test]
-fn every_checked_in_scenario_parses_and_resolves_its_labels() {
-    let mut seen = 0;
-    for entry in fs::read_dir(SCENARIOS).expect("the scenarios directory exists") {
-        let path = entry.unwrap().path();
-        if path.extension().is_none_or(|ext| ext != "toml") {
-            continue;
-        }
-        seen += 1;
-        let text = fs::read_to_string(&path).unwrap();
-        let scenario: contract::Scenario =
-            toml::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        assert_eq!(
-            Some(scenario.name.as_str()),
-            path.file_stem().and_then(|stem| stem.to_str()),
-            "{}: the name is the file stem",
-            path.display()
-        );
-        let errors = contract::check(&scenario);
-        assert!(
-            errors.is_empty(),
-            "{}:\n{}",
-            path.display(),
-            errors.join("\n")
-        );
-        assert!(
-            !scenario.probes.is_empty(),
-            "{}: a scenario without probes checks nothing",
-            path.display()
-        );
-    }
-    assert!(seen > 0, "no scenarios are checked in");
-}
-
-#[test]
-fn the_contract_rejects_what_the_loader_would() {
-    let text = format!(
-        "{HOME_TURN}
+/// Each loader error, as a sentence naming the label at fault.
+const LOADER_ERRORS: &str = r#"
 [[turn]]
-at = \"2026-01-06T09:00:00Z\"
-session = \"s1\"
-user = \"I live in Auckland, as I said.\"
-assistant = \"You did.\"
-used = [\"nowhere\"]
+at = "2026-01-06T09:00:00Z"
+session = "s1"
+user = "I live in Auckland, as I said."
+assistant = "You did."
+used = ["nowhere"]
 
 [[turn.claim]]
-label = \"home-again\"
-content = \"Tim lives in Auckland.\"
-quote = \"I live in Auckland\"
-kind = \"fact\"
-significance = \"minor\"
-reconcile = [{{ memory = \"home\", outcome = \"mentioned_again\" }}]
+label = "home-again"
+content = "Tim lives in Auckland."
+quote = "I live in Auckland"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "home", outcome = "mentioned_again" }]
 
 [[turn.claim]]
-label = \"later\"
-content = \"Tim lives in Wellington.\"
-quote = \"not in the turn\"
-kind = \"fact\"
-significance = \"minor\"
-reconcile = [{{ memory = \"future\", outcome = \"refines\" }}]
+label = "later"
+content = "Tim lives in Wellington."
+quote = "not in the turn"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "future", outcome = "refines" }]
 
 [[probe]]
-at = \"2026-01-01T00:00:00Z\"
-kind = \"band\"
-memory = \"home\"
-band = \"strong\"
+at = "2026-01-01T00:00:00Z"
+kind = "band"
+memory = "home"
+band = "strong"
 
 [[probe]]
-id = \"ghost\"
-at = \"2026-02-01T00:00:00Z\"
-kind = \"absent\"
-memory = \"nobody\"
+id = "ghost"
+at = "2026-02-01T00:00:00Z"
+kind = "absent"
+memory = "nobody"
 
 [[probe]]
-id = \"backwards\"
-at = \"2026-01-07T00:00:00Z\"
-kind = \"faded_at\"
-memory = \"home\"
-between = [\"2026-02-01T00:00:00Z\", \"2026-01-20T00:00:00Z\"]
-"
-    );
-    let scenario: contract::Scenario =
-        toml::from_str(&format!("name = \"bad\"\ngroup = \"ci\"\n{text}")).unwrap();
-    let errors = contract::check(&scenario);
-    let expect = |needle: &str| {
-        assert!(
-            errors.iter().any(|error| error.contains(needle)),
-            "no error mentions {needle:?}: {errors:#?}"
+id = "backwards"
+at = "2026-01-07T00:00:00Z"
+kind = "faded_at"
+memory = "home"
+between = ["2026-02-01T00:00:00Z", "2026-01-20T00:00:00Z"]
+"#;
+
+/// A second weather turn whose unlabelled claim reconciles against `home`,
+/// which isn't among the neighbours call 2 is shown for it. An absorbing
+/// outcome can't label a new memory, so the loader lets it through.
+const NOT_A_NEIGHBOUR: &str = r#"
+[[turn]]
+at = "2026-01-05T10:00:00Z"
+session = "s1"
+user = "The weather is lovely today."
+assistant = "Enjoy it."
+
+[[turn.claim]]
+label = "weather"
+content = "The weather was lovely on 2026-01-05."
+quote = "The weather is lovely today"
+kind = "event"
+significance = "trivial"
+
+[[turn]]
+at = "2026-01-06T09:00:00Z"
+session = "s1"
+user = "The weather is lovely today."
+assistant = "Enjoy it."
+
+[[turn.claim]]
+content = "The weather was lovely on 2026-01-06."
+quote = "The weather is lovely today"
+kind = "event"
+significance = "trivial"
+reconcile = [{ memory = "home", outcome = "mentioned_again" }]
+"#;
+
+/// A new session whose query shares no word with the memory: nothing is
+/// injected, so `home` isn't in context to use.
+const USED_OUT_OF_CONTEXT: &str = r#"
+[[turn]]
+at = "2026-01-06T09:00:00Z"
+session = "s2"
+user = "Tell me a joke."
+assistant = "Why did the chicken cross the road?"
+used = ["home"]
+"#;
+
+/// Two probes with one id would share a probe session and, for `injects`,
+/// could evict each other's pending injections.
+const TWIN_PROBES: &str = r#"
+[[probe]]
+id = "twin"
+at = "2026-01-05T10:00:00Z"
+kind = "exists"
+memory = "home"
+
+[[probe]]
+id = "twin"
+at = "2026-01-05T11:00:00Z"
+kind = "exists"
+memory = "home"
+"#;
+
+/// The engine never guesses (docs/replay.md, "Claims"): a scenario that
+/// doesn't hold together is refused with exit 2, naming what's wrong, and
+/// writes no report, including to the default path its name gives.
+#[test]
+fn an_invalid_scenario_is_refused_without_a_report() {
+    let dir = TestDir::new();
+    let concurrency = dir.file("concurrency.toml", "[llm]\nconcurrency = 2\n");
+    let pooled = ["--overrides", concurrency.to_str().unwrap()];
+    let with_home = |body: &str| format!("{HOME_TURN}{body}");
+    let loader = [
+        "nowhere",
+        "home-again",
+        "future",
+        "not in the turn",
+        "p1",
+        "ghost",
+        "backwards",
+    ];
+    // Probe sessions are `probe:<id>`, so no scenario session may start
+    // with `probe:`. The default report path is `reports/<name>.json`, so
+    // the name is one filename component. A pooled run's call 2 replies
+    // are scripted against what a serial run shows.
+    let reserved = HOME_TURN.replace("session = \"s1\"", "session = \"probe:p1\"");
+    let cases: [(&str, String, &[&str], &[&str]); 8] = [
+        ("loader", with_home(LOADER_ERRORS), &[], &loader),
+        (
+            "unknown-field",
+            "start = \"2026-01-01T00:00:00Z\"\n".into(),
+            &[],
+            &["start"],
+        ),
+        ("twins", with_home(TWIN_PROBES), &[], &["twin"]),
+        ("reserved", reserved, &[], &["probe:"]),
+        ("../../escaped", HOME_TURN.into(), &[], &["name"]),
+        (
+            "not-a-neighbour",
+            with_home(NOT_A_NEIGHBOUR),
+            &[],
+            &["home", "neighbour"],
+        ),
+        (
+            "used-out-of-context",
+            with_home(USED_OUT_OF_CONTEXT),
+            &[],
+            &["home"],
+        ),
+        ("pooled", HOME_TURN.into(), &pooled, &["concurrency"]),
+    ];
+    for (name, body, extra, words) in cases {
+        let file = name.trim_start_matches("../../");
+        let path = dir.file(
+            &format!("{file}.toml"),
+            &format!("name = \"{name}\"\ngroup = \"ci\"\n{body}"),
         );
-    };
-    expect("uses \"nowhere\"");
-    expect("\"home-again\" is absorbed");
-    expect("reconciles against \"future\"");
-    expect("the quote \"not in the turn\"");
-    expect("probe p1 at 2026-01-01T00:00:00Z is before \"home\"");
-    expect("probe ghost names \"nobody\"");
-    expect("probe backwards has its range backwards");
-    expect("probe backwards at 2026-01-07T00:00:00Z is before the end of its range");
-}
-
-#[test]
-fn an_unknown_scenario_field_doesnt_parse() {
-    let error = toml::from_str::<contract::Scenario>(
-        "name = \"x\"\ngroup = \"ci\"\nstart = \"2026-01-01T00:00:00Z\"\n",
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("start"), "{error}");
-}
-
-// The first set, through `asphodel replay`.
-
-#[test]
-fn lifetimes_reproduce_reference_table_within_tolerance() {
-    let dir = TestDir::new();
-    let run = replay(&dir, &scenario("lifetimes"), &[]);
-    run.assert_passed();
-    for id in [
-        "trivial-fades",
-        "minor-fades",
-        "notable-fades",
-        "major-fades",
-        "critical-fades",
-    ] {
-        let probe = run.probe(id);
-        assert_eq!(probe["kind"], "faded_at", "{probe}");
-        assert!(probe["observed"]["faded_at"].is_string(), "{probe}");
+        let output = command(&dir, &path).args(extra).output().unwrap();
+        let stderr = support::stderr(&output);
+        assert_eq!(output.status.code(), Some(2), "{name}: {stderr}");
+        for word in words {
+            assert!(
+                stderr.contains(word),
+                "{name} should name {word:?}: {stderr}"
+            );
+        }
+        assert!(
+            !dir.private().join(format!("reports/{file}.json")).exists()
+                && !dir.path("escaped.json").exists(),
+            "{name} wrote a report"
+        );
     }
-}
-
-#[test]
-fn the_purge_table_reproduces_adr_0008_and_the_shadow_table_counts_re_mentions() {
-    let dir = TestDir::new();
-    let run = replay(&dir, &scenario("purge-table"), &[]);
-    run.assert_passed();
-    let report = run.report();
-    // Purge spares the reinforced memories and the major one, not
-    // the single minor/notable mentions. Both purge before the run ends.
-    assert_eq!(purges(report), 5, "{}", report["purges_per_day"]);
-    let shadow = &report["purged_then_re_mentioned"];
-    assert_eq!(shadow["purged"], 5, "{shadow}");
-    assert_eq!(shadow["re_mentioned"], 1, "{shadow}");
-    let rate = shadow["rate"].as_f64().expect("a rate");
-    assert!((rate - 0.2).abs() < 1e-3, "{shadow}");
-}
-
-#[test]
-fn maya_corrected_to_mia_keeps_her_strength() {
-    let dir = TestDir::new();
-    let run = replay(&dir, &scenario("maya-to-mia"), &[]);
-    run.assert_passed();
-    // Mia's id is the head Maya's chain points at: the observed ids agree.
-    let mia = &run.probe("mia-is-the-head")["observed"];
-    let maya = &run.probe("maya-is-retracted")["observed"];
-    assert!(
-        mia["id"].is_string() && maya["id"].is_string(),
-        "{mia} {maya}"
-    );
-    assert_ne!(mia["id"], maya["id"]);
-}
-
-#[test]
-fn a_rescheduled_appointment_moves_on_the_agenda() {
-    let dir = TestDir::new();
-    replay(&dir, &scenario("rescheduled-appointment"), &[]).assert_passed();
-}
-
-#[test]
-fn event_reminders_expire_but_ordinary_overdue_and_undated_tasks_stay_on_the_agenda() {
-    let dir = TestDir::new();
-    let run = replay(&dir, &scenario("dated-event-reminder"), &[]);
-    run.assert_passed();
-    assert_eq!(run.report()["llm"]["scripted"], 1);
-    assert_eq!(run.report()["llm"]["live"], 0);
-}
-
-#[test]
-fn an_undated_task_expires_after_thirty_days_without_a_mention() {
-    let dir = TestDir::new();
-    let run = replay(&dir, &scenario("undated-task-expiry"), &[]);
-    run.assert_passed();
-    assert_eq!(run.report()["llm"]["scripted"], 1);
-    assert_eq!(run.report()["llm"]["live"], 0);
-}
-
-#[test]
-fn p18_closes_the_task_before_the_future_event_and_excludes_it_from_agenda() {
-    let dir = TestDir::new();
-    replay(&dir, &scenario("p18"), &[]).assert_passed();
 }
 
 #[test]
@@ -554,33 +482,21 @@ fn p18_memory_show_has_no_overdue_task_guard_after_completion() {
     );
 }
 
-#[test]
-fn a_three_week_holiday_runs_on_bank_time() {
-    let dir = TestDir::new();
-    replay(&dir, &scenario("three-week-holiday"), &[]).assert_passed();
-}
-
+/// With no latency the first turn's memory exists at 09:05, so the probes
+/// timed for the scenario's own latency fail, the run exits 1, and the
+/// report still says so.
 #[test]
 fn extraction_latency_is_modelled_in_simulated_time() {
     let dir = TestDir::new();
-    let run = replay(&dir, &scenario("extraction-latency"), &[]);
-    run.assert_passed();
-    assert_eq!(run.report()["flags"]["latency_ms"], 600_000);
-
-    // With no latency the first turn's memory exists at 09:05, so the
-    // first probe fails, the run exits 1, and the report still says so.
     let run = replay(&dir, &scenario("extraction-latency"), &["--latency", "0s"]);
     assert_eq!(run.code(), Some(1), "stderr: {}", run.stderr());
-    assert_eq!(run.report()["flags"]["latency_ms"], 0);
-    assert_eq!(run.probe("first-turn-not-yet-extracted")["passed"], false);
-    assert_eq!(
-        run.probe("second-turn-waits-for-the-worker")["passed"],
-        false
-    );
-    assert_eq!(
-        run.probe("first-turn-extracted-after-its-latency")["passed"],
-        true
-    );
+    for (id, passed) in [
+        ("first-turn-not-yet-extracted", false),
+        ("second-turn-waits-for-the-worker", false),
+        ("first-turn-extracted-after-its-latency", true),
+    ] {
+        assert_eq!(run.probe(id)["passed"], passed, "{id}");
+    }
 }
 
 #[test]
@@ -589,22 +505,13 @@ fn until_keeps_sweeping_past_the_last_turn() {
     let run = replay(&dir, &scenario("extraction-latency"), &[]);
     run.assert_passed();
     assert_eq!(purges(run.report()), 0);
-    assert!(run.report()["flags"]["until"].is_null());
 
     // A year of nightly sweeps purges both trivial memories.
-    let run = replay(
-        &dir,
-        &scenario("extraction-latency"),
-        &["--until", "2027-01-05T09:00:00Z"],
-    );
+    let until = ["--until", "2027-01-05T09:00:00Z"];
+    let run = replay(&dir, &scenario("extraction-latency"), &until);
     run.assert_passed();
-    assert_eq!(run.report()["flags"]["until"], "2027-01-05T09:00:00Z");
-    assert_eq!(
-        purges(run.report()),
-        2,
-        "{}",
-        run.report()["purges_per_day"]
-    );
+    let report = run.report();
+    assert_eq!(purges(report), 2, "{}", report["purges_per_day"]);
 }
 
 #[test]
@@ -633,20 +540,16 @@ memory = "home"
 "#
         ),
     );
-    let before = replay(&dir, &path, &["--until", "2026-01-05T09:04:59Z"]);
-    before.assert_passed();
-    assert_eq!(
-        before.report()["refresh_calls_per_day"],
-        serde_json::json!([])
-    );
-
-    let debounced = replay(&dir, &path, &["--until", "2026-01-05T09:05:00Z"]);
-    debounced.assert_passed();
-    assert_eq!(debounced.report()["flags"]["refresh"], "scripted");
-    assert_eq!(
-        debounced.report()["refresh_calls_per_day"],
-        serde_json::json!([{ "day": "2026-01-05", "count": 1 }])
-    );
+    // The report of a passing run until `until`.
+    let until = |path: &Path, until: &str| {
+        let run = replay(&dir, path, &["--until", until]);
+        run.assert_passed();
+        run.report().clone()
+    };
+    let refreshes = |path: &Path, at: &str| until(path, at)["refresh_calls_per_day"].clone();
+    assert_eq!(refreshes(&path, "2026-01-05T09:04:59Z"), json!([]));
+    let debounced = refreshes(&path, "2026-01-05T09:05:00Z");
+    assert_eq!(debounced, json!([{ "day": "2026-01-05", "count": 1 }]));
 
     let daily_path = dir.file(
         "daily-refresh.toml",
@@ -670,29 +573,21 @@ significance = "minor"
             fs::read_to_string(&path).unwrap()
         ),
     );
-    let before_sweep = replay(&dir, &daily_path, &["--until", "2026-01-05T14:59:59Z"]);
-    before_sweep.assert_passed();
-    assert_eq!(
-        before_sweep.report()["refresh_calls_per_day"],
-        debounced.report()["refresh_calls_per_day"]
-    );
-    let swept = replay(&dir, &daily_path, &["--until", "2026-01-05T15:00:00Z"]);
-    swept.assert_passed();
+    assert_eq!(refreshes(&daily_path, "2026-01-05T14:59:59Z"), debounced);
+    let swept = until(&daily_path, "2026-01-05T15:00:00Z");
     // The seeded "User profile" also refreshes at the sweep.
     // Only the explicit model had a creation-triggered debounce earlier.
     assert_eq!(
-        swept.report()["refresh_calls_per_day"],
-        serde_json::json!([
+        swept["refresh_calls_per_day"],
+        json!([
             { "day": "2026-01-05", "count": 1 },
             { "day": "2026-01-06", "count": 2 }
         ])
     );
-    assert_eq!(swept.report()["llm"]["live"], 0);
-    let unchanged = replay(&dir, &daily_path, &["--until", "2026-01-06T15:00:00Z"]);
-    unchanged.assert_passed();
+    assert_eq!(swept["llm"]["live"], 0);
     assert_eq!(
-        unchanged.report()["refresh_calls_per_day"],
-        swept.report()["refresh_calls_per_day"],
+        refreshes(&daily_path, "2026-01-06T15:00:00Z"),
+        swept["refresh_calls_per_day"],
         "an unchanged fingerprint skips the next day's LLM calls"
     );
 }
@@ -764,7 +659,6 @@ head = true
     );
     assert_eq!(run.report()["extraction_lag"]["samples"], 2);
     assert_eq!(run.report()["extraction_lag"]["p50_ms"], 600_000);
-    assert_eq!(run.report()["extraction_lag"]["p95_ms"], 600_000);
 
     let other = TestDir::new();
     let repeated = replay(&other, &path, &[]);
@@ -775,131 +669,6 @@ head = true
     );
 }
 
-/// The simulated worker claims the head of the
-/// queue, which production orders by priority (turns before documents),
-/// not in arrival order. The turn at 09:05 goes before the document's
-/// second chunk, which arrived at 09:00.
-#[test]
-fn a_turn_between_a_documents_chunks_costs_the_rest_another_latency() {
-    let dir = TestDir::new();
-    let path = inline(
-        &dir,
-        "interrupted-document",
-        r##"
-latency = "10m"
-
-[[document]]
-at = "2026-01-05T09:00:00Z"
-id = "notes"
-reference_date = "2026-01-05"
-text = "# Home\nTim lives in Auckland.\n\n# Transport\nTim's bicycle is blue."
-
-[[document.claim]]
-label = "bicycle"
-content = "Tim's bicycle is blue."
-quote = "Tim's bicycle is blue"
-kind = "fact"
-significance = "minor"
-
-[[document.claim]]
-label = "home"
-content = "Tim lives in Auckland."
-quote = "Tim lives in Auckland"
-kind = "fact"
-significance = "minor"
-
-[[turn]]
-at = "2026-01-05T09:05:00Z"
-session = "s1"
-user = "My favourite tea is Earl Grey."
-assistant = "Noted."
-
-[[turn.claim]]
-label = "tea"
-content = "Tim's favourite tea is Earl Grey."
-quote = "My favourite tea is Earl Grey"
-kind = "fact"
-significance = "minor"
-
-[[probe]]
-at = "2026-01-05T09:15:00Z"
-kind = "exists"
-memory = "home"
-
-[[probe]]
-at = "2026-01-05T09:15:00Z"
-kind = "absent"
-memory = "bicycle"
-
-[[probe]]
-at = "2026-01-05T09:15:00Z"
-kind = "absent"
-memory = "tea"
-
-[[probe]]
-at = "2026-01-05T09:25:00Z"
-kind = "exists"
-memory = "tea"
-
-[[probe]]
-at = "2026-01-05T09:25:00Z"
-kind = "absent"
-memory = "bicycle"
-
-[[probe]]
-at = "2026-01-05T09:35:00Z"
-kind = "exists"
-memory = "bicycle"
-"##,
-    );
-    let run = replay(&dir, &path, &[]);
-    run.assert_passed();
-    assert_eq!(run.report()["extraction_lag"]["samples"], 3);
-    assert_eq!(run.report()["extraction_lag"]["p95_ms"], 1_800_000);
-}
-
-// The report.
-
-#[test]
-fn the_report_names_its_run_and_defaults_its_path() {
-    let dir = TestDir::new();
-    let run = replay(&dir, &scenario("extraction-latency"), &[]);
-    run.assert_passed();
-    let report = run.report();
-    assert_eq!(report["kind"], "scripted");
-    assert_eq!(report["scenario"], "extraction-latency");
-    assert_eq!(report["group"], "ci");
-    assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
-    assert!(report.get("git_sha").is_some(), "{report}");
-    assert_eq!(report["llm"]["live"], 0);
-    assert_eq!(report["llm"]["cache"], 0);
-    assert!(report["llm"]["scripted"].as_u64().is_some_and(|n| n >= 2));
-    // The fake floors are in the resolved tuning, under the scenario's
-    // own layer.
-    assert_eq!(report["tuning"]["clock"]["quiet_rate"], 1.0);
-    assert_eq!(
-        report["tuning"]["reconcile"]["embedding_floors"]["fake-embedder:v1"],
-        0.5
-    );
-
-    // Without --report, the report lands in the private dir.
-    let output = Command::new(env!("CARGO_BIN_EXE_asphodel"))
-        .arg("replay")
-        .arg("--scenario")
-        .arg(scenario("extraction-latency"))
-        .env("ASPHODEL_REPLAY_DIR", dir.replay_dir())
-        .env_remove("ASPHODEL_MODEL_DIR")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let default = dir.replay_dir().join("reports/extraction-latency.json");
-    assert!(default.is_file(), "no report at {}", default.display());
-}
-
 // Overrides and layering.
 
 #[test]
@@ -908,202 +677,60 @@ fn overrides_layer_over_the_production_file_in_the_shape_of_tuning() {
     let config = dir.file("production.toml", "[clock]\nquiet_rate = 0.2\n");
     let overrides = dir.file("overrides.toml", "[clock]\nquiet_rate = 0.5\n");
     let path = scenario("extraction-latency");
-    let path = path.to_str().unwrap();
 
-    // The scenario's own [tuning] (1.0) sits above the production file.
-    let run = replay(
-        &dir,
-        Path::new(path),
-        &["--config", config.to_str().unwrap()],
-    );
-    run.assert_passed();
-    assert_eq!(run.report()["tuning"]["clock"]["quiet_rate"], 1.0);
-
-    // --overrides sits above the scenario.
-    let run = replay(
-        &dir,
-        Path::new(path),
-        &[
-            "--config",
-            config.to_str().unwrap(),
-            "--overrides",
-            overrides.to_str().unwrap(),
-        ],
-    );
-    run.assert_passed();
-    assert_eq!(run.report()["tuning"]["clock"]["quiet_rate"], 0.5);
+    let config = ["--config", config.to_str().unwrap()];
+    let quiet_rate = |extra: &[&str]| {
+        let run = replay(&dir, &path, extra);
+        run.assert_passed();
+        run.report()["tuning"]["clock"]["quiet_rate"].clone()
+    };
+    // The scenario's own [tuning] (1.0) sits above the production file,
+    // and --overrides above the scenario.
+    assert_eq!(quiet_rate(&config), 1.0);
+    let overrides = ["--overrides", overrides.to_str().unwrap()];
+    assert_eq!(quiet_rate(&[config, overrides].concat()), 0.5);
 }
 
 // Privacy and the private directory.
 
+/// Replay writes only under a private dir it owns. No private dir, one
+/// inside a git working tree, a serve data dir (recognised by the store
+/// file at its top level), and a store dir replay didn't create, such as a
+/// stopped daemon's data dir named `store`, are each refused before
+/// anything is written or reset.
 #[test]
-fn replay_refuses_to_run_without_a_private_directory() {
-    let dir = TestDir::new();
-    let report = dir.path("report.json");
-    let output = Command::new(env!("CARGO_BIN_EXE_asphodel"))
-        .arg("replay")
-        .arg("--scenario")
-        .arg(scenario("extraction-latency"))
+fn replay_refuses_a_private_dir_it_doesnt_own() {
+    let path = scenario("extraction-latency");
+
+    let unset = TestDir::new();
+    let report = unset.path("report.json");
+    let output = command(&unset, &path)
+        .env_remove("ASPHODEL_REPLAY_DIR")
         .arg("--report")
         .arg(&report)
-        .env_remove("ASPHODEL_REPLAY_DIR")
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("ASPHODEL_REPLAY_DIR"), "{stderr}");
+    support::assert_refused(&output, "ASPHODEL_REPLAY_DIR");
     assert!(!report.exists());
-}
 
-#[test]
-fn replay_refuses_a_private_directory_inside_a_git_working_tree() {
-    let dir = TestDir::new();
-    fs::create_dir_all(dir.path("repo/.git")).unwrap();
-    let private = dir.path("repo/private");
+    let in_git = TestDir::new();
+    fs::create_dir_all(in_git.path("repo/.git")).unwrap();
+    let private = in_git.path("repo/private");
     fs::create_dir_all(&private).unwrap();
-    let run = replay(
-        &dir,
-        &scenario("extraction-latency"),
-        &["--replay-dir", private.to_str().unwrap()],
-    );
-    run.assert_refused("git");
+    replay(&in_git, &path, &["--replay-dir", private.to_str().unwrap()]).assert_refused("git");
     assert!(
         fs::read_dir(&private).unwrap().next().is_none(),
         "nothing is written inside the working tree"
     );
-}
 
-#[test]
-fn replay_refuses_a_serve_data_dir() {
-    let dir = TestDir::new();
-    // A data dir is recognised by the store file at its top level; replay's
-    // own store lives under <replay dir>/store.
-    fs::write(dir.replay_dir().join("asphodel.db"), b"").unwrap();
-    let run = replay(&dir, &scenario("extraction-latency"), &[]);
-    run.assert_refused("serve");
-}
+    let data_dir = TestDir::new();
+    data_dir.private_file("asphodel.db", "");
+    replay(&data_dir, &path, &[]).assert_refused("serve");
 
-// Scenario errors: the engine never guesses (docs/replay.md, "Claims").
-
-#[test]
-fn a_scripted_outcome_whose_target_isnt_a_neighbour_is_a_scenario_error() {
-    let dir = TestDir::new();
-    let path = inline(
-        &dir,
-        "bad-target",
-        &format!(
-            "{HOME_TURN}
-[[turn]]
-at = \"2026-01-05T10:00:00Z\"
-session = \"s1\"
-user = \"The weather is lovely today.\"
-assistant = \"Enjoy it.\"
-
-[[turn.claim]]
-label = \"weather\"
-content = \"The weather was lovely on 2026-01-05.\"
-quote = \"The weather is lovely today\"
-kind = \"event\"
-significance = \"trivial\"
-
-[[turn]]
-at = \"2026-01-06T09:00:00Z\"
-session = \"s1\"
-user = \"The weather is lovely today.\"
-assistant = \"Enjoy it.\"
-
-[[turn.claim]]
-content = \"The weather was lovely on 2026-01-06.\"
-quote = \"The weather is lovely today\"
-kind = \"event\"
-significance = \"trivial\"
-reconcile = [{{ memory = \"home\", outcome = \"mentioned_again\" }}]
-
-[[probe]]
-at = \"2026-01-07T09:00:00Z\"
-kind = \"exists\"
-memory = \"home\"
-"
-        ),
-    );
-    // An absorbing outcome cannot label a new memory. Keep this claim
-    // unlabelled so loader validation lets it reach call 2. The earlier
-    // weather claim supplies a real neighbour, but home is not one.
-    contract::load(&path).expect("the non-neighbour fixture must pass loader validation");
-    let run = replay(&dir, &path, &[]);
-    run.assert_refused("home");
-    assert!(
-        run.stderr().contains(
-            r#"its outcome names "home", which isn't among the neighbours call 2 is shown for it"#
-        ),
-        "{}",
-        run.stderr()
-    );
-}
-
-#[test]
-fn a_scenario_refuses_to_run_above_concurrency_one() {
-    // Its call 2 replies are scripted against what a serial run shows.
-    let dir = TestDir::new();
-    let path = inline(
-        &dir,
-        "pooled",
-        &format!(
-            "{HOME_TURN}
-[[probe]]
-at = \"2026-01-06T09:00:00Z\"
-kind = \"exists\"
-memory = \"home\"
-"
-        ),
-    );
-    let overrides = dir.file("concurrency.toml", "[llm]\nconcurrency = 2\n");
-    let run = replay(&dir, &path, &["--overrides", overrides.to_str().unwrap()]);
-    run.assert_refused("concurrency");
-}
-
-#[test]
-fn a_used_memory_that_isnt_in_context_is_a_scenario_error() {
-    let dir = TestDir::new();
-    // A new session whose query shares no word with the memory: nothing is
-    // injected, so nothing is in context to use.
-    let path = inline(
-        &dir,
-        "bad-used",
-        &format!(
-            "{HOME_TURN}
-[[turn]]
-at = \"2026-01-06T09:00:00Z\"
-session = \"s2\"
-user = \"Tell me a joke.\"
-assistant = \"Why did the chicken cross the road?\"
-used = [\"home\"]
-
-[[probe]]
-at = \"2026-01-07T09:00:00Z\"
-kind = \"exists\"
-memory = \"home\"
-"
-        ),
-    );
-    replay(&dir, &path, &[]).assert_refused("home");
-}
-
-// Replay directory ownership, output containment and completion.
-
-/// Replay may reset only a store it created. A store dir replay didn't
-/// create, such as a stopped daemon's data
-/// dir named `store`, is refused before anything in it is touched.
-#[test]
-fn replay_refuses_to_reset_a_store_it_didnt_create() {
-    let dir = TestDir::new();
-    let store = dir.replay_dir().join("store");
-    fs::create_dir_all(&store).unwrap();
-    fs::write(store.join("asphodel.db"), b"").unwrap();
-    let sentinel = store.join("sentinel");
-    fs::write(&sentinel, b"a daemon's file").unwrap();
-    let run = replay(&dir, &scenario("extraction-latency"), &[]);
-    run.assert_refused("store");
+    let unowned = TestDir::new();
+    unowned.private_file("store/asphodel.db", "");
+    let sentinel = unowned.private_file("store/sentinel", "a daemon's file");
+    replay(&unowned, &path, &[]).assert_refused("store");
     assert!(
         sentinel.is_file(),
         "the sentinel in the unowned store was removed"
@@ -1118,21 +745,15 @@ fn replay_refuses_to_reset_a_store_it_didnt_create() {
 fn a_second_replay_on_the_same_private_dir_is_refused_while_the_first_runs() {
     let dir = TestDir::new();
     let first_report = dir.path("first.json");
-    let mut first = Command::new(env!("CARGO_BIN_EXE_asphodel"))
-        .arg("replay")
-        .arg("--scenario")
-        .arg(scenario("three-week-holiday"))
+    let mut first = command(&dir, &scenario("three-week-holiday"))
         .arg("--report")
         .arg(&first_report)
-        .arg("--until")
-        .arg("2032-01-01T00:00:00Z")
-        .env("ASPHODEL_REPLAY_DIR", dir.replay_dir())
-        .env_remove("ASPHODEL_MODEL_DIR")
+        .args(["--until", "2032-01-01T00:00:00Z"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let store_db = dir.replay_dir().join("store/asphodel.db");
+    let store_db = dir.private().join("store/asphodel.db");
     let started = Instant::now();
     while !store_db.exists() {
         assert!(
@@ -1146,158 +767,81 @@ fn a_second_replay_on_the_same_private_dir_is_refused_while_the_first_runs() {
     let status = first.wait().unwrap();
     assert!(status.success(), "the first replay was disturbed: {status}");
     let report: Value = serde_json::from_slice(&fs::read(&first_report).unwrap()).unwrap();
+    let probes = report["probes"].as_array().unwrap();
     assert!(
-        report["probes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|probe| probe["passed"] == true),
-        "{}",
-        report["probes"]
+        probes.iter().all(|probe| probe["passed"] == true),
+        "{probes:?}"
     );
 }
 
-/// The default report path uses the scenario's name, which must be one
-/// filename component so the report stays inside the private dir.
+/// `--report` is checked like the private dir, before a run resets
+/// anything. A destination inside a git working tree, an existing symlink
+/// that would write through to wherever it points, and a file replay keeps
+/// in the private dir (the lock, the shadow table and its WAL, the store)
+/// are each refused and left as they were. The run over replay's own files
+/// follows a different scenario, so a reset can't hide behind reproducing
+/// the first run's contents.
 #[test]
-fn a_scenario_name_that_isnt_a_filename_is_refused() {
-    let dir = TestDir::new();
-    let path = dir.file(
-        "escaping.toml",
-        &format!("name = \"../../escaped\"\ngroup = \"ci\"\n{HOME_TURN}"),
-    );
-    let output = Command::new(env!("CARGO_BIN_EXE_asphodel"))
-        .arg("replay")
-        .arg("--scenario")
-        .arg(&path)
-        .env("ASPHODEL_REPLAY_DIR", dir.replay_dir())
-        .env_remove("ASPHODEL_MODEL_DIR")
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("name"), "{stderr}");
-    assert!(
-        !dir.path("escaped.json").exists(),
-        "the report escaped the private dir"
-    );
-}
-
-/// `--report` is checked like the private dir. A destination
-/// inside a git working tree is refused.
-#[test]
-fn a_report_path_inside_a_git_working_tree_is_refused() {
-    let dir = TestDir::new();
-    fs::create_dir_all(dir.path("repo/.git")).unwrap();
-    let report = dir.path("repo/report.json");
-    let run = replay(
-        &dir,
-        &scenario("extraction-latency"),
-        &["--report", report.to_str().unwrap()],
-    );
-    run.assert_refused("git");
-    assert!(!report.exists(), "the report was written inside the tree");
-}
-
-/// An existing symlink at the report path would write through
-/// to wherever it points. It's refused and left as it was.
-#[test]
-fn a_report_path_that_is_a_symlink_is_refused() {
-    let dir = TestDir::new();
-    let target = dir.path("elsewhere.json");
-    fs::write(&target, b"untouched").unwrap();
-    let link = dir.path("report.json");
-    std::os::unix::fs::symlink(&target, &link).unwrap();
-    let run = replay(
-        &dir,
-        &scenario("extraction-latency"),
-        &["--report", link.to_str().unwrap()],
-    );
-    run.assert_refused("symlink");
-    assert_eq!(fs::read(&target).unwrap(), b"untouched");
-}
-
-/// Reserved report destinations must be rejected before resetting a
-/// previously populated store. The second scenario has different memories,
-/// so a reset cannot hide behind reproducing the first run's contents.
-fn assert_reserved_report(destination: &str) {
+fn a_report_path_replay_cant_write_safely_is_refused() {
     use std::os::unix::fs::MetadataExt as _;
 
     let dir = TestDir::new();
-    let seed = inline(
-        &dir,
-        "reserved-report-seed",
-        &format!(
-            "{HOME_TURN}\n[[probe]]\nat = \"2026-01-05T09:01:00Z\"\nkind = \"exists\"\nmemory = \"home\"\n"
-        ),
-    );
-    replay(&dir, &seed, &[]).assert_passed();
-    let private = dir.replay_dir();
-    let db = private.join("store/asphodel.db");
-    let before = fs::read(&db).unwrap();
-    let lock = private.join("lock");
-    let lock_inode = fs::metadata(&lock).unwrap().ino();
-    let sentinel = private.join("store/nested/pre-run-contents");
-    fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
-    fs::write(&sentinel, b"keep the pre-run store, including descendants").unwrap();
-    let marker = private.join("store/replay-store");
-    let marker_before = fs::read(&marker).unwrap();
+    let path = scenario("extraction-latency");
+    fs::create_dir_all(dir.path("repo/.git")).unwrap();
+    let in_git = dir.path("repo/report.json");
+    replay(&dir, &path, &["--report", in_git.to_str().unwrap()]).assert_refused("git");
+    assert!(!in_git.exists(), "the report was written inside the tree");
 
-    let target = private.join(destination);
-    let shadow_sentinel = destination.starts_with("shadow.db");
-    if shadow_sentinel {
-        fs::write(&target, b"keep the pre-run shadow file").unwrap();
-    }
-    let run = replay(
-        &dir,
-        &scenario("extraction-latency"),
-        &["--report", target.to_str().unwrap()],
-    );
+    let target = dir.file("elsewhere.json", "untouched");
+    let link = dir.path("link.json");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    replay(&dir, &path, &["--report", link.to_str().unwrap()]).assert_refused("symlink");
+    assert_eq!(fs::read(&target).unwrap(), b"untouched");
 
-    // Check preservation even when the exit code or diagnostic is wrong.
-    assert!(
-        fs::read(&db).unwrap() == before,
-        "report destination {destination:?} changed the pre-run database"
-    );
-    assert_eq!(
-        fs::read(&sentinel).unwrap(),
-        b"keep the pre-run store, including descendants",
-        "report destination {destination:?} reset the store"
-    );
-    assert_eq!(fs::read(&marker).unwrap(), marker_before);
-    assert_eq!(
-        fs::metadata(&lock).unwrap().ino(),
-        lock_inode,
-        "report destination {destination:?} replaced the private lock inode"
-    );
-    if shadow_sentinel {
-        assert_eq!(
-            fs::read(&target).unwrap(),
-            b"keep the pre-run shadow file",
-            "report destination {destination:?} overwrote the shadow sentinel"
+    for destination in ["lock", "shadow.db", "shadow.db-wal", "store/asphodel.db"] {
+        let dir = TestDir::new();
+        let seed = inline(
+            &dir,
+            "reserved-report-seed",
+            &format!(
+                "{HOME_TURN}\n[[probe]]\nat = \"2026-01-05T09:01:00Z\"\nkind = \"exists\"\nmemory = \"home\"\n"
+            ),
         );
+        replay(&dir, &seed, &[]).assert_passed();
+        dir.private_file("store/nested/pre-run-contents", "keep the pre-run store");
+        let shadow = destination.starts_with("shadow.db");
+        if shadow {
+            dir.private_file(destination, "keep the pre-run shadow file");
+        }
+        // Everything the run must leave as it was: the store's database,
+        // its marker and the sentinel inside it, any shadow file there, and
+        // the lock's inode.
+        let private = dir.private();
+        let snapshot = || {
+            let files = [
+                "store/asphodel.db",
+                "store/replay-store",
+                "store/nested/pre-run-contents",
+            ];
+            let mut bytes: Vec<Vec<u8>> = files
+                .iter()
+                .map(|file| fs::read(private.join(file)).unwrap())
+                .collect();
+            if shadow {
+                bytes.push(fs::read(private.join(destination)).unwrap());
+            }
+            (bytes, fs::metadata(private.join("lock")).unwrap().ino())
+        };
+        let before = snapshot();
+        let target = private.join(destination);
+        let run = replay(&dir, &path, &["--report", target.to_str().unwrap()]);
+        // Check preservation even when the exit code or diagnostic is wrong.
+        assert!(
+            snapshot() == before,
+            "report destination {destination:?} changed the pre-run private dir"
+        );
+        run.assert_refused("reserved");
     }
-    run.assert_refused("reserved");
-}
-
-#[test]
-fn a_report_over_the_replay_lock_is_refused() {
-    assert_reserved_report("lock");
-}
-
-#[test]
-fn a_report_over_the_shadow_table_is_refused() {
-    assert_reserved_report("shadow.db");
-}
-
-#[test]
-fn a_report_over_the_shadow_wal_is_refused() {
-    assert_reserved_report("shadow.db-wal");
-}
-
-#[test]
-fn a_report_inside_the_store_is_refused() {
-    assert_reserved_report("store/asphodel.db");
 }
 
 /// Accepted work is drained before the run ends, including completions
@@ -1311,76 +855,4 @@ fn accepted_sources_are_extracted_even_after_the_last_probe() {
     let report = run.report();
     assert_eq!(report["extraction_lag"]["samples"], 1, "{report}");
     assert_eq!(report["extraction_lag"]["p50_ms"], 600_000, "{report}");
-    assert!(
-        report["llm"]["scripted"].as_u64().is_some_and(|n| n >= 1),
-        "{report}"
-    );
-}
-
-/// Two probes with one id would share a probe session and, for
-/// `injects`, could evict each other's pending injections. Ids are unique
-/// and the loader says so.
-#[test]
-fn duplicate_probe_ids_are_refused_before_the_run() {
-    let dir = TestDir::new();
-    let path = inline(
-        &dir,
-        "twins",
-        &format!(
-            "{HOME_TURN}
-[[probe]]
-id = \"twin\"
-at = \"2026-01-05T10:00:00Z\"
-kind = \"exists\"
-memory = \"home\"
-
-[[probe]]
-id = \"twin\"
-at = \"2026-01-05T11:00:00Z\"
-kind = \"exists\"
-memory = \"home\"
-"
-        ),
-    );
-    let run = replay(&dir, &path, &[]);
-    run.assert_refused("twin");
-}
-
-/// Probe sessions are `probe:<id>`, and no scenario session may
-/// start with `probe:`, so an `injects` probe can never touch a scenario
-/// session's pending injection or idle timeout.
-#[test]
-fn a_scenario_session_in_the_probe_namespace_is_refused() {
-    let dir = TestDir::new();
-    let path = inline(
-        &dir,
-        "reserved",
-        &HOME_TURN.replace("session = \"s1\"", "session = \"probe:p1\""),
-    );
-    let run = replay(&dir, &path, &[]);
-    run.assert_refused("probe:");
-}
-
-/// A memory id is keyed by its source and claim
-/// ordinal. The source is the one ingest minted for the turn's key, and the
-/// ordinal is the claim's chunk position and index in call 1's reply, so a
-/// document's chunks can't collide.
-#[test]
-fn memory_ids_are_uuidv5_of_the_source_and_claim_ordinal() {
-    let dir = TestDir::new();
-    let run = replay(&dir, &scenario("extraction-latency"), &[]);
-    run.assert_passed();
-    let observed = &run.probe("first-turn-extracted-after-its-latency")["observed"]["id"];
-    let observed: uuid::Uuid = observed.as_str().unwrap().parse().unwrap();
-    // The first bank in a fresh store, session `s1`, the first turn's time.
-    let at: jiff::Timestamp = "2026-01-05T09:00:00Z".parse().unwrap();
-    let source = uuid::Uuid::new_v5(
-        &asphodel_core::store::ids::NAMESPACE,
-        format!("1:turn:s1:{}", at.as_microsecond()).as_bytes(),
-    );
-    let expected = uuid::Uuid::new_v5(&source, b"0:0");
-    assert_eq!(
-        observed, expected,
-        "the memory id isn't keyed by its source"
-    );
 }

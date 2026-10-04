@@ -4,15 +4,16 @@
 //! Nothing here touches the network. The OpenAI-compatible client is tested
 //! against [`StubServer`], a loopback HTTP/1.1 server in this file, and the
 //! model loader against files written into a temp dir. The real-model tests
-//! are ignored and run only when the
-//! real models are in `ASPHODEL_MODEL_DIR` (or the XDG cache).
+//! are ignored and run only when the real models are in
+//! `ASPHODEL_MODEL_DIR` (or the XDG cache).
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::ops::RangeInclusive;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asphodel_core::clock::{Clock, SimulatedClock};
@@ -26,8 +27,6 @@ use sha2::{Digest, Sha256};
 
 use asphodel_core::models::*;
 use asphodel_core::{OpenError, Service};
-
-// Fixtures.
 
 /// A temporary directory removed even when an assertion unwinds.
 struct TestDir(PathBuf);
@@ -67,17 +66,18 @@ fn clock() -> Arc<dyn Clock> {
     Arc::new(SimulatedClock::new(start()))
 }
 
-fn open_store(dir: &TestDir) -> Store {
-    Store::open(&dir.join("data"), OpenOptions::default(), clock()).unwrap()
+/// A service on the fake models over a fresh store in `dir`.
+fn open_service(dir: &TestDir, tuning: Tuning) -> Result<Service, OpenError> {
+    let store = Store::open(&dir.join("data"), OpenOptions::default(), clock()).unwrap();
+    Service::with_models(clock(), store, tuning, Models::fake())
 }
 
-/// `[llm]` plus a floor for each fake model, so a service opens on the
-/// fakes.
-fn tuning_for_fakes() -> Tuning {
+/// A floor for each fake model, and a relevance scale for `scaled`.
+fn tuning(scaled: &str) -> Tuning {
     Tuning::from_toml(&format!(
         "[injection.reranker_floors]\n\"{}\" = 0.0\n\
-         [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
-         [reconcile.embedding_floors]\n\"{}\" = 0.5\n",
+         [reconcile.embedding_floors]\n\"{}\" = 0.5\n\
+         [ranking.relevance_scales]\n\"{scaled}\" = 1.0\n",
         FakeReranker::MODEL_ID,
         FakeEmbedder::MODEL_ID,
     ))
@@ -100,14 +100,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-fn norm(v: &[f32]) -> f32 {
-    v.iter().map(|x| x * x).sum::<f32>().sqrt()
-}
-
 /// A manifest of two small models with known bytes, for the fetch tests.
 /// The real manifest's checksums can't be met offline, so `fetch_models`
 /// takes the specs it fills.
@@ -118,35 +110,32 @@ struct Canned {
 
 fn canned() -> Canned {
     let mut bytes = BTreeMap::new();
-    let mut specs = Vec::new();
-    for (id, dir) in [
+    let specs = [
         (EMBEDDING_MODEL_ID, "bge-small-en-v1.5-int8"),
         (RERANKER_MODEL_ID, "jina-reranker-v1-turbo-en-int8"),
-    ] {
-        let files = MODEL_FILES
-            .iter()
-            .map(|name| {
-                let url = format!("https://models.example/{dir}/{name}");
-                let content = format!("{id} {name} bytes").into_bytes();
-                let sha256 = sha256_hex(&content);
-                bytes.insert(url.clone(), content);
-                ModelFile {
-                    name: (*name).to_string(),
-                    url,
-                    sha256,
-                }
-            })
-            .collect();
-        specs.push(ModelSpec {
-            id: id.to_string(),
-            dir: dir.to_string(),
-            files,
+    ]
+    .map(|(id, dir)| {
+        let files = MODEL_FILES.iter().map(|name| {
+            let url = format!("https://models.example/{dir}/{name}");
+            let content = format!("{id} {name} bytes").into_bytes();
+            let sha256 = sha256_hex(&content);
+            bytes.insert(url.clone(), content);
+            let name = name.to_string();
+            ModelFile { name, url, sha256 }
         });
-    }
+        let (id, dir) = (id.to_string(), dir.to_string());
+        ModelSpec {
+            id,
+            dir,
+            files: files.collect(),
+        }
+    })
+    .to_vec();
     Canned { specs, bytes }
 }
 
 /// Serves canned bytes by URL and counts calls.
+#[derive(Default)]
 struct MapFetcher {
     bytes: BTreeMap<String, Vec<u8>>,
     calls: AtomicUsize,
@@ -158,8 +147,7 @@ impl MapFetcher {
     fn new(bytes: BTreeMap<String, Vec<u8>>) -> Self {
         Self {
             bytes,
-            calls: AtomicUsize::new(0),
-            failing: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -220,10 +208,6 @@ impl StubRequest {
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
     }
-
-    fn json(&self) -> Value {
-        serde_json::from_str(&self.body).expect("a JSON body")
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -237,22 +221,21 @@ struct StubResponse {
 }
 
 impl StubResponse {
-    fn json(value: Value) -> Self {
+    fn new(status: u16, body: Value) -> Self {
         Self {
-            status: 200,
+            status,
             headers: Vec::new(),
-            body: value.to_string(),
+            body: body.to_string(),
             delay: Duration::ZERO,
         }
     }
 
+    fn json(value: Value) -> Self {
+        Self::new(200, value)
+    }
+
     fn status(status: u16) -> Self {
-        Self {
-            status,
-            headers: Vec::new(),
-            body: "{}".into(),
-            delay: Duration::ZERO,
-        }
+        Self::new(status, json!({}))
     }
 
     fn with_header(mut self, name: &str, value: &str) -> Self {
@@ -296,12 +279,8 @@ impl StubServer {
         }
     }
 
-    fn requests(&self) -> Vec<StubRequest> {
-        self.requests.lock().unwrap().clone()
-    }
-
     fn only_request(&self) -> StubRequest {
-        let requests = self.requests();
+        let requests = self.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 1, "{requests:?}");
         requests.into_iter().next().unwrap()
     }
@@ -320,53 +299,32 @@ impl StubServer {
 
 fn serve_one(mut stream: TcpStream, response: StubResponse, log: &Mutex<Vec<StubRequest>>) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut line = String::new();
-    if reader.read_line(&mut line).unwrap_or(0) == 0 {
-        return;
-    }
+    let mut lines = reader.by_ref().lines().map_while(Result::ok);
+    let Some(line) = lines.next() else { return };
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
-    let mut headers = Vec::new();
-    let mut length = 0usize;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            break;
-        }
-        if let Some((key, value)) = line.split_once(':') {
-            let (key, value) = (key.trim().to_string(), value.trim().to_string());
-            if key.eq_ignore_ascii_case("content-length") {
-                length = value.parse().unwrap_or(0);
-            }
-            headers.push((key, value));
-        }
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).unwrap();
-    log.lock().unwrap().push(StubRequest {
+    let headers = lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            Some((key.trim().to_string(), value.trim().to_string()))
+        })
+        .collect();
+    let mut request = StubRequest {
         method,
         path,
         headers,
-        body: String::from_utf8_lossy(&body).into_owned(),
-    });
-    std::thread::sleep(response.delay);
-    let reason = match response.status {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        408 => "Request Timeout",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "Status",
+        body: String::new(),
     };
+    let length = request
+        .header("content-length")
+        .map_or(0, |v| v.parse().unwrap());
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    request.body = String::from_utf8_lossy(&body).into_owned();
+    log.lock().unwrap().push(request);
+    std::thread::sleep(response.delay);
     let extra: String = response
         .headers
         .iter()
@@ -374,7 +332,7 @@ fn serve_one(mut stream: TcpStream, response: StubResponse, log: &Mutex<Vec<Stub
         .collect();
     let _ = write!(
         stream,
-        "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{}",
+        "HTTP/1.1 {} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{}",
         response.status,
         response.body.len(),
         response.body
@@ -382,91 +340,47 @@ fn serve_one(mut stream: TcpStream, response: StubResponse, log: &Mutex<Vec<Stub
     let _ = stream.flush();
 }
 
-// The model dir.
-
-#[test]
-fn the_model_dir_is_the_override_then_the_xdg_cache_then_home() {
-    let home = Some(Path::new("/home/tim"));
-    for (override_dir, xdg_cache, expected) in [
-        (Some("/srv/models"), Some("/home/tim/.cache"), "/srv/models"),
-        (
-            None,
-            Some("/var/cache/tim"),
-            "/var/cache/tim/asphodel/models",
-        ),
-        (None, None, "/home/tim/.cache/asphodel/models"),
-        // The XDG spec: a relative XDG_CACHE_HOME is invalid and ignored.
-        (None, Some("cache"), "/home/tim/.cache/asphodel/models"),
-    ] {
-        let dir =
-            ModelDir::resolve(override_dir.map(Path::new), xdg_cache.map(Path::new), home).unwrap();
-        assert_eq!(
-            dir.path(),
-            Path::new(expected),
-            "{override_dir:?} {xdg_cache:?}"
-        );
-    }
+/// One call to a client on a fresh stub answering `response`.
+fn complete(response: StubResponse) -> Result<LlmResponse, LlmError> {
+    complete_with(&StubServer::start(response), |_| {})
 }
 
-// `asphodel models fetch`.
+/// One call to a client on `server`, with its settings edited.
+fn complete_with(
+    server: &StubServer,
+    edit: impl FnOnce(&mut LlmSettings),
+) -> Result<LlmResponse, LlmError> {
+    let mut settings = server.settings(None);
+    edit(&mut settings);
+    OpenAiCompatible::new(settings).complete(&request())
+}
 
 #[test]
-fn fetch_fills_an_empty_dir_and_checks_every_file() {
+fn fetch_fills_the_dir_then_skips_what_is_right_and_replaces_what_is_not() {
     let dir = TestDir::new();
     let models = dir.models();
     let canned = canned();
     let fetcher = MapFetcher::new(canned.bytes.clone());
 
     let report = fetch_models(&models, &canned.specs, &fetcher).unwrap();
-
-    assert_eq!(fetcher.calls(), 10);
-    assert_eq!(report.fetched.len(), 10);
-    assert!(report.skipped.is_empty());
+    assert_eq!((report.fetched.len(), report.skipped.len()), (10, 0));
     for spec in &canned.specs {
         for file in &spec.files {
-            let path = models.file(spec, &file.name);
-            assert!(report.fetched.contains(&path), "{}", path.display());
-            let written = std::fs::read(&path).unwrap();
-            assert_eq!(sha256_hex(&written), file.sha256, "{}", path.display());
+            let written = std::fs::read(models.file(spec, &file.name)).unwrap();
+            assert_eq!(sha256_hex(&written), file.sha256, "{}", file.url);
         }
+        // Nothing else was left behind: no temp files.
+        let entries = std::fs::read_dir(models.path().join(&spec.dir)).unwrap();
+        assert_eq!(entries.count(), MODEL_FILES.len());
     }
-    // Nothing else was left behind: no temp files.
-    for spec in &canned.specs {
-        let entries: Vec<_> = std::fs::read_dir(models.path().join(&spec.dir))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        assert_eq!(entries.len(), MODEL_FILES.len(), "{entries:?}");
-    }
-}
-
-#[test]
-fn fetch_skips_files_that_are_already_right() {
-    let dir = TestDir::new();
-    let models = dir.models();
-    let canned = canned();
-    let fetcher = MapFetcher::new(canned.bytes.clone());
-    fetch_models(&models, &canned.specs, &fetcher).unwrap();
-    assert_eq!(fetcher.calls(), 10);
 
     let report = fetch_models(&models, &canned.specs, &fetcher).unwrap();
     assert_eq!(fetcher.calls(), 10, "a second run fetched again");
-    assert!(report.fetched.is_empty());
-    assert_eq!(report.skipped.len(), 10);
-}
-
-#[test]
-fn fetch_replaces_a_file_whose_bytes_are_wrong() {
-    let dir = TestDir::new();
-    let models = dir.models();
-    let canned = canned();
-    let fetcher = MapFetcher::new(canned.bytes.clone());
-    fetch_models(&models, &canned.specs, &fetcher).unwrap();
+    assert_eq!((report.fetched.len(), report.skipped.len()), (0, 10));
 
     let spec = &canned.specs[1];
     let path = models.file(spec, "model.onnx");
     std::fs::write(&path, b"truncated").unwrap();
-
     let report = fetch_models(&models, &canned.specs, &fetcher).unwrap();
     assert_eq!(report.fetched, std::slice::from_ref(&path));
     assert_eq!(report.skipped.len(), 9);
@@ -477,89 +391,70 @@ fn fetch_replaces_a_file_whose_bytes_are_wrong() {
 }
 
 #[test]
-fn fetch_refuses_bytes_that_do_not_match_the_manifest() {
-    let dir = TestDir::new();
-    let models = dir.models();
+fn fetch_stops_at_a_bad_file_keeps_what_came_before_and_resumes() {
     let canned = canned();
-    let mut bytes = canned.bytes.clone();
-    let tampered = canned.specs[0].files[0].url.clone();
-    bytes.insert(tampered.clone(), b"not the model".to_vec());
-    let fetcher = MapFetcher::new(bytes);
-
-    let error = fetch_models(&models, &canned.specs, &fetcher).unwrap_err();
-    assert!(
-        matches!(&error, FetchFailure::Checksum { url } if *url == tampered),
-        "{error:?}"
-    );
-    // The bad bytes were never written, and nothing after them was fetched.
-    let path = models.file(&canned.specs[0], "model.onnx");
-    assert!(!path.exists(), "{} was written", path.display());
-    assert_eq!(fetcher.calls(), 1);
-    let entries = std::fs::read_dir(models.path().join(&canned.specs[0].dir))
-        .map(|entries| entries.count())
-        .unwrap_or(0);
-    assert_eq!(entries, 0, "a temp file was left behind");
-}
-
-#[test]
-fn fetch_stops_at_the_first_failure_and_keeps_what_it_wrote() {
-    let dir = TestDir::new();
-    let models = dir.models();
-    let canned = canned();
-    let mut fetcher = MapFetcher::new(canned.bytes.clone());
-    // The third file of the first model fails.
+    // The third file of the first model either has bytes that don't match
+    // the manifest or a source that is down.
     let failing = canned.specs[0].files[2].url.clone();
-    fetcher.failing.push(failing.clone());
+    let mut tampered = canned.bytes.clone();
+    tampered.insert(failing.clone(), b"not the model".to_vec());
+    type Expected = fn(&FetchFailure, &str) -> bool;
+    let checksum: Expected =
+        |error, failing| matches!(error, FetchFailure::Checksum { url } if url == failing);
+    let down: Expected = |error, failing| matches!(error, FetchFailure::Fetch { url, error: FetchError::Status(503) } if url == failing);
+    for (bytes, source_down, expected) in [
+        (tampered, false, checksum),
+        (canned.bytes.clone(), true, down),
+    ] {
+        let dir = TestDir::new();
+        let models = dir.models();
+        let mut fetcher = MapFetcher::new(bytes);
+        if source_down {
+            fetcher.failing.push(failing.clone());
+        }
 
-    let error = fetch_models(&models, &canned.specs, &fetcher).unwrap_err();
-    assert!(
-        matches!(&error, FetchFailure::Fetch { url, error: FetchError::Status(503) } if *url == failing),
-        "{error:?}"
-    );
-    assert_eq!(fetcher.calls(), 3);
-    assert!(models.file(&canned.specs[0], "model.onnx").exists());
-    assert!(models.file(&canned.specs[0], "tokenizer.json").exists());
-    assert!(!models.file(&canned.specs[0], "config.json").exists());
+        let error = fetch_models(&models, &canned.specs, &fetcher).unwrap_err();
+        assert!(expected(&error, &failing), "{error:?}");
+        assert_eq!(fetcher.calls(), 3, "{error:?}");
+        // The two files before it stay; the bad bytes were never written,
+        // and no temp file was left behind.
+        let mut entries: Vec<_> = std::fs::read_dir(models.path().join(&canned.specs[0].dir))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        entries.sort();
+        let mut kept = MODEL_FILES[..2].to_vec();
+        kept.sort();
+        assert_eq!(entries, kept, "{error:?}");
 
-    // Once the source recovers, the next run picks up where it stopped.
-    fetcher.failing.clear();
-    let report = fetch_models(&models, &canned.specs, &fetcher).unwrap();
-    assert_eq!(report.skipped.len(), 2);
-    assert_eq!(report.fetched.len(), 8);
+        // Once the source recovers, the next run picks up where it stopped.
+        fetcher.bytes = canned.bytes.clone();
+        fetcher.failing.clear();
+        let report = fetch_models(&models, &canned.specs, &fetcher).unwrap();
+        assert_eq!((report.fetched.len(), report.skipped.len()), (8, 2));
+    }
 }
 
-// Loading: never a download, and a missing file fails fast.
+// Loading: never a download, and a bad file fails fast.
 
 #[test]
-fn an_empty_model_dir_fails_fast_naming_the_first_missing_file() {
+fn loading_fails_fast_on_a_missing_or_corrupt_file() {
     let dir = TestDir::new();
     let models = dir.models();
-    let spec = &manifest()[0];
+    let manifest = manifest();
+    let expected = models.file(&manifest[0], "model.onnx");
 
     let error = Models::load(&models, &ModelOptions::default()).unwrap_err();
-    let expected = models.file(spec, "model.onnx");
     assert!(
         matches!(&error, ModelError::MissingFile { model, path } if model == EMBEDDING_MODEL_ID && *path == expected),
         "{error:?}"
     );
-    let message = error.to_string();
-    assert!(
-        message.contains(&expected.display().to_string()),
-        "{message}"
-    );
-    assert!(message.contains("asphodel models fetch"), "{message}");
     // Fail fast means fail without side effects: nothing was created.
     assert!(!models.path().exists(), "the loader created the model dir");
-}
 
-#[test]
-fn a_corrupt_file_fails_before_onnx_runtime_is_touched() {
     // Every file present, none with the manifest's bytes. The loader checks
     // checksums before building a session, so the error is ours and names
     // the file, not an ONNX Runtime message about a bad protobuf.
-    let dir = TestDir::new();
-    let models = dir.models();
-    let manifest = manifest();
     for spec in &manifest {
         for file in &spec.files {
             let path = models.file(spec, &file.name);
@@ -567,204 +462,73 @@ fn a_corrupt_file_fails_before_onnx_runtime_is_touched() {
             std::fs::write(&path, format!("garbage for {}", file.name)).unwrap();
         }
     }
-
     let error = Models::load(&models, &ModelOptions::default()).unwrap_err();
-    let expected = models.file(&manifest[0], "model.onnx");
     assert!(
         matches!(&error, ModelError::Checksum { model, path } if model == EMBEDDING_MODEL_ID && *path == expected),
         "{error:?}"
     );
-    assert!(
-        error.to_string().contains("asphodel models fetch"),
-        "{error}"
-    );
-}
-
-// The fakes.
-
-#[test]
-fn the_fake_embedder_is_deterministic_unit_length_and_384_wide() {
-    let embedder = FakeEmbedder;
-    assert_eq!(embedder.dimensions(), EMBEDDING_DIMENSIONS);
-
-    let texts = [
-        "Tim moved to Wellington in March.",
-        "Maya's birthday is on 14 June.",
-        "",
-    ];
-    let first = embedder.embed(&texts).unwrap();
-    assert_eq!(first.len(), 3);
-    for vector in &first {
-        assert_eq!(vector.len(), EMBEDDING_DIMENSIONS);
-        assert!((norm(vector) - 1.0).abs() < 1e-5, "norm {}", norm(vector));
-    }
-    // Twice, and from another instance, gives the same bytes.
-    let again = FakeEmbedder.embed(&texts).unwrap();
-    assert_eq!(first, again);
-    // One at a time matches the batch: no cross-text state.
-    let alone = embedder.embed(&[texts[1]]).unwrap();
-    assert_eq!(alone[0], first[1]);
-    assert!(embedder.embed(&[]).unwrap().is_empty());
-}
-
-#[test]
-fn the_fake_embedder_puts_texts_that_share_words_closer() {
-    let embedder = FakeEmbedder;
-    let vectors = embedder
-        .embed(&[
-            "red car parked outside",
-            "red car parked inside",
-            "Outside parked car red",
-            "quarterly tax filing deadline",
-        ])
-        .unwrap();
-    let same = cosine(&vectors[0], &vectors[0]);
-    let near = cosine(&vectors[0], &vectors[1]);
-    let far = cosine(&vectors[0], &vectors[3]);
-    assert!((same - 1.0).abs() < 1e-5, "{same}");
-    assert!(near > far, "near {near} far {far}");
-    assert!(near > 0.5, "three of four words shared: {near}");
-    // A bag of words: order and case don't matter.
-    assert!(
-        (cosine(&vectors[0], &vectors[2]) - 1.0).abs() < 1e-5,
-        "{}",
-        cosine(&vectors[0], &vectors[2])
-    );
-}
-
-#[test]
-fn the_fake_reranker_scores_by_query_words_in_the_document() {
-    let reranker = FakeReranker;
-    let query = "when is Maya's birthday";
-    let documents = [
-        "Maya's birthday is on 14 June.",
-        "Tim moved to Wellington in March.",
-        "Maya is Tim's sister.",
-    ];
-    let scores = reranker.rerank(query, &documents).unwrap();
-    assert_eq!(scores.len(), 3, "one logit per document, in order");
-    assert!(scores[0] > scores[2], "{scores:?}");
-    assert!(scores[2] > scores[1], "{scores:?}");
-    assert!(
-        scores[1] < 0.0,
-        "nothing shared scores below zero: {scores:?}"
-    );
-    assert_eq!(scores, FakeReranker.rerank(query, &documents).unwrap());
-    assert!(reranker.rerank(query, &[]).unwrap().is_empty());
 }
 
 // The service: recorded model ids and the floor check at startup.
 
 #[test]
-fn a_missing_floor_for_a_loaded_model_stops_the_service_opening() {
-    // A missing floor for a configured model stops the daemon.
-    // The check lives in the service so replay gets it too.
-    let dir = TestDir::new();
-    let error = Service::with_models(clock(), open_store(&dir), Tuning::default(), Models::fake())
-        .expect_err("opened without floors");
-    let OpenError::Config(ConfigError::Invalid(errors)) = error else {
-        panic!("{error}");
-    };
-    let keys: Vec<_> = errors.iter().map(|e| e.key.clone()).collect();
-    assert_eq!(
-        keys,
-        [
-            format!("reconcile.embedding_floors.\"{}\"", FakeEmbedder::MODEL_ID),
-            format!("injection.reranker_floors.\"{}\"", FakeReranker::MODEL_ID),
-            format!("ranking.relevance_scales.\"{}\"", FakeReranker::MODEL_ID),
-        ]
-    );
-}
-
-#[test]
-fn only_a_relevance_scale_for_the_exact_reranker_id_opens_the_service() {
-    // Like the floors, the relevance scale is keyed by the exact reranker
-    // model string, quantisation included, with no fallback.
-    let with_scale = |model: &str| {
-        Tuning::from_toml(&format!(
-            "[injection.reranker_floors]\n\"{}\" = 0.0\n\
-             [reconcile.embedding_floors]\n\"{}\" = 0.5\n\
-             [ranking.relevance_scales]\n\"{model}\" = 1.0\n",
-            FakeReranker::MODEL_ID,
-            FakeEmbedder::MODEL_ID,
-        ))
-        .unwrap()
-    };
-    for model in ["fake-reranker", "fake-reranker:v2", "FAKE-RERANKER:V1"] {
+fn the_service_opens_only_with_floors_for_the_exact_loaded_model_ids() {
+    // A missing floor or relevance scale for a loaded model stops the
+    // daemon. Each is keyed by the exact model string, quantisation
+    // included, with no fallback. The check lives in the service so replay
+    // gets it too.
+    let embedding_floor = format!("reconcile.embedding_floors.\"{}\"", FakeEmbedder::MODEL_ID);
+    let reranker_floor = format!("injection.reranker_floors.\"{}\"", FakeReranker::MODEL_ID);
+    let scale = format!("ranking.relevance_scales.\"{}\"", FakeReranker::MODEL_ID);
+    for (tuning, missing) in [
+        (
+            Tuning::default(),
+            vec![embedding_floor, reranker_floor, scale.clone()],
+        ),
+        (tuning("fake-reranker"), vec![scale.clone()]),
+        (tuning("fake-reranker:v2"), vec![scale.clone()]),
+        (tuning("FAKE-RERANKER:V1"), vec![scale]),
+        (tuning(FakeReranker::MODEL_ID), vec![]),
+    ] {
         let dir = TestDir::new();
-        let error =
-            Service::with_models(clock(), open_store(&dir), with_scale(model), Models::fake())
-                .expect_err(model);
-        let OpenError::Config(ConfigError::Invalid(errors)) = error else {
-            panic!("{error}");
+        let keys: Vec<String> = match open_service(&dir, tuning) {
+            Ok(_) => Vec::new(),
+            Err(OpenError::Config(ConfigError::Invalid(errors))) => {
+                errors.into_iter().map(|error| error.key).collect()
+            }
+            Err(error) => panic!("{error}"),
         };
-        let keys: Vec<_> = errors.iter().map(|e| e.key.clone()).collect();
-        assert_eq!(
-            keys,
-            [format!(
-                "ranking.relevance_scales.\"{}\"",
-                FakeReranker::MODEL_ID
-            )],
-            "{model}"
-        );
+        assert_eq!(keys, missing);
     }
-
-    let dir = TestDir::new();
-    Service::with_models(
-        clock(),
-        open_store(&dir),
-        with_scale(FakeReranker::MODEL_ID),
-        Models::fake(),
-    )
-    .unwrap();
 }
 
 #[test]
 fn a_new_bank_records_the_loaded_models() {
-    // a bank records its embedding and reranker model
-    // ids. They come from what's loaded, not from the caller.
-    let dir = TestDir::new();
-    let service = Service::with_models(
-        clock(),
-        open_store(&dir),
-        tuning_for_fakes(),
-        Models::fake(),
-    )
-    .unwrap();
-    let bank = service
-        .ensure_bank_with_models("tim", &BankIdentity::default())
-        .unwrap();
-    assert!(bank.created);
-    assert_eq!(bank.embedding_model, FakeEmbedder::MODEL_ID);
-    assert_eq!(bank.reranker_model, FakeReranker::MODEL_ID);
-
-    // A merge leaves the recorded ids alone: a change goes through
+    // A bank records the loaded embedding and reranker model ids, not the
+    // caller's, and a merge leaves them alone: a change goes through
     // `asphodel reembed`, never through bank config.
-    let again = service
-        .ensure_bank_with_models(
-            "tim",
-            &BankIdentity {
-                owner_name: Some("Tim".into()),
-                ..BankIdentity::default()
-            },
-        )
-        .unwrap();
-    assert!(!again.created);
-    assert_eq!(again.embedding_model, FakeEmbedder::MODEL_ID);
-    assert_eq!(again.reranker_model, FakeReranker::MODEL_ID);
+    let dir = TestDir::new();
+    let service = open_service(&dir, tuning(FakeReranker::MODEL_ID)).unwrap();
+    let merged = BankIdentity {
+        owner_name: Some("Tim".into()),
+        ..BankIdentity::default()
+    };
+    for (identity, created) in [(BankIdentity::default(), true), (merged, false)] {
+        let bank = service.ensure_bank_with_models("tim", &identity).unwrap();
+        assert_eq!(bank.created, created);
+        assert_eq!(bank.embedding_model, FakeEmbedder::MODEL_ID);
+        assert_eq!(bank.reranker_model, FakeReranker::MODEL_ID);
+    }
 }
-
-// LLM settings.
 
 #[test]
 fn llm_settings_come_from_the_tuning_file_and_the_environment() {
-    let tuning = Tuning::from_toml(
-        "[llm]\nmodel = \"some-model:q4_K_M\"\nendpoint = \"http://llm.internal:8080/v1\"\n",
-    )
-    .unwrap();
-    let settings = LlmSettings::from_config(&tuning, &deployment(Some("sk-live-41b2e8-secret")))
-        .unwrap()
-        .expect("configured");
+    let resolve = |toml: &str, key: Option<&str>| {
+        LlmSettings::from_config(&Tuning::from_toml(toml).unwrap(), &deployment(key))
+    };
+    let configured = |toml: &str, key| resolve(toml, key).unwrap().expect("configured");
+    let api = "[llm]\nmodel = \"some-model:q4_K_M\"\nendpoint = \"http://llm.internal:8080/v1\"\n";
+    let settings = configured(api, Some("sk-live-41b2e8-secret"));
     // Without `auth`, the mode is the API key one.
     assert_eq!(settings.auth, LlmAuth::ApiKey);
     assert_eq!(settings.endpoint, "http://llm.internal:8080/v1");
@@ -773,49 +537,37 @@ fn llm_settings_come_from_the_tuning_file_and_the_environment() {
         settings.api_key.as_ref().map(Secret::expose),
         Some("sk-live-41b2e8-secret")
     );
-    assert_eq!(settings.timeout, LlmSettings::DEFAULT_TIMEOUT);
-    // The key never shows in Debug output.
-    assert!(!format!("{settings:?}").contains("41b2e8"), "{settings:?}");
-
     // A local endpoint needs no key.
-    let local = LlmSettings::from_config(&tuning, &deployment(None))
-        .unwrap()
-        .expect("configured");
-    assert!(local.api_key.is_none());
-}
+    assert!(configured(api, None).api_key.is_none());
 
-#[test]
-fn llm_settings_are_absent_when_nothing_is_set_and_an_error_when_half_set() {
-    assert!(
-        LlmSettings::from_config(&Tuning::default(), &deployment(None))
-            .unwrap()
-            .is_none()
+    // The subscription mode needs no endpoint, takes one that is given, and
+    // carries a reasoning effort.
+    let subscription = "[llm]\nauth = \"chatgpt\"\nmodel = \"gpt-5.1\"\n";
+    let chatgpt = configured(&format!("{subscription}reasoning_effort = \"low\"\n"), None);
+    assert_eq!(chatgpt.auth, LlmAuth::Chatgpt);
+    assert_eq!(chatgpt.model, "gpt-5.1");
+    assert_eq!(chatgpt.reasoning_effort.as_deref(), Some("low"));
+    assert!(chatgpt.api_key.is_none());
+    let proxy = format!("{subscription}endpoint = \"https://proxy.internal/codex\"\n");
+    assert_eq!(
+        configured(&proxy, None).endpoint,
+        "https://proxy.internal/codex"
     );
 
-    let only_model = Tuning::from_toml("[llm]\nmodel = \"some-model\"\n").unwrap();
-    let error = LlmSettings::from_config(&only_model, &deployment(None)).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            LlmError::NotConfigured {
-                missing: "llm.endpoint"
-            }
-        ),
-        "{error:?}"
-    );
-
-    let only_endpoint =
-        Tuning::from_toml("[llm]\nendpoint = \"http://llm.internal:8080/v1\"\n").unwrap();
-    let error = LlmSettings::from_config(&only_endpoint, &deployment(None)).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            LlmError::NotConfigured {
-                missing: "llm.model"
-            }
-        ),
-        "{error:?}"
-    );
+    // Nothing set is no LLM; half set is an error. The model stays required
+    // in the subscription mode too: calibration runs against one model.
+    assert!(resolve("", None).unwrap().is_none());
+    for (toml, missing) in [
+        ("[llm]\nmodel = \"some-model\"\n", "llm.endpoint"),
+        ("[llm]\nendpoint = \"http://llm.internal\"\n", "llm.model"),
+        ("[llm]\nauth = \"chatgpt\"\n", "llm.model"),
+    ] {
+        let error = resolve(toml, None).unwrap_err();
+        assert!(
+            matches!(error, LlmError::NotConfigured { missing: got } if got == missing),
+            "{toml}: {error:?}"
+        );
+    }
 }
 
 // The OpenAI-compatible client, against the loopback stub.
@@ -829,17 +581,12 @@ fn the_client_posts_a_structured_chat_completion() {
     assert_eq!(client.model(), "some-model:q4_K_M");
 
     let response = client.complete(&request()).unwrap();
-    assert_eq!(
-        response.json,
-        json!({"claims": ["Tim moved to Wellington in March 2026."]})
-    );
-    assert_eq!(
-        response.usage,
-        Some(LlmUsage {
-            input_tokens: 41,
-            output_tokens: 7
-        })
-    );
+    let usage = LlmUsage {
+        input_tokens: 41,
+        output_tokens: 7,
+    };
+    let claims = json!({"claims": ["Tim moved to Wellington in March 2026."]});
+    assert_eq!((response.json, response.usage), (claims, Some(usage)));
     assert!(response.latency > Duration::ZERO);
 
     let sent = server.only_request();
@@ -849,153 +596,71 @@ fn the_client_posts_a_structured_chat_completion() {
         sent.header("authorization"),
         Some("Bearer sk-live-41b2e8-secret")
     );
+    let content_type = sent.header("content-type").unwrap_or_default();
     assert!(
-        sent.header("content-type")
-            .is_some_and(|value| value.starts_with("application/json")),
-        "{:?}",
-        sent.headers
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    // Not streamed.
+    assert_eq!(
+        serde_json::from_str::<Value>(&sent.body).unwrap(),
+        json!({
+            "model": "some-model:q4_K_M",
+            "messages": [
+                {"role": "system", "content": "You extract memories."},
+                {"role": "user", "content": "Tim said: I moved to Wellington in March."}
+            ],
+            "temperature": 0,
+            "max_tokens": 512,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "claims", "strict": true, "schema": request().schema}
+            }
+        })
     );
 
-    let body = sent.json();
-    assert_eq!(body["model"], "some-model:q4_K_M");
-    assert_eq!(
-        body["messages"],
-        json!([
-            {"role": "system", "content": "You extract memories."},
-            {"role": "user", "content": "Tim said: I moved to Wellington in March."}
-        ])
-    );
-    assert_eq!(body["temperature"], 0);
-    assert_eq!(body["max_tokens"], 512);
-    assert_eq!(body["response_format"]["type"], "json_schema");
-    assert_eq!(body["response_format"]["json_schema"]["name"], "claims");
-    assert_eq!(body["response_format"]["json_schema"]["strict"], true);
-    assert_eq!(
-        body["response_format"]["json_schema"]["schema"],
-        request().schema
-    );
-    assert!(
-        body.get("stream")
-            .is_none_or(|stream| stream == &json!(false)),
-        "{body}"
-    );
-}
-
-#[test]
-fn a_trailing_slash_on_the_endpoint_does_not_double_the_path() {
+    // A trailing slash on the endpoint doesn't double the path.
     let server = StubServer::start(StubResponse::completion("{}"));
-    let mut settings = server.settings(None);
-    settings.endpoint.push('/');
-    OpenAiCompatible::new(settings)
-        .complete(&request())
-        .unwrap();
+    complete_with(&server, |settings| settings.endpoint.push('/')).unwrap();
     assert_eq!(server.only_request().path, "/v1/chat/completions");
 }
 
 #[test]
-fn content_that_is_not_json_is_an_error_that_carries_only_its_size() {
-    let content = "Sure! Here are Tim's claims: he moved to Wellington.";
-    let server = StubServer::start(StubResponse::completion(content));
-    let error = OpenAiCompatible::new(server.settings(None))
-        .complete(&request())
-        .unwrap_err();
-    assert!(
-        matches!(error, LlmError::NotJson { bytes } if bytes == content.len()),
-        "{error:?}"
-    );
-    assert!(!error.is_retryable());
-    // no content in logs. The reply is Tim's data.
-    let shown = format!("{error} {error:?}");
-    assert!(!shown.contains("Wellington"), "{shown}");
-}
-
-#[test]
-fn no_choices_and_a_refusal_are_errors() {
-    let server = StubServer::start(StubResponse::json(json!({
-        "choices": [],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 0}
-    })));
-    let error = OpenAiCompatible::new(server.settings(None))
-        .complete(&request())
-        .unwrap_err();
-    assert!(matches!(error, LlmError::NoContent), "{error:?}");
-    assert!(!error.is_retryable());
-
-    let server = StubServer::start(StubResponse::json(json!({
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": null, "refusal": "I can't help with that."},
-            "finish_reason": "stop"
-        }]
-    })));
-    let error = OpenAiCompatible::new(server.settings(None))
-        .complete(&request())
-        .unwrap_err();
-    assert!(matches!(error, LlmError::Refused), "{error:?}");
-    assert!(!error.is_retryable());
-}
-
-#[test]
-fn http_statuses_map_to_retryable_or_not() {
-    for (status, retryable) in [
-        (400, false),
-        (401, false),
-        (404, false),
-        (408, true),
-        (429, true),
-        (500, true),
-        (502, true),
-        (503, true),
+fn reply_content_is_json_fenced_or_not_and_anything_else_is_an_error() {
+    for content in [
+        "{\"a\":1}",
+        "```json\n{\"a\":1}\n```",
+        "```\n{\"a\":1}\n```",
+        "  ```json\n{\"a\":1}\n```  ",
+        "```{\"a\":1}```",
     ] {
-        let server = StubServer::start(StubResponse::status(status));
-        let error = OpenAiCompatible::new(server.settings(None))
-            .complete(&request())
-            .unwrap_err();
-        assert!(
-            matches!(error, LlmError::Status { status: got } if got == status),
-            "{status}: {error:?}"
-        );
-        assert_eq!(error.is_retryable(), retryable, "{status}");
+        let response = complete(StubResponse::completion(content)).unwrap();
+        assert_eq!(response.json, json!({"a": 1}), "{content:?}");
+    }
+
+    let prose = "Sure! Here are Tim's claims: he moved to Wellington.";
+    let not_json = complete(StubResponse::completion(prose)).unwrap_err();
+    assert!(
+        matches!(not_json, LlmError::NotJson { bytes } if bytes == prose.len()),
+        "{not_json:?}"
+    );
+    // No content in logs: the reply is Tim's data.
+    let shown = format!("{not_json} {not_json:?}");
+    assert!(!shown.contains("Wellington"), "{shown}");
+
+    let no_choices = complete(StubResponse::json(json!({"choices": []}))).unwrap_err();
+    assert!(matches!(no_choices, LlmError::NoContent), "{no_choices:?}");
+    let refusal = json!({"role": "assistant", "content": null, "refusal": "I can't help."});
+    let reply = json!({"choices": [{"message": refusal}]});
+    let refused = complete(StubResponse::json(reply)).unwrap_err();
+    assert!(matches!(refused, LlmError::Refused), "{refused:?}");
+    for error in [not_json, no_choices, refused] {
+        assert!(!error.is_retryable(), "{error:?}");
     }
 }
 
-#[test]
-fn a_429_with_retry_after_in_seconds_is_a_rate_limit() {
-    // Seconds say when to come back, so every caller holds for that long
-    // and nothing is counted.
-    let server = StubServer::start(StubResponse::status(429).with_header("Retry-After", "30"));
-    let error = OpenAiCompatible::new(server.settings(None))
-        .complete(&request())
-        .unwrap_err();
-    assert!(
-        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::from_secs(30)),
-        "{error:?}"
-    );
-    assert!(!error.is_retryable(), "deferral, not a retry");
-
-    // A header that's neither seconds nor a date counts like none.
-    let server = StubServer::start(StubResponse::status(429).with_header("Retry-After", "soon"));
-    let error = OpenAiCompatible::new(server.settings(None))
-        .complete(&request())
-        .unwrap_err();
-    assert!(
-        matches!(error, LlmError::Status { status: 429 }),
-        "{error:?}"
-    );
-
-    // Retry-After on any other status changes nothing.
-    let server = StubServer::start(StubResponse::status(503).with_header("Retry-After", "30"));
-    let error = OpenAiCompatible::new(server.settings(None))
-        .complete(&request())
-        .unwrap_err();
-    assert!(
-        matches!(error, LlmError::Status { status: 503 }),
-        "{error:?}"
-    );
-}
-
 /// `Retry-After` as an HTTP date, the header's other form (RFC 9110).
-fn retry_after_date(from_now: jiff::SignedDuration) -> String {
+fn retry_after_date(from_now: SignedDuration) -> String {
     let at = asphodel_core::clock::SystemClock.now() + from_now;
     jiff::fmt::rfc2822::DateTimePrinter::new()
         .timestamp_to_rfc9110_string(&at)
@@ -1003,286 +668,103 @@ fn retry_after_date(from_now: jiff::SignedDuration) -> String {
 }
 
 #[test]
-fn a_429_with_retry_after_as_a_date_is_a_rate_limit_too() {
-    // A future date holds every caller until then, like seconds would; a
-    // date already past holds no time at all. Neither is counted.
-    let server = StubServer::start(StubResponse::status(429).with_header(
-        "Retry-After",
-        &retry_after_date(SignedDuration::from_mins(10)),
-    ));
-    let error = OpenAiCompatible::new(server.settings(None))
-        .complete(&request())
-        .unwrap_err();
-    assert!(
-        matches!(error, LlmError::RateLimited { retry_after }
-            if retry_after > Duration::from_secs(8 * 60) && retry_after <= Duration::from_secs(10 * 60)),
-        "{error:?}"
-    );
-    assert!(!error.is_retryable(), "deferral, not a retry");
-
-    let server = StubServer::start(StubResponse::status(429).with_header(
-        "Retry-After",
-        &retry_after_date(SignedDuration::from_mins(-10)),
-    ));
-    let error = OpenAiCompatible::new(server.settings(None))
-        .complete(&request())
-        .unwrap_err();
-    assert!(
-        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::ZERO),
-        "{error:?}"
-    );
+fn an_http_error_is_retried_or_held_or_neither() {
+    // A hold says when to come back, so every caller waits that long and
+    // nothing is counted: a deferral, not a retry. A Retry-After that's
+    // neither seconds nor a date counts like none, and on any status but
+    // 429 it changes nothing.
+    enum Expected {
+        Fatal,
+        Retry,
+        Hold(RangeInclusive<Duration>),
+    }
+    use Expected::*;
+    let secs = Duration::from_secs;
+    let after = |value: &str| Some(value.to_string());
+    let at = |mins| Some(retry_after_date(SignedDuration::from_mins(mins)));
+    let cases = [
+        (400, None, Fatal),
+        (401, None, Fatal),
+        (404, None, Fatal),
+        (408, None, Retry),
+        (429, None, Retry),
+        (500, None, Retry),
+        (502, None, Retry),
+        (503, None, Retry),
+        (429, after("30"), Hold(secs(30)..=secs(30))),
+        (429, after("soon"), Retry),
+        (503, after("30"), Retry),
+        (429, at(10), Hold(secs(8 * 60)..=secs(10 * 60))),
+        (429, at(-10), Hold(Duration::ZERO..=Duration::ZERO)),
+    ];
+    for (status, retry_after, expected) in cases {
+        let mut response = StubResponse::status(status);
+        if let Some(value) = &retry_after {
+            response = response.with_header("Retry-After", value);
+        }
+        let error = complete(response).unwrap_err();
+        let case = format!("{status} {retry_after:?}: {error:?}");
+        if let Hold(range) = &expected {
+            assert!(
+                matches!(&error, LlmError::RateLimited { retry_after } if range.contains(retry_after)),
+                "{case}"
+            );
+        } else {
+            assert!(
+                matches!(error, LlmError::Status { status: got } if got == status),
+                "{case}"
+            );
+        }
+        assert_eq!(error.is_retryable(), matches!(expected, Retry), "{case}");
+    }
 }
 
 #[test]
-fn a_slow_endpoint_times_out() {
-    let mut response = StubResponse::completion("{}");
-    response.delay = Duration::from_secs(3);
-    let server = StubServer::start(response);
-    let mut settings = server.settings(None);
-    settings.timeout = Duration::from_millis(200);
-    let error = OpenAiCompatible::new(settings)
-        .complete(&request())
-        .unwrap_err();
+fn a_slow_or_dead_endpoint_is_a_retryable_transport_failure() {
+    let mut slow = StubResponse::completion("{}");
+    slow.delay = Duration::from_secs(3);
+    let server = StubServer::start(slow);
+    let error = complete_with(&server, |settings| {
+        settings.timeout = Duration::from_millis(200)
+    })
+    .unwrap_err();
     assert!(matches!(error, LlmError::Timeout), "{error:?}");
     assert!(error.is_retryable());
-}
 
-#[test]
-fn a_dead_endpoint_is_a_retryable_transport_error() {
     // Bind and drop, so the port is closed.
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let settings = LlmSettings {
-        auth: LlmAuth::ApiKey,
-        endpoint: format!("http://127.0.0.1:{port}/v1"),
-        model: "some-model".into(),
-        reasoning_effort: None,
-        api_key: None,
-        timeout: Duration::from_secs(2),
-    };
-    let error = OpenAiCompatible::new(settings)
-        .complete(&request())
-        .unwrap_err();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed = listener.local_addr().unwrap();
+    drop(listener);
+    let error = complete_with(&server, |settings| {
+        settings.endpoint = format!("http://{closed}/v1")
+    })
+    .unwrap_err();
     assert!(matches!(error, LlmError::Transport { .. }), "{error:?}");
     assert!(error.is_retryable());
 }
 
-// The fake LLM.
-
-#[test]
-fn the_fake_llm_replies_in_order_and_records_requests() {
-    let fake = FakeLlm::scripted(
-        "fake-llm",
-        vec![json!({"claims": ["one"]}), json!({"claims": ["two"]})],
-    );
-    assert_eq!(fake.model(), "fake-llm");
-
-    let first = request();
-    let mut second = request();
-    second.user = "Tim said: and Maya's birthday is 14 June.".into();
-
-    assert_eq!(
-        fake.complete(&first).unwrap().json,
-        json!({"claims": ["one"]})
-    );
-    assert_eq!(
-        fake.complete(&second).unwrap().json,
-        json!({"claims": ["two"]})
-    );
-    let error = fake.complete(&first).unwrap_err();
-    assert!(matches!(error, LlmError::NoContent), "{error:?}");
-
-    assert_eq!(fake.requests(), vec![first, second.clone(), request()]);
-    assert_eq!(fake.requests()[1].user, second.user);
-}
-
-// The gate: the daemon's one way to the LLM.
-
-/// An LLM whose calls wait until the test lets one go, counting how many
-/// are in at once.
-#[derive(Default)]
-struct Held {
-    state: Mutex<HeldState>,
-    changed: Condvar,
-}
-
-#[derive(Default)]
-struct HeldState {
-    inside: usize,
-    most: usize,
-    released: usize,
-}
-
-impl Held {
-    fn wait_until(&self, holds: impl Fn(&HeldState) -> bool) {
-        let state = self.state.lock().unwrap();
-        let (state, timeout) = self
-            .changed
-            .wait_timeout_while(state, Duration::from_secs(5), |state| !holds(state))
-            .unwrap();
-        drop(state);
-        assert!(!timeout.timed_out(), "the calls never got there");
-    }
-
-    fn release(&self, calls: usize) {
-        self.state.lock().unwrap().released += calls;
-        self.changed.notify_all();
-    }
-}
-
-impl LlmClient for Held {
-    fn model(&self) -> &str {
-        "held"
-    }
-
-    fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let mut state = self.state.lock().unwrap();
-        state.inside += 1;
-        state.most = state.most.max(state.inside);
-        self.changed.notify_all();
-        while state.released == 0 {
-            state = self.changed.wait(state).unwrap();
-        }
-        state.released -= 1;
-        state.inside -= 1;
-        self.changed.notify_all();
-        Ok(LlmResponse {
-            json: json!({}),
-            usage: None,
-            latency: Duration::ZERO,
-        })
-    }
-}
-
-#[test]
-fn the_gate_lets_at_most_its_limit_of_calls_through_at_once() {
-    let inner = Arc::new(Held::default());
-    let gate = LlmGate::new(inner.clone(), 2, clock());
-    std::thread::scope(|scope| {
-        let calls: Vec<_> = (0..3)
-            .map(|_| scope.spawn(|| gate.complete(&request())))
-            .collect();
-        inner.wait_until(|state| state.inside == 2);
-        // The third waits in the gate, not in the LLM.
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(inner.state.lock().unwrap().inside, 2);
-
-        inner.release(1);
-        inner.wait_until(|state| state.inside == 2 && state.released == 0);
-        inner.release(2);
-        for call in calls {
-            call.join().unwrap().unwrap();
-        }
-    });
-    assert_eq!(inner.state.lock().unwrap().most, 2);
-}
-
-/// A scripted LLM behind a gate of two on a clock stopped at [`start`].
-fn gated(script: Value) -> (Arc<FakeLlm>, LlmGate, Arc<SimulatedClock>) {
-    let inner = Arc::new(FakeLlm::from_script("fake-llm", &script.to_string()).unwrap());
-    let clock = Arc::new(SimulatedClock::new(start()));
-    let gate = LlmGate::new(inner.clone(), 2, clock.clone());
-    (inner, gate, clock)
-}
-
-#[test]
-fn a_usage_limit_on_one_call_holds_every_call_refreshes_included_until_it_resets() {
-    let resets_at = start() + SignedDuration::from_hours(1);
-    let (inner, gate, clock) = gated(json!([
-        {"fail": "usage_limited", "resets_at": resets_at.to_string()},
-        {"reply": {"claims": []}},
-    ]));
-    let error = gate.complete(&request()).unwrap_err();
-    assert!(matches!(error, LlmError::UsageLimited { resets_at: at } if at == resets_at));
-
-    // An extraction call and a refresh call (which names its memories)
-    // both hold without reaching the LLM.
-    clock.advance(SignedDuration::from_mins(59));
-    let extraction = gate.complete(&request()).unwrap_err();
-    let refresh = gate.complete_identified(&request(), &[]).unwrap_err();
-    for error in [extraction, refresh] {
-        assert!(
-            matches!(error, LlmError::UsageLimited { resets_at: at } if at == resets_at),
-            "{error:?}"
-        );
-    }
-    assert_eq!(inner.requests().len(), 1, "held calls never reach the LLM");
-
-    clock.set(resets_at);
-    assert_eq!(
-        gate.complete(&request()).unwrap().json,
-        json!({"claims": []})
-    );
-    assert_eq!(inner.requests().len(), 2);
-}
-
-#[test]
-fn a_rate_limit_from_a_refresh_holds_extraction_for_what_is_left_of_it() {
-    let (inner, gate, clock) = gated(json!([
-        {"fail": "status", "status": 429, "retry_after_secs": 30},
-        {"reply": {"operations": []}},
-    ]));
-    let error = gate.complete_identified(&request(), &[]).unwrap_err();
-    assert!(
-        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::from_secs(30)),
-        "{error:?}"
-    );
-
-    clock.advance(SignedDuration::from_secs(10));
-    let error = gate.complete(&request()).unwrap_err();
-    assert!(
-        matches!(error, LlmError::RateLimited { retry_after } if retry_after == Duration::from_secs(20)),
-        "{error:?}"
-    );
-    assert_eq!(inner.requests().len(), 1);
-
-    clock.advance(SignedDuration::from_secs(20));
-    gate.complete(&request()).unwrap();
-    assert_eq!(inner.requests().len(), 2);
-}
-
-#[test]
-fn a_429_without_retry_after_holds_no_one() {
-    let (inner, gate, _clock) = gated(json!([
-        {"fail": "status", "status": 429},
-        {"reply": {"claims": []}},
-    ]));
-    let error = gate.complete(&request()).unwrap_err();
-    assert!(
-        matches!(error, LlmError::Status { status: 429 }),
-        "{error:?}"
-    );
-    gate.complete(&request()).unwrap();
-    assert_eq!(inner.requests().len(), 2);
-}
-
 // The real models. Ignored: they run only when the models are present.
 
-/// Where the real models are on this machine, resolved as the daemon would.
-fn real_model_dir() -> ModelDir {
+/// The real models on this machine, from the dir the daemon would resolve.
+fn real_models() -> Models {
     let env = |name: &str| std::env::var_os(name).map(PathBuf::from);
-    ModelDir::resolve(
+    let dir = ModelDir::resolve(
         env("ASPHODEL_MODEL_DIR").as_deref(),
         env("XDG_CACHE_HOME").as_deref(),
         env("HOME").as_deref(),
     )
-    .unwrap()
+    .unwrap();
+    let options = ModelOptions {
+        threads: std::num::NonZeroUsize::new(1),
+    };
+    Models::load(&dir, &options)
+        .unwrap_or_else(|error| panic!("loading from {}: {error}", dir.path().display()))
 }
 
 #[test]
 #[ignore = "needs the real models: run `asphodel models fetch`, or set ASPHODEL_MODEL_DIR"]
 fn real_models_embed_and_rerank() {
-    let dir = real_model_dir();
-    let models = Models::load(
-        &dir,
-        &ModelOptions {
-            threads: std::num::NonZeroUsize::new(1),
-        },
-    )
-    .unwrap_or_else(|error| panic!("loading from {}: {error}", dir.path().display()));
+    let models = real_models();
     assert_eq!(models.embedder.model_id(), EMBEDDING_MODEL_ID);
     assert_eq!(models.reranker.model_id(), RERANKER_MODEL_ID);
     assert_eq!(models.embedder.dimensions(), EMBEDDING_DIMENSIONS);
@@ -1294,9 +776,11 @@ fn real_models_embed_and_rerank() {
     ];
     let vectors = models.embedder.embed(&texts).unwrap();
     assert_eq!(vectors.len(), 3);
+    let cosine = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
     for vector in &vectors {
         assert_eq!(vector.len(), EMBEDDING_DIMENSIONS);
-        assert!((norm(vector) - 1.0).abs() < 1e-3, "norm {}", norm(vector));
+        let norm = cosine(vector, vector).sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "norm {norm}");
     }
     let near = cosine(&vectors[0], &vectors[1]);
     let far = cosine(&vectors[0], &vectors[2]);
@@ -1311,79 +795,12 @@ fn real_models_embed_and_rerank() {
     }
     assert!(models.embedder.embed(&[]).unwrap().is_empty());
 
-    let query = "where did the cat sit";
-    let scores = models.reranker.rerank(query, &texts).unwrap();
-    assert_eq!(
-        scores.len(),
-        3,
-        "one logit per document, in the documents' order"
-    );
-    assert!(scores[0] > scores[2], "{scores:?}");
-    assert!(scores[1] > scores[2], "{scores:?}");
-    assert!(scores.iter().all(|score| score.is_finite()), "{scores:?}");
-    assert!(models.reranker.rerank(query, &[]).unwrap().is_empty());
-}
-
-/// The real reranker scores a pair of at most 512 tokens, truncating the
-/// longer side first and from its end, and its tokenizer makes each CJK
-/// character a token. So a query whose context runs past the budget loses
-/// whatever comes after it, and what comes first survives. Prefetch's
-/// conversation query has to fit that; `TruncatingReranker` in
-/// `tests/retrieval.rs` models it.
-#[test]
-#[ignore = "needs the real models: run `asphodel models fetch`, or set ASPHODEL_MODEL_DIR"]
-fn real_reranker_truncates_a_long_query_from_its_end() {
-    let dir = real_model_dir();
-    let models = Models::load(
-        &dir,
-        &ModelOptions {
-            threads: std::num::NonZeroUsize::new(1),
-        },
-    )
-    .unwrap_or_else(|error| panic!("loading from {}: {error}", dir.path().display()));
-    let documents = ["Tim takes a pottery class on Tuesdays."];
-    let message = "when is my pottery class";
-    let context = "東京".repeat(300);
-    let score = |query: &str| models.reranker.rerank(query, &documents).unwrap()[0];
-
-    assert_eq!(
-        score(&format!("{context}\n{message}")),
-        score(&context),
-        "a message after 600 CJK tokens never reaches the model"
-    );
-    let first = score(&format!("{message}\n{context}"));
-    assert!(
-        first > score(&context) + 1.0,
-        "a message before the context does: {first}"
-    );
-}
-
-#[test]
-#[ignore = "needs the real L-6 models: run `asphodel models fetch`, or set ASPHODEL_MODEL_DIR"]
-fn real_model_reranker_matches_l6_reference_logits() {
-    let dir = real_model_dir();
-    let models = Models::load(
-        &dir,
-        &ModelOptions {
-            threads: std::num::NonZeroUsize::new(1),
-        },
-    )
-    .unwrap_or_else(|error| panic!("loading from {}: {error}", dir.path().display()));
-
     // Independent reference: Python onnxruntime 1.27.1, Xenova L-6 int8,
     // revision a09144355adeed5f58c8ed011d209bf8ee5a1fec. Keep each batch
     // intact and in this order: dynamic int8 activation ranges depend on
     // the other pairs in the batch, so scoring pairs separately differs.
     let batches: [(&str, &[&str], &[f32]); 2] = [
-        (
-            "where did the cat sit",
-            &[
-                "The cat sat on the mat.",
-                "A cat is sitting on a mat.",
-                "The quarterly tax filing deadline is in April.",
-            ],
-            &[5.9225, 3.2397, -11.1688],
-        ),
+        ("where did the cat sit", &texts, &[5.9225, 3.2397, -11.1688]),
         (
             "How many people live in Berlin?",
             &[
@@ -1407,4 +824,38 @@ fn real_model_reranker_matches_l6_reference_logits() {
             );
         }
     }
+    assert!(
+        models
+            .reranker
+            .rerank(batches[0].0, &[])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The real reranker scores a pair of at most 512 tokens, truncating the
+/// longer side first and from its end, and its tokenizer makes each CJK
+/// character a token. So a query whose context runs past the budget loses
+/// whatever comes after it, and what comes first survives. Prefetch's
+/// conversation query has to fit that; `TruncatingReranker` in
+/// `tests/retrieval.rs` models it.
+#[test]
+#[ignore = "needs the real models: run `asphodel models fetch`, or set ASPHODEL_MODEL_DIR"]
+fn real_reranker_truncates_a_long_query_from_its_end() {
+    let models = real_models();
+    let documents = ["Tim takes a pottery class on Tuesdays."];
+    let message = "when is my pottery class";
+    let context = "東京".repeat(300);
+    let score = |query: &str| models.reranker.rerank(query, &documents).unwrap()[0];
+
+    assert_eq!(
+        score(&format!("{context}\n{message}")),
+        score(&context),
+        "a message after 600 CJK tokens never reaches the model"
+    );
+    let first = score(&format!("{message}\n{context}"));
+    assert!(
+        first > score(&context) + 1.0,
+        "a message before the context does: {first}"
+    );
 }

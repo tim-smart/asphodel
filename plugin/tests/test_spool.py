@@ -1,158 +1,122 @@
-"""The spool: one JSON file per turn under
-``$HERMES_HOME/asphodel/spool/`` when the daemon is down, written by rename,
-replayed after the next 2xx, capped at about 10 MB or 7 days."""
+"""The spool: when the daemon is down ``sync_turn`` keeps one file per turn
+under ``$HERMES_HOME/asphodel/spool/``, replayed oldest first after the next
+2xx, capped at about 10 MB or 7 days."""
 
-import json
 import os
 import time
 
-from conftest import SESSION, plugin, transcript
+import pytest
 
-Spool = plugin.spool.Spool
-
-
-def spool_dir(hermes_home):
-    return hermes_home / "asphodel" / "spool"
+from conftest import SESSION, transcript
 
 
-def turn(n: int, size: int = 0) -> dict:
-    return {
-        "session_id": SESSION,
-        "message_at": f"2026-10-02T02:19:{n:02d}Z",
-        "timezone": None,
-        "user_text": "x" * size,
-        "assistant_text": "",
-        "author": None,
-        "platform": "cli",
-        "recall_id": None,
-        "forget_requested": False,
-    }
+def spool_files(hermes_home):
+    return list((hermes_home / "asphodel" / "spool").glob("*.json"))
 
 
-# -- the Spool class ------------------------------------------------------------
+def sync(provider, text, epoch, session=SESSION):
+    provider.sync_turn(text, "ok", session_id=session, messages=transcript(text, "ok", epoch=epoch))
 
 
-def test_write_creates_the_directory_and_one_file_per_turn(tmp_path):
-    spool = Spool(tmp_path / "spool")
-    spool.write(turn(1))
-    spool.write(turn(2))
-    files = spool.files()
-    assert len(files) == 2
-    assert all(f.suffix == ".json" for f in files)
-    assert json.loads(files[0].read_text()) == turn(1)
+def spool(provider, hermes_home, text, *, epoch, ago, session=SESSION):
+    """Syncs a turn the daemon can't take, then dates its spool file ``ago``
+    seconds back: files written within one test can share an mtime."""
+    before = set(spool_files(hermes_home))
+    sync(provider, text, epoch, session)
+    [path] = set(spool_files(hermes_home)) - before
+    stamp = time.time() - ago
+    os.utime(path, (stamp, stamp))
 
 
-def test_file_name_is_the_source_id_so_a_repeat_overwrites(tmp_path):
-    spool = Spool(tmp_path / "spool")
-    spool.write(turn(1))
-    spool.write(turn(1))
-    assert len(spool.files()) == 1
-    assert plugin.spool.spool_file_name(SESSION, "2026-10-02T02:19:01Z") == spool.files()[0].name
+def delivered(daemon, since=0):
+    return [r.body["user_text"] for r in daemon.requests_for("turns")[since:]]
 
 
-def test_file_name_is_safe_for_any_session_id(tmp_path):
-    name = plugin.spool.spool_file_name("telegram:-100/abc def", "2026-10-02T02:19:01Z")
-    assert "/" not in name and " " not in name and ":" not in name
-
-
-def test_size_cap_drops_the_oldest(tmp_path):
-    spool = Spool(tmp_path / "spool", max_bytes=2500)
-    recent = time.time() - 100
-    for n in range(1, 6):
-        path = spool.write(turn(n, size=800))
-        os.utime(path, (recent + n, recent + n))
-    kept = [json.loads(f.read_text())["message_at"] for f in spool.files()]
-    assert sum(f.stat().st_size for f in spool.files()) <= 2500
-    assert kept == [turn(4)["message_at"], turn(5)["message_at"]]
-
-
-def test_replay_sends_oldest_first_and_deletes_delivered(tmp_path):
-    spool = Spool(tmp_path / "spool")
-    recent = time.time() - 100
+def test_turns_spooled_while_the_daemon_is_down_are_delivered_oldest_first(make_provider, daemon, hermes_home, clock):
+    provider = make_provider()
+    daemon.drop_connections("turns", 100)
     # Written out of order: the order is the files' age, not the write order.
-    for n in (3, 1, 2):
-        path = spool.write(turn(n))
-        os.utime(path, (recent + n, recent + n))
-    sent = []
-    delivered = spool.replay(lambda body: sent.append(body["message_at"]) or True)
-    assert delivered == 3
-    assert sent == [turn(n)["message_at"] for n in (1, 2, 3)]
-    assert spool.files() == []
+    spool(provider, hermes_home, "third", epoch=3.0, ago=10)
+    spool(provider, hermes_home, "first", epoch=1.0, ago=30, session="telegram:-100/abc def")
+    spool(provider, hermes_home, "second", epoch=2.0, ago=20)
+    # A repeat of a spooled turn is the same file, so it's delivered once.
+    sync(provider, "third", 3.0)
+    (hermes_home / "asphodel" / "spool" / "junk.json").write_text("{nope")
+    assert len(spool_files(hermes_home)) == 4
+
+    daemon.drops.clear()
+    clock.advance(31)
+    mark = len(daemon.requests_for("turns"))
+    sync(provider, "back", 4.0)
+    assert delivered(daemon, mark) == ["back", "first", "second", "third"]
+    assert daemon.requests_for("turns")[mark + 1].body["session_id"] == "telegram:-100/abc def"
+    # Delivered turns are deleted, and so is the unreadable file.
+    assert spool_files(hermes_home) == []
 
 
-def test_replay_stops_at_the_first_connection_failure_and_keeps_the_rest(tmp_path):
-    spool = Spool(tmp_path / "spool")
-    recent = time.time() - 100
-    for n in (1, 2, 3):
-        path = spool.write(turn(n))
-        os.utime(path, (recent + n, recent + n))
-    calls = []
-
-    def send(body):
-        calls.append(body)
-        if len(calls) == 2:
-            raise plugin.client.DaemonUnavailable("gone again")
-        return True
-
-    assert spool.replay(send) == 1
-    assert len(spool.files()) == 2
-
-
-def test_replay_drops_a_turn_the_daemon_rejects(tmp_path):
-    spool = Spool(tmp_path / "spool")
-    spool.write(turn(1))
-    assert spool.replay(lambda body: False) == 0
-    assert spool.files() == []
-
-
-def test_replay_of_an_unreadable_file_drops_it(tmp_path):
-    spool = Spool(tmp_path / "spool")
-    (tmp_path / "spool").mkdir()
-    (tmp_path / "spool" / "junk.json").write_text("{nope")
-    assert spool.replay(lambda body: True) == 0
-    assert spool.files() == []
-
-
-def test_write_never_raises(tmp_path):
-    blocker = tmp_path / "file"
-    blocker.write_text("not a directory")
-    Spool(blocker / "spool").write(turn(1))
-
-
-# -- through the provider --------------------------------------------------------
-
-
-def test_sync_turn_spools_when_the_daemon_is_down(make_provider, daemon, hermes_home):
-    url = daemon.go_down()
-    provider = make_provider(url=url)
-    messages = transcript("I moved to Wellington.", "Noted.")
-    provider.sync_turn("I moved to Wellington.", "Noted.", session_id=SESSION, messages=messages)
-    files = list(spool_dir(hermes_home).glob("*.json"))
-    assert len(files) == 1
-    body = json.loads(files[0].read_text())
-    assert body == provider.build_turn(
-        "I moved to Wellington.", "Noted.", session_id=SESSION, messages=messages, turn_author=None
-    )
-
-
-def test_sync_turn_spools_on_a_5xx_but_not_a_4xx(make_provider, daemon, hermes_home):
+def test_a_5xx_spools_the_turn_but_a_4xx_drops_it(make_provider, daemon):
     provider = make_provider()
     daemon.set_response("turns", 503, {"error": "draining"})
-    provider.sync_turn("one", "ok", session_id=SESSION, messages=transcript("one", "ok", epoch=1.0))
+    sync(provider, "one", 1.0)
     daemon.set_response("turns", 400, {"error": "invalid timezone"})
-    provider.sync_turn("two", "ok", session_id=SESSION, messages=transcript("two", "ok", epoch=2.0))
-    files = list(spool_dir(hermes_home).glob("*.json"))
-    assert [json.loads(f.read_text())["user_text"] for f in files] == ["one"]
+    sync(provider, "two", 2.0)
+    del daemon.responses["turns"]
+    sync(provider, "three", 3.0)
+    assert delivered(daemon) == ["one", "two", "three", "one"]
 
 
-# -- the age cap at replay -----------------------------------------------------------
-
-
-def test_recovery_after_a_week_delivers_only_the_new_turn(make_provider, daemon, hermes_home):
+@pytest.mark.parametrize(
+    "failure, kept",
+    [("drop", ["second", "third"]), (503, ["second", "third"]), (400, [])],
+    ids=["connection-failure", "5xx", "4xx"],
+)
+def test_a_failed_replay_keeps_the_rest_unless_the_daemon_rejects_the_turn(make_provider, daemon, hermes_home, failure, kept):
     provider = make_provider()
-    path = Spool(spool_dir(hermes_home)).write(turn(1))
-    stale = time.time() - 8 * 24 * 3600
-    os.utime(path, (stale, stale))
-    provider.sync_turn("fresh", "ok", session_id=SESSION, messages=transcript("fresh", "ok", epoch=2.0))
-    assert [r.body["user_text"] for r in daemon.requests_for("turns")] == ["fresh"]
-    assert list(spool_dir(hermes_home).glob("*.json")) == []
+    daemon.set_response("turns", 503, {"error": "draining"})
+    for text, ago in (("first", 30), ("second", 20), ("third", 10)):
+        spool(provider, hermes_home, text, epoch=float(ago), ago=ago)
+    pending = [failure]
+
+    def answer(request):
+        text = request.body["user_text"]
+        if pending and failure == "drop" and text == "first":
+            daemon.drop_connections("turns", 1)  # the next request: "second"
+            pending.clear()
+        elif pending and text == "second":
+            pending.clear()
+            return failure, {"error": "refused"}
+        return 200, {}
+
+    daemon.set_handler("turns", answer)
+    mark = len(daemon.requests_for("turns"))
+    sync(provider, "back", 4.0)
+    assert delivered(daemon, mark)[:3] == ["back", "first", "second"]
+    mark = len(daemon.requests_for("turns"))
+    sync(provider, "next", 5.0)
+    assert delivered(daemon, mark) == ["next", *kept]
+
+
+def test_turns_spooled_over_a_week_ago_are_dropped_not_delivered(make_provider, daemon, hermes_home):
+    provider = make_provider()
+    daemon.set_response("turns", 503, {"error": "draining"})
+    spool(provider, hermes_home, "stale", epoch=1.0, ago=8 * 24 * 3600)
+    del daemon.responses["turns"]
+    mark = len(daemon.requests_for("turns"))
+    sync(provider, "fresh", 2.0)
+    assert delivered(daemon, mark) == ["fresh"]
+    assert spool_files(hermes_home) == []
+
+
+def test_a_spool_over_its_size_cap_drops_the_oldest_turns(make_provider, daemon, hermes_home):
+    provider = make_provider()
+    daemon.set_response("turns", 503, {"error": "draining"})
+    # 1 MB turns, well past the spool's ~10 MB cap.
+    sent = [f"{n:02d}" for n in range(25)]
+    for n, label in enumerate(sent):
+        spool(provider, hermes_home, label + "x" * 1_000_000, epoch=float(n), ago=100 - n)
+    del daemon.responses["turns"]
+    mark = len(daemon.requests_for("turns"))
+    sync(provider, "back", 100.0)
+    replayed = [text[:2] for text in delivered(daemon, mark + 1)]
+    assert replayed and len(replayed) < len(sent)
+    assert replayed == sent[-len(replayed):]

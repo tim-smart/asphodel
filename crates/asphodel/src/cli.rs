@@ -470,8 +470,9 @@ pub enum ModelCommand {
     /// unless `--force`.
     Refresh(ModelRefreshArgs),
 
-    /// Show a model's entries with the memories each cites and whether the
-    /// block shows it.
+    /// Show a model's summary as the block reads it, each section a
+    /// heading and a paragraph. `--entry` shows one entry with the memories
+    /// it cites and whether the block shows it.
     Show(ModelShowArgs),
 }
 
@@ -486,7 +487,8 @@ pub struct ModelShowArgs {
     /// The model's name.
     pub name: String,
 
-    /// Only this entry, by id.
+    /// Only this entry, by id, with its id, the memories it cites and
+    /// whether the block shows it. `--json` lists every entry's id.
     #[arg(long)]
     pub entry: Option<String>,
 }
@@ -1699,13 +1701,16 @@ fn model(command: ModelCommand) -> anyhow::Result<()> {
             if args.client.json {
                 return print_json(&view);
             }
-            print_model_view(&view);
+            print_model_view(&view, args.entry.is_some());
             Ok(())
         }
     }
 }
 
-fn print_model_view(view: &Value) {
+/// A model's view: its settings, then its summary as the block reads,
+/// each section a heading and one paragraph. With `detail`, as for
+/// `--entry`, each entry instead, with its id and what it cites.
+fn print_model_view(view: &Value, detail: bool) {
     let enabled = if view.get("enabled").and_then(Value::as_bool) == Some(false) {
         ", disabled"
     } else {
@@ -1744,7 +1749,26 @@ fn print_model_view(view: &Value) {
             text(view, "last_error_at")
         );
     }
-    for entry in list(view, "entry_views") {
+    let entries = list(view, "entry_views");
+    if !detail {
+        let shown: Vec<&Value> = entries
+            .iter()
+            .filter(|entry| entry.get("renders").and_then(Value::as_bool) == Some(true))
+            .collect();
+        print_summary(&shown);
+        let hidden = entries.len() - shown.len();
+        if hidden > 0 {
+            println!("  ({hidden} more not shown: a memory each cites isn't current; see --json)");
+        }
+        return;
+    }
+    let mut heading: Option<&str> = None;
+    for entry in entries {
+        let section = entry.get("section").and_then(Value::as_str);
+        if section.is_some() && section != heading {
+            println!("  ### {}", section.unwrap_or_default());
+        }
+        heading = section;
         let renders = if entry.get("renders").and_then(Value::as_bool) == Some(true) {
             ""
         } else {
@@ -1788,12 +1812,39 @@ fn print_model(model: &Value) {
             text(model, "last_error_at")
         );
     }
-    for entry in list(model, "entries") {
-        let cites: Vec<&str> = list(entry, "cites")
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        println!("  - {}  (cites {})", text(entry, "text"), cites.join(", "));
+    let entries = list(model, "entries");
+    print_summary(&entries.iter().collect::<Vec<_>>());
+}
+
+/// Entries as the block renders them: each section, in the order its
+/// heading first comes, as the heading and its sentences joined into one
+/// paragraph. An entry written before sections is a line of its own.
+fn print_summary(entries: &[&Value]) {
+    let mut groups: Vec<(Option<&str>, Vec<&str>)> = Vec::new();
+    for entry in entries {
+        let section = entry.get("section").and_then(Value::as_str);
+        let sentence = text(entry, "text");
+        let found = match section {
+            Some(_) => groups.iter_mut().find(|(heading, _)| *heading == section),
+            None => groups.last_mut().filter(|(heading, _)| heading.is_none()),
+        };
+        match found {
+            Some((_, sentences)) => sentences.push(sentence),
+            None => groups.push((section, vec![sentence])),
+        }
+    }
+    for (heading, sentences) in groups {
+        match heading {
+            Some(heading) => {
+                println!("  ### {heading}");
+                println!("  {}", sentences.join(" "));
+            }
+            None => {
+                for sentence in sentences {
+                    println!("  - {sentence}");
+                }
+            }
+        }
     }
 }
 

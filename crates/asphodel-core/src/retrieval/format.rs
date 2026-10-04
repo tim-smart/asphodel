@@ -1,10 +1,12 @@
-//! The injection's text.
+//! Injection and recall-tool text.
 //!
 //! Hermes replays an injection verbatim on every later turn, so nothing in
 //! it is relative to the moment it was made except the header's own time:
 //! annotations give absolute dates, and a state's age comes with the date
 //! it's counted from. The sentence is the stored content verbatim, so
-//! Hermes' identical-bullet dedup works, and there are no memory ids.
+//! Hermes' identical-bullet dedup works, and injection has no memory ids.
+//! Explicit recall shares the annotations but prefixes each line with its id
+//! and labels its kind, weak strength and kept status.
 //!
 //! ```text
 //! Recalled Wed 1 Oct 10:42
@@ -17,6 +19,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use super::candidates::Candidate;
+use super::{Band, band};
 use crate::constants::STATE_AGE_SHOWN_BELOW;
 use crate::strength::{Kind, Phase, TimePrecision, WorldTime};
 
@@ -32,12 +35,68 @@ pub(crate) fn header(now: Timestamp, tz: &TimeZone) -> String {
 
 /// One memory's line: `- <sentence>`, then its annotations in brackets.
 pub(crate) fn line(candidate: &Candidate, now: Timestamp) -> String {
-    let annotations = annotations(candidate, now);
-    if annotations.is_empty() {
-        format!("- {}", candidate.content)
-    } else {
-        format!("- {} [{}]", candidate.content, annotations.join("; "))
+    line_parts(candidate, now).render()
+}
+
+/// A memory's line before it's rendered, so a caller short of room can
+/// shorten the sentence and keep the annotations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Line {
+    pub sentence: String,
+    pub annotations: Vec<String>,
+}
+
+impl Line {
+    pub(crate) fn render(&self) -> String {
+        format!("- {}{}", self.sentence, self.suffix(self.annotations.len()))
     }
+
+    /// The first `count` annotations in brackets, with the space before
+    /// them, or nothing when there are none to show.
+    pub(crate) fn suffix(&self, count: usize) -> String {
+        let shown = &self.annotations[..count.min(self.annotations.len())];
+        if shown.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", shown.join("; "))
+        }
+    }
+}
+
+/// [`line`] in parts.
+pub(crate) fn line_parts(candidate: &Candidate, now: Timestamp) -> Line {
+    Line {
+        sentence: candidate.content.clone(),
+        annotations: annotations(candidate, now),
+    }
+}
+
+/// A recall-tool line starts with the unchanged id for the owner tools.
+/// It shares injection annotations but also exposes kind and weak strength.
+pub(crate) fn recall_line(candidate: &Candidate, now: Timestamp, strong_cutoff: f64) -> String {
+    let kind = match candidate.window.kind {
+        Kind::Fact => "fact",
+        Kind::State => "state",
+        Kind::Event => "event",
+        Kind::Task => "task",
+        Kind::Recurring => "recurring",
+    };
+    let mut labels = vec![kind.to_owned()];
+    match band(candidate.strength, strong_cutoff) {
+        Band::Strong => {}
+        Band::Fading => labels.push("fading".to_owned()),
+        Band::Faded => labels.push("faded".to_owned()),
+    }
+    if candidate.kept {
+        labels.push("kept".to_owned());
+    }
+    labels.extend(annotations(candidate, now));
+    format!(
+        "{} {} [{}]",
+        candidate.uuid,
+        candidate.content,
+        labels.join("; ")
+    )
 }
 
 /// The block: the header, then one line per memory, in score order.
@@ -94,6 +153,12 @@ fn annotations(candidate: &Candidate, now: Timestamp) -> Vec<String> {
 /// [`STATE_AGE_SHOWN_BELOW`], and `None` otherwise. A
 /// mental model entry citing such a state shows it too.
 pub(crate) fn state_age(candidate: &Candidate, now: Timestamp) -> Option<String> {
+    state_observed(candidate, now).map(|age| format!("observed {age}"))
+}
+
+/// [`state_age`] without its verb, `4 days ago, Sat 27 Sep`, for a mental
+/// model's paragraph to say "as of".
+pub(crate) fn state_observed(candidate: &Candidate, now: Timestamp) -> Option<String> {
     if candidate.window.kind != Kind::State || candidate.state_confidence >= STATE_AGE_SHOWN_BELOW {
         return None;
     }
@@ -109,7 +174,7 @@ pub(crate) fn state_age(candidate: &Candidate, now: Timestamp) -> Option<String>
         .last_observed
         .to_zoned(candidate.tz.clone())
         .strftime("%a %-d %b");
-    Some(format!("observed {ago}, {on}"))
+    Some(format!("{ago}, {on}"))
 }
 
 /// A stored time as its precision allows: `Thu 3 Oct 15:00`, `Sat 12 Sep`,

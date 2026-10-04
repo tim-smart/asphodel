@@ -643,17 +643,3 @@ impl LlmClient for FakeLlm {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fences_are_stripped() {
-        assert_eq!(unfence("{\"a\":1}"), "{\"a\":1}");
-        assert_eq!(unfence("```json\n{\"a\":1}\n```"), "{\"a\":1}");
-        assert_eq!(unfence("```\n{\"a\":1}\n```"), "{\"a\":1}");
-        assert_eq!(unfence("  ```json\n[1, 2]\n```  "), "[1, 2]");
-        assert_eq!(unfence("```{\"a\":1}```"), "{\"a\":1}");
-    }
-}

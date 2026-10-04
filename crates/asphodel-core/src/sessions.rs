@@ -11,9 +11,12 @@
 //!   them. A set no turn acknowledges never enters the in-context set, which
 //!   covers a prefetch Hermes timed out on; it waits until
 //!   [`PENDING_PER_SESSION`] newer ones push it out, or the session idles.
+//!   A prefetch's agenda update is held the same way, with the bank-local
+//!   date it brought the agenda up to, and committing it records that date
+//!   as the session's agenda date.
 //! - **The in-context set** is what the agent can already see this session:
-//!   committed injections and recall-tool results (and, once it exists, the
-//!   agenda). Injection skips it, and it's cleared on compaction. Extraction
+//!   committed injections and recall-tool results, the memories its block
+//!   lists or cites, and committed agenda updates. Injection skips it, and it's cleared on compaction. Extraction
 //!   judges `used` against the set as each turn's sync left it,
 //!   which ingest stores with the turn ([`Sessions::after_turn`]), never
 //!   against the session as it is when the worker gets there.
@@ -24,6 +27,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, MutexGuard};
 
+use jiff::civil::Date;
 use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
 
@@ -47,6 +51,9 @@ struct Session {
     in_context: Vec<Uuid>,
     /// Oldest first.
     pending: Vec<Pending>,
+    /// The latest bank-local date a committed agenda update brought the
+    /// agenda up to.
+    agenda_date: Option<Date>,
     touched_at: Timestamp,
 }
 
@@ -54,6 +61,8 @@ struct Session {
 struct Pending {
     recall_id: Uuid,
     memories: Vec<Uuid>,
+    /// The date of the agenda update the prefetch sent, if it sent one.
+    agenda_date: Option<Date>,
 }
 
 impl Sessions {
@@ -77,14 +86,30 @@ impl Sessions {
         }
     }
 
+    /// The latest date a committed agenda update brought the session's
+    /// agenda up to, if one has.
+    pub(crate) fn agenda_date(
+        &self,
+        bank_id: i64,
+        session_id: &str,
+        now: Timestamp,
+    ) -> Option<Date> {
+        let sessions = self.live(now);
+        sessions
+            .get(&(bank_id, session_id.to_owned()))
+            .and_then(|session| session.agenda_date)
+    }
+
     /// Holds `memories` as a pending injection under `recall_id`, alongside
-    /// any others still waiting for their turn.
+    /// any others still waiting for their turn, with the date of the agenda
+    /// update it carries, if any.
     pub(crate) fn hold(
         &self,
         bank_id: i64,
         session_id: &str,
         recall_id: Uuid,
         memories: Vec<Uuid>,
+        agenda_date: Option<Date>,
         now: Timestamp,
     ) {
         let mut sessions = self.live(now);
@@ -92,6 +117,7 @@ impl Sessions {
         session.pending.push(Pending {
             recall_id,
             memories,
+            agenda_date,
         });
         if session.pending.len() > PENDING_PER_SESSION {
             let dropped = session.pending.remove(0);
@@ -130,7 +156,8 @@ impl Sessions {
     }
 
     /// A turn arrived echoing `recall_id`: commits the pending injection
-    /// held under that id. A missing or unknown id changes nothing.
+    /// held under that id, and the date of its agenda update. A missing or
+    /// unknown id changes nothing.
     pub(crate) fn turn(
         &self,
         bank_id: i64,
@@ -150,6 +177,7 @@ impl Sessions {
         {
             let pending = session.pending.remove(index);
             add(&mut session.in_context, &pending.memories);
+            session.agenda_date = session.agenda_date.max(pending.agenda_date);
         }
     }
 
@@ -216,6 +244,7 @@ fn session<'a>(
         .or_insert_with(|| Session {
             in_context: Vec::new(),
             pending: Vec::new(),
+            agenda_date: None,
             touched_at: now,
         });
     session.touched_at = now;
