@@ -309,6 +309,59 @@ fn an_access_made_while_fresh_fades_faster() {
     let s = strength_at(0.0, &[created(0.0), mentioned(1.0)], 2.0);
     assert_near(s.recent_use, (2f64.powf(-A) + 1.5).ln(), EXACT);
     assert_near(s.recent_use, 0.826_183_993_730_038_7, EXACT);
+
+    // Characterization values from the pre-optimization public API at e6aef75.
+    // Frequent use saturates decay; spaced use does not. The interrupted log
+    // goes cold for 30 world days before use resumes in a sparse bank.
+    // Pin the observable results, not how many terms the evaluator visits.
+    let frequent: Vec<_> = std::iter::once(created(0.0))
+        .chain((1..64).map(|i| used(f64::from(i) / 8.0)))
+        .collect();
+    let interrupted: Vec<_> = std::iter::once(created(0.0))
+        .chain((1..64).map(|i| used(f64::from(i) / 8.0 + if i >= 32 { 30.0 } else { 0.0 })))
+        .collect();
+    let spaced: Vec<_> = std::iter::once(created(0.0))
+        .chain((1..8).map(|i| used(f64::from(i) * 10.0)))
+        .collect();
+    let turns: Vec<_> = (0..80).map(|i| at(f64::from(i) * 2.0)).collect();
+    let sparse = BankTime::new(&turns, 0.1);
+    for (accesses, bank, last, recent, values, floor, occasions) in [
+        (
+            &frequent,
+            always_on(),
+            7.875,
+            [7.857_381_279_415_587, -1.713_119_013_790_818_8],
+            [8.607_381_279_415_588, -0.963_119_013_790_818_8],
+            -2.133_407_575_382_443_5,
+            3,
+        ),
+        (
+            &interrupted,
+            sparse.clone(),
+            37.875,
+            [9.782_789_249_409_618, -0.933_130_127_362_564_6],
+            [10.532_789_249_409_618, -0.183_130_127_362_564_62],
+            -1.903_261_917_421_019,
+            4,
+        ),
+        (
+            &spaced,
+            sparse,
+            70.0,
+            [2.700_413_755_656_164, -0.246_334_016_537_481_85],
+            [3.450_413_755_656_164, 0.503_665_983_462_518_1],
+            -1.348_744_172_973_062_7,
+            8,
+        ),
+    ] {
+        for (i, horizon) in [0.02, 180.0].into_iter().enumerate() {
+            let s = strength(0.3, accesses, None, &bank, at(last + horizon));
+            assert_near(s.recent_use, recent[i], EXACT);
+            assert_near(s.value, values[i], EXACT);
+            assert_near(s.lasting_floor, floor, EXACT);
+            assert_eq!(s.occasions, occasions);
+        }
+    }
 }
 
 #[test]
