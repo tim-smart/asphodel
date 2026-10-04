@@ -27,7 +27,7 @@ use asphodel_core::models::{
 };
 use asphodel_core::retrieval::{
     Band, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, clean_query,
-    effective_query, estimate_tokens, fuse, phase_term,
+    conversation_query, effective_query, estimate_tokens, fuse, phase_term,
 };
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::{OpenOptions, Store, VectorIndex, micros};
@@ -482,6 +482,30 @@ impl Harness {
                     session_id: session.into(),
                     query: query.into(),
                     previous_query: previous.map(Into::into),
+                    previous_reply: None,
+                    block_id: None,
+                },
+            )
+            .unwrap()
+    }
+
+    /// A prefetch sent with the previous message and the start of the
+    /// assistant's reply to it.
+    fn prefetch_in_conversation(
+        &self,
+        session: &str,
+        query: &str,
+        previous: Option<&str>,
+        reply: Option<&str>,
+    ) -> Prefetch {
+        self.service
+            .prefetch(
+                BANK,
+                &PrefetchRequest {
+                    session_id: session.into(),
+                    query: query.into(),
+                    previous_query: previous.map(Into::into),
+                    previous_reply: reply.map(Into::into),
                     block_id: None,
                 },
             )
@@ -800,6 +824,104 @@ fn a_short_follow_up_finds_what_the_previous_query_asked_about() {
     assert_eq!(followed.injected, vec![dentist]);
 }
 
+// Reranking against the conversation
+
+/// Fake models and a gate floor of 1.0, with the reranker scoring against
+/// the conversation.
+fn in_conversation() -> Harness {
+    Harness::with(
+        1.0,
+        "rerank_query = \"conversation\"",
+        Arc::new(FakeReranker),
+    )
+}
+
+#[test]
+fn the_conversation_query_is_the_previous_message_the_reply_and_the_message() {
+    let message = "go ahead and order one with that account please";
+    assert_eq!(
+        conversation_query(
+            message,
+            Some("Can you add batteries to the shopping doc?"),
+            Some("Added them. Which account should I order with?"),
+        ),
+        "Can you add batteries to the shopping doc?\n\
+         Added them. Which account should I order with?\n\
+         go ahead and order one with that account please"
+    );
+    assert_eq!(conversation_query(message, None, None), message);
+    assert_eq!(conversation_query(message, Some("  "), Some("")), message);
+}
+
+#[test]
+fn the_conversation_query_takes_only_the_start_of_a_long_reply() {
+    let reply = format!(
+        "Your flight departs at nine. {}Tailword.",
+        "There is more detail after this. ".repeat(400)
+    );
+    let query = conversation_query("remind me", Some("What's on?"), Some(&reply));
+    assert!(
+        query.starts_with("What's on?\nYour flight departs at nine."),
+        "{query}"
+    );
+    assert!(query.ends_with("\nremind me"), "{query}");
+    assert!(!query.contains("Tailword"), "{query}");
+}
+
+/// The default stays as it was: a message of eight words or more is
+/// reranked alone, whatever came before it.
+#[test]
+fn by_default_the_reranker_sees_only_the_message() {
+    let h = Harness::new();
+    let _passkey = h.insert(fact("Tim signs in to Fastmail with a passkey."));
+    let prefetch = h.prefetch_in_conversation(
+        "s",
+        "go ahead and do that for me right now please",
+        Some("Can you sign in to Fastmail for me?"),
+        Some("Sure, signing in to Fastmail now."),
+    );
+    assert!(prefetch.injected.is_empty(), "{prefetch:?}");
+}
+
+/// A message that doesn't name its subject finds the memory the previous
+/// message makes relevant.
+#[test]
+fn reranking_against_the_conversation_finds_what_the_previous_message_named() {
+    let h = in_conversation();
+    let passkey = h.insert(fact("Tim signs in to Fastmail with a passkey."));
+    let message = "go ahead and do that for me right now please";
+    assert!(h.prefetch("alone", message).injected.is_empty());
+
+    let prefetch = h.prefetch_in_conversation(
+        "s",
+        message,
+        Some("Can you sign in to Fastmail for me?"),
+        None,
+    );
+    assert_eq!(prefetch.injected, vec![passkey]);
+}
+
+/// The assistant's reply carries what the message leans on when the
+/// previous message didn't name it either.
+#[test]
+fn reranking_against_the_conversation_finds_what_the_reply_named() {
+    let h = in_conversation();
+    let flight = h.insert(fact("Tim's flight to Wellington departs from gate four."));
+    let message = "remind me two hours before that leaves so I can pack";
+    let previous = Some("Anything on this week?");
+
+    let without = h.prefetch_in_conversation("a", message, previous, None);
+    assert!(without.injected.is_empty(), "{without:?}");
+
+    let with = h.prefetch_in_conversation(
+        "b",
+        message,
+        previous,
+        Some("Your flight to Wellington departs Friday at nine."),
+    );
+    assert_eq!(with.injected, vec![flight]);
+}
+
 // Cleaning the query
 
 /// The note Hermes' Discord gateway puts in front of a turn's message, with
@@ -1048,6 +1170,7 @@ fn the_floor_gates_on_the_raw_logit_whatever_the_relevance_scale() {
                     session_id: "s".into(),
                     query: "pottery class schedule".into(),
                     previous_query: None,
+                    previous_reply: None,
                     block_id: None,
                 },
             )

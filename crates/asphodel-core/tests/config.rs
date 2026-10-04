@@ -410,6 +410,19 @@ fn extraction_guidance_is_unset_by_default_and_must_not_be_empty() {
 }
 
 #[test]
+fn the_rerank_query_is_the_message_by_default_and_can_be_the_conversation() {
+    let rerank_query = |tuning: &Tuning| {
+        serde_json::to_value(tuning).unwrap()["injection"]["rerank_query"].clone()
+    };
+    // Unset, the reranker scores against the message, as it always has.
+    assert_eq!(rerank_query(&Tuning::default()), "message");
+    // The overrides file switches it, as replay's A/B runs need.
+    let layered = layers(&["", "[injection]\nrerank_query = \"conversation\"\n"]).unwrap();
+    assert_eq!(rerank_query(&layered), "conversation");
+    assert_rejected("[injection]\nrerank_query = \"thread\"\n");
+}
+
+#[test]
 fn embedding_floors_must_be_cosines() {
     // floors inside the model's score range.
     for value in ["1.5", "-1.01", "nan", "inf"] {

@@ -522,6 +522,127 @@ fn labelling_material_holds_scored_candidates_at_50_turns_and_call2_lists() {
     );
 }
 
+/// Tim's home turn, then a session whose second message leans on the
+/// first exchange: only the assistant's reply names Auckland.
+const ASKED: &str = "Can you check the weather for me?";
+const ANSWERED: &str = "Auckland is sunny today.";
+const LEANING: &str = "great, should I bring a jacket when I go out later";
+
+fn conversation_history(dir: &TestDir) -> PathBuf {
+    let state_db = dir.private_path("state.db");
+    let db = StateDb::create(&state_db);
+    let start = epoch("2026-01-05T09:00:00Z");
+    db.session("s1", "discord", Some("discord:1"), None, start);
+    db.turn(
+        "s1",
+        start,
+        &format!("{}, near the harbour.", hermes::HOME_QUOTE),
+        "Noted.",
+    );
+    let later = start + 3600.0;
+    db.session("s2", "discord", Some("discord:1"), None, later);
+    db.turn("s2", later, ASKED, ANSWERED);
+    db.turn("s2", later + 300.0, LEANING, "Yes, a light one.");
+    drop(db);
+    let corpus = dir.private_path("corpus/main.jsonl");
+    assert_ok(&support::import(dir, &state_db, &corpus));
+    corpus
+}
+
+/// The material of a live run on `corpus` with the labelling stand-in and
+/// `extra` flags.
+fn material_of(dir: &TestDir, corpus: &Path, name: &str, extra: &[&str]) -> (Value, Value) {
+    let script = labelling_script(dir);
+    let path = dir.private_path(&format!("labelling/{name}.json"));
+    let mut flags = vec!["--labelling", path.to_str().unwrap()];
+    flags.extend_from_slice(extra);
+    let run = replay_history(
+        dir,
+        corpus,
+        "live",
+        PASSING_PROBES,
+        name,
+        Some(&script),
+        &flags,
+    );
+    assert_ok(&run.output);
+    let material = serde_json::from_slice(&fs::read(&path).expect("the material is written"))
+        .expect("the material is JSON");
+    (run.report(), material)
+}
+
+/// The sample for the turn whose message is `message`.
+fn sample_for<'a>(material: &'a Value, message: &str) -> &'a Value {
+    material["recall"]
+        .as_array()
+        .expect("a recall list")
+        .iter()
+        .find(|sample| sample["raw_query"] == message)
+        .unwrap_or_else(|| panic!("a sample for {message:?}: {material}"))
+}
+
+/// Each sample records both queries: `query`, the message the vector and
+/// BM25 arms searched, and `rerank_query`, what the reranker scored
+/// against. By default they're the same.
+#[test]
+fn by_default_the_material_records_the_message_as_the_rerank_query() {
+    let dir = TestDir::new();
+    let corpus = conversation_history(&dir);
+    let (_, material) = material_of(&dir, &corpus, "message", &[]);
+    for sample in material["recall"].as_array().unwrap() {
+        assert_eq!(sample["rerank_query"], sample["query"], "{sample}");
+    }
+    let leaning = sample_for(&material, LEANING);
+    assert_eq!(leaning["query"], LEANING);
+}
+
+/// With `[injection] rerank_query = "conversation"` in the overrides, replay
+/// reranks against the previous message, the start of the assistant's reply
+/// to it from the corpus, and the message. The material records that query
+/// beside the message, and scores candidates against it, so the existing
+/// labels, keyed by memory, can be read against either run.
+#[test]
+fn replay_can_rerank_against_the_conversation_and_records_both_queries() {
+    let dir = TestDir::new();
+    let corpus = conversation_history(&dir);
+    let overrides = dir.private_file(
+        "conversation.toml",
+        "[injection]\nrerank_query = \"conversation\"\n",
+    );
+    let (report, material) = material_of(
+        &dir,
+        &corpus,
+        "conversation",
+        &["--overrides", overrides.to_str().unwrap()],
+    );
+    assert_eq!(
+        report["tuning"]["injection"]["rerank_query"], "conversation",
+        "the report says which query the reranker scored against"
+    );
+
+    let leaning = sample_for(&material, LEANING);
+    assert_eq!(leaning["query"], LEANING, "the arms search the message");
+    let rerank_query = leaning["rerank_query"]
+        .as_str()
+        .expect("the sample records the rerank query");
+    assert_eq!(rerank_query, format!("{ASKED}\n{ANSWERED}\n{LEANING}"));
+
+    let home = candidates(leaning)
+        .iter()
+        .find(|candidate| candidate["sentence"] == hermes::HOME_SENTENCE)
+        .expect("the home memory is a candidate");
+    let score = home["score"].as_f64().unwrap();
+    assert_eq!(score, fake_logit(rerank_query, hermes::HOME_SENTENCE));
+    assert!(
+        score > fake_logit(LEANING, hermes::HOME_SENTENCE),
+        "the reply's Auckland lifts the home memory: {home}"
+    );
+
+    // The first message of a session has no conversation before it.
+    let asked = sample_for(&material, ASKED);
+    assert_eq!(asked["rerank_query"], ASKED);
+}
+
 /// The material is written after the run, so a `--labelling` path that is
 /// also one of the run's inputs or outputs would replace that file with
 /// material: a paid cassette, the corpus, the probes, the report or the
