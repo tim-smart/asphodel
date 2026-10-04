@@ -1073,6 +1073,8 @@ function cutReason(reason, { injection, limit }) {
       return `Over the budget: its line would take the block past ${injection?.token_budget ?? "the"} tokens.`;
     case "over_limit":
       return `Ranked past the limit of ${limit}.`;
+    case "outside_rerank_pool":
+      return "Fused too far down for the reranker to see it.";
     default:
       return reason;
   }
@@ -1436,8 +1438,8 @@ function explainResults(ctx, explained, sent, timeZone) {
       "p",
       { class: "hint" },
       isInjection
-        ? "A memory missing from both lists wasn't found by any search arm."
-        : "A memory missing from both lists wasn't found by any search arm, or the filters dropped it.",
+        ? "A memory missing from both lists wasn't in any search arm's top hits."
+        : "A memory missing from both lists wasn't in any search arm's top hits, or the filters dropped it.",
     ),
   );
 

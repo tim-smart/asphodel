@@ -847,13 +847,17 @@ parts (relevance, w_s × strength, state confidence, phase), its strength
 band and whether it's kept. Each row links to the memory's page. What made
 the cut comes first. What didn't is greyed out underneath with the reason:
 
+- both modes: fused too far down for the reranker to see it. Only the top
+  of the fused list is reranked; the rest is listed in fusion order with
+  its arm and fused ranks, and no logit or score
 - recall: ranked past the limit
 - injection: strength below τ, a logit under the floor, over the cap, over
   the token budget, or a reranker that missed its deadline, in which case
   nothing passes
 
-Recall mode doesn't list what its filters dropped, so a memory missing from
-both lists either wasn't found by any arm or was filtered out. The page also
+Each search arm keeps only its top hits, and recall mode doesn't list what
+its filters dropped. So a memory missing from both lists either wasn't in
+any arm's top hits or was filtered out. The page also
 shows how long embedding, retrieval, reranking and the whole run took, so a
 slow reranker is visible.
 
