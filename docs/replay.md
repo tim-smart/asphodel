@@ -676,10 +676,10 @@ The material is one JSON object:
   `[Name] ` speaker prefix, after a short follow-up borrowed the previous
   message. Keyed recall labels name it. `rerank_query` is what the
   reranker scored against, which the scores and so calibration follow.
-  It's `query` by default; with `[injection]
-  rerank_query = "conversation"` in `--overrides` it's the start of the
-  previous message, the start of the assistant's reply to it, and the
-  message, one per line (see "Reranking against the conversation" below).
+  It's `query` by default; with `[injection] rerank_query =
+  "conversation"` in `--overrides` it's the message, the start of the
+  previous message, and the start of the assistant's reply to it, one per
+  line (see "Reranking against the conversation" below).
   `raw_query` is the message as Hermes sent it, for reading beside it.
   Material written before they were recorded has no `rerank_query` or
   `raw_query`, and `report precision` still reads it.
@@ -785,16 +785,25 @@ file and line, never the text.
 `[injection] rerank_query` decides what prefetch's reranker scores
 candidates against. `"message"`, the default, is the message itself, or
 for a short follow-up the previous message and then the message.
-`"conversation"` is, for every prefetch, the previous message, the start of
-the assistant's reply to it, and the message, one per line, leaving out any
-that's missing. The previous message and the reply are each cut to their
-first 300 characters at a word boundary, so the reranker's 512-token pair
-keeps room for the message and the memory. Vector search and BM25 search
-the message under either setting.
+`"conversation"` is, for every prefetch, the message, the start of the
+previous message, and the start of the assistant's reply to it, one per
+line, leaving out empty or missing parts. The previous message and the
+reply are each cut to their first 300 Unicode characters, cutting back to
+the last whitespace boundary when available. This is a character limit,
+not a token budget: 600 characters of CJK context can cost 600 tokens.
+
+The current message is not cut when building the query. It comes first so
+the reranker's right-side truncation removes trailing context before any
+of the message. The 512-token limit applies to the query and memory pair,
+including special tokens, with the longer side truncated first. A long
+message can still be truncated, and added context can reduce how much of
+the memory survives. There is no reserved token allowance for either.
+Vector search and BM25 use the same effective message query under either
+setting, including the previous message for short follow-ups.
 
 The plugin doesn't send the reply yet, so in production the conversation
-query has the previous message only. Replay takes the reply from the
-corpus.
+query has only the previous message as added context. Replay takes the
+reply from the corpus.
 
 A conversation run injects differently, so call 1's requests change and
 `replay` misses the cassette. Run it in `fast`.

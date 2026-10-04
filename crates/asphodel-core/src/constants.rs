@@ -186,8 +186,10 @@ pub const SHORT_FOLLOW_UP_WORDS: usize = 8;
 
 /// The conversation query keeps at most this many characters of the
 /// previous message, and of the assistant's reply, cut back to the last
-/// whole word. Together they stay near 150 tokens, so a reranker that
-/// truncates the pair at 512 keeps room for the message and the memory.
+/// whitespace boundary when available. This is not a token budget: CJK
+/// text can cost a token per character. The current message comes first
+/// so right-side truncation removes trailing context before the message,
+/// but a long message and the memory side of the pair can still be cut.
 pub const RERANK_CONTEXT_CHARS: usize = 300;
 
 /// The confidence term's floor, `max(−3, ln(state_confidence))`, so a stale

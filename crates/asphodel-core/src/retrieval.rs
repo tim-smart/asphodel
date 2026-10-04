@@ -424,17 +424,19 @@ pub fn effective_query(message: &str, previous: Option<&str>) -> String {
     }
 }
 
-/// The query a conversation-wide rerank scores against: the start of the
-/// previous message, the start of the assistant's reply to it, then the
-/// message, one per line, leaving out any that's empty. Each start is at
-/// most [`RERANK_CONTEXT_CHARS`] characters. The message is kept whole.
+/// The query a conversation-wide rerank scores against: the current
+/// message, the start of the previous message, then the start of the
+/// assistant's reply to it, one per line, leaving out any that's empty.
+/// Each context start is at most [`RERANK_CONTEXT_CHARS`] characters. The
+/// message is kept whole here, but the model may truncate the pair.
 pub fn conversation_query(message: &str, previous: Option<&str>, reply: Option<&str>) -> String {
     let context = [previous, reply]
         .into_iter()
         .flatten()
         .map(|text| start_of(text.trim(), RERANK_CONTEXT_CHARS));
-    context
-        .chain([message.trim()])
+    [message.trim()]
+        .into_iter()
+        .chain(context)
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
