@@ -2727,6 +2727,26 @@ fn an_oversized_first_item_is_cut_at_a_word_and_keeps_its_date() {
 }
 
 #[test]
+fn a_sentence_ending_in_trimmable_punctuation_still_fits_the_update_budget() {
+    // A shortened start drops trailing punctuation before its "…", so a long
+    // run of it measures as nothing while the whole sentence is far over.
+    let h = Harness::new();
+    h.block(Some("s1"));
+    let long = sentence(format!("Tim has an appointment {}", "-".repeat(1200)));
+    h.insert(event(long, "2026-10-03T00:00"));
+
+    let update = update_section(&prefetch(&h, "s1", "hello there").text).to_owned();
+    let budget = h.tuning.agenda.update_budget as usize;
+    assert!(
+        estimate_tokens(&update) <= budget,
+        "the update is {} tokens, over {budget}:\n{update}",
+        estimate_tokens(&update)
+    );
+    let line = line_starting(&update, "Tim has an appointment");
+    assert!(line.ends_with(" [upcoming Sat 3 Oct]"), "{line}");
+}
+
+#[test]
 fn a_word_with_no_boundary_is_cut_safely_in_any_script() {
     // One long word after a short start, in ASCII and in multi-byte text:
     // the cut falls inside the word, on a character, keeping the date.
