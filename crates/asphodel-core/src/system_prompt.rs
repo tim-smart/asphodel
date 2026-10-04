@@ -11,8 +11,8 @@
 //!   routines, least-ranked first, then dated lines in the agenda's fold
 //!   order. The models fill what's left, oldest first, each with its
 //!   entries in stored order until the next doesn't fit. A model's entries
-//!   render as its sections, each a heading and a paragraph; entries from
-//!   before sections are lines. What the block lists, cites and keeps by
+//!   render as one paragraph under its heading and question, including
+//!   entries from before sections. What the block lists, cites and keeps by
 //!   id is only what it rendered.
 //!
 //! - **The cache.** One block per bank, in memory, rebuilt lazily on the
@@ -370,11 +370,10 @@ impl Shown {
     }
 }
 
-/// An entry as the block renders it: a sentence of its section's
-/// paragraph, including entries written before sections.
+/// An entry as the block renders it: a sentence of the model's paragraph,
+/// including entries written before sections.
 #[derive(Clone)]
 struct Piece {
-    section: Option<String>,
     text: String,
 }
 
@@ -384,34 +383,15 @@ pub(crate) fn heading_line(heading: &str) -> String {
     format!("### {heading}")
 }
 
-/// A model's text: its heading and question, then each section in the order its heading
-/// first comes, as the heading's line and its sentences joined as one
-/// paragraph. A heading with nothing under it never renders. Entries with
-/// no section are joined into a paragraph. Budget trials use this same renderer.
+/// A model's heading and question, then its sentences in stored order as one
+/// paragraph. Budget trials use this same renderer.
 fn render_model(name: &str, question: &str, pieces: &[Piece]) -> String {
-    let mut groups: Vec<(Option<&str>, Vec<&str>)> = Vec::new();
-    for piece in pieces {
-        let section = piece.section.as_deref();
-        let found = match section {
-            Some(_) => groups.iter_mut().find(|(heading, _)| *heading == section),
-            None => groups.last_mut().filter(|(heading, _)| heading.is_none()),
-        };
-        match found {
-            Some((_, texts)) => texts.push(&piece.text),
-            None => groups.push((section, vec![&piece.text])),
-        }
-    }
-    let mut lines = vec![format!("### {name}\n\nPrompt:\n{question}\n\nOutput:")];
-    for (heading, texts) in groups {
-        match heading {
-            Some(heading) => {
-                lines.push(heading_line(heading));
-                lines.push(texts.join(" "));
-            }
-            None => lines.push(texts.join(" ")),
-        }
-    }
-    lines.join("\n")
+    let answer = pieces
+        .iter()
+        .map(|piece| piece.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("### {name}\n\nPrompt:\n{question}\n\nOutput:\n{answer}")
 }
 
 /// An entry's piece, or `None` when any memory it cites is retracted,
@@ -462,10 +442,7 @@ fn entry_piece(
         (None, Some(age)) => format!("{} [observed {age}]", entry.text),
         (None, None) => entry.text.clone(),
     };
-    Ok(Some(Piece {
-        section: entry.section.clone(),
-        text,
-    }))
+    Ok(Some(Piece { text }))
 }
 
 /// Records that `session` holds `block`, with what it puts in context. A
