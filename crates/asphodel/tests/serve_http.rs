@@ -1421,7 +1421,7 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     daemon.wait_extracted("main");
 
     // Only "User profile" is seeded, empty and never refreshed.
-    let models = daemon.ok(daemon.get("/v1/banks/main/models"));
+    let models = daemon.ok(daemon.get("/v1/banks/main/models"))["models"].clone();
     assert_eq!(models.as_array().unwrap().len(), 1);
     assert_eq!(models[0]["name"], "User profile");
     assert_eq!(models[0]["entries"], json!([]));
@@ -1475,7 +1475,7 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
         daemon.ok(daemon.post("/v1/banks/main/models/User%20profile/refresh", &Value::Null));
     assert_eq!(unchanged["outcome"], "unchanged", "{unchanged}");
 
-    let profile = &daemon.ok(daemon.get("/v1/banks/main/models"))[0];
+    let profile = &daemon.ok(daemon.get("/v1/banks/main/models"))["models"][0];
     assert_eq!(profile["entries"][0]["text"], ENTRY);
     assert_eq!(profile["entries"][0]["cites"], json!([memory]));
     assert!(profile["last_refreshed_at"].is_string());
@@ -1517,6 +1517,53 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     assert_eq!(
         agenda,
         json!({"dated": [], "folded": 0, "routines": [], "undated_tasks": []})
+    );
+}
+
+/// The dashboard shows the enabled models' `max_tokens` against the budget,
+/// so the list carries the budget beside the models.
+#[test]
+fn the_model_list_carries_the_budget_and_enabling_past_it_changes_nothing() {
+    let dir = TestDir::new();
+    let daemon = Serve::new(&dir).ready();
+    daemon.create_bank("main");
+    // The profile takes 500 of the 800 tokens; a disabled model doesn't count.
+    let created = daemon.post(
+        "/v1/banks/main/models",
+        &json!({"name": "Plans", "question": "Where is Tim going?", "max_tokens": 301,
+                "enabled": false}),
+    );
+    assert_eq!(created.status, 201, "{}", created.body);
+
+    let listed = daemon.ok(daemon.get("/v1/banks/main/models"));
+    assert_eq!(listed["budget"], 800, "{listed}");
+    let enabled = |listed: &Value| -> Vec<(String, bool)> {
+        listed["models"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no models array: {listed}"))
+            .iter()
+            .map(|m| (m["name"].as_str().unwrap().to_owned(), m["enabled"] == true))
+            .collect()
+    };
+    let before = vec![
+        ("User profile".to_owned(), true),
+        ("Plans".to_owned(), false),
+    ];
+    assert_eq!(enabled(&listed), before);
+
+    let refused = daemon.send(
+        "PATCH",
+        "/v1/banks/main/models/Plans",
+        Some(&json!({"enabled": true})),
+    );
+    assert_eq!(refused.status, 422, "{}", refused.body);
+    assert_eq!(
+        refused.json()["error"],
+        "801 tokens is over the 800-token budget for mental models"
+    );
+    assert_eq!(
+        enabled(&daemon.ok(daemon.get("/v1/banks/main/models"))),
+        before
     );
 }
 
@@ -2544,6 +2591,8 @@ fn an_older_backup_restores_into_a_new_data_dir_and_migrates_with_a_copy() {
 // document id is never a path segment: a client normalizes `.` and `..`
 // out of a path, so the id it confirmed wouldn't be the one it sent. There
 // is no `DELETE` route for documents.
+// - `GET /v1/banks/{bank}/models` answers `{"models": [...], "budget": N}`,
+// `N` being `mental_models.budget`, for the models page's budget use.
 // - `GET /dashboard` is served without the token, since the page holds
 // nothing; every route it calls needs the token like any other.
 // - The page's module script, and every module it imports as "./name.js",
