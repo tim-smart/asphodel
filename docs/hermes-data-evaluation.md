@@ -517,7 +517,8 @@ so rather than improvise.
   aggregate).
 - Shipped: `injected_tokens` per session and per turn p50/p95, with cron
   apart; `call2_rate`; `llm.used_verdicts` by source (recorded, top-up,
-  live, none); `agenda_lines_per_day`; `bands_per_week`;
+  live, none); `injection_usage` (used, not used, unjudged and the used
+  fraction among judged memories); `agenda_lines_per_day`; `bands_per_week`;
   `fade_outs_per_week`; `purged_then_re_mentioned.rate`.
 - Shipped, for Tim's eyes: on the browse daemon (step 5), `asphodel
   recalls --bank main --limit 50` after the probe run, then `asphodel memory
@@ -612,6 +613,7 @@ from a report, any query, any name: if one is there, remove it.
 - probes: <passed>/<total>; failed ids: <p003, p007>
 - injected tokens per turn p50/p95: <n>/<n>; cron p95: <n>
 - used verdicts: recorded <n>, top-up <n>, live <n>, none <n>
+- injection usage: used <n>, not used <n>, unjudged <n>; used fraction <x.xx> (used / judged)
 - call2_rate: <x.xx> · agenda lines/day median: <n>
 - purged then re-mentioned: <purged>/<re_mentioned> (<rate>)
 - Tim's spot check of <n> recalls: <relevant>/<n> judged relevant

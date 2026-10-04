@@ -643,6 +643,14 @@ whether it was purged), and `llm` with `cache`, `top_up`, `live`,
 `primed`, `misses`, `used_verdicts` by source and `latency_ms`. A `live` run and the `replay`
 of its cassette differ only in `kind`, `flags`, `llm` and `cassette_hash`.
 
+Reports and aggregates also carry `injection_usage`: per-memory counts
+`used`, `not_used`, `unjudged` (verdict source `none`), and
+`used_fraction = used / (used + not_used)`. The fraction is `0.0` when no
+memories were judged; unjudged memories are excluded from its denominator.
+Counts cover the in-context memories of committed extraction chunks, so a
+memory judged in several chunks counts several times. Stale commit retries
+do not add another outcome. `report diff` compares all four numbers.
+
 `--aggregate <file>` writes the one thing that may leave the private dir. Its type has no string field but a probe's id: the run's kind
 is a set of booleans, days are days since the epoch, weeks are two
 integers, and the hashes and the git SHA are byte arrays. It carries

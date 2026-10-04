@@ -66,8 +66,8 @@ use uuid::Uuid;
 use super::cassette::{Chained, ChunkContext, ChunkKey, Recorder};
 use super::labelling::{Collector, Material};
 use super::report::{
-    Call2Rate, DayCount, InjectedTokens, Lag, LlmCounts, MemoryOutcome, Percentiles, ProbeResult,
-    SessionTokens, WeekBands, WeekCount,
+    Call2Rate, DayCount, InjectedTokens, InjectionUsage, Lag, LlmCounts, MemoryOutcome,
+    Percentiles, ProbeResult, SessionTokens, WeekBands, WeekCount,
 };
 use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX};
 use super::shadow::{Created, ShadowRow};
@@ -139,6 +139,7 @@ pub struct Outcome {
     pub extraction_lag: Lag,
     pub refresh_calls_per_day: Vec<DayCount>,
     pub injected_tokens: InjectedTokens,
+    pub injection_usage: InjectionUsage,
     pub profile_tokens: Percentiles,
     pub call2_rate: Call2Rate,
     pub agenda_lines_per_day: Vec<DayCount>,
@@ -299,6 +300,7 @@ pub struct Engine<'a> {
     previous_strengths: BTreeMap<Uuid, f64>,
     sessions: BTreeMap<String, SessionCount>,
     turn_tokens: Vec<u64>,
+    injection_usage: InjectionUsage,
     cron_prefetches: u64,
     cron_tokens: u64,
     profile_tokens: Vec<u64>,
@@ -379,6 +381,7 @@ impl<'a> Engine<'a> {
             previous_strengths: BTreeMap::new(),
             sessions: BTreeMap::new(),
             turn_tokens: Vec::new(),
+            injection_usage: InjectionUsage::default(),
             cron_prefetches: 0,
             cron_tokens: 0,
             profile_tokens: Vec::new(),
@@ -846,6 +849,14 @@ impl<'a> Engine<'a> {
             mine,
             ..
         } = ready;
+        // Keep the judged set before commit consumes the prepared chunk.
+        // Count only successful commits so stale retries don't double it.
+        let injected: BTreeSet<Uuid> = prepared
+            .call1_input()
+            .in_context
+            .iter()
+            .map(|memory| memory.memory)
+            .collect();
         let extracted = match self.service.try_commit_extraction(prepared)? {
             Committed::Extracted(extracted) => extracted,
             Committed::Stale(stale) => {
@@ -861,6 +872,12 @@ impl<'a> Engine<'a> {
                 }));
             }
         };
+        let used = injected
+            .iter()
+            .filter(|id| extracted.used.contains(id))
+            .count() as u64;
+        self.injection_usage.used += used;
+        self.injection_usage.not_used += injected.len() as u64 - used;
         let mut pending = self
             .pending
             .remove(&source)
@@ -1495,7 +1512,20 @@ impl<'a> Engine<'a> {
             },
             Llm::Recorded(recorder, _) => recorder.llm_counts(),
         };
+        let mut injection_usage = self.injection_usage;
+        // Successful runs currently judge every in-context memory: a miss
+        // either gets a top-up/live verdict or fails without a report.
+        // Keep the explicit none count apart from negative verdicts.
+        injection_usage.unjudged = llm.used_verdicts.none;
+        injection_usage.not_used -= injection_usage.unjudged;
+        let judged = injection_usage.used + injection_usage.not_used;
+        injection_usage.used_fraction = if judged == 0 {
+            0.0
+        } else {
+            injection_usage.used as f64 / judged as f64
+        };
         Ok(Outcome {
+            injection_usage,
             probes: self.probes,
             purges_per_day: self
                 .purges

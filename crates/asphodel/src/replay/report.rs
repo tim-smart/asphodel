@@ -46,6 +46,7 @@ pub struct Report {
     pub extraction_lag: Lag,
     pub refresh_calls_per_day: Vec<DayCount>,
     pub injected_tokens: InjectedTokens,
+    pub injection_usage: InjectionUsage,
     /// The tokens the mental models' entries hold, sampled daily.
     pub profile_tokens: Percentiles,
     pub call2_rate: Call2Rate,
@@ -261,6 +262,17 @@ pub struct UsedVerdicts {
     pub none: u64,
 }
 
+/// Per-memory outcomes across committed extraction chunks. Unjudged
+/// memories do not enter the fraction's denominator.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct InjectionUsage {
+    pub used: u64,
+    pub not_used: u64,
+    pub unjudged: u64,
+    /// Used / (used + not_used), or 0.0 when nothing was judged.
+    pub used_fraction: f64,
+}
+
 // The aggregate export.
 
 /// What may leave the private directory: probe ids and numbers. No field is a
@@ -285,6 +297,7 @@ pub struct Aggregate {
     pub extraction_lag: Lag,
     pub refresh_calls_per_day: Vec<EpochDayCount>,
     pub injected_tokens: AggregateTokens,
+    pub injection_usage: InjectionUsage,
     pub profile_tokens: Percentiles,
     pub call2_rate: Call2Rate,
     pub agenda_lines_per_day: Vec<EpochDayCount>,
@@ -434,6 +447,7 @@ impl Aggregate {
                 },
             },
             profile_tokens: report.profile_tokens.clone(),
+            injection_usage: report.injection_usage.clone(),
             call2_rate: Call2Rate {
                 chunks: report.call2_rate.chunks,
                 call2: report.call2_rate.call2,
