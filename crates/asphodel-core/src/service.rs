@@ -550,14 +550,13 @@ impl Service {
 
     /// Explain: one query through the recall or injection pipeline with
     /// its working shown, writing no recall row or access and touching no
-    /// session ([`crate::retrieval::Explain`]).
+    /// session, not even to restore one ([`crate::retrieval::Explain`]).
     pub fn explain(
         &self,
         bank: &str,
         request: &crate::retrieval::ExplainRequest,
     ) -> Result<crate::retrieval::Explain, RecallError> {
-        let _ = (bank, request);
-        todo!("TIM-165: explain runs the shared retrieval pipeline")
+        crate::retrieval::explain(&self.retrieval()?, bank, request)
     }
 
     /// The session's in-context set: the public ids of the memories the

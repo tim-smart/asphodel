@@ -182,6 +182,10 @@ _Avoid_: Claim (that's an extraction term), line, bullet, block
 Bringing a mental model up to date: one retrieval for its question, then one LLM call that returns edits to its entries. It runs shortly after a conversation adds or changes something the model would care about, and once a day besides, and only when the selected memories have changed.
 _Avoid_: Reflect, consolidation, rebuild, regenerate
 
+**Explain**:
+Running a query through recall or injection to see what each candidate scored and why it was or wasn't returned, without it counting as a recall: nothing is logged, nothing is accessed, and no session is read or changed.
+_Avoid_: Test recall, dry run, debug recall
+
 **In context**:
 Said of a memory the agent can already see this session: injected earlier, listed in the agenda, returned by the recall tool, or cited by an injected mental model. It isn't injected again, and extraction checks it for use.
 _Avoid_: Loaded, seen, in the context window

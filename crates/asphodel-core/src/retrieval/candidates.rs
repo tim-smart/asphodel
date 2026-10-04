@@ -58,8 +58,9 @@ pub(crate) struct Cleanup<'a> {
     now: Timestamp,
     /// Whether a hit's own row is retracted or hidden, by rowid.
     dropped_hits: BTreeMap<i64, bool>,
-    /// Each head's candidate, or `None` when it's dropped.
-    heads: BTreeMap<i64, Option<Candidate>>,
+    /// Each head's candidate and whether `keep` admitted it, or `None`
+    /// when it's dropped.
+    heads: BTreeMap<i64, Option<(Candidate, bool)>>,
     keep: &'a dyn Fn(&Candidate) -> bool,
 }
 
@@ -101,7 +102,37 @@ impl<'a> Cleanup<'a> {
     /// of [`Cleanup::list`].
     pub(crate) fn take(&mut self, ids: &[i64]) -> Vec<Candidate> {
         ids.iter()
-            .filter_map(|id| self.heads.get(id).cloned().flatten())
+            .filter_map(|id| match self.heads.get(id) {
+                Some(Some((candidate, true))) => Some(candidate.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The heads of `hits` that `keep` refused, best first, each once.
+    /// Every hit must have been through [`Cleanup::list`].
+    pub(crate) fn refused(&mut self, hits: &[i64]) -> Vec<i64> {
+        let mut ranked = Vec::new();
+        for &hit in hits {
+            if self.dropped_hits.get(&hit) != Some(&false) {
+                continue;
+            }
+            let head = self.chains.head(hit);
+            if matches!(self.heads.get(&head), Some(Some((_, false)))) && !ranked.contains(&head) {
+                ranked.push(head);
+            }
+        }
+        ranked
+    }
+
+    /// The refused candidates for `ids`, in that order. Every id must have
+    /// come out of [`Cleanup::refused`].
+    pub(crate) fn take_refused(&self, ids: &[i64]) -> Vec<Candidate> {
+        ids.iter()
+            .filter_map(|id| match self.heads.get(id) {
+                Some(Some((candidate, false))) => Some(candidate.clone()),
+                _ => None,
+            })
             .collect()
     }
 
@@ -120,11 +151,16 @@ impl<'a> Cleanup<'a> {
         }
         let head = self.chains.head(hit);
         if let Entry::Vacant(entry) = self.heads.entry(head) {
-            let candidate = load(self.conn, &self.strength, self.now, head)?
-                .filter(|candidate| (self.keep)(candidate));
+            let candidate = load(self.conn, &self.strength, self.now, head)?.map(|candidate| {
+                let admitted = (self.keep)(&candidate);
+                (candidate, admitted)
+            });
             entry.insert(candidate);
         }
-        Ok(self.heads[&head].as_ref().map(|candidate| candidate.id))
+        Ok(match &self.heads[&head] {
+            Some((candidate, true)) => Some(candidate.id),
+            _ => None,
+        })
     }
 }
 

@@ -31,6 +31,11 @@
 //! tokens. Every recall writes one row to the recall log ([`log`]) and none
 //! writes an access: being recalled never strengthens a memory. "Now" is
 //! always the service's clock.
+//!
+//! Recall and prefetch each work out their result in one function with no
+//! side effects, then log it and update the session. [`explain`] calls the
+//! same two functions and returns their working instead, so it can't drift
+//! from either ([`explain`](self::explain)).
 
 mod arms;
 pub(crate) mod candidates;
@@ -597,100 +602,47 @@ pub(crate) fn scored_prefetch(
     request: &PrefetchRequest,
 ) -> Result<ScoredPrefetch, RecallError> {
     let started = Instant::now();
-    let deadline = started + cx.deadline;
     let now = cx.store.now();
-    let message = clean_query(&request.query);
-    let previous = request.previous_query.as_deref().map(clean_query);
-    let query = effective_query(&message, previous.as_deref());
-    let rerank_query = match cx.tuning.injection.rerank_query {
-        RerankQuery::Message => query.clone(),
-        RerankQuery::Conversation => conversation_query(
-            &message,
-            previous.as_deref(),
-            request.previous_reply.as_deref(),
-        ),
-    };
     let (bank_id, bank_tz) = find_bank(cx.store, bank)?;
     let in_context: BTreeSet<Uuid> = cx
         .sessions
         .in_context(bank_id, &request.session_id, now)
         .into_iter()
         .collect();
+    let run = inject(
+        cx,
+        bank_id,
+        &bank_tz,
+        now,
+        started,
+        &Conversation {
+            message: &request.query,
+            previous_query: request.previous_query.as_deref(),
+            previous_reply: request.previous_reply.as_deref(),
+        },
+        &in_context,
+        false,
+    )?;
 
-    let keep =
-        |candidate: &Candidate| candidate.strength >= TAU && !in_context.contains(&candidate.uuid);
-    let found = gather(cx, bank_id, &query, now, &keep, None)?;
-    let documents = found.iter().map(|c| c.content.clone()).collect();
-    let logits = rerank::logits(
-        &cx.models.reranker,
-        cx.permit,
-        &rerank_query,
-        documents,
-        deadline,
-    );
-    let reranked = logits.is_some();
-    let ranking = &cx.tuning.ranking;
-    let ranked = rank(found, logits, |candidate, logit| {
-        let phase = phase_term(
-            &candidate.window,
-            candidate.low_confidence,
-            &candidate.tz,
-            now,
-            ranking,
-        );
-        score(
-            cx.reranking.relevance(logit),
-            ranking.w_s_inject,
-            candidate.strength,
-            candidate.state_confidence,
-            phase,
-        )
-    });
-
-    // The floor gates on the raw logit, not on relevance, so the floors
-    // and the logits in the labelling material stay comparable.
-    let floor = cx.reranking.floor;
-    let cap = cx.tuning.injection.cap as usize;
-    let budget = cx.tuning.injection.token_budget as usize;
-    let header = format::header(now, &bank_tz);
-    let mut lines = Vec::new();
-    let mut injected = Vec::new();
-    let mut logged = Vec::with_capacity(ranked.len());
-    let mut shown = Vec::with_capacity(ranked.len());
-    for item in &ranked {
-        // Past the deadline, or when the reranker fails, there's no logit,
-        // so nothing passes the gate and nothing is injected; the candidates
-        // are still logged.
-        let passes = item.logit.is_some_and(|logit| logit >= floor);
-        let mut take = false;
-        if passes && injected.len() < cap {
-            let line = format::line(&item.candidate, now);
-            let mut with = lines.clone();
-            with.push(line);
-            if estimate_tokens(&format::block(&header, &with)) <= budget {
-                lines = with;
-                take = true;
-            }
-        }
-        if take {
-            injected.push(item.candidate.uuid);
-        }
-        logged.push(Logged {
+    let logged: Vec<Logged> = run
+        .ranked
+        .iter()
+        .zip(&run.cuts)
+        .map(|(item, cut)| Logged {
             memory_id: item.candidate.id,
-            score: item.score,
-            injected: take,
-        });
-        shown.push(GateCandidate {
+            score: item.score(),
+            injected: cut.is_none(),
+        })
+        .collect();
+    let shown = run
+        .ranked
+        .iter()
+        .map(|item| GateCandidate {
             memory: item.candidate.uuid,
             sentence: item.candidate.content.clone(),
             logit: item.logit,
-        });
-    }
-    let text = if lines.is_empty() {
-        String::new()
-    } else {
-        format::block(&header, &lines)
-    };
+        })
+        .collect();
 
     let recall_id = cx.store.new_id();
     log::write(
@@ -700,7 +652,7 @@ pub(crate) fn scored_prefetch(
             bank_id,
             kind: RecallKind::Prefetch,
             session_id: Some(&request.session_id),
-            query: &query,
+            query: &run.query,
             raw_query: Some(&request.query),
             latency_ms: elapsed_ms(started),
             at: now,
@@ -711,26 +663,26 @@ pub(crate) fn scored_prefetch(
         bank_id,
         &request.session_id,
         recall_id,
-        injected.clone(),
+        run.injected.clone(),
         now,
     );
     tracing::debug!(
         bank = bank_id,
         recall = %recall_id,
         candidates = logged.len(),
-        injected = injected.len(),
-        reranked,
+        injected = run.injected.len(),
+        reranked = run.reranked,
         "prefetched"
     );
     Ok(ScoredPrefetch {
         prefetch: Prefetch {
             recall_id,
-            text,
-            injected,
-            reranked,
+            text: run.text,
+            injected: run.injected,
+            reranked: run.reranked,
         },
-        query,
-        rerank_query,
+        query: run.query,
+        rerank_query: run.rerank_query,
         raw_query: request.query.clone(),
         candidates: shown,
     })
@@ -746,66 +698,17 @@ pub(crate) fn recall(
     request: &RecallRequest,
 ) -> Result<Recall, RecallError> {
     let started = Instant::now();
-    let deadline = started + cx.deadline;
     let now = cx.store.now();
-    if let (Some(from), Some(to)) = (request.from, request.to)
-        && from > to
-    {
-        return Err(RecallError::InvertedRange);
-    }
-    let query = request.query.trim().to_owned();
-    let (bank_id, _) = find_bank(cx.store, bank)?;
-    let limit = request
-        .limit
-        .unwrap_or(RECALL_LIMIT_DEFAULT)
-        .clamp(1, RECALL_LIMIT_MAX);
-
-    let linked = match &request.entity {
-        Some(entity) => Some(entity_memories(cx.store, bank_id, entity)?),
-        None => None,
-    };
-    let keep = |candidate: &Candidate| {
-        (request.kinds.is_empty() || request.kinds.contains(&candidate.window.kind))
-            && linked
-                .as_ref()
-                .is_none_or(|ids| ids.contains(&candidate.id))
-            && request.phase.admits(candidate.phase)
-            && in_range(candidate, request)
-    };
-    let found = gather(cx, bank_id, &query, now, &keep, linked.as_ref())?;
-    let documents = found.iter().map(|c| c.content.clone()).collect();
-    let logits = rerank::logits(&cx.models.reranker, cx.permit, &query, documents, deadline);
-    let reranked = logits.is_some();
-    let ranking = &cx.tuning.ranking;
-    let with_phase = request.phase != PhaseFilter::Any;
-    let mut ranked = rank(found, logits, |candidate, logit| {
-        let phase = if with_phase {
-            phase_term(
-                &candidate.window,
-                candidate.low_confidence,
-                &candidate.tz,
-                now,
-                ranking,
-            )
-        } else {
-            0.0
-        };
-        score(
-            cx.reranking.relevance(logit),
-            ranking.w_s_recall,
-            candidate.strength,
-            candidate.state_confidence,
-            phase,
-        )
-    });
-    ranked.truncate(limit);
+    let run = recall_run(cx, bank, now, started, request)?;
+    let mut ranked = run.ranked;
+    ranked.truncate(run.limit);
 
     let strong_cutoff = cx.tuning.recall.strong_cutoff;
     let logged: Vec<Logged> = ranked
         .iter()
         .map(|item| Logged {
             memory_id: item.candidate.id,
-            score: item.score,
+            score: item.score(),
             injected: false,
         })
         .collect();
@@ -838,10 +741,10 @@ pub(crate) fn recall(
         &mut cx.store.connection(),
         &Entry {
             uuid: recall_id,
-            bank_id,
+            bank_id: run.bank_id,
             kind: RecallKind::Tool,
             session_id: request.session_id.as_deref(),
-            query: &query,
+            query: &run.query,
             raw_query: None,
             latency_ms: elapsed_ms(started),
             at: now,
@@ -850,20 +753,412 @@ pub(crate) fn recall(
     )?;
     if let Some(session_id) = &request.session_id {
         let ids: Vec<Uuid> = results.iter().map(|r| r.id).collect();
-        cx.sessions.add(bank_id, session_id, &ids, now);
+        cx.sessions.add(run.bank_id, session_id, &ids, now);
     }
     tracing::debug!(
-        bank = bank_id,
+        bank = run.bank_id,
         recall = %recall_id,
         results = results.len(),
-        reranked,
+        reranked = run.reranked,
         "recalled"
     );
     Ok(Recall {
         recall_id,
         results,
-        reranked,
+        reranked: run.reranked,
     })
+}
+
+/// Explain: [`recall`] or [`scored_prefetch`]'s pipeline with its working
+/// shown and none of their side effects ([`explain`](self::explain)). An
+/// injection runs as for a session with nothing in context.
+pub(crate) fn explain(
+    cx: &Context<'_>,
+    bank: &str,
+    request: &ExplainRequest,
+) -> Result<Explain, RecallError> {
+    let started = Instant::now();
+    let now = cx.store.now();
+    let strong_cutoff = cx.tuning.recall.strong_cutoff;
+    match request {
+        ExplainRequest::Recall(filters) => {
+            let request = RecallRequest {
+                session_id: None,
+                query: filters.query.clone(),
+                from: filters.from,
+                to: filters.to,
+                on: filters.on,
+                phase: filters.phase,
+                kinds: filters.kinds.clone(),
+                entity: filters.entity.clone(),
+                limit: filters.limit,
+            };
+            let run = recall_run(cx, bank, now, started, &request)?;
+            let candidates = run
+                .ranked
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let reason = (index >= run.limit).then_some(Cut::OverLimit);
+                    explained_ranked(item, &run.gathered.arms, strong_cutoff, reason)
+                })
+                .collect();
+            Ok(Explain {
+                mode: ExplainMode::Recall,
+                rerank_query: run.query.clone(),
+                query: run.query,
+                reranked: run.reranked,
+                latency: run.gathered.latency(run.rerank, started),
+                candidates,
+                injection: None,
+            })
+        }
+        ExplainRequest::Injection(conversation) => {
+            let (bank_id, bank_tz) = find_bank(cx.store, bank)?;
+            let run = inject(
+                cx,
+                bank_id,
+                &bank_tz,
+                now,
+                started,
+                &Conversation {
+                    message: &conversation.query,
+                    previous_query: conversation.previous_query.as_deref(),
+                    previous_reply: conversation.previous_reply.as_deref(),
+                },
+                &BTreeSet::new(),
+                true,
+            )?;
+            let gathered = &run.gathered;
+            let mut candidates: Vec<Explained> = run
+                .ranked
+                .iter()
+                .zip(&run.cuts)
+                .map(|(item, cut)| explained_ranked(item, &gathered.arms, strong_cutoff, *cut))
+                .collect();
+            candidates.extend(gathered.refused_candidates.iter().map(|candidate| {
+                explained(
+                    candidate,
+                    arm_ranks(candidate.id, &gathered.refused, false),
+                    None,
+                    None,
+                    None,
+                    strong_cutoff,
+                    Some(Cut::BelowTau),
+                )
+            }));
+            Ok(Explain {
+                mode: ExplainMode::Injection,
+                query: run.query,
+                rerank_query: run.rerank_query,
+                reranked: run.reranked,
+                latency: gathered.latency(run.rerank, started),
+                candidates,
+                injection: Some(ExplainedInjection {
+                    tokens: estimate_tokens(&run.text),
+                    text: run.text,
+                    injected: run.injected,
+                    floor: cx.reranking.floor,
+                    cap: cx.tuning.injection.cap as usize,
+                    token_budget: cx.tuning.injection.token_budget as usize,
+                }),
+            })
+        }
+    }
+}
+
+/// What a prefetch recalls for, as the plugin sends it.
+struct Conversation<'a> {
+    /// The user's message, before [`clean_query`].
+    message: &'a str,
+    previous_query: Option<&'a str>,
+    previous_reply: Option<&'a str>,
+}
+
+/// An injection worked out, before anything is logged or held.
+struct Injection {
+    query: String,
+    rerank_query: String,
+    gathered: Gathered,
+    /// Every reranked candidate, in ranked order.
+    ranked: Vec<Ranked>,
+    /// Why each of `ranked` wasn't injected, or `None` when it was.
+    cuts: Vec<Option<Cut>>,
+    text: String,
+    injected: Vec<Uuid>,
+    reranked: bool,
+    rerank: Duration,
+}
+
+/// The injection for `conversation`, skipping the memories in
+/// `in_context`, with no side effects. `refused` keeps the heads below τ
+/// for explain.
+#[allow(clippy::too_many_arguments)]
+fn inject(
+    cx: &Context<'_>,
+    bank_id: i64,
+    bank_tz: &TimeZone,
+    now: Timestamp,
+    started: Instant,
+    conversation: &Conversation<'_>,
+    in_context: &BTreeSet<Uuid>,
+    refused: bool,
+) -> Result<Injection, RecallError> {
+    let deadline = started + cx.deadline;
+    let message = clean_query(conversation.message);
+    let previous = conversation.previous_query.map(clean_query);
+    let query = effective_query(&message, previous.as_deref());
+    let rerank_query = match cx.tuning.injection.rerank_query {
+        RerankQuery::Message => query.clone(),
+        RerankQuery::Conversation => {
+            conversation_query(&message, previous.as_deref(), conversation.previous_reply)
+        }
+    };
+
+    let keep =
+        |candidate: &Candidate| candidate.strength >= TAU && !in_context.contains(&candidate.uuid);
+    let mut gathered = gather(cx, bank_id, &query, now, &keep, None, refused)?;
+    let found = std::mem::take(&mut gathered.candidates);
+    let documents = found.iter().map(|c| c.content.clone()).collect();
+    let reranking = Instant::now();
+    let logits = rerank::logits(
+        &cx.models.reranker,
+        cx.permit,
+        &rerank_query,
+        documents,
+        deadline,
+    );
+    let rerank = reranking.elapsed();
+    let reranked = logits.is_some();
+    let ranking = &cx.tuning.ranking;
+    let ranked = rank(found, logits, |candidate, logit| {
+        let phase = phase_term(
+            &candidate.window,
+            candidate.low_confidence,
+            &candidate.tz,
+            now,
+            ranking,
+        );
+        score_parts(
+            cx.reranking.relevance(logit),
+            ranking.w_s_inject,
+            candidate.strength,
+            candidate.state_confidence,
+            phase,
+        )
+    });
+
+    // The floor gates on the raw logit, not on relevance, so the floors
+    // and the logits in the labelling material stay comparable.
+    let floor = cx.reranking.floor;
+    let cap = cx.tuning.injection.cap as usize;
+    let budget = cx.tuning.injection.token_budget as usize;
+    let header = format::header(now, bank_tz);
+    let mut lines = Vec::new();
+    let mut injected = Vec::new();
+    let mut cuts = Vec::with_capacity(ranked.len());
+    for item in &ranked {
+        // Past the deadline, or when the reranker fails, there's no logit,
+        // so nothing passes the gate and nothing is injected; the candidates
+        // are still logged.
+        let cut = match item.logit {
+            None => Some(Cut::NotReranked),
+            Some(logit) if logit < floor => Some(Cut::UnderFloor),
+            Some(_) if injected.len() >= cap => Some(Cut::OverCap),
+            Some(_) => {
+                let mut with = lines.clone();
+                with.push(format::line(&item.candidate, now));
+                if estimate_tokens(&format::block(&header, &with)) <= budget {
+                    lines = with;
+                    injected.push(item.candidate.uuid);
+                    None
+                } else {
+                    Some(Cut::OverBudget)
+                }
+            }
+        };
+        cuts.push(cut);
+    }
+    let text = if lines.is_empty() {
+        String::new()
+    } else {
+        format::block(&header, &lines)
+    };
+    Ok(Injection {
+        query,
+        rerank_query,
+        gathered,
+        ranked,
+        cuts,
+        text,
+        injected,
+        reranked,
+        rerank,
+    })
+}
+
+/// An explicit recall worked out, before anything is logged or joins a
+/// session.
+struct RecallRun {
+    bank_id: i64,
+    query: String,
+    gathered: Gathered,
+    /// Every reranked candidate, in ranked order, past the limit too.
+    ranked: Vec<Ranked>,
+    limit: usize,
+    reranked: bool,
+    rerank: Duration,
+}
+
+/// Explicit recall's pipeline for `request`, ignoring its session, with no
+/// side effects.
+fn recall_run(
+    cx: &Context<'_>,
+    bank: &str,
+    now: Timestamp,
+    started: Instant,
+    request: &RecallRequest,
+) -> Result<RecallRun, RecallError> {
+    let deadline = started + cx.deadline;
+    if let (Some(from), Some(to)) = (request.from, request.to)
+        && from > to
+    {
+        return Err(RecallError::InvertedRange);
+    }
+    let query = request.query.trim().to_owned();
+    let (bank_id, _) = find_bank(cx.store, bank)?;
+    let limit = request
+        .limit
+        .unwrap_or(RECALL_LIMIT_DEFAULT)
+        .clamp(1, RECALL_LIMIT_MAX);
+
+    let linked = match &request.entity {
+        Some(entity) => Some(entity_memories(cx.store, bank_id, entity)?),
+        None => None,
+    };
+    let keep = |candidate: &Candidate| {
+        (request.kinds.is_empty() || request.kinds.contains(&candidate.window.kind))
+            && linked
+                .as_ref()
+                .is_none_or(|ids| ids.contains(&candidate.id))
+            && request.phase.admits(candidate.phase)
+            && in_range(candidate, request)
+    };
+    let mut gathered = gather(cx, bank_id, &query, now, &keep, linked.as_ref(), false)?;
+    let found = std::mem::take(&mut gathered.candidates);
+    let documents = found.iter().map(|c| c.content.clone()).collect();
+    let reranking = Instant::now();
+    let logits = rerank::logits(&cx.models.reranker, cx.permit, &query, documents, deadline);
+    let rerank = reranking.elapsed();
+    let reranked = logits.is_some();
+    let ranking = &cx.tuning.ranking;
+    let with_phase = request.phase != PhaseFilter::Any;
+    let ranked = rank(found, logits, |candidate, logit| {
+        let phase = if with_phase {
+            phase_term(
+                &candidate.window,
+                candidate.low_confidence,
+                &candidate.tz,
+                now,
+                ranking,
+            )
+        } else {
+            0.0
+        };
+        score_parts(
+            cx.reranking.relevance(logit),
+            ranking.w_s_recall,
+            candidate.strength,
+            candidate.state_confidence,
+            phase,
+        )
+    });
+    Ok(RecallRun {
+        bank_id,
+        query,
+        gathered,
+        ranked,
+        limit,
+        reranked,
+        rerank,
+    })
+}
+
+/// [`score`] and the terms it sums.
+fn score_parts(
+    relevance: f64,
+    w_s: f64,
+    strength: f64,
+    state_confidence: f64,
+    phase_term: f64,
+) -> ScoreParts {
+    ScoreParts {
+        relevance,
+        w_s,
+        strength_term: w_s * strength,
+        confidence_term: state_confidence.ln().max(CONFIDENCE_TERM_MIN),
+        phase_term,
+        total: score(relevance, w_s, strength, state_confidence, phase_term),
+    }
+}
+
+/// A ranked candidate as explain shows it.
+fn explained_ranked(
+    item: &Ranked,
+    arms: &[Vec<i64>; 3],
+    strong_cutoff: f64,
+    reason: Option<Cut>,
+) -> Explained {
+    explained(
+        &item.candidate,
+        arm_ranks(item.candidate.id, arms, true),
+        Some(item.rrf_rank),
+        item.logit,
+        item.parts,
+        strong_cutoff,
+        reason,
+    )
+}
+
+fn explained(
+    candidate: &Candidate,
+    arms: Vec<ArmRank>,
+    rrf_rank: Option<usize>,
+    logit: Option<f64>,
+    score: Option<ScoreParts>,
+    strong_cutoff: f64,
+    reason: Option<Cut>,
+) -> Explained {
+    Explained {
+        id: candidate.uuid,
+        sentence: candidate.content.clone(),
+        kind: candidate.window.kind,
+        phase: candidate.phase,
+        arms,
+        rrf_rank,
+        logit,
+        score,
+        strength: band(candidate.strength, strong_cutoff),
+        kept: candidate.kept,
+        included: reason.is_none(),
+        reason,
+    }
+}
+
+/// The arms whose list holds `id`, with its 1-based place in each when
+/// `ranked`.
+fn arm_ranks(id: i64, lists: &[Vec<i64>; 3], ranked: bool) -> Vec<ArmRank> {
+    [Arm::Vector, Arm::Bm25, Arm::Entity]
+        .into_iter()
+        .zip(lists)
+        .filter_map(|(arm, list)| {
+            let place = list.iter().position(|listed| *listed == id)?;
+            Some(ArmRank {
+                arm,
+                rank: ranked.then_some(place + 1),
+            })
+        })
+        .collect()
 }
 
 /// How long a refresh waits for the reranker. A refresh is a daemon job
@@ -1065,9 +1360,17 @@ pub(crate) fn linked_memories(
 /// A candidate in its final place.
 struct Ranked {
     candidate: Candidate,
+    /// Its 1-based place in the fused list.
+    rrf_rank: usize,
     logit: Option<f64>,
     /// `None` when the reranker was skipped.
-    score: Option<f64>,
+    parts: Option<ScoreParts>,
+}
+
+impl Ranked {
+    fn score(&self) -> Option<f64> {
+        self.parts.map(|parts| parts.total)
+    }
 }
 
 /// Orders the fused candidates: by score when there are logits, the RRF
@@ -1075,48 +1378,76 @@ struct Ranked {
 fn rank(
     found: Vec<Candidate>,
     logits: Option<Vec<f32>>,
-    score: impl Fn(&Candidate, f64) -> f64,
+    score: impl Fn(&Candidate, f64) -> ScoreParts,
 ) -> Vec<Ranked> {
     let Some(logits) = logits else {
         return found
             .into_iter()
-            .map(|candidate| Ranked {
+            .enumerate()
+            .map(|(index, candidate)| Ranked {
                 candidate,
+                rrf_rank: index + 1,
                 logit: None,
-                score: None,
+                parts: None,
             })
             .collect();
     };
-    let mut ranked: Vec<(usize, Ranked)> = found
+    let mut ranked: Vec<Ranked> = found
         .into_iter()
         .zip(logits)
         .enumerate()
         .map(|(index, (candidate, logit))| {
             let logit = f64::from(logit);
-            let score = score(&candidate, logit);
-            (
-                index,
-                Ranked {
-                    candidate,
-                    logit: Some(logit),
-                    score: Some(score),
-                },
-            )
+            let parts = score(&candidate, logit);
+            Ranked {
+                candidate,
+                rrf_rank: index + 1,
+                logit: Some(logit),
+                parts: Some(parts),
+            }
         })
         .collect();
-    ranked.sort_by(|(left_index, left), (right_index, right)| {
-        let left_score = left.score.unwrap_or(f64::NEG_INFINITY);
-        let right_score = right.score.unwrap_or(f64::NEG_INFINITY);
+    ranked.sort_by(|left, right| {
+        let left_score = left.score().unwrap_or(f64::NEG_INFINITY);
+        let right_score = right.score().unwrap_or(f64::NEG_INFINITY);
         right_score
             .total_cmp(&left_score)
-            .then(left_index.cmp(right_index))
+            .then(left.rrf_rank.cmp(&right.rrf_rank))
     });
-    ranked.into_iter().map(|(_, ranked)| ranked).collect()
+    ranked
+}
+
+/// Steps 1 to 3 and what explain shows of them.
+#[derive(Default)]
+struct Gathered {
+    /// The top [`RERANKED`] fused candidates, in RRF order.
+    candidates: Vec<Candidate>,
+    /// Each arm's list as fusion took it: vector, BM25, entity.
+    arms: [Vec<i64>; 3],
+    /// The heads each arm found that the filter refused, when asked for.
+    refused: [Vec<i64>; 3],
+    /// Their candidates, in RRF order over `refused`.
+    refused_candidates: Vec<Candidate>,
+    embed: Duration,
+    retrieve: Duration,
+}
+
+impl Gathered {
+    fn latency(&self, rerank: Duration, started: Instant) -> StageLatency {
+        let ms = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        StageLatency {
+            embed_ms: ms(self.embed),
+            retrieve_ms: ms(self.retrieve),
+            rerank_ms: ms(rerank),
+            total_ms: elapsed_ms(started),
+        }
+    }
 }
 
 /// Steps 1 to 3: the retrievers, clean-up and fusion, cut to the top
 /// [`RERANKED`] in RRF order. `linked`, when given, also seeds the entity
-/// arm with the memories of the recall tool's `entity`.
+/// arm with the memories of the recall tool's `entity`. With `refused`, the
+/// heads `keep` refused are kept aside too.
 fn gather(
     cx: &Context<'_>,
     bank_id: i64,
@@ -1124,13 +1455,16 @@ fn gather(
     now: Timestamp,
     keep: &dyn Fn(&Candidate) -> bool,
     linked: Option<&BTreeSet<i64>>,
-) -> Result<Vec<Candidate>, RecallError> {
+    refused: bool,
+) -> Result<Gathered, RecallError> {
     if query.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Gathered::default());
     }
+    let started = Instant::now();
     // The vector search runs on the connection the query's model was
     // checked under, so a re-embed's swap can't come between them.
     let (vector, conn) = cx.embed_query(bank_id, query)?;
+    let embed = started.elapsed();
     let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning, now, keep)?;
     let vector_hits = arms::vector(&conn, bank_id, &vector, CANDIDATES_PER_ARM)?;
     let bm25_hits = arms::bm25(&conn, bank_id, query, CANDIDATES_PER_ARM)?;
@@ -1140,10 +1474,11 @@ fn gather(
         Some(ids) => entity_arm_over(&conn, ids, &vector)?,
         None => arms::entity(&conn, bank_id, query, &vector, CANDIDATES_PER_ARM)?,
     };
+    let hits = [vector_hits, bm25_hits, entity_hits];
     let lists = [
-        cleanup.list(&vector_hits)?,
-        cleanup.list(&bm25_hits)?,
-        cleanup.list(&entity_hits)?,
+        cleanup.list(&hits[0])?,
+        cleanup.list(&hits[1])?,
+        cleanup.list(&hits[2])?,
     ];
     let mut fused = fuse(&[
         lists[0].as_slice(),
@@ -1151,7 +1486,27 @@ fn gather(
         lists[2].as_slice(),
     ]);
     fused.truncate(RERANKED);
-    Ok(cleanup.take(&fused))
+    let candidates = cleanup.take(&fused);
+    let (refused, refused_candidates) = if refused {
+        let refused = hits.map(|hits| cleanup.refused(&hits));
+        let order = fuse(&[
+            refused[0].as_slice(),
+            refused[1].as_slice(),
+            refused[2].as_slice(),
+        ]);
+        let candidates = cleanup.take_refused(&order);
+        (refused, candidates)
+    } else {
+        Default::default()
+    };
+    Ok(Gathered {
+        candidates,
+        arms: lists,
+        refused,
+        refused_candidates,
+        embed,
+        retrieve: started.elapsed().saturating_sub(embed),
+    })
 }
 
 /// The entity arm when the caller already resolved the entities: the

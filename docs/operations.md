@@ -793,6 +793,65 @@ the path, where a client would turn `folder/../notes` into `notes`. The
 dashboard asks for confirmation before it calls the route; the CLI and the
 route don't.
 
+## Explaining recall and injection
+
+`POST /v1/banks/{bank}/recall/explain` runs one query through recall or
+injection and returns the working: every candidate with what the pipeline
+computed for it, and why it was or wasn't returned. It needs the bearer
+token like the rest of `/v1`. It runs the same code as `/recall` and
+`/prefetch`. For the same bank state and query, recall mode returns
+the memories `/recall` would, in the same order, and injection mode injects
+what a prefetch for a new session would.
+
+Unlike them, it changes nothing. It writes no recall row and no access, and
+it neither reads nor changes any session. In injection mode nothing counts
+as already in context, so a memory the agent can already see this session
+is still shown as injected. It does take the reranker like any recall, so a
+prefetch arriving at the same moment can wait for it, and on a slow
+reranker can miss its deadline.
+
+The body is tagged by `mode`:
+
+- `{"mode": "recall", "query": "...", ...}` takes the `/recall` filters:
+  `from`, `to`, `on`, `phase`, `kinds`, `entity` and `limit`.
+- `{"mode": "injection", "query": "...", ...}` takes the message and,
+  optionally, `previous_query` and `previous_reply`, as the plugin sends them
+  to `/prefetch`.
+
+Neither takes a session; a `session_id` is ignored. The reply has:
+
+- `mode`, `query` (what the retrievers searched, after cleaning and a short
+  follow-up's borrowing), `rerank_query`, and `reranked`, false when the
+  reranker missed its deadline.
+- `latency`: `embed_ms`, `retrieve_ms`, `rerank_ms` and `total_ms`. The
+  reranker's deadline runs from the start of the request, so `rerank_ms` is
+  at most what was left of it.
+- `candidates`, the reranked candidates in their final order. Each has its
+  `id`, `sentence`, `kind` and `phase`; `arms`, the retrievers that found it
+  (`vector`, `bm25`, `entity`) with its `rank` in each; `rrf_rank`; the raw
+  reranker `logit`; `score`, with `relevance`, `w_s`, `strength_term`,
+  `confidence_term`, `phase_term` and `total`; the `strength` band; `kept`;
+  `included`; and `reason`, null when it was included.
+- In injection mode, `candidates` ends with the memories the retrievers
+  found below the recall threshold. These never reached fusion, so their
+  ranks, logit and score are null.
+- `injection`, null in recall mode: the `text` exactly as the agent would get
+  it, its `tokens`, the `injected` ids, and the `floor`, `cap` and
+  `token_budget` it was gated with.
+
+A candidate left out gives one of these reasons:
+
+| `reason` | Mode | Meaning |
+|---|---|---|
+| `over_limit` | recall | Ranked past `limit` |
+| `below_tau` | injection | Strength below the recall threshold |
+| `not_reranked` | injection | The reranker missed its deadline, so nothing is injected |
+| `under_floor` | injection | Its logit is under the loaded reranker's floor |
+| `over_cap` | injection | `injection.cap` memories were already taken |
+| `over_budget` | injection | Its line would take the block past `injection.token_budget` |
+
+Recall mode doesn't list memories its filters left out.
+
 ## The dashboard
 
 The daemon serves a dashboard at `/dashboard` for browsing banks, documents
