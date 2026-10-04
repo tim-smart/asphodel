@@ -686,8 +686,9 @@ or metadata values. Kind keys are restricted to `fact`, `preference`,
 `event`, `state`, `task` and `recurring`; arbitrary response strings cannot
 escape through the report.
 
-This measures count and kind agreement, not semantic equivalence. Tim must
-run the Hermes comparison where the private corpus and cassettes live.
+This measures count and kind agreement, not semantic equivalence. Route
+Hermes comparisons to Mac Developer where the private corpus and cassettes
+live, following the [evaluation policy](hermes-data-evaluation.md#who-does-what).
 
 ### Report diff
 
@@ -716,8 +717,11 @@ dir, and neither may be a symlink.
 ### Labelling and the precision curve
 
 The two calibrated floors, the reranker gate floor and the
-reconcile similarity floor, are set from Tim's labels, not by eye. `asphodel replay --corpus ... --labelling <file>`
-writes the material to label, inside the private dir. Writing it changes
+reconcile similarity floor, are set from accepted labels, not by eye. For
+Hermes evaluations, follow the [evaluation policy](hermes-data-evaluation.md#who-does-what)
+for independent Fable review and pending-decision rules.
+`asphodel replay --corpus ... --labelling <file>` writes the material to
+label, inside the private dir. Writing it changes
 nothing the run simulates, and the same run writes the same bytes.
 
 The material is one JSON object:
@@ -774,8 +778,9 @@ The material is one JSON object:
 - A candidate's `id` is unique in the file and numbers it within this
   run; `memory` is the memory's id in the replayed store.
 
-The labels file is TOML, written by Tim inside the private dir. Each label
-says whether a candidate is relevant: for recall, worth injecting for the
+The labels file is TOML and holds accepted labels. Keep it inside the
+private dir. Each label says whether a candidate is relevant: for recall,
+worth injecting for the
 query; for call 2, about the same thing as the claim. Labels are keyed by
 what they judge, not by candidate id, so they score another run's material
 over the same corpus.
@@ -916,7 +921,7 @@ refused, naming the sample, and nothing is written. The material, the
 corpus and the output must be inside the private dir, and the output may
 not be either input.
 
-To compare the two queries on Tim's labels, rescore the labelled material
+To compare the two queries on accepted labels, rescore the labelled material
 both ways, with the corpus its run replayed and the real models, and read
 each against the same labels:
 
