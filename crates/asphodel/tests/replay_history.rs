@@ -11,6 +11,7 @@ mod support;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -927,6 +928,373 @@ fn the_self_test_passes_for_fast_with_zero_misses() {
     );
     assert_ok(&run.output);
     assert_eq!(run.report()["llm"]["misses"], 0);
+}
+
+// Priming call 1.
+
+/// Omission keeps priming off; an explicit value wins over the bare
+/// flag's default of ten. All three forms are visible in the report.
+#[test]
+fn prime_concurrency_is_opt_in_with_a_bare_default_of_ten() {
+    for (name, prime_flags, expected) in [
+        ("omitted", vec![], serde_json::json!(null)),
+        (
+            "explicit",
+            vec!["--prime-concurrency", "2"],
+            serde_json::json!(2),
+        ),
+        ("bare", vec!["--prime-concurrency"], serde_json::json!(10)),
+    ] {
+        let dir = TestDir::new();
+        let corpus = imported_small_history(&dir);
+        let script = live_script(&dir);
+        let flags = call1_only(&dir);
+        let mut flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+        flags.extend(prime_flags);
+        let run = replay_history(
+            &dir,
+            &corpus,
+            "fast",
+            PASSING_PROBES,
+            name,
+            Some(&script),
+            &flags,
+        );
+        assert_ok(&run.output);
+        let report = run.report();
+        assert_eq!(report["flags"]["prime_concurrency"], expected, "{report}");
+        if expected.is_null() {
+            assert_eq!(report["llm"]["primed"], 0, "{report}");
+            assert!(report["llm"]["live"].as_u64().unwrap() > 0, "{report}");
+        } else {
+            assert!(report["llm"]["primed"].as_u64().unwrap() > 0, "{report}");
+            assert_eq!(report["llm"]["misses"], 0, "{report}");
+        }
+    }
+}
+
+#[test]
+fn bare_prime_concurrency_is_refused_outside_fast_and_in_scenarios() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    for mode in ["live", "replay"] {
+        let run = replay_history(
+            &dir,
+            &corpus,
+            mode,
+            PASSING_PROBES,
+            mode,
+            None,
+            &["--prime-concurrency"],
+        );
+        assert_refused(&run.output, "fast");
+        assert!(!run.report_path.exists(), "a refused run writes no report");
+    }
+    for flags in [
+        vec!["--prime-concurrency", "2"],
+        vec!["--prime-concurrency"],
+    ] {
+        let output = asphodel(&dir)
+            .args(["replay", "--scenario", "unused.toml"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert_refused(&output, "--scenario");
+    }
+}
+
+/// The flags that keep a `fast` run on the small history to call 1 alone:
+/// the reranker gate shut, so nothing is injected and no pair needs a
+/// top-up, and refreshes answered with no edits.
+fn call1_only(dir: &TestDir) -> Vec<String> {
+    let shut = dir.private_file(
+        "shut-gate.toml",
+        "[injection.reranker_floors]\n\"fake-reranker:v1\" = 1000000.0\n",
+    );
+    vec![
+        "--overrides".into(),
+        shut.to_str().unwrap().into(),
+        "--refresh".into(),
+        "off".into(),
+    ]
+}
+
+/// [`call1_only`] with `--prime-concurrency n`.
+fn primed(dir: &TestDir, n: u32) -> Vec<String> {
+    let mut flags = call1_only(dir);
+    flags.extend(["--prime-concurrency".into(), n.to_string()]);
+    flags
+}
+
+/// The chunks of the cassette's call 1 records, in file order.
+fn call1_chunks(dir: &TestDir) -> Vec<String> {
+    cassette_records(dir)
+        .iter()
+        .filter(|record| record["template"]["name"] == "extract_claims")
+        .map(|record| record["chunk"].to_string())
+        .collect()
+}
+
+/// A script answering every call with the home claim, the first called
+/// answering last: step `i` takes `(8 - i) × 100` ms, and from the eighth
+/// on no time at all.
+fn finishing_backwards_script(dir: &TestDir) -> std::path::PathBuf {
+    let reply = serde_json::json!({
+        "claims": [support::home_claim()],
+        "used_injected_ids": [],
+        "operations": []
+    });
+    let steps: Vec<Value> = (0..64u64)
+        .map(|i| serde_json::json!({ "reply": reply, "delay_ms": 800u64.saturating_sub(i * 100) }))
+        .collect();
+    let path = dir.path("backwards-script.json");
+    fs::write(&path, serde_json::to_vec(&steps).unwrap()).unwrap();
+    path
+}
+
+/// `--prime-concurrency` records call 1 for every chunk a serial run
+/// records it for, once each and in the serial run's order however the
+/// calls finish, before the simulation starts. The simulation then has no
+/// miss, and the report says the run was primed and how many calls the
+/// prime made. A later unprimed `fast` run reuses the primed claims with
+/// no LLM at all, and its report says it wasn't primed.
+#[test]
+fn a_primed_fast_run_records_call_1_for_every_chunk_before_simulating() {
+    let serial = TestDir::new();
+    let serial_corpus = imported_small_history(&serial);
+    record(&serial, &serial_corpus);
+    let expected = call1_chunks(&serial);
+    assert!(expected.len() > 1, "the fixture needs several chunks");
+
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let script = finishing_backwards_script(&dir);
+    let flags = primed(&dir, 4);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "primed",
+        Some(&script),
+        &flags,
+    );
+    assert_ok(&run.output);
+    let report = run.report();
+    assert_eq!(report["flags"]["prime_concurrency"], 4, "{report}");
+    assert_eq!(report["llm"]["primed"], expected.len(), "{report}");
+    assert_eq!(report["llm"]["misses"], 0, "{report}");
+    assert_eq!(call1_chunks(&dir), expected);
+
+    let flags = call1_only(&dir);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let again = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "unprimed",
+        None,
+        &flags,
+    );
+    assert_ok(&again.output);
+    let report = again.report();
+    assert!(report["flags"]["prime_concurrency"].is_null(), "{report}");
+    assert_eq!(report["llm"]["primed"], 0, "{report}");
+    assert_eq!(report["llm"]["misses"], 0, "{report}");
+}
+
+/// The prime skips chunks whose claims `fast` would already reuse, so
+/// priming a recorded history calls nothing and leaves the cassette as it
+/// was.
+#[test]
+fn priming_a_recorded_history_calls_nothing() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    record(&dir, &corpus);
+    let cassette = fs::read(dir.private_path("cassettes/main.jsonl")).unwrap();
+    let script = live_script(&dir);
+    let flags = primed(&dir, 4);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "primed",
+        Some(&script),
+        &flags,
+    );
+    assert_ok(&run.output);
+    let report = run.report();
+    assert_eq!(report["llm"]["primed"], 0, "{report}");
+    assert_eq!(report["llm"]["misses"], 0, "{report}");
+    assert_eq!(
+        fs::read(dir.private_path("cassettes/main.jsonl")).unwrap(),
+        cassette,
+        "nothing needed priming"
+    );
+}
+
+/// A failed prime keeps successful in-flight replies, writes no report,
+/// and resumes by calling only chunks still absent from the cassette.
+#[test]
+fn a_failed_prime_preserves_replies_and_resumes_only_missing_chunks() {
+    let serial = TestDir::new();
+    let serial_corpus = imported_small_history(&serial);
+    record(&serial, &serial_corpus);
+    let expected: BTreeSet<String> = call1_chunks(&serial).into_iter().collect();
+    assert!(expected.len() > 2, "the fixture needs unstarted chunks too");
+
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let reply = serde_json::json!({
+        "claims": [support::home_claim()],
+        "used_injected_ids": [],
+        "operations": []
+    });
+    // Both workers start before the refusal; the successful reply arrives
+    // afterwards, so recovery must also preserve work still in flight.
+    let script = dir.path("partial-failure.json");
+    fs::write(
+        &script,
+        serde_json::to_vec(&serde_json::json!([
+            {"reply": reply, "delay_ms": 500},
+            {"fail": "refused", "delay_ms": 100}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let flags = primed(&dir, 2);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let failed = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "failed-prime",
+        Some(&script),
+        &flags,
+    );
+    assert_refused(&failed.output, "priming call 1 failed");
+    assert!(
+        !failed.report_path.exists(),
+        "a failed prime writes no report"
+    );
+    let preserved = cassette_records(&dir);
+    assert_eq!(preserved.len(), 1, "{preserved:?}");
+    assert_eq!(preserved[0]["response"]["json"], reply);
+    assert_eq!(preserved[0]["primed"], true);
+    let completed = call1_chunks(&dir);
+    assert_eq!(completed.len(), 1);
+    assert!(expected.contains(&completed[0]));
+    let cassette_path = dir.private_path("cassettes/main.jsonl");
+    let before = fs::read(&cassette_path).unwrap();
+
+    // Exactly enough replies for the missing chunks. Any redundant call
+    // exhausts the script and fails instead of silently duplicating work.
+    let missing = expected.len() - completed.len();
+    let script = dir.path("resume.json");
+    fs::write(
+        &script,
+        serde_json::to_vec(&vec![serde_json::json!({"reply": reply}); missing]).unwrap(),
+    )
+    .unwrap();
+    let resumed = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "resumed-prime",
+        Some(&script),
+        &flags,
+    );
+    assert_ok(&resumed.output);
+    let report = resumed.report();
+    assert_eq!(report["llm"]["primed"], missing, "{report}");
+    assert_eq!(report["llm"]["misses"], 0, "{report}");
+    assert!(fs::read(cassette_path).unwrap().starts_with(&before));
+    let chunks = call1_chunks(&dir);
+    assert_eq!(chunks.len(), expected.len(), "no duplicate recordings");
+    assert_eq!(chunks.into_iter().collect::<BTreeSet<_>>(), expected);
+}
+
+/// Priming relies on reusing claims by chunk, which only `fast` does.
+#[test]
+fn priming_is_refused_outside_fast() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    record(&dir, &corpus);
+    let script = live_script(&dir);
+    for mode in ["live", "replay"] {
+        let run = replay_history(
+            &dir,
+            &corpus,
+            mode,
+            PASSING_PROBES,
+            &format!("{mode}-primed"),
+            Some(&script),
+            &["--prime-concurrency", "4"],
+        );
+        assert_refused(&run.output, "fast");
+        assert!(!run.report_path.exists(), "a refused run writes no report");
+    }
+}
+
+/// The prime makes its calls `--prime-concurrency` at a time in wall-clock
+/// time, where an unprimed run makes them one after another. With every
+/// call taking `DELAY_MS`, priming the small history at 4 saves at least
+/// half of the wait the serial calls beyond the first batch add.
+#[test]
+fn priming_makes_the_call_1s_in_parallel() {
+    const DELAY_MS: u64 = 3000;
+
+    let serial = TestDir::new();
+    let serial_corpus = imported_small_history(&serial);
+    let script = support::delayed_script(&serial, DELAY_MS);
+    let flags = call1_only(&serial);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let started = Instant::now();
+    let unprimed = replay_history(
+        &serial,
+        &serial_corpus,
+        "fast",
+        PASSING_PROBES,
+        "unprimed",
+        Some(&script),
+        &flags,
+    );
+    let unprimed_elapsed = started.elapsed();
+    assert_ok(&unprimed.output);
+    let calls = unprimed.report()["llm"]["live"].as_u64().unwrap();
+    assert!(calls > 1, "the fixture needs several chunks");
+
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let script = support::delayed_script(&dir, DELAY_MS);
+    let flags = primed(&dir, 4);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let started = Instant::now();
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "primed",
+        Some(&script),
+        &flags,
+    );
+    let primed_elapsed = started.elapsed();
+    assert_ok(&run.output);
+    assert_eq!(run.report()["llm"]["primed"], calls);
+
+    let batches = calls.div_ceil(4);
+    let saved = Duration::from_millis((calls - batches) * DELAY_MS / 2);
+    assert!(
+        unprimed_elapsed.saturating_sub(primed_elapsed) >= saved,
+        "unprimed took {unprimed_elapsed:?} and primed {primed_elapsed:?} for {calls} calls"
+    );
 }
 
 // The report.

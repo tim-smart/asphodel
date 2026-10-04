@@ -27,6 +27,7 @@
 //! itself failed, with no report.
 
 pub mod cassette;
+pub mod claims_agreement;
 pub mod corpus;
 pub mod diff;
 pub mod engine;
@@ -35,6 +36,7 @@ pub mod html;
 pub mod import;
 pub mod labelling;
 pub mod manifest;
+pub mod prime;
 pub mod probes;
 pub mod report;
 pub mod scenario;
@@ -233,6 +235,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
                 mode: None,
                 no_cache: false,
                 self_test: args.self_test,
+                prime_concurrency: None,
                 onnx_threads: (!fake).then_some(1),
             },
             probes: outcome.probes,
@@ -669,8 +672,8 @@ fn reset_store(store_dir: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Code defaults, the fake floors (on the fakes), `--config`, a scenario's
-/// `[tuning]`, then `--overrides`.
+/// Code defaults, the serial scenario default, the fake floors (on the
+/// fakes), `--config`, a scenario's `[tuning]`, then `--overrides`.
 pub(crate) fn layered_tuning(
     args: &ReplayArgs,
     scenario_tuning: Option<&toml::Table>,
@@ -678,6 +681,14 @@ pub(crate) fn layered_tuning(
     fake: bool,
 ) -> anyhow::Result<Tuning> {
     let mut layers: Vec<(String, String)> = Vec::new();
+    if args.scenario.is_some() {
+        // Scripted call 2 expects serial extraction. Keep that default
+        // without masking explicit config, scenario or override values.
+        layers.push((
+            "the serial scenario default".into(),
+            "[llm]\nconcurrency = 1\n".into(),
+        ));
+    }
     if fake {
         layers.push(("the fake floors".into(), fake_floors()));
     }

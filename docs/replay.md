@@ -34,7 +34,8 @@ asphodel replay --scenario scenarios/maya-to-mia.toml \
   derives from a checked-in fixture; a real-history report never leaves
   it.
 - `--config` is the production tuning file and `--overrides` a file in the
-  shape of `Tuning`. The layers, lowest first: code defaults, the fake
+  shape of `Tuning`. The layers, lowest first: code defaults, the serial
+  scenario default (`[llm] concurrency = 1`), the fake
   floors (group `ci` only, below), `--config`, the scenario's own
   `[tuning]`, then `--overrides`. Each layer must have the shape of
   `Tuning` on its own; an unknown key is refused before anything runs.
@@ -303,7 +304,7 @@ owner review after re-recording.
   were scheduled in. So a probe at a turn's `at` sees that turn's prefetch
   and, with zero latency, its memories.
 - **Extraction** is queued at a source's sync. Each bank has one simulated
-  worker with room for `[llm] concurrency` chunks, 1 by default. Whenever
+  worker with room for `[llm] concurrency` chunks, 10 by default. Whenever
   it has room, at a sync or at a completion, it
   claims the head of the production queue (turns before documents, then
   observed time), runs its LLM calls and neighbour search at once, as
@@ -323,7 +324,8 @@ owner review after re-recording.
   store without those memories. Accesses are stamped with the source's
   ingest time, as in production. The run ends at the latest of the last
   event, `--until` and the last completion.
-- **Concurrency.** Above `[llm] concurrency = 1` (set it in `--overrides`)
+- **Concurrency.** Above `[llm] concurrency = 1` (10 by default for real
+  history, adjustable in `--overrides`)
   the worker keeps that many chunks out, each prepared at its claim, and
   they commit in the order they were claimed: a chunk whose latency ends
   first waits for those claimed before it. A commit that finds a memory or
@@ -340,7 +342,7 @@ owner review after re-recording.
   The report counts these redos as `call2_rate.redos` and
   `call2_rate.redo_rate`, per chunk, fields that only appear above 1.
   Scenarios script call 2 against what a serial run shows it, so a
-  scenario refuses to run above 1.
+  scenario defaults to 1 and refuses explicit values above 1.
 - **Sweeps** run at `mental_models.sweep_time` bank-local (04:00) on the
   simulated clock, purge first, then the source and recall-log sweep, and
   then the refreshes due. Replay records the deletion fingerprint on its
@@ -528,6 +530,7 @@ writes nothing; the counts hold no text, so they can be shared.
 asphodel replay --corpus <file> --mode live|replay|fast \
     [--cassette <file>] [--probes <file>] [--report <file>] [--aggregate <file>] \
     [--labelling <file>] [--no-cache] [--refresh live|recorded|off] [--self-test] \
+    [--prime-concurrency [N]] \
     [--config FILE] [--overrides FILE] [--latency DURATION] [--until TIMESTAMP] \
     [--onnx-threads N] [--token-dir DIR]
 ```
@@ -560,6 +563,37 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   kept carries nothing over. Triggers are counted
   by code in every mode. The mental models to refresh are the manifest's
   `[[model]]` tables, carried in the corpus header.
+- **Priming** (`--prime-concurrency [N]`, `fast` only) records call 1 for
+  every chunk before the simulation starts, N calls at a time in
+  wall-clock time. Priming is off when the flag is omitted. A bare
+  `--prime-concurrency` selects 10; an explicit N overrides that value
+  and must be at least 1. Priming is refused in `live`, `replay` and
+  scenario runs. The simulation is single-threaded, and `[llm]
+  concurrency` only changes simulated time, so without it a re-record
+  makes its call 1s one after another. The prime ingests the corpus into
+  the run's store in the order the simulation syncs it, takes each chunk
+  in the order a serial run claims it, and calls the LLM for the chunks
+  whose claims `fast` can't already reuse. The records are appended in
+  that order, whatever order the calls finish in, and are marked
+  `primed`. The store is reset before the simulation, which then
+  answers every call 1 from the cassette and calls the LLM only for call
+  2 misses, refreshes and `judge_used` top-ups. A failed call stops the
+  prime with exit 2, keeping the calls that succeeded, so the next run
+  primes only the rest. `--self-test` primes once and runs the
+  simulation twice.
+
+  It's an approximation, the one `fast` already makes by reusing claims
+  by chunk. A primed call 1 is shown no in-context memories and no mental
+  model entries, and its candidates are only the entities ingestion
+  makes, with no memories linked, where a serial run's are what the
+  store holds at the claim. Its reply has no `used` verdicts to reuse,
+  so each pair is judged by a top-up when the simulation first meets
+  it. The report marks a primed run with `flags.prime_concurrency`, null
+  when it wasn't, and counts the prime's calls in `llm.primed` alone:
+  not in `live` or `misses`, which are the simulation's. Compare primed
+  claims with serially recorded ones on a corpus before relying on a
+  primed run: prime into a fresh `--cassette` so the two recordings stay
+  apart.
 - **The LLM** for `live` and `fast` is built as `serve` builds its own:
   `[llm]` in `--config` with `ASPHODEL_LLM_API_KEY`, or the ChatGPT login
   under `--token-dir` (the private dir by default). `replay` refuses one.
@@ -602,15 +636,57 @@ scripted fields: `injected_tokens` (per session with a synced turn, the
 per-turn p50 and p95, and cron apart), `profile_tokens` (sampled daily),
 `call2_rate`, `agenda_lines_per_day`, `significance_histogram`,
 `kind_histogram`, `memories` (each created memory with when it faded and
-whether it was purged), and `llm` with `cache`, `top_up`, `live`, `misses`,
-`used_verdicts` by source and `latency_ms`. A `live` run and the `replay`
+whether it was purged), and `llm` with `cache`, `top_up`, `live`,
+`primed`, `misses`, `used_verdicts` by source and `latency_ms`. A `live` run and the `replay`
 of its cassette differ only in `kind`, `flags`, `llm` and `cassette_hash`.
 
 `--aggregate <file>` writes the one thing that may leave the private dir. Its type has no string field but a probe's id: the run's kind
 is a set of booleans, days are days since the epoch, weeks are two
 integers, and the hashes and the git SHA are byte arrays. It carries
-`call1` as the report has it, the probe results, the purge, fade and band series, the token, lag and call
+`call1` as the report has it, `prime_concurrency`, the probe results, the purge, fade and band series, the token, lag and call
 counts, and the histograms.
+
+### Claims agreement
+
+Compare serial and primed call 1 cassettes before relying on priming:
+
+```sh
+asphodel report claims-agreement \
+  --serial cassettes/state.jsonl \
+  --primed cassettes/state-primed.jsonl
+```
+
+Set `ASPHODEL_REPLAY_DIR` or pass `--replay-dir`. Both input files must
+stay inside that private directory; relative paths resolve against it.
+Use a separate, fresh cassette for priming, not the serial cassette.
+The command reads without changing either file and holds the replay lock
+so it cannot compare a cassette while replay is appending to it.
+
+Stdout is one JSON object containing integer counts only, safe to attach
+to the PR. `chunks` contains `serial`, `primed`, `compared`, `serial_only`
+and `primed_only`. Chunks match by source UUID and position, not request
+key, file order or context. `agreement.claim_count` counts matched chunks
+with equal claim counts; `agreement.kind_multiset` counts those with equal
+kind multiplicities, regardless of claim order or wording. `claims` and
+`kinds` each have `serial` and `primed` totals over matched chunks only.
+Kinds with zero claims are omitted. Empty claims can agree; no shared
+chunks produces zero agreement counts, not a percentage.
+
+Non-call-1 and chunkless records are ignored. All compared extraction
+records, including unmatched chunks, must share template version, guidance
+hash, model and language. Record and request templates must agree. Duplicate
+call 1 records for a chunk are refused, even when identical; use a cassette
+with one extraction per chunk. Malformed records, missing claims arrays,
+unknown kinds or incompatible metadata exit 2 with no report. Errors name
+only the input side and line number, never claim text, prompts, source IDs
+or metadata values. Kind keys are restricted to `fact`, `preference`,
+`event`, `state`, `task` and `recurring`; arbitrary response strings cannot
+escape through the report.
+
+This measures count and kind agreement, not semantic equivalence. Tim must
+run the Hermes comparison where the private corpus and cassettes live.
+
+### Report diff
 
 `asphodel report diff A B [--force]` compares two reports: it refuses runs
 on a different corpus or cassette unless forced, lists probes whose result
