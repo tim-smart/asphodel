@@ -245,9 +245,9 @@ enum Labels {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Keyed {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     recall: Vec<RecallLabel>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     call2: Vec<Call2Label>,
 }
 
