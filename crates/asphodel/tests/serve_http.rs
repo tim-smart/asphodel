@@ -771,6 +771,41 @@ fn a_turn_commits_its_prefetch_and_clearing_the_session_forgets_it() {
     assert_eq!(prefetch(&daemon)["injected"], json!([id]));
 }
 
+/// The prefetch route takes the assistant's last reply as `previous_reply`,
+/// which reranking against the conversation reads. A request without it
+/// still works, and reranks against the previous message and the message.
+#[test]
+fn prefetch_takes_the_previous_reply_for_the_conversation_query() {
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir)
+        .tuning("[injection]\nrerank_query = \"conversation\"\n")
+        .script(&[json!({"reply": auckland_reply()})])
+        .ready();
+    daemon.create_bank("main");
+    daemon.ingest_notes("main", "notes.md");
+    let id = daemon.wait_for_memory("main");
+    daemon.wait_extracted("main");
+
+    let message = "great, should I bring a jacket when I go out later";
+    let asked = "Can you check the weather for me?";
+    let without = daemon.ok(daemon.post(
+        "/v1/banks/main/prefetch",
+        &json!({"session_id": "s1", "query": message, "previous_query": asked}),
+    ));
+    assert_eq!(without["injected"], json!([]), "{without}");
+
+    let with = daemon.ok(daemon.post(
+        "/v1/banks/main/prefetch",
+        &json!({
+            "session_id": "s2",
+            "query": message,
+            "previous_query": asked,
+            "previous_reply": "Auckland is sunny today.",
+        }),
+    ));
+    assert_eq!(with["injected"], json!([id]), "{with}");
+}
+
 #[test]
 fn failed_chunks_are_listed_and_retried() {
     let dir = TestDir::new();

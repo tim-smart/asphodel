@@ -10,7 +10,9 @@
 //!   scored with the cosine similarity the reconcile floor compares.
 //! - `asphodel report precision --labels L --material M` prints the
 //!   precision curve for each list as JSON, with how many labels matched a
-//!   candidate, how many found nothing and how many candidates have none.
+//!   candidate, how many found nothing and how many candidates have none,
+//!   and for recall how many relevant candidates rank in the top 8 of their
+//!   sample by logit.
 //! - Labels are keyed by what they judge: a recall label by the cleaned
 //!   query and the memory, a call 2 label by the claim's chunk and ordinal
 //!   and the neighbour. So labels written against one run's material score
@@ -19,6 +21,11 @@
 //!   `--convert` rewrites it in the keyed form.
 //! - `--labels L` beside `--labelling` makes sampling prefer turns whose
 //!   queries already have labels.
+//! - `asphodel report rescore --material M --corpus C --rerank-query
+//!   message|conversation --out M2` scores each recall sample's candidates
+//!   again against the query the mode gives, keeping every id, and writes
+//!   them in logit order. It compares rerankers' queries on fixed pools;
+//!   it says nothing about prefetch's final ranking.
 //!
 //! Everything these read or write is derived from history, so all of it
 //! stays under the private dir and errors never quote it.
@@ -529,6 +536,12 @@ const ANSWERED: &str = "Auckland is sunny today.";
 const LEANING: &str = "great, should I bring a jacket when I go out later";
 
 fn conversation_history(dir: &TestDir) -> PathBuf {
+    history_asking(dir, Some(ANSWERED))
+}
+
+/// [`conversation_history`], with `answer` as the reply to [`ASKED`], or
+/// with no reply before [`LEANING`].
+fn history_asking(dir: &TestDir, answer: Option<&str>) -> PathBuf {
     let state_db = dir.private_path("state.db");
     let db = StateDb::create(&state_db);
     let start = epoch("2026-01-05T09:00:00Z");
@@ -541,7 +554,16 @@ fn conversation_history(dir: &TestDir) -> PathBuf {
     );
     let later = start + 3600.0;
     db.session("s2", "discord", Some("discord:1"), None, later);
-    db.turn("s2", later, ASKED, ANSWERED);
+    match answer {
+        Some(answer) => db.turn("s2", later, ASKED, answer),
+        None => db.message(hermes::Message {
+            session: "s2",
+            role: "user",
+            content: ASKED,
+            at: later,
+            ..hermes::Message::default()
+        }),
+    }
     db.turn("s2", later + 300.0, LEANING, "Yes, a light one.");
     drop(db);
     let corpus = dir.private_path("corpus/main.jsonl");
@@ -1480,4 +1502,346 @@ fn sampling_prefers_labelled_queries_so_labels_carry_over() {
     assert_eq!(curve["call2"]["matched"], call2_labels as u64, "{curve}");
     assert_eq!(curve["call2"]["unmatched"], 0, "{curve}");
     assert_eq!(curve["call2"]["unlabelled"], 0, "{curve}");
+}
+
+// Top 8 by logit.
+
+/// A material whose list order differs from its logit order, with one
+/// sample longer than 8, one shorter, and one of nine tied logits.
+///
+/// - r01: r01.1 at -9 (relevant, listed first but ranked last), r01.2 to
+///   r01.9 at 8 down to 1 (r01.5 relevant, ranked 4th), r01.10 at 0.5
+///   (relevant, ranked 9th): 1 of 3 in the top 8.
+/// - r02: r02.3 at 3 (unlabelled), r02.1 at 1, r02.2 at 0 (relevant): 1 of 1.
+/// - r03: nine at 0, r03.8 and r03.9 relevant. Ties keep list order, so
+///   r03.8 is 8th and r03.9 9th: 1 of 2.
+fn top8_material() -> (Value, String) {
+    let memory = |n: usize| format!("00000000-0000-4000-8000-{n:012}");
+    let candidate = |id: String, n: usize, score: f64| {
+        json!({
+            "id": id,
+            "memory": memory(n),
+            "score": score,
+            "sentence": format!("{MATERIAL_SENTINEL} sentence {n}")
+        })
+    };
+    let sample = |id: &str, candidates: Vec<Value>| {
+        json!({
+            "sample": id,
+            "at": "2026-01-05T09:00:00Z",
+            "session": "s1",
+            "query": format!("{MATERIAL_SENTINEL} query"),
+            "candidates": candidates
+        })
+    };
+    let mut r01 = vec![candidate("r01.1".into(), 1, -9.0)];
+    for n in 2..=9 {
+        r01.push(candidate(format!("r01.{n}"), n, (10 - n) as f64));
+    }
+    r01.push(candidate("r01.10".into(), 10, 0.5));
+    let r02 = vec![
+        candidate("r02.1".into(), 21, 1.0),
+        candidate("r02.2".into(), 22, 0.0),
+        candidate("r02.3".into(), 23, 3.0),
+    ];
+    let r03 = (1..=9)
+        .map(|n| candidate(format!("r03.{n}"), 30 + n, 0.0))
+        .collect();
+    let material = json!({
+        "version": 1,
+        "recall": [sample("r01", r01), sample("r02", r02), sample("r03", r03)],
+        "call2": []
+    });
+    let relevant = ["r01.1", "r01.5", "r01.10", "r02.2", "r03.8", "r03.9"];
+    let labels = material["recall"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(candidates)
+        .filter_map(|candidate| {
+            let id = candidate["id"].as_str().unwrap();
+            (id != "r02.3").then(|| format!("{id:?} = {}\n", relevant.contains(&id)))
+        })
+        .collect();
+    (material, labels)
+}
+
+/// `report precision` counts, for recall, the relevant labelled candidates
+/// ranked in the top 8 of their sample by logit, ties in list order, out
+/// of every relevant labelled candidate. Unlabelled candidates take places
+/// but aren't counted.
+#[test]
+fn precision_counts_the_relevant_candidates_in_each_samples_top_8_by_logit() {
+    let dir = TestDir::new();
+    let (material, labels) = top8_material();
+    let material = dir.private_file(
+        "labelling/top8.json",
+        &serde_json::to_string_pretty(&material).unwrap(),
+    );
+    let labels = dir.private_file("labelling/top8.toml", &labels);
+    let output = precision(&dir, &labels, &material);
+    assert_ok(&output);
+    let out = stdout(&output);
+    let curve: Value = serde_json::from_str(&out).expect("the curve is JSON on stdout");
+    assert_eq!(
+        curve["recall"]["top8"],
+        json!({ "found": 3, "relevant": 6 }),
+        "{curve}"
+    );
+    assert_eq!(curve["recall"]["labelled"], 21, "{curve}");
+    assert_eq!(curve["recall"]["unlabelled"], 1, "{curve}");
+    assert!(!out.contains(MATERIAL_SENTINEL), "{out}");
+}
+
+// Rescoring fixed pools.
+
+fn rescore(dir: &TestDir, material: &Path, corpus: &Path, mode: &str, out: &Path) -> Output {
+    asphodel(dir)
+        .args(["report", "rescore", "--material"])
+        .arg(material)
+        .arg("--corpus")
+        .arg(corpus)
+        .args(["--rerank-query", mode])
+        .arg("--out")
+        .arg(out)
+        .output()
+        .unwrap()
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_slice(&fs::read(path).expect("the file is written")).expect("it is JSON")
+}
+
+/// `candidates` by logit, highest first, ties in the order given.
+fn logit_order(candidates: &[Value]) -> Value {
+    let mut sorted = candidates.to_vec();
+    sorted.sort_by(|a, b| {
+        b["score"]
+            .as_f64()
+            .unwrap()
+            .total_cmp(&a["score"].as_f64().unwrap())
+    });
+    Value::Array(sorted)
+}
+
+/// Asserts `after` is `before` rescored: the same sample, the same
+/// candidates by id with their memories and sentences, each scored with the
+/// fake reranker against `after`'s rerank query, in logit order. Returns
+/// that query.
+fn assert_rescored<'a>(before: &Value, after: &'a Value) -> &'a str {
+    for key in ["sample", "at", "session", "query", "raw_query"] {
+        assert_eq!(after[key], before[key], "{key} is kept: {after}");
+    }
+    let rerank_query = after["rerank_query"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a rescored sample records its rerank query: {after}"));
+    let expected: Vec<Value> = candidates(before)
+        .iter()
+        .map(|candidate| {
+            let mut candidate = candidate.clone();
+            let sentence = candidate["sentence"].as_str().unwrap();
+            candidate["score"] = json!(fake_logit(rerank_query, sentence));
+            candidate
+        })
+        .collect();
+    assert_eq!(after["candidates"], logit_order(&expected), "{after}");
+    rerank_query
+}
+
+/// In message mode, rescoring reranks against the query the default
+/// replay did, so every score comes back as it was, now in logit order.
+/// Sample and candidate ids are kept, so labels written for the material
+/// apply to the rescored one, and call 2's lists are copied unchanged.
+#[test]
+fn rescoring_by_the_message_reproduces_the_replay_logits_in_logit_order() {
+    let dir = TestDir::new();
+    let corpus = conversation_history(&dir);
+    let (_, material) = material_of(&dir, &corpus, "message", &[]);
+    let out = dir.private_path("labelling/rescored-message.json");
+    assert_ok(&rescore(
+        &dir,
+        &dir.private_path("labelling/message.json"),
+        &corpus,
+        "message",
+        &out,
+    ));
+    let rescored = read_json(&out);
+    assert_eq!(rescored["version"], material["version"]);
+    assert_eq!(rescored["call2"], material["call2"]);
+    let before = material["recall"].as_array().unwrap();
+    let after = rescored["recall"].as_array().unwrap();
+    assert_eq!(after.len(), before.len());
+    for (before, after) in before.iter().zip(after) {
+        let rerank_query = assert_rescored(before, after);
+        assert_eq!(rerank_query, before["rerank_query"], "{after}");
+    }
+}
+
+/// In conversation mode, rescoring takes the previous message and the
+/// reply from the corpus, as a conversation replay would, and scores the
+/// same pools against them. The same input rescores to the same bytes.
+#[test]
+fn rescoring_by_the_conversation_scores_the_same_pools_against_it() {
+    let dir = TestDir::new();
+    let corpus = conversation_history(&dir);
+    let (_, material) = material_of(&dir, &corpus, "message", &[]);
+    let input = dir.private_path("labelling/message.json");
+    let out = dir.private_path("labelling/rescored.json");
+    assert_ok(&rescore(&dir, &input, &corpus, "conversation", &out));
+    let rescored = read_json(&out);
+    assert_eq!(rescored["call2"], material["call2"]);
+    let before = material["recall"].as_array().unwrap();
+    let after = rescored["recall"].as_array().unwrap();
+    assert_eq!(after.len(), before.len());
+    for (before, after) in before.iter().zip(after) {
+        assert_rescored(before, after);
+    }
+    assert_eq!(
+        sample_for(&rescored, LEANING)["rerank_query"],
+        format!("{ASKED}\n{ANSWERED}\n{LEANING}")
+    );
+    assert_eq!(sample_for(&rescored, ASKED)["rerank_query"], ASKED);
+    let home = candidates(sample_for(&rescored, LEANING))
+        .iter()
+        .find(|candidate| candidate["sentence"] == hermes::HOME_SENTENCE)
+        .expect("the home memory is still a candidate");
+    assert!(
+        home["score"].as_f64().unwrap() > fake_logit(LEANING, hermes::HOME_SENTENCE),
+        "the reply's Auckland lifts the home memory: {home}"
+    );
+
+    let again = dir.private_path("labelling/again.json");
+    assert_ok(&rescore(&dir, &input, &corpus, "conversation", &again));
+    assert_eq!(fs::read(&again).unwrap(), fs::read(&out).unwrap());
+}
+
+/// A previous message Hermes never answered gives the conversation no
+/// reply, in a conversation replay and in a rescore alike.
+#[test]
+fn an_unanswered_previous_message_gives_the_conversation_no_reply() {
+    let dir = TestDir::new();
+    let corpus = history_asking(&dir, None);
+    let overrides = dir.private_file(
+        "conversation.toml",
+        "[injection]\nrerank_query = \"conversation\"\n",
+    );
+    let (_, replayed) = material_of(
+        &dir,
+        &corpus,
+        "conversation",
+        &["--overrides", overrides.to_str().unwrap()],
+    );
+    let expected = format!("{ASKED}\n{LEANING}");
+    assert_eq!(sample_for(&replayed, LEANING)["rerank_query"], expected);
+
+    let (_, _) = material_of(&dir, &corpus, "message", &[]);
+    let out = dir.private_path("labelling/rescored.json");
+    assert_ok(&rescore(
+        &dir,
+        &dir.private_path("labelling/message.json"),
+        &corpus,
+        "conversation",
+        &out,
+    ));
+    assert_eq!(
+        sample_for(&read_json(&out), LEANING)["rerank_query"],
+        expected
+    );
+}
+
+/// [`hand_material`]'s first sample alone: Tim's home turn in session s1,
+/// which [`conversation_history`] holds.
+fn matching_material() -> Value {
+    let mut material = hand_material();
+    material["recall"].as_array_mut().unwrap().truncate(1);
+    material
+}
+
+/// A sample with no prefetch in the corpus at its session and time is
+/// refused, naming the sample and quoting nothing, and nothing is written.
+#[test]
+fn a_sample_missing_from_the_corpus_is_refused_without_quoting_it() {
+    let dir = TestDir::new();
+    let corpus = conversation_history(&dir);
+    // r02 is in session s2 a day later, where the corpus has no prefetch.
+    let material = dir.private_file(
+        "labelling/hand.json",
+        &serde_json::to_string_pretty(&hand_material()).unwrap(),
+    );
+    let out = dir.private_path("labelling/rescored.json");
+    for mode in ["message", "conversation"] {
+        let output = rescore(&dir, &material, &corpus, mode, &out);
+        assert_refused_without(&output, MATERIAL_SENTINEL, &["r02", "corpus"]);
+        for text in [hermes::HOME_QUOTE, ASKED, ANSWERED, LEANING] {
+            assert!(!stderr(&output).contains(text), "{}", stderr(&output));
+            assert!(!stdout(&output).contains(text), "{}", stdout(&output));
+        }
+        assert!(!out.exists(), "nothing is written in {mode} mode");
+    }
+}
+
+/// The material, the corpus and the output are history, so each must be
+/// inside the private dir, and the output may not replace an input.
+#[test]
+fn rescoring_is_refused_outside_the_private_dir_and_over_its_inputs() {
+    let dir = TestDir::new();
+    let corpus = conversation_history(&dir);
+    let text = serde_json::to_string_pretty(&matching_material()).unwrap();
+    let material = dir.private_file("labelling/hand.json", &text);
+    let out = dir.private_path("labelling/rescored.json");
+    assert_ok(&rescore(&dir, &material, &corpus, "message", &out));
+    fs::remove_file(&out).unwrap();
+
+    let outside_material = dir.path("material.json");
+    fs::write(&outside_material, &text).unwrap();
+    let output = rescore(&dir, &outside_material, &corpus, "message", &out);
+    assert_refused(&output, "private");
+    assert!(!out.exists());
+
+    let outside_corpus = dir.path("corpus.jsonl");
+    fs::copy(&corpus, &outside_corpus).unwrap();
+    let output = rescore(&dir, &material, &outside_corpus, "message", &out);
+    assert_refused(&output, "private");
+    assert!(!out.exists());
+
+    let outside_out = dir.path("rescored.json");
+    let output = rescore(&dir, &material, &corpus, "message", &outside_out);
+    assert_refused(&output, "private");
+    assert!(!outside_out.exists());
+
+    let corpus_bytes = fs::read(&corpus).unwrap();
+    for input in [&material, &corpus] {
+        let output = rescore(&dir, &material, &corpus, "message", input);
+        assert_refused(&output, "--out");
+    }
+    assert_eq!(fs::read(&material).unwrap(), text.as_bytes());
+    assert_eq!(fs::read(&corpus).unwrap(), corpus_bytes);
+}
+
+/// Material that doesn't parse is refused naming the file and the line,
+/// never quoting it.
+#[test]
+fn malformed_material_is_refused_by_rescore_without_quoting_it() {
+    let dir = TestDir::new();
+    let corpus = conversation_history(&dir);
+    let text = serde_json::to_string_pretty(&matching_material())
+        .unwrap()
+        .replacen(
+            "\"score\": 2.5",
+            &format!("\"score\": {MATERIAL_SENTINEL}"),
+            1,
+        );
+    let line = text
+        .lines()
+        .position(|line| line.contains(&format!("\"score\": {MATERIAL_SENTINEL}")))
+        .unwrap()
+        + 1;
+    let material = dir.private_file("labelling/broken.json", &text);
+    let out = dir.private_path("labelling/rescored.json");
+    assert_refused_without(
+        &rescore(&dir, &material, &corpus, "conversation", &out),
+        MATERIAL_SENTINEL,
+        &["broken.json", &format!("line {line}")],
+    );
+    assert!(!out.exists());
 }

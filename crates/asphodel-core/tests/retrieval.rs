@@ -868,6 +868,74 @@ fn the_conversation_query_takes_only_the_start_of_a_long_reply() {
     assert!(!query.contains("Tailword"), "{query}");
 }
 
+#[test]
+fn the_conversation_query_takes_only_the_start_of_a_long_previous_message() {
+    let previous = format!(
+        "Can you check the Fastmail account? {}Tailword.",
+        "Here is some more context. ".repeat(400)
+    );
+    let query = conversation_query("go ahead", Some(&previous), Some("Sure."));
+    assert!(
+        query.starts_with("Can you check the Fastmail account?"),
+        "{query}"
+    );
+    assert!(query.ends_with("\nSure.\ngo ahead"), "{query}");
+    assert!(!query.contains("Tailword"), "{query}");
+}
+
+/// Text with no space to cut back to, or in a script of multi-byte
+/// characters, is still cut to a start made of whole characters.
+#[test]
+fn a_long_context_without_spaces_or_in_another_script_is_cut_to_whole_characters() {
+    for text in [
+        "a".repeat(2000),
+        "東京".repeat(1000),
+        "🙂".repeat(1000),
+        format!("x{}", "é".repeat(1000)),
+        "東京 ".repeat(1000),
+    ] {
+        let query = conversation_query("message", Some(&text), None);
+        let (start, message) = query
+            .split_once('\n')
+            .expect("the context, then the message");
+        assert_eq!(message, "message");
+        assert!(
+            !start.is_empty() && start.len() < text.len(),
+            "{} of {} bytes",
+            start.len(),
+            text.len()
+        );
+        assert!(text.starts_with(start), "{start:?}");
+    }
+}
+
+/// A short follow-up still borrows the previous message for the retrievers,
+/// and the conversation query holds that message once.
+#[test]
+fn a_short_follow_up_in_conversation_holds_the_previous_message_once() {
+    let h = in_conversation();
+    let dentist = h.insert(fact("Tim's dentist appointment is on Friday."));
+    let scored = h
+        .service
+        .scored_prefetch(
+            BANK,
+            &PrefetchRequest {
+                session_id: "s".into(),
+                query: "yes, book it".into(),
+                previous_query: Some("dentist appointment Friday".into()),
+                previous_reply: Some("I can book it for Friday.".into()),
+                block_id: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(scored.query, "dentist appointment Friday\nyes, book it");
+    assert_eq!(
+        scored.rerank_query,
+        "dentist appointment Friday\nI can book it for Friday.\nyes, book it"
+    );
+    assert_eq!(scored.prefetch.injected, vec![dentist]);
+}
+
 /// The default stays as it was: a message of eight words or more is
 /// reranked alone, whatever came before it.
 #[test]
