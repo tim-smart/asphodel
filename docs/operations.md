@@ -277,10 +277,10 @@ The plugin sends `POST /v1/banks/{bank}/prefetch` with `session_id` and
 `query` (the current Hermes message). Optional context fields are:
 
 - `previous_query`, the session's last successful prefetch query.
-- `previous_reply`, the first 300 Unicode characters of the session's last
-  assistant reply received by `sync_turn`. It is omitted when empty or
-  when there is no previous query. The plugin keeps only this prefix,
-  even with ingestion disabled or a failed turn delivery.
+- `previous_reply`, the first 300 Unicode characters of the assistant reply
+  received by `sync_turn` for exactly the selected `previous_query`. It is
+  omitted when empty, not yet synced, or ambiguously attributed. The plugin
+  keeps only this prefix, even with ingestion disabled or a failed turn delivery.
 - `block_id`, a prompt block fetched before the session id was known,
   sent until a prefetch succeeds.
 
@@ -295,7 +295,16 @@ each session's context for a later return. Compression, reset and rewind
 drop the old session's query and reply along with its pending recalls;
 a successful `memory_forget` drops the current session's query and reply.
 Hermes syncs on a background worker, so a prefetch that arrives before
-the preceding turn syncs cannot include that turn's reply yet.
+the preceding turn syncs cannot include that turn's reply yet. It proceeds
+without waiting and never substitutes a reply from an older query.
+
+`sync_turn` provides session and user text, but no originating turn ID.
+The plugin therefore suppresses reply context for repeated query text within
+the same session for the provider's lifetime, including repeats across clears
+and failed prefetch attempts. It retains query digests across clears so a
+delayed pre-clear sync cannot restore reply context for a repeated query.
+Distinct new queries remain eligible. A sync without a matching successful
+prefetch contributes no reply context; turn ingestion is unaffected.
 
 ## Commands
 
