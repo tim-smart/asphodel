@@ -15,7 +15,11 @@
 //!   with no usable RRULE, at or above τ, strongest first and then by
 //!   significance, at most `agenda.routines`.
 //! - **Undated tasks**: open tasks with no due date, gated and ranked the
-//!   same way, at most `agenda.undated_tasks`.
+//!   same way, at most `agenda.undated_tasks`. Their last mention must be
+//!   within `agenda.undated_days` of today, both ends inclusive in the bank
+//!   timezone. A later `mentioned_again` or `confirmed` access renews this
+//!   window, including inherited accesses; `used` does not. This only
+//!   limits the agenda, without ending or deleting the task.
 //!
 //! Only current heads count: nothing retracted, forgotten, refined into a
 //! newer version, or ended ([`has_ended`]: a stated end holds through its
@@ -37,7 +41,7 @@ use crate::retrieval::candidates::Cleanup;
 use crate::retrieval::format;
 use crate::store::strength::{StrengthLoader, memory_kind, significance_value, world_time};
 use crate::store::timestamp;
-use crate::strength::{Kind, WorldTime, unit_end};
+use crate::strength::{AccessKind, Kind, WorldTime, unit_end};
 
 /// The bank's agenda now.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -96,6 +100,7 @@ struct Row {
     rrule: Option<String>,
     recurrence_start: Option<Timestamp>,
     timezone: String,
+    observed_at: Timestamp,
 }
 
 /// A dated item: when it falls, and the local date that places it.
@@ -121,6 +126,9 @@ pub(crate) fn build(
     let overdue_from = today
         .checked_sub(i64::from(settings.overdue_days).days())
         .unwrap_or(Date::MIN);
+    let undated_from = today
+        .checked_sub(i64::from(settings.undated_days).days())
+        .unwrap_or(Date::MIN);
     let start_of_today = today
         .to_zoned(tz.clone())
         .map(|zoned| zoned.timestamp())
@@ -128,6 +136,7 @@ pub(crate) fn build(
     let local = |at: Timestamp| at.to_zoned(tz.clone()).date();
 
     let rows = rows(conn, bank_id, &tuning.strength.significance)?;
+    let loader = StrengthLoader::new(conn, bank_id, tuning, now)?;
     let mut dated: Vec<Dated> = Vec::new();
     let mut routines: Vec<usize> = Vec::new();
     let mut undated: Vec<usize> = Vec::new();
@@ -160,7 +169,21 @@ pub(crate) fn build(
                         });
                     }
                 }
-                None => undated.push(index),
+                None => {
+                    let last_observed = loader
+                        .accesses(conn, row.id)?
+                        .iter()
+                        .filter(|a| a.at <= now)
+                        .filter(|a| {
+                            matches!(a.kind, AccessKind::MentionedAgain | AccessKind::Confirmed)
+                        })
+                        .map(|a| a.at)
+                        .fold(row.observed_at, Timestamp::max);
+                    let date = local(last_observed);
+                    if undated_from <= date && date <= today {
+                        undated.push(index);
+                    }
+                }
             },
             Kind::Recurring => {
                 let long = row
@@ -187,7 +210,6 @@ pub(crate) fn build(
         }
     }
 
-    let loader = StrengthLoader::new(conn, bank_id, tuning, now)?;
     let strength =
         |row: &Row| -> Result<f64, rusqlite::Error> { Ok(loader.strength(conn, row.id)?.value) };
 
@@ -281,7 +303,7 @@ fn rows(
     let mut statement = conn.prepare_cached(
         "SELECT m.id, m.uuid, m.kind, COALESCE(m.owner_significance, m.significance),
                 m.valid_from, m.valid_until, m.due_at, m.recurrence_rrule, m.recurrence_start,
-                s.timezone, m.valid_until_precision
+                s.timezone, m.valid_until_precision, m.observed_at
          FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
          WHERE m.bank_id = ?1 AND m.kind IN ('event', 'task', 'recurring')
            AND m.invalidated_at IS NULL AND m.hidden_at IS NULL
@@ -304,6 +326,7 @@ fn rows(
                 rrule: row.get(7)?,
                 recurrence_start: row.get::<_, Option<i64>>(8)?.map(timestamp),
                 timezone: row.get(9)?,
+                observed_at: timestamp(row.get(11)?),
             })
         })?
         .collect()
