@@ -1466,7 +1466,9 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
 #[test]
 fn the_model_list_carries_the_budget_and_enabling_past_it_changes_nothing() {
     let dir = TestDir::new();
-    let daemon = Serve::new(&dir).ready();
+    let daemon = Serve::new(&dir)
+        .tuning("[mental_models]\nbudget = 800\nprofile_max_tokens = 500\n")
+        .ready();
     daemon.create_bank("main");
     // The profile takes 500 of the 800 tokens; a disabled model doesn't count.
     let created = daemon.post(
