@@ -76,7 +76,8 @@ fn report(output: &Output) -> Value {
 /// kinds, never on the claims' text or order. Chunks only one side holds
 /// are counted apart and left out of the totals, and records other than
 /// call 1's, or without a chunk, are ignored. An empty cassette, or one of
-/// blank lines, compares nothing.
+/// blank lines, compares nothing. A record from when call 1 was shown
+/// mental model entries under handles of their own still compares.
 #[test]
 fn compares_chunks_by_identity_and_counts_kind_multisets_not_text_or_order() {
     let mut reordered = call1(SOURCE_A, 0, &["preference", "fact", "fact"], true);
@@ -87,6 +88,9 @@ fn compares_chunks_by_identity_and_counts_kind_multisets_not_text_or_order() {
     top_up["response"]["json"] = json!({"used": []});
     let mut without_chunk = call1(SOURCE_A, 9, &["fact"], false);
     without_chunk["chunk"] = Value::Null;
+    let mut with_entries = call1(SOURCE_A, 0, &["fact"], false);
+    with_entries["entries"] = json!([{"handle": "n1", "cites": ["m1"]}]);
+    with_entries["response"]["json"]["used_injected_ids"] = json!(["n1"]);
     let nothing_compared = |serial: u64, primed: u64| {
         json!({
             "chunks": {
@@ -122,7 +126,7 @@ fn compares_chunks_by_identity_and_counts_kind_multisets_not_text_or_order() {
         ),
         (
             vec![
-                call1(SOURCE_A, 0, &["fact"], false),
+                with_entries,
                 call1(SOURCE_A, 1, &["preference"], false),
                 top_up,
                 without_chunk,
