@@ -349,3 +349,148 @@ pub fn small_history(path: &Path) -> StateDb {
     );
     db
 }
+
+/// [`small_history`] and two more sessions, the shared fixture of the
+/// plugin's backfill tests: one compacted in place with a carried tail, and
+/// one with tool rows, an injected memory block, speaker prefixes, a
+/// backfilled channel and a multimodal message. `plugin_fixture.rs` checks
+/// it into `plugin/tests/fixtures/`.
+pub fn backfill_history(path: &Path) -> StateDb {
+    let db = small_history(path);
+    let day = 24.0 * 60.0 * 60.0;
+    let start = epoch("2026-01-05T09:00:00Z");
+
+    // The shape a compaction that carries a verbatim tail leaves: the turn
+    // before the tail archived, the tail's originals rewound, then the
+    // summary and the tail's clones as fresh rows at the tail's times.
+    let t = start + 6.0 * day;
+    db.session("s-compacted", "discord", Some("discord:1"), None, t);
+    let row = |role, content, at, active, compacted, summary| Message {
+        session: "s-compacted",
+        role,
+        content,
+        at,
+        active,
+        compacted,
+        summary,
+        ..Message::default()
+    };
+    db.message(row("user", "Archived question.", t, false, true, false));
+    db.message(row(
+        "assistant",
+        "Archived answer.",
+        t + 30.0,
+        false,
+        true,
+        false,
+    ));
+    db.message(row(
+        "user",
+        "Carried question.",
+        t + 600.0,
+        false,
+        false,
+        false,
+    ));
+    db.message(row(
+        "assistant",
+        "Carried answer.",
+        t + 630.0,
+        false,
+        false,
+        false,
+    ));
+    db.message(row(
+        "user",
+        "HERMES-COMPACTION-SUMMARY",
+        t + 1200.0,
+        true,
+        false,
+        true,
+    ));
+    db.message(row(
+        "user",
+        "Carried question.",
+        t + 600.0,
+        true,
+        false,
+        false,
+    ));
+    db.message(row(
+        "assistant",
+        "Carried answer.",
+        t + 630.0,
+        true,
+        false,
+        false,
+    ));
+    db.turn(
+        "s-compacted",
+        t + 1800.0,
+        "After the compaction.",
+        "Still here.",
+    );
+
+    let t = start + 7.0 * day;
+    db.session("s-mixed", "discord", Some("discord:1"), None, t);
+    db.message(Message {
+        session: "s-mixed",
+        content: "What's on my calendar tomorrow?",
+        at: t,
+        ..Message::default()
+    });
+    db.message(Message {
+        session: "s-mixed",
+        role: "assistant",
+        content: "INTERMEDIATE-ASSISTANT-TEXT",
+        at: t + 5.0,
+        tool_calls: Some(
+            r#"[{"id":"c1","type":"function","function":{"name":"calendar","arguments":"{}"}}]"#,
+        ),
+        ..Message::default()
+    });
+    db.message(Message {
+        session: "s-mixed",
+        role: "tool",
+        content: "TOOL-RESULT-TEXT",
+        at: t + 6.0,
+        ..Message::default()
+    });
+    db.message(Message {
+        session: "s-mixed",
+        role: "assistant",
+        content: "A dentist appointment at ten.",
+        at: t + 20.0,
+        ..Message::default()
+    });
+    db.turn(
+        "s-mixed",
+        t + 600.0,
+        "<memory-context>HINDSIGHT-INJECTED-MEMORY</memory-context>\nI started learning the cello.",
+        "Good luck.",
+    );
+    db.turn(
+        "s-mixed",
+        t + 1200.0,
+        "[Sam] I'm Tim's friend from Wellington.",
+        "Hi Sam.",
+    );
+    db.turn("s-mixed", t + 1800.0, "[Bob] Is it raining?", "Not yet.");
+    db.turn(
+        "s-mixed",
+        t + 2400.0,
+        "[Alice] BACKFILLED-CHANNEL-HISTORY\n[New message] [Sam] See you at noon.",
+        "See you then.",
+    );
+    let garden = serde_json::json!([
+        {"type": "text", "text": "Look at my garden."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,IMAGE-BYTES-SENTINEL"}}
+    ]);
+    db.turn(
+        "s-mixed",
+        t + 3000.0,
+        &format!("\u{0}json:{garden}"),
+        "Lovely roses.",
+    );
+    db
+}
