@@ -1428,7 +1428,7 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     assert_eq!(models[0]["entries"], json!([]));
     assert_eq!(models[0]["last_refreshed_at"], Value::Null);
 
-    // The profile takes 500 of the 800 tokens.
+    // The profile takes 2048 of the 2560 tokens, leaving 212 after Plans.
     let created = daemon.post(
         "/v1/banks/main/models",
         &json!({"name": "Plans", "question": "Where is Tim going?", "kinds": ["event"],
@@ -1440,7 +1440,7 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     assert_eq!(plans["kinds"], json!(["event"]));
     let over = daemon.post(
         "/v1/banks/main/models",
-        &json!({"name": "Big", "question": "Anything?", "max_tokens": 1}),
+        &json!({"name": "Big", "question": "Anything?", "max_tokens": 213}),
     );
     assert_eq!(over.status, 422, "{}", over.body);
     assert!(over.json()["error"].as_str().unwrap().contains("budget"));
@@ -1547,7 +1547,7 @@ fn model_show_and_list_print_a_section_as_a_paragraph() {
     // The model display reads like the block Hermes sees: a section's
     // sentences are one paragraph under its heading. Entry ids and what
     // each entry cites are in the detail view, `--entry`.
-    let first = "Tim lives in Auckland.";
+    let first = "Tim's home is in Auckland.";
     let second = "Tim's home is in New Zealand.";
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir)
