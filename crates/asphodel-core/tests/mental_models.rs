@@ -2093,15 +2093,20 @@ fn budgets_below_the_memory_guidance_minimum_are_rejected() {
 
 #[test]
 fn accepted_boundary_budgets_fit_memory_guidance_and_the_dated_fold_summary() {
-    // At START, guidance alone needs 117 tokens. Guidance plus the agenda
-    // heading and "and 1 more dated item" needs 128. A stricter validation
-    // floor may reject these budgets, but accepting one must never overrun it.
-    let mut overruns = Vec::new();
-    for budget in [117, 127, 128] {
+    // The safe minimum is 134 tokens on 64-bit targets (131 on 32-bit):
+    // guidance with a two-digit day, an agenda heading, and a fold summary
+    // with the largest representable count, including their separators.
+    let minimum = if usize::BITS == 64 { 134 } else { 131 };
+    let below = minimum - 1;
+    let error = Tuning::from_toml(&format!(
+        "[mental_models]\nbudget = {below}\nprofile_max_tokens = {below}\n"
+    ))
+    .expect_err("the token immediately below the safe minimum must be rejected");
+    assert!(error.to_string().contains("mental_models.budget"));
+
+    for budget in [minimum, minimum + 1] {
         let extra = format!("[mental_models]\nbudget = {budget}\nprofile_max_tokens = {budget}\n");
-        if Tuning::from_toml(&extra).is_err() {
-            continue;
-        }
+        Tuning::from_toml(&extra).expect("the safe minimum and higher budgets must be accepted");
         let h = Harness::with_tuning(&extra);
         let empty = h.block(None);
         assert_memory_guidance(&empty);
@@ -2120,14 +2125,11 @@ fn accepted_boundary_budgets_fit_memory_guidance_and_the_dated_fold_summary() {
         assert_memory_guidance(&folded);
         assert!(folded.text.contains("- and 1 more dated item"));
         let tokens = estimate_tokens(&folded.text);
-        if tokens > budget {
-            overruns.push((budget, tokens));
-        }
+        assert!(
+            tokens <= budget,
+            "folded block uses {tokens} tokens with budget {budget}"
+        );
     }
-    assert!(
-        overruns.is_empty(),
-        "accepted budgets exceeded by folded blocks (budget, tokens): {overruns:?}"
-    );
 }
 
 #[test]
