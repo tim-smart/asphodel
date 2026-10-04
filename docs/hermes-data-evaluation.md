@@ -3,9 +3,9 @@
 This page is a handoff for a local agent that evaluates Asphodel against
 Tim's real Hermes history, on Tim's machine, with the replay harness
 (`docs/replay.md`). Hand the agent everything from "Who does what" down.
-It covers the commands, how the agent drafts probes and labels for Tim to
-approve, what to measure, and a feedback template that carries numbers and
-ids but never content.
+It covers the commands, how the agent drafts probes and labels for
+independent Fable sub-agent review, what to measure, and a feedback template
+that carries numbers and ids but never content.
 
 Every `asphodel` command here exists in `--help` on this branch. The build,
 the model fetch, the scripted replay and the report commands were run while
@@ -14,28 +14,52 @@ since they need Tim's data.
 
 ## Who does what
 
-You are a local agent running on Tim's machine. You run commands, draft
-the evaluation data, collect numbers, and prepare material. Three things
-are not yours:
+Route future live comparisons to Mac Developer, running locally on Tim's
+machine. You run commands, draft the evaluation data, collect numbers, and
+prepare material. Follow these rules:
 
-1. **Tim approves the probes and the labels.** You draft them: you propose
-   the questions, the expected answers and the labels, grounded in what the
-   replayed store actually holds, and you keep every draft in
-   `$ASPHODEL_REPLAY_DIR/drafts/`. Nothing reaches `probes.toml` or
-   `labels.toml` until Tim has approved that exact entry in this session.
-   Those two files are the evaluation data; the drafts are not. Only runs on
-   the approved files go into the feedback.
-2. **Nothing goes to an LLM backend without Tim's explicit approval in this
-   session.** Before any `--mode live`, any `--mode fast` with an LLM
-   configured, or `asphodel llm login`, stop, state the endpoint and model
-   that will see the history, and wait for a yes. Browsing (step 5),
+1. **Fable independently reviews probes and labels.** Ask Mac Developer to
+   arrange review of each exact entry, including probe re-anchors and new or
+   changed labels. You draft the questions, expected answers and labels,
+   grounded in what the replayed store actually holds, and keep every draft
+   in `$ASPHODEL_REPLAY_DIR/drafts/`. Nothing reaches `probes.toml` or
+   `labels.toml` until that exact entry passes independent Fable review.
+   If review is unavailable or the permitted material is insufficient,
+   keep the entry pending in drafts. Those two files are the evaluation
+   data; the drafts are not. Only runs on the reviewed files go into the
+   feedback as accepted evidence; identify draft previews separately.
+2. **Live comparisons have standing authorization while the data stays
+   private.** Tim granted this on 2026-10-04 for live recordings and
+   LLM-backed `fast` top-ups using `https://chatgpt.com/backend-api/codex`,
+   `auth = "chatgpt"`, `model = "gpt-6-luna"` and
+   `reasoning_effort = "low"`. No new per-run approval is needed within
+   this boundary, including login for this backend. Before changing the
+   endpoint, auth, model or reasoning setting, ask Mac Developer to arrange
+   independent Fable review of the proposed change under rule 4. This does
+   not accept labels, probes, probe re-anchors or floor selection. Browsing (step 5),
    `replay` mode and `report` never call a backend.
 3. **Nothing from the private directory leaves it except the aggregate
    export and the feedback template below.** No sentence, query, entity
    name, alias, source text or LLM reply goes into a ticket, a PR, a chat
    reply or a file outside `ASPHODEL_REPLAY_DIR`. Memory ids and probe ids
    are fine. The output of `asphodel recall`, `recalls` and `memory show` is
-   content: read it, show it to Tim, never quote it anywhere else.
+   content: read it locally, never quote it anywhere else.
+4. **All evaluation decisions require independent review.** Before making
+   them, ask Mac Developer to obtain an independent review from a Fable
+   sub-agent. This includes probes, re-anchors, labels, recall and call-2
+   floor selection, tuning, spot-check verdicts, distribution assessments
+   and backend changes. Mac Developer makes decisions only after sufficient
+   independent review; no evaluation decision returns to Tim for approval.
+   The review must follow the same privacy restrictions in rule 3: share
+   only the permitted aggregate export and feedback template, never private
+   content. If review is unavailable or the permitted material is
+   insufficient, leave the decision pending rather than bypassing review
+   or broadening access. Record the reviewer, date, exact scope, outcome
+   and any pending decisions in the feedback without private content.
+
+These rules guide agents; they are not a technical privacy guarantee. Raw
+history, memory text, queries and cassettes remain private even when a run
+has standing authorization.
 
 ## 0. Setup
 
@@ -86,7 +110,10 @@ kubectl exec -n hermes "$HERMES_POD" -c hermes -- rm /tmp/state-copy.db
 
 ## 2. Manifest and import
 
-Ask Tim for the timezone, owner platform ids and other speakers. Write
+Use the existing private manifest for the timezone, owner platform ids and
+other speakers. If any are missing or ambiguous, leave import pending and
+ask Mac Developer to arrange independent Fable review; do not guess or
+request an evaluation decision from Tim. Write
 `$ASPHODEL_REPLAY_DIR/manifest.toml`:
 
 ```toml
@@ -122,8 +149,10 @@ to start without floors for the exact loaded models.
 
 ```toml
 [llm]
-model = "<the exact model Tim will run in production>"
-endpoint = "https://api.openai.com/v1"    # or: auth = "chatgpt" and no endpoint
+auth = "chatgpt"
+model = "gpt-6-luna"
+endpoint = "https://chatgpt.com/backend-api/codex"
+reasoning_effort = "low"
 
 [reconcile.embedding_floors]
 "bge-small-en-v1.5:int8" = 0.8
@@ -135,16 +164,20 @@ endpoint = "https://api.openai.com/v1"    # or: auth = "chatgpt" and no endpoint
 "ms-marco-MiniLM-L-6-v2:int8" = 3.564211
 ```
 
-**Stop here and get approval.** Then one of:
+Check that the configuration matches the standing authorization above.
+If it differs, stop until Mac Developer obtains sufficient independent
+Fable review of the exact proposed backend change, including its privacy
+boundary. Keep it pending if review is unavailable or insufficient. For
+the authorized ChatGPT backend:
 
 ```sh
-export ASPHODEL_LLM_API_KEY=...                           # api_key mode
 asphodel llm login --data-dir "$ASPHODEL_REPLAY_DIR"      # chatgpt mode; replay reads tokens from the private dir
 ```
 
-ChatGPT mode is unverified against the real backend (`docs/models.md`). If
-the first call fails there, switch to `api_key` before concluding anything
-else.
+See `docs/models.md` for backend and login details. If the first call fails,
+report the failure without private content. Do not switch to `api_key` or
+another endpoint or model before that change passes independent Fable
+review arranged by Mac Developer. Review does not relax the privacy rules.
 
 ## 4. The recording run
 
@@ -168,7 +201,9 @@ without private data or live calls, run the scripted scenario first:
 
 GNU time prints `Elapsed (wall clock) time` and `Maximum resident set size
 (kbytes)` to stderr. The macOS form prints `real` and `maximum resident
-set size`. Only start the live run below after the endpoint/model approval.
+set size`. Only start the live run below with a configuration covered by
+the standing authorization or a backend change that has passed independent
+Fable review arranged by Mac Developer.
 
 ```sh
 "$GNU_TIME" -v asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode live \
@@ -245,7 +280,7 @@ the evaluation: it is a second copy of the history. Never point this at a
 window, phase, the source passage, the supersession chain, the access log,
 and the projected fade date.
 
-## 6. Probes: drafted by you, approved by Tim
+## 6. Probes: drafted by you, independently reviewed by Fable
 
 A probe pins a time and an expectation (`docs/replay.md`, "Probes"). The
 kinds are `band`, `faded_at`, `exists`, `absent`, `agenda_has`,
@@ -329,28 +364,35 @@ Exit 2 means the file was refused: a duplicate id, a regex that doesn't
 parse, a `faded_at` range that ends after its `at`. Fix and re-run. Exit 0
 or 1 gives a report whose `probes` list has `observed` for every probe:
 the band and strength, the ids recall returned, the agenda's ids, the
-fade instant. Read it before the review, so you can tell Tim what the
-system actually did next to what you expected. Resolved probes report
+fade instant. Read it before the review, so you can compare what the
+system actually did with what you expected in the permitted IDs-and-numbers
+summary. Resolved probes report
 `resolved_by` (`id` or `regex`) and `regex_matches`. Review any
 `regex_matches = false`: re-recording may have shifted claim ordinals
 so the grounding id now names a different fact. This flag does not fail
 the check by itself. `resolved: false` fails the probe and contributes
 to exit 1; it is not evidence that a negative expectation was met.
 
-**Review.** Walk Tim through the draft in batches of about ten. For each
-probe show the question, your expected answer, the grounding memory's
-sentence, and what the draft run observed. Tim approves, edits or rejects.
-An approved probe moves into `$ASPHODEL_REPLAY_DIR/probes.toml` with its
-comment block and `# status: approved by Tim <date>`. An edited probe is
-re-shown before it moves. A rejected probe stays in the draft marked
-`rejected`, so it isn't proposed again. Never write anything else into
-`probes.toml`.
+**Review.** Ask Mac Developer to arrange independent Fable sub-agent review
+of the draft in batches of about ten, including new probes and re-anchors.
+Keep questions, expected-answer text, grounding sentences and full draft
+observations in the private directory. Share only the permitted aggregate
+export and feedback template with the reviewer, using probe and memory IDs
+and numbers, never private content. If review is unavailable or the
+permitted material is insufficient to decide, leave the probe pending.
 
-A failing probe is not a reason to change its expectation. If Tim says the
-expectation is right and the observation is wrong, that is a finding:
-approve the probe as written and it goes into the feedback as a failed id.
+A probe that passes review moves into `$ASPHODEL_REPLAY_DIR/probes.toml`
+with its comment block and `# status: reviewed by Fable <date>`. Record the
+review outcome in the private drafts. An edited or re-anchored probe needs
+independent review again before it moves. A rejected probe stays in the
+draft marked `rejected`, so it isn't proposed again. Never write unreviewed
+entries into `probes.toml`.
 
-**Run the approved set.** This is the run the feedback reports.
+A failing probe is not a reason to change its expectation. If independent
+review finds the expectation right and the observation wrong, that is a
+finding: retain the probe as written and report its failed id.
+
+**Run the reviewed set.** This is the run the feedback reports.
 
 ```sh
 asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode replay \
@@ -373,7 +415,7 @@ It copies the replayed store under `bench/` and starts a daemon on loopback
 with the production 1.5 s reranker deadline on. It never touches another
 store. Stop the browse daemon first if it is on the same port.
 
-## 8. Labels: guided by you, decided by Tim
+## 8. Labels: drafted by you, independently reviewed by Fable
 
 `labelling.json` (step 4) holds 50 sampled prefetches, each with its query
 and the reranked candidates before the gate, and every candidate list call
@@ -384,7 +426,7 @@ its score and its sentence.
 Labels are keyed by what they judge, not by candidate id, so they survive a
 re-record. A recall label is the sample's `query` and the candidate's
 `memory`. A call-2 label is the sample's `chunk` and `ordinal` and the
-candidate's `memory`. Use the ids to find your place with Tim, but never
+candidate's `memory`. Use the ids to track review scope, but never
 write them into a label: they number this run's candidates and mean
 nothing in the next one.
 
@@ -395,22 +437,26 @@ same thing as the claim, so that the claim restates, confirms, refines,
 ends or contradicts it? Same person and topic is not enough; it has to be
 the same fact.
 
-**Guide.** Go sample by sample. Show Tim the query (or the claim), then
-each candidate with its id, score and sentence, your suggested label and a
-one-line reason. He confirms or flips each. Suggest, don't decide: the
-curve is only as good as his labels. Ten recall samples and ten call-2
-samples, about two hundred labels, is enough to start; more samples
-sharpen the curve around the floor. Do every candidate in a sample you
-start, including the low-scored ones, or the curve's low end is missing.
+**Draft and review.** Go sample by sample locally. Inspect the query (or
+claim), each candidate's id, score and sentence, and draft a suggested label
+with a one-line reason. Keep this content inside the private directory.
+Ten recall samples and ten call-2 samples, about two hundred labels, is
+enough to start; more samples sharpen the curve around the floor. Do every
+candidate in a sample you start, including low-scored ones.
 
-Write confirmed labels to `$ASPHODEL_REPLAY_DIR/drafts/labels.draft.toml`
-as you go, one comment per sample saying which one it was and whether Tim
-has finished it. When a sample is finished, move its labels to
-`$ASPHODEL_REPLAY_DIR/labels.toml`. The approved file holds only labels Tim
-confirmed; a label he hasn't looked at never goes there.
+Write drafts to `$ASPHODEL_REPLAY_DIR/drafts/labels.draft.toml`, with a
+comment per sample recording its review status. Ask Mac Developer to
+arrange independent Fable review of the exact labels. Share only the
+permitted aggregate export and feedback template, using IDs and numbers,
+never queries, claims, candidate sentences or private draft files. If that
+material cannot support a judgment, or review is unavailable, leave labels
+pending in drafts. Do not infer acceptance from silence or from a model's
+own drafts. Move only labels that pass independent review into
+`$ASPHODEL_REPLAY_DIR/labels.toml`, recording reviewer, date, scope and
+outcome locally. Edited labels require review again.
 
 ```toml
-# sample r1, finished by Tim 2026-10-03
+# sample r1, independently reviewed by Fable <reviewer> <date>
 [[recall]]
 query = "what time is the dentist"
 memory = "b4ccd45d-80dd-53dd-9b22-b1c8f9f43bc5"
@@ -421,7 +467,7 @@ query = "what time is the dentist"
 memory = "41c78166-793c-50c2-bca7-c1d7227c222e"
 relevant = false
 
-# sample c1, finished by Tim 2026-10-03
+# sample c1, independently reviewed by Fable <reviewer> <date>
 [[call2]]
 chunk = "0d6f3a52-1c4e-5b7a-9e2f-6a8b3c1d4e5f"
 ordinal = 0
@@ -433,7 +479,7 @@ Copy `query`, `chunk` and `ordinal` from the sample exactly as the
 material has them; a label whose key differs by a character matches
 nothing.
 
-**The curve.** Run it on the approved file. Running it on the draft is fine
+**The curve.** Run it on the reviewed file. Running it on the draft is fine
 for a preview, but say so.
 
 ```sh
@@ -445,16 +491,19 @@ It prints, for recall and for call 2, how many candidates were labelled
 candidate (`matched`) and how many found nothing (`unmatched`), and one
 point per distinct score: at that `floor`, how many labelled candidates
 were kept, how many were relevant, and the precision. Numbers only; it may
-be reported whole. Tim picks the two
-floors: for recall, the lowest logit at which precision is still what he
-wants; for call 2, the lowest cosine. Put them in `replay.toml` and in the
-production `asphodel.toml`. The recall curve matches the gate exactly. The
-call-2 curve covers only candidates the placeholder reconcile floor let
-call 2 see, so after the floors change, re-run step 4 (approval again) and
-re-label if the material changed.
+be reported whole. Propose the two floors with precision targets and sample
+coverage: for recall, the lowest qualifying logit; for call 2, the lowest
+qualifying cosine. Mac Developer must arrange independent Fable review of
+the targets and exact floor choices before adopting them in `replay.toml`
+or production `asphodel.toml`. If review is unavailable or insufficient,
+leave selection pending and retain the current floors. The recall curve
+matches the gate exactly. The call-2 curve covers only candidates the
+placeholder reconcile floor let call 2 see, so after reviewed floor changes,
+re-run step 4 within the authorized backend boundary and re-label if the
+material changed. New or changed labels need independent Fable review too.
 
-**After a re-record.** Pass the approved labels when you re-run step 4, so
-the material samples the prefetches whose queries Tim has already labelled:
+**After a re-record.** Pass the accepted labels when you re-run step 4, so
+the material samples prefetches whose queries already have accepted labels:
 
 ```sh
     --labelling "$ASPHODEL_REPLAY_DIR/labelling.json" \
@@ -466,7 +515,8 @@ says how many carried over and `unlabelled` how many candidates are new.
 Expect partial carry-over, not all: a memory's id comes from its source
 and its claim's position in call 1's reply, so when a new prompt splits a
 turn differently the ids shift and the labels on them stop matching. Label
-the unlabelled candidates in the samples you show Tim, as above.
+the unlabelled candidates through the draft and independent-review workflow
+above; keep unresolved labels pending.
 
 **Labels in the old form.** A `labels.toml` of candidate ids (`"r1.1" =
 true`) is still read against the material it was written for. Convert it
@@ -484,14 +534,16 @@ labels convert only if that material records each claim's chunk and
 ordinal, which material written before this change doesn't, so on old
 material every call-2 label is dropped and counted in `dropped_call2`;
 those samples need labelling again. `conflicting` counts labels left out
-because Tim judged the same query and memory both ways in two samples;
-ask him again. Report both counts.
+because the same query and memory were labelled both ways in two samples;
+ask Mac Developer to arrange independent Fable review of the conflict. Keep
+conflicting labels pending until resolved. Report both counts.
 
 ## 9. A/B runs
 
 `fast` reuses recorded claims and verdicts and calls the LLM only for pairs
-nobody has judged, so it also needs approval. Overrides take the shape of
-`Tuning`, for example `clock.quiet_rate = 0.2` or `injection.cap = 6`.
+nobody has judged. These top-ups are covered by the standing authorization
+only within the same private-data and backend boundary. Overrides take the
+shape of `Tuning`, for example `clock.quiet_rate = 0.2` or `injection.cap = 6`.
 
 ```sh
 asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode fast \
@@ -519,9 +571,12 @@ so rather than improvise.
   apart; `call2_rate`; `llm.used_verdicts` by source (recorded, top-up,
   live, none); `agenda_lines_per_day`; `bands_per_week`;
   `fade_outs_per_week`; `purged_then_re_mentioned.rate`.
-- Shipped, for Tim's eyes: on the browse daemon (step 5), `asphodel
+- Shipped, for local inspection: on the browse daemon (step 5), `asphodel
   recalls --bank main --limit 50` after the probe run, then `asphodel memory
-  show` on returned ids. Tim judges relevance; you count his verdicts.
+  show` on returned ids. Draft relevance verdicts locally; Mac Developer
+  arranges independent Fable review using only permitted IDs and numbers.
+  Count accepted verdicts and report pending ones if review cannot judge
+  relevance without private content.
 - Manual: sanity bounds. Per-turn injected p95 should stay well under the
   prompt's budget; a `used` rate near zero across a run means injection
   isn't being relied on; a `call2_rate` near 1.0 means almost every claim is
@@ -533,8 +588,10 @@ so rather than improvise.
 
 - Shipped: the precision curve for recall and call 2 (`report precision`);
   `significance_histogram` and `kind_histogram` in the report.
-- Manual: Tim compares the significance and kind histograms with what he
-  expects of his history. Report the histograms and his verdict.
+- Manual: propose an assessment of the significance and kind histograms.
+  Mac Developer arranges independent Fable review before adopting it or
+  changing significance values. Report histograms, review outcome and any
+  pending assessment; do not share private history.
 - Not implemented: any automatic floor selection or optimiser; the harness
   is deliberately A/B only.
 
@@ -589,6 +646,12 @@ so rather than improvise.
 
 ## Feedback template
 
+Preserve historical provenance for carried-over evidence. Do not relabel
+past Tim-approved entries as Fable-reviewed or imply a review occurred
+when it did not. Record carried-over counts and their original authority
+separately from new Fable-reviewed entries and pending drafts. All new
+decisions follow the independent-review policy above.
+
 Copy this, fill it, and attach `aggregate-*.json`, the one artifact the
 standing rule lets out of the private dir: its type has no string field
 but probe ids and enum names. `bench.json` stays in the private dir. It
@@ -603,10 +666,13 @@ from a report, any query, any name: if one is there, remove it.
 - branch / commit: asphodel-v1 @ <git sha from the report>
 - corpus_hash: <first 12 hex> · cassette_hash: <first 12 hex> · hermes schema: <30|31>
 - import counts (dry run): <sessions / turns / cron / skipped>
-- LLM: auth=<api_key|chatgpt> model=<model> · approved by Tim on <date>
+- LLM: endpoint=<endpoint> auth=<api_key|chatgpt> model=<model> reasoning=<effort> · authorization=<standing 2026-10-04 | backend change independently reviewed by Fable: reviewer/date/scope/outcome>
 - modes run: live <y/n>, replay --self-test <passed/failed>, fast <n runs>
 - overrides tried: <key = value, ...> (or none)
-- probes: <n> approved by Tim (<n> drafted, <n> rejected) · labels: <n> approved by Tim over <n> samples
+- probes: <n> independently reviewed by Fable (<n> drafted, <n> rejected, <n> pending) · labels: <n> independently reviewed by Fable over <n> samples (<n> pending)
+- independent review arranged by Mac Developer: <reviewer/date/exact scope/outcome for probes, labels, floors, tuning, backend changes and other decisions; IDs and numbers only>
+- pending decisions: <IDs/counts or none; unavailable or insufficient review>
+- carried-over evidence: <probe/label counts and original authority/date; not retroactively Fable-reviewed>
 
 ### Retrieval
 - probes: <passed>/<total>; failed ids: <p003, p007>
@@ -614,14 +680,14 @@ from a report, any query, any name: if one is there, remove it.
 - used verdicts: recorded <n>, top-up <n>, live <n>, none <n>
 - call2_rate: <x.xx> · agenda lines/day median: <n>
 - purged then re-mentioned: <purged>/<re_mentioned> (<rate>)
-- Tim's spot check of <n> recalls: <relevant>/<n> judged relevant
+- independently reviewed spot check of <n> recalls: <relevant>/<n> judged relevant; pending <n>
 
 ### Calibration
-- recall floor chosen: <logit> at precision <x.xx> over <labelled> labels
-- call-2 floor chosen: <cosine> at precision <x.xx> over <labelled> labels
+- recall floor: <reviewed choice or pending/current logit> at precision <x.xx> over <labelled> labels
+- call-2 floor: <reviewed choice or pending/current cosine> at precision <x.xx> over <labelled> labels
 - significance histogram: trivial <n> minor <n> notable <n> major <n> critical <n>
 - kind histogram: fact <n> event <n> state <n> task <n> recurring <n>
-- Tim's view of the distributions: <one line>
+- independently reviewed distribution assessment: <outcome or pending; no content>
 
 ### Latency and throughput
 - bench @1/4/16: p50 <n>/<n>/<n> ms, p95 <n>/<n>/<n> ms, within deadline <x.xx>/<x.xx>/<x.xx>
