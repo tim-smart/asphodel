@@ -160,6 +160,7 @@ struct PlannedTurn {
     user: String,
     assistant: String,
     previous_query: Option<String>,
+    previous_reply: Option<String>,
     author: Option<Author>,
     platform: Option<String>,
     class: SessionClass,
@@ -402,6 +403,7 @@ impl<'a> Engine<'a> {
                 user: turn.user.clone(),
                 assistant: turn.assistant.clone(),
                 previous_query: turn.previous_query.clone(),
+                previous_reply: turn.previous_reply.clone(),
                 author: turn.author.clone(),
                 platform: turn.platform.clone(),
                 class: turn.class,
@@ -509,6 +511,7 @@ impl<'a> Engine<'a> {
                 session_id: turn.session.clone(),
                 query: turn.user.clone(),
                 previous_query: turn.previous_query.clone(),
+                previous_reply: turn.previous_reply.clone(),
                 block_id: None,
             },
         )?;
@@ -1382,6 +1385,7 @@ impl<'a> Engine<'a> {
                         session_id: format!("{PROBE_SESSION_PREFIX}{id}"),
                         query: query.clone(),
                         previous_query: None,
+                        previous_reply: None,
                         block_id: None,
                     },
                 )?;

@@ -489,7 +489,9 @@ Hermes uses for search, in `timestamp` order, not row id. Then, per primary sess
   `user` row; assistant rows that only call tools, and `tool` rows, are
   skipped. The turn is a `prefetch` event at the user row's time and a
   `sync` event at the reply's time, with the previous user message as the
-  prefetch's `previous_query`;
+  prefetch's `previous_query`. Replay takes the reply to that message from
+  its `sync` event, when it came before this prefetch, as the prefetch's
+  `previous_reply`;
 - compacted rows (`active=0, compacted=1`) are replayed. Hermes' summary
   row (`_compressed_summary=1`) is skipped, and a `clear` is emitted at its
   time;
@@ -724,7 +726,8 @@ The material is one JSON object:
   "version": 2,
   "recall": [
     { "sample": "r1", "at": "<prefetch time>", "session": "<session id>",
-      "query": "<the query the reranker scored against>",
+      "query": "<the query the retrievers searched>",
+      "rerank_query": "<the query the reranker scored against>",
       "raw_query": "<the message as Hermes sent it>",
       "candidates": [
         { "id": "r1.1", "memory": "<uuid>", "score": 1.5, "sentence": "..." } ] } ],
@@ -745,11 +748,17 @@ The material is one JSON object:
   reranked candidates in ranked order before the gate, including those
   the gate turned away, scored with the raw reranker logit the gate floor
   compares, not the logit divided by the relevance scale. `query` is
-  what the reranker scored against: the message without the Discord message-id note and the
+  what vector search and BM25 searched: the message without the Discord message-id note and the
   `[Name] ` speaker prefix, after a short follow-up borrowed the previous
-  message. Calibration uses it. `raw_query` is the message as Hermes sent
-  it, for reading beside it. Material written before it was recorded has
-  no `raw_query`, and `report precision` still reads it.
+  message. Keyed recall labels name it. `rerank_query` is what the
+  reranker scored against, which the scores and so calibration follow.
+  By default it's the message, the start of the previous message, and the
+  start of the assistant's reply to it, one per
+  line (see "Reranking against the conversation" below). With
+  `[injection] rerank_query = "message"` in `--overrides` it's `query`.
+  `raw_query` is the message as Hermes sent it, for reading beside it.
+  Material written before they were recorded has no `rerank_query` or
+  `raw_query`, and `report precision` still reads it.
 - `call2` holds every candidate list call 2 was shown, one per claim:
   the claim and its neighbours, scored with the cosine similarity of the
   claim to each. Only what call 2 was shown is here. Flagged claims bypass
@@ -814,8 +823,15 @@ ascending order. At each point's `floor`, `kept` counts the labelled
 candidates scoring at or above it, `relevant` counts those labelled
 `true`, and `precision` is `relevant / kept`. For recall this matches the
 gate's logit comparison. For call 2 it is a score-threshold curve over
-observed candidates, not a prediction for another reconcile floor. The
-curve is numbers only.
+observed candidates, not a prediction for another reconcile floor.
+
+For `recall` it also prints `top8`: `found` counts the candidates labelled
+`true` that rank in their sample's top 8 by score (logit), highest first
+and ties in the material's order, and `relevant` counts every candidate
+labelled `true`. Unlabelled candidates take places in the top 8 but aren't
+counted. Both forms of label count it the same way; a keyed label counts
+in every sample whose query it judges, and one that finds nothing counts
+in neither. The output is numbers only.
 
 A keyed label that finds nothing is counted as unmatched, since a
 re-recorded run is expected to lose some. An old-form label naming no
@@ -839,6 +855,87 @@ as it can. With more labelled turns than the sample holds, it spreads the
 over the other turns. Old-form labels are refused there; convert them
 first. Every file must be inside the private dir, and an error names the
 file and line, never the text.
+
+### Reranking against the conversation
+
+`[injection] rerank_query` decides what prefetch's reranker scores
+candidates against. `"message"` is the message itself, or
+for a short follow-up the previous message and then the message.
+`"conversation"` is the default. For every prefetch it uses the message,
+the start of the previous message, and the start of the assistant's reply to it, one per
+line, leaving out empty or missing parts. The previous message and the
+reply are each cut to their first 300 Unicode characters, cutting back to
+the last whitespace boundary when available. This is a character limit,
+not a token budget: 600 characters of CJK context can cost 600 tokens.
+
+The current message is not cut when building the query. It comes first so
+the reranker's right-side truncation removes trailing context before any
+of the message. The 512-token limit applies to the query and memory pair,
+including special tokens, with the longer side truncated first. A long
+message can still be truncated, and added context can reduce how much of
+the memory survives. There is no reserved token allowance for either.
+Vector search and BM25 use the same effective message query under either
+setting, including the previous message for short follow-ups.
+
+The plugin doesn't send the reply yet, so in production the conversation
+query has only the previous message as added context. Replay takes the
+reply from the corpus.
+
+A conversation run injects differently, so call 1's requests change and
+`replay` misses the cassette. Run it in `fast`.
+
+### Rescoring fixed pools
+
+```
+asphodel report rescore --material <file> --corpus <file> \
+    --rerank-query message|conversation --out <file> \
+    [--model-dir DIR] [--onnx-threads N]
+```
+
+scores each recall sample's candidates in the material again with the
+reranker, against the query `--rerank-query` gives, and writes the material
+again with the candidates in logit order, highest first, ties in the order
+they were listed. Each sample is found in the corpus by its session and
+time, and its query rebuilt from the corpus as replay builds it: `message`
+is the query an explicit message-mode run reranked against, and `conversation` the
+conversation query, with the reply from the corpus. Each sample records it
+as `rerank_query`. Sample and candidate ids, memories, sentences and each
+sample's `query` are kept, so labels apply unchanged in either form:
+candidate ids name the same candidates, and keyed labels match the same
+query and memory. Call 2's lists, with their chunks and ordinals, are
+copied as they were.
+
+The pools are the ones the material's run gathered, so the comparison
+isolates the reranker's query. Ordering is by logit alone, so it says
+nothing about prefetch's final ranking, which adds strength, state
+confidence and phase.
+
+A sample with no prefetch at its session and time in the corpus is
+refused, naming the sample, and nothing is written. The material, the
+corpus and the output must be inside the private dir, and the output may
+not be either input.
+
+To compare the two queries on Tim's labels, rescore the labelled material
+both ways, with the corpus its run replayed and the real models, and read
+each against the same labels:
+
+```
+R=$ASPHODEL_REPLAY_DIR
+for query in message conversation; do
+  asphodel report rescore --material "$R/labelling.json" \
+      --corpus "$R/corpus/state.jsonl" --rerank-query $query \
+      --out "$R/rescored-$query.json"
+  asphodel report precision --labels "$R/labels.toml" \
+      --material "$R/rescored-$query.json"
+done
+```
+
+`message` reproduces the labelled run's logits, so its curve matches
+`report precision` on `labelling.json` itself; if it doesn't, the models or
+the corpus aren't the ones that run used. Compare `recall.top8` and the
+recall curves. Only the labelled candidates count, and they're the same in
+both, so a relevant memory the conversation query would have pulled into a
+pool from outside it isn't measured.
 
 ### Bench
 

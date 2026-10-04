@@ -1,0 +1,138 @@
+//! `asphodel report rescore`: the labelling material's recall pools scored
+//! again against another rerank query (`docs/replay.md`, "Rescoring fixed
+//! pools").
+//!
+//! Each recall sample is found in the corpus by its session and time, and
+//! its rerank query rebuilt from the corpus as replay builds it: the message
+//! (after a short follow-up borrowed the previous one), or the conversation
+//! query. The sample's candidates are scored with the reranker against it
+//! and listed by logit, highest first, ties in the order the material gave.
+//! Every sample and candidate id, memory and sentence is kept, so labels
+//! written for the material apply to what this writes, and call 2's lists
+//! are copied unchanged.
+//!
+//! The pools are fixed and the order is by logit alone, so this compares
+//! rerank queries; it says nothing about prefetch's final ranking, which
+//! adds strength, state confidence and phase. Everything read and written
+//! is history, so all of it stays under the private dir and no error
+//! quotes it.
+
+use std::num::NonZeroUsize;
+
+use anyhow::{Context as _, anyhow, bail};
+use asphodel_core::config::RerankQuery;
+use asphodel_core::models::{Models, Reranker};
+use asphodel_core::retrieval::{clean_query, conversation_query, effective_query};
+
+use super::labelling::{Material, load_material};
+use super::timeline::{Timeline, Turn};
+use crate::cli::RescoreArgs;
+
+/// Runs `asphodel report rescore`: exit 0 once the material is written, or
+/// exit 2 when the inputs are refused or don't parse, writing nothing.
+pub fn run(args: RescoreArgs) -> anyhow::Result<()> {
+    if let Err(error) = execute(&args) {
+        eprintln!("error: {error:#}");
+        std::process::exit(2)
+    }
+    Ok(())
+}
+
+fn execute(args: &RescoreArgs) -> anyhow::Result<()> {
+    let dir = super::private_dir(args.replay_dir.as_deref())?;
+    let material_path = super::inside_private(&dir, &args.material, "the material")?;
+    let corpus_path = super::inside_private(&dir, &args.corpus, "the corpus")?;
+    let out_path = super::inside_private(&dir, &args.out, "the rescored material")?;
+    if out_path == material_path || out_path == corpus_path {
+        bail!(
+            "--out {} collides with an input of this run",
+            out_path.display()
+        );
+    }
+    let mut material = load_material(&material_path)?;
+    let corpus = super::corpus::load(&corpus_path)?;
+    let timeline =
+        Timeline::from_corpus(&corpus, Vec::new()).map_err(|message| anyhow!(message))?;
+
+    let mode = args.rerank_query.into();
+    let mut queries = Vec::with_capacity(material.recall.len());
+    for sample in &material.recall {
+        let turn = timeline
+            .turns
+            .iter()
+            .find(|turn| turn.session == sample.session && turn.at == sample.at)
+            .ok_or_else(|| {
+                anyhow!(
+                    "sample {} has no prefetch in the corpus {} at its session and time; rescore the material with the corpus its run replayed",
+                    sample.sample,
+                    corpus_path.display()
+                )
+            })?;
+        queries.push(rerank_query(turn, mode));
+    }
+
+    let models = if super::fake_models_requested()? {
+        Models::fake()
+    } else {
+        let threads = args.onnx_threads.or(NonZeroUsize::new(1));
+        super::load_models(args.model_dir.as_deref(), threads)
+            .context("rescoring needs the real models in ASPHODEL_MODEL_DIR")?
+    };
+    rescore(&mut material, queries, models.reranker.as_ref())?;
+
+    let mut json = serde_json::to_vec_pretty(&material)?;
+    json.push(b'\n');
+    super::write_file(&out_path, &json)
+        .with_context(|| format!("writing the rescored material to {}", out_path.display()))
+}
+
+/// The query replay's prefetch would have reranked `turn` against.
+fn rerank_query(turn: &Turn, mode: RerankQuery) -> String {
+    let message = clean_query(&turn.user);
+    let previous = turn.previous_query.as_deref().map(clean_query);
+    match mode {
+        RerankQuery::Message => effective_query(&message, previous.as_deref()),
+        RerankQuery::Conversation => conversation_query(
+            &message,
+            previous.as_deref(),
+            turn.previous_reply.as_deref(),
+        ),
+    }
+}
+
+/// Scores each recall sample's candidates against its query and sorts them
+/// by logit, highest first; the sort is stable, so ties keep their order.
+fn rescore(
+    material: &mut Material,
+    queries: Vec<String>,
+    reranker: &dyn Reranker,
+) -> anyhow::Result<()> {
+    for (sample, query) in material.recall.iter_mut().zip(queries) {
+        if !sample.candidates.is_empty() {
+            let documents: Vec<&str> = sample
+                .candidates
+                .iter()
+                .map(|candidate| candidate.sentence.as_str())
+                .collect();
+            let logits = reranker
+                .rerank(&query, &documents)
+                .with_context(|| format!("reranking sample {}", sample.sample))?;
+            if logits.len() != documents.len() {
+                bail!(
+                    "the reranker scored {} of sample {}'s {} candidates",
+                    logits.len(),
+                    sample.sample,
+                    documents.len()
+                );
+            }
+            for (candidate, logit) in sample.candidates.iter_mut().zip(logits) {
+                candidate.score = f64::from(logit);
+            }
+            sample
+                .candidates
+                .sort_by(|a, b| b.score.total_cmp(&a.score));
+        }
+        sample.rerank_query = Some(query);
+    }
+    Ok(())
+}

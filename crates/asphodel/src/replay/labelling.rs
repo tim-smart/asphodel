@@ -19,8 +19,9 @@
 //! recall label by the cleaned query and the memory, a call 2 label by the
 //! claim's chunk and ordinal and the neighbour. A file in the old form, a
 //! table of candidate id to relevance, is read against the material it was
-//! written for, and `--convert` rewrites it keyed. The curve is numbers
-//! only. Every file is history, so all must be inside the private dir, and
+//! written for, and `--convert` rewrites it keyed. For recall it also
+//! counts the relevant candidates in each sample's top [`TOP`] by logit,
+//! the same way for either form of label. The output is numbers only. Every file is history, so all must be inside the private dir, and
 //! no error quotes any.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,6 +39,10 @@ use crate::cli::PrecisionArgs;
 /// How many synced turns the recall material samples.
 pub const SAMPLED_TURNS: usize = 50;
 
+/// How many of a sample's candidates by logit `top8` looks at: the
+/// injection cap.
+const TOP: usize = 8;
+
 /// The material's format version. Version 2 added the claim's chunk and
 /// ordinal to call 2's samples.
 const VERSION: u32 = 2;
@@ -49,15 +54,21 @@ pub struct Material {
     pub call2: Vec<Call2Sample>,
 }
 
-/// A sampled turn's prefetch: the query the reranker scored against, the
-/// message it was cleaned from, and its candidates in ranked order.
+/// A sampled turn's prefetch: the query the retrievers searched, the query
+/// the reranker scored against, the message they were cleaned from, and its
+/// candidates in ranked order.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecallSample {
     pub sample: String,
     pub at: Timestamp,
     pub session: String,
-    /// The cleaned query, which calibration uses.
+    /// The cleaned query the retrievers searched.
     pub query: String,
+    /// The query the reranker scored against, which calibration uses: the
+    /// same as `query` unless the run reranked against the conversation.
+    /// Material written before it was recorded has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_query: Option<String>,
     /// The message as Hermes sent it. Material written before it was
     /// recorded has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,6 +105,7 @@ struct Turn {
     at: Timestamp,
     session: String,
     query: String,
+    rerank_query: String,
     raw_query: String,
     candidates: Vec<(Uuid, String, f64)>,
 }
@@ -126,6 +138,7 @@ impl Collector {
             at,
             session: session.to_owned(),
             query: scored.query.clone(),
+            rerank_query: scored.rerank_query.clone(),
             raw_query: scored.raw_query.clone(),
             candidates: shown
                 .iter()
@@ -171,6 +184,7 @@ impl Collector {
                     at: turn.at,
                     session: turn.session,
                     query: turn.query,
+                    rerank_query: Some(turn.rerank_query),
                     raw_query: Some(turn.raw_query),
                 }
             })
@@ -352,7 +366,7 @@ fn load_labels(path: &Path) -> anyhow::Result<Labels> {
     }
 }
 
-fn load_material(path: &Path) -> anyhow::Result<Material> {
+pub(crate) fn load_material(path: &Path) -> anyhow::Result<Material> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text)
@@ -381,6 +395,17 @@ struct Curve {
     /// Labels that found no candidate.
     unmatched: u64,
     curve: Vec<Point>,
+    /// For recall only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top8: Option<Top>,
+}
+
+/// The candidates labelled relevant that rank in their sample's top [`TOP`]
+/// by logit, out of every candidate labelled relevant.
+#[derive(Debug, Serialize)]
+struct Top {
+    found: u64,
+    relevant: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -509,8 +534,12 @@ fn id_curves(material: &Material, ids: &BTreeMap<String, bool>) -> Curves {
         let matched = scored.iter().filter(|(_, label)| label.is_some()).count() as u64;
         curve(&scored, matched, 0)
     };
+    let mut recall = scored(&mut material.recall.iter().flat_map(|sample| &sample.candidates));
+    recall.top8 = Some(top(&material.recall, |_, candidate| {
+        ids.get(&candidate.id).copied()
+    }));
     Curves {
-        recall: scored(&mut material.recall.iter().flat_map(|sample| &sample.candidates)),
+        recall,
         call2: scored(&mut material.call2.iter().flat_map(|sample| &sample.candidates)),
         converted: None,
     }
@@ -539,7 +568,13 @@ fn keyed_curves(material: &Material, lookup: &Lookup) -> Curves {
         })
         .collect();
     let matched = hits.len() as u64;
-    let recall = curve(&recall, matched, lookup.recall.len() as u64 - matched);
+    let mut recall = curve(&recall, matched, lookup.recall.len() as u64 - matched);
+    recall.top8 = Some(top(&material.recall, |sample, candidate| {
+        lookup
+            .recall
+            .get(&(sample.query.clone(), candidate.memory))
+            .copied()
+    }));
 
     let mut hits = BTreeSet::new();
     let call2: Vec<(f64, Option<bool>)> = material
@@ -634,6 +669,27 @@ fn convert(
     (Keyed { recall, call2 }, conversion)
 }
 
+/// Each sample's candidates ranked by logit, highest first and ties in the
+/// material's order, with `label` giving each candidate's label. Unlabelled
+/// candidates take places but aren't counted.
+fn top(samples: &[RecallSample], label: impl Fn(&RecallSample, &Candidate) -> Option<bool>) -> Top {
+    let mut found = 0;
+    let mut relevant = 0;
+    for sample in samples {
+        let mut ranked: Vec<&Candidate> = sample.candidates.iter().collect();
+        ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
+        for (rank, candidate) in ranked.into_iter().enumerate() {
+            if label(sample, candidate) == Some(true) {
+                relevant += 1;
+                if rank < TOP {
+                    found += 1;
+                }
+            }
+        }
+    }
+    Top { found, relevant }
+}
+
 /// One point per distinct score among the labelled candidates, in
 /// ascending order. A candidate is kept at a floor when it scores at or
 /// above it. For recall this matches the gate comparison; for call 2 it
@@ -672,5 +728,6 @@ fn curve(scored: &[(f64, Option<bool>)], matched: u64, unmatched: u64) -> Curve 
         matched,
         unmatched,
         curve,
+        top8: None,
     }
 }

@@ -184,6 +184,14 @@ pub const RERANKED: usize = 40;
 /// of the session.
 pub const SHORT_FOLLOW_UP_WORDS: usize = 8;
 
+/// The conversation query keeps at most this many characters of the
+/// previous message, and of the assistant's reply, cut back to the last
+/// whitespace boundary when available. This is not a token budget: CJK
+/// text can cost a token per character. The current message comes first
+/// so right-side truncation removes trailing context before the message,
+/// but a long message and the memory side of the pair can still be cut.
+pub const RERANK_CONTEXT_CHARS: usize = 300;
+
 /// The confidence term's floor, `max(−3, ln(state_confidence))`, so a stale
 /// state is demoted and never gated.
 pub const CONFIDENCE_TERM_MIN: f64 = -3.0;
@@ -251,6 +259,7 @@ pub struct RetrievalConstants {
     pub candidates_per_arm: usize,
     pub reranked: usize,
     pub short_follow_up_words: usize,
+    pub rerank_context_chars: usize,
     pub confidence_term_min: f64,
     pub upcoming_bonus_days: f64,
     pub overdue_full_days: f64,
@@ -314,6 +323,7 @@ impl FixedConstants {
                 candidates_per_arm: CANDIDATES_PER_ARM,
                 reranked: RERANKED,
                 short_follow_up_words: SHORT_FOLLOW_UP_WORDS,
+                rerank_context_chars: RERANK_CONTEXT_CHARS,
                 confidence_term_min: CONFIDENCE_TERM_MIN,
                 upcoming_bonus_days: UPCOMING_BONUS_DAYS,
                 overdue_full_days: OVERDUE_FULL_DAYS,

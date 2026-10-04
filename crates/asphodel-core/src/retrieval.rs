@@ -17,7 +17,9 @@
 //!    from the start of the request. Past it, explicit recall keeps RRF
 //!    order and prefetch injects nothing: without the logit there's no
 //!    relevance to gate on, and a wrong injection is replayed for the rest
-//!    of the session.
+//!    of the session. Prefetch reranks against the message, or with
+//!    `injection.rerank_query = "conversation"` against
+//!    [`conversation_query`].
 //! 5. **Score.** [`score`]: relevance (the reranker logit), plus w_s times
 //!    strength, plus the clamped log of state confidence, plus the phase
 //!    term. w_s is `ranking.w_s_inject` or `ranking.w_s_recall`, and the
@@ -49,11 +51,11 @@ use uuid::Uuid;
 pub(crate) use arms::bm25;
 pub(crate) use rerank::Permit;
 
-use crate::config::{RankingTuning, Tuning};
+use crate::config::{RankingTuning, RerankQuery, Tuning};
 use crate::constants::{
     CANDIDATES_PER_ARM, CONFIDENCE_TERM_MIN, ENDED_GRACE_DAYS, OVERDUE_FULL_DAYS,
-    OVERDUE_ZERO_DAYS, RECALL_LIMIT_DEFAULT, RECALL_LIMIT_MAX, RECENTLY_PAST_DAYS, RERANKED, RRF_K,
-    SHORT_FOLLOW_UP_WORDS, TAU, UPCOMING_BONUS_DAYS,
+    OVERDUE_ZERO_DAYS, RECALL_LIMIT_DEFAULT, RECALL_LIMIT_MAX, RECENTLY_PAST_DAYS,
+    RERANK_CONTEXT_CHARS, RERANKED, RRF_K, SHORT_FOLLOW_UP_WORDS, TAU, UPCOMING_BONUS_DAYS,
 };
 use crate::models::{ModelError, Models};
 use crate::sessions::Sessions;
@@ -74,6 +76,10 @@ pub struct PrefetchRequest {
     /// follow-up borrows. The plugin drops it on `memory_forget`.
     #[serde(default)]
     pub previous_query: Option<String>,
+    /// The assistant's reply to the previous message, which the
+    /// conversation query starts from.
+    #[serde(default)]
+    pub previous_reply: Option<String>,
     /// The block `system_prompt_block()` returned, when Hermes gave no
     /// session id then. The plugin sends it with the session's first
     /// prefetch, and the daemon maps the session to that block unless it
@@ -418,6 +424,37 @@ pub fn effective_query(message: &str, previous: Option<&str>) -> String {
     }
 }
 
+/// The query a conversation-wide rerank scores against: the current
+/// message, the start of the previous message, then the start of the
+/// assistant's reply to it, one per line, leaving out any that's empty.
+/// Each context start is at most [`RERANK_CONTEXT_CHARS`] characters. The
+/// message is kept whole here, but the model may truncate the pair.
+pub fn conversation_query(message: &str, previous: Option<&str>, reply: Option<&str>) -> String {
+    let context = [previous, reply]
+        .into_iter()
+        .flatten()
+        .map(|text| start_of(text.trim(), RERANK_CONTEXT_CHARS));
+    [message.trim()]
+        .into_iter()
+        .chain(context)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// At most `max` characters from the start of `text`, cut back to the last
+/// whitespace when it has to be cut and there's any.
+fn start_of(text: &str, max: usize) -> &str {
+    let Some((end, _)) = text.char_indices().nth(max) else {
+        return text;
+    };
+    let cut = &text[..end];
+    match cut.rfind(char::is_whitespace) {
+        Some(space) => cut[..space].trim_end(),
+        None => cut,
+    }
+}
+
 /// About how many tokens `text` costs: a quarter of its characters, rounded
 /// up. It's what the injection budget counts.
 pub fn estimate_tokens(text: &str) -> usize {
@@ -536,7 +573,11 @@ pub struct GateCandidate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoredPrefetch {
     pub prefetch: Prefetch,
+    /// The query the retrievers searched, which the recall log stores.
     pub query: String,
+    /// The query the reranker scored against: `query`, or the conversation
+    /// query.
+    pub rerank_query: String,
     /// The message as it was sent, before [`clean_query`].
     pub raw_query: String,
     pub candidates: Vec<GateCandidate>,
@@ -553,8 +594,17 @@ pub(crate) fn scored_prefetch(
     let started = Instant::now();
     let deadline = started + cx.deadline;
     let now = cx.store.now();
+    let message = clean_query(&request.query);
     let previous = request.previous_query.as_deref().map(clean_query);
-    let query = effective_query(&clean_query(&request.query), previous.as_deref());
+    let query = effective_query(&message, previous.as_deref());
+    let rerank_query = match cx.tuning.injection.rerank_query {
+        RerankQuery::Message => query.clone(),
+        RerankQuery::Conversation => conversation_query(
+            &message,
+            previous.as_deref(),
+            request.previous_reply.as_deref(),
+        ),
+    };
     let (bank_id, bank_tz) = find_bank(cx.store, bank)?;
     let in_context: BTreeSet<Uuid> = cx
         .sessions
@@ -566,7 +616,13 @@ pub(crate) fn scored_prefetch(
         |candidate: &Candidate| candidate.strength >= TAU && !in_context.contains(&candidate.uuid);
     let found = gather(cx, bank_id, &query, now, &keep, None)?;
     let documents = found.iter().map(|c| c.content.clone()).collect();
-    let logits = rerank::logits(&cx.models.reranker, cx.permit, &query, documents, deadline);
+    let logits = rerank::logits(
+        &cx.models.reranker,
+        cx.permit,
+        &rerank_query,
+        documents,
+        deadline,
+    );
     let reranked = logits.is_some();
     let ranking = &cx.tuning.ranking;
     let ranked = rank(found, logits, |candidate, logit| {
@@ -669,6 +725,7 @@ pub(crate) fn scored_prefetch(
             reranked,
         },
         query,
+        rerank_query,
         raw_query: request.query.clone(),
         candidates: shown,
     })

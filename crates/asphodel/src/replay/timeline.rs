@@ -3,6 +3,8 @@
 //! corpus `asphodel import` wrote. The engine reads only this, so nothing in it
 //! knows whether the history is scripted or real.
 
+use std::collections::BTreeMap;
+
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +31,9 @@ pub struct Turn {
     /// The plugin's previous prefetch query for the session, which a short
     /// follow-up borrows.
     pub previous_query: Option<String>,
+    /// The assistant's reply to the previous message, when it came before
+    /// this one.
+    pub previous_reply: Option<String>,
     pub author: Option<Author>,
     pub platform: Option<String>,
     pub class: SessionClass,
@@ -71,6 +76,7 @@ impl Timeline {
                 user: turn.user.clone(),
                 assistant: turn.assistant.clone(),
                 previous_query: None,
+                previous_reply: None,
                 author: turn.author.clone(),
                 platform: turn.platform.clone(),
                 class: SessionClass::Primary,
@@ -92,6 +98,7 @@ impl Timeline {
                     user: format!("Just checking in ({n})."),
                     assistant: "Hello again.".into(),
                     previous_query: None,
+                    previous_reply: None,
                     author: None,
                     platform: None,
                     class: SessionClass::Primary,
@@ -114,11 +121,13 @@ impl Timeline {
     }
 
     /// A corpus's events: a prefetch and its sync make one turn, a prefetch on
-    /// its own a prefetch-only turn, and a clear a clear. Probes come from the
-    /// private probes file.
+    /// its own a prefetch-only turn, and a clear a clear. A prefetch that has
+    /// a previous query takes the reply to the session's previous turn, if
+    /// it was synced by then. Probes come from the private probes file.
     pub fn from_corpus(corpus: &Corpus, probes: Vec<Probe>) -> Result<Self, String> {
         let mut turns: Vec<Turn> = Vec::new();
         let mut clears = Vec::new();
+        let mut last: BTreeMap<&str, usize> = BTreeMap::new();
         for event in &corpus.events {
             match event {
                 Event::Prefetch {
@@ -128,20 +137,30 @@ impl Timeline {
                     query,
                     previous_query,
                     platform,
-                } => turns.push(Turn {
-                    at: *at,
-                    reply_at: *at,
-                    session: session.clone(),
-                    user: query.clone(),
-                    assistant: String::new(),
-                    previous_query: previous_query.clone(),
-                    author: None,
-                    platform: platform.clone(),
-                    class: *class,
-                    prefetch_only: true,
-                    claims: Vec::new(),
-                    used: Vec::new(),
-                }),
+                } => {
+                    let previous_reply = previous_query
+                        .as_ref()
+                        .and_then(|_| last.get(session.as_str()))
+                        .map(|&index| &turns[index])
+                        .filter(|turn| !turn.prefetch_only && !turn.assistant.is_empty())
+                        .map(|turn| turn.assistant.clone());
+                    last.insert(session, turns.len());
+                    turns.push(Turn {
+                        at: *at,
+                        reply_at: *at,
+                        session: session.clone(),
+                        user: query.clone(),
+                        assistant: String::new(),
+                        previous_query: previous_query.clone(),
+                        previous_reply,
+                        author: None,
+                        platform: platform.clone(),
+                        class: *class,
+                        prefetch_only: true,
+                        claims: Vec::new(),
+                        used: Vec::new(),
+                    });
+                }
                 Event::Sync {
                     at,
                     session,

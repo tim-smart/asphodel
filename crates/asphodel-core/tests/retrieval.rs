@@ -27,7 +27,7 @@ use asphodel_core::models::{
 };
 use asphodel_core::retrieval::{
     Band, On, PhaseFilter, Prefetch, PrefetchRequest, Recall, RecallRequest, clean_query,
-    effective_query, estimate_tokens, fuse, phase_term,
+    conversation_query, effective_query, estimate_tokens, fuse, phase_term,
 };
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::{OpenOptions, Store, VectorIndex, micros};
@@ -167,6 +167,85 @@ impl Reranker for KeywordReranker {
         Ok(documents
             .iter()
             .map(|d| if d.contains(self.0) { 5.0 } else { -1.0 })
+            .collect())
+    }
+}
+
+/// A reranker that scores like `FakeReranker`, but only on what reaches
+/// the model: the query and the document as one pair of at most 512 tokens,
+/// three of them special, the longer side truncated first and from its end,
+/// as fastembed sets up the real one. Each CJK character is a token, as the
+/// real tokenizer splits them; otherwise each run of letters and digits and
+/// each other character is one. `real_reranker_truncates_a_long_query_from_its_end`
+/// in `tests/models.rs` checks the real one behaves this way.
+struct TruncatingReranker;
+
+impl TruncatingReranker {
+    const MAX_TOKENS: usize = 512 - 3;
+
+    fn tokens(text: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut word = String::new();
+        for c in text.chars() {
+            let cjk = matches!(c, '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}');
+            if c.is_alphanumeric() && !cjk {
+                word.extend(c.to_lowercase());
+                continue;
+            }
+            if !word.is_empty() {
+                tokens.push(std::mem::take(&mut word));
+            }
+            if !c.is_whitespace() {
+                tokens.push(c.to_string());
+            }
+        }
+        if !word.is_empty() {
+            tokens.push(word);
+        }
+        tokens
+    }
+
+    /// How many of each side's tokens survive: the longer side is cut to
+    /// fit, or both to half when even the shorter is more than half.
+    fn kept(query: usize, document: usize) -> (usize, usize) {
+        let max = Self::MAX_TOKENS;
+        if query + document <= max {
+            return (query, document);
+        }
+        let short = query.min(document);
+        let (short, long) = if short > max / 2 {
+            (max / 2, max / 2 + max % 2)
+        } else {
+            (short, max - short)
+        };
+        if query <= document {
+            (short, long)
+        } else {
+            (long, short)
+        }
+    }
+}
+
+impl Reranker for TruncatingReranker {
+    fn model_id(&self) -> &str {
+        FakeReranker::MODEL_ID
+    }
+
+    fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, ModelError> {
+        let query = Self::tokens(query);
+        Ok(documents
+            .iter()
+            .map(|document| {
+                let document = Self::tokens(document);
+                let (q, d) = Self::kept(query.len(), document.len());
+                let seen: std::collections::BTreeSet<&String> = query[..q].iter().collect();
+                let shared: std::collections::BTreeSet<&String> = document[..d]
+                    .iter()
+                    .filter(|token| token.chars().any(char::is_alphanumeric))
+                    .filter(|token| seen.contains(token))
+                    .collect();
+                shared.len() as f32 - 0.5
+            })
             .collect())
     }
 }
@@ -482,6 +561,30 @@ impl Harness {
                     session_id: session.into(),
                     query: query.into(),
                     previous_query: previous.map(Into::into),
+                    previous_reply: None,
+                    block_id: None,
+                },
+            )
+            .unwrap()
+    }
+
+    /// A prefetch sent with the previous message and the start of the
+    /// assistant's reply to it.
+    fn prefetch_in_conversation(
+        &self,
+        session: &str,
+        query: &str,
+        previous: Option<&str>,
+        reply: Option<&str>,
+    ) -> Prefetch {
+        self.service
+            .prefetch(
+                BANK,
+                &PrefetchRequest {
+                    session_id: session.into(),
+                    query: query.into(),
+                    previous_query: previous.map(Into::into),
+                    previous_reply: reply.map(Into::into),
                     block_id: None,
                 },
             )
@@ -800,6 +903,206 @@ fn a_short_follow_up_finds_what_the_previous_query_asked_about() {
     assert_eq!(followed.injected, vec![dentist]);
 }
 
+// Reranking against the conversation
+
+/// Fake models and a gate floor of 1.0, with the reranker scoring against
+/// the conversation.
+fn in_conversation() -> Harness {
+    Harness::with(
+        1.0,
+        "rerank_query = \"conversation\"",
+        Arc::new(FakeReranker),
+    )
+}
+
+#[test]
+fn the_conversation_query_is_the_message_the_previous_message_and_the_reply() {
+    let message = "go ahead and order one with that account please";
+    assert_eq!(
+        conversation_query(
+            message,
+            Some("Can you add batteries to the shopping doc?"),
+            Some("Added them. Which account should I order with?"),
+        ),
+        "go ahead and order one with that account please\n\
+         Can you add batteries to the shopping doc?\n\
+         Added them. Which account should I order with?"
+    );
+    assert_eq!(conversation_query(message, None, None), message);
+    assert_eq!(conversation_query(message, Some("  "), Some("")), message);
+}
+
+#[test]
+fn the_conversation_query_takes_only_the_start_of_a_long_reply() {
+    let reply = format!(
+        "Your flight departs at nine. {}Tailword.",
+        "There is more detail after this. ".repeat(400)
+    );
+    let query = conversation_query("remind me", Some("What's on?"), Some(&reply));
+    assert!(
+        query.starts_with("remind me\nWhat's on?\nYour flight departs at nine."),
+        "{query}"
+    );
+    assert!(!query.contains("Tailword"), "{query}");
+}
+
+#[test]
+fn the_conversation_query_takes_only_the_start_of_a_long_previous_message() {
+    let previous = format!(
+        "Can you check the Fastmail account? {}Tailword.",
+        "Here is some more context. ".repeat(400)
+    );
+    let query = conversation_query("go ahead", Some(&previous), Some("Sure."));
+    assert!(
+        query.starts_with("go ahead\nCan you check the Fastmail account?"),
+        "{query}"
+    );
+    assert!(query.ends_with("\nSure."), "{query}");
+    assert!(!query.contains("Tailword"), "{query}");
+}
+
+/// Text with no space to cut back to, or in a script of multi-byte
+/// characters, is still cut to a start made of whole characters.
+#[test]
+fn a_long_context_without_spaces_or_in_another_script_is_cut_to_whole_characters() {
+    for text in [
+        "a".repeat(2000),
+        "東京".repeat(1000),
+        "🙂".repeat(1000),
+        format!("x{}", "é".repeat(1000)),
+        "東京 ".repeat(1000),
+    ] {
+        let query = conversation_query("message", Some(&text), None);
+        let (message, start) = query
+            .split_once('\n')
+            .expect("the message, then the context");
+        assert_eq!(message, "message");
+        assert!(
+            !start.is_empty() && start.len() < text.len(),
+            "{} of {} bytes",
+            start.len(),
+            text.len()
+        );
+        assert!(text.starts_with(start), "{start:?}");
+    }
+}
+
+/// However long the previous message and the reply, the message still
+/// reaches the reranker: the conversation's context gives way to it within
+/// the reranker's 512 tokens. 300 characters of CJK are 300 tokens, so two
+/// such parts alone are more than the pair holds.
+#[test]
+fn the_message_reaches_the_reranker_past_a_long_conversation() {
+    let h = Harness::with(
+        1.0,
+        "rerank_query = \"conversation\"",
+        Arc::new(TruncatingReranker),
+    );
+    let pottery = h.insert(fact("Tim takes a pottery class."));
+    let message = "pottery class schedule please";
+    assert_eq!(h.prefetch("alone", message).injected, vec![pottery]);
+
+    let context = "東京".repeat(150);
+    let prefetch = h.prefetch_in_conversation("s", message, Some(&context), Some(&context));
+    assert_eq!(prefetch.injected, vec![pottery], "{prefetch:?}");
+}
+
+/// A short follow-up still borrows the previous message for the retrievers,
+/// and the conversation query holds that message once.
+#[test]
+fn a_short_follow_up_in_conversation_holds_the_previous_message_once() {
+    let h = in_conversation();
+    let dentist = h.insert(fact("Tim's dentist appointment is on Friday."));
+    let scored = h
+        .service
+        .scored_prefetch(
+            BANK,
+            &PrefetchRequest {
+                session_id: "s".into(),
+                query: "yes, book it".into(),
+                previous_query: Some("dentist appointment Friday".into()),
+                previous_reply: Some("I can book it for Friday.".into()),
+                block_id: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(scored.query, "dentist appointment Friday\nyes, book it");
+    assert_eq!(
+        scored.rerank_query,
+        "yes, book it\ndentist appointment Friday\nI can book it for Friday."
+    );
+    assert_eq!(scored.prefetch.injected, vec![dentist]);
+}
+
+/// By default, context can make a memory relevant even when a message
+/// of eight words or more doesn't name its subject.
+#[test]
+fn by_default_the_reranker_sees_the_conversation() {
+    let h = Harness::new();
+    let passkey = h.insert(fact("Tim signs in to Fastmail with a passkey."));
+    let prefetch = h.prefetch_in_conversation(
+        "s",
+        "go ahead and do that for me right now please",
+        Some("Can you sign in to Fastmail for me?"),
+        Some("Sure, signing in to Fastmail now."),
+    );
+    assert_eq!(prefetch.injected, vec![passkey], "{prefetch:?}");
+}
+
+/// Explicit message mode ignores context for a message of eight words
+/// or more, preserving the message-only comparison.
+#[test]
+fn in_message_mode_the_reranker_sees_only_the_message() {
+    let h = Harness::with(1.0, "rerank_query = \"message\"", Arc::new(FakeReranker));
+    let _passkey = h.insert(fact("Tim signs in to Fastmail with a passkey."));
+    let prefetch = h.prefetch_in_conversation(
+        "s",
+        "go ahead and do that for me right now please",
+        Some("Can you sign in to Fastmail for me?"),
+        Some("Sure, signing in to Fastmail now."),
+    );
+    assert!(prefetch.injected.is_empty(), "{prefetch:?}");
+}
+
+/// A message that doesn't name its subject finds the memory the previous
+/// message makes relevant.
+#[test]
+fn reranking_against_the_conversation_finds_what_the_previous_message_named() {
+    let h = in_conversation();
+    let passkey = h.insert(fact("Tim signs in to Fastmail with a passkey."));
+    let message = "go ahead and do that for me right now please";
+    assert!(h.prefetch("alone", message).injected.is_empty());
+
+    let prefetch = h.prefetch_in_conversation(
+        "s",
+        message,
+        Some("Can you sign in to Fastmail for me?"),
+        None,
+    );
+    assert_eq!(prefetch.injected, vec![passkey]);
+}
+
+/// The assistant's reply carries what the message leans on when the
+/// previous message didn't name it either.
+#[test]
+fn reranking_against_the_conversation_finds_what_the_reply_named() {
+    let h = in_conversation();
+    let flight = h.insert(fact("Tim's flight to Wellington departs from gate four."));
+    let message = "remind me two hours before that leaves so I can pack";
+    let previous = Some("Anything on this week?");
+
+    let without = h.prefetch_in_conversation("a", message, previous, None);
+    assert!(without.injected.is_empty(), "{without:?}");
+
+    let with = h.prefetch_in_conversation(
+        "b",
+        message,
+        previous,
+        Some("Your flight to Wellington departs Friday at nine."),
+    );
+    assert_eq!(with.injected, vec![flight]);
+}
+
 // Cleaning the query
 
 /// The note Hermes' Discord gateway puts in front of a turn's message, with
@@ -1048,6 +1351,7 @@ fn the_floor_gates_on_the_raw_logit_whatever_the_relevance_scale() {
                     session_id: "s".into(),
                     query: "pottery class schedule".into(),
                     previous_query: None,
+                    previous_reply: None,
                     block_id: None,
                 },
             )

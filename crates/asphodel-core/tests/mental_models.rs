@@ -1849,6 +1849,7 @@ fn a_sessions_block_puts_its_agenda_and_cited_memories_in_context() {
                 session_id: "s1".into(),
                 query: "is the cat called Miso".into(),
                 previous_query: None,
+                previous_reply: None,
                 block_id: None,
             },
         )
@@ -2252,6 +2253,7 @@ fn prefetch_holding(h: &Harness, session: &str, query: &str, block: Option<Uuid>
                 session_id: session.into(),
                 query: query.into(),
                 previous_query: None,
+                previous_reply: None,
                 block_id: block,
             },
         )

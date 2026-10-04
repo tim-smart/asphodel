@@ -39,6 +39,7 @@ pub mod manifest;
 pub mod prime;
 pub mod probes;
 pub mod report;
+pub mod rescore;
 pub mod scenario;
 pub mod shadow;
 pub mod timeline;

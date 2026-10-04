@@ -1324,6 +1324,40 @@ fn real_models_embed_and_rerank() {
     assert!(models.reranker.rerank(query, &[]).unwrap().is_empty());
 }
 
+/// The real reranker scores a pair of at most 512 tokens, truncating the
+/// longer side first and from its end, and its tokenizer makes each CJK
+/// character a token. So a query whose context runs past the budget loses
+/// whatever comes after it, and what comes first survives. Prefetch's
+/// conversation query has to fit that; `TruncatingReranker` in
+/// `tests/retrieval.rs` models it.
+#[test]
+#[ignore = "needs the real models: run `asphodel models fetch`, or set ASPHODEL_MODEL_DIR"]
+fn real_reranker_truncates_a_long_query_from_its_end() {
+    let dir = real_model_dir();
+    let models = Models::load(
+        &dir,
+        &ModelOptions {
+            threads: std::num::NonZeroUsize::new(1),
+        },
+    )
+    .unwrap_or_else(|error| panic!("loading from {}: {error}", dir.path().display()));
+    let documents = ["Tim takes a pottery class on Tuesdays."];
+    let message = "when is my pottery class";
+    let context = "東京".repeat(300);
+    let score = |query: &str| models.reranker.rerank(query, &documents).unwrap()[0];
+
+    assert_eq!(
+        score(&format!("{context}\n{message}")),
+        score(&context),
+        "a message after 600 CJK tokens never reaches the model"
+    );
+    let first = score(&format!("{message}\n{context}"));
+    assert!(
+        first > score(&context) + 1.0,
+        "a message before the context does: {first}"
+    );
+}
+
 #[test]
 #[ignore = "needs the real L-6 models: run `asphodel models fetch`, or set ASPHODEL_MODEL_DIR"]
 fn real_model_reranker_matches_l6_reference_logits() {
