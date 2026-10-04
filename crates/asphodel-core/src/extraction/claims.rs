@@ -173,6 +173,9 @@ pub(super) struct NewMemory {
     pub start: usize,
     pub end: usize,
     pub valid_from: Option<Stamp>,
+    /// Only this field was synthesized from the observation day, rather
+    /// than supplied by call 1. Confidence alone cannot distinguish them.
+    pub valid_from_defaulted: bool,
     pub valid_until: Option<Stamp>,
     pub until_event: Option<String>,
     pub low_confidence: bool,
@@ -182,6 +185,17 @@ pub(super) struct NewMemory {
     pub recurrence_rrule: Option<String>,
     pub recurrence_start: Option<Stamp>,
     pub links: Vec<Link>,
+}
+
+impl NewMemory {
+    /// The start supplied by call 1, excluding the undated-event fallback.
+    pub fn supplied_valid_from(&self) -> Option<Stamp> {
+        if self.valid_from_defaulted {
+            None
+        } else {
+            self.valid_from
+        }
+    }
 }
 
 /// The reply after the checks.
@@ -327,7 +341,8 @@ fn check_claim(
         low = true;
     }
 
-    if claim.kind == Kind::Event && valid_from.is_none() {
+    let valid_from_defaulted = claim.kind == Kind::Event && valid_from.is_none();
+    if valid_from_defaulted {
         // An event with no stated time starts on the day it was said,
         // with low confidence.
         valid_from = start_of_day(input.observed_at, tz).map(|at| Stamp {
@@ -363,6 +378,7 @@ fn check_claim(
         start,
         end,
         valid_from,
+        valid_from_defaulted,
         valid_until,
         until_event,
         low_confidence: low,

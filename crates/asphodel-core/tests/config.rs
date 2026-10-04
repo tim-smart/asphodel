@@ -641,13 +641,13 @@ fn an_override_can_lower_one_significance_level_over_production() {
 
 #[test]
 fn significance_order_is_checked_on_the_layered_result() {
-    // Production raises trivial above the default minor; the override
-    // lowers trivial again, so the merged result is in order.
-    let production = "[strength.significance]\ntrivial = 0.3\n";
+    // Production sets minor below trivial; the override lowers trivial
+    // below minor, so the merged result is in order.
+    let production = "[strength.significance]\ntrivial = 0.1\nminor = 0.08\n";
     assert!(layers(&[production]).is_err());
     let t = layers(&[production, "[strength.significance]\ntrivial = 0.04\n"]).unwrap();
     assert_eq!(t.strength.significance.trivial, 0.04);
-    assert_eq!(t.strength.significance.minor, 0.2);
+    assert_eq!(t.strength.significance.minor, 0.08);
 }
 
 #[test]

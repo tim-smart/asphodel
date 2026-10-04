@@ -108,7 +108,7 @@ pub fn guidance_hash(guidance: Option<&str>) -> Option<String> {
 
 /// Call 2's template name and version, which replay's cassette keys include.
 pub const CALL2_TEMPLATE: &str = "reconcile_claims";
-pub const CALL2_VERSION: u32 = 2;
+pub const CALL2_VERSION: u32 = 3;
 
 /// The top five neighbours per claim after fusing vector search and BM25.
 /// A flagged claim's entity-linked open tasks and current states come on top.
@@ -344,6 +344,9 @@ pub struct ReconcileClaim {
     /// The claim's index in call 1's reply, as [`Dropped::claim`] counts it.
     pub claim: usize,
     pub content: String,
+    pub due_at: Option<Timestamp>,
+    pub valid_from: Option<Timestamp>,
+    pub valid_until: Option<Timestamp>,
     /// The source's `observed_at`, which decides direction.
     pub observed_at: Timestamp,
     /// `changes_something` or `remember_this`: the claim gets the wider
@@ -361,6 +364,9 @@ pub struct NeighbourMemory {
     pub handle: String,
     pub memory: Uuid,
     pub content: String,
+    pub due_at: Option<Timestamp>,
+    pub valid_from: Option<Timestamp>,
+    pub valid_until: Option<Timestamp>,
     pub kind: crate::strength::Kind,
     pub observed_at: Timestamp,
     /// Whether another memory has already ended it. Code rejects a newer

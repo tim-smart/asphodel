@@ -1359,6 +1359,226 @@ fn mentioned_again_writes_an_access_and_no_memory() {
     assert!(extracted_at.is_some());
 }
 
+/// Seed through extraction so the window fixture uses the same public contract
+/// as the later claim. The second turn is newer than the seeded memory.
+fn window_repeat(initial: Value, repeated: Value, label: &str) -> (Harness, Uuid, Extracted) {
+    let h = Harness::new();
+    owner_says(&h, "I need to renew my passport.");
+    let old = extract_alone(&h, reply(vec![initial])).memories[0];
+    h.advance(24);
+    h.service
+        .ingest_turn(
+            "main",
+            &turn(
+                "s1",
+                "2026-10-02T06:30:00Z",
+                "I still need to renew my passport.",
+                "Noted.",
+            ),
+        )
+        .unwrap();
+    let extracted = one_label(&h, reply(vec![repeated]), old, label);
+    (h, old, extracted)
+}
+
+#[test]
+fn repeat_labels_preserve_added_or_changed_windows_as_a_dated_head() {
+    for label in ["mentioned_again", "confirmed"] {
+        for field in ["due_at", "valid_from", "valid_until"] {
+            for initial_date in [None, Some("2026-10-08T08:00")] {
+                let mut initial = claim(PASSPORT, "task", "renew my passport");
+                if let Some(date) = initial_date {
+                    initial = initial.with(field, time(date, "minute"));
+                }
+                let repeated = claim(PASSPORT, "task", "renew my passport")
+                    .with(field, time("2026-10-09T08:00", "minute"));
+                let (h, old, extracted) = window_repeat(initial, repeated, label);
+                let old_view = h.service.show_memory("main", &old.to_string()).unwrap();
+                let head = h
+                    .service
+                    .show_memory("main", &old_view.chain.head.to_string())
+                    .unwrap();
+                let window = serde_json::to_value(&head.window).unwrap();
+                assert_eq!(
+                    window[field]["at"],
+                    json!(local("2026-10-09T08:00").to_string()),
+                    "{label}, {field}, initial date {initial_date:?}"
+                );
+                assert_eq!(window[field]["precision"], "minute");
+                assert_eq!(extracted.memories, vec![head.id]);
+                assert_ne!(head.id, old);
+                assert!(
+                    old_view.retracted_at.is_none(),
+                    "adding detail is a refinement"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_undated_mention_of_a_dated_task_is_still_absorbed() {
+    let initial = claim(PASSPORT, "task", "renew my passport")
+        .with("due_at", time("2026-10-09T08:00", "minute"));
+    let (h, old, extracted) = window_repeat(
+        initial,
+        claim(PASSPORT, "task", "renew my passport"),
+        "mentioned_again",
+    );
+    assert!(extracted.memories.is_empty());
+    let view = h.service.show_memory("main", &old.to_string()).unwrap();
+    assert_eq!(view.chain.head, old);
+    assert_eq!(view.window.due_at.unwrap().at, local("2026-10-09T08:00"));
+}
+
+#[test]
+fn an_undated_retraction_inherits_the_dated_window() {
+    // Choose carry-over, not relabelling as mentioned_again: a genuine
+    // correction must still retract its predecessor. Missing times are not
+    // evidence that the previously stated dates were cancelled.
+    let initial = claim(PASSPORT, "task", "renew my passport")
+        .with("valid_from", time("2026-10-11", "day"))
+        .with("valid_until", time("2026-10-15", "day"))
+        .with("due_at", time("2026-10-15T08:00", "minute"));
+    let (h, old, extracted) = window_repeat(
+        initial,
+        claim(PASSPORT, "task", "renew my passport"),
+        "retracts",
+    );
+    let old_view = h.service.show_memory("main", &old.to_string()).unwrap();
+    let head = h
+        .service
+        .show_memory("main", &old_view.chain.head.to_string())
+        .unwrap();
+    assert_eq!(extracted.memories, vec![head.id]);
+    assert_ne!(head.id, old);
+    assert!(old_view.retracted_at.is_some());
+    assert_eq!(
+        head.window, old_view.window,
+        "the replacement retains dates and precision"
+    );
+}
+
+/// Both turns describe the same booking. Only the first supplies dates;
+/// extraction must not treat the second turn's observation-day default as
+/// a newly stated booking date.
+fn undated_booking(label: &str) -> (Harness, Uuid, Extracted) {
+    booking_restatement(
+        label,
+        claim("Tim has a hotel booking.", "event", "hotel booking"),
+        "I have a hotel booking.",
+    )
+}
+
+fn booking_restatement(
+    label: &str,
+    restatement: Value,
+    message: &str,
+) -> (Harness, Uuid, Extracted) {
+    const BOOKING: &str = "Tim has a hotel booking.";
+    let h = Harness::new();
+    owner_says(&h, "I have a hotel booking for January 11 to 15, 2027.");
+    let initial = claim(BOOKING, "event", "hotel booking")
+        .with("valid_from", time("2027-01-11", "day"))
+        .with("valid_until", time("2027-01-15", "day"));
+    let old = extract_alone(&h, reply(vec![initial])).memories[0];
+    h.advance(24);
+    h.service
+        .ingest_turn(
+            "main",
+            &turn("s1", "2026-10-02T06:30:00Z", message, "Noted."),
+        )
+        .unwrap();
+    let extracted = one_label(&h, reply(vec![restatement]), old, label);
+    (h, old, extracted)
+}
+
+fn assert_undated_booking_absorbed(label: &str) {
+    let (h, old, extracted) = undated_booking(label);
+    let view = h.service.show_memory("main", &old.to_string()).unwrap();
+    assert_eq!(
+        view.chain.head, old,
+        "{label} must not replace a dated booking"
+    );
+    assert!(extracted.memories.is_empty());
+    assert_eq!(
+        view.window.valid_from.unwrap().at,
+        local("2027-01-11T00:00")
+    );
+    assert_eq!(
+        view.window.valid_until.unwrap().at,
+        local("2027-01-15T00:00")
+    );
+}
+
+#[test]
+fn an_undated_event_mentioned_again_keeps_the_dated_booking() {
+    assert_undated_booking_absorbed("mentioned_again");
+}
+
+#[test]
+fn an_undated_event_confirmed_keeps_the_dated_booking() {
+    assert_undated_booking_absorbed("confirmed");
+}
+
+#[test]
+fn an_undated_event_retraction_inherits_the_dated_booking_window() {
+    let (h, old, extracted) = undated_booking("retracts");
+    let old_view = h.service.show_memory("main", &old.to_string()).unwrap();
+    let head = h
+        .service
+        .show_memory("main", &old_view.chain.head.to_string())
+        .unwrap();
+    assert_eq!(extracted.memories, vec![head.id]);
+    assert_ne!(head.id, old);
+    assert!(old_view.retracted_at.is_some());
+    assert_eq!(
+        head.window, old_view.window,
+        "an omitted event date must inherit the booking window, not the observation day"
+    );
+}
+
+fn assert_explicit_low_confidence_booking(label: &str) {
+    // Deliberately use the observation day and the fallback's precision and
+    // confidence. Only whether the start was supplied distinguishes it.
+    let restatement = claim("Tim has a hotel booking.", "event", "hotel booking")
+        .with("valid_from", time("2026-10-02", "day"))
+        .with("window_confidence", json!("low"));
+    let (h, old, extracted) =
+        booking_restatement(label, restatement, "I think my hotel booking starts today.");
+    let old_view = h.service.show_memory("main", &old.to_string()).unwrap();
+    let head = h
+        .service
+        .show_memory("main", &old_view.chain.head.to_string())
+        .unwrap();
+    assert_eq!(extracted.memories, vec![head.id]);
+    assert_ne!(head.id, old, "{label} must retain an explicit date");
+    assert_eq!(old_view.retracted_at.is_some(), label == "retracts");
+    let start = head.window.valid_from.unwrap();
+    assert_eq!(start.at, local("2026-10-02T00:00"));
+    assert_eq!(start.precision, asphodel_core::strength::TimePrecision::Day);
+    assert!(
+        head.window.valid_until.is_none(),
+        "do not inherit the old end"
+    );
+    assert_eq!(head.window.window_confidence, "low");
+}
+
+#[test]
+fn an_explicit_low_confidence_event_mentioned_again_refines_the_booking() {
+    assert_explicit_low_confidence_booking("mentioned_again");
+}
+
+#[test]
+fn an_explicit_low_confidence_event_confirmed_refines_the_booking() {
+    assert_explicit_low_confidence_booking("confirmed");
+}
+
+#[test]
+fn an_explicit_low_confidence_event_retraction_keeps_its_own_window() {
+    assert_explicit_low_confidence_booking("retracts");
+}
+
 #[test]
 fn mentioned_again_outranks_used_in_the_same_turn() {
     // The reply relied on the memory and the user restated it in the same

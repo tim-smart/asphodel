@@ -220,8 +220,36 @@ the target. Raise the overlap with the target's sentence or flag the claim;
 the engine never smuggles a target in, because that would make the
 scenario say something production wouldn't do.
 
-A claim whose outcomes absorb it (`mentioned_again` or `confirmed` only)
-creates no memory, so a `label` on it is a scenario error.
+Code promotes a newer claim's `mentioned_again` or `confirmed` to `refines`
+when any supplied `due_at`, `valid_from` or `valid_until` adds or changes
+the neighbour's date (including its precision). The claim becomes a new
+chain head instead of losing its schedule through absorption. An omitted
+date does not trigger this guard, and older claims cannot replace newer
+memories. Ended and retracted neighbours still reject newer edits.
+
+Call 2 version 3 shows these fields beside both claims and memories, using
+UTC timestamps and `none` for absent dates. Its prompt treats an added
+schedule as a refinement: "needs to pack the carrots" refined by "reminder
+to pack the carrots at 8am on the 30th".
+
+A fully undated `retracts` still corrects and invalidates its predecessor.
+The replacement carries over the first retracted neighbour's whole window
+(`due_at`, `valid_from`, `valid_until`, `until_event`, precision and window
+confidence). This applies only when the claim supplies none of those time
+fields; a partial or explicit replacement window is not filled in. Multiple
+neighbours' windows are not combined. `denies` does not carry dates over.
+
+An undated event's observation-day `valid_from` is a synthetic fallback,
+not a supplied date. It does not trigger the repeat guard or prevent
+undated-retraction carry-over; the inherited window replaces that fallback.
+Standalone undated events still keep it. Explicit dates count as supplied
+even when their window confidence is low.
+
+The scenario loader currently rejects a `label` on a claim with only
+`mentioned_again` or `confirmed` outcomes, even when this date guard would
+create a new memory. Leave the claim unlabelled and inspect the original
+memory's chain head, as in `reminder-adds-date.toml`. Without the guard,
+these outcomes absorb the claim and create no memory.
 
 ### Probes
 

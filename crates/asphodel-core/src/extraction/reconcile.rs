@@ -22,8 +22,10 @@
 //!
 //! **Labels.** Code decides direction from `observed_at`, ties broken by
 //! the later `ingested_at` and then the source's rowid, never from the LLM.
-//! A newer claim's labels apply as given, except that any label on a
-//! neighbour already ended or retracted is rejected. An older claim's
+//! A newer repeat label becomes `refines` if the claim supplies a new or
+//! changed date. A fully undated `retracts` carries the old window over at
+//! commit. Labels on neighbours already ended or retracted are rejected.
+//! An older claim's
 //! `mentioned_again` and `confirmed` still write the access, even on an
 //! ended neighbour; its `ends` creates it already ended by the neighbour;
 //! its `retracts`, `denies` and `refines` create nothing. A claim left with
@@ -70,6 +72,10 @@ pub(super) struct Neighbour {
     /// Its source's timezone, which its day is in.
     pub tz: TimeZone,
     pub valid_from: Option<Stamp>,
+    pub valid_until: Option<Stamp>,
+    pub due_at: Option<Stamp>,
+    pub until_event: Option<String>,
+    pub low_confidence: bool,
     pub significance: Significance,
     pub owner_significance: Option<String>,
     /// Already ended by another memory.
@@ -284,6 +290,9 @@ pub(super) fn search(
             handle: format!("c{}", index + 1),
             claim: memory.claim,
             content: memory.content.clone(),
+            due_at: memory.due_at.map(|stamp| stamp.at),
+            valid_from: memory.valid_from.map(|stamp| stamp.at),
+            valid_until: memory.valid_until.map(|stamp| stamp.at),
             observed_at: input.observed_at,
             flagged: memory.flagged,
             neighbours: found
@@ -298,6 +307,9 @@ pub(super) fn search(
             handle: handle_of[&neighbour.id].clone(),
             memory: neighbour.uuid,
             content: neighbour.content.clone(),
+            due_at: neighbour.due_at.map(|stamp| stamp.at),
+            valid_from: neighbour.valid_from.map(|stamp| stamp.at),
+            valid_until: neighbour.valid_until.map(|stamp| stamp.at),
             kind: neighbour.kind,
             observed_at: neighbour.observed_at,
             ended: neighbour.ended,
@@ -452,7 +464,9 @@ fn load(conn: &Connection, id: i64) -> Result<Option<Neighbour>, rusqlite::Error
     let row = conn.query_row(
         "SELECT m.uuid, m.content, m.kind, m.observed_at, m.valid_from, m.valid_from_precision,
                 m.significance, m.owner_significance, m.ended_by IS NOT NULL,
-                m.invalidated_at IS NOT NULL, s.id, s.ingested_at, s.document_id, s.timezone
+                m.invalidated_at IS NOT NULL, s.id, s.ingested_at, s.document_id, s.timezone,
+                m.valid_until, m.valid_until_precision, m.due_at, m.due_at_precision,
+                m.until_event, m.window_confidence
          FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
          WHERE m.id = ?1",
         [id],
@@ -486,6 +500,10 @@ fn load(conn: &Connection, id: i64) -> Result<Option<Neighbour>, rusqlite::Error
                     document_id: row.get(12)?,
                     tz: TimeZone::get(&row.get::<_, String>(13)?).unwrap_or(TimeZone::UTC),
                     valid_from,
+                    valid_until: load_stamp(row, 14, 15)?,
+                    due_at: load_stamp(row, 16, 17)?,
+                    until_event: row.get(18)?,
+                    low_confidence: row.get::<_, String>(19)? == "low",
                     significance: level(&row.get::<_, String>(6)?),
                     owner_significance: row.get(7)?,
                     ended: row.get(8)?,
@@ -495,6 +513,25 @@ fn load(conn: &Connection, id: i64) -> Result<Option<Neighbour>, rusqlite::Error
     )?;
     let (retracted, neighbour) = row;
     Ok((!retracted).then_some(neighbour))
+}
+
+fn load_stamp(
+    row: &rusqlite::Row<'_>,
+    at: usize,
+    precision: usize,
+) -> Result<Option<Stamp>, rusqlite::Error> {
+    Ok(
+        match (
+            row.get::<_, Option<i64>>(at)?,
+            row.get::<_, Option<String>>(precision)?,
+        ) {
+            (Some(at), Some(precision)) => Precision::parse(&precision).map(|precision| Stamp {
+                at: timestamp(at),
+                precision,
+            }),
+            _ => None,
+        },
+    )
 }
 
 fn kind(text: &str) -> Kind {
@@ -636,6 +673,21 @@ pub(super) fn plan(
                 neighbour.ingested_at,
                 neighbour.source_id,
             )) != Ordering::Less;
+            // Repeat labels must not discard a newly supplied or changed date.
+            let label = if newer
+                && matches!(label, Label::MentionedAgain | Label::Confirmed)
+                && [
+                    (memory.due_at, neighbour.due_at),
+                    (memory.supplied_valid_from(), neighbour.valid_from),
+                    (memory.valid_until, neighbour.valid_until),
+                ]
+                .iter()
+                .any(|(claim, stored)| claim.is_some() && claim != stored)
+            {
+                Label::Refines
+            } else {
+                label
+            };
             match label {
                 Label::MentionedAgain | Label::Confirmed => {
                     if newer && ended[n] {
