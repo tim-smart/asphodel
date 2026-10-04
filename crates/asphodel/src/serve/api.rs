@@ -910,13 +910,29 @@ async fn agenda(
     Ok(Json(agenda))
 }
 
+/// The models with the budget their enabled `max_tokens` must fit, so a
+/// client can show what's left without knowing the tuning.
+#[derive(Serialize)]
+struct ModelList {
+    models: Vec<Model>,
+    /// `mental_models.budget`.
+    budget: u32,
+}
+
 /// `GET /v1/banks/{bank}/models`: `asphodel model list`.
 async fn list_models(
     State(app): State<Shared>,
     Path(bank): Path<String>,
-) -> Result<Json<Vec<Model>>, ApiError> {
-    let models = app.call(move |service| service.list_models(&bank)).await?;
-    Ok(Json(models))
+) -> Result<Json<ModelList>, ApiError> {
+    let list = app
+        .call(move |service| {
+            Ok::<_, ModelError>(ModelList {
+                models: service.list_models(&bank)?,
+                budget: service.tuning().mental_models.budget,
+            })
+        })
+        .await?;
+    Ok(Json(list))
 }
 
 /// `POST /v1/banks/{bank}/models`: `asphodel model create`. 201.

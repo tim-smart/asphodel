@@ -1584,12 +1584,20 @@ fn model(command: ModelCommand) -> anyhow::Result<()> {
             if args.client.json {
                 return print_json(&models);
             }
-            let models = models.as_array().cloned().unwrap_or_default();
-            if models.is_empty() {
+            let list = models["models"].as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
                 println!("no models");
             }
-            for model in &models {
+            for model in &list {
                 print_model(model);
+            }
+            if let Some(budget) = models["budget"].as_u64() {
+                let used: u64 = list
+                    .iter()
+                    .filter(|model| model["enabled"] == true)
+                    .filter_map(|model| model["max_tokens"].as_u64())
+                    .sum();
+                println!("enabled models take {used} of the {budget}-token budget");
             }
             Ok(())
         }

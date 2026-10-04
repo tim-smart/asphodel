@@ -479,7 +479,9 @@ Only the owner defines mental models, through these commands or the API.
 
 - `asphodel model create --bank B <name> --question Q --max-tokens N
   [--kind K]... [--entity E] [--min-volatility V] [--disabled]`
-- `asphodel model list --bank B`
+- `asphodel model list --bank B` lists them, then the enabled models'
+  `max_tokens` against `mental_models.budget`.
+  `GET /v1/banks/{bank}/models` answers `{"models": [...], "budget": N}`.
 - `asphodel model edit --bank B <name> [--question Q] [--max-tokens N]
   [--kind K... | --all-kinds] [--min-volatility V|none] [--enable |
   --disable]`
@@ -868,9 +870,10 @@ memory doesn't strengthen it or log a recall. The Recall page doesn't
 either; see below.
 
 It also shows each bank's counts, the `attention` lines from `status` as a
-banner, failed chunks with retry, and the purge pause with its
-acknowledgement. Retract, forget, document removal and the purge
-acknowledgement each ask first and say what will go.
+banner, failed chunks with retry, the purge pause with its
+acknowledgement, and which mental models go into the system prompt.
+Retract, forget, document removal and the purge acknowledgement each ask
+first and say what will go.
 
 A daemon on loopback without a token is browsed without asking. Otherwise
 the dashboard asks once per browser tab, keeps the token in that tab's
@@ -884,6 +887,25 @@ there is no build step and nothing to install. Its serif is Source Serif 4,
 Adobe's woff2 release files unmodified, served from the daemon under the SIL
 Open Font License (`OFL.txt` beside them, also at `/dashboard/OFL.txt`). Node runs its tests only:
 `cd tests/dashboard && nix develop ../.. -c sh -c 'npm ci && npm test'`.
+
+### The mental models page
+
+Each bank has a Models tab, `#/banks/{bank}/models`, also linked
+from the bank's model count on the banks page. It lists each model with
+its question, `max_tokens`, entries, last refresh and last refresh error,
+and shows the enabled models' `max_tokens` against `mental_models.budget`.
+The agenda takes its share of that budget first, so a model can get less
+than its limit.
+
+A model's switch puts it in or takes it out of the system prompt through
+`PATCH /v1/banks/{bank}/models/{model}` with `{"enabled": ...}`, the same
+as `asphodel model edit --enable|--disable`. It persists in the store and
+the next `GET /system-prompt` reflects it. Hermes freezes the block per
+session, so a change reaches new sessions only. Taking a model out also
+pauses its refreshes, and putting it back in starts one. When enabling
+would take the enabled models over the budget, the daemon refuses with
+422, and the page shows its reason and leaves the model out. Creating,
+editing and deleting models stays with the CLI.
 
 ### The Recall page
 

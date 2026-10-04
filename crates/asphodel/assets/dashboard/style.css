@@ -1337,6 +1337,157 @@ legend {
   min-width: 14rem;
 }
 
+/* Mental models. The budget bar stacks each enabled model's share; a model
+   out of the prompt keeps its card, paled like a faded memory. */
+
+.budget {
+  max-width: 40rem;
+}
+
+.budget-figure {
+  margin: 0;
+  font: 400 0.95rem var(--sans);
+  color: var(--ink-2);
+}
+
+.budget-figure strong {
+  font: 600 1.6rem/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+.budget-bar {
+  display: flex;
+  gap: 2px;
+  height: 0.55rem;
+  border-radius: 999px;
+  background: var(--rule);
+  overflow: hidden;
+}
+
+.budget-bar > span {
+  flex: none;
+  width: var(--share);
+  background: var(--stem);
+}
+
+.budget-bar > span:nth-child(even) {
+  background: color-mix(in srgb, var(--stem) 65%, var(--surface));
+}
+
+.model-notes {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.88rem;
+  color: var(--ink-2);
+  max-width: 64ch;
+  display: grid;
+  gap: 0.2rem;
+}
+
+.model-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 24rem), 1fr));
+  gap: var(--gap);
+}
+
+.model-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.model h2 {
+  font: 650 1.1rem var(--sans);
+  letter-spacing: -0.01em;
+}
+
+.model .question {
+  margin: 0;
+  font: 400 1.08rem/1.4 var(--serif);
+  color: var(--ink);
+}
+
+.model[data-enabled="false"] {
+  background: transparent;
+  border-style: dashed;
+}
+
+.model[data-enabled="false"] .question {
+  color: var(--ink-faded);
+}
+
+.model-error {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--ink-2);
+}
+
+/* The in-prompt switch: the checkbox stays in place, transparent, over its
+   track, so the browser keeps its keyboard and form behaviour. */
+
+.switch {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font: 400 0.85rem var(--sans);
+  color: var(--ink-2);
+  cursor: pointer;
+  margin: 0;
+}
+
+.switch-input {
+  position: absolute;
+  left: 0;
+  width: 2.3rem;
+  height: 1.3rem;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.switch-track {
+  position: relative;
+  width: 2.3rem;
+  height: 1.3rem;
+  border-radius: 999px;
+  background: var(--rule);
+}
+
+.switch-track::after {
+  content: "";
+  position: absolute;
+  top: 0.15rem;
+  left: 0.15rem;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+}
+
+.switch-input:checked + .switch-track {
+  background: var(--stem);
+}
+
+.switch-input:checked + .switch-track::after {
+  transform: translateX(1rem);
+}
+
+.switch-input:focus-visible + .switch-track {
+  outline: 2px solid var(--stem);
+  outline-offset: 2px;
+}
+
+.switch-input:disabled,
+.switch-input:disabled + .switch-track {
+  cursor: progress;
+  opacity: 0.6;
+}
+
 /* Confirmations */
 
 dialog.confirm {
@@ -1444,6 +1595,10 @@ dialog.confirm h2 {
 }
 
 @media (max-width: 40rem) {
+  .tabs a {
+    padding-inline: 0.5rem;
+  }
+
   .memory {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
@@ -1510,6 +1665,14 @@ dialog.confirm h2 {
     transition: width 400ms ease-out;
   }
 
+  .switch-track {
+    transition: background 120ms ease-out;
+  }
+
+  .switch-track::after {
+    transition: transform 120ms ease-out;
+  }
+
   dialog.confirm[open] {
     animation: rise 160ms ease-out;
   }
@@ -1523,6 +1686,22 @@ dialog.confirm h2 {
 }
 
 @media (forced-colors: active) {
+  .switch-track {
+    border: 1px solid CanvasText;
+  }
+
+  .switch-track::after {
+    background: CanvasText;
+  }
+
+  .switch-input:checked + .switch-track {
+    background: Highlight;
+  }
+
+  .budget-bar > span {
+    background: CanvasText;
+  }
+
   .segment:has(input:checked) {
     border: 2px solid Highlight;
   }
