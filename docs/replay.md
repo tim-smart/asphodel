@@ -821,7 +821,7 @@ reranker, against the query `--rerank-query` gives, and writes the material
 again with the candidates in logit order, highest first, ties in the order
 they were listed. Each sample is found in the corpus by its session and
 time, and its query rebuilt from the corpus as replay builds it: `message`
-is the query a default run reranked against, and `conversation` the
+is the query an explicit message-mode run reranked against, and `conversation` the
 conversation query, with the reply from the corpus. Each sample records it
 as `rerank_query`. Sample and candidate ids, memories, sentences and each
 sample's `query` are kept, so labels apply unchanged in either form:
