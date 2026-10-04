@@ -87,7 +87,11 @@ fn select(cx: &Context<'_>, model: &ModelRow, log: bool) -> Result<Selection, Mo
         };
         candidate.strength >= TAU
             && current
-            && model.admits(candidate.window.kind, candidate.volatility)
+            && model.admits(
+                candidate.window.kind,
+                candidate.volatility,
+                candidate.rrule.as_deref(),
+            )
             && linked
                 .as_ref()
                 .is_none_or(|linked| linked.contains(&candidate.id))

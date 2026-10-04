@@ -327,7 +327,27 @@ impl ModelRow {
     /// Whether the model's own filters let a memory of `kind` and
     /// `volatility` through. The entity filter is checked apart, since it
     /// needs the memory's links.
-    pub(crate) fn admits(&self, kind: Kind, volatility: Option<Volatility>) -> bool {
+    pub(crate) fn admits(
+        &self,
+        kind: Kind,
+        volatility: Option<Volatility>,
+        rrule: Option<&str>,
+    ) -> bool {
+        // The profile excludes routines, not all recurring memories. Use the
+        // agenda's classification, including its conservative unknown-rule case.
+        if self.name == crate::store::bank::PROFILE_NAME && kind == Kind::Recurring {
+            if rrule.and_then(crate::agenda::period_within_a_week) != Some(false) {
+                return false;
+            }
+            // Extend the seeded filter without rewriting existing profiles or
+            // overriding an owner's custom kind selection.
+            if self.kinds.len() == 2
+                && self.kinds.contains(&Kind::Fact)
+                && self.kinds.contains(&Kind::State)
+            {
+                return true;
+            }
+        }
         let kind_passes = self.kinds.is_empty() || self.kinds.contains(&kind);
         let volatility_passes = match (self.min_volatility, kind, volatility) {
             (Some(min), Kind::State, Some(volatility)) => volatility >= min,
@@ -677,6 +697,7 @@ struct Written {
     id: i64,
     kind: Kind,
     volatility: Option<Volatility>,
+    rrule: Option<String>,
     /// The owner's setting if there is one, `kept` as the highest level.
     level: Option<Significance>,
     kept: bool,
@@ -684,7 +705,7 @@ struct Written {
 
 fn written(conn: &Connection, memory_id: i64) -> Result<Option<Written>, rusqlite::Error> {
     conn.query_row(
-        "SELECT kind, volatility, significance, owner_significance FROM memories
+        "SELECT kind, volatility, significance, owner_significance, recurrence_rrule FROM memories
          WHERE id = ?1 AND invalidated_at IS NULL AND hidden_at IS NULL",
         [memory_id],
         |row| {
@@ -697,6 +718,7 @@ fn written(conn: &Connection, memory_id: i64) -> Result<Option<Written>, rusqlit
                 id: memory_id,
                 kind: memory_kind(&kind).unwrap_or(Kind::Fact),
                 volatility: volatility_text.as_deref().and_then(volatility),
+                rrule: row.get(4)?,
                 level: significance(&level),
                 kept: owner.as_deref() == Some("kept"),
             })
@@ -823,7 +845,7 @@ pub(crate) fn effects(
             continue;
         }
         for model in &models {
-            if !model.admits(memory.kind, memory.volatility) {
+            if !model.admits(memory.kind, memory.volatility, memory.rrule.as_deref()) {
                 continue;
             }
             if let Some(entity) = model.entity_id
