@@ -647,7 +647,7 @@ fn replay_can_rerank_against_the_conversation_and_records_both_queries() {
     let rerank_query = leaning["rerank_query"]
         .as_str()
         .expect("the sample records the rerank query");
-    assert_eq!(rerank_query, format!("{ASKED}\n{ANSWERED}\n{LEANING}"));
+    assert_eq!(rerank_query, format!("{LEANING}\n{ASKED}\n{ANSWERED}"));
 
     let home = candidates(leaning)
         .iter()
@@ -1698,7 +1698,7 @@ fn rescoring_by_the_conversation_scores_the_same_pools_against_it() {
     }
     assert_eq!(
         sample_for(&rescored, LEANING)["rerank_query"],
-        format!("{ASKED}\n{ANSWERED}\n{LEANING}")
+        format!("{LEANING}\n{ASKED}\n{ANSWERED}")
     );
     assert_eq!(sample_for(&rescored, ASKED)["rerank_query"], ASKED);
     let home = candidates(sample_for(&rescored, LEANING))
@@ -1731,7 +1731,7 @@ fn an_unanswered_previous_message_gives_the_conversation_no_reply() {
         "conversation",
         &["--overrides", overrides.to_str().unwrap()],
     );
-    let expected = format!("{ASKED}\n{LEANING}");
+    let expected = format!("{LEANING}\n{ASKED}");
     assert_eq!(sample_for(&replayed, LEANING)["rerank_query"], expected);
 
     let (_, _) = material_of(&dir, &corpus, "message", &[]);

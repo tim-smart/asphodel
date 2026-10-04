@@ -916,7 +916,7 @@ fn in_conversation() -> Harness {
 }
 
 #[test]
-fn the_conversation_query_is_the_previous_message_the_reply_and_the_message() {
+fn the_conversation_query_is_the_message_the_previous_message_and_the_reply() {
     let message = "go ahead and order one with that account please";
     assert_eq!(
         conversation_query(
@@ -924,9 +924,9 @@ fn the_conversation_query_is_the_previous_message_the_reply_and_the_message() {
             Some("Can you add batteries to the shopping doc?"),
             Some("Added them. Which account should I order with?"),
         ),
-        "Can you add batteries to the shopping doc?\n\
-         Added them. Which account should I order with?\n\
-         go ahead and order one with that account please"
+        "go ahead and order one with that account please\n\
+         Can you add batteries to the shopping doc?\n\
+         Added them. Which account should I order with?"
     );
     assert_eq!(conversation_query(message, None, None), message);
     assert_eq!(conversation_query(message, Some("  "), Some("")), message);
@@ -940,10 +940,9 @@ fn the_conversation_query_takes_only_the_start_of_a_long_reply() {
     );
     let query = conversation_query("remind me", Some("What's on?"), Some(&reply));
     assert!(
-        query.starts_with("What's on?\nYour flight departs at nine."),
+        query.starts_with("remind me\nWhat's on?\nYour flight departs at nine."),
         "{query}"
     );
-    assert!(query.ends_with("\nremind me"), "{query}");
     assert!(!query.contains("Tailword"), "{query}");
 }
 
@@ -955,10 +954,10 @@ fn the_conversation_query_takes_only_the_start_of_a_long_previous_message() {
     );
     let query = conversation_query("go ahead", Some(&previous), Some("Sure."));
     assert!(
-        query.starts_with("Can you check the Fastmail account?"),
+        query.starts_with("go ahead\nCan you check the Fastmail account?"),
         "{query}"
     );
-    assert!(query.ends_with("\nSure.\ngo ahead"), "{query}");
+    assert!(query.ends_with("\nSure."), "{query}");
     assert!(!query.contains("Tailword"), "{query}");
 }
 
@@ -974,9 +973,9 @@ fn a_long_context_without_spaces_or_in_another_script_is_cut_to_whole_characters
         "東京 ".repeat(1000),
     ] {
         let query = conversation_query("message", Some(&text), None);
-        let (start, message) = query
+        let (message, start) = query
             .split_once('\n')
-            .expect("the context, then the message");
+            .expect("the message, then the context");
         assert_eq!(message, "message");
         assert!(
             !start.is_empty() && start.len() < text.len(),
@@ -1030,7 +1029,7 @@ fn a_short_follow_up_in_conversation_holds_the_previous_message_once() {
     assert_eq!(scored.query, "dentist appointment Friday\nyes, book it");
     assert_eq!(
         scored.rerank_query,
-        "dentist appointment Friday\nI can book it for Friday.\nyes, book it"
+        "yes, book it\ndentist appointment Friday\nI can book it for Friday."
     );
     assert_eq!(scored.prefetch.injected, vec![dentist]);
 }
