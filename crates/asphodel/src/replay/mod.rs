@@ -203,7 +203,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             latency,
             latency_from_cassette: false,
             until: args.until,
-            labelling: false,
+            labelling: None,
         };
         let engine = Engine::new(
             &service,

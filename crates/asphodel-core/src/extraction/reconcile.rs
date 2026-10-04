@@ -359,6 +359,8 @@ pub(super) fn shown_lists(
             });
         }
         lists.push(Call2List {
+            chunk: search.input.chunk,
+            ordinal: claim.claim,
             claim: claim.content.clone(),
             candidates,
         });

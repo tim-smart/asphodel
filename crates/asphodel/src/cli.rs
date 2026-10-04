@@ -897,6 +897,11 @@ pub struct ReplayArgs {
     #[arg(long, conflicts_with = "scenario")]
     pub labelling: Option<PathBuf>,
 
+    /// Keyed labels, under the private dir: the labelling material samples
+    /// turns whose queries they label first, so they carry over.
+    #[arg(long, requires = "labelling", conflicts_with = "scenario")]
+    pub labels: Option<PathBuf>,
+
     /// Where to write the JSON report; `<replay dir>/reports/<name>.json`
     /// by default. Given twice, the last one wins.
     #[arg(long, overrides_with = "report")]
@@ -1016,13 +1021,20 @@ pub struct PrecisionArgs {
     #[arg(long, env = "ASPHODEL_REPLAY_DIR")]
     pub replay_dir: Option<PathBuf>,
 
-    /// The labels: a TOML table of candidate id to `true` or `false`.
+    /// The labels: keyed by query and memory, and by claim and
+    /// neighbour, or the old TOML table of candidate id to `true` or
+    /// `false`.
     #[arg(long)]
     pub labels: PathBuf,
 
     /// The material `asphodel replay --labelling` wrote.
     #[arg(long)]
     pub material: PathBuf,
+
+    /// Also write labels of candidate ids keyed, under the private dir,
+    /// read through the material they were written for.
+    #[arg(long)]
+    pub convert: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
