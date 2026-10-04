@@ -1418,6 +1418,15 @@ legend {
   color: var(--ink-faded);
 }
 
+.cached-prompt .empty {
+  padding: 0;
+}
+
+.cached-prompt pre {
+  max-height: 32rem;
+  overflow: auto;
+}
+
 .model-error {
   margin: 0;
   font-size: 0.85rem;

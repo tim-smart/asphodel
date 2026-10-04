@@ -87,6 +87,10 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/v1/banks/{bank}/chunks", get(chunks))
         .route("/v1/banks/{bank}/chunks/retry", post(retry_chunks))
         .route("/v1/banks/{bank}/system-prompt", get(system_prompt))
+        .route(
+            "/v1/banks/{bank}/system-prompt/cached",
+            get(cached_system_prompt),
+        )
         .route("/v1/banks/{bank}/agenda", get(agenda))
         .route(
             "/v1/banks/{bank}/models",
@@ -899,6 +903,24 @@ async fn system_prompt(
         .call(move |service| service.system_prompt(&bank, query.session_id.as_deref()))
         .await?;
     Ok(Json(block))
+}
+
+#[derive(Serialize)]
+struct CachedBlock {
+    block: Option<Block>,
+}
+
+/// `GET /v1/banks/{bank}/system-prompt/cached`: the block the daemon has
+/// cached, or `null`, for the dashboard. Unlike `/system-prompt` it never
+/// builds one, so looking writes nothing.
+async fn cached_system_prompt(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+) -> Result<Json<CachedBlock>, ApiError> {
+    let block = app
+        .call(move |service| service.cached_system_prompt(&bank))
+        .await?;
+    Ok(Json(CachedBlock { block }))
 }
 
 /// `GET /v1/banks/{bank}/agenda`: the agenda as the block would list it.

@@ -907,6 +907,17 @@ would take the enabled models over the budget, the daemon refuses with
 422, and the page shows its reason and leaves the model out. Creating,
 editing and deleting models stays with the CLI.
 
+The page also shows the system prompt block the daemon has cached for the
+bank, exactly as a new Hermes session gets it, with when it was built. It
+reads `GET /v1/banks/{bank}/system-prompt/cached`, which answers
+`{"block": ...}` with the block `/system-prompt` would serve now, or
+`{"block": null}` when nothing is cached. Unlike `/system-prompt` it never
+builds a block, so looking writes nothing and refreshes no model. The cache
+is cleared whenever the block's content could change and at local midnight
+(see `crates/asphodel-core/src/system_prompt.rs`), and it lives in memory,
+so after a restart the page says nothing is cached until the next Hermes
+session fetches the block.
+
 ### The Recall page
 
 Each bank has a Recall tab, `#/banks/{bank}/recall`, for testing a query

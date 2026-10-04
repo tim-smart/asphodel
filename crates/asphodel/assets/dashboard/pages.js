@@ -1494,7 +1494,8 @@ function candidateRow(ctx, c, reason) {
 
 // The bank's mental models, and which of them go into Hermes's system
 // prompt. A model is in the prompt while it's enabled; the daemon refuses an
-// enable past the budget, and the page shows its reason.
+// enable past the budget, and the page shows its reason. The block the
+// daemon has cached is read without building one, so looking writes nothing.
 
 const REFRESH_FAILURES = {
   llm: "The LLM call failed",
@@ -1505,7 +1506,10 @@ const REFRESH_FAILURES = {
 async function models(ctx) {
   const { api, ui, bank } = ctx;
   const { h, time, pill } = ui;
-  const { models: list, budget } = await api.models(bank);
+  const [{ models: list, budget }, { block: cached }] = await Promise.all([
+    api.models(bank),
+    api.cachedSystemPrompt(bank),
+  ]);
   const enabled = list.filter((m) => m.enabled);
   const used = enabled.reduce((sum, m) => sum + m.max_tokens, 0);
   const left = budget - used;
@@ -1557,6 +1561,27 @@ async function models(ctx) {
     { class: "model-notes" },
     h("li", {}, "Changes reach new Hermes sessions only. A running session keeps the system prompt it started with."),
     h("li", {}, "Taking a model out also pauses its refreshes. Putting it back in starts one."),
+  );
+
+  const prompt = h(
+    "section",
+    { class: "panel cached-prompt", "aria-labelledby": "cached-title" },
+    h(
+      "div",
+      { class: "section-head" },
+      h("h2", { id: "cached-title" }, "Cached system prompt"),
+      cached ? h("p", { class: "quiet-text" }, "Built ", time(cached.built_at, { withTime: true })) : null,
+    ),
+    cached
+      ? [
+          h("p", { class: "quiet-text" }, "What a new Hermes session gets now, exactly as it gets it."),
+          h("pre", { class: "injection-text", tabindex: "0", "aria-label": "The cached system prompt" }, cached.text),
+        ]
+      : h(
+          "p",
+          { class: "empty" },
+          "Nothing is cached right now. The next Hermes session to start builds the block, from the agenda and the enabled models as they are then.",
+        ),
   );
 
   const cards = list.map((m, i) => {
@@ -1621,6 +1646,7 @@ async function models(ctx) {
       list.length
         ? h("div", { class: "model-grid" }, cards)
         : h("p", { class: "empty" }, "No mental models yet. Create one with asphodel model create."),
+      prompt,
     ],
   };
 }
