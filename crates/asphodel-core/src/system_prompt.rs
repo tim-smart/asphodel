@@ -617,6 +617,10 @@ fn shorten(line: &Line, fits: impl Fn(&str) -> bool) -> String {
 /// The longest `- <start of sentence>…<suffix>` that `fits` takes, keeping
 /// at least `min` characters of the sentence, or `None`.
 fn cut(sentence: &str, suffix: &str, min: usize, fits: &impl Fn(&str) -> bool) -> Option<String> {
+    let whole = format!("- {sentence}{suffix}");
+    if fits(&whole) {
+        return Some(whole);
+    }
     let chars: Vec<char> = sentence.chars().collect();
     let render = |kept: &[char]| -> String {
         let start: String = kept.iter().collect();
@@ -637,14 +641,10 @@ fn cut(sentence: &str, suffix: &str, min: usize, fits: &impl Fn(&str) -> bool) -
             high = middle - 1;
         }
     }
-    if low == chars.len() {
-        // Only annotations gave way; the sentence is whole.
-        return Some(format!("- {sentence}{suffix}"));
-    }
     // The text after the last space would be a broken word, unless the
     // cut falls just before a space. With no space in the second half of
     // what fits, the cut is mid-word.
-    let end = if chars[low].is_whitespace() {
+    let end = if low == chars.len() || chars[low].is_whitespace() {
         low
     } else {
         match chars[..low].iter().rposition(|c| c.is_whitespace()) {
