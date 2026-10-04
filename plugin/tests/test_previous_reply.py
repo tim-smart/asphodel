@@ -1,10 +1,13 @@
 """Conversation context sent over the daemon HTTP boundary."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from threading import Event
 
 import pytest
 
-from conftest import SESSION
+from conftest import FAST, SESSION
 
 
 @pytest.mark.parametrize(
@@ -122,4 +125,59 @@ def test_late_sync_cannot_restore_cleared_reply_context(make_provider, daemon, c
     provider.prefetch("next query")
     body = daemon.requests_for("prefetch")[-1].body
     assert body["previous_query"] == fresh_query
+    assert body.get("previous_reply") is None
+
+
+def test_clear_during_prefetch_cannot_restore_reply_context(make_provider, daemon):
+    provider = make_provider(timeouts=replace(FAST, prefetch=5.0))
+    started = Event()
+    release = Event()
+
+    def held_prefetch(request):
+        started.set()
+        release.wait(timeout=10.0)
+        return 200, {"text": "Completed held prefetch."}
+
+    daemon.set_handler("prefetch", held_prefetch)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(provider.prefetch, "old query")
+        try:
+            assert started.wait(timeout=3.0), "prefetch did not reach the daemon"
+            provider.on_session_switch(SESSION, reset=True)
+            assert daemon.requests_for("clear")[-1].session == SESSION
+        finally:
+            release.set()
+        # Require a successful response: a timeout would not exercise the
+        # completed request trying to restore its pre-clear context.
+        assert pending.result(timeout=5.0) == "Completed held prefetch."
+
+    daemon.set_response("prefetch", 200, {"text": "Fresh prefetch."})
+    provider.sync_turn("old query", "Late answer from before the clear.")
+    assert provider.prefetch("fresh query") == "Fresh prefetch."
+    body = daemon.requests_for("prefetch")[-1].body
+    assert body.get("previous_query") is None
+    assert body.get("previous_reply") is None
+
+
+@pytest.mark.parametrize(
+    "first_attempt_fails", [True, False], ids=["failed-then-successful", "successful-then-failed"]
+)
+def test_failed_repeated_prefetch_makes_reply_ambiguous(make_provider, daemon, first_attempt_fails):
+    provider = make_provider()
+    for fails in (first_attempt_fails, not first_attempt_fails):
+        if fails:
+            daemon.set_response("prefetch", 500, {"error": "prefetch failed"})
+            assert provider.prefetch("repeated query") == ""
+        else:
+            daemon.set_response("prefetch", 200, {"text": "Successful prefetch."})
+            assert provider.prefetch("repeated query") == "Successful prefetch."
+    assert [request.body["query"] for request in daemon.requests_for("prefetch")] == [
+        "repeated query", "repeated query"
+    ]
+
+    provider.sync_turn("repeated query", "Answer with ambiguous turn attribution.")
+    daemon.set_response("prefetch", 200, {"text": "Next prefetch."})
+    assert provider.prefetch("next query") == "Next prefetch."
+    body = daemon.requests_for("prefetch")[-1].body
+    assert body["previous_query"] == "repeated query"
     assert body.get("previous_reply") is None
