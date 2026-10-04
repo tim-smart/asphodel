@@ -1,10 +1,10 @@
 # The purge table through the store, with δ = 1.0 and bank time at world
 # speed. One mention is purged at the first 04:00 sweep after
 # strength falls below τ − δ: e^((S·σ − τ + δ) / a) days after the mention,
-# which is 262.8 days for trivial, 1096.6 for minor and 4576 for notable.
+# which is 128.7 days for trivial, 536.8 for minor and 4576 for notable.
 # The exists probes sit 5% before the crossing and the absent probes 5%
 # plus a sweep after it. Separate occasions (at least three world days
-# apart) lift the lasting floor: trivial on 4 occasions, minor on 3 and
+# apart) lift the lasting floor: trivial on 6 occasions, minor on 3 and
 # notable on 2 are never purged, and nothing major is.
 #
 # The cat is stated again after its memory was purged. Reconciliation has
@@ -15,7 +15,7 @@
 
 name = "purge-table"
 group = "ci"
-description = "One mention is purged at 9 months, 3 years or 12.5 years; enough separate occasions, or major significance, is never purged."
+description = "One mention is purged at 4 months, 1.5 years or 12.5 years; enough separate occasions, or major significance, is never purged."
 
 [bank]
 timezone = "UTC"
@@ -65,7 +65,7 @@ kind = "fact"
 significance = "trivial"
 
 [[turn.claim]]
-label = "trivial-four"
+label = "trivial-six"
 content = "Tim's gym locker is number 37."
 quote = "my gym locker is number 37"
 kind = "fact"
@@ -104,7 +104,7 @@ content = "Tim's gym locker is number 37."
 quote = "my gym locker is number 37"
 kind = "fact"
 significance = "trivial"
-reconcile = [{ memory = "trivial-four", outcome = "mentioned_again" }]
+reconcile = [{ memory = "trivial-six", outcome = "mentioned_again" }]
 
 [[turn.claim]]
 content = "Tim takes his tea with milk."
@@ -139,7 +139,7 @@ content = "Tim's gym locker is number 37."
 quote = "my gym locker is number 37"
 kind = "fact"
 significance = "trivial"
-reconcile = [{ memory = "trivial-four", outcome = "mentioned_again" }]
+reconcile = [{ memory = "trivial-six", outcome = "mentioned_again" }]
 
 [[turn.claim]]
 content = "Tim takes his tea with milk."
@@ -160,9 +160,37 @@ content = "Tim's gym locker is number 37."
 quote = "my gym locker is number 37"
 kind = "fact"
 significance = "trivial"
-reconcile = [{ memory = "trivial-four", outcome = "mentioned_again" }]
+reconcile = [{ memory = "trivial-six", outcome = "mentioned_again" }]
 
-# The cat again, 300 days on: its memory was purged about five weeks ago.
+# Fifth occasion, for the locker only.
+[[turn]]
+at = "2026-01-21T09:00:00Z"
+session = "s1"
+user = "My gym locker is still number 37."
+assistant = "Locker 37."
+
+[[turn.claim]]
+content = "Tim's gym locker is number 37."
+quote = "My gym locker is still number 37"
+kind = "fact"
+significance = "trivial"
+reconcile = [{ memory = "trivial-six", outcome = "mentioned_again" }]
+
+# Sixth occasion, for the locker only.
+[[turn]]
+at = "2026-01-25T09:00:00Z"
+session = "s1"
+user = "My gym locker is still number 37."
+assistant = "Locker 37."
+
+[[turn.claim]]
+content = "Tim's gym locker is number 37."
+quote = "My gym locker is still number 37"
+kind = "fact"
+significance = "trivial"
+reconcile = [{ memory = "trivial-six", outcome = "mentioned_again" }]
+
+# The cat again, 300 days on: its memory was purged about six months ago.
 [[turn]]
 at = "2026-11-01T09:00:00Z"
 session = "s1"
@@ -178,13 +206,13 @@ significance = "trivial"
 
 [[probe]]
 id = "trivial-still-there"
-at = "2026-09-11T09:00:00Z"
+at = "2026-05-07T09:00:00Z"
 kind = "exists"
 memory = "trivial"
 
 [[probe]]
 id = "trivial-purged"
-at = "2026-10-09T09:00:00Z"
+at = "2026-05-21T09:00:00Z"
 kind = "absent"
 memory = "trivial"
 
@@ -197,19 +225,19 @@ head = true
 
 [[probe]]
 id = "minor-still-there"
-at = "2028-11-11T09:00:00Z"
+at = "2027-05-30T09:00:00Z"
 kind = "exists"
 memory = "minor"
 
 [[probe]]
 id = "minor-purged"
-at = "2029-03-03T09:00:00Z"
+at = "2027-07-24T09:00:00Z"
 kind = "absent"
 memory = "minor"
 
 [[probe]]
 id = "trivial-thrice-still-there"
-at = "2028-10-01T09:00:00Z"
+at = "2027-01-05T09:00:00Z"
 kind = "exists"
 memory = "trivial-thrice"
 
@@ -238,10 +266,10 @@ kind = "exists"
 memory = "major"
 
 [[probe]]
-id = "trivial-four-never-purged"
+id = "trivial-six-never-purged"
 at = "2039-03-04T09:00:00Z"
 kind = "exists"
-memory = "trivial-four"
+memory = "trivial-six"
 
 [[probe]]
 id = "minor-thrice-never-purged"
