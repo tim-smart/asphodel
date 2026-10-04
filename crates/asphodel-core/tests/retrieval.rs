@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use asphodel_core::config::RankingTuning;
-use asphodel_core::constants::CANDIDATES_PER_ARM;
+use asphodel_core::constants::{CANDIDATES_PER_ARM, RERANKED};
 use asphodel_core::ingest::{Outcome, Turn};
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, ModelError, Models, Reranker,
@@ -2408,4 +2408,103 @@ fn an_explained_injection_shows_a_reranker_that_missed_its_deadline() {
     let shown = explained(&explain, pottery);
     assert_eq!(shown.reason, Some(Cut::NotReranked));
     assert_eq!(shown.logit, None);
+}
+
+/// A reranker that answers like `FakeReranker` and records how many
+/// documents each call was sent.
+#[derive(Default)]
+struct CountingReranker(Mutex<Vec<usize>>);
+
+impl Reranker for CountingReranker {
+    fn model_id(&self) -> &str {
+        FakeReranker::MODEL_ID
+    }
+
+    fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, ModelError> {
+        self.0.lock().unwrap().push(documents.len());
+        FakeReranker.rerank(query, documents)
+    }
+}
+
+/// A cut's reason as the response names it.
+fn reason_name(candidate: &Explained) -> Option<String> {
+    serde_json::to_value(candidate.reason)
+        .unwrap()
+        .as_str()
+        .map(str::to_owned)
+}
+
+#[test]
+fn fused_candidates_past_the_rerank_pool_are_listed_and_never_reranked() {
+    let reranker = Arc::new(CountingReranker::default());
+    let h = Harness::with(1.0, "", reranker.clone());
+    // More eligible matches than the reranker takes, and one below τ.
+    let notes: Vec<Uuid> = (0..RERANKED + 5)
+        .map(|n| h.insert(fact(leak(format!("Pottery class note {n}.")))))
+        .collect();
+    let faded = h.insert(Memory {
+        significance: "trivial",
+        observed_at: at("2021-01-01T00:00:00Z"),
+        ..fact("Tim once tried a pottery class.")
+    });
+
+    let recall_request = RecallRequest {
+        limit: Some(30),
+        ..query("pottery class")
+    };
+    let recall = h.explain(explain_recall(&recall_request));
+    let injection = h.explain(explain_injection("pottery class"));
+    // Explain sent the reranker no more than production does.
+    assert_eq!(*reranker.0.lock().unwrap(), vec![RERANKED, RERANKED]);
+
+    for (explain, eligible) in [
+        (&recall, [notes.clone(), vec![faded]].concat()),
+        (&injection, notes.clone()),
+    ] {
+        let reranked = &explain.candidates[..RERANKED];
+        assert!(reranked.iter().all(|c| c.logit.is_some()));
+        let overflow: Vec<&Explained> = explain
+            .candidates
+            .iter()
+            .filter(|c| reason_name(c).as_deref() == Some("outside_rerank_pool"))
+            .collect();
+        assert_eq!(overflow.len(), eligible.len() - RERANKED, "{explain:#?}");
+        let mut listed: Vec<Uuid> = reranked
+            .iter()
+            .chain(overflow.iter().copied())
+            .map(|c| c.id)
+            .collect();
+        listed.sort();
+        let mut eligible = eligible;
+        eligible.sort();
+        assert_eq!(listed, eligible, "{:?}", explain.mode);
+
+        // The overflow follows the reranked candidates in RRF order, with
+        // the ranks fusion gave it and nothing from the reranker.
+        let ranks: Vec<usize> = overflow.iter().map(|c| c.rrf_rank.unwrap()).collect();
+        assert_eq!(ranks, (RERANKED + 1..=eligible.len()).collect::<Vec<_>>());
+        assert_eq!(explain.candidates[RERANKED].id, overflow[0].id);
+        for c in &overflow {
+            assert!(!c.included);
+            assert_eq!((c.logit, c.score), (None, None));
+            assert!(!c.arms.is_empty());
+            assert!(c.arms.iter().all(|arm| arm.rank.is_some()), "{c:#?}");
+        }
+    }
+    // Below τ still comes last, after the overflow.
+    assert_eq!(injection.candidates.last().unwrap().id, faded);
+    assert_eq!(
+        injection.candidates.len(),
+        notes.len() + 1,
+        "{injection:#?}"
+    );
+
+    // Production selection is unchanged: the same results and injection,
+    // from the same number of reranked documents.
+    assert_eq!(included(&recall), ids(&h.recall(recall_request)));
+    assert_eq!(
+        injection.injection.as_ref().unwrap().injected,
+        h.prefetch("fresh", "pottery class").injected
+    );
+    assert_eq!(*reranker.0.lock().unwrap(), vec![RERANKED; 4]);
 }
