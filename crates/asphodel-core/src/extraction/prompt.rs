@@ -14,67 +14,71 @@ use crate::queue::SourceKind;
 
 const SCHEMA_NAME: &str = "call1_claims";
 
-const SYSTEM: &str = r#"You extract memories for a personal assistant's long-term memory. You are given a text (a conversation turn or a section of a document) and return the claims in it worth remembering, plus which of the memories already in the assistant's context its reply relied on.
+const SYSTEM: &str = r#"Extract claims worth remembering from a conversation turn or document section for a personal assistant's long-term memory. Also identify which memories in the assistant's context its reply relied on.
 
 # Claims
 
-Each claim is one sentence that makes sense on its own: use names instead of pronouns, and absolute dates instead of relative ones ("tomorrow" becomes "on 2 October 2026"). Put the why into the sentence; there are no separate fields for who, what or why. {language_rule}
+Write each claim as one self-contained sentence. Use names instead of pronouns and absolute dates instead of relative ones ("tomorrow" becomes "on 2 October 2026"). Include the reason in the sentence; there are no separate who, what or why fields. {language_rule}
 
-`quote` is the exact passage of the text the claim comes from, copied character for character. Quote only from the text, never from the context: the context is there so you can understand the text, and a claim found only in the context is not extracted. A claim whose quote isn't in the text is thrown away.
+For `quote`, copy the passage supporting the claim character for character from the text. Use context only to understand the text, never as a quote or the sole source of a claim. Claims with quotes absent from the text are discarded.
 
-What to extract:
-- From the speaker's message, what they say about themselves, the people, places and things in their life, their plans, tasks and preferences. "I" and "me" mean the speaker.
-- A short answer to a question the assistant asked in the context is the speaker's claim, written out in full. "Yes" after "Are you still at Acme?" becomes "Alex still works at Acme.", quoting "Yes". A "remember that" pointing at something said earlier works the same way.
-- From the assistant's reply, only decisions, commitments, and durable content or storage locations stated while carrying out the speaker's request. An assistant task is extracted only when the speaker asked for it and it has a due date or an until-event beyond this turn. Never extract the assistant's suggestions, general knowledge, or findings from tools.
-- Don't extract that someone asked a question or made a request, or the assistant's routine operations: running commands, checks, restarts, reporting results, and adding, updating, saving, removing, restoring, moving or verifying content in notes or files. Extract the durable content itself instead, not an event about the edit. Keep genuine decisions and commitments, not the routine operation that records them; a date or path alone does not make an operation worth extracting. Extract where something durable is kept only when that location is not already stated in the supplied context, and only as a fact about the thing ("the trip notes are in 07_Trips/Anniversary"), not as an event about the edit.
-- Nothing from a request to forget something, and no task to forget it.
-- Skip greetings, filler and small talk.
+Extract:
+- What the speaker says about themselves, the people, places and things in their life, and their plans, tasks and preferences. "I" and "me" mean the speaker.
+- The speaker's short answers and references to earlier context, written out in full. "Yes" after "Are you still at Acme?" becomes "Alex still works at Acme.", quoting "Yes". A "remember that" referring to an earlier statement works the same way.
+- From the assistant's reply, only decisions, commitments, durable content and storage locations stated while carrying out the speaker's request. Extract an assistant task only if the speaker requested it and it has a due date or an until-event beyond this turn.
+
+Skip:
+- The fact that someone asked a question or made a request.
+- The assistant's suggestions, general knowledge and tool findings.
+- Routine operations: commands, checks, restarts, result reports, and adding, updating, saving, removing, restoring, moving or verifying notes or files. Extract the durable content, decision or commitment, not an event about the operation. A date or path alone does not make an operation worth remembering.
+- Storage locations already stated in the supplied context. Extract where something durable is kept only as a fact about the thing ("the trip notes are in 07_Trips/Anniversary"), not an edit event.
+- Requests to forget something, including tasks to forget it.
+- Greetings, filler and small talk.
 
 # Kinds
 
-Decide `kind` in this order:
-- `task`: something to be done. Give `due_at` when the text gives a due date.
-- `recurring`: something that repeats on a schedule, when the next occurrence matters. A habit with no schedule ("Alex goes to the gym") is a fact.
-- `event`: something that happens at a time or over a span, including anything with an explicit end date ("on holiday until 12 October"). A completed or cancelled task is an event.
-- `state`: ongoing and expected to change without anyone announcing it: mood, where someone is, what they're working on, how something is going. A state with an explicit end condition keeps it as `until_event` ("until the release ships").
-- `fact`: everything else, including preferences, and things whose change would be announced (a job, a home, a relationship) or that aren't expected to change (a chronic condition).
+Choose `kind` in this order:
+- `task`: something to be done. Set `due_at` if the text gives a due date.
+- `recurring`: something scheduled to repeat whose next occurrence matters. An unscheduled habit ("Alex goes to the gym") is a fact.
+- `event`: something that happens at a time or over a span, including anything with an explicit end date ("on holiday until 12 October"). Completed or cancelled tasks are events.
+- `state`: something ongoing that is expected to change without an announcement, such as mood, location, current work or progress. Keep an explicit end condition as `until_event` ("until the release ships").
+- `fact`: everything else, including preferences, things whose change would be announced (a job, home or relationship), and things not expected to change (a chronic condition).
 
-The rule between fact and state: a fact isn't expected to change, or its change would be announced; a state is expected to change quietly.
-
-`volatility` is for states only: how quickly the state goes stale. `hours` (mood, where someone is today), `days` (an illness, a trip, a bug being chased), `weeks` (a sprint, a visitor), `months` (a project, job hunting), `years` (a degree). Use null when unsure, and null for every other kind.
+Use `volatility` only for states, to describe how quickly they go stale: `hours` (mood, today's location), `days` (an illness, trip or bug being chased), `weeks` (a sprint or visitor), `months` (a project or job hunting), `years` (a degree). Use null when unsure and for all other kinds.
 
 # Significance
 
-How much the claim matters on its own terms, judged by how long it should be remembered:
-- `trivial`: a passing detail, worth about a week. "Alex had pasta for lunch." "Alex is reading the release notes."
-- `minor`: useful for about a month. "Alex's sister is visiting next weekend." "Alex needs to reply to the landlord this week."
-- `notable`: worth most of a year. "Alex started learning Rust." "Alex's team ships the new API on 15 November 2026."
-- `major`: worth years. "Alex moved to Wellington." "Alex is allergic to penicillin."
-- `critical`: worth a decade or more, and rare. "Alex's daughter Mia was born on 3 March 2026." "Alex married Jo on 12 June 2027."
+Judge each claim on its own terms by how long it is worth remembering:
+- `trivial`: about a week. "Alex had pasta for lunch." "Alex is reading the release notes."
+- `minor`: about a month. "Alex's sister is visiting next weekend." "Alex needs to reply to the landlord this week."
+- `notable`: most of a year. "Alex started learning Rust." "Alex's team ships the new API on 15 November 2026."
+- `major`: years. "Alex moved to Wellington." "Alex is allergic to penicillin."
+- `critical`: a decade or more. "Alex's daughter Mia was born on 3 March 2026." "Alex married Jo on 12 June 2027."
 
-Most claims are trivial or minor. Major is rare and critical is a few per hundred claims.
+Most claims are trivial or minor. Major is rare; critical is a few per hundred claims.
 
 `remember_this` is true only when the text explicitly asks to remember the claim ("remember this", "don't forget that"). `changes_something` is true when the claim ends, corrects, reschedules or completes something that may already be remembered ("I moved out of Berlin", "the dentist is now on Friday", "I filed the tax return").
 
 # Time
 
-Use the calendar to turn relative times into absolute ones. Times are local to the text's timezone. Each time is an object with `at` and `precision`: `at` is `YYYY`, `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`, and `precision` is `year`, `month`, `day`, `hour` or `minute`, as exact as the text is. "In March 2024" is `{"at": "2024-03", "precision": "month"}`; "tomorrow at 3pm" is a day and hour.
+Resolve relative times using the calendar and the text's timezone. Each time has `at` (`YYYY`, `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`) and `precision` (`year`, `month`, `day`, `hour` or `minute`). Match the text's precision: "in March 2024" is `{"at": "2024-03", "precision": "month"}`; "tomorrow at 3pm" specifies a day and hour.
 
-- `valid_from` is when the claim starts to hold; `valid_until` when it stops. Never set `valid_until` unless the text states an end or the task is for a dated occasion as below. A fact never gets `valid_until`, though it keeps a start the text states ("started at Acme in March 2024").
-- A task's due date, or the time to do it, goes in `due_at` and is never an end on its own: "renew my passport by 20 October" and "pay the power bill on 9 October at 9am" have `due_at` but no `valid_until`, because a payment, renewal, reply or chore still needs doing when overdue. Set `valid_until` only when the task is for a separate occasion (an appointment, trip, meeting or departure) and is pointless once that occasion has passed; set it to the occasion's time. "bring my insurance card to the dentist appointment tomorrow at 2pm" and "pack the carrots before we leave for the mountains on Saturday" have both `due_at` and `valid_until` at the appointment or departure. When unsure, leave `valid_until` null.
-- `until_event` is an end given as a condition rather than a date.
-- `window_confidence` is `low` when you had to guess at the dates, otherwise `high`. A coarse date is a matter of precision, not confidence.
-- If the reference date is unknown, don't resolve relative times; use only dates written out in full.
+- `valid_from` is when the claim starts to hold; `valid_until` is when it stops. Set `valid_until` only for an explicit end or a task tied to a dated occasion, as below. Facts never have `valid_until`, but keep any stated start ("started at Acme in March 2024").
+- Put a task's due date or scheduled time in `due_at`. Being overdue is not an end: "renew my passport by 20 October" and "pay the power bill on 9 October at 9am" have `due_at` but no `valid_until`. Payments, renewals, replies and chores still need doing when overdue.
+- Set a task's `valid_until` only if it is for a separate occasion (an appointment, trip, meeting or departure) and becomes pointless afterward. Use the occasion's time. "Bring my insurance card to the dentist appointment tomorrow at 2pm" and "pack the carrots before we leave for the mountains on Saturday" have both `due_at` and `valid_until` at the appointment or departure. When unsure, leave `valid_until` null.
+- `until_event` is an end condition rather than a date.
+- Set `window_confidence` to `low` if you guessed dates, otherwise `high`. Coarse dates affect precision, not confidence.
+- If the reference date is unknown, use only fully written dates; don't resolve relative times.
 
-For a recurring claim, always give `recurrence_text`, the schedule in plain words. Add `recurrence_rrule` (an RFC 5545 RRULE such as `FREQ=WEEKLY;BYDAY=TU`) only when the wording maps cleanly, together with `recurrence_start`, the first occurrence. Otherwise leave both null.
+For recurring claims, always give the schedule in plain words in `recurrence_text`. Set `recurrence_rrule` (an RFC 5545 RRULE such as `FREQ=WEEKLY;BYDAY=TU`) and `recurrence_start` (the first occurrence) only if the wording maps cleanly. Otherwise leave both null.
 
 # Entities
 
-Link each claim to the entities it's about. Known entities are listed with a handle (`e1`, `e2`, …), their aliases and a few memories about them. Link to a known entity with its handle in `entity`. If the claim is about someone or something not listed, propose it with `new_name` and `new_kind` (`person`, `place`, `organisation`, `project` or `thing`) and leave `entity` null. Two different people can share a name: propose a new entity rather than link to a known one that isn't the same person. `surface_form` is how the text names the entity ("Alex", "my sister", "I"). The user and the assistant are always listed.
+Link each claim to the entities it is about. Known entities have handles (`e1`, `e2`, ...), aliases and a few memories. Put a known entity's handle in `entity`. For an unlisted entity, set `new_name` and `new_kind` (`person`, `place`, `organisation`, `project` or `thing`), and leave `entity` null. A shared name does not mean the same person; propose a new entity if the known one is someone else. Copy the text's name for the entity into `surface_form` ("Alex", "my sister", "I"). The user and assistant are always listed.
 
 # Used
 
-The memories already in the assistant's context are listed with handles (`m1`, `m2`, …), and so are any entries of the assistant's standing notes about the user (`n1`, `n2`, …), each with the memories it rests on. In `used_injected_ids`, give the handles of those the assistant's reply actually relied on: a memory's, or an entry's when the reply relied on the entry. Being shown a memory or an entry isn't using it, and a document has no reply, so for a document this is empty."#;
+Context memories have handles (`m1`, `m2`, ...). Standing-note entries have handles (`n1`, `n2`, ...) and list the memories they rest on. In `used_injected_ids`, return only handles the assistant's reply actually relied on: the memory's handle, or the entry's if the reply relied on the entry. Being shown an item is not using it. Return an empty list for documents, which have no reply."#;
 
 /// The language rule without `[llm] language`.
 const INFERRED_LANGUAGE: &str = "Write the claim in the language of the passage it quotes and never translate. Entity names and dates stay as they appear.";
