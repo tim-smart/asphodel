@@ -915,6 +915,89 @@ fn priming_a_recorded_history_calls_nothing() {
     );
 }
 
+/// A failed prime keeps successful in-flight replies, writes no report,
+/// and resumes by calling only chunks still absent from the cassette.
+#[test]
+fn a_failed_prime_preserves_replies_and_resumes_only_missing_chunks() {
+    let serial = TestDir::new();
+    let serial_corpus = imported_small_history(&serial);
+    record(&serial, &serial_corpus);
+    let expected: BTreeSet<String> = call1_chunks(&serial).into_iter().collect();
+    assert!(expected.len() > 2, "the fixture needs unstarted chunks too");
+
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let reply = serde_json::json!({
+        "claims": [support::home_claim()],
+        "used_injected_ids": [],
+        "operations": []
+    });
+    // Both workers start before the refusal; the successful reply arrives
+    // afterwards, so recovery must also preserve work still in flight.
+    let script = dir.path("partial-failure.json");
+    fs::write(
+        &script,
+        serde_json::to_vec(&serde_json::json!([
+            {"reply": reply, "delay_ms": 500},
+            {"fail": "refused", "delay_ms": 100}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let flags = primed(&dir, 2);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let failed = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "failed-prime",
+        Some(&script),
+        &flags,
+    );
+    assert_refused(&failed.output, "priming call 1 failed");
+    assert!(
+        !failed.report_path.exists(),
+        "a failed prime writes no report"
+    );
+    let preserved = cassette_records(&dir);
+    assert_eq!(preserved.len(), 1, "{preserved:?}");
+    assert_eq!(preserved[0]["response"]["json"], reply);
+    assert_eq!(preserved[0]["primed"], true);
+    let completed = call1_chunks(&dir);
+    assert_eq!(completed.len(), 1);
+    assert!(expected.contains(&completed[0]));
+    let cassette_path = dir.private_path("cassettes/main.jsonl");
+    let before = fs::read(&cassette_path).unwrap();
+
+    // Exactly enough replies for the missing chunks. Any redundant call
+    // exhausts the script and fails instead of silently duplicating work.
+    let missing = expected.len() - completed.len();
+    let script = dir.path("resume.json");
+    fs::write(
+        &script,
+        serde_json::to_vec(&vec![serde_json::json!({"reply": reply}); missing]).unwrap(),
+    )
+    .unwrap();
+    let resumed = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        PASSING_PROBES,
+        "resumed-prime",
+        Some(&script),
+        &flags,
+    );
+    assert_ok(&resumed.output);
+    let report = resumed.report();
+    assert_eq!(report["llm"]["primed"], missing, "{report}");
+    assert_eq!(report["llm"]["misses"], 0, "{report}");
+    assert!(fs::read(cassette_path).unwrap().starts_with(&before));
+    let chunks = call1_chunks(&dir);
+    assert_eq!(chunks.len(), expected.len(), "no duplicate recordings");
+    assert_eq!(chunks.into_iter().collect::<BTreeSet<_>>(), expected);
+}
+
 /// Priming relies on reusing claims by chunk, which only `fast` does.
 #[test]
 fn priming_is_refused_outside_fast() {
