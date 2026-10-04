@@ -52,6 +52,11 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             "--refresh says how fast mode answers refreshes; live and replay answer them by request"
         );
     }
+    if args.prime_concurrency.is_some() && mode != ReplayMode::Fast {
+        bail!(
+            "--prime-concurrency records call 1 for fast mode to reuse by chunk, so it goes with --mode fast"
+        );
+    }
     let refresh = args.refresh.unwrap_or(RefreshMode::Recorded);
 
     let dir = super::private_dir(args.replay_dir.as_deref())?;
@@ -164,6 +169,44 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         _ => "request",
     };
 
+    // Primed once, before the simulation, so a self-test's two runs read
+    // the same cassette.
+    let primed = match args.prime_concurrency {
+        Some(concurrency) => {
+            let recorder = Recorder::open(
+                &cassette_path,
+                mode,
+                refresh,
+                false,
+                live.clone(),
+                tuning.llm.language.clone(),
+                Arc::new(SimulatedClock::new(start)),
+            )?
+            .with_guidance(guidance_hash(tuning.extraction.guidance.as_deref()));
+            let chunks = super::prime::chunks(
+                &super::prime::Input {
+                    dir: &dir,
+                    timeline: &timeline,
+                    tuning: &tuning,
+                    models: &models,
+                    bank: &header.bank,
+                    identity: &identity,
+                    start,
+                },
+                &recorder,
+            )?;
+            let started = std::time::Instant::now();
+            let primed = recorder.prime(&chunks, concurrency)?;
+            tracing::info!(
+                primed,
+                seconds = started.elapsed().as_secs(),
+                "primed call 1 before the simulation"
+            );
+            primed
+        }
+        None => 0,
+    };
+
     let mut material = None;
     let finished = super::deliver(args, &report_path, aggregate_path.as_deref(), || {
         let clock = Arc::new(SimulatedClock::new(start));
@@ -206,6 +249,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         )
         .map_err(failure)?;
         let mut outcome = engine.run().map_err(failure)?;
+        outcome.llm.primed = primed;
         material = outcome.material.take();
         let purged_then_re_mentioned =
             super::write_shadow(&service, &tuning, &shadow_path, &outcome)?;
@@ -228,6 +272,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
                 mode: Some(kind),
                 no_cache: args.no_cache,
                 self_test: args.self_test,
+                prime_concurrency: args.prime_concurrency.map(NonZeroUsize::get),
                 onnx_threads: (!fake).then(|| threads.map(NonZeroUsize::get)).flatten(),
             },
             probes: outcome.probes,

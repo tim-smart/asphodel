@@ -93,6 +93,9 @@ pub struct Flags {
     pub mode: Option<&'static str>,
     pub no_cache: bool,
     pub self_test: bool,
+    /// `--prime-concurrency`: how many call 1s at a time a primed `fast`
+    /// run recorded before its simulation; null when it wasn't primed.
+    pub prime_concurrency: Option<usize>,
     /// The pinned ONNX Runtime intra-op thread count, when real models ran.
     pub onnx_threads: Option<usize>,
 }
@@ -237,6 +240,9 @@ pub struct LlmCounts {
     pub cache: u64,
     pub top_up: u64,
     pub live: u64,
+    /// Call 1s the prime recorded before the simulation, counted here
+    /// alone: not as live calls or misses.
+    pub primed: u64,
     /// Calls the cassette couldn't answer. A `replay` run stops at the
     /// first; `live` and `fast` call the LLM instead.
     pub misses: u64,
@@ -268,6 +274,7 @@ pub struct Aggregate {
     pub git_sha: Option<Vec<u8>>,
     pub call1: AggregateCall1,
     pub latency_ms: u64,
+    pub prime_concurrency: Option<u64>,
     pub probes: Vec<ProbeOutcome>,
     pub probes_passed: u64,
     pub probes_failed: u64,
@@ -376,6 +383,7 @@ impl Aggregate {
                 guidance_hash: report.call1.guidance_hash.as_deref().map(hex_bytes),
             },
             latency_ms: report.flags.latency_ms,
+            prime_concurrency: report.flags.prime_concurrency.map(|n| n as u64),
             probes: report
                 .probes
                 .iter()

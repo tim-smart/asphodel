@@ -487,6 +487,7 @@ writes nothing; the counts hold no text, so they can be shared.
 asphodel replay --corpus <file> --mode live|replay|fast \
     [--cassette <file>] [--probes <file>] [--report <file>] [--aggregate <file>] \
     [--labelling <file>] [--no-cache] [--refresh live|recorded|off] [--self-test] \
+    [--prime-concurrency N] \
     [--config FILE] [--overrides FILE] [--latency DURATION] [--until TIMESTAMP] \
     [--onnx-threads N] [--token-dir DIR]
 ```
@@ -519,6 +520,34 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   kept carries nothing over. Triggers are counted
   by code in every mode. The mental models to refresh are the manifest's
   `[[model]]` tables, carried in the corpus header.
+- **Priming** (`--prime-concurrency N`, `fast` only) records call 1 for
+  every chunk before the simulation starts, N calls at a time in
+  wall-clock time. The simulation is single-threaded, and `[llm]
+  concurrency` only changes simulated time, so without it a re-record
+  makes its call 1s one after another. The prime ingests the corpus into
+  the run's store in the order the simulation syncs it, takes each chunk
+  in the order a serial run claims it, and calls the LLM for the chunks
+  whose claims `fast` can't already reuse. The records are appended in
+  that order, whatever order the calls finish in, and are marked
+  `primed`. The store is reset before the simulation, which then
+  answers every call 1 from the cassette and calls the LLM only for call
+  2 misses, refreshes and `judge_used` top-ups. A failed call stops the
+  prime with exit 2, keeping the calls that succeeded, so the next run
+  primes only the rest. `--self-test` primes once and runs the
+  simulation twice.
+
+  It's an approximation, the one `fast` already makes by reusing claims
+  by chunk. A primed call 1 is shown no in-context memories and no mental
+  model entries, and its candidates are only the entities ingestion
+  makes, with no memories linked, where a serial run's are what the
+  store holds at the claim. Its reply has no `used` verdicts to reuse,
+  so each pair is judged by a top-up when the simulation first meets
+  it. The report marks a primed run with `flags.prime_concurrency`, null
+  when it wasn't, and counts the prime's calls in `llm.primed` alone:
+  not in `live` or `misses`, which are the simulation's. Compare primed
+  claims with serially recorded ones on a corpus before relying on a
+  primed run: prime into a fresh `--cassette` so the two recordings stay
+  apart.
 - **The LLM** for `live` and `fast` is built as `serve` builds its own:
   `[llm]` in `--config` with `ASPHODEL_LLM_API_KEY`, or the ChatGPT login
   under `--token-dir` (the private dir by default). `replay` refuses one.
@@ -559,14 +588,14 @@ scripted fields: `injected_tokens` (per session with a synced turn, the
 per-turn p50 and p95, and cron apart), `profile_tokens` (sampled daily),
 `call2_rate`, `agenda_lines_per_day`, `significance_histogram`,
 `kind_histogram`, `memories` (each created memory with when it faded and
-whether it was purged), and `llm` with `cache`, `top_up`, `live`, `misses`,
-`used_verdicts` by source and `latency_ms`. A `live` run and the `replay`
+whether it was purged), and `llm` with `cache`, `top_up`, `live`,
+`primed`, `misses`, `used_verdicts` by source and `latency_ms`. A `live` run and the `replay`
 of its cassette differ only in `kind`, `flags`, `llm` and `cassette_hash`.
 
 `--aggregate <file>` writes the one thing that may leave the private dir. Its type has no string field but a probe's id: the run's kind
 is a set of booleans, days are days since the epoch, weeks are two
 integers, and the hashes and the git SHA are byte arrays. It carries
-`call1` as the report has it, the probe results, the purge, fade and band series, the token, lag and call
+`call1` as the report has it, `prime_concurrency`, the probe results, the purge, fade and band series, the token, lag and call
 counts, and the histograms.
 
 `asphodel report diff A B [--force]` compares two reports: it refuses runs

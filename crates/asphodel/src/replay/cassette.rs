@@ -15,6 +15,8 @@
 //!   nobody has judged with one short top-up call, and answers call 2 and
 //!   refreshes by request key, calling the LLM on a miss when one is
 //!   configured. `--refresh` says how refreshes are answered.
+//!   `--prime-concurrency` records call 1 for every chunk first, many at
+//!   once ([`Recorder::prime`]).
 //!
 //! A record carries prompt text, so the cassette never leaves the private
 //! dir. Nothing here logs content.
@@ -22,11 +24,13 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write as _;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Context as _;
+use anyhow::{Context as _, bail};
 use asphodel_core::extraction::{CALL1_TEMPLATE, CALL1_VERSION, CALL2_TEMPLATE, Call1Input};
 use asphodel_core::mental_models::REFRESH_TEMPLATE;
 use asphodel_core::models::{LlmClient, LlmError, LlmRequest, LlmResponse, Template};
@@ -90,6 +94,10 @@ pub struct Record {
     /// the run that made it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Recorded by `--prime-concurrency` before a simulation, shown no
+    /// in-context memories or entries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub primed: bool,
     pub request: LlmRequest,
     pub response: LlmResponse,
 }
@@ -161,6 +169,14 @@ impl ChunkContext {
                 .collect(),
         }
     }
+}
+
+/// One chunk's call 1 for [`Recorder::prime`]: the request, the chunk it's
+/// recorded under, and the simulated time it's recorded at.
+pub struct Priming {
+    pub context: ChunkContext,
+    pub request: LlmRequest,
+    pub at: Timestamp,
 }
 
 /// What `fast` reuses call 1's claims by: the chunk, the template version
@@ -412,6 +428,7 @@ impl Recorder {
             cache: counts.cache,
             top_up: counts.top_up,
             live: counts.live,
+            primed: 0,
             misses: counts.misses,
             used_verdicts: counts.verdicts.clone(),
             latency_ms: Percentiles::of(&mut latencies),
@@ -432,14 +449,7 @@ impl Recorder {
     pub fn compose_call1(&self, context: &ChunkContext) -> Result<Option<Value>, LlmError> {
         let (claims, mut used, unknown) = {
             let index = lock(&self.index);
-            let key = (
-                context.key.clone(),
-                CALL1_VERSION,
-                self.guidance.clone(),
-                self.model.clone(),
-                self.language.clone(),
-            );
-            let Some(&position) = index.claims.get(&key) else {
+            let Some(&position) = index.claims.get(&self.claims_key(&context.key)) else {
                 return Ok(None);
             };
             let record = &index.records[position];
@@ -474,6 +484,99 @@ impl Recorder {
             used.extend(self.top_up(context, &unknown)?);
         }
         Ok(Some(json!({ "claims": claims, "used_injected_ids": used })))
+    }
+
+    /// What `fast` reuses the chunk's claims by in this run.
+    fn claims_key(&self, chunk: &ChunkKey) -> ClaimsKey {
+        (
+            chunk.clone(),
+            CALL1_VERSION,
+            self.guidance.clone(),
+            self.model.clone(),
+            self.language.clone(),
+        )
+    }
+
+    /// Whether `fast` would reuse recorded claims for the chunk.
+    pub fn has_claims(&self, chunk: &ChunkKey) -> bool {
+        lock(&self.index)
+            .claims
+            .contains_key(&self.claims_key(chunk))
+    }
+
+    /// `--prime-concurrency`: calls the LLM for each chunk's call 1,
+    /// `concurrency` at a time, and records the replies. They're appended
+    /// in the order given, whatever order the calls finish in, so the
+    /// cassette doesn't depend on timing. After a failure no new call
+    /// starts, the replies already in are still recorded, and the first
+    /// error is returned. Returns how many were recorded.
+    pub fn prime(&self, chunks: &[Priming], concurrency: NonZeroUsize) -> anyhow::Result<u64> {
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+        let Some(live) = &self.live else {
+            bail!(
+                "priming {} chunk(s) needs an LLM: set [llm] in --config and ASPHODEL_LLM_API_KEY, or log in with `asphodel llm login` and pass --token-dir",
+                chunks.len()
+            );
+        };
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let replies: Vec<Mutex<Option<Result<LlmResponse, LlmError>>>> =
+            chunks.iter().map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..concurrency.get().min(chunks.len()) {
+                scope.spawn(|| {
+                    while !failed.load(Ordering::Relaxed) {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(chunk) = chunks.get(index) else {
+                            break;
+                        };
+                        let reply = call_with_retries(live.as_ref(), &chunk.request);
+                        if reply.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        *lock(&replies[index]) = Some(reply);
+                    }
+                });
+            }
+        });
+        let mut primed = 0;
+        let mut first_error = None;
+        for (chunk, reply) in chunks.iter().zip(replies) {
+            match reply
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                Some(Ok(response)) => {
+                    let latency_ms =
+                        u64::try_from(response.latency.as_millis()).unwrap_or(u64::MAX);
+                    let mut record = self.record(
+                        &chunk.request,
+                        response,
+                        chunk.at,
+                        latency_ms,
+                        Some(&chunk.context),
+                        &[],
+                    );
+                    record.primed = true;
+                    self.append(record)
+                        .context("writing a primed call 1 to the cassette")?;
+                    primed += 1;
+                }
+                Some(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                None => {}
+            }
+        }
+        match first_error {
+            Some(error) => Err(anyhow::anyhow!(
+                "priming call 1 failed after {primed} of {} chunk(s) were recorded: {error}",
+                chunks.len()
+            )),
+            None => Ok(primed),
+        }
     }
 
     /// One short call judging the reply against the sentences nobody has
@@ -587,12 +690,37 @@ impl Recorder {
             counts.latencies_ms.push(latency_ms);
         }
         let current = lock(&self.chunk);
-        let context = context.or(current.as_ref());
-        let record = Record {
-            key,
+        let record = self.record(
+            request,
+            response.clone(),
+            self.clock.now(),
+            latency_ms,
+            context.or(current.as_ref()),
+            identities,
+        );
+        drop(current);
+        self.append(record).map_err(|error| LlmError::Transport {
+            reason: format!("writing the cassette: {error}"),
+        })?;
+        Ok(response)
+    }
+
+    /// A record of `request` answered with `response` at `at`, tagged
+    /// with the chunk `context` when there is one.
+    fn record(
+        &self,
+        request: &LlmRequest,
+        response: LlmResponse,
+        at: Timestamp,
+        latency_ms: u64,
+        context: Option<&ChunkContext>,
+        identities: &[(String, Uuid)],
+    ) -> Record {
+        Record {
+            key: key_of(&self.model, request),
             model: self.model.clone(),
             template: request.template.clone(),
-            at: self.clock.now(),
+            at,
             latency_ms,
             chunk: context.map(|context| context.key.clone()),
             in_context: context
@@ -617,14 +745,10 @@ impl Recorder {
                 .map(|context| context.reply_hash.clone()),
             identities: identities.to_vec(),
             language: self.language.clone(),
+            primed: false,
             request: request.clone(),
-            response: response.clone(),
-        };
-        drop(current);
-        self.append(record).map_err(|error| LlmError::Transport {
-            reason: format!("writing the cassette: {error}"),
-        })?;
-        Ok(response)
+            response,
+        }
     }
 
     fn append(&self, record: Record) -> anyhow::Result<()> {

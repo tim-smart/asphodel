@@ -35,6 +35,7 @@ pub mod html;
 pub mod import;
 pub mod labelling;
 pub mod manifest;
+pub mod prime;
 pub mod probes;
 pub mod report;
 pub mod scenario;
@@ -233,6 +234,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
                 mode: None,
                 no_cache: false,
                 self_test: args.self_test,
+                prime_concurrency: None,
                 onnx_threads: (!fake).then_some(1),
             },
             probes: outcome.probes,

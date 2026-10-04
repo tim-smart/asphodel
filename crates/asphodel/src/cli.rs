@@ -880,6 +880,12 @@ pub struct ReplayArgs {
     #[arg(long, value_enum, conflicts_with = "scenario")]
     pub refresh: Option<RefreshMode>,
 
+    /// Record call 1 for every chunk the cassette has no claims for, this
+    /// many at a time, before the simulation (`fast` only). Primed calls
+    /// are shown no in-context memories or mental model entries.
+    #[arg(long, conflicts_with = "scenario")]
+    pub prime_concurrency: Option<NonZeroUsize>,
+
     /// The real-history probes file, under the private dir.
     #[arg(long, conflicts_with = "scenario")]
     pub probes: Option<PathBuf>,
