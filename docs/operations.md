@@ -349,9 +349,15 @@ holds a block, prefetch's `text` can start with an `Agenda update for
 <date>` section ahead of the `Recalled …` injection. It appears when the
 bank-local day has moved past the day the block was built for, or when
 the agenda lists items the session hasn't seen. It lists only those
-items, within `agenda.update_budget` tokens (default 200), and counts any
-that don't fit. On a later day with nothing new, it carries the date
-alone. Like the injection, it joins the session's in-context set only
+items, and counts any that don't fit for a later turn, with the whole
+section (header and count included) within `agenda.update_budget` tokens.
+The default is 200 and the minimum is 40. The first item is always
+listed, so each update makes progress. When that item doesn't fit whole,
+its sentence is shortened, at a word boundary where one keeps enough of
+it and mid-word otherwise, and ends in "…". Its annotations, such as
+`[upcoming Sat 3 Oct]`, stay. If they leave too little of the sentence,
+only the date is kept, then nothing. On a later day with nothing new, the
+update carries the date alone. Like the injection, it joins the session's in-context set only
 when a `sync_turn` echoes the prefetch's `recall_id`, so it's sent once.
 A session with no block mapping never gets one.
 

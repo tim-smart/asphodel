@@ -248,6 +248,16 @@ pub struct ExtractionTuning {
     pub guidance: Option<String>,
 }
 
+/// The smallest `agenda.update_budget`. The date-only update takes 71
+/// characters at most (18 tokens): "Agenda update for Wed 30 Sep" and
+/// "- Nothing new since this session's agenda.". With items, the header, a
+/// group heading ("Open tasks"), a three-digit count ("- and 100 more
+/// agenda items") and the newlines between them take 68, so 40 tokens (160
+/// characters) leaves 92 for the first line: room for its date annotation,
+/// such as " [upcoming Wed 30 Sep 2027 15:00]", and over 50 characters of
+/// its sentence.
+pub const UPDATE_BUDGET_MIN: u32 = 40;
+
 /// `[agenda]`: the list in `system_prompt_block()` chosen by world time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -278,6 +288,7 @@ pub struct AgendaTuning {
 
     /// At most about this many tokens for the agenda update prefetch puts
     /// ahead of relevance injection, apart from `injection.token_budget`.
+    /// At least [`UPDATE_BUDGET_MIN`].
     pub update_budget: u32,
 }
 
@@ -655,11 +666,19 @@ impl Tuning {
             ("agenda.overdue_days", agenda.overdue_days),
             ("agenda.undated_days", agenda.undated_days),
             ("agenda.dated_lines", agenda.dated_lines),
-            ("agenda.update_budget", agenda.update_budget),
         ] {
             if value == 0 {
                 fail(key, "must be at least 1".into());
             }
+        }
+        if agenda.update_budget < UPDATE_BUDGET_MIN {
+            fail(
+                "agenda.update_budget",
+                format!(
+                    "must be at least {UPDATE_BUDGET_MIN}, got {}",
+                    agenda.update_budget
+                ),
+            );
         }
 
         let models = &self.mental_models;

@@ -32,11 +32,39 @@ pub(crate) fn header(now: Timestamp, tz: &TimeZone) -> String {
 
 /// One memory's line: `- <sentence>`, then its annotations in brackets.
 pub(crate) fn line(candidate: &Candidate, now: Timestamp) -> String {
-    let annotations = annotations(candidate, now);
-    if annotations.is_empty() {
-        format!("- {}", candidate.content)
-    } else {
-        format!("- {} [{}]", candidate.content, annotations.join("; "))
+    line_parts(candidate, now).render()
+}
+
+/// A memory's line before it's rendered, so a caller short of room can
+/// shorten the sentence and keep the annotations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Line {
+    pub sentence: String,
+    pub annotations: Vec<String>,
+}
+
+impl Line {
+    pub(crate) fn render(&self) -> String {
+        format!("- {}{}", self.sentence, self.suffix(self.annotations.len()))
+    }
+
+    /// The first `count` annotations in brackets, with the space before
+    /// them, or nothing when there are none to show.
+    pub(crate) fn suffix(&self, count: usize) -> String {
+        let shown = &self.annotations[..count.min(self.annotations.len())];
+        if shown.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", shown.join("; "))
+        }
+    }
+}
+
+/// [`line`] in parts.
+pub(crate) fn line_parts(candidate: &Candidate, now: Timestamp) -> Line {
+    Line {
+        sentence: candidate.content.clone(),
+        annotations: annotations(candidate, now),
     }
 }
 
