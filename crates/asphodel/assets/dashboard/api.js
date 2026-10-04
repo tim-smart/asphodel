@@ -87,6 +87,9 @@ export function client(fetch, storage) {
     // The id goes in the body exactly as ingested: a URL path would lose `..`
     // and `.` segments to normalization and could name another document.
     removeDocument: (name, documentId) => call("POST", `${bank(name)}/documents/remove`, { document_id: documentId }),
+    // Explain runs recall or injection with the working shown, and logs
+    // nothing: no recall row, no access, no session.
+    explain: (name, request) => call("POST", `${bank(name)}/recall/explain`, request),
     chunks: (name) => call("GET", `${bank(name)}/chunks`),
     retryChunks: (name, chunks) => call("POST", `${bank(name)}/chunks/retry`, chunks ? { chunks } : {}),
   };

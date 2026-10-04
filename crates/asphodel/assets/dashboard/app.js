@@ -1,5 +1,5 @@
-// The dashboard: hash routes over the daemon's read-only list routes, and
-// the owner's actions (keep, retract, forget, remove a document, retry
+// The dashboard: hash routes over the daemon's read-only list routes, the
+// Recall page's explain (which logs nothing), and the owner's actions (keep, retract, forget, remove a document, retry
 // chunks, resume purge), each destructive one behind a confirmation.
 //
 // `mount(root, { fetch })` renders into `root` and returns a function that
@@ -45,6 +45,7 @@ export function mount(root, { fetch }) {
             ["memories", "Memories"],
             ["documents", "Documents"],
             ["chunks", "Ingestion"],
+            ["recall", "Recall"],
           ].map(([name, label]) =>
             h(
               "a",
