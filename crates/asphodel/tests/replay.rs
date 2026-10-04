@@ -460,6 +460,15 @@ fn event_reminders_expire_but_ordinary_overdue_and_undated_tasks_stay_on_the_age
 }
 
 #[test]
+fn an_undated_task_expires_after_thirty_days_without_a_mention() {
+    let dir = TestDir::new();
+    let run = replay(&dir, &scenario("undated-task-expiry"), &[]);
+    run.assert_passed();
+    assert_eq!(run.report()["llm"]["scripted"], 1);
+    assert_eq!(run.report()["llm"]["live"], 0);
+}
+
+#[test]
 fn p18_closes_the_task_before_the_future_event_and_excludes_it_from_agenda() {
     let dir = TestDir::new();
     replay(&dir, &scenario("p18"), &[]).assert_passed();

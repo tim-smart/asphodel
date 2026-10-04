@@ -2071,6 +2071,147 @@ fn overdue_tasks_are_listed_for_overdue_days() {
 }
 
 #[test]
+fn undated_tasks_leave_after_the_last_mention_cap_inclusive() {
+    let h = Harness::with_tuning("[agenda]\nundated_days = 10\n");
+    let boundary = h.insert(Memory {
+        significance: "major",
+        observed_at: local("2026-09-21T12:00"),
+        ..task("Tim needs to sort the tools.")
+    });
+    let expired = h.insert(Memory {
+        significance: "major",
+        observed_at: local("2026-09-20T12:00"),
+        ..task("Tim needs to paint the shed.")
+    });
+    assert_eq!(h.agenda().undated_tasks, vec![boundary]);
+    assert!(!h.agenda().undated_tasks.contains(&expired));
+    h.set(local("2026-10-02T00:00"));
+    assert!(h.agenda().undated_tasks.is_empty());
+}
+
+#[test]
+fn undated_tasks_renew_on_mentions_but_not_on_use() {
+    let h = Harness::with_tuning("[agenda]\nundated_days = 10\n");
+    let mentioned = h.insert(Memory {
+        significance: "major",
+        observed_at: local("2026-07-01T12:00"),
+        ..task("Tim needs to repair the chair.")
+    });
+    let used = h.insert(Memory {
+        significance: "major",
+        observed_at: local("2026-07-01T12:00"),
+        ..task("Tim needs to tidy the attic.")
+    });
+    for (memory, kind) in [(mentioned, "mentioned_again"), (used, "used")] {
+        h.execute(
+            "INSERT INTO accesses (bank_id, memory_id, kind, at, turn)
+             VALUES (?1, ?2, ?3, ?4, 1)",
+            (
+                h.bank_id(),
+                h.rowid(memory),
+                kind,
+                micros(local("2026-09-25T12:00")),
+            ),
+        );
+    }
+    assert_eq!(h.agenda().undated_tasks, vec![mentioned]);
+    h.set(local("2026-10-05T23:59"));
+    assert_eq!(h.agenda().undated_tasks, vec![mentioned]);
+    h.set(local("2026-10-06T00:00"));
+    assert!(h.agenda().undated_tasks.is_empty());
+}
+
+#[test]
+fn undated_task_mentions_and_confirmations_are_inherited_by_the_head() {
+    // Exercise both access kinds on a head and through two superseded ancestors.
+    for kind in ["mentioned_again", "confirmed"] {
+        for inherited in [false, true] {
+            let h = Harness::new();
+            let head = h.insert(Memory {
+                significance: "major",
+                observed_at: local("2026-07-01T12:00"),
+                ..task("Tim needs to mend the garden fence.")
+            });
+            let mut accessed = head;
+            if inherited {
+                for content in [
+                    "Tim needs to fix the fence.",
+                    "Tim needs to fix the boundary fence.",
+                ] {
+                    let predecessor = h.insert(Memory {
+                        significance: "major",
+                        observed_at: local("2026-07-01T12:00"),
+                        ..task(content)
+                    });
+                    h.execute(
+                        "UPDATE memories SET superseded_by = ?2 WHERE id = ?1",
+                        (h.rowid(predecessor), h.rowid(accessed)),
+                    );
+                    accessed = predecessor;
+                }
+            }
+            h.execute(
+                "INSERT INTO accesses (bank_id, memory_id, kind, at, turn)
+                 VALUES (?1, ?2, ?3, ?4, 1)",
+                (
+                    h.bank_id(),
+                    h.rowid(accessed),
+                    kind,
+                    micros(local("2026-09-25T12:00")),
+                ),
+            );
+            assert_eq!(
+                h.agenda().undated_tasks,
+                vec![head],
+                "{kind}, inherited={inherited}"
+            );
+            h.set(local("2026-10-25T23:59"));
+            assert_eq!(
+                h.agenda().undated_tasks,
+                vec![head],
+                "{kind}, inherited={inherited}"
+            );
+            h.set(local("2026-10-26T00:00"));
+            assert!(
+                h.agenda().undated_tasks.is_empty(),
+                "{kind}, inherited={inherited}"
+            );
+        }
+    }
+}
+
+#[test]
+fn undated_task_cap_uses_bank_local_dates_not_utc_or_elapsed_hours() {
+    let h = Harness::new();
+    // 1 September UTC is 2 September in Auckland. At the boundary below,
+    // more than 30 * 24 hours have elapsed, but it is still local day 30.
+    let task = h.insert(Memory {
+        significance: "major",
+        observed_at: at("2026-09-01T23:30:00Z"),
+        ..task("Tim needs to catalogue the spare parts.")
+    });
+    h.set(at("2026-10-02T10:59:00Z")); // 2 October, 23:59 NZDT
+    assert_eq!(h.agenda().undated_tasks, vec![task]);
+    h.set(at("2026-10-02T11:00:00Z")); // 3 October, 00:00 NZDT; UTC date unchanged
+    assert!(h.agenda().undated_tasks.is_empty());
+}
+
+#[test]
+fn undated_task_cap_does_not_shorten_overdue_obligations() {
+    let h = Harness::with_tuning("[agenda]\nundated_days = 10\n");
+    let obligation = h.insert(Memory {
+        observed_at: local("2026-07-01T12:00"),
+        ..task_due("Tim needs to renew his library card.", "2026-09-05T00:00")
+    });
+    assert_eq!(h.agenda().dated, vec![obligation]);
+    assert!(h.agenda().undated_tasks.is_empty());
+    h.set(local("2026-10-05T23:59"));
+    assert_eq!(h.agenda().dated, vec![obligation]);
+    h.set(local("2026-10-06T00:00"));
+    assert!(h.agenda().dated.is_empty());
+}
+
+#[test]
 fn dated_items_are_listed_even_when_faded() {
     // A minor appointment mentioned three months ahead mustn't fade out on
     // the day it matters.
@@ -2180,6 +2321,23 @@ fn a_long_period_routine_joins_the_dated_lines_when_it_next_occurs_within_a_week
     assert_eq!(agenda.dated, vec![soon]);
     assert!(agenda.routines.is_empty(), "a month is longer than a week");
     assert!(!agenda.dated.contains(&later));
+}
+
+#[test]
+fn an_undated_task_can_fade_out_before_the_last_mention_cap() {
+    let h = Harness::with_tuning("[clock]\nquiet_rate = 1.0\n");
+    let task = h.insert(Memory {
+        significance: "trivial",
+        observed_at: at(START),
+        ..task("Tim wants to try a new tea.")
+    });
+    assert_eq!(h.agenda().undated_tasks, vec![task]);
+
+    // Twenty bank days put this single trivial mention below τ, while
+    // it is still inside the default 30-day last-mention window. There
+    // are no other tasks to exclude it through ranking or the list cap.
+    h.advance(SignedDuration::from_hours(20 * 24));
+    assert!(h.agenda().undated_tasks.is_empty());
 }
 
 #[test]

@@ -260,6 +260,13 @@ pub struct AgendaTuning {
     /// deletion fingerprint.
     pub overdue_days: u32,
 
+    /// Undated open tasks are listed through this many bank-local days
+    /// after their last mention (observed_at or a later mentioned_again /
+    /// confirmed access, including inherited accesses). Uses do not renew
+    /// it. This only limits the agenda, so it is not in the deletion
+    /// fingerprint. Must be at least 1; defaults to 30.
+    pub undated_days: u32,
+
     /// The cap on dated lines.
     pub dated_lines: u32,
 
@@ -275,6 +282,7 @@ impl Default for AgendaTuning {
         Self {
             horizon_days: 7,
             overdue_days: 30,
+            undated_days: 30,
             dated_lines: 15,
             routines: 4,
             undated_tasks: 5,
@@ -640,6 +648,7 @@ impl Tuning {
         for (key, value) in [
             ("agenda.horizon_days", agenda.horizon_days),
             ("agenda.overdue_days", agenda.overdue_days),
+            ("agenda.undated_days", agenda.undated_days),
             ("agenda.dated_lines", agenda.dated_lines),
         ] {
             if value == 0 {

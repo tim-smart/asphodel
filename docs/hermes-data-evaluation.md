@@ -312,6 +312,11 @@ the model:
   `agenda_has` shortly before the date, `agenda_lacks` well after it.
   Obligations (payments, renewals): `agenda_has` before the date and as
   overdue after it, until done or `agenda.overdue_days` passes.
+- *Undated tasks.* `agenda_has` through `agenda.undated_days` (default 30)
+  after the last mention, and `agenda_lacks` the next bank-local day, even
+  if strength is still above τ. A later mention or confirmation renews
+  the window; recall use does not. An occasion with a known end should
+  leave after that end instead, without waiting for this cap.
 - *The profile.* `profile_has` with `model = "User profile"` for two or
   three facts about Tim that a profile should carry.
 
