@@ -545,9 +545,19 @@ question always writes again, even when it plans the same facets.
 
 The prompt block renders each section as a heading and a paragraph. A
 sentence citing a low-confidence state says how old it is after it, as
-"(as of 30 days ago, Tue 1 Sep)". The token caps are unchanged, so the
-500-token profile is a few short paragraphs. An entry written before
+"(as of 30 days ago, Tue 1 Sep)". The seeded profile defaults to a
+2048-token output cap (`mental_models.profile_max_tokens`), within a
+2560-token prompt block (`mental_models.budget`) shared with the agenda
+and every enabled model. Headings count toward these caps, and the block
+still trims entries to fit; the profile is not guaranteed its full cap
+when the agenda or other models use the budget. An entry written before
 sections renders as a line until its model's next refresh.
+
+The profile cap is stored on the model row when the bank is created.
+Changing the default or tuning alone does not resize an existing profile.
+See `docs/upgrading.md`, "Existing banks: opt in to larger summaries", for
+the tuning and model edit needed to opt in. These output caps do not
+change facet recall limits or admission filters.
 
 ### Health and failures
 

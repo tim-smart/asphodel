@@ -213,3 +213,37 @@ Replay: no recorded `refresh_model` record can stand in for a
 a cassette recorded before this version. The first replay of private
 history after upgrading needs live refresh calls, which need their own
 authorization.
+
+### Existing banks: opt in to larger summaries
+
+The output defaults also change: `profile_max_tokens` rises from 500 to
+2048, and the shared `budget` from 800 to 2560. New banks seed their User
+profile with the configured profile cap. Existing model rows keep their
+stored `max_tokens`; the schema migration does not resize them. Explicit
+tuning overrides still take precedence over the new defaults.
+
+To opt an existing bank into the larger profile, first set the following
+in the daemon's tuning file, preserving any other `[mental_models]`
+settings, and restart the daemon with that file:
+
+```toml
+[mental_models]
+budget = 2560
+profile_max_tokens = 2048
+```
+
+Then update the stored model cap for each bank you choose to migrate:
+
+```sh
+asphodel model edit --bank main "User profile" --max-tokens 2048
+```
+
+Replace `main` with the bank name. The edit is refused if the enabled
+models' caps together exceed the active shared budget, so apply the tuning
+first and leave room for any other enabled models. The next
+refresh can write to the new cap; editing the cap does not immediately
+expand the existing text. Larger summaries can add tokens to every
+Hermes turn, and the agenda and other enabled models still share the
+2560-token block. Bounded recall and admission filters are unchanged.
+These are opt-in operator steps, not automatic production changes or
+authorization for private replay or live backend calls.

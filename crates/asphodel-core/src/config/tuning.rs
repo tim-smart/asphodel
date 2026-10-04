@@ -349,8 +349,8 @@ pub struct MentalModelsTuning {
 impl Default for MentalModelsTuning {
     fn default() -> Self {
         Self {
-            budget: 800,
-            profile_max_tokens: 500,
+            budget: 2560,
+            profile_max_tokens: 2048,
             trigger_level: Significance::Notable,
             refresh_debounce_minutes: 5,
             refresh_max_delay_minutes: 30,
