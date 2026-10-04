@@ -2579,6 +2579,99 @@ fn items_the_block_left_out_for_its_budget_arrive_in_the_first_update() {
     }
 }
 
+// The update's budget is a cap on the whole rendered section: header, group
+// headings, lines and the count of what's left out.
+
+/// The prefetch's agenda update section, or "" when it has none.
+fn update_section(text: &str) -> &str {
+    if !text.starts_with("Agenda update") {
+        return "";
+    }
+    text.split("\n\nRecalled ").next().unwrap_or(text)
+}
+
+/// A sentence of about `chars` characters about an appointment on `day`.
+fn long_sentence(day: &str, chars: usize) -> &'static str {
+    let mut text = format!("Tim has an appointment on {day} October");
+    while text.len() < chars {
+        text.push_str(" about the garden");
+    }
+    text.truncate(chars);
+    text.push('.');
+    sentence(text)
+}
+
+#[test]
+fn a_single_oversized_item_still_fits_the_update_budget() {
+    let h = Harness::new();
+    h.block(Some("s1"));
+    // About 300 tokens, well over the default 200.
+    h.insert(event(long_sentence("3", 1200), "2026-10-03T00:00"));
+
+    let first = prefetch(&h, "s1", "hello there");
+    let update = update_section(&first.text);
+    assert!(!update.is_empty(), "no update:\n{}", first.text);
+    let budget = h.tuning.agenda.update_budget as usize;
+    assert!(
+        estimate_tokens(update) <= budget,
+        "the update is {} tokens, over {budget}:\n{update}",
+        estimate_tokens(update)
+    );
+
+    // However it's shown, it isn't sent forever.
+    sync(&h, "s1", "Hello there.", Some(first.recall_id));
+    let second = prefetch(&h, "s1", "and again");
+    assert!(!second.text.contains("Agenda update"), "{}", second.text);
+}
+
+#[test]
+fn an_update_with_leftovers_fits_its_budget_footer_included() {
+    // The first item's length runs across the point where it fits only
+    // without the count of what's left out.
+    let budget = 60;
+    for chars in (40..=180).step_by(5) {
+        let h = Harness::with_tuning(&format!("[agenda]\nupdate_budget = {budget}\n"));
+        h.block(Some("s1"));
+        h.insert(event(long_sentence("2", chars), "2026-10-02T00:00"));
+        h.insert(event(long_sentence("3", 200), "2026-10-03T00:00"));
+
+        let first = prefetch(&h, "s1", "hello there");
+        let update = update_section(&first.text);
+        assert!(!update.is_empty(), "no update:\n{}", first.text);
+        assert!(
+            estimate_tokens(update) <= budget,
+            "with a {chars}-character first item the update is {} tokens, over \
+             {budget}:\n{update}",
+            estimate_tokens(update)
+        );
+    }
+}
+
+#[test]
+fn the_smallest_accepted_update_budget_fits_the_date_alone() {
+    let budget = (1..=1000)
+        .find(|budget| Tuning::from_toml(&format!("[agenda]\nupdate_budget = {budget}\n")).is_ok())
+        .expect("some update budget is accepted");
+    let h = Harness::with_tuning(&format!("[agenda]\nupdate_budget = {budget}\n"));
+    h.insert(event(DENTIST, "2026-10-05T00:00"));
+    h.block(Some("s1"));
+    h.set(local("2026-10-02T09:00"));
+
+    let first = prefetch(&h, "s1", "hello there");
+    let update = update_section(&first.text);
+    assert!(
+        update.contains("Agenda update for Fri 2 Oct"),
+        "{}",
+        first.text
+    );
+    assert!(
+        estimate_tokens(update) <= budget,
+        "the date-only update is {} tokens, over the smallest accepted budget \
+         {budget}:\n{update}",
+        estimate_tokens(update)
+    );
+}
+
 // The agenda
 
 #[test]
