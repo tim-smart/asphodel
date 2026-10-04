@@ -18,6 +18,8 @@ export const ids = {
   job: "01a10400-0000-7000-8000-000000000005",
   oldJob: "01a10400-0000-7000-8000-000000000006",
   berlin: "01a10400-0000-7000-8000-000000000007",
+  // Only ever an explain candidate, never in the memory list.
+  pottery: "01a10400-0000-7000-8000-000000000008",
   documentV1: "01a10400-0000-7000-8000-0000000000a1",
   documentV2: "01a10400-0000-7000-8000-0000000000a2",
   recipes: "01a10400-0000-7000-8000-0000000000a3",
@@ -35,6 +37,7 @@ export const sentences = {
   job: "Sam works at Effectful.",
   oldJob: "Sam works at Acme.",
   berlin: "Sam visited Berlin in May.",
+  pottery: "Sam goes to a pottery class on Thursdays.",
 };
 
 function memory(key, fields) {
@@ -257,6 +260,19 @@ function explained(key, rank, logit, fields = {}) {
   };
 }
 
+/// A candidate fused past the rerank pool: ranked by the arms and fusion,
+/// but never sent to the reranker.
+function outsidePool(key) {
+  return {
+    ...explained(key, 41, 0),
+    arms: [{ arm: "bm25", rank: 52 }],
+    logit: null,
+    score: null,
+    included: false,
+    reason: "outside_rerank_pool",
+  };
+}
+
 /// A candidate below τ: the arms found it, but it never reached fusion.
 function belowTau(key) {
   return {
@@ -271,7 +287,8 @@ function belowTau(key) {
   };
 }
 
-/// Recall mode with `limit: 2`: two returned, Ada's past the limit.
+/// Recall mode with `limit: 2`: two returned, Ada's past the limit, and
+/// pottery fused past the rerank pool.
 function explainedRecall() {
   return {
     mode: "recall",
@@ -289,13 +306,15 @@ function explainedRecall() {
       }),
       explained("job", 1, 1.25),
       explained("ada", 2, 0.5, { kept: true, included: false, reason: "over_limit" }),
+      outsidePool("pottery"),
     ],
     injection: null,
   };
 }
 
 /// Injection mode with a cap of 1: Auckland injected, and one candidate
-/// left out for each reason a reranked injection can leave one out.
+/// left out for each reason a reranked injection can leave one out. The
+/// reranked come first, then what was fused past the pool, then below τ.
 function explainedInjection() {
   const text = "Recalled Sat 3 Oct 22:00\n- Sam lives in Auckland.";
   return {
@@ -309,6 +328,7 @@ function explainedInjection() {
       explained("job", 2, 1.25, { included: false, reason: "over_cap" }),
       explained("oldJob", 3, 1.1, { included: false, reason: "over_budget" }),
       explained("ada", 4, -0.5, { kept: true, included: false, reason: "under_floor" }),
+      outsidePool("pottery"),
       belowTau("dentist"),
     ],
     injection: { text, tokens: 17, injected: [ids.auckland], floor: 0, cap: 1, token_budget: 400 },

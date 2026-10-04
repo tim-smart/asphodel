@@ -372,3 +372,40 @@ test("recall filters left invalid don't stop an injection from running", async (
 
   assert.equal(body.mode, "injection");
 });
+
+// Fusion keeps every candidate the arms found, but only the top of the
+// fused list goes to the reranker. What's fused past that pool is listed
+// under Left out with its fused and arm ranks, in both modes, so "why didn't
+// memory X come back?" still has an answer.
+
+for (const mode of ["recall", "injection"]) {
+  test(`${mode}: a candidate fused past the rerank pool is left out, saying the reranker never saw it`, async (t) => {
+    const daemon = new FakeDaemon();
+    const page = await open(t, daemon, { hash: RECALL, token: TOKEN });
+    if (mode === "injection") await chooseMode(page.root, "injection");
+    await explain(daemon, page.root);
+
+    const included = await findResult(page.root, "auckland");
+    const row = await findResult(page.root, "pottery");
+
+    assert.ok(follows(included, row), "under what made the cut");
+    if (mode === "injection") assert.ok(follows(row, await findResult(page.root, "dentist")), "before what was below τ");
+    assert.match(column(row, /rrf|fused/i), /\b41\b/);
+    assert.match(column(row, /arms?|found/i), /bm25\D{0,12}52/i);
+    assert.match(textOf(row), /rerank/i, "says it wasn't reranked");
+    assert.doesNotMatch(textOf(row), /outside_rerank_pool|null|undefined|NaN/, "in words, with nothing missing shown raw");
+  });
+
+  test(`${mode}: the hint for a missing memory doesn't claim no search arm found it`, async (t) => {
+    const daemon = new FakeDaemon();
+    const page = await open(t, daemon, { hash: RECALL, token: TOKEN });
+    if (mode === "injection") await chooseMode(page.root, "injection");
+    await explain(daemon, page.root);
+    await findResult(page.root, "pottery");
+
+    const hint = await findText(page.root, /missing from both lists/i);
+    assert.doesNotMatch(textOf(hint), /(wasn't|was not|not) found by any/i);
+    assert.match(textOf(hint), /\btop\b/i, "an arm only keeps its top hits");
+    if (mode === "recall") assert.match(textOf(hint), /filter/i);
+  });
+}
