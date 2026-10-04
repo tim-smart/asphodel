@@ -78,7 +78,27 @@ pub(super) fn commit(
             lease.source,
             &format!("{}:{}", lease.position, memory.claim),
         );
-        let memory_id = insert_memory(tx, store, unit, input, memory, uuid, ended)?;
+        // A correction with no window is silent about dates, not a request
+        // to erase them. Keep the first retracted neighbour's whole window;
+        // never combine potentially unrelated windows from several memories.
+        let mut memory = memory.clone();
+        if memory.due_at.is_none()
+            && memory.valid_from.is_none()
+            && memory.valid_until.is_none()
+            && memory.until_event.is_none()
+            && let Some(neighbour) = plan.edits.iter().find_map(|&(claim, id, edit)| {
+                (claim == index && edit == Edit::Retracts)
+                    .then(|| neighbours.iter().find(|neighbour| neighbour.id == id))
+                    .flatten()
+            })
+        {
+            memory.due_at = neighbour.due_at;
+            memory.valid_from = neighbour.valid_from;
+            memory.valid_until = neighbour.valid_until;
+            memory.until_event = neighbour.until_event.clone();
+            memory.low_confidence = neighbour.low_confidence;
+        }
+        let memory_id = insert_memory(tx, store, unit, input, &memory, uuid, ended)?;
         written.insert(
             index,
             Written {

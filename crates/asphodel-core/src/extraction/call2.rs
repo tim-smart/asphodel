@@ -24,14 +24,14 @@ const SYSTEM: &str = r#"You reconcile new claims with a personal assistant's exi
 Give a claim a label on a memory only when the two are about the same thing:
 - `mentioned_again`: the claim states what the memory already says, independently. Rewording, or the same fact with less detail, is still mentioned again.
 - `confirmed`: the claim says the memory is still right, such as "yes" to a question about it, or "still" true.
-- `refines`: the claim is a more precise version of the same statement, and the memory wasn't wrong ("going to Japan in 2027" refined by "going to Tokyo in April 2027").
+- `refines`: the claim is a more precise version of the same statement, and the memory wasn't wrong ("going to Japan in 2027" refined by "going to Tokyo in April 2027"; "needs to pack the carrots" refined by "reminder to pack the carrots at 8am on the 30th"). Adding a date or schedule is a refinement, not a repeat, even when only the structured time fields show it.
 - `retracts`: the claim is a corrected version of the memory, which was wrong: a correction, or a rescheduled appointment or plan ("the dentist is on Friday, not Thursday", "her name is Mia, not Maya", "I filed the tax return on the 2nd, not the 1st").
 - `denies`: the claim says the memory didn't happen or isn't true at all, with nothing to replace it ("I haven't filed the tax return after all", "the trip to Japan isn't happening"). When unsure between `denies` and `retracts`, use `retracts`.
 - `ends`: the memory was true and the claim says it stopped being true: a move, a job left, a habit stopped, or a task completed or cancelled ("moved out of Berlin" ends "lives in Berlin"; "filed the tax return" ends "needs to file the tax return").
 
 A claim can have labels on several memories, and several claims can label the same memory. A claim about something new gets no labels. Don't label a memory just because it's on the same topic: "likes tea" and "likes coffee" are two memories.
 
-Each memory shows when it was said. Memories marked ended have already stopped being true. Judge only what each claim says about each memory; don't decide which is newer, and label a claim the same whichever was said first.
+Each claim and memory shows its due_at, valid_from and valid_until alongside the sentence; none means no date was supplied. Each memory shows when it was said. Memories marked ended have already stopped being true. Judge only what each claim says about each memory; don't decide which is newer, and label a claim the same whichever was said first.
 
 Return every claim that has at least one label, with its labels. Leave out claims with none."#;
 
@@ -63,6 +63,7 @@ fn render(input: &Call2Input) -> String {
             claim.observed_at.strftime("%Y-%m-%d"),
             claim.content
         );
+        render_window(&mut out, claim.due_at, claim.valid_from, claim.valid_until);
         if !claim.neighbours.is_empty() {
             let _ = write!(out, " [closest: {}]", claim.neighbours.join(", "));
         }
@@ -79,9 +80,42 @@ fn render(input: &Call2Input) -> String {
             if neighbour.ended { ", ended" } else { "" },
             neighbour.content
         );
+        render_window(
+            &mut out,
+            neighbour.due_at,
+            neighbour.valid_from,
+            neighbour.valid_until,
+        );
         out.push('\n');
     }
     out
+}
+
+fn render_window(
+    out: &mut String,
+    due_at: Option<jiff::Timestamp>,
+    valid_from: Option<jiff::Timestamp>,
+    valid_until: Option<jiff::Timestamp>,
+) {
+    out.push_str(" [");
+    for (index, (name, at)) in [
+        ("due_at", due_at),
+        ("valid_from", valid_from),
+        ("valid_until", valid_until),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(
+            out,
+            "{name}={}",
+            at.map_or_else(|| "none".into(), |at| at.to_string())
+        );
+    }
+    out.push(']');
 }
 
 fn kind_name(kind: Kind) -> &'static str {
