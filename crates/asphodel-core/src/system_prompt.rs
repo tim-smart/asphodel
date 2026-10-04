@@ -135,7 +135,7 @@ impl Blocks {
 
 /// Memory usage guidance, with the build time. Sessions are frozen, so it says
 /// how to reach anything added since.
-fn guidance(now: Timestamp, tz: &TimeZone) -> String {
+fn guidance(built_at: &str) -> String {
     format!(
         "## Long-term memory (Asphodel)\n\
          Memories from past conversations are saved automatically, so you never need to save anything. \
@@ -144,8 +144,32 @@ fn guidance(now: Timestamp, tz: &TimeZone) -> String {
          Before saying you don't know or don't remember something, call memory_recall \
          (with phase \"upcoming\" for plans added since). \
          Use it ahead of session_search unless you need exact wording.",
-        now.to_zoned(tz.clone()).strftime("%a %-d %b %H:%M")
+        built_at
     )
+}
+
+fn agenda_heading(date: &str) -> String {
+    format!("Agenda for {date}")
+}
+
+fn fold_summary(count: usize) -> String {
+    format!(
+        "- and {count} more dated item{}",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+/// Reserve the mandatory guidance and the agenda after every dated item folds.
+/// English abbreviated weekdays/months have three characters; a two-digit day
+/// and the largest representable fold count cover any date and bank contents.
+/// Measure the same renderers and separators as the block, not a token constant.
+pub(crate) fn minimum_budget() -> usize {
+    estimate_tokens(&format!(
+        "{}\n\n{}\n{}",
+        guidance("Wed 30 Sep 23:59"),
+        agenda_heading("Wed 30 Sep"),
+        fold_summary(usize::MAX)
+    ))
 }
 
 /// Builds the bank's block at `now`.
@@ -159,7 +183,11 @@ pub(crate) fn build(
     let conn = store.connection();
     let agenda = crate::agenda::build(&conn, tuning, bank_id, tz, now)?;
     let budget = tuning.mental_models.budget as usize;
-    let guidance = guidance(now, tz);
+    let guidance = guidance(
+        &now.to_zoned(tz.clone())
+            .strftime("%a %-d %b %H:%M")
+            .to_string(),
+    );
     // The agenda and every enabled model share the budget, with the guidance
     // always kept. Each try lays the sections out as they'd be rendered
     // and measures the whole text.
@@ -287,17 +315,12 @@ impl Shown {
             .filter_map(|(line, shown)| shown.then_some(line))
             .collect();
         if !dated.is_empty() || self.folded > 0 {
-            lines.push(format!(
-                "Agenda for {}",
-                now.to_zoned(tz.clone()).strftime("%a %-d %b")
+            lines.push(agenda_heading(
+                &now.to_zoned(tz.clone()).strftime("%a %-d %b").to_string(),
             ));
             lines.extend(dated.into_iter().cloned());
             if self.folded > 0 {
-                lines.push(format!(
-                    "- and {} more dated item{}",
-                    self.folded,
-                    if self.folded == 1 { "" } else { "s" }
-                ));
+                lines.push(fold_summary(self.folded));
             }
         }
         if self.routines > 0 {
