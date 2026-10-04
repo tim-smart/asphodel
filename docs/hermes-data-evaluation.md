@@ -14,9 +14,9 @@ since they need Tim's data.
 
 ## Who does what
 
-You are a local agent running on Tim's machine. You run commands, draft
-the evaluation data, collect numbers, and prepare material. Three things
-are not yours:
+Route future live comparisons to Mac Developer, running locally on Tim's
+machine. You run commands, draft the evaluation data, collect numbers, and
+prepare material. Follow these rules:
 
 1. **Tim approves the probes and the labels.** You draft them: you propose
    the questions, the expected answers and the labels, grounded in what the
@@ -25,10 +25,14 @@ are not yours:
    `labels.toml` until Tim has approved that exact entry in this session.
    Those two files are the evaluation data; the drafts are not. Only runs on
    the approved files go into the feedback.
-2. **Nothing goes to an LLM backend without Tim's explicit approval in this
-   session.** Before any `--mode live`, any `--mode fast` with an LLM
-   configured, or `asphodel llm login`, stop, state the endpoint and model
-   that will see the history, and wait for a yes. Browsing (step 5),
+2. **Live comparisons have standing authorization while the data stays
+   private.** Tim granted this on 2026-10-04 for live recordings and
+   LLM-backed `fast` top-ups using `https://chatgpt.com/backend-api/codex`,
+   `auth = "chatgpt"`, `model = "gpt-6-luna"` and
+   `reasoning_effort = "low"`. No new per-run approval is needed within
+   this boundary, including login for this backend. Ask Tim before changing
+   the endpoint, auth, model or reasoning setting. This does not approve
+   labels, probes, probe re-anchors or floor selection. Browsing (step 5),
    `replay` mode and `report` never call a backend.
 3. **Nothing from the private directory leaves it except the aggregate
    export and the feedback template below.** No sentence, query, entity
@@ -36,6 +40,10 @@ are not yours:
    reply or a file outside `ASPHODEL_REPLAY_DIR`. Memory ids and probe ids
    are fine. The output of `asphodel recall`, `recalls` and `memory show` is
    content: read it, show it to Tim, never quote it anywhere else.
+
+These rules guide agents; they are not a technical privacy guarantee. Raw
+history, memory text, queries and cassettes remain private even when a run
+has standing authorization.
 
 ## 0. Setup
 
@@ -122,8 +130,10 @@ to start without floors for the exact loaded models.
 
 ```toml
 [llm]
-model = "<the exact model Tim will run in production>"
-endpoint = "https://api.openai.com/v1"    # or: auth = "chatgpt" and no endpoint
+auth = "chatgpt"
+model = "gpt-6-luna"
+endpoint = "https://chatgpt.com/backend-api/codex"
+reasoning_effort = "low"
 
 [reconcile.embedding_floors]
 "bge-small-en-v1.5:int8" = 0.8
@@ -135,16 +145,17 @@ endpoint = "https://api.openai.com/v1"    # or: auth = "chatgpt" and no endpoint
 "ms-marco-MiniLM-L-6-v2:int8" = 3.564211
 ```
 
-**Stop here and get approval.** Then one of:
+Check that the configuration matches the standing authorization above.
+If it differs, stop and ask Tim before proceeding. For the authorized
+ChatGPT backend:
 
 ```sh
-export ASPHODEL_LLM_API_KEY=...                           # api_key mode
 asphodel llm login --data-dir "$ASPHODEL_REPLAY_DIR"      # chatgpt mode; replay reads tokens from the private dir
 ```
 
-ChatGPT mode is unverified against the real backend (`docs/models.md`). If
-the first call fails there, switch to `api_key` before concluding anything
-else.
+See `docs/models.md` for backend and login details. If the first call fails,
+report the failure without private content. Do not switch to `api_key` or
+another endpoint or model without Tim's approval.
 
 ## 4. The recording run
 
@@ -168,7 +179,8 @@ without private data or live calls, run the scripted scenario first:
 
 GNU time prints `Elapsed (wall clock) time` and `Maximum resident set size
 (kbytes)` to stderr. The macOS form prints `real` and `maximum resident
-set size`. Only start the live run below after the endpoint/model approval.
+set size`. Only start the live run below with a configuration covered by
+the standing authorization or separately approved by Tim.
 
 ```sh
 "$GNU_TIME" -v asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode live \
@@ -450,8 +462,9 @@ floors: for recall, the lowest logit at which precision is still what he
 wants; for call 2, the lowest cosine. Put them in `replay.toml` and in the
 production `asphodel.toml`. The recall curve matches the gate exactly. The
 call-2 curve covers only candidates the placeholder reconcile floor let
-call 2 see, so after the floors change, re-run step 4 (approval again) and
-re-label if the material changed.
+call 2 see, so after the floors change, re-run step 4 within the authorized
+backend boundary and re-label if the material changed. New or changed
+labels still need Tim's approval.
 
 **After a re-record.** Pass the approved labels when you re-run step 4, so
 the material samples the prefetches whose queries Tim has already labelled:
@@ -490,8 +503,9 @@ ask him again. Report both counts.
 ## 9. A/B runs
 
 `fast` reuses recorded claims and verdicts and calls the LLM only for pairs
-nobody has judged, so it also needs approval. Overrides take the shape of
-`Tuning`, for example `clock.quiet_rate = 0.2` or `injection.cap = 6`.
+nobody has judged. These top-ups are covered by the standing authorization
+only within the same private-data and backend boundary. Overrides take the
+shape of `Tuning`, for example `clock.quiet_rate = 0.2` or `injection.cap = 6`.
 
 ```sh
 asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode fast \
@@ -603,7 +617,7 @@ from a report, any query, any name: if one is there, remove it.
 - branch / commit: asphodel-v1 @ <git sha from the report>
 - corpus_hash: <first 12 hex> · cassette_hash: <first 12 hex> · hermes schema: <30|31>
 - import counts (dry run): <sessions / turns / cron / skipped>
-- LLM: auth=<api_key|chatgpt> model=<model> · approved by Tim on <date>
+- LLM: endpoint=<endpoint> auth=<api_key|chatgpt> model=<model> reasoning=<effort> · authorization=<standing 2026-10-04 | separately approved by Tim on date>
 - modes run: live <y/n>, replay --self-test <passed/failed>, fast <n runs>
 - overrides tried: <key = value, ...> (or none)
 - probes: <n> approved by Tim (<n> drafted, <n> rejected) · labels: <n> approved by Tim over <n> samples
