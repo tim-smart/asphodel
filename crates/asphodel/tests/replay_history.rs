@@ -1598,7 +1598,17 @@ memory = "lives in Auckland"
         "the later prefetch sees the memory: {report}"
     );
     assert_eq!(tokens("s2"), 0, "the earlier prefetch can't: {report}");
-    assert_ok(&run.output);
+    let early = resolution_probe(&report, "p001");
+    assert_eq!(early["passed"], false, "{early}");
+    assert_eq!(early["observed"]["resolved"], false, "{early}");
+    let later = resolution_probe(&report, "p002");
+    assert_eq!(later["passed"], true, "{later}");
+    assert_eq!(
+        run.output.status.code(),
+        Some(1),
+        "the pre-creation probe is unresolved: {}",
+        stderr(&run.output)
+    );
 }
 
 /// `--no-cache` re-records from scratch, so re-recording leaves
