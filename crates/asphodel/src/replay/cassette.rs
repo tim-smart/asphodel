@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use asphodel_core::extraction::{CALL1_TEMPLATE, CALL1_VERSION, CALL2_TEMPLATE, Call1Input};
-use asphodel_core::mental_models::REFRESH_TEMPLATE;
+use asphodel_core::mental_models::WRITE_TEMPLATE;
 use asphodel_core::models::{LlmClient, LlmError, LlmRequest, LlmResponse, Template};
 use asphodel_core::{Clock, SimulatedClock};
 use jiff::Timestamp;
@@ -193,7 +193,7 @@ struct Index {
     claims: BTreeMap<ClaimsKey, usize>,
     /// `used` verdicts by (reply hash, sentence hash).
     pairs: BTreeMap<(String, String), bool>,
-    /// Refresh records, for the nearest-in-time substitution.
+    /// Refresh write records, for the nearest-in-time substitution.
     refreshes: Vec<usize>,
 }
 
@@ -215,7 +215,7 @@ impl Index {
                 index,
             );
         }
-        if record.template.name == REFRESH_TEMPLATE {
+        if record.template.name == WRITE_TEMPLATE {
             self.refreshes.push(index);
         }
         if let Some(reply_hash) = &record.reply_hash {
@@ -774,14 +774,16 @@ impl Recorder {
         Ok(())
     }
 
-    /// `fast` with `--refresh recorded`: the recorded refresh of the same
+    /// `fast` with `--refresh recorded`: the recorded write of the same
     /// mental model, by the question line the request starts with, nearest
     /// in simulated time, among those made with this run's LLM model, language, and
-    /// the request's template version. Its operations are carried over by
-    /// identity: each handle goes to the memory or entry it stood for when
-    /// recorded, then to that one's handle now, and an operation whose
-    /// entry or any cited memory isn't in this input is dropped, since
-    /// it would say something the LLM never said about what's here.
+    /// the request's template version. Its sentences are carried over by
+    /// identity: each handle goes to the memory it stood for when recorded,
+    /// then to that one's handle now, and a sentence citing any memory that
+    /// isn't in this input is dropped, since it would say something the LLM
+    /// never said about what's here. The rest of its section is kept. A
+    /// plan isn't substituted: it holds only the question and the language,
+    /// so it replays by key.
     fn nearest_refresh(
         &self,
         request: &LlmRequest,
@@ -808,7 +810,7 @@ impl Recorder {
     }
 }
 
-/// A recorded refresh's response with its handles carried over to
+/// A recorded write's response with its handles carried over to
 /// `identities` (see [`Recorder::nearest_refresh`]). A record without
 /// identities, from before they were kept, carries nothing over.
 fn carry_over(record: &Record, identities: &[(String, Uuid)]) -> LlmResponse {
@@ -825,35 +827,42 @@ fn carry_over(record: &Record, identities: &[(String, Uuid)]) -> LlmResponse {
         let id = meant.get(handle.trim())?;
         current.get(id).map(|handle| (*handle).to_string())
     };
-    let operations = record
+    let sections = record
         .response
         .json
-        .get("operations")
+        .get("sections")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut kept = Vec::new();
-    for mut operation in operations {
-        if let Some(entry) = operation.get("entry").and_then(Value::as_str) {
-            match carry(entry) {
-                Some(handle) => operation["entry"] = Value::from(handle),
-                None => continue,
-            }
-        }
-        if let Some(cites) = operation.get("cites").and_then(Value::as_array) {
+    let mut kept_sections = Vec::new();
+    for mut section in sections {
+        let sentences = section
+            .get("sentences")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut kept = Vec::new();
+        for mut sentence in sentences {
+            let cites = sentence
+                .get("cites")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let carried: Option<Vec<Value>> = cites
                 .iter()
                 .map(|cite| cite.as_str().and_then(carry).map(Value::from))
                 .collect();
             match carried {
-                Some(cites) => operation["cites"] = Value::Array(cites),
+                Some(cites) => sentence["cites"] = Value::Array(cites),
                 None => continue,
             }
+            kept.push(sentence);
         }
-        kept.push(operation);
+        section["sentences"] = Value::Array(kept);
+        kept_sections.push(section);
     }
     let mut json = record.response.json.clone();
-    json["operations"] = Value::Array(kept);
+    json["sections"] = Value::Array(kept_sections);
     LlmResponse {
         json,
         ..record.response.clone()
@@ -874,13 +883,13 @@ impl LlmClient for Recorder {
         request: &LlmRequest,
         identities: &[(String, Uuid)],
     ) -> Result<LlmResponse, LlmError> {
-        if request.template.name == REFRESH_TEMPLATE {
+        if request.template.name == WRITE_TEMPLATE {
             lock(&self.counts).refresh_times.push(self.clock.now());
             if self.mode == ReplayMode::Fast {
                 match self.refresh {
                     RefreshMode::Off => {
                         return Ok(LlmResponse {
-                            json: json!({ "operations": [] }),
+                            json: json!({ "sections": [] }),
                             usage: None,
                             latency: Duration::ZERO,
                         });

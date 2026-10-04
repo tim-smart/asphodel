@@ -306,7 +306,7 @@ fn labelling_history(dir: &TestDir) -> PathBuf {
 
 /// A stand-in whose every step answers any call: call 1 claims the home
 /// sentence (kept only where the turn quotes it), call 2 labels it
-/// `mentioned_again` on the first neighbour, and a refresh makes no edits.
+/// `mentioned_again` on the first neighbour, and a refresh writes nothing.
 fn labelling_script(dir: &TestDir) -> PathBuf {
     let mut home = claim(hermes::HOME_SENTENCE, hermes::HOME_QUOTE, "fact");
     home["claim"] = json!("c1");
@@ -314,7 +314,7 @@ fn labelling_script(dir: &TestDir) -> PathBuf {
     let reply = json!({
         "claims": [home],
         "used_injected_ids": [],
-        "operations": []
+        "sections": []
     });
     let steps: Vec<Value> = (0..256).map(|_| json!({ "reply": reply })).collect();
     let path = dir.path("labelling-script.json");
@@ -774,7 +774,7 @@ fn call2_material_keeps_a_flagged_claims_neighbour_below_the_floor() {
     cat["changes_something"] = json!(true);
     cat["claim"] = json!("c1");
     cat["labels"] = json!([]);
-    let reply = json!({ "claims": [home, cat], "used_injected_ids": [], "operations": [] });
+    let reply = json!({ "claims": [home, cat], "used_injected_ids": [], "sections": [] });
     let steps: Vec<Value> = (0..64).map(|_| json!({ "reply": reply })).collect();
     let script = dir.path("flagged-script.json");
     fs::write(&script, serde_json::to_vec(&steps).unwrap()).unwrap();

@@ -352,9 +352,10 @@ owner review after re-recording.
   notable write starts from the completion event, and the daily sweep
   follows the purge. A scenario's `[[model]]` sections create mental
   models before the first event so there is something to refresh. The
-  scripted LLM answers every refresh with no edits, so entries stay empty
-  and `refresh_calls_per_day` is what a scenario can watch; scripted
-  refresh replies are still open.
+  scripted LLM plans a question as one facet, the question itself, and
+  writes an empty summary, so entries stay empty and
+  `refresh_calls_per_day`, which counts the writes, is what a scenario can
+  watch; scripted refresh replies are still open.
 - **Bank time** comes from the turns the engine ingests, chatter included.
   Documents don't move it.
 - **Wall-clock timeouts.** The reranker deadline is off, so the reranker is
@@ -553,17 +554,22 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   judged with one short `judge_used` call, and answers call 2 and refreshes
   by request key, calling the LLM on a miss when one is configured. The
   report counts every miss, so "fast with zero misses" is a number.
-- **Refreshes in `fast`**: `--refresh recorded` (the default) substitutes
-  the recorded refresh of the same mental model nearest in simulated time,
+- **Refreshes in `fast`**: a refresh is a `plan_model` call, made once
+  per question for a model without a built-in plan, and a `write_model`
+  call. The plan holds only the question and the language, so it's
+  answered by key like call 2. For the write, `--refresh recorded` (the
+  default) substitutes the recorded write of the same mental model, by the
+  `Question:` line its request starts with, nearest in simulated time,
   among those made with this run's LLM model and template version; `live`
-  calls on a miss, and `off` answers with no edits. Refresh handles (`m1`,
-  `e1`, …) are positional, so a refresh's record keeps the memory or entry
-  each stood for, and a substituted reply is carried over by identity: a
+  calls on a miss, and `off` answers with an empty summary. Memory handles
+  (`m1`, …) are positional, so a write's record keeps the memory each
+  stood for, and a substituted reply is carried over by identity: a
   handle goes to the memory it meant, then to that memory's handle now.
-  An operation whose entry or any cited memory isn't in this run's input
-  is dropped whole. Citations are checked by identity rather than by name.
-  A refresh recorded before identities were
-  kept carries nothing over. Triggers are counted
+  A sentence citing any memory that isn't in this run's input is dropped,
+  and the rest of its section is kept. Citations are checked by identity
+  rather than by name. A write recorded before identities were kept
+  carries nothing over, and a `refresh_model` record from before schema
+  version 13 never stands in for a write. Triggers are counted
   by code in every mode. The mental models to refresh are the manifest's
   `[[model]]` tables, carried in the corpus header.
 - **Priming** (`--prime-concurrency [N]`, `fast` only) records call 1 for

@@ -203,16 +203,27 @@ pub fn imported_with_a_model(dir: &TestDir) -> PathBuf {
     corpus
 }
 
-/// A refresh operation adding one entry that cites `cites`.
-pub fn add_entry(text: &str, cites: &[&str]) -> Value {
-    json!({ "op": "add", "entry": null, "text": text, "cites": cites })
+/// A sentence of a refresh's write, citing memory handles.
+pub fn said(text: &str, cites: &[&str]) -> Value {
+    json!({ "text": text, "cites": cites })
+}
+
+/// A refresh's write: the whole summary, one section holding `sentences`.
+pub fn write_reply(sentences: Vec<Value>) -> Value {
+    json!({ "sections": [{ "heading": "Home", "sentences": sentences }] })
+}
+
+/// A refresh's plan: one facet recalling [`HOME_QUESTION`], so `home`
+/// selects as one retrieval for its question would.
+pub fn home_facets() -> Value {
+    json!([{ "heading": "Home", "query": HOME_QUESTION }])
 }
 
 /// A script whose every step answers any call: call 1 reads `claims` and
-/// `used_injected_ids` (the home claim, as [`live_script`]), and a refresh
-/// reads `operations`, which add one entry citing `m1`, the only memory the
-/// history makes. Neither reply type refuses the other's fields, so the
-/// order calls come in doesn't matter.
+/// `used_injected_ids` (the home claim, as [`live_script`]), a refresh's
+/// plan reads `facets`, and its write reads `sections`, one sentence citing
+/// `m1`, the only memory the history makes. No reply type refuses the
+/// others' fields, so the order calls come in doesn't matter.
 pub fn universal_script(dir: &TestDir) -> PathBuf {
     let reply = json!({
         "claims": [{
@@ -234,7 +245,8 @@ pub fn universal_script(dir: &TestDir) -> PathBuf {
             "entities": []
         }],
         "used_injected_ids": [],
-        "operations": [add_entry("Tim lives in Auckland.", &["m1"])]
+        "facets": home_facets(),
+        "sections": write_reply(vec![said("Tim lives in Auckland.", &["m1"])])["sections"]
     });
     let steps: Vec<Value> = (0..64).map(|_| json!({ "reply": reply })).collect();
     let path = dir.path("universal-script.json");
@@ -270,13 +282,14 @@ pub fn claim(content: &str, quote: &str, kind: &str) -> Value {
 }
 
 /// [`live_script`] with every step taking `delay_ms` to answer, so a
-/// `live` run measures that latency. The reply also reads as a refresh
-/// with no edits, so the seeded profile's refreshes succeed.
+/// `live` run measures that latency. The reply also reads as a plan and
+/// as an empty write, so the seeded profile's refreshes succeed.
 pub fn delayed_script(dir: &TestDir, delay_ms: u64) -> PathBuf {
     let reply = json!({
         "claims": [home_claim()],
         "used_injected_ids": [],
-        "operations": []
+        "facets": home_facets(),
+        "sections": []
     });
     let steps: Vec<Value> = (0..64)
         .map(|_| json!({ "reply": reply, "delay_ms": delay_ms }))
@@ -286,18 +299,19 @@ pub fn delayed_script(dir: &TestDir, delay_ms: u64) -> PathBuf {
     path
 }
 
-/// A script whose every step answers any call with `claims` and
-/// `operations`, as [`universal_script`] does.
+/// A script whose every step answers any call with `claims`, the home
+/// facet and a write of `sentences`, as [`universal_script`] does.
 pub fn script_answering_everything(
     dir: &TestDir,
     name: &str,
     claims: Vec<Value>,
-    operations: Vec<Value>,
+    sentences: Vec<Value>,
 ) -> PathBuf {
     let reply = json!({
         "claims": claims,
         "used_injected_ids": [],
-        "operations": operations
+        "facets": home_facets(),
+        "sections": write_reply(sentences)["sections"]
     });
     let steps: Vec<Value> = (0..64).map(|_| json!({ "reply": reply })).collect();
     let path = dir.path(&format!("{name}.json"));

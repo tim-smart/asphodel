@@ -22,9 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use asphodel_core::config::PurgePause;
 use asphodel_core::constants::CHUNK_RETRY_CAP;
 use asphodel_core::ingest::{Document, Outcome, Turn};
-use asphodel_core::mental_models::{
-    Model, Outcome as RefreshOutcome, REFRESH_TEMPLATE, RefreshInput,
-};
+use asphodel_core::mental_models::{Model, Outcome as RefreshOutcome, RefreshInput};
 use asphodel_core::models::{Embedder, FakeEmbedder, FakeLlm, FakeReranker, Models};
 use asphodel_core::retrieval::{Recall, RecallRequest};
 use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME};
@@ -561,7 +559,9 @@ impl Harness {
         let handles: Vec<String> = cites.iter().map(|m| handle(&input, *m)).collect();
         let llm = FakeLlm::scripted(
             MODEL,
-            vec![json!({"operations": [{"op": "add", "text": text, "cites": handles}]})],
+            vec![json!({"sections": [{"heading": "About Tim", "sentences": [
+                {"text": text, "cites": handles},
+            ]}]})],
         );
         let outcome = self
             .service
@@ -1115,7 +1115,7 @@ fn a_model_citing_a_purged_memory_refreshes_once_that_night() {
     h.sweep();
     assert_eq!(h.rows(&[maya]), 0);
     assert!(h.profile().entries.is_empty());
-    let llm = FakeLlm::scripted(MODEL, vec![json!({"operations": []}); 3]);
+    let llm = FakeLlm::scripted(MODEL, vec![json!({"sections": []}); 3]);
     h.service.run_refreshes(&llm).unwrap();
     for later in [
         minutes(31),
@@ -1129,7 +1129,7 @@ fn a_model_citing_a_purged_memory_refreshes_once_that_night() {
     let refreshes: Vec<_> = llm
         .requests()
         .into_iter()
-        .filter(|request| request.template.name == REFRESH_TEMPLATE)
+        .filter(|request| request.template.name == "write_model")
         .collect();
     assert_eq!(refreshes.len(), 1, "one refresh between two sweeps");
     assert!(refreshes[0].user.contains(TEA));
@@ -1710,11 +1710,10 @@ mod regressions {
             service: &h.service,
             memory: maya,
             erase,
-            reply: json!({"operations": [
-                {"op": "add", "text": "Tim has a daughter called Maya.",
-                 "cites": [handle(&input, maya)]},
-                {"op": "add", "text": "Tim likes green tea.", "cites": [handle(&input, tea)]},
-            ]}),
+            reply: json!({"sections": [{"heading": "About Tim", "sentences": [
+                {"text": "Tim has a daughter called Maya.", "cites": [handle(&input, maya)]},
+                {"text": "Tim likes green tea.", "cites": [handle(&input, tea)]},
+            ]}]}),
         };
         let outcome = h
             .service

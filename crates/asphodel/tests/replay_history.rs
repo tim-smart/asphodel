@@ -17,9 +17,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use support::hermes::{self, StateDb, epoch};
 use support::{
-    HOME_QUESTION, PASSING_PROBES, PROBES_WITH_A_FAILURE, TestDir, add_entry, asphodel, assert_ok,
+    HOME_QUESTION, PASSING_PROBES, PROBES_WITH_A_FAILURE, TestDir, asphodel, assert_ok,
     assert_refused, cassette_records, imported_small_history, imported_with_a_model, judge_script,
-    live_script, record, replay_history, stderr, universal_script, write_cassette,
+    live_script, record, replay_history, said, stderr, universal_script, write_cassette,
+    write_reply,
 };
 
 /// What a run simulated, without what identifies the run: the mode
@@ -1616,8 +1617,10 @@ model = "home"
 memory = "lives in Auckland"
 "#;
 
+/// Whether a record is a refresh's write. A plan is recorded apart, under
+/// `plan_model`, and replays by its key like any other call.
 fn is_refresh(record: &Value) -> bool {
-    record["template"]["name"] == "refresh_model"
+    record["template"]["name"] == "write_model"
 }
 
 /// Whether a refresh record is `home`'s, by the question line its request
@@ -1713,11 +1716,11 @@ fn with_near_and_far_home_refreshes(dir: &TestDir, near: Vec<Value>, far: Vec<Va
         .clone();
     let at: jiff::Timestamp = first["at"].as_str().unwrap().parse().unwrap();
     let later = at + jiff::SignedDuration::from_hours(24 * 200);
-    let copy = |at: jiff::Timestamp, operations: Vec<Value>, tag: &str| {
+    let copy = |at: jiff::Timestamp, sentences: Vec<Value>, tag: &str| {
         let mut record = first.clone();
         record["at"] = Value::from(at.to_string());
         record["key"] = Value::from(format!("{}-{tag}", first["key"].as_str().unwrap()));
-        record["response"]["json"] = serde_json::json!({ "operations": operations });
+        record["response"]["json"] = write_reply(sentences);
         record
     };
     let mut kept: Vec<Value> = records
@@ -1737,11 +1740,7 @@ fn fast_refresh_recorded_substitutes_the_nearest_recorded_refresh() {
     let corpus = imported_with_a_model(&dir);
     record_with_models(&dir, &corpus);
 
-    with_near_and_far_home_refreshes(
-        &dir,
-        vec![add_entry("Tim lives in Auckland.", &["m1"])],
-        vec![],
-    );
+    with_near_and_far_home_refreshes(&dir, vec![said("Tim lives in Auckland.", &["m1"])], vec![]);
     let near_adds = replay_history(
         &dir,
         &corpus,
@@ -1754,11 +1753,7 @@ fn fast_refresh_recorded_substitutes_the_nearest_recorded_refresh() {
     assert_ok(&near_adds.output);
     assert_eq!(near_adds.report()["flags"]["refresh"], "recorded");
 
-    with_near_and_far_home_refreshes(
-        &dir,
-        vec![],
-        vec![add_entry("Tim lives in Auckland.", &["m1"])],
-    );
+    with_near_and_far_home_refreshes(&dir, vec![], vec![said("Tim lives in Auckland.", &["m1"])]);
     let far_adds = replay_history(
         &dir,
         &corpus,
@@ -2108,13 +2103,16 @@ fn identity_corpora(dir: &TestDir) -> (std::path::PathBuf, std::path::PathBuf) {
     (both, facts)
 }
 
-/// The memories a refresh request lists, in handle order.
+/// The memories a refresh's write lists, `m1: ...` and so on, in the order
+/// it lists them.
 fn listed_memories(record: &Value) -> Vec<String> {
     let user = record["request"]["user"].as_str().unwrap();
-    let memories = user.split("\nMemories:\n").nth(1).unwrap_or("");
-    memories
-        .lines()
-        .filter(|line| line.starts_with('m'))
+    user.lines()
+        .filter(|line| {
+            line.strip_prefix('m')
+                .and_then(|rest| rest.split_once(": "))
+                .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        })
         .map(str::to_string)
         .collect()
 }
@@ -2132,7 +2130,7 @@ fn record_with_a_meaning_m1(dir: &TestDir, corpus: &std::path::Path) {
             support::claim("Tim needs to renew his passport.", PASSPORT_QUOTE, "task"),
             support::home_claim(),
         ],
-        vec![add_entry("An entry citing m1.", &["m1"])],
+        vec![said("An entry citing m1.", &["m1"])],
     );
     let live = replay_history(dir, corpus, "live", "", "live", Some(&script), &[]);
     assert_ok(&live.output);
@@ -2196,7 +2194,7 @@ memory = "lives in Auckland"
 }
 
 /// When the memory a substituted refresh cited isn't in the
-/// current input, the operation is dropped, even though its handle names
+/// current input, the sentence is dropped, even though its handle names
 /// another memory now.
 #[test]
 fn a_substituted_refresh_citing_an_absent_memory_is_dropped() {
@@ -2241,12 +2239,11 @@ fn a_refresh_recorded_under_another_model_is_never_substituted() {
     let mut other = first.clone();
     other["model"] = Value::from("other-model");
     other["key"] = Value::from(format!("{}-other", first["key"].as_str().unwrap()));
-    other["response"]["json"] =
-        serde_json::json!({ "operations": [add_entry("Tim lives in Auckland.", &["m1"])] });
+    other["response"]["json"] = write_reply(vec![said("Tim lives in Auckland.", &["m1"])]);
     let mut far = first.clone();
     far["at"] = Value::from((at + jiff::SignedDuration::from_hours(24 * 200)).to_string());
     far["key"] = Value::from(format!("{}-far", first["key"].as_str().unwrap()));
-    far["response"]["json"] = serde_json::json!({ "operations": [] });
+    far["response"]["json"] = write_reply(vec![]);
     // The other model's record goes first, so the run's model, which
     // `replay` and `fast` take from the last record, stays the original.
     let mut kept = vec![other];
@@ -2270,200 +2267,72 @@ fn a_refresh_recorded_under_another_model_is_never_substituted() {
     assert_probes_pass(&run);
 }
 
-// A substituted refresh's edit or remove
-// whose recorded entry is absent from this run is dropped, even though its
-// handle names another entry now.
+// A substituted write is carried over sentence by sentence: one citing a
+// memory absent from this run is dropped, and the rest of its section is
+// kept.
 
-const LIBRARY_QUOTE: &str = "I work at the library";
-
-/// The identity history with a library fact on day 7, so `home` refreshes
-/// again after the home fact, imported as `both` (facts and tasks) and
-/// `facts` (facts only, so the passport task and any entry citing it never
-/// exist).
-fn entry_corpora(dir: &TestDir) -> (std::path::PathBuf, std::path::PathBuf) {
-    let state_db = dir.private_path("state.db");
-    let db = StateDb::create(&state_db);
-    let t = epoch("2026-01-05T09:00:00Z");
-    db.session("s1", "discord", Some("discord:1"), None, t);
-    db.turn("s1", t, &format!("{PASSPORT_QUOTE} soon."), "Noted.");
-    db.turn(
-        "s1",
-        t + 3.0 * 86_400.0,
-        &format!("{}, near the harbour.", hermes::HOME_QUOTE),
-        "Noted.",
-    );
-    db.turn(
-        "s1",
-        t + 7.0 * 86_400.0,
-        &format!("{LIBRARY_QUOTE} now."),
-        "Noted.",
-    );
-    drop(db);
-    let both = dir.private_path("corpus/both.jsonl");
-    let facts = dir.private_path("corpus/facts.jsonl");
-    for (corpus, kinds) in [(&both, r#"["fact", "task"]"#), (&facts, r#"["fact"]"#)] {
-        assert_ok(&support::import_with(
-            dir,
-            &state_db,
-            corpus,
-            &manifest_with_home_kinds(kinds),
-            &[],
-        ));
-    }
-    (both, facts)
-}
-
-/// The current entries a refresh request lists, in handle order.
-fn listed_entries(record: &Value) -> Vec<String> {
-    let user = record["request"]["user"].as_str().unwrap();
-    let entries = user
-        .split("\nCurrent entries:\n")
-        .nth(1)
-        .and_then(|rest| rest.split("\n\nMemories:\n").next())
-        .unwrap_or("");
-    entries
-        .lines()
-        .filter(|line| line.starts_with('e'))
-        .map(str::to_string)
-        .collect()
-}
-
-/// Records the entry history on `both`, where `home`'s refresh after the
-/// home fact sees entry A (citing the passport) as `e1`. Then rewrites the
-/// cassette so `home` has two refreshes, both copies of that one and so
-/// both recorded with `e1` meaning A and `m1` the home fact: R_add at its
-/// own time, adding an entry citing `m1`, and R_target at the time of the
-/// refresh after the library fact, answering `target`.
-///
-/// On `facts`, R_add makes entry B citing the home fact, `home`'s only
-/// entry and so `e1`, and R_target then reaches a run where its `e1`
-/// meant A, which never exists, while `e1` names B.
-fn record_with_e1_meaning_a(dir: &TestDir, both: &std::path::Path, target: Vec<Value>) {
+/// Records the identity history on `both` with every write answering two
+/// sentences in one section, one citing `m1` and one `m2`, then keeps only
+/// `home`'s write recorded when it listed the home fact as `m1` and the
+/// passport task as `m2`.
+fn record_with_two_sentences(dir: &TestDir, both: &std::path::Path) {
     let script = support::script_answering_everything(
         dir,
-        "entry-script",
+        "two-sentence-script",
         vec![
             support::claim("Tim needs to renew his passport.", PASSPORT_QUOTE, "task"),
             support::home_claim(),
-            support::claim("Tim works at the library.", LIBRARY_QUOTE, "fact"),
         ],
-        vec![add_entry("An entry citing m1.", &["m1"])],
+        vec![
+            said("Tim lives in Auckland.", &["m1"]),
+            said("Tim has a passport to renew.", &["m2"]),
+        ],
     );
-    let live = replay_history(
-        dir,
-        both,
-        "live",
-        "",
-        "live",
-        Some(&script),
-        &["--until", "2026-01-14T09:00:00Z"],
-    );
+    let live = replay_history(dir, both, "live", "", "live", Some(&script), &[]);
     assert_ok(&live.output);
     let records = cassette_records(dir);
-    let homes: Vec<&Value> = records.iter().filter(|r| is_home_refresh(r)).collect();
-    let after_home = homes
+    let both_listed = records
         .iter()
         .find(|record| {
             let listed = listed_memories(record);
-            listed.len() == 2 && listed[0].starts_with("m1: ") && listed[0].contains("Auckland")
+            is_home_refresh(record)
+                && listed.len() == 2
+                && listed[0].starts_with("m1: ")
+                && listed[0].contains("Auckland")
+                && listed[1].contains("passport")
         })
-        .expect("home refreshed with the home fact as m1 and the passport");
-    let entries = listed_entries(after_home);
-    assert!(
-        entries.len() == 1 && entries[0].starts_with("e1: ") && entries[0].ends_with("[cites m2]"),
-        "fixture: e1 is A, citing the passport: {entries:?}"
-    );
-    assert!(
-        after_home["identities"]
-            .as_array()
-            .is_some_and(|ids| ids.iter().any(|pair| pair[0] == "e1")),
-        "fixture: the record keeps what e1 meant"
-    );
-    let after_library = homes
-        .iter()
-        .find(|record| {
-            listed_memories(record)
-                .iter()
-                .any(|line| line.contains("library"))
-        })
-        .expect("home refreshed after the library fact");
-
-    let copy = |at: &Value, operations: Vec<Value>, tag: &str| {
-        let mut record = (*after_home).clone();
-        record["at"] = at.clone();
-        record["key"] = Value::from(format!("{}-{tag}", after_home["key"].as_str().unwrap()));
-        record["response"]["json"] = serde_json::json!({ "operations": operations });
-        record
-    };
-    let r_add = copy(
-        &after_home["at"],
-        vec![add_entry("Tim lives in Auckland.", &["m1"])],
-        "add",
-    );
-    let r_target = copy(&after_library["at"], target, "target");
-    let mut kept: Vec<Value> = records
-        .iter()
-        .filter(|record| !is_home_refresh(record))
-        .cloned()
+        .expect("home refreshed listing the home fact as m1 and the passport as m2")
+        .clone();
+    let kept: Vec<Value> = records
+        .into_iter()
+        .filter(|record| !is_home_refresh(record) || *record == both_listed)
         .collect();
-    kept.push(r_target);
-    kept.push(r_add);
     write_cassette(dir, &kept);
 }
 
-/// B, citing the home fact, is in `home` the day after the library fact.
-const B_REMAINS: &str = r#"
+#[test]
+fn a_substituted_sentence_citing_an_absent_memory_is_dropped_and_its_section_kept() {
+    // On `facts` the passport task never exists, so the sentence citing it
+    // goes, while the one citing the home fact is written.
+    let dir = TestDir::new();
+    let (both, facts) = identity_corpora(&dir);
+    record_with_two_sentences(&dir, &both);
+    let probes = r#"
 [[probe]]
 id = "p001"
-at = "2026-01-13T12:00:00Z"
+at = "2026-01-09T12:00:00Z"
 kind = "profile_has"
 model = "home"
 memory = "lives in Auckland"
 "#;
-
-/// A `fast --refresh recorded` run on `facts` with R_target answering
-/// `target`.
-fn substituted(target: Vec<Value>, name: &str) -> (TestDir, support::Run) {
-    let dir = TestDir::new();
-    let (both, facts) = entry_corpora(&dir);
-    record_with_e1_meaning_a(&dir, &both, target);
     let run = replay_history(
         &dir,
         &facts,
         "fast",
-        B_REMAINS,
-        name,
+        probes,
+        "fast",
         None,
-        &["--refresh", "recorded", "--until", "2026-01-14T09:00:00Z"],
-    );
-    (dir, run)
-}
-
-#[test]
-fn a_substituted_edit_whose_entry_is_absent_is_dropped() {
-    let (_control_dir, control) = substituted(vec![], "control");
-    assert_probes_pass(&control);
-    let control = control.report();
-    assert!(
-        control["profile_tokens"]["p95"]
-            .as_u64()
-            .is_some_and(|tokens| tokens > 0),
-        "fixture: B renders: {control}"
-    );
-
-    let (_dir, run) = substituted(
-        vec![serde_json::json!({
-            "op": "edit",
-            "entry": "e1",
-            "text": "Tim lives in Auckland, in a tall blue house above the harbour with a view over the whole city and the gulf.",
-            "cites": ["m1"],
-        })],
-        "edit",
+        &["--refresh", "recorded"],
     );
     assert_probes_pass(&run);
-    assert_eq!(
-        run.report()["profile_tokens"],
-        control["profile_tokens"],
-        "B's text is unchanged"
-    );
 }

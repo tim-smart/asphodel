@@ -888,6 +888,9 @@ pub struct ModelView {
 pub struct EntryView {
     pub id: Uuid,
     pub position: i64,
+    /// The heading it's written under; `None` for an entry from before
+    /// sections.
+    pub section: Option<String>,
     pub text: String,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -938,9 +941,10 @@ pub(crate) fn model_view(
         ),
         None => None,
     };
-    let rows: Vec<(i64, Uuid, i64, String, i64, i64)> = {
+    type Row = (i64, Uuid, i64, Option<String>, String, i64, i64);
+    let rows: Vec<Row> = {
         let mut statement = conn.prepare(
-            "SELECT id, uuid, position, text, created_at, updated_at
+            "SELECT id, uuid, position, section, text, created_at, updated_at
              FROM mental_model_entries WHERE model_id = ?1 ORDER BY position",
         )?;
         statement
@@ -952,6 +956,7 @@ pub(crate) fn model_view(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             })?
             .collect::<Result<_, _>>()?
@@ -965,7 +970,7 @@ pub(crate) fn model_view(
          WHERE c.entry_id = ?1 ORDER BY c.rowid",
     )?;
     let mut entry_views = Vec::new();
-    for (id, uuid, position, text, created, updated) in rows {
+    for (id, uuid, position, section, text, created, updated) in rows {
         if entry.is_some_and(|wanted| wanted != uuid) {
             continue;
         }
@@ -994,6 +999,7 @@ pub(crate) fn model_view(
         entry_views.push(EntryView {
             id: uuid,
             position,
+            section,
             text,
             created_at: timestamp(created),
             updated_at: timestamp(updated),

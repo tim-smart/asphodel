@@ -112,6 +112,18 @@ fn defaults_are_valid() {
 }
 
 #[test]
+fn profile_output_defaults_to_2048_tokens() {
+    assert_eq!(Tuning::default().mental_models.profile_max_tokens, 2048);
+    assert_eq!(load("").unwrap().mental_models.profile_max_tokens, 2048);
+}
+
+#[test]
+fn shared_model_block_defaults_to_2560_tokens() {
+    assert_eq!(Tuning::default().mental_models.budget, 2560);
+    assert_eq!(load("").unwrap().mental_models.budget, 2560);
+}
+
+#[test]
 fn undated_days_defaults_to_thirty_and_accepts_overrides() {
     let days =
         |tuning: &Tuning| serde_json::to_value(tuning).unwrap()["agenda"]["undated_days"].clone();
@@ -146,6 +158,33 @@ fn an_agenda_update_budget_too_small_for_the_date_alone_is_rejected() {
                 .agenda
                 .update_budget,
             budget
+        );
+    }
+}
+
+#[test]
+fn a_refresh_recalls_up_to_six_facets_of_twenty_within_ninety_or_a_hundred_with_cited() {
+    // Up to six facets of 20 candidates each, at most 90 after removing
+    // duplicates, and room up to 100 for the memories the model cites.
+    let defaults = serde_json::to_value(Tuning::default().mental_models).unwrap();
+    for (key, value) in [
+        ("max_facets", 6),
+        ("facet_budget", 20),
+        ("input_budget", 90),
+        ("input_budget_with_cited", 100),
+    ] {
+        assert_eq!(defaults[key], value, "{key}");
+    }
+    let set = load("[mental_models]\nmax_facets = 4\nfacet_budget = 15\n").unwrap();
+    let set = serde_json::to_value(set.mental_models).unwrap();
+    assert_eq!(
+        (&set["max_facets"], &set["facet_budget"]),
+        (&4.into(), &15.into())
+    );
+    for key in ["max_facets", "facet_budget"] {
+        assert_eq!(
+            invalid_keys(&format!("[mental_models]\n{key} = 0\n")),
+            [format!("mental_models.{key}")]
         );
     }
 }
@@ -947,14 +986,16 @@ fn excluded_tuning_values_leave_the_fingerprint_alone() {
         "[agenda]\ndated_lines = 20\n",
         "[agenda]\nroutines = 0\n",
         "[agenda]\nundated_tasks = 9\n",
-        "[mental_models]\nbudget = 1200\n",
+        "[mental_models]\nbudget = 3000\n",
         "[mental_models]\nprofile_max_tokens = 300\n",
         "[mental_models]\ntrigger_level = \"major\"\n",
         "[mental_models]\nrefresh_debounce_minutes = 2\n",
         "[mental_models]\nrefresh_max_delay_minutes = 90\n",
         "[mental_models]\nsweep_time = \"02:00\"\n",
         "[mental_models]\ninput_budget = 40\n",
-        "[mental_models]\ninput_budget_with_cited = 80\n",
+        "[mental_models]\ninput_budget_with_cited = 120\n",
+        "[mental_models]\nmax_facets = 4\n",
+        "[mental_models]\nfacet_budget = 10\n",
         "[sessions]\nmapping_expiry_days = 7\n",
         "[llm]\nmodel = \"other-model\"\n",
         "[llm]\nendpoint = \"https://other.example/v1\"\n",

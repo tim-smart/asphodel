@@ -1,13 +1,21 @@
 //! Mental models.
 //!
-//! A model answers a standing question, such as "who is the user?", with
-//! entries: one sentence each, citing the memories it rests on. Only the
-//! owner defines models, through the CLI or API, and there are no hand
-//! edits. A refresh is one retrieval for the question and one LLM call that
-//! returns edits to the entries ([`refresh`]); code applies them and refuses
-//! any that cite outside the refresh's input. The memories always win: an
-//! entry citing a retracted or ended memory isn't rendered, and one citing a
-//! memory that left the input is dropped at the next refresh.
+//! A model answers a standing question, such as "who is the user?", with a
+//! summary: sections of sentences, each sentence an entry citing the
+//! memories it rests on. Only the owner defines models, through the CLI or
+//! API, and there are no hand edits. A refresh ([`refresh`]) asks one
+//! narrow question per facet of the model's question instead of one
+//! compound one: a plan names the facets, built in for the seeded profile
+//! and otherwise made once per question by an LLM call, each facet is one
+//! retrieval, and one LLM call writes the whole summary from what they
+//! found. Code refuses any sentence that cites outside the refresh's input.
+//! The memories always win: an entry citing a retracted or ended memory
+//! isn't rendered, and one citing a memory that left the input is dropped at
+//! the next refresh.
+//!
+//! The block renders each section as a heading and a paragraph. An entry
+//! written before sections existed has none, and renders as a line until
+//! its model's next write replaces it.
 //!
 //! A refresh is triggered by a write a model would care about, debounced
 //! per bank, at most every [`MIN_REFRESH_INTERVAL`] per model, and once a
@@ -34,10 +42,13 @@ use crate::strength::Kind;
 pub(crate) use refresh::{refresh, refresh_input};
 pub(crate) use schedule::Schedule;
 
-/// The refresh call's template name and version, which replay's cassette
-/// keys include.
-pub const REFRESH_TEMPLATE: &str = "refresh_model";
-pub const REFRESH_VERSION: u32 = 2;
+/// A refresh's two calls by template name and version, which replay's
+/// cassette keys include: the plan, made once per question for a model
+/// without a built-in one, and the write of the summary.
+pub const PLAN_TEMPLATE: &str = "plan_model";
+pub const PLAN_VERSION: u32 = 1;
+pub const WRITE_TEMPLATE: &str = "write_model";
+pub const WRITE_VERSION: u32 = 1;
 
 /// The least time between two refreshes of one model, and the wait before
 /// a failed refresh is tried again. Fixed
@@ -119,19 +130,32 @@ pub struct Model {
     pub last_error_at: Option<Timestamp>,
 }
 
-/// One sentence citing the memories it rests on. Code assigns `id`, and it
-/// survives edits.
+/// One sentence citing the memories it rests on, under its section's
+/// heading. Code assigns `id`, and keeps it when a write restates the
+/// sentence or rewords it citing the same memories.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
     pub id: Uuid,
+    /// The heading it's written under, or `None` for an entry written
+    /// before sections.
+    #[serde(default)]
+    pub section: Option<String>,
     pub text: String,
     /// In the order the refresh gave them.
     pub cites: Vec<Uuid>,
 }
 
-/// What one refresh sends the LLM. Handles are short ids local to the
-/// call, `m1`, `m2`, … for memories in score order and `e1`, `e2`, … for
-/// entries in position order, as call 1 and call 2 use.
+/// One part of a model's question: the heading its sentences are written
+/// under and the query its retrieval runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Facet {
+    pub heading: String,
+    pub query: String,
+}
+
+/// What one refresh's write sends the LLM. Memory handles are short ids
+/// local to the call, `m1`, `m2`, … in selection order, as call 1 and
+/// call 2 use.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RefreshInput {
     pub question: String,
@@ -139,12 +163,15 @@ pub struct RefreshInput {
     /// writes them in the language of the memories they cite.
     pub language: Option<String>,
     pub max_tokens: u32,
+    /// The plan the selection was recalled by. Until a new question is
+    /// planned, the input shows it recalled as one facet.
+    pub facets: Vec<Facet>,
     /// The selection.
     pub memories: Vec<InputMemory>,
-    /// The entries whose citations are all in the selection. The others
-    /// are dropped by the refresh before the call.
+    /// The entries whose citations are all in the selection, as the write
+    /// is shown them. The others are dropped by the refresh before the call.
     pub entries: Vec<InputEntry>,
-    /// The hash of the selection, the question, the filters and
+    /// The hash of the selection, the question, the plan, the filters and
     /// `max_tokens`.
     pub fingerprint: String,
 }
@@ -154,12 +181,14 @@ pub struct InputMemory {
     pub handle: String,
     pub memory: Uuid,
     pub sentence: String,
+    /// The heading of the first facet that found it.
+    pub facet: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputEntry {
-    pub handle: String,
     pub entry: Uuid,
+    pub section: Option<String>,
     pub text: String,
     /// Memory handles.
     pub cites: Vec<String>,
@@ -184,7 +213,11 @@ pub enum Outcome {
     },
 }
 
-/// The reply's operations, as code applied them.
+/// What a write did to the entries. A sentence whose text matches an
+/// entry's keeps that entry's id, and one citing exactly what an entry
+/// cited keeps its id under new words; either is `edited` when its text,
+/// citations or section changed. Every other sentence is `added`, and an
+/// entry the write left out is `removed`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Applied {
     pub added: Vec<Uuid>,
@@ -198,7 +231,8 @@ pub struct Applied {
     pub trimmed: Vec<Uuid>,
 }
 
-/// An operation code refused, by its index in the reply.
+/// A sentence code refused, by its index in the reply, counted across its
+/// sections.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rejected {
     pub index: usize,
@@ -210,11 +244,9 @@ pub struct Rejected {
 pub enum RejectReason {
     /// A citation that isn't a memory handle in this refresh's input.
     CitesOutsideInput,
-    /// An add or edit that leaves the entry citing nothing.
+    /// A sentence citing nothing.
     NoCitations,
-    /// An edit or remove naming no current entry.
-    UnknownEntry,
-    /// An add or edit with no text.
+    /// A sentence with no text.
     EmptyText,
 }
 
@@ -223,7 +255,7 @@ pub enum RejectReason {
 pub enum FailureKind {
     /// The LLM call failed.
     Llm,
-    /// The reply didn't parse as operations.
+    /// The reply didn't parse as a plan or a summary, or planned nothing.
     Malformed,
     /// The retrieval for the question failed, such as the embedder
     /// erroring, so there was nothing to send.
@@ -321,9 +353,45 @@ pub(crate) struct ModelRow {
     pub refresh_requested_at: Option<Timestamp>,
     pub last_error: Option<FailureKind>,
     pub last_error_at: Option<Timestamp>,
+    /// The plan made for a question by an LLM call, if any.
+    pub plan: Option<StoredPlan>,
+}
+
+/// A planned question's facets, kept with the question they were made for,
+/// so a changed question is planned again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredPlan {
+    pub question: String,
+    pub facets: Vec<Facet>,
 }
 
 impl ModelRow {
+    /// The facets a refresh recalls by, at most `limit` of them, or `None`
+    /// when the question needs planning: the built-in plan for the seeded
+    /// question, or the stored plan when it was made for the current
+    /// question. A plan longer than the limit keeps its first facets, as a
+    /// new plan does, so lowering `mental_models.max_facets` bounds plans
+    /// made before it without planning them again.
+    pub(crate) fn facets(&self, limit: usize) -> Option<Vec<Facet>> {
+        let mut facets: Vec<Facet> = if self.question == crate::store::bank::PROFILE_QUESTION {
+            crate::store::bank::PROFILE_FACETS
+                .iter()
+                .map(|(heading, query)| Facet {
+                    heading: (*heading).to_owned(),
+                    query: (*query).to_owned(),
+                })
+                .collect()
+        } else {
+            self.plan
+                .as_ref()
+                .filter(|plan| plan.question == self.question)?
+                .facets
+                .clone()
+        };
+        facets.truncate(limit);
+        Some(facets)
+    }
+
     /// Whether the model's own filters let a memory of `kind` and
     /// `volatility` through. The entity filter is checked apart, since it
     /// needs the memory's links.
@@ -359,13 +427,14 @@ impl ModelRow {
 pub(crate) struct StoredEntry {
     pub id: i64,
     pub uuid: Uuid,
+    pub section: Option<String>,
     pub text: String,
     pub cites: Vec<(i64, Uuid)>,
 }
 
 const MODEL_COLUMNS: &str = "id, uuid, bank_id, name, question, filter_kinds, filter_entity_id,
      filter_min_volatility, max_tokens, enabled, last_fingerprint, last_refreshed_at,
-     refresh_requested_at, last_error_kind, last_error_at";
+     refresh_requested_at, last_error_kind, last_error_at, plan";
 
 fn model_row(row: &rusqlite::Row<'_>) -> Result<ModelRow, rusqlite::Error> {
     let uuid: String = row.get(1)?;
@@ -395,6 +464,9 @@ fn model_row(row: &rusqlite::Row<'_>) -> Result<ModelRow, rusqlite::Error> {
         refresh_requested_at: row.get::<_, Option<i64>>(12)?.map(timestamp),
         last_error: error.as_deref().and_then(FailureKind::parse),
         last_error_at: row.get::<_, Option<i64>>(14)?.map(timestamp),
+        plan: row
+            .get::<_, Option<String>>(15)?
+            .and_then(|plan| serde_json::from_str(&plan).ok()),
     })
 }
 
@@ -467,7 +539,7 @@ pub(crate) fn load_entries(
     model_id: i64,
 ) -> Result<Vec<StoredEntry>, rusqlite::Error> {
     let mut entries = conn.prepare_cached(
-        "SELECT id, uuid, text FROM mental_model_entries WHERE model_id = ?1
+        "SELECT id, uuid, text, section FROM mental_model_entries WHERE model_id = ?1
          ORDER BY position, id",
     )?;
     let mut entries: Vec<StoredEntry> = entries
@@ -476,6 +548,7 @@ pub(crate) fn load_entries(
             Ok(StoredEntry {
                 id: row.get(0)?,
                 uuid: uuid.parse().unwrap_or_default(),
+                section: row.get(3)?,
                 text: row.get(2)?,
                 cites: Vec::new(),
             })
@@ -511,6 +584,7 @@ pub(crate) fn model(conn: &Connection, row: &ModelRow) -> Result<Model, rusqlite
         .into_iter()
         .map(|entry| Entry {
             id: entry.uuid,
+            section: entry.section,
             text: entry.text,
             cites: entry.cites.into_iter().map(|(_, uuid)| uuid).collect(),
         })

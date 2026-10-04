@@ -153,6 +153,12 @@ fn annotations(candidate: &Candidate, now: Timestamp) -> Vec<String> {
 /// [`STATE_AGE_SHOWN_BELOW`], and `None` otherwise. A
 /// mental model entry citing such a state shows it too.
 pub(crate) fn state_age(candidate: &Candidate, now: Timestamp) -> Option<String> {
+    state_observed(candidate, now).map(|age| format!("observed {age}"))
+}
+
+/// [`state_age`] without its verb, `4 days ago, Sat 27 Sep`, for a mental
+/// model's paragraph to say "as of".
+pub(crate) fn state_observed(candidate: &Candidate, now: Timestamp) -> Option<String> {
     if candidate.window.kind != Kind::State || candidate.state_confidence >= STATE_AGE_SHOWN_BELOW {
         return None;
     }
@@ -168,7 +174,7 @@ pub(crate) fn state_age(candidate: &Candidate, now: Timestamp) -> Option<String>
         .last_observed
         .to_zoned(candidate.tz.clone())
         .strftime("%a %-d %b");
-    Some(format!("observed {ago}, {on}"))
+    Some(format!("{ago}, {on}"))
 }
 
 /// A stored time as its precision allows: `Thu 3 Oct 15:00`, `Sat 12 Sep`,
