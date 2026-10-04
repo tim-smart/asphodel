@@ -236,8 +236,9 @@ to pack the carrots at 8am on the 30th".
 A fully undated `retracts` still corrects and invalidates its predecessor.
 The replacement carries over the first retracted neighbour's whole window
 (`due_at`, `valid_from`, `valid_until`, `until_event`, precision and window
-confidence). This applies only when the claim supplies none of those time
-fields; a partial or explicit replacement window is not filled in. Multiple
+confidence). This applies only when both memories have the same kind and
+the claim supplies none of those time fields. A replacement of another kind
+keeps its own window; a partial or explicit window is not filled in. Multiple
 neighbours' windows are not combined. `denies` does not carry dates over.
 
 An undated event's observation-day `valid_from` is a synthetic fallback,

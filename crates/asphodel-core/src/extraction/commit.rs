@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rusqlite::{OptionalExtension, Transaction};
 use uuid::Uuid;
 
-use super::claims::{Checked, Link, NewMemory, Precision, Stamp, is_pronoun};
+use super::claims::{Checked, Kind as ClaimKind, Link, NewMemory, Precision, Stamp, is_pronoun};
 use super::input::{Unit, survivor};
 use super::reconcile::{Edit, Fate, Neighbour, Plan, end_at};
 use super::{
@@ -19,6 +19,7 @@ use crate::constants::{
 use crate::queue::{self, Lease};
 use crate::store::bank::{add_alias, log_edit, log_memory_edit};
 use crate::store::{Store, StoreError, VectorError, VectorIndex, micros, timestamp};
+use crate::strength::Kind;
 
 /// A new memory's row, as the edits on its neighbours need it.
 struct Written {
@@ -78,9 +79,9 @@ pub(super) fn commit(
             lease.source,
             &format!("{}:{}", lease.position, memory.claim),
         );
-        // A correction with no window is silent about dates, not a request
-        // to erase them. Keep the first retracted neighbour's whole window;
-        // never combine potentially unrelated windows from several memories.
+        // A correction of the same kind with no window is silent about dates,
+        // not a request to erase them. Keep the first retracted neighbour's
+        // whole window; never combine windows or inherit another kind's fields.
         let mut memory = memory.clone();
         if memory.due_at.is_none()
             && memory.supplied_valid_from().is_none()
@@ -91,6 +92,14 @@ pub(super) fn commit(
                     .then(|| neighbours.iter().find(|neighbour| neighbour.id == id))
                     .flatten()
             })
+            && matches!(
+                (memory.kind, neighbour.kind),
+                (ClaimKind::Fact, Kind::Fact)
+                    | (ClaimKind::Event, Kind::Event)
+                    | (ClaimKind::State, Kind::State)
+                    | (ClaimKind::Task, Kind::Task)
+                    | (ClaimKind::Recurring, Kind::Recurring)
+            )
         {
             memory.due_at = neighbour.due_at;
             memory.valid_from = neighbour.valid_from;
