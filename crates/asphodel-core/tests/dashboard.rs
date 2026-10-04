@@ -536,7 +536,7 @@ fn a_significance_override_changes_the_strength_shown_for_an_existing_memory() {
         },
         asphodel_core::config::Layer {
             origin: "override",
-            text: "[strength.significance]\ntrivial = 0.0\n",
+            text: "[strength.significance]\ntrivial = 0.1\n",
         },
     ])
     .unwrap();
@@ -551,10 +551,10 @@ fn a_significance_override_changes_the_strength_shown_for_an_existing_memory() {
     let service = Service::with_models(clock, store, tuning, Models::fake()).unwrap();
     let after = service.show_memory(BANK, &memory.to_string()).unwrap();
 
-    assert_eq!(before.significance.value, 0.1);
-    assert_eq!(after.significance.value, 0.0);
-    // S = 2.5: lowering trivial from 0.1 to 0.0 removes 0.25 strength.
-    assert!((before.strength.value - after.strength.value - 0.25).abs() < 1e-9);
+    assert_eq!(before.significance.value, 0.0);
+    assert_eq!(after.significance.value, 0.1);
+    // S = 2.5: raising trivial from 0.0 to 0.1 adds 0.25 strength.
+    assert!((after.strength.value - before.strength.value - 0.25).abs() < 1e-9);
 }
 
 #[test]

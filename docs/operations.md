@@ -173,15 +173,15 @@ at 2.5:
 
 ```toml
 [strength.significance]
-trivial = 0.1
-minor = 0.3
+trivial = 0.0
+minor = 0.2
 notable = 0.5
 major = 0.7
 critical = 0.9
 ```
 
 Those are the defaults. Lowering a level makes the memories at it fade
-sooner; trivial at 0.1 starts 0.25 above a memory with significance 0.
+sooner; raising trivial from 0.0 to 0.1 adds 0.25 to its strength.
 Each value is between 0 and 1, and each level must be strictly above the
 one below it, so critical can be 1.0. A kept memory's significance is fixed
 at 1.0 and isn't a key: it never fades. The values are deletion inputs, so
