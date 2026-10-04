@@ -1,5 +1,28 @@
 # Upgrading
 
+## Shorter trivial and minor lifetimes
+
+The significance mapping changes from 0.1 to 0.0 for trivial memories and
+from 0.3 to 0.2 for minor memories. Notable, major, critical and kept
+memories are unchanged. With one mention and the default strength tuning,
+a trivial memory now fades after 7.4 bank days and becomes eligible for
+purge after 4.2 bank months; a minor memory fades after about 1 bank month
+and becomes eligible for purge after about 1.5 bank years. Reinforcement
+and purge guards still apply. These are bank-time ages, not wall-clock
+deadlines.
+
+Stored memories keep their significance labels and access histories. The
+new mapping applies to existing memories as soon as the upgraded daemon
+computes their strength, so some trivial and minor memories may immediately
+fall below the recall threshold or become eligible for the next purge
+sweep. No schema migration or re-extraction is needed.
+
+For a before/after evaluation, use scripted scenarios without LLM calls.
+A real-history run in strict `replay` mode can miss the cassette because
+strength affects injection and injected memories are part of the recorded
+request. `fast` mode reuses recorded claims but may make top-up LLM calls;
+get approval before using it on private data.
+
 ## Schema version 2: send each bank's config again
 
 Schema version 2 adds `speaker_ids`, the only mapping a turn's speaker is

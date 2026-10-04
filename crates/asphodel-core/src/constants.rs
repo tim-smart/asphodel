@@ -108,8 +108,8 @@ impl Significance {
     /// The significance value this level stands for.
     pub const fn value(self) -> f64 {
         match self {
-            Significance::Trivial => 0.1,
-            Significance::Minor => 0.3,
+            Significance::Trivial => 0.0,
+            Significance::Minor => 0.2,
             Significance::Notable => 0.5,
             Significance::Major => 0.7,
             Significance::Critical => 0.9,
