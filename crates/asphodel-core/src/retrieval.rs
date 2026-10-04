@@ -184,6 +184,9 @@ pub struct RecallRequest {
 pub struct Recall {
     pub recall_id: Uuid,
     pub results: Vec<Recalled>,
+    /// Plain lines for the recall tool, with ids and source-local dates.
+    /// Structured results remain available to CLI and dashboard callers.
+    pub text: String,
     /// Whether the reranker answered in time. When it didn't, the results
     /// are in RRF order.
     pub reranked: bool,
@@ -704,6 +707,15 @@ pub(crate) fn recall(
     ranked.truncate(run.limit);
 
     let strong_cutoff = cx.tuning.recall.strong_cutoff;
+    let text = if ranked.is_empty() {
+        "No memories recalled.".to_owned()
+    } else {
+        ranked
+            .iter()
+            .map(|item| format::recall_line(&item.candidate, now, strong_cutoff))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let logged: Vec<Logged> = ranked
         .iter()
         .map(|item| Logged {
@@ -765,6 +777,7 @@ pub(crate) fn recall(
     Ok(Recall {
         recall_id,
         results,
+        text,
         reranked: run.reranked,
     })
 }

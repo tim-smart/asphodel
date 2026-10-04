@@ -1,10 +1,12 @@
-//! The injection's text.
+//! Injection and recall-tool text.
 //!
 //! Hermes replays an injection verbatim on every later turn, so nothing in
 //! it is relative to the moment it was made except the header's own time:
 //! annotations give absolute dates, and a state's age comes with the date
 //! it's counted from. The sentence is the stored content verbatim, so
-//! Hermes' identical-bullet dedup works, and there are no memory ids.
+//! Hermes' identical-bullet dedup works, and injection has no memory ids.
+//! Explicit recall shares the annotations but prefixes each line with its id
+//! and labels its kind, weak strength and kept status.
 //!
 //! ```text
 //! Recalled Wed 1 Oct 10:42
@@ -17,6 +19,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use super::candidates::Candidate;
+use super::{Band, band};
 use crate::constants::STATE_AGE_SHOWN_BELOW;
 use crate::strength::{Kind, Phase, TimePrecision, WorldTime};
 
@@ -38,6 +41,34 @@ pub(crate) fn line(candidate: &Candidate, now: Timestamp) -> String {
     } else {
         format!("- {} [{}]", candidate.content, annotations.join("; "))
     }
+}
+
+/// A recall-tool line starts with the unchanged id for the owner tools.
+/// It shares injection annotations but also exposes kind and weak strength.
+pub(crate) fn recall_line(candidate: &Candidate, now: Timestamp, strong_cutoff: f64) -> String {
+    let kind = match candidate.window.kind {
+        Kind::Fact => "fact",
+        Kind::State => "state",
+        Kind::Event => "event",
+        Kind::Task => "task",
+        Kind::Recurring => "recurring",
+    };
+    let mut labels = vec![kind.to_owned()];
+    match band(candidate.strength, strong_cutoff) {
+        Band::Strong => {}
+        Band::Fading => labels.push("fading".to_owned()),
+        Band::Faded => labels.push("faded".to_owned()),
+    }
+    if candidate.kept {
+        labels.push("kept".to_owned());
+    }
+    labels.extend(annotations(candidate, now));
+    format!(
+        "{} {} [{}]",
+        candidate.uuid,
+        candidate.content,
+        labels.join("; ")
+    )
 }
 
 /// The block: the header, then one line per memory, in score order.
