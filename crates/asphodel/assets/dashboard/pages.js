@@ -1199,9 +1199,12 @@ async function recall(ctx) {
     placeholder: String(RECALL_LIMIT_DEFAULT),
   });
 
+  // Each mode's fields sit in a fieldset that's disabled, not just hidden,
+  // while the other mode is on: a disabled control keeps its value but isn't
+  // validated, so a recall filter left invalid can't block an injection.
   const recallFilters = h(
-    "div",
-    { class: "explain-filters" },
+    "fieldset",
+    { class: "explain-filters", "aria-label": "Recall filters" },
     field("explain-from", "From", from),
     field("explain-to", "To", to),
     field("explain-on", "Dates match", on),
@@ -1221,8 +1224,8 @@ async function recall(ctx) {
   const previousQuery = h("textarea", { id: "explain-previous-query", rows: 3, autocomplete: "off" });
   const previousReply = h("textarea", { id: "explain-previous-reply", rows: 3, autocomplete: "off" });
   const injectionFields = h(
-    "div",
-    { class: "explain-filters", hidden: true },
+    "fieldset",
+    { class: "explain-filters", "aria-label": "Conversation", hidden: true },
     field("explain-previous-query", "Previous message", previousQuery, "The user's message before this one, if any."),
     field("explain-previous-reply", "Previous reply", previousReply, "The agent's reply to it. A short follow-up borrows from both."),
     h(
@@ -1239,8 +1242,8 @@ async function recall(ctx) {
     mode = next;
     queryLabel.textContent = mode === "recall" ? "Query" : "Message";
     query.placeholder = mode === "recall" ? "What the agent would search for" : "What the user just said";
-    recallFilters.hidden = mode !== "recall";
-    injectionFields.hidden = mode !== "injection";
+    recallFilters.hidden = recallFilters.disabled = mode !== "recall";
+    injectionFields.hidden = injectionFields.disabled = mode !== "injection";
   }
   setMode(mode);
 
