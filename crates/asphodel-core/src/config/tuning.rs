@@ -210,10 +210,10 @@ pub struct InjectionTuning {
 #[serde(rename_all = "snake_case")]
 pub enum RerankQuery {
     /// The message, after a short follow-up borrowed the previous one.
-    #[default]
     Message,
-    /// The start of the previous message and of the assistant's reply to
-    /// it, then the message, for every prefetch.
+    /// The message, then the start of the previous message and of the
+    /// assistant's reply to it, for every prefetch.
+    #[default]
     Conversation,
 }
 
@@ -223,7 +223,7 @@ impl Default for InjectionTuning {
             cap: 8,
             token_budget: 600,
             reranker_floors: BTreeMap::new(),
-            rerank_query: RerankQuery::Message,
+            rerank_query: RerankQuery::Conversation,
         }
     }
 }

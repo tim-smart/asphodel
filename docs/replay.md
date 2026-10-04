@@ -676,10 +676,10 @@ The material is one JSON object:
   `[Name] ` speaker prefix, after a short follow-up borrowed the previous
   message. Keyed recall labels name it. `rerank_query` is what the
   reranker scored against, which the scores and so calibration follow.
-  It's `query` by default; with `[injection] rerank_query =
-  "conversation"` in `--overrides` it's the message, the start of the
-  previous message, and the start of the assistant's reply to it, one per
-  line (see "Reranking against the conversation" below).
+  By default it's the message, the start of the previous message, and the
+  start of the assistant's reply to it, one per
+  line (see "Reranking against the conversation" below). With
+  `[injection] rerank_query = "message"` in `--overrides` it's `query`.
   `raw_query` is the message as Hermes sent it, for reading beside it.
   Material written before they were recorded has no `rerank_query` or
   `raw_query`, and `report precision` still reads it.
@@ -783,10 +783,10 @@ file and line, never the text.
 ### Reranking against the conversation
 
 `[injection] rerank_query` decides what prefetch's reranker scores
-candidates against. `"message"`, the default, is the message itself, or
+candidates against. `"message"` is the message itself, or
 for a short follow-up the previous message and then the message.
-`"conversation"` is, for every prefetch, the message, the start of the
-previous message, and the start of the assistant's reply to it, one per
+`"conversation"` is the default. For every prefetch it uses the message,
+the start of the previous message, and the start of the assistant's reply to it, one per
 line, leaving out empty or missing parts. The previous message and the
 reply are each cut to their first 300 Unicode characters, cutting back to
 the last whitespace boundary when available. This is a character limit,
