@@ -981,7 +981,7 @@ fn excluded_tuning_values_leave_the_fingerprint_alone() {
         "[mental_models]\nrefresh_max_delay_minutes = 90\n",
         "[mental_models]\nsweep_time = \"02:00\"\n",
         "[mental_models]\ninput_budget = 40\n",
-        "[mental_models]\ninput_budget_with_cited = 80\n",
+        "[mental_models]\ninput_budget_with_cited = 120\n",
         "[mental_models]\nmax_facets = 4\n",
         "[mental_models]\nfacet_budget = 10\n",
         "[sessions]\nmapping_expiry_days = 7\n",
