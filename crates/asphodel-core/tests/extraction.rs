@@ -932,6 +932,127 @@ fn up_to_three_earlier_turns_of_the_session_are_context() {
 }
 
 #[test]
+fn occasion_context_keeps_its_own_date_for_relative_times() {
+    let h = Harness::new();
+    // The open day is tomorrow relative to the earlier turn (2 October),
+    // not tomorrow relative to the task request (4 October).
+    ingest(
+        &h,
+        &turn(
+            "open-day",
+            T1,
+            "The school open day is tomorrow at 2pm.",
+            "Noted.",
+        ),
+    );
+    let current = ingest(
+        &h,
+        &turn(
+            "open-day",
+            "2026-10-03T06:30:00Z",
+            "Remember to bring the visitor badge to that open day.",
+            "Noted the task.",
+        ),
+    );
+    h.focus(h.chunk_of(current.source, 0));
+
+    let input = input(&h, "main", &[]);
+    assert_eq!(input.reference_date, Some(date(2026, 10, 3)));
+    assert_eq!(input.context.len(), 1);
+    let request = call1_request(&input);
+    let context = request.user.split("<context>").nth(1).unwrap();
+    let context = context.split("</context>").next().unwrap();
+    assert!(context.contains("The school open day is tomorrow at 2pm."));
+    assert!(
+        context.contains("2026-10-01"),
+        "Call 1 needs the earlier turn's local date to ground tomorrow, not just the current reference date. Context: {context}"
+    );
+}
+
+#[test]
+fn occasion_context_windows_expire_without_ending_overdue_or_unknown_date_tasks() {
+    let h = Harness::new();
+    ingest(
+        &h,
+        &turn(
+            "open-day",
+            T1,
+            "The school open day is on 3 October 2026 at 2pm. The neighbourhood picnic has no date yet.",
+            "Noted.",
+        ),
+    );
+    h.advance(24);
+    let user = "Remember to bring the visitor badge to the open day. Renew my library card by 3 October at noon. Bring a blanket to the neighbourhood picnic.";
+    let current = ingest(
+        &h,
+        &turn("open-day", "2026-10-02T06:30:00Z", user, "Noted the tasks."),
+    );
+    h.focus(h.chunk_of(current.source, 0));
+    let input = input(&h, "main", &[]);
+    let request = call1_request(&input);
+    assert!(
+        request
+            .user
+            .contains("The school open day is on 3 October 2026 at 2pm.")
+    );
+    assert!(!input.text.contains("open day is on 3 October"));
+
+    // Script the external LLM's correctly grounded answer. This checks
+    // quote validation, time conversion and the public agenda, not whether
+    // the model itself can infer a window from the context.
+    let memories = extract(
+        &h,
+        reply(
+            vec![
+                claim(
+                    "Tim needs to bring the visitor badge to the school open day on 3 October 2026 at 14:00.",
+                    "task",
+                    "Remember to bring the visitor badge to the open day.",
+                )
+                .with("due_at", time("2026-10-03T14:00", "minute"))
+                .with("valid_until", time("2026-10-03T14:00", "minute")),
+                claim(
+                    "Tim needs to renew his library card by 3 October 2026 at noon.",
+                    "task",
+                    "Renew my library card by 3 October at noon.",
+                )
+                .with("due_at", time("2026-10-03T12:00", "minute")),
+                claim(
+                    "Tim needs to bring a blanket to the neighbourhood picnic, whose date is unknown.",
+                    "task",
+                    "Bring a blanket to the neighbourhood picnic.",
+                ),
+            ],
+            &[],
+        ),
+    )
+    .memories;
+    assert_eq!(memories.len(), 3);
+    let [badge, library, blanket] = memories.as_slice() else {
+        unreachable!()
+    };
+    // 13:00 Auckland on 3 October: the renewal is already overdue.
+    h.advance(17);
+    let before = h.service.agenda("main").unwrap().listed();
+    assert!(before.contains(badge));
+    assert!(before.contains(library));
+    assert!(before.contains(blanket));
+
+    // 15:00 Auckland: the occasion passed, but the obligation and the
+    // occasion with an unknown date must not acquire an invented expiry.
+    h.advance(2);
+    let after = h.service.agenda("main").unwrap().listed();
+    assert!(!after.contains(badge));
+    assert!(after.contains(library));
+    assert!(after.contains(blanket));
+    h.advance(22 * 24);
+    let later = h.service.agenda("main").unwrap().listed();
+    assert!(!later.contains(badge));
+    assert!(later.contains(library));
+    assert!(later.contains(blanket));
+}
+
+#[test]
 fn context_is_clipped_oldest_first() {
     let h = Harness::new();
     // Three earlier turns of 2,500 characters each: 7,500 in all.
