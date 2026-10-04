@@ -642,6 +642,11 @@ pub enum Committed {
 /// floor would retain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call2List {
+    /// The chunk the claim came from.
+    pub chunk: Uuid,
+    /// The claim's index in call 1's reply, which with the chunk names
+    /// the claim across runs, as it names the memory a claim makes.
+    pub ordinal: usize,
     /// The claim's sentence.
     pub claim: String,
     pub candidates: Vec<Call2Candidate>,

@@ -377,8 +377,16 @@ store. Stop the browse daemon first if it is on the same port.
 
 `labelling.json` (step 4) holds 50 sampled prefetches, each with its query
 and the reranked candidates before the gate, and every candidate list call
-2 was shown, each with its claim and neighbours. Every candidate has an id
-(`r1.1`, `c1.1`), the memory's id, its score and its sentence.
+2 was shown, each with its claim, the claim's chunk and ordinal, and its
+neighbours. Every candidate has an id (`r1.1`, `c1.1`), the memory's id,
+its score and its sentence.
+
+Labels are keyed by what they judge, not by candidate id, so they survive a
+re-record. A recall label is the sample's `query` and the candidate's
+`memory`. A call-2 label is the sample's `chunk` and `ordinal` and the
+candidate's `memory`. Use the ids to find your place with Tim, but never
+write them into a label: they number this run's candidates and mean
+nothing in the next one.
 
 **The two questions.** For a recall candidate: given this query, would a
 good assistant want this memory in front of it for the reply? Related is
@@ -403,10 +411,27 @@ confirmed; a label he hasn't looked at never goes there.
 
 ```toml
 # sample r1, finished by Tim 2026-10-03
-"r1.1" = true
-"r1.2" = false
-"r1.3" = false
+[[recall]]
+query = "what time is the dentist"
+memory = "b4ccd45d-80dd-53dd-9b22-b1c8f9f43bc5"
+relevant = true
+
+[[recall]]
+query = "what time is the dentist"
+memory = "41c78166-793c-50c2-bca7-c1d7227c222e"
+relevant = false
+
+# sample c1, finished by Tim 2026-10-03
+[[call2]]
+chunk = "0d6f3a52-1c4e-5b7a-9e2f-6a8b3c1d4e5f"
+ordinal = 0
+memory = "41c78166-793c-50c2-bca7-c1d7227c222e"
+relevant = true
 ```
+
+Copy `query`, `chunk` and `ordinal` from the sample exactly as the
+material has them; a label whose key differs by a character matches
+nothing.
 
 **The curve.** Run it on the approved file. Running it on the draft is fine
 for a preview, but say so.
@@ -415,16 +440,52 @@ for a preview, but say so.
 asphodel report precision --labels "$ASPHODEL_REPLAY_DIR/labels.toml" --material "$ASPHODEL_REPLAY_DIR/labelling.json"
 ```
 
-It prints, for recall and for call 2, how many candidates were labelled and
-how many weren't, and one point per distinct score: at that `floor`, how
-many labelled candidates were kept, how many were relevant, and the
-precision. Numbers only; it may be reported whole. Tim picks the two
+It prints, for recall and for call 2, how many candidates were labelled
+(`labelled`) and how many weren't (`unlabelled`), how many labels matched a
+candidate (`matched`) and how many found nothing (`unmatched`), and one
+point per distinct score: at that `floor`, how many labelled candidates
+were kept, how many were relevant, and the precision. Numbers only; it may
+be reported whole. Tim picks the two
 floors: for recall, the lowest logit at which precision is still what he
 wants; for call 2, the lowest cosine. Put them in `replay.toml` and in the
 production `asphodel.toml`. The recall curve matches the gate exactly. The
 call-2 curve covers only candidates the placeholder reconcile floor let
 call 2 see, so after the floors change, re-run step 4 (approval again) and
 re-label if the material changed.
+
+**After a re-record.** Pass the approved labels when you re-run step 4, so
+the material samples the prefetches whose queries Tim has already labelled:
+
+```sh
+    --labelling "$ASPHODEL_REPLAY_DIR/labelling.json" \
+    --labels "$ASPHODEL_REPLAY_DIR/labels.toml" \
+```
+
+Then run the curve on the new material with the same labels. `matched`
+says how many carried over and `unlabelled` how many candidates are new.
+Expect partial carry-over, not all: a memory's id comes from its source
+and its claim's position in call 1's reply, so when a new prompt splits a
+turn differently the ids shift and the labels on them stop matching. Label
+the unlabelled candidates in the samples you show Tim, as above.
+
+**Labels in the old form.** A `labels.toml` of candidate ids (`"r1.1" =
+true`) is still read against the material it was written for. Convert it
+once, against that material, before using it with any other:
+
+```sh
+asphodel report precision --labels "$ASPHODEL_REPLAY_DIR/labels-old.toml" \
+    --material "$ASPHODEL_REPLAY_DIR/labelling-old.json" \
+    --convert "$ASPHODEL_REPLAY_DIR/labels.toml"
+```
+
+The output gains `converted`: the `recall` and `call2` labels written,
+`dropped_call2`, and `conflicting`. Recall labels always convert. Call-2
+labels convert only if that material records each claim's chunk and
+ordinal, which material written before this change doesn't, so on old
+material every call-2 label is dropped and counted in `dropped_call2`;
+those samples need labelling again. `conflicting` counts labels left out
+because Tim judged the same query and memory both ways in two samples;
+ask him again. Report both counts.
 
 ## 9. A/B runs
 

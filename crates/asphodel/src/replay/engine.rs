@@ -125,8 +125,9 @@ pub struct Settings {
     /// recorded for a record, measured for a live call. Otherwise `latency`.
     pub latency_from_cassette: bool,
     pub until: Option<Timestamp>,
-    /// Collect the labelling material.
-    pub labelling: bool,
+    /// Collect the labelling material, sampling turns whose queries these
+    /// labels judge first.
+    pub labelling: Option<BTreeSet<String>>,
 }
 
 /// What a run produced for the report.
@@ -339,7 +340,7 @@ impl<'a> Engine<'a> {
                 "a scenario scripts call 2 against what a serial run shows it, so it runs at [llm] concurrency = 1".into(),
             ));
         }
-        let labelling = settings.labelling.then(Collector::default);
+        let labelling = settings.labelling.clone().map(Collector::new);
         let mut engine = Self {
             service,
             clock: Arc::clone(&clock),
