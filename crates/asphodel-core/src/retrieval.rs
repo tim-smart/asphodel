@@ -34,6 +34,7 @@
 
 mod arms;
 pub(crate) mod candidates;
+mod explain;
 pub(crate) mod format;
 mod log;
 mod rerank;
@@ -49,6 +50,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub(crate) use arms::bm25;
+pub use explain::{
+    Arm, ArmRank, Cut, Explain, ExplainInjection, ExplainMode, ExplainRecall, ExplainRequest,
+    Explained, ExplainedInjection, ScoreParts, StageLatency,
+};
 pub(crate) use rerank::Permit;
 
 use crate::config::{RankingTuning, RerankQuery, Tuning};

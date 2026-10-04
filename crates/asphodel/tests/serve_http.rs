@@ -2608,6 +2608,22 @@ fn the_dashboard_routes_browse_without_writing_anything() {
     assert_eq!(shown["text"], NOTES, "{shown}");
     assert_eq!(shown["chunks"][0]["memories"], json!([id]), "{shown}");
 
+    // Explaining a recall or an injection runs the pipeline without using
+    // anything either.
+    let explained = daemon.ok(daemon.post(
+        "/v1/banks/main/recall/explain",
+        &json!({"mode": "recall", "query": "Auckland"}),
+    ));
+    assert_eq!(explained["mode"], "recall", "{explained}");
+    assert_eq!(explained["candidates"][0]["id"], id.as_str(), "{explained}");
+    assert_eq!(explained["candidates"][0]["included"], true, "{explained}");
+    let explained = daemon.ok(daemon.post(
+        "/v1/banks/main/recall/explain",
+        &json!({"mode": "injection", "query": "Where does Tim live? Auckland?"}),
+    ));
+    assert_eq!(explained["mode"], "injection", "{explained}");
+    assert!(explained["injection"]["text"].is_string(), "{explained}");
+
     // Looking is not using: no access, no recall.
     let memory = daemon.ok(daemon.get(&format!("/v1/banks/main/memories/{id}")));
     let kinds: Vec<&str> = memory["accesses"]
@@ -2708,6 +2724,7 @@ fn off_loopback_the_dashboard_page_is_open_and_its_routes_need_the_token() {
             ("GET", format!("/v1/banks/main/sources/{memory}")),
             ("POST", format!("/v1/banks/main/memories/{memory}/retract")),
             ("POST", "/v1/banks/main/documents/remove".to_string()),
+            ("POST", "/v1/banks/main/recall/explain".to_string()),
         ] {
             let reply = request(&addr, method, &path, token, None).unwrap();
             assert_eq!(reply.status, 401, "{method} {path} with {token:?}");
