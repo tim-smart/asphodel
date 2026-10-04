@@ -1463,6 +1463,18 @@ fn an_undated_retraction_inherits_the_dated_window() {
 /// extraction must not treat the second turn's observation-day default as
 /// a newly stated booking date.
 fn undated_booking(label: &str) -> (Harness, Uuid, Extracted) {
+    booking_restatement(
+        label,
+        claim("Tim has a hotel booking.", "event", "hotel booking"),
+        "I have a hotel booking.",
+    )
+}
+
+fn booking_restatement(
+    label: &str,
+    restatement: Value,
+    message: &str,
+) -> (Harness, Uuid, Extracted) {
     const BOOKING: &str = "Tim has a hotel booking.";
     let h = Harness::new();
     owner_says(&h, "I have a hotel booking for January 11 to 15, 2027.");
@@ -1474,20 +1486,10 @@ fn undated_booking(label: &str) -> (Harness, Uuid, Extracted) {
     h.service
         .ingest_turn(
             "main",
-            &turn(
-                "s1",
-                "2026-10-02T06:30:00Z",
-                "I have a hotel booking.",
-                "Noted.",
-            ),
+            &turn("s1", "2026-10-02T06:30:00Z", message, "Noted."),
         )
         .unwrap();
-    let extracted = one_label(
-        &h,
-        reply(vec![claim(BOOKING, "event", "hotel booking")]),
-        old,
-        label,
-    );
+    let extracted = one_label(&h, reply(vec![restatement]), old, label);
     (h, old, extracted)
 }
 
@@ -1534,6 +1536,47 @@ fn an_undated_event_retraction_inherits_the_dated_booking_window() {
         head.window, old_view.window,
         "an omitted event date must inherit the booking window, not the observation day"
     );
+}
+
+fn assert_explicit_low_confidence_booking(label: &str) {
+    // Deliberately use the observation day and the fallback's precision and
+    // confidence. Only whether the start was supplied distinguishes it.
+    let restatement = claim("Tim has a hotel booking.", "event", "hotel booking")
+        .with("valid_from", time("2026-10-02", "day"))
+        .with("window_confidence", json!("low"));
+    let (h, old, extracted) =
+        booking_restatement(label, restatement, "I think my hotel booking starts today.");
+    let old_view = h.service.show_memory("main", &old.to_string()).unwrap();
+    let head = h
+        .service
+        .show_memory("main", &old_view.chain.head.to_string())
+        .unwrap();
+    assert_eq!(extracted.memories, vec![head.id]);
+    assert_ne!(head.id, old, "{label} must retain an explicit date");
+    assert_eq!(old_view.retracted_at.is_some(), label == "retracts");
+    let start = head.window.valid_from.unwrap();
+    assert_eq!(start.at, local("2026-10-02T00:00"));
+    assert_eq!(start.precision, asphodel_core::strength::TimePrecision::Day);
+    assert!(
+        head.window.valid_until.is_none(),
+        "do not inherit the old end"
+    );
+    assert_eq!(head.window.window_confidence, "low");
+}
+
+#[test]
+fn an_explicit_low_confidence_event_mentioned_again_refines_the_booking() {
+    assert_explicit_low_confidence_booking("mentioned_again");
+}
+
+#[test]
+fn an_explicit_low_confidence_event_confirmed_refines_the_booking() {
+    assert_explicit_low_confidence_booking("confirmed");
+}
+
+#[test]
+fn an_explicit_low_confidence_event_retraction_keeps_its_own_window() {
+    assert_explicit_low_confidence_booking("retracts");
 }
 
 #[test]
