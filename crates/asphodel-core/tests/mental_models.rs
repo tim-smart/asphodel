@@ -2397,6 +2397,188 @@ fn an_agenda_update_has_its_own_cap_and_leaves_room_for_relevance_injection() {
     );
 }
 
+#[test]
+fn a_stale_block_with_nothing_new_gets_the_date_alone_once() {
+    let h = Harness::new();
+    h.insert(event(DENTIST, "2026-10-05T00:00"));
+    h.block(Some("s1"));
+    h.set(local("2026-10-02T09:00"));
+
+    let first = prefetch(&h, "s1", "hello there");
+    assert!(
+        first.text.contains("Agenda update for Fri 2 Oct"),
+        "{}",
+        first.text
+    );
+    assert!(
+        !first.text.contains(DENTIST),
+        "the update repeated what the session holds:\n{}",
+        first.text
+    );
+
+    // Unacknowledged, it's sent again.
+    sync(&h, "s1", "Hello there.", None);
+    let second = prefetch(&h, "s1", "and again");
+    assert!(
+        second.text.contains("Agenda update for Fri 2 Oct"),
+        "{}",
+        second.text
+    );
+
+    sync(&h, "s1", "And again.", Some(second.recall_id));
+    let third = prefetch(&h, "s1", "one more time");
+    assert!(!third.text.contains("Agenda update"), "{}", third.text);
+
+    // The next day is stale again.
+    h.set(local("2026-10-03T09:00"));
+    let saturday = prefetch(&h, "s1", "good morning");
+    assert!(
+        saturday.text.contains("Agenda update for Sat 3 Oct"),
+        "{}",
+        saturday.text
+    );
+    assert!(!saturday.text.contains(DENTIST), "{}", saturday.text);
+}
+
+#[test]
+fn items_over_the_update_budget_arrive_on_later_turns_each_once() {
+    let h = Harness::with_tuning("[agenda]\nupdate_budget = 40\n");
+    h.block(Some("s1"));
+    let items = [
+        "Tim has a meeting with the accountant about the quarterly tax return on 2 October.",
+        "Tim has a meeting with the builder about the kitchen renovation on 3 October 2026.",
+        "Tim has a meeting with the school about Maya's reading progress on 4 October 2026.",
+    ];
+    for (content, day) in items.iter().zip(["02", "03", "04"]) {
+        h.insert(event(content, &format!("2026-10-{day}T00:00")));
+    }
+
+    let first = prefetch(&h, "s1", "hello there");
+    let listed: Vec<&str> = items
+        .iter()
+        .copied()
+        .filter(|item| first.text.contains(item))
+        .collect();
+    assert!(
+        !listed.is_empty() && listed.len() < items.len(),
+        "the update wasn't capped:\n{}",
+        first.text
+    );
+    assert!(
+        first.text.contains("more"),
+        "the update didn't count what it left out:\n{}",
+        first.text
+    );
+
+    let mut seen: Vec<&str> = listed;
+    let mut recall_id = first.recall_id;
+    for turn in 0..items.len() {
+        sync(&h, "s1", &format!("Turn {turn}."), Some(recall_id));
+        let next = prefetch(&h, "s1", &format!("and again {turn}"));
+        if !next.text.contains("Agenda update") {
+            break;
+        }
+        for item in items {
+            if next.text.contains(item) {
+                assert!(
+                    !seen.contains(&item),
+                    "{item:?} was sent twice:\n{}",
+                    next.text
+                );
+                seen.push(item);
+            }
+        }
+        recall_id = next.recall_id;
+    }
+    for item in items {
+        assert!(seen.contains(&item), "{item:?} never arrived");
+    }
+    sync(&h, "s1", "Done.", Some(recall_id));
+    let last = prefetch(&h, "s1", "anything else");
+    assert!(!last.text.contains("Agenda update"), "{}", last.text);
+}
+
+#[test]
+fn a_session_with_no_block_mapping_gets_no_agenda_update() {
+    let h = Harness::new();
+    h.insert(event(DENTIST, "2026-10-05T00:00"));
+
+    // Never fetched a block.
+    let never = prefetch(&h, "s1", "hello there");
+    assert!(!never.text.contains("Agenda update"), "{}", never.text);
+    h.set(local("2026-10-02T09:00"));
+    let next_day = prefetch(&h, "s1", "hello again");
+    assert!(
+        !next_day.text.contains("Agenda update"),
+        "{}",
+        next_day.text
+    );
+
+    // Fetched one, then cleared.
+    h.block(Some("s2"));
+    h.service.clear_session(BANK, "s2").unwrap();
+    h.insert(event(CONCERT, "2026-10-09T00:00"));
+    let cleared = prefetch(&h, "s2", "hello there");
+    assert!(!cleared.text.contains("Agenda update"), "{}", cleared.text);
+}
+
+#[test]
+fn after_a_restart_an_acknowledged_update_is_sent_at_most_once_more() {
+    // Sessions live in daemon memory, so a restart can repeat one update,
+    // but no more than that.
+    let h = Harness::new();
+    h.insert(event(DENTIST, "2026-10-05T00:00"));
+    h.insert(event(CONCERT, "2026-10-09T00:00"));
+    h.block(Some("s1"));
+    h.set(local("2026-10-02T09:00"));
+    let first = prefetch(&h, "s1", "hello there");
+    assert!(first.text.contains(CONCERT), "{}", first.text);
+    sync(&h, "s1", "Hello there.", Some(first.recall_id));
+
+    let h = h.restart();
+    let again = prefetch(&h, "s1", "and again");
+    sync(&h, "s1", "And again.", Some(again.recall_id));
+    let after = prefetch(&h, "s1", "one more time");
+    assert!(!after.text.contains("Agenda update"), "{}", after.text);
+}
+
+#[test]
+fn items_the_block_left_out_for_its_budget_arrive_in_the_first_update() {
+    let h = Harness::with_tuning("[mental_models]\nbudget = 80\nprofile_max_tokens = 80\n");
+    let tasks = [
+        "Tim needs to sort out the paperwork for renewing the car registration before it lapses.",
+        "Tim needs to book a plumber to look at the dripping tap in the upstairs bathroom soon.",
+    ];
+    let ids: Vec<Uuid> = tasks
+        .iter()
+        .map(|content| h.insert(task(content)))
+        .collect();
+    let block = h.block(Some("s1"));
+    let left_out: Vec<usize> = (0..tasks.len())
+        .filter(|&n| !block.agenda.contains(&ids[n]))
+        .collect();
+    assert!(
+        !left_out.is_empty(),
+        "the block fit every task, so this test checks nothing:\n{}",
+        block.text
+    );
+
+    let first = prefetch(&h, "s1", "hello there");
+    assert!(
+        first.text.contains("Agenda update for Thu 1 Oct"),
+        "{}",
+        first.text
+    );
+    for n in left_out {
+        assert!(first.text.contains(tasks[n]), "{}", first.text);
+    }
+    for n in 0..tasks.len() {
+        if block.agenda.contains(&ids[n]) {
+            assert!(!first.text.contains(tasks[n]), "{}", first.text);
+        }
+    }
+}
+
 // The agenda
 
 #[test]

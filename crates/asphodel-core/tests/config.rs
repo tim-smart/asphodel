@@ -130,6 +130,21 @@ fn undated_days_must_be_at_least_one() {
 }
 
 #[test]
+fn the_agenda_update_budget_must_be_at_least_one() {
+    assert_eq!(
+        invalid_keys("[agenda]\nupdate_budget = 0\n"),
+        ["agenda.update_budget"]
+    );
+    assert_eq!(
+        load("[agenda]\nupdate_budget = 1\n")
+            .unwrap()
+            .agenda
+            .update_budget,
+        1
+    );
+}
+
+#[test]
 fn no_file_and_an_empty_file_give_the_defaults() {
     assert_eq!(Tuning::load(None).unwrap(), Tuning::default());
     assert_eq!(load("").unwrap(), Tuning::default());
