@@ -5,11 +5,13 @@
 //!    recall query. The seeded profile's question has them built in
 //!    ([`PROFILE_FACETS`](crate::store::bank::PROFILE_FACETS)). Any other
 //!    question is planned by one LLM call holding only the question and the
-//!    language, so it replays by key, keeping at most `max_facets`. The plan
-//!    is stored on the model in its own write before anything is recalled,
-//!    so a failed or held write doesn't pay for it again, and it's made
-//!    again only once the question changes. A bank whose embedder isn't
-//!    served fails the refresh before the plan call, as its retrieval would.
+//!    language, so it replays by key. The plan is stored on the model in
+//!    its own write before anything is recalled, so a failed or held write
+//!    doesn't pay for it again, and it's made again only once the question
+//!    changes. Whichever plan it is, a refresh recalls by its first
+//!    `max_facets` facets, so the limit holds for plans made before it was
+//!    lowered too. A bank whose embedder isn't served fails the refresh
+//!    before the plan call, as its retrieval would.
 //! 2. **Selection.** Each facet's query runs through the recall pipeline
 //!    with injection's weighting over current memories at or above τ that
 //!    pass the model's filters, taking its best `facet_budget`. Reranker
@@ -322,12 +324,14 @@ pub(crate) fn refresh_input(
     cx: &Context<'_>,
     model: &ModelRow,
 ) -> Result<RefreshInput, ModelError> {
-    let facets = model.facets().unwrap_or_else(|| {
-        vec![Facet {
-            heading: model.name.clone(),
-            query: model.question.clone(),
-        }]
-    });
+    let facets = model
+        .facets(cx.tuning.mental_models.max_facets as usize)
+        .unwrap_or_else(|| {
+            vec![Facet {
+                heading: model.name.clone(),
+                query: model.question.clone(),
+            }]
+        });
     Ok(select(cx, model, facets, false)?.input)
 }
 
@@ -351,7 +355,7 @@ pub(crate) fn refresh(
         model: model.id,
         generation: schedule.generation(model.id),
     };
-    let facets = match model.facets() {
+    let facets = match model.facets(cx.tuning.mental_models.max_facets as usize) {
         Some(facets) => facets,
         None => {
             // A plan is no use if nothing can be recalled for it.

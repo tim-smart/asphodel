@@ -503,9 +503,12 @@ Only the owner defines mental models, through these commands or the API.
   --disable]`
 - `asphodel model refresh --bank B <name> [--force]` refreshes now. It's
   skipped when the inputs haven't changed, unless `--force`.
-- `asphodel model show --bank B <name> [--entry ID]` answers "why does the
-  profile say X?": each entry under its section heading, with the memories
-  it cites, and whether the prompt block shows it.
+- `asphodel model show --bank B <name> [--entry ID]` prints the summary as
+  the prompt block reads it: each section a heading and one paragraph,
+  with a count of entries the block doesn't show. To answer "why does the
+  profile say X?", find the sentence's entry id with `--json`, then
+  `--entry ID` shows that entry with the memories it cites, their status,
+  and whether the prompt block shows it.
 
 A refresh asks one narrow question per part of the model's question, its
 facets, instead of one compound question, so a memory about one part isn't

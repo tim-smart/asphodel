@@ -366,25 +366,30 @@ pub(crate) struct StoredPlan {
 }
 
 impl ModelRow {
-    /// The facets a refresh recalls by, or `None` when the question needs
-    /// planning: the built-in plan for the seeded question, or the stored
-    /// plan when it was made for the current question.
-    pub(crate) fn facets(&self) -> Option<Vec<Facet>> {
-        if self.question == crate::store::bank::PROFILE_QUESTION {
-            return Some(
-                crate::store::bank::PROFILE_FACETS
-                    .iter()
-                    .map(|(heading, query)| Facet {
-                        heading: (*heading).to_owned(),
-                        query: (*query).to_owned(),
-                    })
-                    .collect(),
-            );
-        }
-        self.plan
-            .as_ref()
-            .filter(|plan| plan.question == self.question)
-            .map(|plan| plan.facets.clone())
+    /// The facets a refresh recalls by, at most `limit` of them, or `None`
+    /// when the question needs planning: the built-in plan for the seeded
+    /// question, or the stored plan when it was made for the current
+    /// question. A plan longer than the limit keeps its first facets, as a
+    /// new plan does, so lowering `mental_models.max_facets` bounds plans
+    /// made before it without planning them again.
+    pub(crate) fn facets(&self, limit: usize) -> Option<Vec<Facet>> {
+        let mut facets: Vec<Facet> = if self.question == crate::store::bank::PROFILE_QUESTION {
+            crate::store::bank::PROFILE_FACETS
+                .iter()
+                .map(|(heading, query)| Facet {
+                    heading: (*heading).to_owned(),
+                    query: (*query).to_owned(),
+                })
+                .collect()
+        } else {
+            self.plan
+                .as_ref()
+                .filter(|plan| plan.question == self.question)?
+                .facets
+                .clone()
+        };
+        facets.truncate(limit);
+        Some(facets)
     }
 
     /// Whether the model's own filters let a memory of `kind` and
