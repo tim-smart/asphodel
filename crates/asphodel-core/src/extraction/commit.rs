@@ -83,7 +83,7 @@ pub(super) fn commit(
         // never combine potentially unrelated windows from several memories.
         let mut memory = memory.clone();
         if memory.due_at.is_none()
-            && memory.valid_from.is_none()
+            && memory.supplied_valid_from().is_none()
             && memory.valid_until.is_none()
             && memory.until_event.is_none()
             && let Some(neighbour) = plan.edits.iter().find_map(|&(claim, id, edit)| {
@@ -94,6 +94,7 @@ pub(super) fn commit(
         {
             memory.due_at = neighbour.due_at;
             memory.valid_from = neighbour.valid_from;
+            memory.valid_from_defaulted = false;
             memory.valid_until = neighbour.valid_until;
             memory.until_event = neighbour.until_event.clone();
             memory.low_confidence = neighbour.low_confidence;

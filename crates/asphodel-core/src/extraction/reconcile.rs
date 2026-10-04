@@ -678,7 +678,7 @@ pub(super) fn plan(
                 && matches!(label, Label::MentionedAgain | Label::Confirmed)
                 && [
                     (memory.due_at, neighbour.due_at),
-                    (memory.valid_from, neighbour.valid_from),
+                    (memory.supplied_valid_from(), neighbour.valid_from),
                     (memory.valid_until, neighbour.valid_until),
                 ]
                 .iter()

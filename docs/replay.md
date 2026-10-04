@@ -239,6 +239,12 @@ confidence). This applies only when the claim supplies none of those time
 fields; a partial or explicit replacement window is not filled in. Multiple
 neighbours' windows are not combined. `denies` does not carry dates over.
 
+An undated event's observation-day `valid_from` is a synthetic fallback,
+not a supplied date. It does not trigger the repeat guard or prevent
+undated-retraction carry-over; the inherited window replaces that fallback.
+Standalone undated events still keep it. Explicit dates count as supplied
+even when their window confidence is low.
+
 The scenario loader currently rejects a `label` on a claim with only
 `mentioned_again` or `confirmed` outcomes, even when this date guard would
 create a new memory. Leave the claim unlabelled and inspect the original
