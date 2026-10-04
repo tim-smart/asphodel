@@ -2167,6 +2167,236 @@ fn a_mapping_expires_after_thirty_days_without_a_turn() {
     assert!(h.in_context("s1").is_empty());
 }
 
+// Agenda updates. Hermes freezes the block per session and only rebuilds it
+// on compaction, so a long-lived session's agenda goes stale. Prefetch
+// brings it up to date: when the bank-local day has moved past the day the
+// session's block was built for, or the agenda lists items the session's
+// in-context set doesn't hold, it puts an "Agenda update for <date>"
+// section ahead of the relevance injection, listing only the missing
+// items. The update is held under the prefetch's `recall_id` and committed
+// by the turn that echoes it, as injected memories are.
+
+const DENTIST: &str = "Tim's dentist appointment is on 5 October.";
+const CONCERT: &str = "Tim has a concert on 9 October.";
+
+fn prefetch(h: &Harness, session: &str, query: &str) -> asphodel_core::retrieval::Prefetch {
+    h.service
+        .prefetch(
+            BANK,
+            &PrefetchRequest {
+                session_id: session.into(),
+                query: query.into(),
+                previous_query: None,
+                previous_reply: None,
+                block_id: None,
+            },
+        )
+        .unwrap()
+}
+
+/// The session's turn arriving, echoing `recall_id` when given.
+fn sync(h: &Harness, session: &str, user: &str, recall_id: Option<Uuid>) {
+    h.service
+        .ingest_turn(
+            BANK,
+            &Turn {
+                recall_id: recall_id.map(|id| id.to_string()),
+                ..turn(session, h.now() - minutes(1), user)
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_session_whose_block_is_from_an_earlier_day_gets_one_agenda_update() {
+    let h = Harness::new();
+    let dentist = h.insert(event(DENTIST, "2026-10-05T00:00"));
+    // Past Thursday's seven-day horizon, inside Friday's.
+    let concert = h.insert(event(CONCERT, "2026-10-09T00:00"));
+    let block = h.block(Some("s1"));
+    assert_eq!(block.agenda, vec![dentist]);
+
+    h.set(local("2026-10-02T09:00"));
+    let first = prefetch(&h, "s1", "hello there");
+    assert!(
+        first.text.contains("Agenda update for Fri 2 Oct"),
+        "{}",
+        first.text
+    );
+    assert!(first.text.contains(CONCERT), "{}", first.text);
+    assert!(
+        !first.text.contains(DENTIST),
+        "the update repeated what the session holds:\n{}",
+        first.text
+    );
+
+    sync(&h, "s1", "Hello there.", Some(first.recall_id));
+    assert!(h.in_context("s1").contains(&concert));
+
+    h.advance(minutes(5));
+    let second = prefetch(&h, "s1", "and again");
+    assert!(
+        !second.text.contains("Agenda update"),
+        "the update was sent twice:\n{}",
+        second.text
+    );
+}
+
+#[test]
+fn an_agenda_item_added_mid_session_shows_up_once_through_prefetch() {
+    let h = Harness::new();
+    h.insert(event(DENTIST, "2026-10-05T00:00"));
+    h.block(Some("s1"));
+
+    let haircut = h.says(
+        claim("Tim has a haircut on 3 October 2026.", "event", "minor").with(
+            "valid_from",
+            json!({"at": "2026-10-03", "precision": "day"}),
+        ),
+    );
+    let rates = h.says(
+        claim(
+            "Tim needs to pay the rates by 4 October 2026.",
+            "task",
+            "notable",
+        )
+        .with("due_at", json!({"at": "2026-10-04", "precision": "day"})),
+    );
+    assert!(h.agenda().dated.contains(&haircut));
+    assert!(h.agenda().dated.contains(&rates));
+
+    let first = prefetch(&h, "s1", "hello there");
+    assert!(
+        first.text.contains("Agenda update for Thu 1 Oct"),
+        "{}",
+        first.text
+    );
+    assert!(
+        first.text.contains("Tim has a haircut on 3 October 2026."),
+        "{}",
+        first.text
+    );
+    assert!(
+        first
+            .text
+            .contains("Tim needs to pay the rates by 4 October 2026."),
+        "{}",
+        first.text
+    );
+    assert!(!first.text.contains(DENTIST), "{}", first.text);
+
+    sync(&h, "s1", "Hello there.", Some(first.recall_id));
+    let second = prefetch(&h, "s1", "and again");
+    assert!(
+        !second.text.contains("Agenda update"),
+        "the update was sent twice:\n{}",
+        second.text
+    );
+}
+
+#[test]
+fn a_session_whose_block_is_current_sees_no_agenda_update() {
+    let h = Harness::new();
+    h.insert(event(DENTIST, "2026-10-05T00:00"));
+    h.insert(event(CONCERT, "2026-10-09T00:00"));
+    h.block(Some("s1"));
+
+    h.advance(minutes(30));
+    let same_day = prefetch(&h, "s1", "hello there");
+    assert!(
+        !same_day.text.contains("Agenda update"),
+        "{}",
+        same_day.text
+    );
+
+    // A block fetched on the new day is current again.
+    h.set(local("2026-10-02T09:00"));
+    h.block(Some("s1"));
+    let next_day = prefetch(&h, "s1", "hello again");
+    assert!(
+        !next_day.text.contains("Agenda update"),
+        "{}",
+        next_day.text
+    );
+}
+
+#[test]
+fn an_agenda_update_no_turn_acknowledges_is_sent_again() {
+    // Held, like an injection, until the turn echoing its recall_id: a turn
+    // without it commits nothing, so the next prefetch still sends it.
+    let h = Harness::new();
+    h.insert(event(DENTIST, "2026-10-05T00:00"));
+    let concert = h.insert(event(CONCERT, "2026-10-09T00:00"));
+    h.block(Some("s1"));
+    h.set(local("2026-10-02T09:00"));
+
+    let first = prefetch(&h, "s1", "hello there");
+    assert!(first.text.contains(CONCERT), "{}", first.text);
+    assert!(
+        !h.in_context("s1").contains(&concert),
+        "a pending update was already in context"
+    );
+
+    sync(&h, "s1", "Hello there.", None);
+    assert!(!h.in_context("s1").contains(&concert));
+    let second = prefetch(&h, "s1", "and again");
+    assert!(
+        second.text.contains("Agenda update for Fri 2 Oct"),
+        "{}",
+        second.text
+    );
+    assert!(second.text.contains(CONCERT), "{}", second.text);
+
+    sync(&h, "s1", "And again.", Some(second.recall_id));
+    assert!(h.in_context("s1").contains(&concert));
+    let third = prefetch(&h, "s1", "one more time");
+    assert!(!third.text.contains("Agenda update"), "{}", third.text);
+}
+
+#[test]
+fn an_agenda_update_has_its_own_cap_and_leaves_room_for_relevance_injection() {
+    let h = Harness::new();
+    let cat = h.insert(fact(CAT));
+    h.block(Some("s1"));
+
+    // Fifteen dated items added mid-session, far more text than an update
+    // should carry.
+    let events: Vec<&'static str> = (0..15)
+        .map(|n| {
+            sentence(format!(
+                "Tim has appointment number {n} on 3 October, which involves a long drive \
+                 across town, a stop at the hardware store for paint and brushes, a call \
+                 to the bank about the mortgage, and a late lunch with his sister in the city."
+            ))
+        })
+        .collect();
+    for content in &events {
+        h.insert(event(content, "2026-10-03T00:00"));
+    }
+    assert_eq!(h.agenda().dated.len(), 15);
+
+    let prefetch = prefetch(&h, "s1", "is the cat called Miso");
+    let text = &prefetch.text;
+    let update = text
+        .find("Agenda update for Thu 1 Oct")
+        .unwrap_or_else(|| panic!("no update:\n{text}"));
+    let recalled = text
+        .find("Recalled ")
+        .unwrap_or_else(|| panic!("no relevance injection:\n{text}"));
+    assert!(update < recalled, "the update isn't first:\n{text}");
+    assert!(prefetch.injected.contains(&cat), "{text}");
+
+    let all_lines: usize = events.iter().map(|e| estimate_tokens(e)).sum();
+    assert!(
+        estimate_tokens(&text[update..recalled]) < all_lines,
+        "the update carried every item:\n{text}"
+    );
+    assert!(
+        events.iter().any(|e| !text.contains(e)),
+        "the update carried every item:\n{text}"
+    );
+}
+
 // The agenda
 
 #[test]
