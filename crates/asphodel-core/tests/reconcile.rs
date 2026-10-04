@@ -1495,6 +1495,71 @@ fn an_undated_retraction_with_a_new_kind_keeps_its_own_window() {
     }
 }
 
+#[test]
+fn a_related_claim_of_another_kind_never_replaces_an_open_task() {
+    // A status event and a general preference on the same topic say
+    // nothing about whether the renewal is done or was wrong. Whatever call
+    // 2 labels them, the task stays the head of its chain and on the agenda.
+    // Only `ends` or a corrected task replaces it.
+    for label in ["retracts", "refines"] {
+        let h = Harness::new();
+        owner_says(&h, "I need to renew my passport by 9 October.");
+        let task = extract_alone(
+            &h,
+            reply(vec![
+                claim(PASSPORT, "task", "I need to renew my passport")
+                    .with("due_at", time("2026-10-09T08:00", "minute")),
+            ]),
+        )
+        .memories[0];
+        h.advance(24);
+        h.service
+            .ingest_turn(
+                "main",
+                &turn(
+                    "s1",
+                    "2026-10-02T06:30:00Z",
+                    "I asked the post office how to renew my passport. \
+                     I prefer to renew my passport online.",
+                    "Noted.",
+                ),
+            )
+            .unwrap();
+        let call1 = reply(vec![
+            claim(
+                "Tim asked the post office how to renew his passport.",
+                "event",
+                "I asked the post office how to renew my passport",
+            ),
+            claim(
+                "Tim prefers to renew his passport online.",
+                "fact",
+                "I prefer to renew my passport online",
+            ),
+        ]);
+        let input = call2(&h, &call1).expect("call 2 runs");
+        let n = neighbour_handle(&input, task);
+        let extracted = reconcile(
+            &h,
+            call1,
+            call2_reply(vec![
+                labelled(&input.claims[0].handle, &[(n.clone(), label)]),
+                labelled(&input.claims[1].handle, &[(n, label)]),
+            ]),
+        );
+
+        assert_eq!(extracted.memories.len(), 2, "{label}: both claims are new");
+        let view = h.service.show_memory("main", &task.to_string()).unwrap();
+        assert!(view.retracted_at.is_none(), "{label}");
+        assert_eq!(view.chain.head, task, "{label}");
+        assert_eq!(view.chain.ended_by, None, "{label}");
+        assert!(
+            h.service.agenda("main").unwrap().listed().contains(&task),
+            "{label}: the renewal is still outstanding"
+        );
+    }
+}
+
 /// Both turns describe the same booking. Only the first supplies dates;
 /// extraction must not treat the second turn's observation-day default as
 /// a newly stated booking date.
