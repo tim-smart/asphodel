@@ -357,3 +357,18 @@ test("an injection where nothing passed says so, without an empty table of what 
   const zero = [...page.root.querySelectorAll("h2, h3")].filter((el) => /^injected\D*\b0\b/i.test(textOf(el)));
   assert.deepEqual(zero, [], "no section counting nothing injected");
 });
+
+test("recall filters left invalid don't stop an injection from running", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: RECALL, token: TOKEN });
+  await findQuery(page.root);
+
+  // Past the recall limit's maximum, and a range that ends before it starts.
+  type(await findField(page.root, /limit/i), "31");
+  await pickDate(page.root, /^from$/i, "2026-10-02");
+  await pickDate(page.root, /^to$/i, "2026-10-01");
+  await chooseMode(page.root, "injection");
+  const body = await explain(daemon, page.root);
+
+  assert.equal(body.mode, "injection");
+});
