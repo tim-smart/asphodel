@@ -1532,6 +1532,84 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     );
 }
 
+/// The line after `heading`'s own line in CLI output: the section's
+/// paragraph, trimmed. A heading may be marked up, as `### Home`.
+fn paragraph_after<'a>(text: &'a str, heading: &str) -> Option<&'a str> {
+    let mut lines = text.lines();
+    lines
+        .by_ref()
+        .find(|line| line.trim().trim_start_matches('#').trim() == heading)?;
+    lines.next().map(str::trim)
+}
+
+#[test]
+fn model_show_and_list_print_a_section_as_a_paragraph() {
+    // The model display reads like the block Hermes sees: a section's
+    // sentences are one paragraph under its heading. Entry ids and what
+    // each entry cites are in the detail view, `--entry`.
+    let first = "Tim lives in Auckland.";
+    let second = "Tim's home is in New Zealand.";
+    let dir = TestDir::new();
+    let mut daemon = Serve::new(&dir)
+        .script(&[
+            json!({"reply": auckland_reply()}),
+            json!({"reply": {"sections": [{"heading": "Home", "sentences": [
+                {"text": first, "cites": ["m1"]},
+                {"text": second, "cites": ["m1"]},
+            ]}]}}),
+        ])
+        .ready();
+    daemon.create_bank("main");
+    daemon.ingest_notes("main", "notes.md");
+    let memory = daemon.wait_for_memory("main");
+    daemon.wait_extracted("main");
+    let refreshed = daemon.ok(daemon.post(
+        "/v1/banks/main/models/User%20profile/refresh?force=true",
+        &Value::Null,
+    ));
+    assert_eq!(refreshed["outcome"], "applied", "{refreshed}");
+    let entries = &daemon.ok(daemon.get("/v1/banks/main/models"))[0]["entries"];
+    let ids: Vec<String> = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids.len(), 2, "{entries}");
+    let paragraph = format!("{first} {second}");
+
+    for command in ["show", "list"] {
+        let mut args = vec!["model", command, "--bank", "main"];
+        if command == "show" {
+            args.push("User profile");
+        }
+        let text = succeeded(run(cli(&daemon).args(&args)));
+        assert_eq!(
+            paragraph_after(&text, "Home"),
+            Some(paragraph.as_str()),
+            "model {command}:\n{text}"
+        );
+        for id in &ids {
+            assert!(!text.contains(id.as_str()), "model {command}:\n{text}");
+        }
+        assert!(!text.contains("cites"), "model {command}:\n{text}");
+    }
+
+    let detail = succeeded(run(cli(&daemon).args([
+        "model",
+        "show",
+        "--bank",
+        "main",
+        "User profile",
+        "--entry",
+        &ids[1],
+    ])));
+    assert!(detail.contains(ids[1].as_str()), "{detail}");
+    assert!(detail.contains(second), "{detail}");
+    assert!(detail.contains(&memory), "{detail}");
+    assert!(!detail.contains(first), "{detail}");
+}
+
 #[test]
 fn a_refresh_held_by_an_extraction_limit_answers_held_over_http_and_the_cli() {
     // A memory is extracted, so the profile has something to refresh; then

@@ -266,15 +266,20 @@ impl Harness {
         Self::build(1.0, "", models)
     }
 
-    fn build(scale: f64, extra: &str, models: Models) -> Self {
-        let tuning = Tuning::from_toml(&format!(
+    /// The floors the fakes need at relevance scale `scale`, then `extra`.
+    fn tuning(scale: f64, extra: &str) -> Tuning {
+        Tuning::from_toml(&format!(
             "[injection.reranker_floors]\n\"{}\" = 1.0\n\
              [ranking.relevance_scales]\n\"{0}\" = {scale:?}\n\
              [reconcile.embedding_floors]\n\"{}\" = 0.5\n{extra}",
             FakeReranker::MODEL_ID,
             FakeEmbedder::MODEL_ID,
         ))
-        .unwrap();
+        .unwrap()
+    }
+
+    fn build(scale: f64, extra: &str, models: Models) -> Self {
+        let tuning = Self::tuning(scale, extra);
         let dir = TestDir::new();
         let clock = Arc::new(SimulatedClock::new(at(START)));
         let store = Store::open(&dir.0, OpenOptions::default(), clock.clone()).unwrap();
@@ -310,12 +315,19 @@ impl Harness {
     /// The daemon restarting: the service and its in-memory state (sessions,
     /// the block cache, pending debounces) go; the store stays.
     fn restart(self) -> Self {
+        let tuning = self.tuning.clone();
+        self.restart_with(tuning)
+    }
+
+    /// [`Harness::restart`] with `tuning` from then on, as an owner editing
+    /// the tuning file does.
+    fn restart_with(self, tuning: Tuning) -> Self {
         let Self {
             service,
             clock,
-            tuning,
             chunk,
             _dir,
+            ..
         } = self;
         drop(service);
         let store = Store::open(&_dir.0, OpenOptions::default(), clock.clone()).unwrap();
@@ -1883,6 +1895,77 @@ fn a_plan_takes_at_most_six_facets() {
     let write = &calls(&llm, WRITE)[0].user;
     assert!(write.contains("Part 6"), "{write}");
     assert!(!write.contains("Part 7"), "{write}");
+}
+
+#[test]
+fn a_lowered_facet_limit_bounds_a_plan_made_before_it() {
+    // The limit applies to the facets a refresh recalls by, not only to a
+    // new plan. A plan stored under the default of six keeps its first two
+    // once the owner lowers the limit to two, without planning again, and
+    // the write and the fingerprint follow the facets recalled.
+    let h = Harness::new();
+    h.service.create_model(BANK, &plans_model()).unwrap();
+    h.insert(event(JAPAN, "2027-01-01T00:00"));
+    let facets: Vec<(String, String)> = (1..=6)
+        .map(|n| {
+            (
+                format!("Part {n}"),
+                format!("Where is Tim going, part {n}?"),
+            )
+        })
+        .collect();
+    let facets: Vec<(&str, &str)> = facets
+        .iter()
+        .map(|(heading, query)| (heading.as_str(), query.as_str()))
+        .collect();
+    h.plan("Plans", &facets);
+    let recalls =
+        |h: &Harness| -> i64 { h.one("SELECT COUNT(*) FROM recalls WHERE kind = 'refresh'", []) };
+    assert_eq!(recalls(&h), 6);
+
+    let h = h.restart_with(Harness::tuning(1.0, "[mental_models]\nmax_facets = 2\n"));
+    let llm = quiet_llm(1);
+    let outcome = h.service.refresh_model(BANK, "Plans", &llm, false).unwrap();
+    assert!(
+        matches!(outcome, Outcome::Applied(_)),
+        "fewer facets is a new input: {outcome:?}"
+    );
+    assert!(
+        calls(&llm, PLAN).is_empty(),
+        "the stored plan was planned again"
+    );
+    assert_eq!(recalls(&h), 6 + 2);
+    let write = &calls(&llm, WRITE)[0].user;
+    assert!(write.contains("Part 2"), "{write}");
+    assert!(!write.contains("Part 3"), "{write}");
+}
+
+#[test]
+fn the_facet_limit_bounds_the_built_in_plan() {
+    let h = Harness::with_tuning("[mental_models]\nmax_facets = 2\n");
+    h.insert(fact(TEA));
+    let llm = quiet_llm(1);
+    let outcome = h
+        .service
+        .refresh_model(BANK, PROFILE_NAME, &llm, true)
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Applied(_)), "{outcome:?}");
+    let recalls: i64 = h.one("SELECT COUNT(*) FROM recalls WHERE kind = 'refresh'", []);
+    assert_eq!(recalls, 2);
+    let write = calls(&llm, WRITE)[0].user.clone();
+    let (_, rest) = write.split_once('\n').unwrap();
+    for heading in ["Preferences", "People"] {
+        assert!(
+            rest.contains(heading),
+            "the write lacks {heading:?}:\n{rest}"
+        );
+    }
+    for heading in ["Work and home", "Platforms", "How to help"] {
+        assert!(
+            !rest.contains(heading),
+            "the write has {heading:?}:\n{rest}"
+        );
+    }
 }
 
 #[test]
