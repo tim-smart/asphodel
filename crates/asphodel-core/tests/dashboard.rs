@@ -286,7 +286,9 @@ impl Harness {
         let handle = &cited.expect("the profile's selection has it").handle;
         let llm = FakeLlm::scripted(
             MODEL,
-            vec![json!({"operations": [{"op": "add", "text": text, "cites": [handle]}]})],
+            vec![json!({"sections": [{"heading": "About Tim", "sentences": [
+                {"text": text, "cites": [handle]},
+            ]}]})],
         );
         let outcome = self.service.refresh_model(BANK, PROFILE_NAME, &llm, true);
         let applied = matches!(outcome, Ok(RefreshOutcome::Applied(_)));

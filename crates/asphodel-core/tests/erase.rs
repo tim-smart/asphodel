@@ -28,7 +28,7 @@ use asphodel_core::extraction::Extracted;
 use asphodel_core::ingest::{Document, Ingested, Outcome, Turn};
 use asphodel_core::inspect::{Gone, MemoryView};
 use asphodel_core::mental_models::{
-    Model, ModelSpec, Outcome as RefreshOutcome, REFRESH_TEMPLATE, RefreshInput,
+    Model, ModelSpec, Outcome as RefreshOutcome, RefreshInput, WRITE_TEMPLATE,
 };
 use asphodel_core::models::{
     FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest, LlmResponse, Models,
@@ -401,7 +401,7 @@ impl Harness {
     fn profile_entry_citing(&self, text: &str, cites: &[Uuid]) {
         let input: RefreshInput = self.service.refresh_input(BANK, PROFILE_NAME).unwrap();
         let handles: Vec<String> = cites.iter().map(|m| handle(&input, *m)).collect();
-        let reply = json!({"operations": [{"op": "add", "text": text, "cites": handles}]});
+        let reply = sections(json!([{"text": text, "cites": handles}]));
         let llm = FakeLlm::scripted(MODEL, vec![reply]);
         let outcome = self.service.refresh_model(BANK, PROFILE_NAME, &llm, true);
         assert!(
@@ -583,6 +583,11 @@ fn query(text: &str) -> RecallRequest {
 
 fn ids(recall: &Recall) -> Vec<Uuid> {
     recall.results.iter().map(|r| r.id).collect()
+}
+
+/// A refresh write reply with `sentences` under one heading.
+fn sections(sentences: Value) -> Value {
+    json!({"sections": [{"heading": "About Tim", "sentences": sentences}]})
 }
 
 fn handle(input: &RefreshInput, memory: Uuid) -> String {
@@ -861,7 +866,7 @@ fn a_model_citing_a_purged_memory_refreshes_once_that_night() {
     h.sweep();
     assert_eq!(h.exist(&[maya]), [false]);
     assert!(h.profile().entries.is_empty());
-    let llm = FakeLlm::scripted(MODEL, vec![json!({"operations": []}); 3]);
+    let llm = FakeLlm::scripted(MODEL, vec![json!({"sections": []}); 3]);
     h.service.run_refreshes(&llm).unwrap();
     for later in [
         minutes(31),
@@ -874,7 +879,7 @@ fn a_model_citing_a_purged_memory_refreshes_once_that_night() {
     }
     let requests = llm.requests().into_iter();
     let refreshes: Vec<_> = requests
-        .filter(|request| request.template.name == REFRESH_TEMPLATE)
+        .filter(|request| request.template.name == WRITE_TEMPLATE)
         .collect();
     assert_eq!(refreshes.len(), 1, "one refresh between two sweeps");
     assert!(refreshes[0].user.contains(TEA));
@@ -1217,11 +1222,10 @@ fn a_refresh_in_flight_drops_an_entry_citing_a_memory_hidden_or_erased_meanwhile
             service: &h.service,
             memory: maya,
             erase,
-            reply: json!({"operations": [
-                {"op": "add", "text": "Tim has a daughter called Maya.",
-                 "cites": [handle(&input, maya)]},
-                {"op": "add", "text": "Tim likes green tea.", "cites": [handle(&input, tea)]},
-            ]}),
+            reply: sections(json!([
+                {"text": "Tim has a daughter called Maya.", "cites": [handle(&input, maya)]},
+                {"text": "Tim likes green tea.", "cites": [handle(&input, tea)]},
+            ])),
         };
         let outcome = h.service.refresh_model(BANK, PROFILE_NAME, &llm, true);
         assert!(

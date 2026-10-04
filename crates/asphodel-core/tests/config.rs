@@ -105,6 +105,8 @@ fn a_full_file_sets_every_value() {
         refresh_debounce_minutes = 10
         refresh_max_delay_minutes = 60
         sweep_time = "03:15"
+        max_facets = 4
+        facet_budget = 15
         input_budget = 50
         input_budget_with_cited = 65
 
@@ -272,6 +274,8 @@ fn out_of_range_values_are_reported_together_by_key() {
         ("clock.quiet_rate", "-0.1"),
         ("clock.quiet_rate", "nan"),
         ("llm.concurrency", "0"),
+        ("mental_models.max_facets", "0"),
+        ("mental_models.facet_budget", "0"),
         ("llm.language", "\"\""),
         ("llm.language", "\"\\t \""),
         ("extraction.guidance", "\"\""),
@@ -518,7 +522,8 @@ fn only_a_fingerprinted_value_pauses_purge_and_the_plan_names_it() {
             .into(),
         "[mental_models]\nbudget = 1200\nprofile_max_tokens = 300\ntrigger_level = \"major\"\n\
          refresh_debounce_minutes = 2\nrefresh_max_delay_minutes = 90\n\
-         sweep_time = \"02:00\"\ninput_budget = 40\ninput_budget_with_cited = 80\n"
+         sweep_time = \"02:00\"\ninput_budget = 40\ninput_budget_with_cited = 80\n\
+         max_facets = 4\nfacet_budget = 10\n"
             .into(),
         "[sessions]\nmapping_expiry_days = 7\n".into(),
         "[llm]\nmodel = \"other-model\"\nendpoint = \"https://other.example/v1\"\n\

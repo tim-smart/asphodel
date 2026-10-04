@@ -1323,16 +1323,35 @@ fn the_cli_reaches_a_tcp_daemon_with_the_token_from_the_environment() {
 
 // Mental models and the system prompt block.
 
-const ENTRY: &str = "Tim lives in Auckland.";
+const ENTRY: &str = "Tim's home is in Auckland.";
+const SECOND: &str = "Tim's home is in New Zealand.";
+
+/// Whether the line after `heading`'s own line in `text` is the section's
+/// paragraph: [`ENTRY`] then [`SECOND`]. A heading may be marked up, as
+/// `### Home`.
+fn paragraph_after(text: &str, heading: &str) -> bool {
+    let mut lines = text.lines();
+    lines
+        .by_ref()
+        .find(|line| line.trim().trim_start_matches('#').trim() == heading);
+    let paragraph = lines.next().unwrap_or_default();
+    paragraph
+        .find(ENTRY)
+        .zip(paragraph.find(SECOND))
+        .is_some_and(|(first, second)| first < second)
+}
 
 #[test]
 fn models_are_created_listed_edited_and_refreshed_over_http() {
-    // The refresh adds one entry citing the first memory in its input.
-    let adds_entry =
-        json!({"operations": [{"op": "add", "entry": null, "text": ENTRY, "cites": ["m1"]}]});
+    // The refresh writes two sentences under "Home", each citing the first
+    // memory in its input.
+    let sentences: Vec<Value> = [ENTRY, SECOND]
+        .map(|text| json!({"text": text, "cites": ["m1"]}))
+        .into();
+    let writes = json!({"sections": [{"heading": "Home", "sentences": sentences}]});
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir)
-        .script(&[auckland(), step(adds_entry, 0)])
+        .script(&[auckland(), step(writes, 0)])
         .ready();
     let memory = daemon.seed_notes();
 
@@ -1377,23 +1396,48 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     let refresh = "/v1/banks/main/models/User%20profile/refresh";
     let refreshed = daemon.post_ok(&format!("{refresh}?force=true"), &Value::Null);
     assert_eq!(refreshed["outcome"], "applied", "{refreshed}");
-    assert_eq!(refreshed["detail"]["added"].as_array().unwrap().len(), 1);
+    assert_eq!(refreshed["detail"]["added"].as_array().unwrap().len(), 2);
     let unchanged = daemon.post_ok(refresh, &Value::Null);
     assert_eq!(unchanged["outcome"], "unchanged", "{unchanged}");
 
     let profile = &daemon.get_ok("/v1/banks/main/models")[0];
     assert_eq!(profile["entries"][0]["text"], ENTRY);
+    assert_eq!(profile["entries"][0]["section"], "Home");
     assert_eq!(profile["entries"][0]["cites"], json!([memory]));
     assert!(profile["last_refreshed_at"].is_string());
+    let shown = daemon.get_ok("/v1/banks/main/models/User%20profile");
+    assert_eq!(shown["entry_views"][0]["section"], "Home", "{shown}");
 
-    // The block holds the entry, and a session's fetch puts the cited
+    // `model show` and `model list` read like the block: the section's
+    // sentences are one paragraph under its heading, without entry ids or
+    // cited memories. `--entry` shows one entry, its id and what it cites.
+    let ids: Vec<&str> = profile["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    let model = ["model", "show", "--bank", "main", "User profile"];
+    let list = ["model", "list", "--bank", "main"];
+    for args in [&model[..], &list[..]] {
+        let text = succeeded(run(cli(&daemon).args(args)));
+        assert!(paragraph_after(&text, "Home"), "{args:?}:\n{text}");
+        for hidden in ids.iter().chain([&memory.as_str()]) {
+            assert!(!text.contains(hidden), "{args:?}:\n{text}");
+        }
+    }
+    let detail = succeeded(run(cli(&daemon).args(model).args(["--entry", ids[1]])));
+    for shown in [ids[1], SECOND, &memory] {
+        assert!(detail.contains(shown), "{detail}");
+    }
+    assert!(!detail.contains(ENTRY), "{detail}");
+
+    // The block holds the section, and a session's fetch puts the cited
     // memory in context, so prefetch doesn't inject it.
     let block = daemon.get_ok("/v1/banks/main/system-prompt?session_id=s1");
     let text = block["text"].as_str().unwrap();
-    assert!(
-        text.contains("User profile") && text.contains(ENTRY),
-        "{text}"
-    );
+    assert!(text.contains("User profile"), "{text}");
+    assert!(paragraph_after(text, "Home"), "{text}");
     assert!(!text.contains("Plans"), "a disabled model was rendered");
     assert_eq!(block["cited"], json!([memory]));
     assert_eq!(

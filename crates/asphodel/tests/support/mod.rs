@@ -207,8 +207,8 @@ pub fn live_script(dir: &TestDir) -> PathBuf {
 }
 
 /// The test manifest with one mental model of its own beside the "User
-/// profile" every bank is seeded with. The seeded profile takes 500 of the
-/// default 800-token budget, so this one stays within the rest.
+/// profile" every bank is seeded with, within the budget the profile
+/// leaves.
 pub fn model_manifest(question: &str) -> String {
     format!(
         "{}\n[[model]]\nname = \"home\"\nquestion = \"{question}\"\nkinds = [\"fact\"]\nmax_tokens = 100\n",
@@ -230,18 +230,22 @@ pub fn imported_with_a_model(dir: &TestDir) -> PathBuf {
     corpus
 }
 
-/// A refresh operation adding one entry that cites `cites`.
-pub fn add_entry(text: &str, cites: &[&str]) -> Value {
-    json!({ "op": "add", "entry": null, "text": text, "cites": cites })
+/// A sentence of a refresh's write, citing memory handles.
+pub fn said(text: &str, cites: &[&str]) -> Value {
+    json!({ "text": text, "cites": cites })
 }
 
-/// A script whose every step answers any call: call 1 reads `claims` and
-/// `used_injected_ids` (the home claim, as [`live_script`]), and a refresh
-/// reads `operations`, which add one entry citing `m1`, the only memory the
-/// history makes.
+/// A refresh's write: the whole summary, one section holding `sentences`.
+pub fn write_reply(sentences: &[Value]) -> Value {
+    json!({ "sections": [{ "heading": "Home", "sentences": sentences }] })
+}
+
+/// A script whose every step answers any call: call 1 with the home claim
+/// (as [`live_script`]), and a refresh's write with one sentence citing
+/// `m1`, the only memory the history makes.
 pub fn universal_script(dir: &TestDir) -> PathBuf {
-    let operations = vec![add_entry("Tim lives in Auckland.", &["m1"])];
-    script_answering_everything(dir, "universal-script", vec![home_claim()], operations)
+    let sentences = vec![said("Tim lives in Auckland.", &["m1"])];
+    script_answering_everything(dir, "universal-script", vec![home_claim()], sentences)
 }
 
 /// The call 1 claim [`live_script`] makes, as JSON.
@@ -260,30 +264,36 @@ pub fn claim(content: &str, quote: &str, kind: &str) -> Value {
     })
 }
 
-/// The reply of [`script_answering_everything`].
-pub fn reply_to_everything(claims: Vec<Value>, operations: Vec<Value>) -> Value {
-    json!({ "claims": claims, "used_injected_ids": [], "operations": operations })
+/// The reply of [`script_answering_everything`]: call 1 reads `claims`, a
+/// refresh's plan reads `facets` (one recalling [`HOME_QUESTION`]) and its
+/// write reads `sections`, one holding `sentences`. No reply type refuses
+/// the others' fields, so the order calls come in doesn't matter.
+pub fn reply_to_everything(claims: Vec<Value>, sentences: Vec<Value>) -> Value {
+    let mut reply = write_reply(&sentences);
+    reply["claims"] = json!(claims);
+    reply["used_injected_ids"] = json!([]);
+    reply["facets"] = json!([{ "heading": "Home", "query": HOME_QUESTION }]);
+    reply
 }
 
 /// [`live_script`] with every step taking `delay_ms` to answer, so a
-/// `live` run measures that latency. The reply also reads as a refresh
-/// with no edits, so the seeded profile's refreshes succeed.
+/// `live` run measures that latency. The reply also reads as a plan and an
+/// empty write, so the seeded profile's refreshes succeed.
 pub fn delayed_script(dir: &TestDir, delay_ms: u64) -> PathBuf {
     let reply = reply_to_everything(vec![home_claim()], vec![]);
     let steps = vec![json!({ "reply": reply, "delay_ms": delay_ms }); 64];
     script_steps(dir, &format!("delayed-script-{delay_ms}"), &steps)
 }
 
-/// A script whose every step answers any call with `claims` and
-/// `operations`. Neither reply type refuses the other's fields, so the
-/// order calls come in doesn't matter.
+/// A script whose every step answers any call with
+/// [`reply_to_everything`].
 pub fn script_answering_everything(
     dir: &TestDir,
     name: &str,
     claims: Vec<Value>,
-    operations: Vec<Value>,
+    sentences: Vec<Value>,
 ) -> PathBuf {
-    script(dir, name, reply_to_everything(claims, operations))
+    script(dir, name, reply_to_everything(claims, sentences))
 }
 
 /// The cassette every real-history run here records to and reads from.

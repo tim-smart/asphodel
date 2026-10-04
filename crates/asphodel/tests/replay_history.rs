@@ -18,11 +18,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::hermes::{self, StateDb, epoch, start};
 use support::{
-    HOME_MEMORY, PASSING_PROBES, Run, TestDir, add_entry, asphodel, assert_ok, assert_refused,
+    HOME_MEMORY, PASSING_PROBES, Run, TestDir, asphodel, assert_ok, assert_refused,
     assert_refused_without, cassette_bytes, cassette_path, cassette_records, claim, home_claim,
     import_history, imported_small_history, imported_with_a_model, live_script, overrides, probe,
-    probe_in, record, replay_history, script_answering_everything, script_steps, simulation,
-    stderr, universal_script, write_cassette,
+    probe_in, record, replay_history, said, script_answering_everything, script_steps, simulation,
+    stderr, universal_script, write_cassette, write_reply,
 };
 
 fn sha(bytes: &[u8]) -> String {
@@ -47,8 +47,10 @@ fn is_call2(record: &Value) -> bool {
     record["template"]["name"] == "reconcile_claims"
 }
 
+/// Whether a record is a refresh's write. A plan is recorded apart, under
+/// `plan_model`, and replays by its key like any other call.
 fn is_refresh(record: &Value) -> bool {
-    record["template"]["name"] == "refresh_model"
+    record["template"]["name"] == "write_model"
 }
 
 // Probe identity and unresolved-memory regressions, through the CLI report.
@@ -217,7 +219,7 @@ fn replay_at_concurrency_five_ends_with_the_memories_of_a_serial_run() {
 
 /// A script whose every step answers any call: call 1 with the home
 /// claim, call 2 labelling it a mention of the one neighbour, and a
-/// refresh with no edits.
+/// refresh writing nothing.
 fn mention_script(dir: &TestDir) -> PathBuf {
     let mut claim = home_claim();
     claim["claim"] = json!("c1");
@@ -511,7 +513,7 @@ fn the_self_test_passes_for_fast_with_zero_misses() {
 
 /// A `fast` run kept to call 1 alone, with `extra` flags: the reranker
 /// gate shut, so nothing is injected and no pair needs a top-up, and
-/// refreshes answered with no edits.
+/// refreshes writing nothing.
 fn fast_call1_only(dir: &TestDir, corpus: &Path, script: Option<&Path>, extra: &[&str]) -> Run {
     let shut = overrides(dir, SHUT_GATE);
     let mut flags = vec!["--overrides", &shut, "--refresh", "off"];
@@ -932,7 +934,7 @@ fn refresh_calls(report: &Value) -> u64 {
         .sum()
 }
 
-/// `--refresh off` answers every refresh with no edits, so `home` stays
+/// `--refresh off` answers every write with nothing, so `home` stays
 /// empty, but triggers are counted by code, so refresh calls per day match
 /// the recording.
 #[test]
@@ -951,13 +953,13 @@ fn fast_refresh_off_makes_no_edits_but_counts_every_trigger() {
 }
 
 /// A copy of refresh `record` `days` later, under a key of its own,
-/// answering `operations`.
-fn refresh_copy(record: &Value, days: i64, operations: &[Value], tag: &str) -> Value {
+/// writing `sentences`.
+fn refresh_copy(record: &Value, days: i64, sentences: &[Value], tag: &str) -> Value {
     let at: jiff::Timestamp = record["at"].as_str().unwrap().parse().unwrap();
     let mut copy = record.clone();
     copy["at"] = Value::from((at + jiff::SignedDuration::from_hours(24 * days)).to_string());
     copy["key"] = Value::from(format!("{}-{tag}", record["key"].as_str().unwrap()));
-    copy["response"]["json"] = json!({ "operations": operations });
+    copy["response"]["json"] = write_reply(sentences);
     copy
 }
 
@@ -991,7 +993,7 @@ fn fast_refresh_recorded_substitutes_the_nearest_recorded_refresh() {
     let (refreshes, others): (Vec<Value>, Vec<Value>) =
         cassette_records(&dir).into_iter().partition(is_refresh);
     assert!(!refreshes.is_empty(), "the recording refreshed");
-    let adds = [add_entry("Tim lives in Auckland.", &["m1"])];
+    let adds = [said("Tim lives in Auckland.", &["m1"])];
     for (near, far, probes) in [
         (&adds[..], &[][..], home_has_home()),
         (&[][..], &adds[..], home_lacks_home()),
@@ -1187,25 +1189,18 @@ fn replay_lag_counts_only_the_records_that_answered() {
 }
 
 const PASSPORT_QUOTE: &str = "I need to renew my passport";
-const LIBRARY_QUOTE: &str = "I work at the library";
 
-/// A history where a passport task (A) is remembered on day 0, the home
-/// fact (B) on day 3 and, with `library`, a library fact (C) on day 7,
-/// imported twice: `home` filtered to facts and tasks (`corpus/both.jsonl`),
-/// and to facts only (`corpus/facts.jsonl`), so A is out of its input. The
-/// chunks are the same in both.
-fn identity_corpora(dir: &TestDir, library: bool) -> (PathBuf, PathBuf) {
+/// A history where a passport task (A) is remembered on day 0 and the home
+/// fact (B) on day 3, imported twice: `home` filtered to facts and tasks
+/// (`corpus/both.jsonl`), and to facts only (`corpus/facts.jsonl`), so A is
+/// out of its input. The chunks are the same in both.
+fn identity_corpora(dir: &TestDir) -> (PathBuf, PathBuf) {
     let state_db = dir.private_path("state.db");
     let db = hermes::one_session(&state_db);
     let t = start();
     db.turn("s1", t, &format!("{PASSPORT_QUOTE} soon."), "Noted.");
     db.home_turn("s1", t + 3.0 * hermes::DAY);
-    if library {
-        let library = format!("{LIBRARY_QUOTE} now.");
-        db.turn("s1", t + 7.0 * hermes::DAY, &library, "Noted.");
-    } else {
-        db.turn("s1", t + 5.0 * hermes::DAY, "Anything else?", "No.");
-    }
+    db.turn("s1", t + 5.0 * hermes::DAY, "Anything else?", "No.");
     drop(db);
     let corpora = [("both", r#"["fact", "task"]"#), ("facts", r#"["fact"]"#)].map(|(name, kinds)| {
         let corpus = dir.private_path(&format!("corpus/{name}.jsonl"));
@@ -1221,35 +1216,32 @@ fn identity_corpora(dir: &TestDir, library: bool) -> (PathBuf, PathBuf) {
     (both, facts)
 }
 
-/// A `live` run of the identity history on `both` with every refresh adding
-/// an entry that cites `m1`; returns the cassette and the ids of A, B and
-/// C (when there is one), resolved by probes.
-fn record_identities(dir: &TestDir, both: &Path, extra: &[&str]) -> (Vec<Value>, [Value; 3]) {
+/// A `live` run of the identity history on `both` with every write
+/// answering one section of two sentences, one citing `m1` and one `m2`;
+/// returns the cassette and the ids of A and B, resolved by probes.
+fn record_identities(dir: &TestDir, both: &Path) -> (Vec<Value>, [Value; 2]) {
     let script = script_answering_everything(
         dir,
         "identity-script",
         vec![
             claim("Tim needs to renew his passport.", PASSPORT_QUOTE, "task"),
             home_claim(),
-            claim("Tim works at the library.", LIBRARY_QUOTE, "fact"),
         ],
-        vec![add_entry("An entry citing m1.", &["m1"])],
+        vec![
+            said("Tim lives in Auckland.", &["m1"]),
+            said("Tim has a passport to renew.", &["m2"]),
+        ],
     );
-    let probes: String = [
-        ("a", 5, "renew his passport"),
-        ("b", 8, "lives in Auckland"),
-        ("c", 12, "works at the library"),
-    ]
-    .map(|(id, day, memory)| probe_on(id, day, "exists", &format!("memory = \"{memory}\"")))
-    .concat();
-    let report = replay_history(dir, both, "live", &probes, Some(&script), extra).report();
-    let ids = ["a", "b", "c"].map(|probe| observed_id(&report, probe));
-    assert!(ids[0].is_string() && ids[1].is_string(), "{report}");
+    let probes = probe_on("a", 5, "exists", "memory = \"renew his passport\"")
+        + &probe_on("b", 8, "exists", HOME_MEMORY);
+    let report = replay_history(dir, both, "live", &probes, Some(&script), &[]).report();
+    let ids = ["a", "b"].map(|probe| observed_id(&report, probe));
+    assert!(ids.iter().all(Value::is_string), "{report}");
     (cassette_records(dir), ids)
 }
 
-/// The handles a refresh record's request used, each with the memory or
-/// entry it stood for, memories first, in handle order.
+/// The handles a write record's request used, each with the memory it
+/// stood for, in handle order.
 fn identities(record: &Value) -> Vec<(String, Value)> {
     let mut pairs: Vec<(String, Value)> = record["identities"]
         .as_array()
@@ -1260,60 +1252,58 @@ fn identities(record: &Value) -> Vec<(String, Value)> {
                 .collect()
         })
         .unwrap_or_default();
-    pairs.sort_by(|a, b| {
-        b.0.starts_with('m')
-            .cmp(&a.0.starts_with('m'))
-            .then(a.0.cmp(&b.0))
-    });
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs
 }
 
-/// Whether `record` is a refresh of `home`: the only model that takes
-/// tasks, so the only one shown the passport task `a`.
-fn is_home_refresh(record: &Value, a: &Value) -> bool {
-    is_refresh(record) && identities(record).iter().any(|(_, id)| id == a)
-}
-
-/// A substituted refresh carries its operations over by what each handle
-/// stood for when recorded, not by the handle's name now: on `both` the
-/// entry recorded citing `m1` cites the passport task it meant, and on
-/// `facts`, where the passport task isn't in `home`'s input, the operation
-/// is dropped even though `m1` names the home fact there.
+/// A substituted write is carried over sentence by sentence, by what each
+/// handle stood for when recorded, not by the handle's name now. A
+/// sentence citing a memory absent from this run is dropped, even though
+/// its handle names another memory now, and the rest of its section is
+/// kept.
 ///
-/// The cassette keeps only `home`'s refresh recorded when the passport
-/// task was its one memory, so `m1` meant A. `home`'s later recorded
-/// refresh had the home fact as `m1`, so a substitution by handle name
-/// would cite B.
+/// The cassette keeps one of `home`'s writes (`home` is the only model
+/// shown the passport task A) and drops the rest:
+/// - the one recorded when A was its one memory, so `m1` meant A and `m2`
+///   nothing. On `both` the sentence citing `m1` cites A, not the home
+///   fact B that `m1` names there now; on `facts`, where A isn't in the
+///   input, no sentence is kept.
+/// - the one recorded with B as `m1` and A as `m2`. On `facts` the
+///   sentence citing A goes and the one citing B is written.
 #[test]
 fn a_substituted_refresh_cites_the_memory_it_was_recorded_with_or_none() {
     let dir = TestDir::new();
-    let (both, facts) = identity_corpora(&dir, false);
-    let (records, [a, b, _]) = record_identities(&dir, &both, &[]);
-    let only_a = records
-        .iter()
-        .find(|record| identities(record) == [("m1".to_string(), a.clone())])
-        .expect("home refreshed when the passport task was its one memory")
-        .clone();
-    assert!(
-        records.iter().any(|record| is_home_refresh(record, &a)
-            && identities(record)[0] == ("m1".into(), b.clone())),
-        "fixture: with both memories, home's m1 is the home fact"
-    );
-    let kept: Vec<Value> = records
-        .into_iter()
-        .filter(|record| !is_home_refresh(record, &a) || *record == only_a)
-        .collect();
-    write_cassette(&dir, &kept);
-
+    let (both, facts) = identity_corpora(&dir);
+    let (records, [a, b]) = record_identities(&dir, &both);
+    let is_home =
+        |record: &Value| is_refresh(record) && identities(record).iter().any(|(_, id)| *id == a);
+    let keep_only = |handles: &[(String, Value)]| {
+        let kept: Vec<Value> = records
+            .iter()
+            .filter(|record| !is_home(record) || identities(record) == handles)
+            .cloned()
+            .collect();
+        assert!(
+            kept.iter().any(is_home),
+            "fixture: home wrote with {handles:?}"
+        );
+        write_cassette(&dir, &kept);
+    };
     let lacks_b = probe_on("p001", 9, "profile_lacks", HOME_IN_HOME);
+    let has_b = probe_on("p001", 9, "profile_has", HOME_IN_HOME);
     let has_a = probe_on(
         "p002",
         9,
         "profile_has",
         "model = \"home\"\nmemory = \"renew his passport\"",
     );
+
+    keep_only(&[("m1".into(), a.clone())]);
     recorded_refreshes(&dir, &both, &format!("{lacks_b}{has_a}"), &[]);
     recorded_refreshes(&dir, &facts, &lacks_b, &[]);
+
+    keep_only(&[("m1".into(), b.clone()), ("m2".into(), a.clone())]);
+    recorded_refreshes(&dir, &facts, &has_b, &[]);
 }
 
 /// Nearest-refresh substitution only considers records of the run's own
@@ -1326,7 +1316,7 @@ fn a_refresh_recorded_under_another_model_is_never_substituted() {
     record_with_models(&dir, &corpus);
     let (refreshes, others): (Vec<Value>, Vec<Value>) =
         cassette_records(&dir).into_iter().partition(is_refresh);
-    let adds = [add_entry("Tim lives in Auckland.", &["m1"])];
+    let adds = [said("Tim lives in Auckland.", &["m1"])];
     // The other model's records go first, so the run's model, which
     // `replay` and `fast` take from the last record, stays the original.
     let mut kept: Vec<Value> = refreshes
@@ -1341,78 +1331,4 @@ fn a_refresh_recorded_under_another_model_is_never_substituted() {
     kept.extend(refreshes.iter().map(|r| refresh_copy(r, 200, &[], "far")));
     write_cassette(&dir, &kept);
     recorded_refreshes(&dir, &corpus, &home_lacks_home(), &[]);
-}
-
-/// A substituted refresh's edit whose recorded entry is absent from this
-/// run is dropped, even though its handle names another entry now.
-///
-/// The identity history with the library fact is recorded on `both`,
-/// where `home`'s refresh after the home fact sees entry A (citing the
-/// passport) as `e1`. The cassette is rewritten so `home` has two
-/// refreshes, both copies of that one and so both recorded with `e1`
-/// meaning A and `m1` the home fact: R_add at its own time, adding an
-/// entry citing `m1`, and R_target at the time of the refresh after the
-/// library fact, answering `target`.
-///
-/// On `facts`, R_add makes entry B citing the home fact, `home`'s only
-/// entry and so `e1`, and R_target then reaches a run where its `e1`
-/// meant A, which never exists, while `e1` names B. B stays in `home`
-/// the day after the library fact, and its text is unchanged.
-#[test]
-fn a_substituted_edit_whose_entry_is_absent_is_dropped() {
-    let until = ["--until", "2026-01-14T09:00:00Z"];
-    let substituted = |target: Vec<Value>| {
-        let dir = TestDir::new();
-        let (both, facts) = identity_corpora(&dir, true);
-        let (records, [a, b, c]) = record_identities(&dir, &both, &until);
-        let homes: Vec<&Value> = records
-            .iter()
-            .filter(|record| is_home_refresh(record, &a))
-            .collect();
-        let after_home = homes
-            .iter()
-            .find(|record| {
-                let handles = identities(record);
-                handles.len() == 3
-                    && handles[..2] == [("m1".into(), b.clone()), ("m2".into(), a.clone())]
-            })
-            .expect("home refreshed with the home fact as m1, the passport and one entry");
-        assert_eq!(
-            identities(after_home)[2].0,
-            "e1",
-            "fixture: the record keeps what e1 meant"
-        );
-        let after_library = homes
-            .iter()
-            .find(|record| identities(record).iter().any(|(_, id)| *id == c))
-            .expect("home refreshed after the library fact");
-
-        let adds = [add_entry("Tim lives in Auckland.", &["m1"])];
-        let r_add = refresh_copy(after_home, 0, &adds, "add");
-        let mut r_target = refresh_copy(after_home, 0, &target, "target");
-        r_target["at"] = after_library["at"].clone();
-        let mut kept: Vec<Value> = records
-            .iter()
-            .filter(|record| !is_home_refresh(record, &a))
-            .cloned()
-            .collect();
-        kept.extend([r_target, r_add]);
-        write_cassette(&dir, &kept);
-
-        let b_remains = probe_on("p001", 13, "profile_has", HOME_IN_HOME);
-        recorded_refreshes(&dir, &facts, &b_remains, &until)["profile_tokens"].clone()
-    };
-
-    let control = substituted(vec![]);
-    assert!(
-        control["p95"].as_u64().is_some_and(|tokens| tokens > 0),
-        "fixture: B renders: {control}"
-    );
-    let edited = substituted(vec![json!({
-        "op": "edit",
-        "entry": "e1",
-        "text": "Tim lives in Auckland, in a tall blue house above the harbour with a view over the whole city and the gulf.",
-        "cites": ["m1"],
-    })]);
-    assert_eq!(edited, control, "B's text is unchanged");
 }

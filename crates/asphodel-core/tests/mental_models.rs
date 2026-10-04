@@ -3,10 +3,13 @@
 //! memories: reading or injecting it never counts as an access.
 //!
 //! These tests drive the service on a `SimulatedClock` and refresh models
-//! with `FakeLlm`. Every memory comes from extraction: the owner says it in
-//! a turn, call 1 (a scripted `FakeLlm`) finds the claim, and call 2's
-//! labels make retractions, endings and refinements. `keep`, `retract`,
-//! `forget` and the owner's model edits do the rest.
+//! with `FakeLlm`, scripted as the calls a refresh makes: a plan, only for
+//! a model whose question has no built-in or stored plan, then a write of
+//! the whole summary as sections of cited sentences. Every memory comes
+//! from extraction: the owner says it in a turn, call 1 (a scripted
+//! `FakeLlm`) finds the claim, and call 2's labels make retractions,
+//! endings and refinements. `keep`, `retract`, `forget` and the owner's
+//! model edits do the rest.
 //!
 //! The API under test is `asphodel_core::mental_models`,
 //! `asphodel_core::agenda`, `asphodel_core::system_prompt` and the
@@ -30,14 +33,14 @@ use asphodel_core::constants::Significance;
 use asphodel_core::ingest::Turn;
 use asphodel_core::inspect::{BankOverview, MemoryView};
 use asphodel_core::mental_models::{
-    Applied, FailureKind, Model, ModelEdit, ModelError, ModelSpec, Outcome, REFRESH_TEMPLATE,
-    RefreshInput, Refreshes, RejectReason,
+    Applied, FailureKind, Model, ModelEdit, ModelError, ModelSpec, Outcome, PLAN_TEMPLATE,
+    RefreshInput, Refreshes, RejectReason, WRITE_TEMPLATE,
 };
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmGate, LlmRequest,
     LlmResponse, ModelError as EmbedError, Models,
 };
-use asphodel_core::operations::{Audit, AuditList};
+use asphodel_core::operations::{Audit, AuditList, RecallRow};
 use asphodel_core::retrieval::{Prefetch, PrefetchRequest, estimate_tokens};
 use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME};
 use asphodel_core::store::{OpenOptions, Store};
@@ -163,6 +166,8 @@ impl Harness {
             refresh_debounce_minutes: 5,
             refresh_max_delay_minutes: 30,
             sweep_time: Time::constant(4, 0, 0, 0),
+            max_facets: 6,
+            facet_budget: 20,
             input_budget: 60,
             input_budget_with_cited: 70,
         };
@@ -330,26 +335,58 @@ impl Harness {
         self.service.refresh_model(BANK, name, llm, force).unwrap()
     }
 
-    /// Forces a refresh of `name` whose reply is `operations` made from its
-    /// input, and returns what it applied.
-    fn refresh_with(
-        &self,
-        name: &str,
-        operations: impl FnOnce(&RefreshInput) -> Vec<Value>,
-    ) -> Applied {
-        let llm = FakeLlm::scripted(MODEL, vec![reply(operations(&self.input(name)))]);
-        match self.refresh(name, &llm, true) {
-            Outcome::Applied(applied) => applied,
-            other => panic!("the refresh didn't apply: {other:?}"),
-        }
+    /// Forces a refresh of `name` whose write is `reply` made from its
+    /// input, and returns what it applied. A model that plans must have its
+    /// plan already ([`Harness::plan`]).
+    fn refresh_with(&self, name: &str, reply: impl FnOnce(&RefreshInput) -> Value) -> Applied {
+        let llm = FakeLlm::scripted(MODEL, vec![reply(&self.input(name))]);
+        applied(self.refresh(name, &llm, true))
     }
 
-    /// As [`Harness::refresh_with`], adding one entry per `(text, cites)`.
-    fn refresh_adding(&self, name: &str, entries: &[(&str, &[Uuid])]) -> Applied {
+    /// As [`Harness::refresh_with`], writing `sections`, each a heading and
+    /// its sentences as `(text, cites)`.
+    fn rewrite(&self, name: &str, sections: &[Section<'_>]) -> Applied {
         self.refresh_with(name, |input| {
-            let add = |(text, cites): &(&str, &[Uuid])| add(text, &handles(input, cites));
-            entries.iter().map(add).collect()
+            let said = |(text, cites): &(&str, &[Uuid])| said(text, &handles(input, cites));
+            let sections = sections
+                .iter()
+                .map(|(heading, sentences)| (*heading, sentences.iter().map(said).collect()));
+            written(sections.collect())
         })
+    }
+
+    /// As [`Harness::rewrite`], with one section, [`SECTION`].
+    fn refresh_adding(&self, name: &str, entries: &[(&str, &[Uuid])]) -> Applied {
+        self.rewrite(name, &[(SECTION, entries)])
+    }
+
+    /// Plans `name` with one facet per `(heading, query)`: a forced refresh
+    /// whose plan call returns them and whose write, if there's anything to
+    /// write from, is empty. Returns the plan request.
+    fn plan(&self, name: &str, facets: &[(&str, &str)]) -> LlmRequest {
+        let llm = FakeLlm::scripted(MODEL, vec![planned(facets), written(vec![])]);
+        applied(self.refresh(name, &llm, true));
+        calls(&llm, PLAN_TEMPLATE)
+            .pop()
+            .expect("the refresh planned")
+    }
+
+    /// Gives `name` `question`, planned as `facets`.
+    fn ask(&self, name: &str, question: &str, facets: &[(&str, &str)]) {
+        self.edit(name, json!({"question": question})).unwrap();
+        self.plan(name, facets);
+    }
+
+    /// The recall log's `refresh` rows, newest first.
+    fn refresh_recalls(&self) -> Vec<RecallRow> {
+        let audit = self.service.audit(BANK, AuditList::Recalls, None).unwrap();
+        let Audit::Recalls { recalls } = audit else {
+            panic!("recalls");
+        };
+        recalls
+            .into_iter()
+            .filter(|r| r.kind == "refresh")
+            .collect()
     }
 
     fn profile_adding(&self, entries: &[(&str, &[Uuid])]) -> Applied {
@@ -566,27 +603,65 @@ impl With for Value {
     }
 }
 
-// The refresh reply.
+// The refresh replies.
 
-fn reply(operations: Vec<Value>) -> Value {
-    json!({"operations": operations})
+/// The section [`Harness::refresh_adding`] writes its sentences under.
+const SECTION: &str = "About Tim";
+
+/// A section of a scripted write: its heading, and each sentence's text
+/// with the memories it cites.
+type Section<'a> = (&'a str, &'a [(&'a str, &'a [Uuid])]);
+
+/// A plan: one facet per `(heading, query)`.
+fn planned(facets: &[(&str, &str)]) -> Value {
+    let facets = facets
+        .iter()
+        .map(|(h, q)| json!({"heading": h, "query": q}));
+    json!({"facets": facets.collect::<Vec<_>>()})
 }
 
-fn add(text: &str, cites: &[String]) -> Value {
-    json!({"op": "add", "text": text, "cites": cites})
+/// A write: the whole summary, one section per `(heading, sentences)`.
+fn written(sections: Vec<(&str, Vec<Value>)>) -> Value {
+    let sections = sections
+        .into_iter()
+        .map(|(heading, sentences)| json!({"heading": heading, "sentences": sentences}));
+    json!({"sections": sections.collect::<Vec<_>>()})
 }
 
-fn edit(entry: &str, text: &str, cites: &[String]) -> Value {
-    json!({"op": "edit", "entry": entry, "text": text, "cites": cites})
+/// A sentence of a write, citing memory handles.
+fn said(text: &str, cites: &[String]) -> Value {
+    json!({"text": text, "cites": cites})
 }
 
-fn remove(entry: &str) -> Value {
-    json!({"op": "remove", "entry": entry})
+fn applied(outcome: Outcome) -> Applied {
+    match outcome {
+        Outcome::Applied(applied) => applied,
+        other => panic!("the refresh didn't apply: {other:?}"),
+    }
 }
 
-/// An LLM that answers every refresh with no operations.
+/// An LLM that answers every write with an empty summary.
 fn quiet_llm(calls: usize) -> FakeLlm {
-    FakeLlm::scripted(MODEL, vec![reply(vec![]); calls])
+    FakeLlm::scripted(MODEL, vec![written(vec![]); calls])
+}
+
+/// The requests `llm` was sent with `template`, in order.
+fn calls(llm: &FakeLlm, template: &str) -> Vec<LlmRequest> {
+    let requests = llm.requests().into_iter();
+    requests.filter(|r| r.template.name == template).collect()
+}
+
+fn writes(llm: &FakeLlm) -> usize {
+    calls(llm, WRITE_TEMPLATE).len()
+}
+
+/// The line after `heading`'s own line in a rendered block: the section's
+/// paragraph. A heading may be marked up, as `### People`.
+fn paragraph<'a>(text: &'a str, heading: &str) -> Option<&'a str> {
+    let mut lines = text.lines();
+    let heading_line = |line: &&str| line.trim_start_matches('#').trim() == heading;
+    lines.by_ref().find(heading_line)?;
+    lines.next()
 }
 
 fn handle(input: &RefreshInput, memory: Uuid) -> String {
@@ -603,29 +678,12 @@ fn handles(input: &RefreshInput, memories: &[Uuid]) -> Vec<String> {
     memories.iter().map(|m| handle(input, *m)).collect()
 }
 
-fn entry_handle(input: &RefreshInput, entry: Uuid) -> String {
-    input
-        .entries
-        .iter()
-        .find(|e| e.entry == entry)
-        .unwrap_or_else(|| panic!("{entry} is in the refresh input"))
-        .handle
-        .clone()
-}
-
 fn inputs(input: &RefreshInput) -> BTreeSet<Uuid> {
     input.memories.iter().map(|m| m.memory).collect()
 }
 
 fn texts(model: &Model) -> Vec<&str> {
     model.entries.iter().map(|e| e.text.as_str()).collect()
-}
-
-fn refresh_calls(llm: &FakeLlm) -> usize {
-    llm.requests()
-        .iter()
-        .filter(|r| r.template.name == REFRESH_TEMPLATE)
-        .count()
 }
 
 fn plans_model(max_tokens: u32) -> ModelSpec {
@@ -652,7 +710,7 @@ fn a_notable_memory_triggers_a_refresh_five_minutes_later_and_at_most_every_thir
     let llm = quiet_llm(2);
     let early = h.tick(&llm);
     assert!(early.ran.is_empty());
-    assert_eq!(refresh_calls(&llm), 0);
+    assert_eq!(writes(&llm), 0);
     assert_eq!(early.next_due, Some(said + minutes(5)));
 
     let refreshed = said + minutes(5);
@@ -660,7 +718,7 @@ fn a_notable_memory_triggers_a_refresh_five_minutes_later_and_at_most_every_thir
     let ran = h.tick(&llm);
     assert_eq!(ran.ran.len(), 1);
     assert_eq!(ran.ran[0].model, PROFILE_NAME);
-    assert_eq!(refresh_calls(&llm), 1);
+    assert_eq!(writes(&llm), 1);
     assert_eq!(h.profile().last_refreshed_at, Some(refreshed));
 
     // The debounce alone would run the next one at +6 minutes.
@@ -672,7 +730,7 @@ fn a_notable_memory_triggers_a_refresh_five_minutes_later_and_at_most_every_thir
     assert_eq!(waiting.next_due, Some(refreshed + minutes(30)));
     h.set(refreshed + minutes(30));
     assert_eq!(h.tick(&llm).ran.len(), 1);
-    assert_eq!(refresh_calls(&llm), 2);
+    assert_eq!(writes(&llm), 2);
 }
 
 #[test]
@@ -704,7 +762,7 @@ fn each_trigger_pushes_the_refresh_back_but_never_past_thirty_minutes() {
     assert!(h.tick(&llm).ran.is_empty());
     h.set(first + minutes(30));
     assert_eq!(h.tick(&llm).ran.len(), 1);
-    assert_eq!(refresh_calls(&llm), 1);
+    assert_eq!(writes(&llm), 1);
 }
 
 #[test]
@@ -723,7 +781,7 @@ fn a_memory_below_the_trigger_level_waits_for_the_daily_sweep() {
     // The sweep lets minor additions in.
     h.set(at(SWEEP));
     assert_eq!(h.tick(&llm).ran.len(), 1);
-    assert_eq!(refresh_calls(&llm), 1);
+    assert_eq!(writes(&llm), 1);
     assert!(llm.requests()[0].user.contains(TEA));
     // The next one is 04:00 the next local day.
     let next = h.tick(&llm).next_due;
@@ -747,7 +805,7 @@ fn a_memory_the_models_filters_leave_out_triggers_nothing() {
 #[test]
 fn an_owner_edit_triggers_a_refresh_that_isnt_skipped() {
     // The question and the size are part of what a refresh compares, so the
-    // same memories still get an LLM call.
+    // same memories still get an LLM call. A new question is planned first.
     let h = Harness::new();
     h.seed(fact(TEA));
     h.profile_adding(&[]);
@@ -755,15 +813,18 @@ fn an_owner_edit_triggers_a_refresh_that_isnt_skipped() {
     h.edit(PROFILE_NAME, json!({"question": question})).unwrap();
 
     h.advance(minutes(30));
-    let llm = quiet_llm(1);
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![planned(&[("Drinks", question)]), written(vec![])],
+    );
     let ran = h.tick(&llm);
     assert_eq!(ran.ran.len(), 1);
     assert!(matches!(ran.ran[0].outcome, Outcome::Applied(_)));
-    assert!(llm.requests()[0].user.contains(question));
+    assert!(calls(&llm, PLAN_TEMPLATE)[0].user.contains(question));
+    assert_eq!(writes(&llm), 1);
 
     h.edit(PROFILE_NAME, json!({"max_tokens": 400})).unwrap();
-    let resized = h.refresh(PROFILE_NAME, &quiet_llm(1), false);
-    assert!(matches!(resized, Outcome::Applied(_)));
+    applied(h.refresh(PROFILE_NAME, &quiet_llm(1), false));
 }
 
 #[test]
@@ -816,7 +877,7 @@ fn a_refresh_held_by_the_gate_waits_for_the_hold_not_thirty_minutes() {
         let h = Harness::new();
         h.says(fact(TEA));
         h.advance(minutes(5));
-        let script = json!([limit, {"reply": reply(vec![])}]).to_string();
+        let script = json!([limit, {"reply": written(vec![])}]).to_string();
         let inner = Arc::new(FakeLlm::from_script(MODEL, &script).unwrap());
         let gate = LlmGate::new(inner.clone(), 1, h.clock.clone());
         let hello = turn("gated", h.now(), "Hello.");
@@ -836,7 +897,7 @@ fn a_refresh_held_by_the_gate_waits_for_the_hold_not_thirty_minutes() {
         h.set(lifts);
         let ran = h.tick(&gate);
         assert_eq!(ran.ran.len(), 1, "{limit}");
-        assert_eq!(refresh_calls(&inner), 1, "{limit}");
+        assert_eq!(writes(&inner), 1, "{limit}");
         assert_eq!(h.profile().last_refreshed_at, Some(lifts), "{limit}");
     }
 }
@@ -851,7 +912,7 @@ fn a_disabled_model_is_never_refreshed() {
     assert!(h.tick(&llm).ran.is_empty());
     h.set(at(SWEEP));
     assert!(h.tick(&llm).ran.is_empty());
-    assert_eq!(refresh_calls(&llm), 0);
+    assert_eq!(writes(&llm), 0);
 }
 
 #[test]
@@ -1027,12 +1088,9 @@ fn a_custom_profile_selects_and_refreshes_on_weekly_memories() {
         let h = Harness::new();
         let tea = h.seed(fact("Alex likes green tea."));
         let question = "What are Alex's recurring activities?";
-        let change = json!({"question": question, "kinds": kinds});
-        h.edit(PROFILE_NAME, change).unwrap();
-        // Run the refresh the edit asked for, then leave the minimum refresh
-        // interval behind.
-        h.advance(minutes(30));
-        h.tick(&quiet_llm(1));
+        h.edit(PROFILE_NAME, json!({"kinds": kinds})).unwrap();
+        h.ask(PROFILE_NAME, question, &[("Activities", question)]);
+        // Leave the minimum refresh interval behind.
         h.advance(minutes(30));
         let llm = quiet_llm(1);
         assert!(h.tick(&llm).ran.is_empty());
@@ -1055,12 +1113,13 @@ fn a_cited_memory_stays_in_the_input_past_the_input_budget() {
     // Keeping cited memories stops one that slips from 3rd to 4th from
     // being removed and added back on alternate refreshes.
     let h = Harness::with(|t| {
+        t.mental_models.facet_budget = 3;
         t.mental_models.input_budget = 3;
         t.mental_models.input_budget_with_cited = 4;
     });
-    // No word in common with the question, like the facts below, so it
-    // ranks below every one of them on strength alone.
-    let weak = h.seed(fact("Tim's cat Miso sleeps."));
+    // No word in common with any facet, like the facts below, so it ranks
+    // below every one of them on strength alone.
+    let weak = h.seed(fact("Miso sleeps."));
     h.profile_adding(&[(CAT_ENTRY, &[weak])]);
     let strong = (1..=5).map(|n| fact(&format!("Fact {n}.")).level("critical"));
     h.seed_all(BANK, h.now(), strong.collect());
@@ -1072,15 +1131,18 @@ fn a_cited_memory_stays_in_the_input_past_the_input_budget() {
 #[test]
 fn the_relevance_scale_leaves_the_strength_term_alone_in_a_refresh() {
     // With room for one memory: a weak one sharing five words with the
-    // profile question, against a strong one sharing none. At scale 1.0 the
-    // shared words outweigh w_s_inject·strength; at 100.0 strength decides,
-    // unless it were scaled too.
+    // question, against a strong one sharing none. At scale 1.0 the shared
+    // words outweigh w_s_inject·strength; at 100.0 strength decides, unless
+    // it were scaled too.
     let selected = |scale: f64| {
         let h = Harness::with(|t| {
             set_scale(t, scale);
+            t.mental_models.facet_budget = 1;
             t.mental_models.input_budget = 1;
             t.mental_models.input_budget_with_cited = 1;
         });
+        let question = "Who is the user: their work and home?";
+        h.ask(PROFILE_NAME, question, &[("Answer", question)]);
         let weak = h.seed(fact("The user likes work and home life.").level("trivial"));
         let strong = h.says(fact("Tim cooks dinner.").level("critical"));
         (inputs(&h.input(PROFILE_NAME)), weak, strong)
@@ -1098,7 +1160,7 @@ fn an_unchanged_selection_skips_the_llm_and_force_doesnt() {
     h.profile_adding(&[(TEA, &[tea])]);
     let refresh = |force| {
         let llm = quiet_llm(1);
-        (h.refresh(PROFILE_NAME, &llm, force), refresh_calls(&llm))
+        (h.refresh(PROFILE_NAME, &llm, force), writes(&llm))
     };
     assert_eq!(refresh(false), (Outcome::Unchanged, 0));
     // A memory outside the filters leaves the selection as it was.
@@ -1127,9 +1189,14 @@ fn a_faded_memory_leaves_the_model_at_the_next_sweep() {
     let input = inputs(&h.input(PROFILE_NAME));
     assert!(!input.contains(&tea) && input.contains(&cat), "{input:?}");
 
-    // Even a reply that leaves the entry alone loses it.
+    // The write is never shown the faded memory or the entry citing it, so
+    // it can't keep them.
     h.set(at(SWEEP));
-    let llm = quiet_llm(1);
+    let input = h.input(PROFILE_NAME);
+    let shown: Vec<Uuid> = input.entries.iter().map(|e| e.entry).collect();
+    assert_eq!(shown, [applied.added[0]]);
+    let cat_entry = said(CAT_ENTRY, &handles(&input, &[cat]));
+    let llm = FakeLlm::scripted(MODEL, vec![written(vec![(SECTION, vec![cat_entry])])]);
     let ran = h.tick(&llm);
     assert_eq!(ran.ran.len(), 1);
     let Outcome::Applied(applied) = &ran.ran[0].outcome else {
@@ -1158,72 +1225,320 @@ fn refreshing_and_building_the_block_write_nothing_but_the_refreshs_recall_log()
     h.agenda();
     assert_eq!(state(&h), before);
 
-    let Audit::Recalls { recalls } = h.service.audit(BANK, AuditList::Recalls, None).unwrap()
-    else {
-        panic!("recalls");
-    };
-    let refreshes: Vec<_> = recalls.iter().filter(|r| r.kind == "refresh").collect();
-    assert_eq!(refreshes.len(), 1, "{recalls:?}");
-    assert_eq!(refreshes[0].session_id, None);
+    // One retrieval per facet, each logged with its query and no session.
+    let facets = h.input(PROFILE_NAME).facets;
+    let recalls = h.refresh_recalls();
+    assert_eq!(recalls.len(), facets.len(), "{recalls:?}");
+    assert!(
+        recalls.iter().all(|r| r.session_id.is_none()),
+        "{recalls:?}"
+    );
+    let queries: BTreeSet<_> = recalls.into_iter().filter_map(|r| r.query).collect();
+    assert_eq!(queries, facets.into_iter().map(|f| f.query).collect());
 }
 
-// Entries and edits
+// Planning and per-facet recall. A refresh asks one narrow question per
+// facet instead of one compound question: a plan names the facets, each is
+// one retrieval, and one write turns what they found into the summary.
 
 #[test]
-fn untouched_entries_are_copied_byte_for_byte_and_edits_keep_their_id() {
+fn the_facet_limit_bounds_built_in_and_stored_plans_without_planning_again() {
+    // The seeded profile ships its plan, so it costs no plan call and
+    // replays exactly. Any plan keeps its first `max_facets` facets, and a
+    // lowered limit bounds a plan stored before it.
+    let mut h = Harness::with(|t| t.mental_models.max_facets = 3);
+    h.seed(fact(TEA));
+    h.seed(event(JAPAN, "2027-01-01"));
+    let llm = quiet_llm(1);
+    applied(h.refresh(PROFILE_NAME, &llm, true));
+    assert!(calls(&llm, PLAN_TEMPLATE).is_empty());
+    let profile = h.input(PROFILE_NAME).facets;
+    assert!(profile.len() <= 3, "{profile:?}");
+    let write = &calls(&llm, WRITE_TEMPLATE)[0].user;
+    for facet in &profile {
+        assert!(write.contains(&facet.heading), "{write}");
+    }
+    h.service.create_model(BANK, &plans_model(100)).unwrap();
+    let parts: Vec<_> = (1..=5)
+        .map(|n| (format!("Part {n}"), format!("Trip part {n}?")))
+        .collect();
+    let parts: Vec<_> = parts
+        .iter()
+        .map(|(h, q)| (h.as_str(), q.as_str()))
+        .collect();
+    h.plan("Plans", &parts);
+    let headings = |h: &Harness, name| h.input(name).facets.into_iter().map(|f| f.heading);
+    assert_eq!(
+        headings(&h, "Plans").collect::<Vec<_>>(),
+        ["Part 1", "Part 2", "Part 3"]
+    );
+
+    h.tuning.mental_models.max_facets = 2;
+    let h = h.restart();
+    assert_eq!(h.input(PROFILE_NAME).facets, profile[..2]);
+    let recalled = h.refresh_recalls().len();
+    let llm = quiet_llm(1);
+    applied(h.refresh("Plans", &llm, false)); // fewer facets, a new input
+    assert!(calls(&llm, PLAN_TEMPLATE).is_empty(), "planned again");
+    assert_eq!(h.refresh_recalls().len(), recalled + 2);
+    let write = &calls(&llm, WRITE_TEMPLATE)[0].user;
+    assert!(
+        write.contains("Part 2") && !write.contains("Part 3"),
+        "{write}"
+    );
+}
+
+#[test]
+fn a_question_is_planned_once_from_itself_and_the_language_alone() {
+    // The plan is stored before the facets are recalled, so a failed write
+    // doesn't pay for it again, and it's kept across a restart until the
+    // question changes. Its request holds nothing that changes between
+    // runs or stores, such as the memories or the entries, so the cassette
+    // answers it by key.
     let h = Harness::new();
-    let tea = h.seed(fact(TEA));
-    let cat = h.seed(fact(CAT));
-    let bees = h.seed(fact("Tim keeps bees."));
-    let applied = h.profile_adding(&[
-        (TEA, &[tea]),
-        ("Tim has a cat  called Miso.\u{00a0}", &[cat]),
-        ("Tim keeps bees.", &[bees]),
-    ]);
-    let [tea_entry, cat_entry, bees_entry] = applied.added[..] else {
-        panic!("three adds");
+    h.service.create_model(BANK, &plans_model(100)).unwrap();
+    let japan = h.seed(event(JAPAN, "2027-01-01"));
+    let trips = [
+        ("Trips", "Where is Tim going?"),
+        ("Dates", "When is Tim going away?"),
+    ];
+    let llm = FakeLlm::scripted(MODEL, vec![planned(&trips)]);
+    let failed = Outcome::Failed(FailureKind::Llm);
+    assert_eq!(h.refresh("Plans", &llm, true), failed, "the write fails");
+    let first = calls(&llm, PLAN_TEMPLATE).pop().unwrap();
+    let question = plans_model(100).question;
+    assert!(first.user.contains(&question), "{}", first.user);
+    // Each facet's query is a retrieval of its own.
+    let queries: BTreeSet<_> = h.refresh_recalls().into_iter().map(|r| r.query).collect();
+    assert_eq!(queries, trips.map(|(_, q)| Some(q.to_owned())).into());
+
+    let h = h.restart();
+    let llm = quiet_llm(1);
+    applied(h.refresh("Plans", &llm, true));
+    assert_eq!((calls(&llm, PLAN_TEMPLATE).len(), writes(&llm)), (0, 1));
+
+    // Another question is planned, then the first again once the store
+    // holds an entry.
+    let countries = "Which countries is Tim visiting?";
+    h.ask("Plans", countries, &[("Countries", countries)]);
+    let entry = ("Tim is going to Japan next year.", &[japan][..]);
+    h.rewrite("Plans", &[("Countries", &[entry])]);
+    h.edit("Plans", json!({"question": question})).unwrap();
+    let again = h.plan("Plans", &trips);
+    let request = |r: &LlmRequest| (r.system.clone(), r.user.clone(), r.schema.clone());
+    assert_eq!(request(&again), request(&first));
+
+    // The language is the other thing it holds.
+    let english = Harness::with(|t| t.llm.language = Some("English".into()));
+    english
+        .service
+        .create_model(BANK, &plans_model(100))
+        .unwrap();
+    let request = english.plan("Plans", &trips);
+    assert!((request.system + &request.user).contains("English"));
+}
+
+#[test]
+fn a_date_lost_under_a_compound_question_is_found_through_its_facet() {
+    // Recalled as one question, food and drink memories sharing five words
+    // with it outrank an anniversary sharing two. Asked on its own, the
+    // dates facet finds the anniversary. It still has to pass the profile's
+    // filters: a dinner, an event, is left out however well it matches.
+    let h = Harness::with(|t| {
+        t.mental_models.facet_budget = 5;
+        t.mental_models.input_budget = 20;
+        t.mental_models.input_budget_with_cited = 20;
+    });
+    let question = "What does Tim like to drink and eat, and which dates matter to him?";
+    h.edit(PROFILE_NAME, json!({"question": question})).unwrap();
+    let rule = Some("FREQ=YEARLY;BYMONTH=6;BYMONTHDAY=12");
+    let anniversary = "Tim and Sam's wedding anniversary is on 12 June.";
+    let dinner = "Tim and Sam have a wedding anniversary dinner booked on 12 June 2027.";
+    let mut claims = vec![
+        recurring(anniversary, rule, "2026-06-12"),
+        event(dinner, "2027-06-12"),
+    ];
+    let dish = |n| fact(&format!("Tim likes to drink and eat dish {n}.")).level("critical");
+    claims.extend((1..=8).map(dish));
+    let memories = h.seed_all(BANK, at(EARLIER), claims);
+    let (anniversary, dinner) = (memories[0], memories[1]);
+    // Until it's planned, the input shows the question recalled whole.
+    assert!(!inputs(&h.input(PROFILE_NAME)).contains(&anniversary));
+
+    let dates = "Which wedding anniversary and birthday dates matter to Tim?";
+    let food = "What does Tim like to drink and eat?";
+    h.plan(PROFILE_NAME, &[("Food and drink", food), ("Dates", dates)]);
+    let input = h.input(PROFILE_NAME);
+    let selected = inputs(&input);
+    assert!(selected.contains(&anniversary) && !selected.contains(&dinner));
+    // Each facet takes its best five, and a memory both find is listed once.
+    assert!(input.memories.len() <= 10, "{}", input.memories.len());
+    assert_eq!(selected.len(), input.memories.len());
+}
+
+#[test]
+fn the_total_goes_round_the_facets_instead_of_taking_the_best_scores() {
+    // Reranker logits for different queries aren't comparable. Every match
+    // for the first facet here outscores every match for the second, and
+    // the second still gets its share: the total takes each facet's next
+    // best in turn.
+    let h = Harness::with(|t| {
+        t.mental_models.facet_budget = 3;
+        t.mental_models.input_budget = 4;
+        t.mental_models.input_budget_with_cited = 4;
+    });
+    let garden = ModelSpec {
+        name: "Garden".into(),
+        question: "What does Tim grow and keep?".into(),
+        kinds: vec![Kind::Fact],
+        ..plans_model(100)
+    };
+    h.service.create_model(BANK, &garden).unwrap();
+    let beds = "Which tomatoes, basil, chillies and garlic does Tim grow?";
+    h.plan("Garden", &[("Beds", beds), ("Hives", "bees")]);
+    let levels = [("one", "critical"), ("two", "major"), ("three", "notable")];
+    let claims = levels.into_iter().flat_map(|(bed, level)| {
+        let grows = format!("Tim grows tomatoes, basil, chillies and garlic in bed {bed}.");
+        [fact(&grows), fact(&format!("Hive {bed} has bees."))].map(|c| c.level(level))
+    });
+    let m = h.seed_all(BANK, at(EARLIER), claims.collect());
+    let expected = BTreeSet::from([m[0], m[1], m[2], m[3]]);
+    assert_eq!(inputs(&h.input("Garden")), expected);
+}
+
+#[test]
+fn a_changed_question_rewrites_the_summary_even_with_the_same_facets() {
+    // The question is compared with the plan. Here the new question plans
+    // the same facet and selects the same memories, and the refresh still
+    // isn't skipped: the write is shown the previous summary, and what it
+    // leaves out goes.
+    let h = Harness::new();
+    let question = mornings(&h, 100);
+    let drinks = ["tea", "coffee", "juice"];
+    let drinks = drinks.map(|d| fact(&format!("Tim drinks {d} in the morning.")));
+    let m = h.seed_all(BANK, at(EARLIER), drinks.into());
+    let wording = [
+        "Tim has tea first thing.",
+        "Tim has coffee too.",
+        "Tim has juice.",
+    ];
+    let sentences = [0, 1, 2].map(|n| (wording[n], std::slice::from_ref(&m[n])));
+    let first = h.rewrite("Mornings", &[("Drinks", &sentences)]);
+    let input = h.input("Mornings");
+
+    let breakfast = "What does Tim have with breakfast?";
+    h.edit("Mornings", json!({"question": breakfast})).unwrap();
+    let keep = |n: usize| said(wording[n], &handles(&input, &[m[n]]));
+    let write = written(vec![("Drinks", vec![keep(0), keep(1)])]);
+    let llm = FakeLlm::scripted(MODEL, vec![planned(&[("Drinks", question)]), write]);
+    let rewritten = applied(h.refresh("Mornings", &llm, false));
+    assert_eq!(rewritten.removed, [first.added[2]]);
+    assert_eq!(texts(&h.model("Mornings")), wording[..2]);
+    let write = &calls(&llm, WRITE_TEMPLATE)[0].user;
+    assert!(write.contains(wording[2]), "{write}");
+}
+
+// The written summary
+
+#[test]
+fn a_write_keeps_ids_for_matching_text_or_citations_and_replaces_the_rest() {
+    // Every write restates the whole summary. A sentence whose text matches
+    // an entry keeps that entry's id, but never its citations or section:
+    // those come from the write. One citing exactly what an entry cited, in
+    // new words, keeps the id as an edit. Anything else is added, and an
+    // entry the write leaves out is removed.
+    let h = Harness::new();
+    let claims = [
+        TEA,
+        "Tim walks to work.",
+        CAT,
+        "Tim still has Miso.",
+        "Tim keeps bees.",
+        MAYA,
+    ];
+    let m = h.seed_all(BANK, at(EARLIER), claims.map(fact).into());
+    let [tea, walk, cat, still, bees, maya] = m[..] else {
+        unreachable!()
+    };
+    let first = h.rewrite(
+        PROFILE_NAME,
+        &[
+            (
+                "Preferences",
+                &[(TEA, &[tea]), ("Tim walks to work.", &[walk])],
+            ),
+            (
+                "People",
+                &[(CAT_ENTRY, &[cat]), ("Tim keeps bees.", &[bees])],
+            ),
+        ],
+    );
+    let [tea_entry, walk_entry, cat_entry, bees_entry] = first.added[..] else {
+        panic!("four adds: {first:?}");
     };
     let before = h.profile();
 
-    let morning = "Tim drinks green tea every morning.";
-    let applied = h.refresh_with(PROFILE_NAME, |input| {
-        let (entry, cites) = (entry_handle(input, tea_entry), handles(input, &[tea]));
-        let bees = entry_handle(input, bees_entry);
-        vec![edit(&entry, morning, &cites), remove(&bees)]
-    });
-    assert_eq!(applied.edited, vec![tea_entry]);
-    assert_eq!(applied.removed, vec![bees_entry]);
-
+    let hives = "Tim keeps two hives of bees.";
+    let second = h.rewrite(
+        PROFILE_NAME,
+        &[
+            ("Preferences", &[(TEA, &[tea])]),
+            ("Pets", &[(CAT_ENTRY, &[still]), (hives, &[bees])]),
+            ("People", &[(MAYA, &[maya])]),
+        ],
+    );
+    assert_eq!(second.edited, vec![cat_entry, bees_entry]);
+    assert_eq!(second.removed, vec![walk_entry]);
+    let [maya_entry] = second.added[..] else {
+        panic!("one add: {second:?}");
+    };
     let after = h.profile();
-    assert_eq!(after.entries.len(), 2);
-    assert_eq!(after.entries[0].id, tea_entry);
-    assert_eq!(after.entries[0].text, morning);
-    let untouched = after.entries.iter().find(|e| e.id == cat_entry).unwrap();
-    assert_eq!(untouched, &before.entries[1], "the untouched entry changed");
+    let entries = after.entries.iter().map(|e| {
+        (
+            e.id,
+            e.section.as_deref(),
+            e.text.as_str(),
+            e.cites.as_slice(),
+        )
+    });
+    assert_eq!(
+        entries.collect::<Vec<_>>(),
+        [
+            (tea_entry, Some("Preferences"), TEA, &[tea][..]),
+            (cat_entry, Some("Pets"), CAT_ENTRY, &[still][..]),
+            (bees_entry, Some("Pets"), hives, &[bees][..]),
+            (maya_entry, Some("People"), MAYA, &[maya][..]),
+        ]
+    );
+    assert_eq!(
+        after.entries[0], before.entries[0],
+        "the restated entry changed"
+    );
 }
 
 #[test]
-fn invalid_operations_are_rejected_and_the_rest_apply() {
-    // Code refuses an entry whose citations aren't in the refresh's input,
-    // an entry that cites nothing, and an edit or remove of an entry that
-    // doesn't exist.
+fn unsupported_sentences_are_rejected_and_the_rest_are_written() {
+    // Code refuses a sentence citing outside the refresh's input, citing
+    // nothing, or with no text, by its index in the reply counted across
+    // its sections.
     let h = Harness::new();
     let tea = h.seed(fact(TEA));
     let outside = h.seed(event("Tim went surfing in Raglan.", "2026-09-01"));
-    let applied = h.profile_adding(&[(TEA, &[tea])]);
+    h.profile_adding(&[(TEA, &[tea])]);
     assert!(!inputs(&h.input(PROFILE_NAME)).contains(&outside));
     let applied = h.refresh_with(PROFILE_NAME, |input| {
-        let (tea, entry) = (handle(input, tea), entry_handle(input, applied.added[0]));
-        vec![
-            add("Tim surfs.", &["m99".into()]),
-            add("Tim surfs in Raglan.", &[outside.to_string()]),
-            add("Tim likes tea and surfing.", &[tea.clone(), "m99".into()]),
-            edit(&entry, "Tim likes tea.", &[]),
-            add("Tim is lovely.", &[]),
-            edit("e7", "Tim likes tea.", std::slice::from_ref(&tea)),
-            remove("e8"),
-            add("Tim drinks green tea.", &[tea]),
-        ]
+        let tea = handle(input, tea);
+        let hobbies = vec![
+            said("Tim surfs.", &["m99".into()]),
+            said("Tim surfs in Raglan.", &[outside.to_string()]),
+            said("Tim likes tea and surfing.", &[tea.clone(), "m99".into()]),
+        ];
+        let preferences = vec![
+            said("Tim is lovely.", &[]),
+            said("  ", std::slice::from_ref(&tea)),
+            said("Tim drinks green tea.", &[tea]),
+        ];
+        written(vec![("Hobbies", hobbies), ("Preferences", preferences)])
     });
     let rejected = applied.rejected.iter().map(|r| (r.index, r.reason));
     assert_eq!(
@@ -1233,16 +1548,14 @@ fn invalid_operations_are_rejected_and_the_rest_apply() {
             (1, RejectReason::CitesOutsideInput),
             (2, RejectReason::CitesOutsideInput),
             (3, RejectReason::NoCitations),
-            (4, RejectReason::NoCitations),
-            (5, RejectReason::UnknownEntry),
-            (6, RejectReason::UnknownEntry),
+            (4, RejectReason::EmptyText),
         ]
     );
-    assert_eq!(texts(&h.profile()), [TEA, "Tim drinks green tea."]);
+    assert_eq!(texts(&h.profile()), ["Tim drinks green tea."]);
 }
 
 #[test]
-fn a_malformed_reply_leaves_the_entries_untouched_and_records_an_error() {
+fn a_malformed_reply_or_plan_writes_nothing_and_records_an_error() {
     let h = Harness::new();
     let tea = h.seed(fact(TEA));
     h.profile_adding(&[(TEA, &[tea])]);
@@ -1252,9 +1565,9 @@ fn a_malformed_reply_leaves_the_entries_untouched_and_records_an_error() {
     h.advance(minutes(1));
     let malformed = Outcome::Failed(FailureKind::Malformed);
     for nonsense in [
-        json!({"edits": []}),
-        json!({"operations": [{"op": "rewrite", "text": "Everything."}]}),
-        json!({"operations": "add everything"}),
+        json!({"operations": []}),
+        json!({"sections": [{"heading": "Tea", "sentences": "all of them"}]}),
+        json!({"sections": "everything"}),
     ] {
         let llm = FakeLlm::scripted(MODEL, vec![nonsense.clone()]);
         let outcome = h.refresh(PROFILE_NAME, &llm, false);
@@ -1267,8 +1580,21 @@ fn a_malformed_reply_leaves_the_entries_untouched_and_records_an_error() {
     }
     // A failed refresh doesn't record what it selected, so the next one
     // isn't skipped.
-    let next = h.refresh(PROFILE_NAME, &quiet_llm(1), false);
-    assert!(matches!(next, Outcome::Applied(_)));
+    applied(h.refresh(PROFILE_NAME, &quiet_llm(1), false));
+
+    // A plan that names no facet stops the refresh before the write.
+    h.service.create_model(BANK, &plans_model(100)).unwrap();
+    for nonsense in [
+        json!({"facets": "everything"}),
+        json!({"facets": []}),
+        json!({"sections": []}),
+    ] {
+        let llm = FakeLlm::scripted(MODEL, vec![nonsense.clone(), written(vec![])]);
+        assert_eq!(h.refresh("Plans", &llm, true), malformed, "{nonsense}");
+        let calls = (calls(&llm, PLAN_TEMPLATE).len(), writes(&llm));
+        assert_eq!(calls, (1, 0), "{nonsense}");
+        assert_eq!(h.model("Plans").last_error, Some(FailureKind::Malformed));
+    }
 }
 
 // The budget
@@ -1297,60 +1623,107 @@ fn creating_resizing_or_enabling_past_the_budget_is_refused() {
     assert_eq!(h.profile().max_tokens, 800);
 }
 
+/// A fact-only model asking what Tim drinks in the morning, in
+/// `max_tokens`, planned as one facet that recalls its question. Returns
+/// the question.
+fn mornings(h: &Harness, max_tokens: u32) -> &'static str {
+    let question = "What does Tim drink in the morning?";
+    let spec = ModelSpec {
+        name: "Mornings".into(),
+        question: question.into(),
+        kinds: vec![Kind::Fact],
+        ..plans_model(max_tokens)
+    };
+    h.service.create_model(BANK, &spec).unwrap();
+    h.plan("Mornings", &[("Drinks", question)]);
+    question
+}
+
 #[test]
-fn entries_past_max_tokens_are_trimmed_lowest_ranked_first() {
+fn entries_past_max_tokens_are_trimmed_lowest_ranked_first_headings_included() {
     // Code trims the lowest-ranked entries, ranked by the best score among
     // each entry's cited memories. The three memories here share the same
     // words with the question, so strength decides.
     let h = Harness::new();
-    let mornings = ModelSpec {
-        name: "Mornings".into(),
-        question: "What does Tim drink in the morning?".into(),
-        kinds: vec![Kind::Fact],
-        ..plans_model(30)
-    };
-    h.service.create_model(BANK, &mornings).unwrap();
-    let tea = h.seed(fact("Tim drinks tea in the morning.").level("critical"));
-    let coffee = h.seed(fact("Tim drinks coffee in the morning.").level("minor"));
-    let juice = h.seed(fact("Tim drinks juice in the morning.").level("major"));
-    // 60 characters each: 15 tokens, so two fit in 30.
+    mornings(&h, 34);
+    let drinks = [("tea", "critical"), ("coffee", "minor"), ("juice", "major")];
+    let drinks =
+        drinks.map(|(d, level)| fact(&format!("Tim drinks {d} in the morning.")).level(level));
+    let m = h.seed_all(BANK, at(EARLIER), drinks.into());
+    // 60 characters each: 15 tokens, so two and their heading fit in 34.
     let texts = [
         "Tim starts every single day with a large pot of green tea..",
         "Tim sometimes has a strong black coffee in the morning too.",
         "Tim drinks a glass of fresh orange juice with his breakfast.",
     ];
-    let entries: [&[Uuid]; 3] = [&[tea], &[coffee], &[juice]];
-    let entries: Vec<_> = texts.into_iter().zip(entries).collect();
-    let applied = h.refresh_adding("Mornings", &entries);
+    let s = |n: usize| (texts[n], std::slice::from_ref(&m[n]));
+    let applied = h.rewrite("Mornings", &[("Drinks", &[s(0), s(1), s(2)])]);
     assert_eq!(applied.trimmed, vec![applied.added[1]]);
     let model = h.model("Mornings");
     assert_eq!(model.entries.len(), 2);
     let tokens: usize = model.entries.iter().map(|e| estimate_tokens(&e.text)).sum();
-    assert!(tokens <= 30, "{tokens} tokens");
+    assert!(tokens <= 34, "{tokens} tokens");
+
+    // Two fill 30 exactly, so with two headings they don't fit, and the
+    // lower-ranked goes with its heading.
+    h.edit("Mornings", json!({"max_tokens": 30})).unwrap();
+    let applied = h.rewrite("Mornings", &[("Tea", &[s(0)]), ("Coffee", &[s(1)])]);
+    assert_eq!(applied.trimmed, applied.added, "the coffee");
+    let text = h.block(None).text;
+    assert!(paragraph(&text, "Tea").is_some(), "{text}");
+    assert_eq!(paragraph(&text, "Coffee"), None, "{text}");
 }
 
 // Memories win
 
 #[test]
-fn an_entry_citing_a_retracted_memory_is_dropped_from_the_block() {
+fn sections_render_as_paragraphs_and_an_entry_citing_a_retracted_memory_is_dropped() {
+    // Each section is its heading, then its sentences as one paragraph.
     let h = Harness::new();
+    let tea = h.seed(fact(TEA));
     let maya = h.seed(fact(MAYA));
     let cat = h.seed(fact(CAT));
-    let applied = h.profile_adding(&[("Tim's daughter is Maya.", &[maya]), (CAT_ENTRY, &[cat])]);
-    assert!(h.block(None).text.contains("Tim's daughter is Maya."));
+    let daughter = "Tim's daughter is Maya.";
+    let applied = h.rewrite(
+        PROFILE_NAME,
+        &[
+            ("People", &[(daughter, &[maya])]),
+            ("Preferences", &[(TEA, &[tea]), (CAT_ENTRY, &[cat])]),
+        ],
+    );
+    let text = h.block(None).text;
+    let people = paragraph(&text, "People");
+    assert!(people.is_some_and(|p| p.contains(daughter)), "{text}");
+    let preferences = paragraph(&text, "Preferences").unwrap_or_default();
+    let order = (preferences.find(TEA), preferences.find(CAT_ENTRY));
+    assert!(matches!(order, (Some(a), Some(b)) if a < b), "{text}");
 
     h.advance(minutes(30));
     let corrected = h.now();
     let mia = fact(MIA).with("changes_something", json!(true));
     h.says_changing(mia, maya, "retracts");
     let block = h.block(None);
-    assert!(!block.text.contains("Tim's daughter is Maya."));
+    assert!(!block.text.contains(daughter));
+    // A heading with nothing left to show under it isn't rendered.
+    assert_eq!(paragraph(&block.text, "People"), None, "{}", block.text);
     assert!(block.text.contains(CAT_ENTRY));
     assert!(!block.cited.contains(&maya));
     // Dropped at render time, and the model is refreshed: the retraction of
     // a cited memory is a triggering write.
     assert_eq!(h.profile().entries[0].id, applied.added[0]);
     assert_eq!(h.tick(&quiet_llm(1)).next_due, Some(corrected + minutes(5)));
+
+    // An entry written before sections existed has none, and renders as a
+    // line of its own until its model's next write replaces it.
+    let store = h.service.store().unwrap();
+    let conn = store.connection();
+    conn.execute("UPDATE mental_model_entries SET section = NULL", [])
+        .unwrap();
+    drop(conn);
+    let text = h.restart().block(None).text;
+    assert_eq!(paragraph(&text, "Preferences"), None, "{text}");
+    let line = text.lines().find(|line| line.contains(TEA));
+    assert!(line.is_some_and(|line| !line.contains(CAT_ENTRY)), "{text}");
 }
 
 #[test]
@@ -1376,36 +1749,38 @@ fn an_entry_is_dropped_when_any_one_of_its_memories_ends() {
 fn a_refinement_moves_the_citation_to_the_head_of_the_chain() {
     let h = Harness::new();
     h.service.create_model(BANK, &plans_model(100)).unwrap();
+    h.plan("Plans", &[("Trips", "Where is Tim going and when?")]);
     let year = json!({"at": "2027", "precision": "year"});
     let japan = h.seed(claim(JAPAN, "event", "notable").with("valid_from", year));
-    let applied = h.refresh_adding("Plans", &[("Tim is going to Japan next year.", &[japan])]);
+    let added = h.refresh_adding("Plans", &[("Tim is going to Japan next year.", &[japan])]);
 
     h.advance(minutes(30));
     let refined = h.now();
     let tokyo = claim(TOKYO, "event", "notable").with("valid_from", month("2027-04"));
     let tokyo = h.says_changing(tokyo, japan, "refines");
     let plans = h.model("Plans");
-    assert_eq!(plans.entries[0].id, applied.added[0]);
+    assert_eq!(plans.entries[0].id, added.added[0]);
     assert_eq!(plans.entries[0].cites, vec![tokyo]);
     // The entry still renders, and the next refresh, which isn't skipped,
     // rewords it.
     let text = h.block(None).text;
     assert!(text.contains("Tim is going to Japan next year."));
     assert_eq!(h.tick(&quiet_llm(1)).next_due, Some(refined + minutes(5)));
-    let next = h.refresh("Plans", &quiet_llm(1), false);
-    assert!(matches!(next, Outcome::Applied(_)));
+    applied(h.refresh("Plans", &quiet_llm(1), false));
 }
 
 #[test]
 fn an_entry_citing_a_low_confidence_state_shows_its_age() {
-    // As in injection, show when it was said: Tuesday 1 September.
+    // As in injection, show when it was said, Tuesday 1 September, after
+    // the sentence in its paragraph.
     let h = Harness::new();
     let job = h.seed(state("Tim is job hunting.", "weeks"));
-    h.profile_adding(&[("Tim is looking for a new job.", &[job])]);
+    let tea = h.seed(fact(TEA));
+    h.profile_adding(&[("Tim is looking for a new job.", &[job]), (TEA, &[tea])]);
     let text = h.block(None).text;
-    let line = text.lines().find(|line| line.contains("a new job."));
-    let line = line.expect("the entry is rendered");
-    assert!(line.contains("Tue 1 Sep"), "{line}");
+    let line = paragraph(&text, SECTION).unwrap_or_default();
+    let order = ["a new job.", "Tue 1 Sep", TEA].map(|needle| line.find(needle));
+    assert!(order.is_sorted() && order[0].is_some(), "{text}");
 }
 
 // The block
@@ -2085,7 +2460,7 @@ fn a_refresh_whose_retrieval_fails_waits_thirty_minutes_like_any_failure() {
     embedder.failing.store(true, Ordering::SeqCst);
     let llm = quiet_llm(1);
     let ran = h.tick(&llm);
-    assert_eq!(refresh_calls(&llm), 0);
+    assert_eq!(writes(&llm), 0);
     let profile = h.profile();
     assert!(profile.last_error.is_some());
     assert_eq!(profile.last_error_at, Some(failed_at));
@@ -2102,7 +2477,7 @@ fn a_refresh_whose_retrieval_fails_waits_thirty_minutes_like_any_failure() {
 
     h.set(failed_at + minutes(30));
     assert_eq!(h.tick(&llm).ran.len(), 1);
-    assert_eq!(refresh_calls(&llm), 1);
+    assert_eq!(writes(&llm), 1);
     let profile = h.profile();
     assert_eq!(profile.last_error, None);
     assert_eq!(profile.last_refreshed_at, Some(failed_at + minutes(30)));
@@ -2127,14 +2502,8 @@ fn a_reply_relying_on_an_entry_its_turn_held_is_credited_on_every_memory_it_cite
     let tea_time = turn("s1", h.now() - minutes(1), "Tea time?");
     h.service.ingest_turn(BANK, &tea_time).unwrap();
 
-    h.refresh_with(PROFILE_NAME, |input| {
-        let (entry, cites) = (&input.entries[0].handle, handles(input, &[cat, tea]));
-        vec![edit(
-            entry,
-            "Tim only drinks tea when Miso the cat is asleep.",
-            &cites,
-        )]
-    });
+    let asleep = "Tim only drinks tea when Miso the cat is asleep.";
+    h.profile_adding(&[(asleep, &[cat, tea])]);
 
     let call1 = json!({"claims": [], "used_injected_ids": ["n1"]});
     let llm = FakeLlm::scripted(MODEL, vec![call1]);
@@ -2214,7 +2583,7 @@ impl LlmClient for KeepsDuringCall<'_> {
             self.service.keep(BANK, &[self.keep.to_string()]).unwrap();
         }
         Ok(LlmResponse {
-            json: reply(vec![]),
+            json: written(vec![]),
             usage: None,
             latency: Duration::ZERO,
         })
