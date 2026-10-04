@@ -1456,7 +1456,7 @@ fn speakers_never_cross_banks() {
 
 #[test]
 fn each_bank_has_one_worker() {
-    let h = Harness::new();
+    let h = Harness::with_concurrency(1);
     ingest(
         &h,
         "main",
