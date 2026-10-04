@@ -4,6 +4,7 @@ Test behavior through public seams only:
 
 - `Service` and the other public core API it hands out
 - the HTTP API (`asphodel serve`)
+- public clients tested against stub servers for external HTTP contracts
 - the CLI
 - the plugin's public surface (the Hermes provider and its tools)
 - replay scenarios in `scenarios/*.toml`

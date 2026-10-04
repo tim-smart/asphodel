@@ -29,8 +29,8 @@ use crate::erase::{
 use crate::extraction::{Call1Input, Call2Input, Committed, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use crate::inspect::{
-    BankOverview, EntityView, InspectError, MemoryPage, MemoryQuery, MemoryView, ModelView,
-    SourceDetail, SourcePage, SourceQuery,
+    BankOverview, EntitySummary, EntityView, InspectError, MemoryPage, MemoryQuery, MemoryView,
+    ModelView, SourceDetail, SourcePage, SourceQuery,
 };
 use crate::keep::{KeepError, Kept, SignificanceSet, Unkept};
 use crate::mental_models::{
@@ -981,6 +981,12 @@ impl Service {
     /// `entity show`: an entity by id, `user`, `assistant`, name or alias.
     pub fn show_entity(&self, bank: &str, entity: &str) -> Result<EntityView, InspectError> {
         crate::inspect::entity(&self.store, bank, entity)
+    }
+
+    /// All entities in a bank, including seeded and merged entities, ordered
+    /// by name then UUID. Names need not be unique; inspect each by its id.
+    pub fn entities(&self, bank: &str) -> Result<Vec<EntitySummary>, InspectError> {
+        crate::inspect::entities(&self.store, bank)
     }
 
     /// `model show [--entry]`: a model with each entry's citations.
