@@ -2108,6 +2108,46 @@ fn taking_a_model_out_of_the_prompt_and_back_shows_in_the_next_block_and_survive
 }
 
 #[test]
+fn the_cached_block_is_read_without_building_one() {
+    let h = Harness::new();
+    let tea = h.insert(fact(TEA));
+    h.refresh_adding(PROFILE_NAME, &[("Tim likes green tea.", &[tea])]);
+    let built = || h.one::<i64, _>("SELECT COUNT(*) FROM prompt_blocks", []);
+    let accesses = h.accesses();
+
+    // Nothing has fetched the block, so nothing is cached, and looking
+    // doesn't build one.
+    let before = built();
+    assert_eq!(h.service.cached_system_prompt(BANK).unwrap(), None);
+    assert_eq!(built(), before);
+
+    let served = h.block(None);
+    assert_eq!(
+        h.service.cached_system_prompt(BANK).unwrap(),
+        Some(served.clone())
+    );
+    assert_eq!(built(), before + 1);
+
+    // Whatever clears the cache empties it: an edit, and local midnight.
+    h.service
+        .edit_model(
+            BANK,
+            PROFILE_NAME,
+            &ModelEdit {
+                enabled: Some(false),
+                ..ModelEdit::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(h.service.cached_system_prompt(BANK).unwrap(), None);
+    h.block(None);
+    h.set(at("2026-10-01T11:00:00Z"));
+    assert_eq!(h.service.cached_system_prompt(BANK).unwrap(), None);
+    assert_eq!(built(), before + 2);
+    assert_eq!(h.accesses(), accesses, "reading the cache never counts");
+}
+
+#[test]
 fn a_new_agenda_memory_clears_the_block() {
     let h = Harness::new();
     let first = h.block(None);

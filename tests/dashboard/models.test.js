@@ -6,6 +6,11 @@
 //
 // A model's toggle is the checkbox, `role="switch"` or `aria-pressed` button
 // in its row.
+//
+// The page also shows the system prompt block the daemon has cached, read
+// from `GET .../system-prompt/cached`. Reading it never builds a block, as
+// `GET .../system-prompt` does when nothing is cached, and never refreshes a
+// model. The block's text is shown verbatim in a `<pre>`.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -17,7 +22,6 @@ import {
   findText,
   open,
   queryText,
-  rowOf,
   showsCount,
   stays,
   textOf,
@@ -35,9 +39,23 @@ function isOn(toggle) {
   return (toggle.getAttribute("aria-checked") ?? toggle.getAttribute("aria-pressed")) === "true";
 }
 
+/// The row of the model named `name`: the innermost row with a prompt
+/// toggle whose text has the name. Other text with the name, such as the
+/// cached block, isn't a row.
+function queryModel(page, name) {
+  const rows = [...page.root.querySelectorAll('tr, li, article, [role="row"], [role="listitem"]')].filter(
+    (row) => toggleIn(row) && textOf(row).includes(name),
+  );
+  return rows.find((row) => !rows.some((other) => other !== row && row.contains(other))) ?? null;
+}
+
+function findModel(page, name) {
+  return waitFor(() => queryModel(page, name), `the model ${name}`);
+}
+
 /// The toggle in `name`'s row, if the page shows it.
 function queryToggle(page, name) {
-  const row = rowOf(page.root, name);
+  const row = queryModel(page, name);
   return row && toggleIn(row);
 }
 
@@ -72,19 +90,19 @@ test("a bank's model count on the banks page opens its mental models", async (t)
 test("each model shows its question, token limit, whether it's in the prompt, its last refresh and error", async (t) => {
   const page = await open(t, new FakeDaemon(), { hash: MODELS, token: TOKEN });
 
-  const profile = await findRow(page.root, "User profile");
+  const profile = await findModel(page, "User profile");
   assert.ok(textOf(profile).includes(questions.profile), textOf(profile));
   assert.match(textOf(profile), /(^|\D)500(\D|$)/);
   assert.ok(profile.querySelector('time[datetime="2026-10-03T08:30:00Z"]'), profile.innerHTML);
   assert.ok(isOn(toggleIn(profile)), "the profile is in the prompt");
 
-  const plans = await findRow(page.root, "Plans");
+  const plans = await findModel(page, "Plans");
   assert.ok(textOf(plans).includes(questions.plans), textOf(plans));
   assert.match(textOf(plans), /(^|\D)200(\D|$)/);
   assert.match(textOf(plans), /malformed/i);
   assert.ok(isOn(toggleIn(plans)), "Plans is in the prompt");
 
-  const travel = await findRow(page.root, "Travel");
+  const travel = await findModel(page, "Travel");
   assert.ok(textOf(travel).includes(questions.travel), textOf(travel));
   assert.match(textOf(travel), /(^|\D)150(\D|$)/);
   assert.ok(!isOn(toggleIn(travel)), "Travel is out of the prompt");
@@ -133,10 +151,40 @@ test("enabling past the budget shows the daemon's error and leaves the model out
 
 test("the page says changes reach new Hermes sessions only, and that a model out of the prompt isn't refreshed", async (t) => {
   const page = await open(t, new FakeDaemon(), { hash: MODELS, token: TOKEN });
-  await findRow(page.root, "Plans");
+  await findModel(page, "Plans");
 
   const shown = textOf(page.root);
   assert.match(shown, /\bnew\b[^.]*\bsessions?\b/i);
   assert.match(shown, /\bpaus/i);
   assert.match(shown, /\brefresh/i);
+});
+
+/// The `<pre>` holding exactly `text`, if the page shows one.
+function queryBlock(page, text) {
+  return [...page.root.querySelectorAll("pre")].find((el) => el.textContent === text) ?? null;
+}
+
+/// Nothing the page sent could build a block or refresh a model.
+function builtNothing(daemon) {
+  return daemon.calls(null, "/v1/banks/main/system-prompt").length === 0 && daemon.calls(null, /\/refresh$/).length === 0;
+}
+
+test("the cached system prompt shows exactly as Hermes gets it, with when it was built", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: MODELS, token: TOKEN });
+
+  const block = daemon.state.cachedBlock;
+  await waitFor(() => queryBlock(page, block.text), "the cached block's text");
+  assert.ok(page.root.querySelector(`time[datetime="${block.built_at}"]`), "when it was built");
+  await stays(() => builtNothing(daemon), "no block built and no model refreshed");
+});
+
+test("with nothing cached the page says so and builds nothing", async (t) => {
+  const daemon = new FakeDaemon();
+  daemon.state.cachedBlock = null;
+  const page = await open(t, daemon, { hash: MODELS, token: TOKEN });
+
+  await findText(page.root, /\b(nothing|not|no|isn't)\b[^.]*\bcached\b/i);
+  assert.equal(page.root.querySelector("pre"), null, page.root.innerHTML);
+  await stays(() => builtNothing(daemon) && daemon.state.cachedBlock === null, "no block built");
 });

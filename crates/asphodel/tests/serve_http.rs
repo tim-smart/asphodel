@@ -1567,6 +1567,25 @@ fn the_model_list_carries_the_budget_and_enabling_past_it_changes_nothing() {
     );
 }
 
+/// The dashboard shows the block the daemon has cached without building
+/// one, so looking writes nothing.
+#[test]
+fn the_cached_system_prompt_is_null_until_a_fetch_builds_it() {
+    let dir = TestDir::new();
+    let daemon = Serve::new(&dir).ready();
+    daemon.create_bank("main");
+    let cached = || daemon.ok(daemon.get("/v1/banks/main/system-prompt/cached"));
+
+    assert_eq!(cached(), json!({"block": null}));
+    assert_eq!(cached(), json!({"block": null}), "looking built a block");
+    let block = daemon.ok(daemon.get("/v1/banks/main/system-prompt"));
+    assert_eq!(cached(), json!({ "block": block }));
+    assert_eq!(
+        daemon.get("/v1/banks/nope/system-prompt/cached").status,
+        404
+    );
+}
+
 #[test]
 fn a_refresh_held_by_an_extraction_limit_answers_held_over_http_and_the_cli() {
     // A memory is extracted, so the profile has something to refresh; then
@@ -2593,6 +2612,9 @@ fn an_older_backup_restores_into_a_new_data_dir_and_migrates_with_a_copy() {
 // is no `DELETE` route for documents.
 // - `GET /v1/banks/{bank}/models` answers `{"models": [...], "budget": N}`,
 // `N` being `mental_models.budget`, for the models page's budget use.
+// - `GET /v1/banks/{bank}/system-prompt/cached` answers `{"block": ...}`, the
+// block `/system-prompt` would serve now, or `null` when nothing is cached.
+// It never builds one.
 // - `GET /dashboard` is served without the token, since the page holds
 // nothing; every route it calls needs the token like any other.
 // - The page's module script, and every module it imports as "./name.js",

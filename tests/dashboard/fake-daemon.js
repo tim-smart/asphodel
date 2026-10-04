@@ -31,6 +31,7 @@ export const ids = {
   plans: "01a10400-0000-7000-8000-0000000000d2",
   travel: "01a10400-0000-7000-8000-0000000000d3",
   profileEntry: "01a10400-0000-7000-8000-0000000000e1",
+  block: "01a10400-0000-7000-8000-0000000000f1",
 };
 
 export const sentences = {
@@ -232,6 +233,19 @@ export function fixtures() {
     ],
     /// `mental_models.budget`.
     budget: 800,
+    /// The system prompt block the daemon has cached for `main`, or null when
+    /// nothing is cached until the next fetch builds one.
+    cachedBlock: {
+      id: ids.block,
+      built_at: "2026-10-03T08:45:00Z",
+      text: [
+        "Agenda\n- Tue 6 Oct: Sam has a dentist appointment on Tuesday. (upcoming)",
+        "User profile\n- Sam lives in Auckland.",
+        "Built Sat 3 Oct 21:45; memories win: use memory_recall for history and detail.",
+      ].join("\n\n"),
+      agenda: [ids.dentist],
+      cited: [ids.auckland],
+    },
     queued: [],
     failed: [
       {
@@ -631,6 +645,21 @@ export class FakeDaemon {
       return json(200, { models: state.models, budget: state.budget });
     }
     if (collection === "models" && action === undefined && method === "PATCH") return this.editModel(id, body);
+    // Reading the cache never builds a block; fetching the block does, when
+    // nothing is cached.
+    if (collection === "system-prompt" && id === "cached" && method === "GET") {
+      return json(200, { block: state.cachedBlock });
+    }
+    if (collection === "system-prompt" && id === undefined && method === "GET") {
+      state.cachedBlock ??= {
+        id: "01a10400-0000-7000-8000-0000000000f2",
+        built_at: NOW,
+        text: "Built Sat 3 Oct 22:00; memories win: use memory_recall for history and detail.",
+        agenda: [],
+        cited: [],
+      };
+      return json(200, state.cachedBlock);
+    }
     return error(404, "no such route");
   }
 
@@ -647,6 +676,7 @@ export class FakeDaemon {
     if (collection === "sources" && method === "GET") return json(200, { sources: [], total: 0, next_cursor: null });
     if (collection === "chunks" && method === "GET") return json(200, { queued: [], failed: [] });
     if (collection === "models" && method === "GET") return json(200, { models: [], budget: 800 });
+    if (collection === "system-prompt" && method === "GET") return json(200, { block: null });
     return error(404, "no such route");
   }
 
@@ -775,6 +805,8 @@ export class FakeDaemon {
       }
     }
     if (typeof edit?.enabled === "boolean") found.enabled = edit.enabled;
+    // An edit clears the bank's cached block, as the daemon's does.
+    this.state.cachedBlock = null;
     return json(200, found);
   }
 
