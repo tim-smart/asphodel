@@ -1845,3 +1845,211 @@ fn malformed_material_is_refused_by_rescore_without_quoting_it() {
     );
     assert!(!out.exists());
 }
+
+// Top 8 with labels keyed by query and memory.
+
+/// A version 2 material for top 8 under keyed labels, and those labels.
+/// Recall labels are keyed by the cleaned query and the memory, so a label
+/// reaches the memory in every sample with that query, and none with
+/// another.
+///
+/// - r01, query A: memory 1 at -9 (relevant, listed first but ranked
+///   last), memories 2 to 9 at 8 down to 1 (5 relevant, ranked 4th), memory
+///   10 at 0.5 (relevant, ranked 9th): 1 of 3 in the top 8.
+/// - r02, query A again: memory 11 at 3 (unlabelled), memory 5 at 2 (its
+///   query A label makes it relevant here too): 1 of 1.
+/// - r03, query B: memory 1 at 5 (labelled only under query A, so
+///   unlabelled here, but it takes 1st place), then memories 21 to 29 tied
+///   at 0 in list order (27 and 28 relevant, the rest unlabelled): 27 is
+///   8th and 28 9th, so 1 of 2.
+/// - One label, query B with memory 99, judges nothing the material shows:
+///   unmatched, and not counted.
+///
+/// So 3 found of 6 relevant; 13 candidates labelled and 9 not; 12 labels
+/// matched and 1 unmatched.
+fn keyed_top8_fixture() -> (Value, String) {
+    let memory = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+    let query = |name: &str| format!("{MATERIAL_SENTINEL} query {name}");
+    let candidate = |id: String, n: u32, score: f64| {
+        json!({
+            "id": id,
+            "memory": memory(n),
+            "score": score,
+            "sentence": format!("{MATERIAL_SENTINEL} sentence {n}")
+        })
+    };
+    let sample = |id: &str, at: &str, name: &str, candidates: Vec<Value>| {
+        json!({
+            "sample": id,
+            "at": at,
+            "session": format!("s-{id}"),
+            "query": query(name),
+            "candidates": candidates
+        })
+    };
+    let mut r01 = vec![candidate("r01.1".into(), 1, -9.0)];
+    for n in 2..=9 {
+        r01.push(candidate(format!("r01.{n}"), n, f64::from(10 - n)));
+    }
+    r01.push(candidate("r01.10".into(), 10, 0.5));
+    let r02 = vec![
+        candidate("r02.1".into(), 11, 3.0),
+        candidate("r02.2".into(), 5, 2.0),
+    ];
+    let mut r03 = vec![candidate("r03.1".into(), 1, 5.0)];
+    for n in 21..=29 {
+        r03.push(candidate(format!("r03.{}", n - 19), n, 0.0));
+    }
+    let material = json!({
+        "version": 2,
+        "recall": [
+            sample("r01", "2026-01-05T09:00:00Z", "A", r01),
+            sample("r02", "2026-01-06T09:00:00Z", "A", r02),
+            sample("r03", "2026-01-07T09:00:00Z", "B", r03)
+        ],
+        "call2": []
+    });
+    let label = |name: &str, n: u32, relevant: bool| json!({ "query": query(name), "memory": memory(n), "relevant": relevant });
+    let mut recall: Vec<Value> = (1..=10)
+        .map(|n| label("A", n, [1, 5, 10].contains(&n)))
+        .collect();
+    recall.extend([
+        label("B", 27, true),
+        label("B", 28, true),
+        label("B", 99, true),
+    ]);
+    let labels = toml::to_string(&json!({ "recall": recall })).unwrap();
+    (material, labels)
+}
+
+/// The same judgements as candidate ids: every candidate a keyed label
+/// reaches, under its id in `material`.
+fn id_labels_for(material: &Value, keyed: &str) -> String {
+    let keyed: Value = toml::from_str(keyed).unwrap();
+    let judged: Vec<(&Value, &Value, bool)> = keyed["recall"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|label| {
+            (
+                &label["query"],
+                &label["memory"],
+                label["relevant"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    let mut labels = String::new();
+    for sample in material["recall"].as_array().unwrap() {
+        for candidate in candidates(sample) {
+            if let Some((_, _, relevant)) = judged.iter().find(|(query, memory, _)| {
+                **query == sample["query"] && **memory == candidate["memory"]
+            }) {
+                labels.push_str(&format!(
+                    "{:?} = {relevant}\n",
+                    candidate["id"].as_str().unwrap()
+                ));
+            }
+        }
+    }
+    labels
+}
+
+/// Top 8 is the same for keyed labels as for candidate ids: each sample's
+/// candidates by logit, highest first and ties in list order, unlabelled
+/// candidates taking places but never counting, and relevant counting the
+/// labelled-relevant candidates the material shows. Keyed labels keep their
+/// matching: a label reaches its memory under its query in any sample, a
+/// label judging nothing shown is unmatched, and the two paths give the
+/// same curve.
+#[test]
+fn keyed_labels_and_candidate_ids_count_the_same_top_8() {
+    let dir = TestDir::new();
+    let (material, keyed) = keyed_top8_fixture();
+    let ids = id_labels_for(&material, &keyed);
+    let material_path = dir.private_file(
+        "labelling/keyed-top8.json",
+        &serde_json::to_string_pretty(&material).unwrap(),
+    );
+    let keyed_path = dir.private_file("labelling/keyed-top8.toml", &keyed);
+    let ids_path = dir.private_file("labelling/id-top8.toml", &ids);
+
+    let output = precision(&dir, &keyed_path, &material_path);
+    assert_ok(&output);
+    let out = stdout(&output);
+    let by_key: Value = serde_json::from_str(&out).expect("the curve is JSON on stdout");
+    assert_eq!(
+        by_key["recall"]["top8"],
+        json!({ "found": 3, "relevant": 6 }),
+        "{by_key}"
+    );
+    assert_eq!(by_key["recall"]["labelled"], 13, "{by_key}");
+    assert_eq!(by_key["recall"]["unlabelled"], 9, "{by_key}");
+    assert_eq!(by_key["recall"]["matched"], 12, "{by_key}");
+    assert_eq!(by_key["recall"]["unmatched"], 1, "{by_key}");
+    assert!(!out.contains(MATERIAL_SENTINEL), "{out}");
+    assert!(!out.contains("00000000-0000-4000"), "{out}");
+
+    let output = precision(&dir, &ids_path, &material_path);
+    assert_ok(&output);
+    let by_id: Value = serde_json::from_str(&stdout(&output)).expect("the curve is JSON");
+    assert_eq!(by_id["recall"]["top8"], by_key["recall"]["top8"], "{by_id}");
+    assert_eq!(by_id["recall"]["labelled"], 13, "{by_id}");
+    assert_eq!(by_id["recall"]["unlabelled"], 9, "{by_id}");
+    assert_eq!(
+        by_id["recall"]["curve"], by_key["recall"]["curve"],
+        "{by_id}"
+    );
+}
+
+/// Rescoring keeps each sample's query, which keyed labels match on, so a
+/// keyed label reaches the same candidates in the rescored material as in
+/// the material it was written for, in either mode.
+#[test]
+fn keyed_labels_reach_the_same_candidates_after_a_rescore() {
+    let dir = TestDir::new();
+    let corpus = conversation_history(&dir);
+    let (_, material) = material_of(&dir, &corpus, "message", &[]);
+    let recall: Vec<Value> = material["recall"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|sample| {
+            candidates(sample).iter().map(move |candidate| {
+                json!({
+                    "query": sample["query"],
+                    "memory": candidate["memory"],
+                    "relevant": candidate["sentence"] == hermes::HOME_SENTENCE
+                })
+            })
+        })
+        .collect();
+    assert!(!recall.is_empty(), "the run shows candidates: {material}");
+    let labels = dir.private_file(
+        "labelling/keyed.toml",
+        &toml::to_string(&json!({ "recall": recall })).unwrap(),
+    );
+
+    let input = dir.private_path("labelling/message.json");
+    let output = precision(&dir, &labels, &input);
+    assert_ok(&output);
+    let before: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(before["recall"]["unmatched"], 0, "{before}");
+    assert_eq!(before["recall"]["unlabelled"], 0, "{before}");
+    for mode in ["message", "conversation"] {
+        let out = dir.private_path(&format!("labelling/rescored-{mode}.json"));
+        assert_ok(&rescore(&dir, &input, &corpus, mode, &out));
+        let output = precision(&dir, &labels, &out);
+        assert_ok(&output);
+        let after: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        for key in ["labelled", "unlabelled", "matched", "unmatched"] {
+            assert_eq!(
+                after["recall"][key], before["recall"][key],
+                "{mode} {key}: {after}"
+            );
+        }
+        assert_eq!(
+            after["recall"]["top8"]["relevant"], before["recall"]["top8"]["relevant"],
+            "{mode}: {after}"
+        );
+    }
+}
