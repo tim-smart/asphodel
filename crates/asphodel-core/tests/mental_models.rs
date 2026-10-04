@@ -2072,6 +2072,65 @@ fn budget_folding_keeps_memory_guidance_and_counts_it_in_the_budget() {
 }
 
 #[test]
+fn budgets_below_the_memory_guidance_minimum_are_rejected() {
+    // The fixture guidance alone needs 117 estimated tokens. Neither the
+    // reported 100-token budget nor the token immediately below it can fit.
+    let mut accepted = Vec::new();
+    for budget in [100, 116] {
+        let result = Tuning::from_toml(&format!(
+            "[mental_models]\nbudget = {budget}\nprofile_max_tokens = {budget}\n"
+        ));
+        match result {
+            Ok(_) => accepted.push(budget),
+            Err(error) => assert!(error.to_string().contains("mental_models.budget")),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "accepted budgets below the guidance minimum: {accepted:?}"
+    );
+}
+
+#[test]
+fn accepted_boundary_budgets_fit_memory_guidance_and_the_dated_fold_summary() {
+    // At START, guidance alone needs 117 tokens. Guidance plus the agenda
+    // heading and "and 1 more dated item" needs 128. A stricter validation
+    // floor may reject these budgets, but accepting one must never overrun it.
+    let mut overruns = Vec::new();
+    for budget in [117, 127, 128] {
+        let extra = format!("[mental_models]\nbudget = {budget}\nprofile_max_tokens = {budget}\n");
+        if Tuning::from_toml(&extra).is_err() {
+            continue;
+        }
+        let h = Harness::with_tuning(&extra);
+        let empty = h.block(None);
+        assert_memory_guidance(&empty);
+        assert!(estimate_tokens(&empty.text) <= budget);
+
+        let h = Harness::with_tuning(&extra);
+        h.insert(event(
+            sentence(format!(
+                "Tim has a planning appointment. {}",
+                "There are many details to discuss. ".repeat(30)
+            )),
+            "2026-10-01T00:00",
+        ));
+        let folded = h.block(None);
+        assert!(folded.agenda.is_empty(), "the dated item did not fold");
+        assert_memory_guidance(&folded);
+        assert!(folded.text.contains("- and 1 more dated item"));
+        let tokens = estimate_tokens(&folded.text);
+        if tokens > budget {
+            overruns.push((budget, tokens));
+        }
+    }
+    assert!(
+        overruns.is_empty(),
+        "accepted budgets exceeded by folded blocks (budget, tokens): {overruns:?}"
+    );
+}
+
+#[test]
 fn building_the_block_or_the_agenda_never_writes_an_access() {
     let h = Harness::new();
     let tea = h.insert(fact(TEA));
