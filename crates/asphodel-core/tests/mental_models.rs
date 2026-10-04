@@ -1120,6 +1120,123 @@ fn the_profile_admits_recurring_memories_with_periods_longer_than_a_week() {
     assert_eq!(inputs(&h.input(PROFILE_NAME)), expected);
 }
 
+// Synthetic dates, unrelated to any private anniversary. Extraction runs on
+// 1 October in Auckland, so 5 October is inside the default agenda horizon.
+const ANNIVERSARY_RULE: &str = "FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=5";
+
+fn extract_startless_anniversary(h: &Harness) -> Uuid {
+    h.says(
+        claim(
+            "Alex and Jo celebrate their anniversary on 5 October.",
+            "recurring",
+            "critical",
+        )
+        .with("recurrence_text", json!("every 5 October"))
+        .with("recurrence_rrule", json!(ANNIVERSARY_RULE)),
+    )
+}
+
+#[test]
+fn a_startless_anniversary_survives_extraction() {
+    let h = Harness::new();
+    let memory = extract_startless_anniversary(&h);
+    let view = h.service.show_memory(BANK, &memory.to_string()).unwrap();
+    assert_eq!(view.kind, "recurring");
+    assert_eq!(view.window.recurrence.as_deref(), Some("every 5 October"));
+    assert_eq!(
+        view.window.recurrence_rrule.as_deref(),
+        Some(ANNIVERSARY_RULE)
+    );
+}
+
+#[test]
+fn a_startless_anniversary_reaches_the_seeded_profile_input() {
+    let h = Harness::new();
+    let memory = extract_startless_anniversary(&h);
+    assert_eq!(inputs(&h.input(PROFILE_NAME)), BTreeSet::from([memory]));
+}
+
+#[test]
+fn a_startless_anniversary_is_a_dated_agenda_occasion_not_a_routine() {
+    let h = Harness::new();
+    let memory = extract_startless_anniversary(&h);
+    assert_eq!(h.agenda().dated, vec![memory]);
+    assert!(h.agenda().routines.is_empty());
+    // Deriving a start must not turn a yearly occasion into a daily one.
+    h.set(local("2026-10-06T00:00"));
+    assert!(h.agenda().dated.is_empty());
+    h.set(local("2027-10-01T00:00"));
+    assert_eq!(h.agenda().dated, vec![memory]);
+}
+
+#[test]
+fn startless_rules_with_unknown_dates_or_interval_phase_keep_only_their_text() {
+    for rule in [
+        "FREQ=WEEKLY;INTERVAL=2",
+        // BY parts do not resolve an interval phase, even with a full date.
+        "FREQ=YEARLY;INTERVAL=2;BYMONTH=10;BYMONTHDAY=5",
+        "FREQ=DAILY;INTERVAL=2;BYHOUR=9",
+        // These BY parts still inherit a day or weekday from DTSTART.
+        "FREQ=YEARLY;BYMONTH=10",
+        "FREQ=MONTHLY;BYMONTH=10",
+        "FREQ=WEEKLY;BYHOUR=9",
+    ] {
+        let h = Harness::new();
+        let memory = h.says(
+            claim(
+                "Alex has a recurring occasion with no stated first date.",
+                "recurring",
+                "critical",
+            )
+            .with("recurrence_text", json!("a recurring occasion"))
+            .with("recurrence_rrule", json!(rule)),
+        );
+        let view = h.service.show_memory(BANK, &memory.to_string()).unwrap();
+        assert_eq!(
+            view.window.recurrence.as_deref(),
+            Some("a recurring occasion")
+        );
+        assert_eq!(view.window.recurrence_rrule, None, "ambiguous rule: {rule}");
+        assert!(inputs(&h.input(PROFILE_NAME)).is_empty(), "{rule}");
+        assert!(h.agenda().dated.is_empty(), "{rule}");
+        assert_eq!(h.agenda().routines, vec![memory], "text survives: {rule}");
+    }
+}
+
+#[test]
+fn an_explicit_recurrence_start_keeps_its_stated_interval_phase() {
+    let h = Harness::new();
+    // The explicit start fixes even years. Its two-year phase must survive.
+    let rule = "FREQ=YEARLY;INTERVAL=2;BYMONTH=10;BYMONTHDAY=5";
+    let memory = h.says(
+        claim(
+            "Alex and Jo celebrate this occasion every other 5 October, starting in 2024.",
+            "recurring",
+            "critical",
+        )
+        .with(
+            "recurrence_text",
+            json!("every other 5 October, starting in 2024"),
+        )
+        .with("recurrence_rrule", json!(rule))
+        .with(
+            "recurrence_start",
+            json!({"at": "2024-10-05", "precision": "day"}),
+        ),
+    );
+    let view = h.service.show_memory(BANK, &memory.to_string()).unwrap();
+    assert_eq!(view.window.recurrence_rrule.as_deref(), Some(rule));
+    assert_eq!(inputs(&h.input(PROFILE_NAME)), BTreeSet::from([memory]));
+    assert_eq!(h.agenda().dated, vec![memory]);
+    assert!(h.agenda().routines.is_empty());
+    h.set(local("2027-10-01T00:00"));
+    assert!(h.agenda().dated.is_empty());
+    h.set(local("2028-10-01T00:00"));
+    assert_eq!(h.agenda().dated, vec![memory]);
+    h.set(local("2028-10-06T00:00"));
+    assert!(h.agenda().dated.is_empty());
+}
+
 #[test]
 fn the_profile_excludes_weekly_or_more_frequent_and_unclassified_routines() {
     let h = Harness::new();
