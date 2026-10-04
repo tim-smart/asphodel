@@ -33,6 +33,7 @@ pub(crate) struct Candidate {
     pub low_confidence: bool,
     pub until_event: Option<String>,
     pub recurrence_text: Option<String>,
+    pub rrule: Option<String>,
     pub observed_at: Timestamp,
     /// Its source's timezone, which its window's units are in.
     pub tz: TimeZone,
@@ -140,7 +141,7 @@ fn load(
                 m.valid_from, m.valid_from_precision, m.valid_until, m.valid_until_precision,
                 m.due_at, m.due_at_precision, m.window_confidence, m.until_event,
                 m.recurrence_text, m.volatility, m.owner_significance,
-                m.invalidated_at IS NOT NULL OR m.hidden_at IS NOT NULL, s.timezone
+                m.invalidated_at IS NOT NULL OR m.hidden_at IS NOT NULL, s.timezone, m.recurrence_rrule
          FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
          WHERE m.id = ?1",
         [id],
@@ -162,6 +163,7 @@ fn load(
                 owner_significance: row.get(14)?,
                 dropped: row.get(15)?,
                 timezone: row.get(16)?,
+                rrule: row.get(17)?,
             })
         },
     )?;
@@ -206,6 +208,7 @@ fn load(
         low_confidence: row.window_confidence == "low",
         until_event: row.until_event,
         recurrence_text: row.recurrence_text,
+        rrule: row.rrule,
         observed_at: row.observed_at,
         tz,
         strength,
@@ -229,6 +232,7 @@ struct Row {
     window_confidence: String,
     until_event: Option<String>,
     recurrence_text: Option<String>,
+    rrule: Option<String>,
     volatility: Option<String>,
     owner_significance: Option<String>,
     dropped: bool,

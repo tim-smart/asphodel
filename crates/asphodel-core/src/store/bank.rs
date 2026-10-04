@@ -24,9 +24,10 @@ pub const PROFILE_NAME: &str = "User profile";
 pub const PROFILE_QUESTION: &str = "Who is the user: their preferences, important people, work and home, \
      the platforms they use, and how they like to be helped. Not upcoming events, tasks or routines.";
 
-/// The seeded profile's filters: facts, plus states of
+/// The seeded profile's stored filters: facts, plus states of
 /// volatility weeks or slower. A memory with no volatility passes, and there
-/// is no entity filter, since the profile is about the whole bank.
+/// is no entity filter, since the profile is about the whole bank. The default
+/// profile also admits non-routine recurring memories at selection time.
 pub const PROFILE_FILTER_KINDS: &str = r#"["fact","state"]"#;
 pub const PROFILE_MIN_VOLATILITY: &str = "weeks";
 

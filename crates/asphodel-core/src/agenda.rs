@@ -311,7 +311,7 @@ fn rows(
 
 /// Whether an RRULE repeats at least weekly; `None` when its frequency
 /// can't be read, which makes it a routine like one with no RRULE.
-fn period_within_a_week(rule: &str) -> Option<bool> {
+pub(crate) fn period_within_a_week(rule: &str) -> Option<bool> {
     let rule = rule.trim();
     let rule = rule.strip_prefix("RRULE:").unwrap_or(rule);
     let mut freq = None;
