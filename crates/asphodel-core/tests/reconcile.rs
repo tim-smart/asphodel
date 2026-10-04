@@ -1459,6 +1459,83 @@ fn an_undated_retraction_inherits_the_dated_window() {
     );
 }
 
+/// Both turns describe the same booking. Only the first supplies dates;
+/// extraction must not treat the second turn's observation-day default as
+/// a newly stated booking date.
+fn undated_booking(label: &str) -> (Harness, Uuid, Extracted) {
+    const BOOKING: &str = "Tim has a hotel booking.";
+    let h = Harness::new();
+    owner_says(&h, "I have a hotel booking for January 11 to 15, 2027.");
+    let initial = claim(BOOKING, "event", "hotel booking")
+        .with("valid_from", time("2027-01-11", "day"))
+        .with("valid_until", time("2027-01-15", "day"));
+    let old = extract_alone(&h, reply(vec![initial])).memories[0];
+    h.advance(24);
+    h.service
+        .ingest_turn(
+            "main",
+            &turn(
+                "s1",
+                "2026-10-02T06:30:00Z",
+                "I have a hotel booking.",
+                "Noted.",
+            ),
+        )
+        .unwrap();
+    let extracted = one_label(
+        &h,
+        reply(vec![claim(BOOKING, "event", "hotel booking")]),
+        old,
+        label,
+    );
+    (h, old, extracted)
+}
+
+fn assert_undated_booking_absorbed(label: &str) {
+    let (h, old, extracted) = undated_booking(label);
+    let view = h.service.show_memory("main", &old.to_string()).unwrap();
+    assert_eq!(
+        view.chain.head, old,
+        "{label} must not replace a dated booking"
+    );
+    assert!(extracted.memories.is_empty());
+    assert_eq!(
+        view.window.valid_from.unwrap().at,
+        local("2027-01-11T00:00")
+    );
+    assert_eq!(
+        view.window.valid_until.unwrap().at,
+        local("2027-01-15T00:00")
+    );
+}
+
+#[test]
+fn an_undated_event_mentioned_again_keeps_the_dated_booking() {
+    assert_undated_booking_absorbed("mentioned_again");
+}
+
+#[test]
+fn an_undated_event_confirmed_keeps_the_dated_booking() {
+    assert_undated_booking_absorbed("confirmed");
+}
+
+#[test]
+fn an_undated_event_retraction_inherits_the_dated_booking_window() {
+    let (h, old, extracted) = undated_booking("retracts");
+    let old_view = h.service.show_memory("main", &old.to_string()).unwrap();
+    let head = h
+        .service
+        .show_memory("main", &old_view.chain.head.to_string())
+        .unwrap();
+    assert_eq!(extracted.memories, vec![head.id]);
+    assert_ne!(head.id, old);
+    assert!(old_view.retracted_at.is_some());
+    assert_eq!(
+        head.window, old_view.window,
+        "an omitted event date must inherit the booking window, not the observation day"
+    );
+}
+
 #[test]
 fn mentioned_again_outranks_used_in_the_same_turn() {
     // The reply relied on the memory and the user restated it in the same
