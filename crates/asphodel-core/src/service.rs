@@ -35,7 +35,7 @@ use crate::inspect::{
 use crate::keep::{KeepError, Kept, SignificanceSet, Unkept};
 use crate::mental_models::{
     Model, ModelEdit, ModelError, ModelSpec, Outcome as RefreshOutcome, RefreshInput, RefreshRun,
-    Refreshes, Schedule,
+    Refreshes, Schedule, ScoredRefresh,
 };
 use crate::models::{Embedder, LlmClient, Models, RetryBoard};
 use crate::operations::{Audit, AuditError, AuditList, Backup, BackupError, Status};
@@ -1532,8 +1532,14 @@ impl Service {
     ) -> Result<RefreshOutcome, ModelError> {
         let _refreshing = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
         let row = self.model_row(bank, name)?;
-        let outcome =
-            crate::mental_models::refresh(&self.retrieval()?, &self.schedule, &row, llm, force)?;
+        let outcome = crate::mental_models::refresh(
+            &self.retrieval()?,
+            &self.schedule,
+            &row,
+            llm,
+            force,
+            None,
+        )?;
         if matches!(outcome, RefreshOutcome::Applied(_)) {
             self.blocks.invalidate(row.bank_id);
         }
@@ -1546,6 +1552,27 @@ impl Service {
     /// a timer and the replay harness after advancing its clock. A model that
     /// fails to refresh doesn't stop the rest.
     pub fn run_refreshes(&self, llm: &dyn LlmClient) -> Result<Refreshes, ModelError> {
+        self.refreshes(llm, None)
+    }
+
+    /// [`Service::run_refreshes`], also returning each refresh's selection
+    /// as it was scored: every facet's whole pool before its budget cut it,
+    /// for replay's labelling material. A refresh stopped before its
+    /// selection, by a plan call or a failed retrieval, has none.
+    pub fn scored_refreshes(
+        &self,
+        llm: &dyn LlmClient,
+    ) -> Result<(Refreshes, Vec<ScoredRefresh>), ModelError> {
+        let mut scored = Vec::new();
+        let refreshes = self.refreshes(llm, Some(&mut scored))?;
+        Ok((refreshes, scored))
+    }
+
+    fn refreshes(
+        &self,
+        llm: &dyn LlmClient,
+        mut scored: Option<&mut Vec<ScoredRefresh>>,
+    ) -> Result<Refreshes, ModelError> {
         let _refreshing = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.now();
         let tuning = &self.tuning.mental_models;
@@ -1583,7 +1610,21 @@ impl Service {
                 if !run {
                     continue;
                 }
-                match crate::mental_models::refresh(&cx, &self.schedule, &model, llm, false) {
+                let mut facets = Vec::new();
+                let capture = scored.is_some().then_some(&mut facets);
+                let refreshed =
+                    crate::mental_models::refresh(&cx, &self.schedule, &model, llm, false, capture);
+                if let Some(scored) = scored.as_deref_mut()
+                    && !facets.is_empty()
+                {
+                    scored.push(ScoredRefresh {
+                        bank: bank.clone(),
+                        model: model.name.clone(),
+                        at: now,
+                        facets,
+                    });
+                }
+                match refreshed {
                     Ok(outcome) => {
                         if matches!(outcome, RefreshOutcome::Applied(_)) {
                             self.blocks.invalidate(bank_id);

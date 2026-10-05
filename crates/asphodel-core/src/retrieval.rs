@@ -1308,6 +1308,50 @@ pub(crate) struct Selected {
     pub score: f64,
 }
 
+/// What took a facet's candidate: the facet's budget, the cited fill past
+/// it, or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Taken {
+    Budget,
+    Cited,
+    Cut,
+}
+
+/// A facet's candidate as a refresh's selection scored it, before the
+/// facet's budget cut it: the raw reranker logit, or `None` when the facet
+/// missed the reranker and scored on strength alone. Replay's labelling
+/// material lists these.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FacetCandidate {
+    pub memory: Uuid,
+    pub sentence: String,
+    pub logit: Option<f64>,
+    pub strength: f64,
+    pub score: f64,
+    /// Whether the model cites the memory now.
+    pub cited: bool,
+    pub taken: Taken,
+    /// The handle the memory reached the write under, under whichever facet
+    /// took it, or `None` when it isn't in the selection.
+    pub input: Option<String>,
+}
+
+/// One facet's whole pool, in score order, and the query the reranker
+/// scored it against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FacetPool {
+    pub rerank_query: String,
+    /// Whether the reranker scored the facet.
+    pub reranked: bool,
+    pub candidates: Vec<FacetCandidate>,
+}
+
+/// One facet's selection, and its whole pool when it was asked for.
+pub(crate) struct FacetSelection {
+    pub selected: Vec<Selected>,
+    pub pool: Option<FacetPool>,
+}
+
 /// A refresh's selection, one facet per query: each query runs through the
 /// pipeline with injection's weighting, over the memories `keep` admits.
 /// Every fused candidate is reranked and scored, the best `budget` are
@@ -1319,7 +1363,8 @@ pub(crate) struct Selected {
 /// Each result is in score order, and the recall log gets one `refresh` row
 /// per query when `log` is set, with the query in `query` and `raw_query`
 /// alike. The facets share `deadline`: one whose rerank misses it scores
-/// every candidate as if its relevance were 0, so strength decides.
+/// every candidate as if its relevance were 0, so strength decides. With
+/// `pools`, each facet's whole scored pool comes back too.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select(
     cx: &Context<'_>,
@@ -1330,8 +1375,9 @@ pub(crate) fn select(
     budget: usize,
     with_cited: usize,
     log: bool,
+    pools: bool,
     deadline: Instant,
-) -> Result<Vec<Vec<Selected>>, RecallError> {
+) -> Result<Vec<FacetSelection>, RecallError> {
     let started = Instant::now();
     let now = cx.store.now();
     let queries: Vec<&str> = queries.iter().map(|query| query.trim()).collect();
@@ -1392,9 +1438,12 @@ pub(crate) fn select(
 
     let mut selections = Vec::with_capacity(queries.len());
     for (query, (found, cited)) in queries.iter().zip(found) {
-        let selected = rank_facet(cx, query, found, &cited, budget, with_cited, now, deadline);
+        let selection = rank_facet(
+            cx, query, found, &cited, budget, with_cited, pools, now, deadline,
+        );
         if log {
-            let logged: Vec<Logged> = selected
+            let logged: Vec<Logged> = selection
+                .selected
                 .iter()
                 .map(|item| Logged {
                     memory_id: item.candidate.id,
@@ -1417,14 +1466,15 @@ pub(crate) fn select(
                 },
             )?;
         }
-        selections.push(selected);
+        selections.push(selection);
     }
     Ok(selections)
 }
 
 /// One facet's candidates reranked for `query` and scored, best first:
 /// the best `budget`, then the memories in `cited`, best first, until
-/// there are `with_cited`.
+/// there are `with_cited`. With `pool`, every candidate scored comes back
+/// too, with what took it.
 #[allow(clippy::too_many_arguments)]
 fn rank_facet(
     cx: &Context<'_>,
@@ -1433,9 +1483,10 @@ fn rank_facet(
     cited: &BTreeSet<i64>,
     budget: usize,
     with_cited: usize,
+    pool: bool,
     now: Timestamp,
     deadline: Instant,
-) -> Vec<Selected> {
+) -> FacetSelection {
     let logits = if query.is_empty() {
         None
     } else {
@@ -1443,14 +1494,15 @@ fn rank_facet(
         rerank::logits(&cx.models.reranker, cx.permit, query, documents, deadline)
     };
     let ranking = &cx.tuning.ranking;
-    let mut scored: Vec<(usize, Selected)> = found
+    let mut scored: Vec<(usize, Option<f64>, Selected)> = found
         .into_iter()
         .enumerate()
         .map(|(index, candidate)| {
-            let logit = logits
+            let raw = logits
                 .as_ref()
                 .and_then(|logits| logits.get(index))
-                .map_or(0.0, |logit| f64::from(*logit));
+                .map(|logit| f64::from(*logit));
+            let logit = raw.unwrap_or(0.0);
             let phase = phase_term(
                 &candidate.window,
                 candidate.low_confidence,
@@ -1465,27 +1517,53 @@ fn rank_facet(
                 candidate.state_confidence,
                 phase,
             );
-            (index, Selected { candidate, score })
+            (index, raw, Selected { candidate, score })
         })
         .collect();
-    scored.sort_by(|(left_index, left), (right_index, right)| {
+    scored.sort_by(|(left_index, _, left), (right_index, _, right)| {
         right
             .score
             .total_cmp(&left.score)
             .then(left_index.cmp(right_index))
     });
-    let mut selected = Vec::new();
-    let mut extras = Vec::new();
-    for (_, item) in scored {
-        if selected.len() < budget {
-            selected.push(item);
-        } else if cited.contains(&item.candidate.id) {
-            extras.push(item);
-        }
+    let room = with_cited.saturating_sub(budget.min(scored.len()));
+    let mut taken = Vec::with_capacity(scored.len());
+    let mut cited_taken = 0;
+    for (place, (_, _, item)) in scored.iter().enumerate() {
+        taken.push(if place < budget {
+            Taken::Budget
+        } else if cited.contains(&item.candidate.id) && cited_taken < room {
+            cited_taken += 1;
+            Taken::Cited
+        } else {
+            Taken::Cut
+        });
     }
-    let room = with_cited.saturating_sub(selected.len());
-    selected.extend(extras.into_iter().take(room));
-    selected
+    let pool = pool.then(|| FacetPool {
+        rerank_query: query.to_owned(),
+        reranked: logits.is_some(),
+        candidates: scored
+            .iter()
+            .zip(&taken)
+            .map(|((_, logit, item), taken)| FacetCandidate {
+                memory: item.candidate.uuid,
+                sentence: item.candidate.content.clone(),
+                logit: *logit,
+                strength: item.candidate.strength,
+                score: item.score,
+                cited: cited.contains(&item.candidate.id),
+                taken: *taken,
+                input: None,
+            })
+            .collect(),
+    });
+    let selected = scored
+        .into_iter()
+        .zip(taken)
+        .filter(|(_, taken)| *taken != Taken::Cut)
+        .map(|((_, _, item), _)| item)
+        .collect();
+    FacetSelection { selected, pool }
 }
 
 /// The memories linked to `entity` or to an entity merged into it, with the

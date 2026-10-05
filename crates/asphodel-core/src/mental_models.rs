@@ -39,7 +39,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::constants::{Significance, Volatility};
-use crate::retrieval::RecallError;
+use crate::retrieval::{FacetPool, RecallError};
 use crate::store::strength::memory_kind;
 use crate::store::{Store, StoreError, micros, timestamp};
 use crate::strength::Kind;
@@ -180,6 +180,25 @@ pub struct InputMemory {
     pub sentence: String,
     /// The heading of the first facet that found it.
     pub facet: String,
+}
+
+/// A refresh's selection as it was scored: every facet's whole pool before
+/// the facet's budget cut it, for replay's labelling material.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredRefresh {
+    pub bank: String,
+    pub model: String,
+    pub at: Timestamp,
+    pub facets: Vec<ScoredFacet>,
+}
+
+/// One facet of a [`ScoredRefresh`], in plan order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredFacet {
+    pub heading: String,
+    /// The facet's query as the plan holds it.
+    pub query: String,
+    pub pool: FacetPool,
 }
 
 /// What a refresh did.

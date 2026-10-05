@@ -64,8 +64,8 @@ use uuid::Uuid;
 use super::schedule::Schedule;
 use super::{
     Answer, Applied, Facet, FailureKind, InputMemory, ModelError, ModelRow, Outcome, PLAN_TEMPLATE,
-    PLAN_VERSION, RefreshInput, RejectReason, Rejected, StoredPlan, WRITE_TEMPLATE, WRITE_VERSION,
-    load_cites, volatility_str,
+    PLAN_VERSION, RefreshInput, RejectReason, Rejected, ScoredFacet, StoredPlan, WRITE_TEMPLATE,
+    WRITE_VERSION, load_cites, volatility_str,
 };
 use crate::constants::{STATE_AGE_SHOWN_BELOW, TAU};
 use crate::models::{LlmClient, LlmError, LlmRequest, Template};
@@ -81,6 +81,8 @@ struct Selection {
     /// Memory rowid to handle.
     handles: BTreeMap<i64, String>,
     input: RefreshInput,
+    /// Each facet's whole scored pool, when they were asked for.
+    scored: Option<Vec<ScoredFacet>>,
 }
 
 fn select(
@@ -88,6 +90,7 @@ fn select(
     model: &ModelRow,
     facets: Vec<Facet>,
     log: bool,
+    pools: bool,
 ) -> Result<Selection, ModelError> {
     let (previous, cited, linked) = {
         let conn = cx.store.connection();
@@ -138,11 +141,21 @@ fn select(
         facet_budget,
         facet_budget + cited.len(),
         log,
+        pools,
         Instant::now() + REFRESH_RERANK_DEADLINE,
     )?;
     let mut ranked: Vec<Vec<Selected>> = Vec::with_capacity(facets.len());
     let mut extras: Vec<(usize, Selected)> = Vec::new();
-    for (index, mut found) in found.into_iter().enumerate() {
+    let mut scored: Vec<ScoredFacet> = Vec::new();
+    for (index, selection) in found.into_iter().enumerate() {
+        if let (Some(pool), Some(facet)) = (selection.pool, facets.get(index)) {
+            scored.push(ScoredFacet {
+                heading: facet.heading.clone(),
+                query: facet.query.clone(),
+                pool,
+            });
+        }
+        let mut found = selection.selected;
         extras.extend(
             found
                 .split_off(found.len().min(facet_budget))
@@ -185,7 +198,24 @@ fn select(
         fingerprint: fingerprint(model, &facets, &selected),
         facets,
     };
-    Ok(Selection { handles, input })
+    let scored = pools.then(|| {
+        let by_memory: BTreeMap<Uuid, &str> = input
+            .memories
+            .iter()
+            .map(|memory| (memory.memory, memory.handle.as_str()))
+            .collect();
+        for facet in &mut scored {
+            for candidate in &mut facet.pool.candidates {
+                candidate.input = by_memory.get(&candidate.memory).map(|h| (*h).to_owned());
+            }
+        }
+        scored
+    });
+    Ok(Selection {
+        handles,
+        input,
+        scored,
+    })
 }
 
 /// The selection from each facet's best, in rank order: the first of each
@@ -334,7 +364,7 @@ pub(crate) fn refresh_input(
                 query: model.question.clone(),
             }]
         });
-    Ok(select(cx, model, facets, false)?.input)
+    Ok(select(cx, model, facets, false, false)?.input)
 }
 
 /// Refreshes `model` with `llm`. Unless `force`, the write is skipped when
@@ -342,13 +372,16 @@ pub(crate) fn refresh_input(
 /// retrieval, an LLM failure or a malformed reply is `Ok(Outcome::Failed)`,
 /// recorded on the model so the schedule waits before trying again. An LLM
 /// held by a limit is `Ok(Outcome::Held)`: nothing is recorded as failed,
-/// and the refresh stays requested until the hold lifts.
+/// and the refresh stays requested until the hold lifts. With `scored`,
+/// each facet's whole scored pool is put there once the selection is made,
+/// whatever the refresh goes on to do.
 pub(crate) fn refresh(
     cx: &Context<'_>,
     schedule: &Schedule,
     model: &ModelRow,
     llm: &dyn LlmClient,
     force: bool,
+    scored: Option<&mut Vec<ScoredFacet>>,
 ) -> Result<Outcome, ModelError> {
     // Taken before the inputs are selected: a request made after this may
     // have written something the selection doesn't hold.
@@ -377,8 +410,13 @@ pub(crate) fn refresh(
     };
     // A failed retrieval is a failed refresh like any other: recorded, and
     // tried again once the interval has passed, never on every timer pass.
-    let selection = match select(cx, model, facets, true) {
-        Ok(selection) => selection,
+    let selection = match select(cx, model, facets, true, scored.is_some()) {
+        Ok(mut selection) => {
+            if let (Some(scored), Some(pools)) = (scored, selection.scored.take()) {
+                *scored = pools;
+            }
+            selection
+        }
         Err(ModelError::Retrieval(error)) => {
             tracing::warn!(model = %model.uuid, %error, "a mental model refresh's retrieval failed");
             return failed(cx, model, FailureKind::Retrieval);
