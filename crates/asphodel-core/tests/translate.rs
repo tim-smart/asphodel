@@ -3,37 +3,42 @@
 //! A translation is a new memory that supersedes the one named, the way a
 //! refinement does, so the chain carries strength, accesses and provenance
 //! over. The other two tests race a translation against the bank's other
-//! writers. Every memory here is synthetic, inserted directly.
+//! writers. Every memory here is made by extracting a turn.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use asphodel_core::Service;
 use asphodel_core::clock::SimulatedClock;
 use asphodel_core::config::Tuning;
-use asphodel_core::extraction::EDIT_REFINED;
+use asphodel_core::extraction::Call2Input;
 use asphodel_core::ingest::Turn;
 use asphodel_core::inspect::MemoryView;
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, ModelError, Models,
 };
 use asphodel_core::store::bank::BankIdentity;
-use asphodel_core::store::{DB_FILE, OpenOptions, Store, VectorIndex, micros};
+use asphodel_core::store::{DB_FILE, OpenOptions, Store};
 use asphodel_core::translate::{TranslateError, Translation};
 use jiff::Timestamp;
-use rusqlite::types::FromSql;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 // Fixtures
 
 const START: &str = "2026-10-01T07:00:00Z";
-const TZ: &str = "Pacific/Auckland";
 
-/// What the fixture turn says. The LLM is never shown it.
+/// When the clock starts, so memories can be said before [`START`].
+const EARLIER: &str = "2026-09-01T00:00:00Z";
+const TZ: &str = "Pacific/Auckland";
+const BANK: &str = "main";
+const MODEL: &str = "fake-llm";
+
+/// What the turn a memory comes from says around it. The LLM is never
+/// shown it.
 const PASSAGE: &str = "Passage text the translation must never see.";
 
 const RUSSIAN: &str = "Сэм пьёт чай каждое утро.";
@@ -52,15 +57,10 @@ impl Drop for TestDir {
     }
 }
 
-fn next_uuid() -> Uuid {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    Uuid::from_u128((0x7a_u128 << 120) | u128::from(NEXT.fetch_add(1, Ordering::Relaxed)))
-}
-
-fn turn(session: &str, user: &str) -> Turn {
+fn turn(session: &str, message_at: Timestamp, user: &str) -> Turn {
     Turn {
         session_id: session.into(),
-        message_at: at("2026-10-01T06:30:00Z"),
+        message_at,
         timezone: Some(TZ.into()),
         user_text: user.into(),
         assistant_text: "Noted.".into(),
@@ -71,23 +71,44 @@ fn turn(session: &str, user: &str) -> Turn {
     }
 }
 
+/// Call 1's claim of `content`, quoting all of it: a minor fact with no
+/// times and no entities. The nullable fields it may leave out are left out.
+fn claim(content: &str) -> Value {
+    json!({
+        "content": content,
+        "kind": "fact",
+        "quote": content,
+        "significance": "minor",
+        "remember_this": false,
+        "changes_something": false,
+        "window_confidence": "high",
+        "entities": [],
+    })
+}
+
+/// Call 2's reply giving the first claim `labels` against their memories.
+fn call2(input: &Call2Input, labels: &[(Uuid, &str)]) -> Value {
+    let labels: Vec<Value> = labels
+        .iter()
+        .map(|(memory, label)| {
+            let neighbour = input.neighbours.iter().find(|n| n.memory == *memory);
+            json!({"neighbour": neighbour.expect("a neighbour").handle, "label": label})
+        })
+        .collect();
+    json!({"claims": [{"claim": input.claims[0].handle, "labels": labels}]})
+}
+
 /// The LLM's reply for a translation.
-fn reply(sentence: &str) -> Value {
-    json!({ "sentence": sentence })
-}
-
 fn llm(sentence: &str) -> FakeLlm {
-    FakeLlm::scripted("fake-llm", vec![reply(sentence)])
+    FakeLlm::scripted(MODEL, vec![json!({ "sentence": sentence })])
 }
 
-/// A service on the fakes with one bank, `main`, and an extracted turn
-/// saying [`PASSAGE`] for memories to rest on. Field order matters: the
+/// A service on the fakes with one bank, [`BANK`]. Field order matters: the
 /// service drops before the directory it lives in.
 struct Harness {
     service: Service,
     clock: Arc<SimulatedClock>,
     dir: TestDir,
-    chunk: i64,
 }
 
 impl Harness {
@@ -98,55 +119,26 @@ impl Harness {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         )));
-        let clock = Arc::new(SimulatedClock::new(at(START)));
-        let mut h = Self::open(dir, clock, 0, language, Models::fake(), None);
-        h.service
-            .ensure_bank_with_models(
-                "main",
-                &BankIdentity {
-                    owner_name: Some("Tim".into()),
-                    owner_platform_ids: vec![],
-                    assistant_name: Some("Hermes".into()),
-                    timezone: Some(TZ.into()),
-                },
-            )
-            .unwrap();
-        h.service
-            .ingest_turn("main", &turn("fixtures", PASSAGE))
-            .unwrap();
-        h.chunk = h.one("SELECT id FROM chunks", []);
-        h.execute("DELETE FROM extraction_queue", []);
-        h.execute("UPDATE chunks SET extracted_at = ?1", [micros(at(START))]);
+        let clock = Arc::new(SimulatedClock::new(at(EARLIER)));
+        let h = Self::open(dir, clock, language, Models::fake());
+        let identity = BankIdentity {
+            owner_name: Some("Tim".into()),
+            assistant_name: Some("Hermes".into()),
+            timezone: Some(TZ.into()),
+            ..BankIdentity::default()
+        };
+        h.service.ensure_bank_with_models(BANK, &identity).unwrap();
         h
     }
 
-    /// The same store under a restarted daemon: `[llm] language` set to
-    /// `language`, serving with `models` and carrying `previous` for a bank
-    /// recorded under it.
-    fn restart(
-        self,
-        language: Option<&str>,
-        models: Models,
-        previous: Option<Arc<dyn Embedder>>,
-    ) -> Self {
-        let Harness {
-            service,
-            clock,
-            dir,
-            chunk,
-        } = self;
-        drop(service);
-        Self::open(dir, clock, chunk, language, models, previous)
+    /// The same store under a restarted daemon translating into English and
+    /// serving with `models`.
+    fn restart(self, models: Models) -> Self {
+        drop(self.service);
+        Self::open(self.dir, self.clock, Some("English"), models)
     }
 
-    fn open(
-        dir: TestDir,
-        clock: Arc<SimulatedClock>,
-        chunk: i64,
-        language: Option<&str>,
-        models: Models,
-        previous: Option<Arc<dyn Embedder>>,
-    ) -> Self {
+    fn open(dir: TestDir, clock: Arc<SimulatedClock>, lang: Option<&str>, models: Models) -> Self {
         let mut toml = format!(
             "[injection.reranker_floors]\n\"{}\" = 0.0\n\
              [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
@@ -155,26 +147,17 @@ impl Harness {
             FakeEmbedder::MODEL_ID,
             FakeEmbedderV2::MODEL_ID,
         );
-        if let Some(language) = language {
+        if let Some(language) = lang {
             toml.push_str(&format!("[llm]\nlanguage = \"{language}\"\n"));
         }
         let store =
             Store::open(&dir.0.join("data"), OpenOptions::default(), clock.clone()).unwrap();
-        let mut service = Service::with_models(
-            clock.clone(),
-            store,
-            Tuning::from_toml(&toml).unwrap(),
-            models,
-        )
-        .unwrap();
-        if let Some(previous) = previous {
-            service = service.with_previous_embedder(previous).unwrap();
-        }
+        let tuning = Tuning::from_toml(&toml).unwrap();
+        let service = Service::with_models(clock.clone(), store, tuning, models).unwrap();
         Self {
             service,
             clock,
             dir,
-            chunk,
         }
     }
 
@@ -182,96 +165,85 @@ impl Harness {
         self.dir.0.join("data").join(DB_FILE)
     }
 
-    fn one<T: FromSql, P: rusqlite::Params>(&self, sql: &str, params: P) -> T {
-        self.service
-            .store()
-            .unwrap()
-            .connection()
-            .query_row(sql, params, |row| row.get(0))
-            .unwrap()
-    }
-
-    fn execute<P: rusqlite::Params>(&self, sql: &str, params: P) {
-        self.service
-            .store()
-            .unwrap()
-            .connection()
-            .execute(sql, params)
-            .unwrap();
-    }
-
-    /// A state in `main`, inserted directly with no vector: a window, a
-    /// volatility, a span into the fixture chunk, an entity link with a
-    /// surface form, and accesses on three separate occasions.
-    fn memory(&self, content: &str) -> Uuid {
-        let uuid = next_uuid();
-        let created = micros(at("2026-09-01T00:00:00Z"));
-        self.execute(
-            "INSERT INTO memories (uuid, bank_id, content, kind, significance, chunk_id,
-                                   source_start, source_end, observed_at,
-                                   valid_from, valid_from_precision, window_confidence,
-                                   volatility, created_at, updated_at)
-             SELECT ?1, id, ?2, 'state', 'minor', ?3, 3, 27, ?4, ?4, 'day', 'low',
-                    'months', ?4, ?4
-             FROM banks WHERE name = 'main'",
-            (uuid.to_string(), content, self.chunk, created),
-        );
-        for (kind, when, turn) in [
-            ("created", "2026-09-01T00:00:00Z", 1),
-            ("used", "2026-09-10T00:00:00Z", 2),
-            ("confirmed", "2026-09-20T00:00:00Z", 3),
-        ] {
-            self.execute(
-                "INSERT INTO accesses (bank_id, memory_id, kind, at, turn)
-                 SELECT bank_id, id, ?2, ?3, ?4 FROM memories WHERE uuid = ?1",
-                (uuid.to_string(), kind, micros(at(when)), turn),
-            );
+    /// The owner says `user` at `message_at`, and the turn is extracted at
+    /// once with call 1 finding `claims` and judging `used` used, and call 2
+    /// giving the first claim `labels` against their memories. Returns the
+    /// new memories.
+    fn says(
+        &self,
+        message_at: &str,
+        user: &str,
+        claims: Vec<Value>,
+        used: &[Uuid],
+        labels: &[(Uuid, &str)],
+    ) -> Vec<Uuid> {
+        let service = &self.service;
+        self.clock.set(at(message_at));
+        let said = turn("fixtures", at(message_at), user);
+        service.ingest_turn(BANK, &said).unwrap();
+        let lease = service.claim_chunk(BANK).unwrap().expect("queued");
+        let input = service.call1_input(&lease, used).unwrap();
+        let handles: Vec<&str> = used
+            .iter()
+            .map(|id| {
+                let memory = input.in_context.iter().find(|m| m.memory == *id);
+                memory.expect("in context").handle.as_str()
+            })
+            .collect();
+        let call1 = json!({"claims": claims, "used_injected_ids": handles});
+        let mut replies = vec![call1.clone()];
+        if let Some(input) = service.call2_input(&lease, &call1, used).unwrap() {
+            replies.push(call2(&input, labels));
         }
-        let entity = next_uuid();
-        self.execute(
-            "INSERT INTO entities (uuid, bank_id, name, kind, created_at, updated_at)
-             SELECT ?1, id, 'Sam', 'person', ?2, ?2 FROM banks WHERE name = 'main'",
-            (entity.to_string(), created),
-        );
-        self.execute(
-            "INSERT INTO memory_entities (memory_id, entity_id, surface_form)
-             SELECT m.id, e.id, 'Сэм' FROM memories m, entities e
-             WHERE m.uuid = ?1 AND e.uuid = ?2",
-            (uuid.to_string(), entity.to_string()),
-        );
-        uuid
+        let llm = FakeLlm::scripted(MODEL, replies);
+        service.extract_chunk(lease, &llm, used).unwrap().memories
+    }
+
+    /// A state said on 1 September inside [`PASSAGE`], with a window, a
+    /// volatility and an entity linked by its first word, then used on 10
+    /// September and confirmed on 20 September: three separate occasions.
+    fn memory(&self, content: &str) -> Uuid {
+        let surface = content.split_whitespace().next().unwrap();
+        let mut state = claim(content);
+        state["kind"] = json!("state");
+        state["valid_from"] = json!({"at": "2026-09-01T00:00", "precision": "day"});
+        state["window_confidence"] = json!("low");
+        state["volatility"] = json!("months");
+        state["entities"] = json!([
+            {"entity": null, "new_name": "Sam", "new_kind": "person", "surface_form": surface}
+        ]);
+        let passage = format!("{PASSAGE} {content}");
+        let memory = self.says(EARLIER, &passage, vec![state], &[], &[])[0];
+        self.says("2026-09-10T00:00:00Z", "Thanks.", vec![], &[memory], &[]);
+        let confirmed = [(memory, "confirmed")];
+        let again = vec![claim(content)];
+        self.says("2026-09-20T00:00:00Z", content, again, &[], &confirmed);
+        self.clock.set(at(START));
+        memory
+    }
+
+    /// The memories call 2 would be shown for a new claim of `sentence`.
+    /// Its vector must be near theirs for call 2 to run at all.
+    fn neighbours(&self, sentence: &str) -> Vec<Uuid> {
+        let service = &self.service;
+        let probe = turn("probe", at(START), sentence);
+        service.ingest_turn(BANK, &probe).unwrap();
+        let lease = service.claim_chunk(BANK).unwrap().expect("queued");
+        let call1 = json!({"claims": [claim(sentence)], "used_injected_ids": []});
+        match service.call2_input(&lease, &call1, &[]).unwrap() {
+            Some(input) => input.neighbours.iter().map(|n| n.memory).collect(),
+            None => Vec::new(),
+        }
     }
 
     fn show(&self, memory: Uuid) -> MemoryView {
-        self.service
-            .show_memory("main", &memory.to_string())
-            .unwrap()
+        self.service.show_memory(BANK, &memory.to_string()).unwrap()
     }
 
     fn translate(&self, memory: Uuid, llm: &dyn LlmClient) -> Result<Translation, TranslateError> {
         self.service
-            .translate_memory("main", &memory.to_string(), llm)
+            .translate_memory(BANK, &memory.to_string(), llm)
     }
-
-    fn refined_edits(&self) -> i64 {
-        self.one("SELECT COUNT(*) FROM edits WHERE kind = ?1", [EDIT_REFINED])
-    }
-
-    /// The stored vector of `memory`, as the index holds it.
-    fn vector(&self, memory: Uuid) -> Vec<u8> {
-        self.one(
-            "SELECT embedding FROM memory_vectors
-             WHERE memory_id = (SELECT id FROM memories WHERE uuid = ?1)",
-            [memory.to_string()],
-        )
-    }
-}
-
-fn vector_bytes(embedder: &dyn Embedder, text: &str) -> Vec<u8> {
-    embedder.embed(&[text]).unwrap()[0]
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect()
 }
 
 /// The new head of a translation.
@@ -289,19 +261,17 @@ fn a_translation_supersedes_the_memory_and_keeps_its_strength_accesses_and_prove
     let h = Harness::new(None);
     let original = h.memory(RUSSIAN);
     h.service
-        .set_significance("main", &original.to_string(), Some("major"))
+        .set_significance(BANK, &original.to_string(), Some("major"))
         .unwrap();
     let asked = llm(ENGLISH);
 
     // Without a target language there's nothing to translate into.
     let refused = h.translate(original, &asked);
-    assert!(
-        matches!(refused, Err(TranslateError::LanguageUnset)),
-        "{refused:?}"
-    );
+    let unset = matches!(refused, Err(TranslateError::LanguageUnset));
+    assert!(unset, "{refused:?}");
     assert!(asked.requests().is_empty());
 
-    let h = h.restart(Some("English"), Models::fake(), None);
+    let h = h.restart(Models::fake());
     let before = h.show(original);
     let head = translated(h.translate(original, &asked));
 
@@ -309,14 +279,15 @@ fn a_translation_supersedes_the_memory_and_keeps_its_strength_accesses_and_prove
     // the passage it came from.
     let requests = asked.requests();
     assert_eq!(requests.len(), 1);
-    assert!(requests[0].system.contains("English"));
-    assert!(requests[0].user.contains(RUSSIAN));
-    assert!(!requests[0].system.contains(PASSAGE) && !requests[0].user.contains(PASSAGE));
+    let sent = format!("{}\n{}", requests[0].system, requests[0].user);
+    assert!(sent.contains("English") && sent.contains(RUSSIAN), "{sent}");
+    assert!(!sent.contains(PASSAGE), "{sent}");
 
     // A refinement: one chain, the original superseded but not retracted.
     let after = h.show(head);
     assert_eq!(after.sentence, ENGLISH);
     assert_eq!(after.chain.head, head);
+    assert_eq!(after.chain.members.len(), 2);
     let old = after
         .chain
         .members
@@ -325,11 +296,11 @@ fn a_translation_supersedes_the_memory_and_keeps_its_strength_accesses_and_prove
         .expect("the original is in the new head's chain");
     assert_eq!(old.superseded_by, Some(head));
     assert!(!old.retracted && !old.hidden);
-    assert_eq!(h.refined_edits(), 1);
 
     // Strength is unchanged at the same instant: the same significance, the
     // same accesses, and no new access for the translation itself.
     assert_eq!(after.strength, before.strength);
+    assert_eq!(after.strength.occasions, 3);
     assert_eq!(after.accesses.len(), before.accesses.len());
     for (inherited, own) in after.accesses.iter().zip(&before.accesses) {
         assert_eq!(
@@ -340,18 +311,14 @@ fn a_translation_supersedes_the_memory_and_keeps_its_strength_accesses_and_prove
     }
 
     // Provenance and everything but the sentence carry over, and the new
-    // sentence is what's embedded.
-    assert_eq!(after.source.chunk, before.source.chunk);
-    assert_eq!(
-        (after.source.start, after.source.end),
-        (before.source.start, before.source.end)
-    );
+    // sentence is what's embedded: a claim of it finds the head.
+    assert_eq!(after.source, before.source);
     assert_eq!(after.observed_at, before.observed_at);
     assert_eq!(after.kind, before.kind);
     assert_eq!(after.window, before.window);
     assert_eq!(after.significance, before.significance);
     assert_eq!(after.entities, before.entities);
-    assert_eq!(h.vector(head), vector_bytes(&FakeEmbedder, ENGLISH));
+    assert!(!after.entities.is_empty());
 
     // Naming an id again writes nothing and asks the LLM nothing: the old
     // id is refused with its head, and the head is already in the language.
@@ -369,51 +336,23 @@ fn a_translation_supersedes_the_memory_and_keeps_its_strength_accesses_and_prove
         }
     );
     assert!(again.requests().is_empty());
-    assert_eq!(h.refined_edits(), 1);
+    assert_eq!(h.show(head).chain.members.len(), 2);
+    assert!(h.neighbours(ENGLISH).contains(&head));
 }
 
 // Concurrency with the bank's other writers
-
-/// Waits briefly for a translation running on another thread to commit. A
-/// translation that has to wait for the bank never does, so the caller
-/// carries on either way.
-fn give_translation_a_chance(h: &Harness) {
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while h.refined_edits() == 0 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
 
 /// [`FakeEmbedderV2`] behind a gate, for a re-embed. Its first call is the
 /// job's step: while it runs, a memory is inserted below the job's cursor,
 /// so the step never reaches it and the swap has a tail to embed. The
 /// second call is the swap's tail, embedded after the swap has read what's
-/// unstaged and before its transaction: it says so and waits to be let go.
+/// unstaged and before its transaction: it says so on `paused` and waits on
+/// `open` to be let go.
 struct Gate {
     db: PathBuf,
     calls: AtomicUsize,
-    paused: Mutex<Option<Sender<()>>>,
-    open: Mutex<bool>,
-    opened: Condvar,
-}
-
-impl Gate {
-    fn new(db: PathBuf) -> (Arc<Self>, Receiver<()>) {
-        let (paused, receiver) = mpsc::channel();
-        let gate = Arc::new(Self {
-            db,
-            calls: AtomicUsize::new(0),
-            paused: Mutex::new(Some(paused)),
-            open: Mutex::new(false),
-            opened: Condvar::new(),
-        });
-        (gate, receiver)
-    }
-
-    fn open(&self) {
-        *self.open.lock().unwrap() = true;
-        self.opened.notify_all();
-    }
+    paused: Sender<()>,
+    open: Mutex<Receiver<()>>,
 }
 
 impl Embedder for Gate {
@@ -438,18 +377,13 @@ impl Embedder for Gate {
                                 chunk_id, source_start, source_end, observed_at,
                                 window_confidence, created_at, updated_at
                          FROM memories LIMIT 1",
-                        [next_uuid().to_string()],
+                        [Uuid::from_u128(0x7a).to_string()],
                     )
                     .unwrap();
             }
             1 => {
-                if let Some(paused) = self.paused.lock().unwrap().take() {
-                    let _ = paused.send(());
-                }
-                let mut open = self.open.lock().unwrap();
-                while !*open {
-                    open = self.opened.wait(open).unwrap();
-                }
+                let _ = self.paused.send(());
+                let _ = self.open.lock().unwrap().recv();
             }
             _ => {}
         }
@@ -465,22 +399,37 @@ fn a_translation_during_a_reembed_swap_is_embedded_with_the_new_model() {
     // the bank has after it.
     let h = Harness::new(Some("English"));
     let original = h.memory(RUSSIAN);
-    let (gate, paused) = Gate::new(h.db());
+    let (paused, on_pause) = mpsc::channel();
+    let (open, on_open) = mpsc::channel();
+    let gate = Gate {
+        db: h.db(),
+        calls: AtomicUsize::new(0),
+        paused,
+        open: Mutex::new(on_open),
+    };
     let models = Models {
-        embedder: gate.clone(),
+        embedder: Arc::new(gate),
         reranker: Arc::new(FakeReranker),
     };
-    let h = h.restart(Some("English"), models, Some(Arc::new(FakeEmbedder)));
-    h.service.start_reembed("main").unwrap();
+    let mut h = h.restart(models);
+    // The bank was recorded under the old model, which the re-embed replaces.
+    let previous = Arc::new(FakeEmbedder);
+    h.service = h.service.with_previous_embedder(previous).unwrap();
+    h.service.start_reembed(BANK).unwrap();
 
     let (outcome, reembedded) = std::thread::scope(|scope| {
-        let reembed = scope.spawn(|| h.service.run_reembed("main"));
-        paused
+        let reembed = scope.spawn(|| h.service.run_reembed(BANK));
+        on_pause
             .recv_timeout(Duration::from_secs(30))
             .expect("the swap reaches its tail");
         let translate = scope.spawn(|| h.translate(original, &llm(ENGLISH)));
-        give_translation_a_chance(&h);
-        gate.open();
+        // Give the translation a moment to commit. One that has to wait for
+        // the bank never does, so carry on either way.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while h.show(original).chain.head == original && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        open.send(()).unwrap();
         let reembedded = reembed.join().unwrap();
         (translate.join().unwrap(), reembedded)
     });
@@ -488,7 +437,7 @@ fn a_translation_during_a_reembed_swap_is_embedded_with_the_new_model() {
     reembedded.unwrap();
     let head = translated(outcome);
     assert!(
-        h.vector(head) == vector_bytes(&FakeEmbedderV2, ENGLISH),
+        h.neighbours(ENGLISH).contains(&head),
         "the translation keeps a vector from a model the bank no longer uses"
     );
 }
@@ -502,89 +451,36 @@ fn a_translation_cant_commit_while_an_extraction_is_prepared() {
     // without writing and stops holding back the queue.
     let h = Harness::new(Some("English"));
     let before_work = "Sam drinks tea every morning before work.";
-    let original = h.memory(before_work);
-    let (bank_id, memory_id): (i64, i64) = (
-        h.one("SELECT id FROM banks WHERE name = 'main'", []),
-        h.one(
-            "SELECT id FROM memories WHERE uuid = ?1",
-            [original.to_string()],
-        ),
-    );
-    let store = h.service.store().unwrap();
-    store
-        .vectors()
-        .upsert(
-            &store.connection(),
-            bank_id,
-            memory_id,
-            &FakeEmbedder.embed(&[before_work]).unwrap()[0],
-        )
-        .unwrap();
+    let original = h.says(EARLIER, before_work, vec![claim(before_work)], &[], &[])[0];
+    h.clock.set(at(START));
 
     let green = "Sam drinks green tea every morning before work.";
-    h.service.ingest_turn("main", &turn("s1", green)).unwrap();
-    let call1 = json!({
-        "claims": [{
-            "content": green,
-            "kind": "fact",
-            "quote": "Sam drinks green tea every morning before work",
-            "significance": "minor",
-            "remember_this": false,
-            "changes_something": false,
-            "valid_from": null,
-            "valid_until": null,
-            "window_confidence": "high",
-            "until_event": null,
-            "due_at": null,
-            "volatility": null,
-            "recurrence_text": null,
-            "recurrence_rrule": null,
-            "recurrence_start": null,
-            "entities": [],
-        }],
-        "used_injected_ids": [],
-    });
-    let claimed = h
-        .service
-        .next_extraction("main")
-        .unwrap()
-        .expect("the turn is queued");
-    let input = h
-        .service
-        .call2_input(&claimed.lease, &call1, &claimed.in_context)
-        .unwrap()
-        .expect("the memory is a neighbour, so call 2 runs");
-    let neighbour = input
-        .neighbours
-        .iter()
-        .find(|neighbour| neighbour.memory == original)
-        .expect("the memory is a neighbour");
-    let call2 = json!({"claims": [{
-        "claim": input.claims[0].handle,
-        "labels": [{"neighbour": neighbour.handle, "label": "refines"}],
-    }]});
+    let said = turn("s1", at("2026-10-01T06:30:00Z"), green);
+    h.service.ingest_turn(BANK, &said).unwrap();
+    let call1 = json!({"claims": [claim(green)], "used_injected_ids": []});
+    let claimed = h.service.next_extraction(BANK).unwrap();
+    let claimed = claimed.expect("the turn is queued");
+    let (lease, in_context) = (claimed.lease, &claimed.in_context);
+    let input = h.service.call2_input(&lease, &call1, in_context).unwrap();
+    let input = input.expect("the memory is a neighbour, so call 2 runs");
+    let call2 = call2(&input, &[(original, "refines")]);
+    let extractor = FakeLlm::scripted(MODEL, vec![call1, call2]);
     let prepared = h
         .service
-        .prepare_extraction(
-            claimed.lease,
-            &FakeLlm::scripted("fake-llm", vec![call1, call2]),
-            &claimed.in_context,
-            &claimed.entries,
-        )
+        .prepare_extraction(lease, &extractor, in_context, &claimed.entries)
         .unwrap();
 
-    h.service
-        .ingest_turn("main", &turn("s2", "Sam walks to work."))
-        .unwrap();
+    let next = turn("s2", at("2026-10-01T06:31:00Z"), "Sam walks to work.");
+    h.service.ingest_turn(BANK, &next).unwrap();
 
     let busy = h.translate(original, &llm(ENGLISH));
     assert!(matches!(busy, Err(TranslateError::Busy)), "{busy:?}");
-    assert_eq!(h.refined_edits(), 0);
+    assert_eq!(h.show(original).chain.head, original, "it wrote nothing");
 
     let refinement = h.service.commit_extraction(prepared).unwrap().memories[0];
     assert_eq!(h.show(original).chain.head, refinement);
     assert!(
-        h.service.next_extraction("main").unwrap().is_some(),
+        h.service.next_extraction(BANK).unwrap().is_some(),
         "the queue hands out the next chunk"
     );
 }

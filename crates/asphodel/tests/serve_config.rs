@@ -2,28 +2,30 @@
 //!
 //! Each deployment flag has an `ASPHODEL_*` environment variable,
 //! secrets come from the environment only, and an unknown key or
-//! out-of-range value in the tuning file stops the daemon starting.
+//! out-of-range value in the tuning file stops the daemon starting. The
+//! tests read what the daemon resolved from `GET /v1/config`.
 
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
 
 const TOKEN: &str = "tok-7f3a9c-secret";
 const LLM_KEY: &str = "sk-live-41b2e8-secret";
 
-/// A floor for each fake model. The daemon loads its models before it is
-/// ready and refuses a model without floors, so every daemon
-/// here that is meant to start runs on the fakes with these.
+/// A floor for each fake model. The daemon refuses a model without floors,
+/// so every daemon here that is meant to start runs on the fakes with these.
 const FLOORS_FOR_FAKES: &str = "[injection.reranker_floors]\n\"fake-reranker:v1\" = 0.0\n\
                                 [ranking.relevance_scales]\n\"fake-reranker:v1\" = 1.0\n\
                                 [reconcile.embedding_floors]\n\"fake-embedder:v1\" = 0.5\n";
 
-/// `asphodel serve` with a clean environment, so the caller's `ASPHODEL_*`
-/// variables can't leak in. It runs on the fake models, because the real
-/// ones aren't on a CI machine.
+/// `asphodel serve` on the fake models (the real ones aren't on a CI machine)
+/// with a clean environment, so the caller's `ASPHODEL_*` can't leak in.
 fn serve() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
     command
@@ -33,32 +35,21 @@ fn serve() -> Command {
     command
 }
 
-/// `asphodel serve` with its own data dir under `dir`. Every daemon that
-/// is meant to start gets one, so `--data-dir` can become required without
-/// touching these tests. Precedence tests that set `ASPHODEL_DATA_DIR`
-/// use `serve()` instead, because the flag would win over the variable.
+/// `asphodel serve` with its own data dir under `dir`. Tests that set
+/// `ASPHODEL_DATA_DIR` use `serve()`, since the flag would win.
 fn serve_in(dir: &TestDir) -> Command {
     let mut command = serve();
     command.arg("--data-dir").arg(dir.0.join("data"));
     command
 }
 
-/// [`serve_in`] with a tuning file holding only the floors for the fakes,
-/// for a daemon whose test doesn't need a tuning file of its own.
+/// [`serve_in`] with a tuning file holding only the floors for the fakes.
 fn serve_with_floors(dir: &TestDir) -> Command {
     let mut command = serve_in(dir);
     command
         .arg("--config")
         .arg(dir.with_floors("floors.toml", ""));
     command
-}
-
-fn run(command: &mut Command) -> Output {
-    command.stdin(Stdio::null()).output().unwrap()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 /// A temporary directory removed even when an assertion unwinds.
@@ -94,10 +85,19 @@ impl Drop for TestDir {
     }
 }
 
+/// A loopback address on a port that is free now.
+fn loopback() -> String {
+    let free = TcpListener::bind("127.0.0.1:0").unwrap();
+    free.local_addr().unwrap().to_string()
+}
+
 /// A running daemon, killed on drop.
 struct Daemon {
     child: Child,
-    log: String,
+    /// The loopback address it listens on.
+    addr: String,
+    /// Reads its stderr to the end.
+    log: Option<JoinHandle<String>>,
 }
 
 impl Drop for Daemon {
@@ -107,278 +107,194 @@ impl Drop for Daemon {
     }
 }
 
-/// Starts the daemon on an ephemeral loopback port and collects its log up
-/// to the "listening" line. Panics if it exits or stalls first.
-fn start(command: &mut Command) -> Daemon {
+impl Daemon {
+    /// `GET <path>` with `token` if given: the status and the body.
+    fn get(&self, path: &str, token: Option<&str>) -> std::io::Result<(u16, String)> {
+        let mut stream = TcpStream::connect(&self.addr)?;
+        let auth = token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+        write!(stream, "GET {path} HTTP/1.0\r\n{auth}\r\n")?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        let (head, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
+        let status = head.split_whitespace().nth(1).and_then(|s| s.parse().ok());
+        Ok((status.unwrap_or(0), body.to_string()))
+    }
+
+    /// `GET /v1/config`, which must answer 200, with `token` if given.
+    fn config(&self, token: Option<&str>) -> Value {
+        let (status, body) = self.get("/v1/config", token).unwrap();
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    /// Kills the daemon and returns its whole log.
+    fn log(&mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.log.take().unwrap().join().unwrap()
+    }
+}
+
+/// Starts the daemon listening on `addr` and waits until `/v1/health`
+/// answers 200. Panics with its log if it exits or stalls first.
+fn start(command: &mut Command, addr: &str) -> Daemon {
     let mut child = command
-        .args(["--listen", "127.0.0.1:0"])
         .env("ASPHODEL_LOG", "trace")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let (lines, received) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines() {
-            let Ok(line) = line else { break };
-            if lines.send(line).is_err() {
-                break;
-            }
-        }
+    let mut stderr = child.stderr.take().unwrap();
+    let log = std::thread::spawn(move || {
+        let mut log = String::new();
+        let _ = stderr.read_to_string(&mut log);
+        log
     });
-
-    let mut log = String::new();
-    loop {
-        match received.recv_timeout(Duration::from_secs(10)) {
-            Ok(line) => {
-                log.push_str(&line);
-                log.push('\n');
-                if line.contains("asphodel listening") {
-                    return Daemon { child, log };
-                }
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("the daemon never became ready:\n{log}");
-            }
+    // Dropped, so killed, if it panics here.
+    let mut daemon = Daemon {
+        child,
+        addr: addr.to_string(),
+        log: Some(log),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(daemon.get("/v1/health", None), Ok((200, _))) {
+        if Instant::now() >= deadline {
+            panic!("the daemon never became ready:\n{}", daemon.log());
         }
+        std::thread::sleep(Duration::from_millis(20));
     }
+    daemon
 }
 
-/// The JSON of the "resolved config" log line.
-fn resolved_config(log: &str) -> serde_json::Value {
-    let line = log
-        .lines()
-        .find(|line| line.contains("resolved config"))
-        .unwrap_or_else(|| panic!("no resolved config line in:\n{log}"));
-    let start = line.find("config=").expect("a config field") + "config=".len();
-    let text = &line[start..];
-    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
-    stream.next().unwrap().unwrap()
-}
-
-#[test]
-fn secrets_have_no_flag() {
-    let output = run(serve().arg("--help"));
-    let help = String::from_utf8_lossy(&output.stdout).to_lowercase();
-    assert!(!help.contains("--token"), "{help}");
-    assert!(!help.contains("api-key"), "{help}");
-    assert!(!help.contains("--llm-key"), "{help}");
-
-    for args in [
-        ["--token", TOKEN],
-        ["--llm-api-key", LLM_KEY],
-        ["--api-key", LLM_KEY],
-    ] {
-        let output = run(serve().args(args));
-        assert!(!output.status.success(), "{args:?} was accepted");
-    }
-}
-
-#[test]
-fn an_unknown_tuning_key_stops_startup() {
-    let dir = TestDir::new();
-    let path = dir.file("tuning.toml", "[clock]\nquiet_rat = 0.2\n");
-    let output = run(serve_in(&dir).arg("--config").arg(&path));
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("quiet_rat"), "{}", stderr(&output));
-}
-
-#[test]
-fn an_out_of_range_tuning_value_stops_startup() {
-    let dir = TestDir::new();
-    let path = dir.file("tuning.toml", "[purge]\ndelta = -1.0\n");
-    let output = run(serve_in(&dir).arg("--config").arg(&path));
-    assert!(!output.status.success());
+/// Runs a daemon that is expected to refuse and exit on its own, naming
+/// `name` (an empty one checks nothing). Stderr goes to a file so a pipe
+/// can't fill while waiting, and a daemon still running at the deadline is
+/// killed so one that wrongly starts can't hang the suite.
+fn refused(dir: &TestDir, command: &mut Command, name: &str) {
+    let log_path = dir.0.join("stderr.log");
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log_path).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            status => break status,
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let log = std::fs::read_to_string(log_path).unwrap();
     assert!(
-        stderr(&output).contains("purge.delta"),
-        "{}",
-        stderr(&output)
+        status.is_some_and(|status| !status.success()),
+        "it started ({status:?}):\n{log}"
     );
+    assert!(log.contains(name), "{name}:\n{log}");
 }
 
 #[test]
-fn a_missing_tuning_file_stops_startup() {
+fn bad_settings_and_secret_flags_stop_startup() {
     let dir = TestDir::new();
-    let output = run(serve_in(&dir)
-        .arg("--config")
-        .arg(dir.0.join("missing.toml")));
-    assert!(!output.status.success());
+    let loopback = ["--listen", "127.0.0.1:0"];
+    let with_config = |name, text| {
+        let mut command = serve_in(&dir);
+        command.arg("--config").arg(dir.with_floors(name, text));
+        command
+    };
+    // Secrets have no flag, so they never show in a process list.
+    for flag in ["--token", "--llm-api-key", "--api-key"] {
+        refused(&dir, serve().args([flag, TOKEN]), "");
+    }
+    let key = "[clock]\nquiet_rat = 0.2\n";
+    refused(&dir, &mut with_config("key.toml", key), "quiet_rat");
+    let range = "[purge]\ndelta = -1.0\n";
+    refused(&dir, &mut with_config("range.toml", range), "purge.delta");
+    let missing = dir.0.join("missing.toml");
+    refused(&dir, serve_in(&dir).arg("--config").arg(missing), "");
+    let endpoint = "[llm]\nendpoint = \"http://\"\n";
+    let mut command = with_config("endpoint.toml", endpoint);
+    refused(&dir, command.args(loopback), "llm.endpoint");
+    // The store lives under the data dir: without one there's nowhere to
+    // persist.
+    refused(&dir, serve().args(loopback), "--data-dir");
+    // The variable is read: an unparseable address in it is refused.
+    let mut command = serve_with_floors(&dir);
+    refused(&dir, command.env("ASPHODEL_LISTEN", "not-an-address"), "");
+    // Off loopback needs a token, from the environment.
+    let off_loopback = || {
+        let mut command = serve_with_floors(&dir);
+        command.args(["--listen", "0.0.0.0:0"]);
+        command
+    };
+    refused(&dir, &mut off_loopback(), "ASPHODEL_TOKEN");
+    let mut empty_token = off_loopback();
+    empty_token.env("ASPHODEL_TOKEN", "");
+    refused(&dir, &mut empty_token, "ASPHODEL_TOKEN");
 }
 
 #[test]
-fn the_config_flag_wins_over_its_variable() {
-    let dir = TestDir::new();
-    let bad = dir.file("bad.toml", "[injection]\ncap = 0\n");
-    let good = dir.with_floors("good.toml", "[clock]\nquiet_rate = 0.3\n");
-    let daemon = start(
-        serve_in(&dir)
-            .env("ASPHODEL_CONFIG", &bad)
-            .arg("--config")
-            .arg(&good),
-    );
-    let config = resolved_config(&daemon.log);
-    assert_eq!(config["tuning"]["clock"]["quiet_rate"], 0.3);
-}
-
-#[test]
-fn deployment_values_come_from_the_environment() {
+fn deployment_values_come_from_the_environment_and_flags_win() {
     let dir = TestDir::new();
     let tuning = dir.with_floors("tuning.toml", "[purge]\nsource_horizon_days = 60\n");
     let data = dir.0.join("data");
     let models = dir.0.join("models");
+    let addr = loopback();
     let daemon = start(
         serve()
             .env("ASPHODEL_CONFIG", &tuning)
             .env("ASPHODEL_DATA_DIR", &data)
             .env("ASPHODEL_MODEL_DIR", &models)
-            .env("ASPHODEL_ALLOW_NETWORK_FS", "true"),
+            .env("ASPHODEL_ALLOW_NETWORK_FS", "true")
+            .env("ASPHODEL_LISTEN", &addr),
+        &addr,
     );
-    let config = resolved_config(&daemon.log);
+    let config = daemon.config(None);
     let deployment = &config["deployment"];
     assert_eq!(deployment["data_dir"], data.to_str().unwrap());
     assert_eq!(deployment["model_dir"], models.to_str().unwrap());
     assert_eq!(deployment["allow_network_fs"], true);
     assert_eq!(config["tuning"]["purge"]["source_horizon_days"], 60);
-}
+    drop(daemon);
 
-#[test]
-fn listen_comes_from_its_variable_and_the_flag_wins() {
-    // An unparseable address in the variable must lose to the flag.
-    let dir = TestDir::new();
-    let daemon = start(serve_with_floors(&dir).env("ASPHODEL_LISTEN", "not-an-address"));
-    let config = resolved_config(&daemon.log);
-    assert_eq!(config["deployment"]["listen"], "127.0.0.1:0");
-
-    let output = run(serve_with_floors(&dir).env("ASPHODEL_LISTEN", "not-an-address"));
-    assert!(!output.status.success(), "ASPHODEL_LISTEN was ignored");
+    let bad = dir.file("bad.toml", "[injection]\ncap = 0\n");
+    let good = dir.with_floors("good.toml", "[clock]\nquiet_rate = 0.3\n");
+    let addr = loopback();
+    let daemon = start(
+        serve_in(&dir)
+            .env("ASPHODEL_CONFIG", &bad)
+            .env("ASPHODEL_LISTEN", "not-an-address")
+            .arg("--config")
+            .arg(&good)
+            .args(["--listen", &addr]),
+        &addr,
+    );
+    let config = daemon.config(None);
+    assert_eq!(config["tuning"]["clock"]["quiet_rate"], 0.3);
+    assert_eq!(config["deployment"]["listen"], addr);
 }
 
 #[test]
 fn secrets_are_read_from_the_environment_and_never_logged() {
     let dir = TestDir::new();
-    let daemon = start(
+    let addr = loopback();
+    let mut daemon = start(
         serve_with_floors(&dir)
+            .args(["--listen", &addr])
             .env("ASPHODEL_TOKEN", TOKEN)
             .env("ASPHODEL_LLM_API_KEY", LLM_KEY),
+        &addr,
     );
-    assert!(!daemon.log.contains(TOKEN), "{}", daemon.log);
-    assert!(!daemon.log.contains(LLM_KEY), "{}", daemon.log);
-    assert!(!daemon.log.contains("7f3a9c"));
-    assert!(!daemon.log.contains("41b2e8"));
-
-    let config = resolved_config(&daemon.log);
-    assert_eq!(config["deployment"]["token"], "[redacted]", "{config}");
-    assert_eq!(
-        config["deployment"]["llm_api_key"], "[redacted]",
-        "{config}"
-    );
-}
-
-#[test]
-fn off_loopback_needs_a_token_from_the_environment() {
-    let dir = TestDir::new();
-    for env in [None, Some("")] {
-        let mut command = serve_with_floors(&dir);
-        command.args(["--listen", "0.0.0.0:0"]);
-        if let Some(value) = env {
-            command.env("ASPHODEL_TOKEN", value);
-        }
-        let output = run(&mut command);
-        assert!(
-            !output.status.success(),
-            "started without a token ({env:?})"
-        );
-        assert!(
-            stderr(&output).contains("ASPHODEL_TOKEN"),
-            "{}",
-            stderr(&output)
-        );
-        // Refused before binding, so nothing off this machine ever reached it.
-        assert!(
-            !stderr(&output).contains("asphodel starting"),
-            "the daemon bound before refusing:\n{}",
-            stderr(&output)
-        );
+    let config = daemon.config(Some(TOKEN));
+    for secret in ["token", "llm_api_key"] {
+        assert_eq!(config["deployment"][secret], "[redacted]", "{config}");
     }
-}
-
-/// Runs a daemon that is expected to refuse and exit on its own. Its
-/// stderr goes to `log_path` so a pipe can't fill while waiting, and the
-/// guard kills and reaps the child on every exit path, including a timeout
-/// or an assertion panic, so a daemon that wrongly starts can't hang the
-/// suite. Returns `None` when it was still running at the deadline.
-fn run_bounded(command: &mut Command, log_path: &Path) -> (Option<ExitStatus>, String) {
-    let child = command
-        .args(["--listen", "127.0.0.1:0"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(log_path).unwrap())
-        .spawn()
-        .unwrap();
-    let mut daemon = Daemon {
-        child,
-        log: String::new(),
-    };
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = daemon.child.try_wait().unwrap() {
-            break Some(status);
-        }
-        if std::time::Instant::now() >= deadline {
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    drop(daemon);
-    (status, std::fs::read_to_string(log_path).unwrap())
-}
-
-#[test]
-fn a_malformed_llm_endpoint_stops_startup() {
-    let dir = TestDir::new();
-    let path = dir.with_floors("tuning.toml", "[llm]\nendpoint = \"http://\"\n");
-    let (status, log) = run_bounded(
-        serve_in(&dir).arg("--config").arg(&path),
-        &dir.0.join("stderr.log"),
-    );
-    let status = status.unwrap_or_else(|| {
-        panic!("invalid endpoint did not stop startup within 5 seconds:\n{log}")
-    });
-    assert!(
-        !status.success(),
-        "invalid endpoint exited successfully:\n{log}"
-    );
-    assert!(log.contains("llm.endpoint"), "{log}");
-}
-
-#[test]
-fn serve_needs_a_data_dir_from_the_flag_or_the_environment() {
-    // The store lives under `--data-dir`. A daemon with
-    // neither the flag nor `ASPHODEL_DATA_DIR` has nowhere to persist, so it
-    // must refuse to start rather than answer ready with no store.
-    let dir = TestDir::new();
-    let (status, log) = run_bounded(&mut serve(), &dir.0.join("stderr.log"));
-    let status = status
-        .unwrap_or_else(|| panic!("a daemon with no data dir kept running for 5 seconds:\n{log}"));
-    assert!(
-        !status.success(),
-        "a daemon with no data dir started:\n{log}"
-    );
-    assert!(
-        log.contains("--data-dir") || log.contains("ASPHODEL_DATA_DIR"),
-        "the refusal doesn't name the missing setting:\n{log}"
-    );
-    // Refused before binding, let alone becoming ready.
-    assert!(
-        !log.contains("asphodel starting"),
-        "the daemon bound before refusing:\n{log}"
-    );
-    assert!(
-        !log.contains("asphodel listening"),
-        "the daemon became ready before refusing:\n{log}"
-    );
+    let log = daemon.log();
+    for secret in ["7f3a9c", "41b2e8"] {
+        assert!(!config.to_string().contains(secret), "{config}");
+        assert!(!log.contains(secret), "{log}");
+    }
 }

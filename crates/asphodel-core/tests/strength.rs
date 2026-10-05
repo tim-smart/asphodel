@@ -1,59 +1,36 @@
-//! The strength model, phase and state confidence: strength counts use, not
-//! retrieval; the lasting floor counts every access; memory runs on bank
-//! time and truth on world time; and purge is a margin below the recall
-//! threshold.
+//! The strength model through `Service`: strength counts use, not
+//! retrieval; the lasting floor counts separate occasions in world time;
+//! memory runs on bank time and truth on world time; a closed window
+//! restarts recent use; a correction inherits what it corrects; and purge
+//! waits below its line for the dates still ahead.
 //!
-//! These tests exercise the production API in `asphodel_core::strength`,
-//! checking it against the lifetime, abandoned-bank and purge tables and
-//! against their closed forms.
-//!
-//! Tolerances:
-//!
-//! - [`EXACT`] (1e-9, on the log scale strength lives on) for values worked
-//!   by hand from the formula. Each test shows the arithmetic.
-//! - [`TABLE`] (5% relative) for the rounded figures in the lifetimes
-//!   table and the purge table. Trivial fades at 7.39 d and purges at
-//!   128.66 d; minor fades at 30.83 d and purges at 536.85 d. The rounded
-//!   targets use 7.4 days and 4.2 months to stay inside the 5% tolerance.
-//! - [`ABOUT`] (10% relative) for how long one mention lasts in an abandoned
-//!   bank at the 0.1 quiet rate, "about 10 weeks, 1.7 years and 7 years" at
-//!   significance 0, 0.3 and 0.5, which are 9.3 weeks, 1.70 years and 7.17
-//!   years.
-//! - [`CROSSING`] (1e-6 relative) between a bisected crossing time and its
-//!   closed form.
-//!
-//! Months are 365.2425 / 12 days and years 365.2425 days, as in
-//! [`Volatility::rate_days`].
+//! Memories are made by extracting turns with a scripted LLM and read back
+//! with `show_memory` and `faded_at`. The one-mention lifetimes, the purge
+//! table, a three-week holiday and the Maya-to-Mia correction run as
+//! scenarios under `scenarios/`.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use asphodel_core::config::Tuning;
-use asphodel_core::constants::{
-    A, C, D_MAX, FLOOR_SPACING_DAYS, G, MIN_ACCESS_AGE_DAYS, N0, S, SIGNIFICANCE_KEPT,
-    Significance, TAU, Volatility, WEIGHT_CONFIRMED, WEIGHT_CREATED, WEIGHT_MENTIONED_AGAIN,
-    WEIGHT_WINDOW_CLOSE,
-};
-use jiff::tz::TimeZone;
+use asphodel_core::config::{Layer, Tuning};
+use asphodel_core::ingest::Turn;
+use asphodel_core::inspect::{Guard, MemoryView, StrengthView};
+use asphodel_core::models::{FakeEmbedder, FakeLlm, FakeReranker, Models};
+use asphodel_core::retrieval::RecallRequest;
+use asphodel_core::store::bank::BankIdentity;
+use asphodel_core::store::{OpenOptions, Store};
+use asphodel_core::{Service, SimulatedClock};
 use jiff::{SignedDuration, Timestamp};
+use serde_json::{Value, json};
+use uuid::Uuid;
 
 use asphodel_core::strength::*;
 
 const EXACT: f64 = 1e-9;
-const TABLE: f64 = 0.05;
-const ABOUT: f64 = 0.10;
-const CROSSING: f64 = 1e-6;
-
-const DAYS_PER_MONTH: f64 = 365.2425 / 12.0;
 const DAYS_PER_YEAR: f64 = 365.2425;
-
-/// Far enough out that recent use has sunk below every floor in these
-/// fixtures, and still inside jiff's range.
-const FAR_DAYS: f64 = 1000.0 * DAYS_PER_YEAR;
-
-/// The purge margin δ below the recall threshold, as it starts.
-const DELTA: f64 = 1.0;
-
-// Fixtures.
+const BANK: &str = "main";
 
 fn t0() -> Timestamp {
     "2026-01-05T09:00:00Z".parse().unwrap()
@@ -69,79 +46,6 @@ fn ts(text: &str) -> Timestamp {
     text.parse().unwrap()
 }
 
-fn tz(name: &str) -> TimeZone {
-    TimeZone::get(name).unwrap()
-}
-
-fn access(kind: AccessKind, days: f64) -> Access {
-    Access { kind, at: at(days) }
-}
-
-fn created(days: f64) -> Access {
-    access(AccessKind::Created, days)
-}
-
-fn used(days: f64) -> Access {
-    access(AccessKind::Used, days)
-}
-
-fn mentioned(days: f64) -> Access {
-    access(AccessKind::MentionedAgain, days)
-}
-
-fn confirmed(days: f64) -> Access {
-    access(AccessKind::Confirmed, days)
-}
-
-/// One access every `FLOOR_SPACING_DAYS`, the first a `created`: `n`
-/// separate occasions.
-fn occasions(n: u32) -> Vec<Access> {
-    (0..n)
-        .map(|i| {
-            let day = f64::from(i) * FLOOR_SPACING_DAYS;
-            if i == 0 { created(day) } else { used(day) }
-        })
-        .collect()
-}
-
-/// Bank time equal to world time, so ages in the tables read as days.
-fn always_on() -> BankTime {
-    BankTime::new(&[], 1.0)
-}
-
-/// The default quiet rate with turns at the given world days.
-fn quiet_bank(turn_days: &[f64]) -> BankTime {
-    let turns: Vec<_> = turn_days.iter().map(|&d| at(d)).collect();
-    BankTime::new(&turns, Tuning::default().clock.quiet_rate)
-}
-
-fn strength_at(significance: f64, accesses: &[Access], days: f64) -> Strength {
-    strength(significance, accesses, None, &always_on(), at(days))
-}
-
-fn wt(text: &str, precision: TimePrecision) -> WorldTime {
-    WorldTime {
-        at: ts(text),
-        precision,
-    }
-}
-
-fn window(kind: Kind) -> Window {
-    Window {
-        kind,
-        valid_from: None,
-        valid_until: None,
-        due_at: None,
-    }
-}
-
-fn rule(delta: Option<f64>) -> PurgeRule {
-    PurgeRule {
-        delta,
-        overdue_days: 30,
-    }
-}
-
 #[track_caller]
 fn assert_near(actual: f64, expected: f64, tolerance: f64) {
     assert!(
@@ -150,1085 +54,590 @@ fn assert_near(actual: f64, expected: f64, tolerance: f64) {
     );
 }
 
-#[track_caller]
-fn assert_relative(actual: f64, expected: f64, tolerance: f64) {
-    let off = (actual / expected - 1.0).abs();
-    assert!(
-        off <= tolerance,
-        "expected {expected} within {}%, got {actual} ({:.2}% off)",
-        tolerance * 100.0,
-        off * 100.0
-    );
+/// A temporary directory removed even when an assertion unwinds.
+struct TestDir(PathBuf);
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
-/// The first day in `[lo, hi]` at which `value` is below `threshold`, by
-/// bisection. `value` must cross once, downwards.
-fn crossing(lo: f64, hi: f64, threshold: f64, value: impl Fn(f64) -> f64) -> f64 {
-    assert!(value(lo) >= threshold, "already below at {lo}");
-    assert!(value(hi) < threshold, "still above at {hi}");
-    let (mut lo, mut hi) = (lo, hi);
-    for _ in 0..200 {
-        let mid = (lo + hi) / 2.0;
-        if value(mid) < threshold {
-            hi = mid;
+/// A service on the fakes with one bank in UTC. Bank time runs at world
+/// speed, δ is 1, tasks are held 30 days overdue, and the significance
+/// levels are the calibrated ones, unless `extra` says otherwise. Field
+/// order matters: the service drops before its directory.
+struct Harness {
+    service: Service,
+    clock: Arc<SimulatedClock>,
+    _dir: TestDir,
+}
+
+impl Harness {
+    fn new(extra: &str) -> Self {
+        let base = format!(
+            "[clock]\nquiet_rate = 1.0\n[purge]\ndelta = 1.0\n[agenda]\noverdue_days = 30\n\
+             [strength.significance]\ntrivial = 0.0\nminor = 0.2\nnotable = 0.5\nmajor = 0.7\n\
+             critical = 0.9\n\
+             [injection.reranker_floors]\n\"{}\" = 1.0\n\
+             [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
+             [reconcile.embedding_floors]\n\"{}\" = 0.5\n",
+            FakeReranker::MODEL_ID,
+            FakeEmbedder::MODEL_ID,
+        );
+        let layer = |origin, text| Layer { origin, text };
+        let tuning = Tuning::from_layers(&[layer("base", &base), layer("test", extra)]).unwrap();
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = TestDir(
+            std::env::temp_dir().join(format!("asphodel-strength-{}-{n}", std::process::id())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let clock = Arc::new(SimulatedClock::new(t0()));
+        let store = Store::open(&dir.0, OpenOptions::default(), clock.clone()).unwrap();
+        let service = Service::with_models(clock.clone(), store, tuning, Models::fake()).unwrap();
+        let identity = BankIdentity {
+            timezone: Some("UTC".into()),
+            ..BankIdentity::default()
+        };
+        service.ensure_bank_with_models(BANK, &identity).unwrap();
+        Self {
+            service,
+            clock,
+            _dir: dir,
+        }
+    }
+
+    fn set(&self, to: Timestamp) {
+        self.clock.set(to);
+    }
+
+    /// The owner says each claim's quote at `when` in `tz`, and the turn is
+    /// extracted with call 1 finding `claims` and judging `used` used, and
+    /// call 2 giving the first claim `labels` against their memories.
+    /// Returns the new memories.
+    fn turn(
+        &self,
+        when: Timestamp,
+        tz: &str,
+        claims: Vec<Value>,
+        used: &[Uuid],
+        labels: &[(Uuid, &str)],
+    ) -> Vec<Uuid> {
+        self.set(when);
+        let quotes: Vec<&str> = claims
+            .iter()
+            .map(|c| c["quote"].as_str().unwrap())
+            .collect();
+        let turn = Turn {
+            session_id: "s".into(),
+            message_at: when,
+            timezone: Some(tz.into()),
+            user_text: format!("{} ({when})", quotes.join(" ")),
+            assistant_text: "Noted.".into(),
+            author: None,
+            platform: Some("cli".into()),
+            recall_id: None,
+            forget_requested: false,
+        };
+        self.service.ingest_turn(BANK, &turn).unwrap();
+        let lease = self.service.claim_chunk(BANK).unwrap().expect("queued");
+        let input = self.service.call1_input(&lease, used).unwrap();
+        let handles: Vec<&str> = used
+            .iter()
+            .map(|id| {
+                let memory = input.in_context.iter().find(|m| m.memory == *id);
+                memory.expect("in context").handle.as_str()
+            })
+            .collect();
+        let call1 = json!({"claims": claims, "used_injected_ids": handles});
+        let mut replies = vec![call1.clone()];
+        if let Some(input) = self.service.call2_input(&lease, &call1, used).unwrap() {
+            let labels: Vec<Value> = labels
+                .iter()
+                .map(|(memory, label)| {
+                    let neighbour = input.neighbours.iter().find(|n| n.memory == *memory);
+                    let handle = &neighbour.expect("a neighbour").handle;
+                    json!({"neighbour": handle, "label": label})
+                })
+                .collect();
+            replies.push(json!({"claims": [{"claim": input.claims[0].handle, "labels": labels}]}));
         } else {
-            lo = mid;
+            assert!(labels.is_empty(), "call 2 didn't run");
         }
+        let llm = FakeLlm::scripted("fake-llm", replies);
+        let extracted = self.service.extract_chunk(lease, &llm, used).unwrap();
+        extracted.memories
     }
-    hi
-}
 
-// Closed forms of the tables.
-
-/// The floor with n separate occasions.
-fn floor_with(n: u32) -> f64 {
-    TAU - G * N0.ln() + G * f64::from(n).ln()
-}
-
-/// Bank days until a memory mentioned once falls below `threshold`:
-/// `S·σ − a·ln t = threshold`, while the floor is lower still.
-fn one_mention_days(significance: f64, threshold: f64) -> f64 {
-    ((S * significance - threshold) / A).exp()
-}
-
-/// Lifetime figures: significance, and how long one mention stays
-/// in recall, in bank days.
-const LIFETIMES: [(Significance, f64); 5] = [
-    (Significance::Trivial, 7.4),
-    (Significance::Minor, DAYS_PER_MONTH),
-    (Significance::Notable, 9.0 * DAYS_PER_MONTH),
-    (Significance::Major, 3.0 * DAYS_PER_YEAR),
-    (Significance::Critical, 12.0 * DAYS_PER_YEAR),
-];
-
-/// The purge table at δ = 1.0: significance, how long until one mention is
-/// purged in bank days (`None` for never), and the separate occasions that
-/// make it unpurgeable.
-const PURGES: [(Significance, Option<f64>, u32); 5] = [
-    (Significance::Trivial, Some(4.2 * DAYS_PER_MONTH), 6),
-    (Significance::Minor, Some(1.5 * DAYS_PER_YEAR), 3),
-    (Significance::Notable, Some(12.5 * DAYS_PER_YEAR), 2),
-    (Significance::Major, None, 1),
-    (Significance::Critical, None, 1),
-];
-
-/// Permanence figures: significance and the separate occasions
-/// that lift the floor to τ.
-const PERMANENCE: [(Significance, u32); 3] = [
-    (Significance::Trivial, 18),
-    (Significance::Minor, 10),
-    (Significance::Notable, 4),
-];
-
-/// Significance, and how long one mention lasts in an abandoned bank, in
-/// world days. Bank time runs at the 0.1 quiet rate once a day has passed
-/// since the last turn.
-const ABANDONED: [(f64, f64); 3] = [
-    (0.0, 10.0 * 7.0),
-    (0.3, 1.7 * DAYS_PER_YEAR),
-    (0.5, 7.0 * DAYS_PER_YEAR),
-];
-
-/// World days until a memory created in a bank's last turn fades out: one
-/// bank day at full speed, then the quiet rate.
-fn abandoned_days(significance: f64) -> f64 {
-    let quiet_rate = Tuning::default().clock.quiet_rate;
-    1.0 + (one_mention_days(significance, TAU) - 1.0) / quiet_rate
-}
-
-// Bank time: full speed for 24 hours after a turn, the quiet rate otherwise.
-
-#[test]
-fn bank_time_runs_at_full_speed_for_24_hours_after_a_turn() {
-    let bank = quiet_bank(&[0.0]);
-    assert_near(bank.elapsed_days(at(0.0), at(0.5)), 0.5, EXACT);
-    // 1 day at full speed, then 9 at 0.1.
-    assert_near(bank.elapsed_days(at(0.0), at(10.0)), 1.9, EXACT);
-}
-
-#[test]
-fn overlapping_windows_merge_and_never_run_faster_than_world_time() {
-    // Windows [0, 1) and [0.5, 1.5) cover 1.5 days.
-    let bank = quiet_bank(&[0.0, 0.5]);
-    assert_near(bank.elapsed_days(at(0.0), at(10.0)), 1.5 + 0.1 * 8.5, EXACT);
-
-    // A turn every hour for ten days: full speed throughout, and no faster.
-    let hourly: Vec<f64> = (0..240).map(|h| f64::from(h) / 24.0).collect();
-    assert_near(
-        quiet_bank(&hourly).elapsed_days(at(0.0), at(10.0)),
-        10.0,
-        EXACT,
-    );
-
-    // How many turns there were doesn't matter, only when.
-    assert_near(
-        quiet_bank(&[0.0, 0.0, 0.0]).elapsed_days(at(0.0), at(10.0)),
-        quiet_bank(&[0.0]).elapsed_days(at(0.0), at(10.0)),
-        EXACT,
-    );
-}
-
-#[test]
-fn a_turn_before_the_interval_speeds_up_its_start_and_later_turns_dont_count() {
-    assert_near(
-        quiet_bank(&[0.0]).elapsed_days(at(0.5), at(2.0)),
-        0.5 + 0.1,
-        EXACT,
-    );
-    assert_near(
-        quiet_bank(&[5.0]).elapsed_days(at(0.0), at(2.0)),
-        0.2,
-        EXACT,
-    );
-}
-
-// Recent use and the lasting floor.
-
-#[test]
-fn a_fresh_access_counts_at_the_minimum_age() {
-    let expected = -A * MIN_ACCESS_AGE_DAYS.ln();
-    assert_near(expected, 1.611_809_565_095_831_7, EXACT);
-    assert_near(
-        strength_at(0.0, &[created(5.0)], 5.0).recent_use,
-        expected,
-        EXACT,
-    );
-    // A minute is younger than the minimum.
-    let minute = 1.0 / 1440.0;
-    assert_near(
-        strength_at(0.0, &[created(5.0)], 5.0 + minute).recent_use,
-        expected,
-        EXACT,
-    );
-}
-
-#[test]
-fn an_access_made_while_fresh_fades_faster() {
-    // Pavlik spacing. The second access comes when m = ln(1^−0.35) = 0, so
-    // d₂ = 0.35 + 0.2·e⁰ = 0.55. At day 2: ln(1·2^−0.35 + 1.5·1^−0.55).
-    let s = strength_at(0.0, &[created(0.0), mentioned(1.0)], 2.0);
-    assert_near(s.recent_use, (2f64.powf(-A) + 1.5).ln(), EXACT);
-    assert_near(s.recent_use, 0.826_183_993_730_038_7, EXACT);
-
-    // Characterization values from the pre-optimization public API at e6aef75.
-    // Frequent use saturates decay; spaced use does not. The interrupted log
-    // goes cold for 30 world days before use resumes in a sparse bank.
-    // Pin the observable results, not how many terms the evaluator visits.
-    let frequent: Vec<_> = std::iter::once(created(0.0))
-        .chain((1..64).map(|i| used(f64::from(i) / 8.0)))
-        .collect();
-    let interrupted: Vec<_> = std::iter::once(created(0.0))
-        .chain((1..64).map(|i| used(f64::from(i) / 8.0 + if i >= 32 { 30.0 } else { 0.0 })))
-        .collect();
-    let spaced: Vec<_> = std::iter::once(created(0.0))
-        .chain((1..8).map(|i| used(f64::from(i) * 10.0)))
-        .collect();
-    let turns: Vec<_> = (0..80).map(|i| at(f64::from(i) * 2.0)).collect();
-    let sparse = BankTime::new(&turns, 0.1);
-    for (accesses, bank, last, recent, values, floor, occasions) in [
-        (
-            &frequent,
-            always_on(),
-            7.875,
-            [7.857_381_279_415_587, -1.713_119_013_790_818_8],
-            [8.607_381_279_415_588, -0.963_119_013_790_818_8],
-            -2.133_407_575_382_443_5,
-            3,
-        ),
-        (
-            &interrupted,
-            sparse.clone(),
-            37.875,
-            [9.782_789_249_409_618, -0.933_130_127_362_564_6],
-            [10.532_789_249_409_618, -0.183_130_127_362_564_62],
-            -1.903_261_917_421_019,
-            4,
-        ),
-        (
-            &spaced,
-            sparse,
-            70.0,
-            [2.700_413_755_656_164, -0.246_334_016_537_481_85],
-            [3.450_413_755_656_164, 0.503_665_983_462_518_1],
-            -1.348_744_172_973_062_7,
-            8,
-        ),
-    ] {
-        for (i, horizon) in [0.02, 180.0].into_iter().enumerate() {
-            let s = strength(0.3, accesses, None, &bank, at(last + horizon));
-            assert_near(s.recent_use, recent[i], EXACT);
-            assert_near(s.value, values[i], EXACT);
-            assert_near(s.lasting_floor, floor, EXACT);
-            assert_eq!(s.occasions, occasions);
-        }
+    fn says(&self, when: Timestamp, claim: Value) -> Uuid {
+        self.turn(when, "UTC", vec![claim], &[], &[])[0]
     }
+
+    /// The owner says `claim`, which call 2 labels against `memory`.
+    fn labels(&self, when: Timestamp, claim: Value, memory: Uuid, label: &str) -> Vec<Uuid> {
+        self.turn(when, "UTC", vec![claim], &[], &[(memory, label)])
+    }
+
+    /// A turn whose reply used `memory`.
+    fn uses(&self, when: Timestamp, memory: Uuid) {
+        self.turn(when, "UTC", vec![], &[memory], &[]);
+    }
+
+    fn show(&self, memory: Uuid) -> MemoryView {
+        self.service.show_memory(BANK, &memory.to_string()).unwrap()
+    }
+
+    fn strength(&self, memory: Uuid) -> StrengthView {
+        self.show(memory).strength
+    }
+
+    /// The memories `memory` inherits accesses from.
+    fn inherits(&self, memory: Uuid) -> BTreeSet<Uuid> {
+        let accesses = self.show(memory).accesses;
+        accesses.iter().filter_map(|a| a.inherited_from).collect()
+    }
+}
+
+/// Call 1's claim of `content`, quoting all of it, with no times.
+fn claim(kind: &str, significance: &str, content: &str) -> Value {
+    json!({
+        "content": content, "quote": content, "kind": kind, "significance": significance,
+        "remember_this": false, "changes_something": false, "window_confidence": "high",
+        "entities": [],
+    })
+}
+
+fn trivial(kind: &str, content: &str) -> Value {
+    claim(kind, "trivial", content)
+}
+
+fn minor(kind: &str, content: &str) -> Value {
+    claim(kind, "minor", content)
+}
+
+trait With {
+    fn with(self, key: &str, value: Value) -> Value;
+}
+
+impl With for Value {
+    fn with(mut self, key: &str, value: Value) -> Value {
+        self[key] = value;
+        self
+    }
+}
+
+/// A claim flagged as changing something, so its neighbours aren't held to
+/// the floor.
+fn changing(claim: Value) -> Value {
+    claim.with("changes_something", json!(true))
+}
+
+/// A source-local time at a precision, as call 1 writes it.
+fn local(at: &str, precision: &str) -> Value {
+    json!({"at": at, "precision": precision})
+}
+
+fn day(date: &str) -> Value {
+    local(&format!("{date}T00:00"), "day")
+}
+
+/// `before` until the minute before `at`, and `after` from `at`.
+fn edge(at: &str, before: Phase, after: Phase) -> Vec<(Timestamp, Phase)> {
+    let at = ts(at);
+    let minute_before = at.checked_sub(SignedDuration::from_mins(1)).unwrap();
+    vec![(minute_before, before), (at, after)]
+}
+
+#[test]
+fn bank_time_runs_at_world_speed_while_the_bank_talks_and_never_faster() {
+    // A bank at world speed fades a trivial memory about a week after its
+    // one mention. A quiet bank chatting every hour for ten days runs at
+    // full speed throughout: its overlapping 24-hour windows merge rather
+    // than add up, so the memory fades at the same moment.
+    let world = Harness::new("");
+    let tea = world.says(at(0.0), trivial("fact", "Tim likes green tea."));
+    world.set(at(20.0));
+
+    let busy = Harness::new("[clock]\nquiet_rate = 0.1\n");
+    let biscuit = busy.says(at(0.0), trivial("fact", "Tim likes green tea."));
+    for hour in 1..=240 {
+        busy.turn(at(f64::from(hour) / 24.0), "UTC", vec![], &[], &[]);
+    }
+    busy.set(at(20.0));
+
+    let fades = |h: &Harness, memory| h.service.faded_at(BANK, memory).unwrap().unwrap();
+    let (world, busy) = (fades(&world, tea), fades(&busy, biscuit));
+    assert!(world > at(7.0) && world < at(8.0), "{world}");
+    assert!(
+        busy.duration_since(world).abs() <= SignedDuration::from_mins(1),
+        "{busy} vs {world}"
+    );
 }
 
 #[test]
 fn massed_use_spikes_then_falls_below_spaced_use() {
-    // 15 uses in one day against 5 uses a week apart.
-    let massed: Vec<_> = std::iter::once(created(0.0))
-        .chain((1..15).map(|h| used(f64::from(h) / 24.0)))
-        .collect();
-    let spaced: Vec<_> = std::iter::once(created(0.0))
-        .chain((1..5).map(|w| used(7.0 * f64::from(w))))
-        .collect();
-
-    let (m, s) = (
-        strength_at(0.0, &massed, 1.0),
-        strength_at(0.0, &spaced, 1.0),
+    // Use every three hours for a week, long enough to saturate decay,
+    // against four uses a week apart. The same burst broken by 30 cold
+    // days recovers when use resumes.
+    let h = Harness::new("");
+    let massed = h.says(at(0.0), trivial("fact", "Tim's gym locker is number 37."));
+    let resumed = h.says(at(0.001), trivial("fact", "Tim's gym code is 4512."));
+    let spaced = h.says(
+        at(0.002),
+        trivial("fact", "Tim's bus to work is number 14."),
     );
-    assert!(m.recent_use > s.recent_use, "{m:?} {s:?}");
-    assert_near(m.recent_use, 3.611_502_811_239_257_8, EXACT);
-    assert_near(s.recent_use, 0.0, EXACT);
-
-    let (m, s) = (
-        strength_at(0.0, &massed, 90.0),
-        strength_at(0.0, &spaced, 90.0),
-    );
-    assert!(m.recent_use < s.recent_use, "{m:?} {s:?}");
-    assert_near(m.recent_use, -1.504_853_433_428_120_5, EXACT);
-    assert_near(s.recent_use, -0.449_286_690_871_333_2, EXACT);
-    assert_eq!((m.occasions, s.occasions), (1, 5));
-}
-
-#[test]
-fn accesses_after_now_are_ignored() {
-    let alone = strength_at(0.3, &[created(0.0)], 10.0);
-    let with_later = strength_at(0.3, &[created(0.0), confirmed(20.0)], 10.0);
-    assert_eq!(alone, with_later);
-}
-
-#[test]
-fn the_floor_counts_occasions_at_least_three_world_days_apart() {
-    // The floor takes at most one access per three world days: daily for a
-    // week is about 3 occasions, every ten days for three months is 10.
-    let week: Vec<_> = (0..7).map(|d| used(f64::from(d))).collect();
-    assert_eq!(strength_at(0.0, &week, 7.0).occasions, 3);
-    let months: Vec<_> = (0..10).map(|i| used(10.0 * f64::from(i))).collect();
-    assert_eq!(strength_at(0.0, &months, 91.0).occasions, 10);
-
-    // Greedy from the last counted access; exactly 3 days counts.
-    let edges = [created(0.0), used(2.99), used(3.0), used(5.99), used(6.0)];
-    assert_eq!(strength_at(0.0, &edges, 7.0).occasions, 3);
-    assert_eq!(FLOOR_SPACING_DAYS, 3.0);
-
-    // The kind doesn't matter.
-    let kinds = [created(0.0), mentioned(3.0), confirmed(6.0), used(9.0)];
-    assert_eq!(strength_at(0.0, &kinds, 10.0).occasions, 4);
-}
-
-#[test]
-fn floor_spacing_is_world_time_even_in_a_quiet_bank() {
-    // Three world days apart is 0.3 bank days in a quiet bank.
-    let s = strength(0.0, &occasions(3), None, &quiet_bank(&[]), at(10.0));
-    assert_eq!(s.occasions, 3);
-}
-
-// Lifetimes on the strength function itself.
-
-#[test]
-fn one_mention_lifetimes_reproduce_reference_table() {
-    for (level, days) in LIFETIMES {
-        let significance = level.value();
-        let fades = crossing(0.0, 200.0 * DAYS_PER_YEAR, TAU, |day| {
-            strength_at(significance, &[created(0.0)], day).value
-        });
-        assert_relative(fades, one_mention_days(significance, TAU), CROSSING);
-        assert_relative(fades, days, TABLE);
-    }
-}
-
-#[test]
-fn one_mention_lifetimes_in_an_abandoned_bank_reproduce_adr_0004() {
-    let bank = quiet_bank(&[0.0]);
-    for (significance, days) in ABANDONED {
-        let fades = crossing(0.0, 200.0 * DAYS_PER_YEAR, TAU, |day| {
-            strength(significance, &[created(0.0)], None, &bank, at(day)).value
-        });
-        assert_relative(fades, abandoned_days(significance), CROSSING);
-        assert_relative(fades, days, ABOUT);
-    }
-}
-
-#[test]
-fn enough_separate_occasions_make_a_memory_permanent() {
-    for (level, n) in PERMANENCE {
-        let significance = level.value();
-        let held = strength_at(significance, &occasions(n), FAR_DAYS);
-        assert!(
-            held.value >= TAU,
-            "{n} occasions at {significance}: {held:?}"
-        );
-        let fades = strength_at(significance, &occasions(n - 1), FAR_DAYS);
-        assert!(
-            fades.value < TAU,
-            "{} occasions at {significance}: {fades:?}",
-            n - 1
-        );
-    }
-}
-
-#[test]
-fn a_kept_memory_never_fades_and_a_critical_one_does() {
-    let kept = strength_at(SIGNIFICANCE_KEPT, &[created(0.0)], FAR_DAYS);
-    assert!(kept.value >= TAU, "{kept:?}");
-    let critical = Significance::Critical.value();
-    let fades = crossing(0.0, 200.0 * DAYS_PER_YEAR, TAU, |day| {
-        strength_at(critical, &[created(0.0)], day).value
-    });
-    assert_relative(fades, 12.0 * DAYS_PER_YEAR, TABLE);
-}
-
-// Equal-time accesses use timestamp ascending, then weight descending.
-// These are distinct accesses, including inherited ones; same-turn
-// deduplication is deliberately outside this pure-function contract.
-
-fn access_permutations(accesses: &[Access]) -> Vec<Vec<Access>> {
-    if accesses.is_empty() {
-        return vec![vec![]];
-    }
-    let mut permutations = Vec::new();
-    for (i, first) in accesses.iter().enumerate() {
-        let mut rest = accesses.to_vec();
-        rest.remove(i);
-        for mut tail in access_permutations(&rest) {
-            tail.insert(0, *first);
-            permutations.push(tail);
-        }
-    }
-    permutations
-}
-
-#[test]
-fn tie_order_mixed_weights_are_heaviest_first() {
-    let expected = strength_at(0.1, &[confirmed(0.0), created(0.0)], 100.0);
-    // confirmed has d = a; the massed created access has d capped at 2.
-    let recent = (WEIGHT_CONFIRMED * 100f64.powf(-A) + WEIGHT_CREATED * 100f64.powf(-D_MAX)).ln();
-    assert_near(expected.recent_use, recent, EXACT);
-    assert_near(expected.value, -0.668_411_822, EXACT);
-    for accesses in access_permutations(&[created(0.0), confirmed(0.0)]) {
-        assert_eq!(strength_at(0.1, &accesses, 100.0), expected);
-    }
-}
-
-#[test]
-fn tie_order_inherited_logs_are_independent_of_concatenation_order() {
-    let maya = [created(0.0), mentioned(20.0)];
-    let mia = [created(20.0)];
-    let inherited_first: Vec<_> = maya.iter().chain(&mia).copied().collect();
-    let own_first: Vec<_> = mia.iter().chain(&maya).copied().collect();
-    let expected = strength_at(0.1, &inherited_first, 120.0);
-    // created@0 supplies m at day 20. mentioned@20 goes first among
-    // the ties; created@20 then receives the capped massed decay.
-    let d = (A + C * WEIGHT_CREATED * 20f64.powf(-A)).min(D_MAX);
-    let recent = (WEIGHT_CREATED * 120f64.powf(-A)
-        + WEIGHT_MENTIONED_AGAIN * 100f64.powf(-d)
-        + WEIGHT_CREATED * 100f64.powf(-D_MAX))
-    .ln();
-    assert_near(expected.recent_use, recent, EXACT);
-    assert_near(expected.value, -0.656_301_673, EXACT);
-    assert_eq!(strength_at(0.1, &own_first, 120.0), expected);
-    for accesses in access_permutations(&inherited_first) {
-        assert_eq!(strength_at(0.1, &accesses, 120.0), expected);
-    }
-}
-
-#[test]
-fn tie_order_mixed_real_accesses_at_synthetic_restart_are_heaviest_first() {
-    let accesses = [created(0.0), confirmed(12.0), mentioned(12.0)];
-    let expected = closed_strength(0.1, &accesses, close(10.0, 12.0), 100.0);
-    // confirmed, mentioned_again, then synthetic. Both later decays cap.
-    let recent = (WEIGHT_CONFIRMED * 88f64.powf(-A)
-        + (WEIGHT_MENTIONED_AGAIN + WEIGHT_WINDOW_CLOSE) * 88f64.powf(-D_MAX))
-    .ln();
-    assert_near(expected.recent_use, recent, EXACT);
-    for permutation in access_permutations(&accesses) {
-        assert_eq!(
-            closed_strength(0.1, &permutation, close(10.0, 12.0), 100.0),
-            expected
-        );
-    }
-}
-
-#[test]
-fn tie_order_adding_tied_accesses_never_weakens_the_heaviest_alone() {
-    let sets = [
-        vec![created(0.0), confirmed(0.0)],
-        vec![used(0.0), mentioned(0.0)],
-        vec![created(0.0), used(0.0), mentioned(0.0), confirmed(0.0)],
-    ];
-    for accesses in sets {
-        let heaviest = *accesses
-            .iter()
-            .max_by(|a, b| a.kind.weight().total_cmp(&b.kind.weight()))
-            .unwrap();
-        for day in [1.0, 15.0, 100.0, 1000.0] {
-            let alone = strength_at(0.1, &[heaviest], day);
-            for permutation in access_permutations(&accesses) {
-                let together = strength_at(0.1, &permutation, day);
-                assert!(
-                    together.value >= alone.value,
-                    "{permutation:?} at day {day}: {together:?} < {alone:?}"
-                );
-            }
-        }
-    }
-}
-
-// Window close: only recent use restarts, from a single recency boost
-// placed at the later of the window close and when the end became known.
-// The lasting floor stays.
-
-fn close(closes: f64, known: f64) -> Option<WindowClose> {
-    Some(WindowClose {
-        closes_at: at(closes),
-        known_at: at(known),
-    })
-}
-
-fn closed_strength(
-    significance: f64,
-    accesses: &[Access],
-    close: Option<WindowClose>,
-    day: f64,
-) -> Strength {
-    strength(significance, accesses, close, &always_on(), at(day))
-}
-
-#[test]
-fn closing_a_window_restarts_recent_use_from_one_synthetic_access() {
-    // The end was known from the start, so the synthetic access sits at the
-    // close, day 10. At day 12 it's 2 days old and the only one counted.
-    let accesses = [created(0.0), mentioned(2.0), mentioned(4.0)];
-    let s = closed_strength(0.1, &accesses, close(10.0, 0.0), 12.0);
-    assert_eq!(WEIGHT_WINDOW_CLOSE, 1.0);
-    assert_near(s.recent_use, -A * 2f64.ln(), EXACT);
-    assert_near(s.recent_use, -0.242_601_513_195_980_83, EXACT);
-}
-
-#[test]
-fn a_late_reported_end_places_the_synthetic_access_when_it_became_known() {
-    // Valid until day 30, reported on day 40, used on day 35 in between.
-    // Counted: used@35 (d = a), then the synthetic access @40, which comes
-    // when m = −0.35·ln 5, so d = 0.35 + 0.2·5^−0.35. At day 45:
-    // ln(10^−0.35 + 5^−d).
-    let accesses = [created(0.0), used(20.0), used(35.0)];
-    let s = closed_strength(0.3, &accesses, close(30.0, 40.0), 45.0);
-    let d = A + C * 5f64.powf(-A);
-    assert_near(s.recent_use, (10f64.powf(-A) + 5f64.powf(-d)).ln(), EXACT);
-    assert_near(s.recent_use, -0.082_646_089_892_332_44, EXACT);
-}
-
-#[test]
-fn accesses_after_the_close_count_and_one_at_the_close_does_not() {
-    // Strictly after: an access at the close itself is inside the window.
-    let at_close = closed_strength(0.0, &[created(0.0), used(10.0)], close(10.0, 0.0), 12.0);
-    assert_near(at_close.recent_use, -A * 2f64.ln(), EXACT);
-
-    // Synthetic@10 (d = a), then mentioned@11 with m = 0 and d = 0.55. At
-    // day 12 that's the two-access fixture again.
-    let after = closed_strength(
-        0.0,
-        &[created(0.0), mentioned(11.0)],
-        close(10.0, 0.0),
-        12.0,
-    );
-    assert_near(after.recent_use, 0.826_183_993_730_038_7, EXACT);
-}
-
-#[test]
-fn a_window_that_hasnt_closed_or_isnt_known_to_have_closed_counts_everything() {
-    let accesses = [created(0.0), used(4.0), mentioned(8.0)];
-    let open = closed_strength(0.3, &accesses, None, 9.0);
-    // Closes on day 20.
-    assert_eq!(closed_strength(0.3, &accesses, close(20.0, 0.0), 9.0), open);
-    // Closed on day 5, but only reported on day 12.
-    assert_eq!(closed_strength(0.3, &accesses, close(5.0, 12.0), 9.0), open);
-}
-
-#[test]
-fn a_past_appointment_comes_back_to_recall_when_its_window_closes() {
-    // "how did the dentist go?" works the next day. A trivial
-    // appointment mentioned once, 90 days ahead.
-    let trivial = Significance::Trivial.value();
-    let accesses = [created(0.0)];
-    let before = closed_strength(trivial, &accesses, close(90.0, 0.0), 89.0);
-    assert!(before.value < TAU, "{before:?}");
-    assert_near(before.value, -A * 89f64.ln(), EXACT);
-    let after = closed_strength(trivial, &accesses, close(90.0, 0.0), 91.0);
-    assert_near(after.value, 0.0, EXACT);
-
-    // Then it fades like any fresh trivial memory, about a week later.
-    let fades = crossing(91.0, 200.0, TAU, |day| {
-        closed_strength(trivial, &accesses, close(90.0, 0.0), day).value
-    });
-    assert_relative(fades - 90.0, one_mention_days(trivial, TAU), CROSSING);
-}
-
-#[test]
-fn an_appointment_discussed_daily_for_a_week_fades_and_can_be_purged() {
-    // About 3 occasions three world days apart, so it fades.
-    let trivial = Significance::Trivial.value();
-    let accesses: Vec<_> = (0..7).map(|d| mentioned(f64::from(d))).collect();
-    let s = closed_strength(trivial, &accesses, close(7.0, 0.0), FAR_DAYS);
-    assert_eq!(s.occasions, 3);
-    assert!(s.value < TAU - DELTA, "{s:?}");
-}
-
-#[test]
-fn a_state_used_for_three_months_stays_in_history_after_it_ends() {
-    // "User lived in Berlin", minor, used every ten days for three months,
-    // ended on day 95 and reported on day 100. An ended memory stays in
-    // history.
-    let minor = Significance::Minor.value();
-    let accesses: Vec<_> = std::iter::once(created(0.0))
-        .chain((1..10).map(|i| used(10.0 * f64::from(i))))
+    let mut uses: Vec<(f64, Uuid)> = (1..64)
+        .flat_map(|i| {
+            let day = f64::from(i) / 8.0;
+            let gap = if i >= 32 { 30.0 } else { 0.0 };
+            [(day, massed), (day + gap + 0.001, resumed)]
+        })
+        .chain((1..5).map(|week| (7.0 * f64::from(week) + 0.002, spaced)))
         .collect();
-    let s = closed_strength(minor, &accesses, close(95.0, 100.0), FAR_DAYS);
-    assert_eq!(s.occasions, 10);
-    assert!(s.value >= TAU, "{s:?}");
-    assert_near(s.value, 0.5 + floor_with(10), EXACT);
-}
-
-// Inheritance.
-
-const MAYA: i64 = 1;
-const MIA: i64 = 2;
-
-fn link(id: i64, superseded_by: Option<i64>, ended_by: Option<i64>) -> Link {
-    Link {
-        id,
-        superseded_by,
-        ended_by,
-    }
-}
-
-#[test]
-fn correcting_maya_to_mia_keeps_the_corrected_name_as_strong() {
-    // "Maya" is created, used twice and mentioned again; on day 20 the user
-    // corrects it, and "Mia" retracts it.
-    let links = [link(MAYA, Some(MIA), None), link(MIA, None, None)];
-    assert_eq!(chain_head(&links, MAYA), MIA);
-    assert_eq!(inherits_from(&links, MIA), BTreeSet::from([MAYA, MIA]));
-
-    let minor = Significance::Minor.value();
-    let maya = [created(0.0), used(3.0), used(7.0), mentioned(10.0)];
-    let mia_own = [created(20.0)];
-    let mia: Vec<_> = maya.iter().chain(&mia_own).copied().collect();
-
-    let maya_then = strength_at(minor, &maya, 20.0);
-    assert_near(maya_then.recent_use, 0.182_036_993_685_896_5, EXACT);
-    let mia_next_day = strength_at(minor, &mia, 21.0);
-    assert_near(mia_next_day.recent_use, 0.768_503_277_496_431_8, EXACT);
-    assert!(mia_next_day.value >= maya_then.value);
-    assert_eq!(mia_next_day.occasions, 5);
-
-    for day in [20.0, 20.5, 21.0, 30.0, 100.0, 1000.0, FAR_DAYS] {
-        let wrong = strength_at(minor, &maya, day);
-        let corrected = strength_at(minor, &mia, day);
-        assert!(
-            corrected.value >= wrong.value,
-            "day {day}: {corrected:?} < {wrong:?}"
-        );
-        assert!(corrected.value > strength_at(minor, &mia_own, day).value);
-    }
-}
-
-#[test]
-fn inheritance_follows_chains_of_several_and_trees() {
-    // 1 → 2 → 3.
-    let line = [
-        link(1, Some(2), None),
-        link(2, Some(3), None),
-        link(3, None, None),
-    ];
-    assert_eq!(chain_head(&line, 1), 3);
-    assert_eq!(inherits_from(&line, 3), BTreeSet::from([1, 2, 3]));
-    assert_eq!(inherits_from(&line, 2), BTreeSet::from([1, 2]));
-    assert_eq!(chain(&line, 2), BTreeSet::from([1, 2, 3]));
-
-    // 1 and 2 refined into 3.
-    let tree = [
-        link(1, Some(3), None),
-        link(2, Some(3), None),
-        link(3, None, None),
-    ];
-    assert_eq!(chain_head(&tree, 2), 3);
-    assert_eq!(inherits_from(&tree, 3), BTreeSet::from([1, 2, 3]));
-    assert_eq!(chain(&tree, 1), BTreeSet::from([1, 2, 3]));
-}
-
-#[test]
-fn chains_finds_the_heads_chain_head_does_in_any_order() {
-    // `Chains` indexes a bank's links once for reconcile's many lookups and
-    // remembers the heads it finds; whatever order they're asked in, each
-    // head is the one `chain_head` gives.
-    let links = [
-        // 1 → 2 → 3, and 4 and 5 refined into 6 → 7.
-        link(1, Some(2), None),
-        link(2, Some(3), None),
-        link(4, Some(6), None),
-        link(5, Some(6), None),
-        link(6, Some(7), None),
-        // 8 is ended by 3 but supersedes nothing; 9 has no links at all.
-        link(8, None, Some(3)),
-    ];
-    let ids = [1, 2, 3, 4, 5, 6, 7, 8, 9];
-    let orders: [Vec<i64>; 3] = [
-        ids.to_vec(),
-        ids.iter().rev().copied().collect(),
-        vec![2, 6, 9, 1, 5, 3, 8, 4, 7],
-    ];
-    for order in orders {
-        let mut chains = Chains::new(&links);
-        for id in &order {
-            assert_eq!(
-                chains.head(*id),
-                chain_head(&links, *id),
-                "{id} in {order:?}"
-            );
-            // Asking again gives the remembered head.
-            assert_eq!(chains.head(*id), chain_head(&links, *id), "{id} again");
+    uses.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut check = |until: f64| {
+        for &(day, memory) in uses.iter().filter(|(day, _)| *day < until) {
+            h.uses(at(day), memory);
         }
+        uses.retain(|(day, _)| *day >= until);
+        h.set(at(until));
+        (h.strength(massed), h.strength(resumed), h.strength(spaced))
+    };
+    let (m, _, s) = check(7.9);
+    assert!(m.value > s.value, "{m:?} {s:?}");
+    let (m, r, _) = check(38.0);
+    assert!(r.value > m.value && r.recallable, "{m:?} {r:?}");
+    let (m, r, s) = check(90.0);
+    assert!(m.value < r.value && r.value < s.value, "{m:?} {r:?} {s:?}");
+    assert_eq!((m.occasions, r.occasions, s.occasions), (3, 4, 5));
+    assert!(!m.recallable && s.recallable, "{m:?} {s:?}");
+}
+
+#[test]
+fn separate_occasions_in_world_time_make_a_memory_permanent_even_once_it_ends() {
+    // A quiet bank, where three world days between turns are only 1.2 bank
+    // days. Berlin is mentioned on four occasions exactly three world days
+    // apart; Otago four times too, but the last only two days after the
+    // third, so it counts three. A notable memory needs four occasions to
+    // stay in recall for good, and ending Berlin's window doesn't lower its
+    // floor.
+    let h = Harness::new("[clock]\nquiet_rate = 0.1\n");
+    let berlin_claim = || claim("state", "notable", "Tim lives in Berlin.");
+    let otago_claim = || claim("fact", "notable", "Tim studied physics at Otago.");
+    let berlin = h.says(at(0.0), berlin_claim());
+    let otago = h.says(at(0.001), otago_claim());
+    for (day, again, memory) in [
+        (3.0, berlin_claim(), berlin),
+        (3.001, otago_claim(), otago),
+        (6.0, berlin_claim(), berlin),
+        (6.001, otago_claim(), otago),
+        (8.001, otago_claim(), otago),
+        (9.0, berlin_claim(), berlin),
+    ] {
+        h.labels(at(day), again, memory, "mentioned_again");
     }
-    let mut chains = Chains::new(&links);
-    assert_eq!(chains.head(1), 3);
-    assert_eq!(chains.head(4), 7);
-    assert_eq!(chains.head(8), 8, "ended_by isn't a chain link");
-    assert_eq!(chains.head(9), 9);
-    assert_eq!(Chains::new(&[]).head(1), 1);
+    let lisbon = changing(claim("state", "notable", "Tim moved to Lisbon."));
+    let lisbon = h.labels(at(12.0), lisbon, berlin, "ends")[0];
+
+    h.set(at(100.0 * DAYS_PER_YEAR));
+    let (berlin, otago) = (h.show(berlin), h.show(otago));
+    assert_eq!(berlin.chain.ended_by, Some(lisbon));
+    assert_eq!(berlin.strength.occasions, 4);
+    assert_eq!(otago.strength.occasions, 3);
+    assert!(berlin.strength.recallable, "{:?}", berlin.strength);
+    assert_eq!(berlin.projection.fade, None);
+    assert!(!otago.strength.recallable, "{:?}", otago.strength);
+}
+
+// Window close: recent use restarts from one boost at the later of the
+// close and when the end became known. The lasting floor stays.
+
+#[test]
+fn a_closed_window_restarts_recent_use_once_its_end_is_known() {
+    let h = Harness::new("");
+    // Staying in Lisbon ends on day 30, but that's only said on day 40.
+    let lisbon = h.says(at(0.0), trivial("state", "Tim is staying in Lisbon."));
+    // A trivial appointment on day 90, mentioned once.
+    let dentist = trivial("event", "Tim has a dentist appointment on 5 April.")
+        .with("valid_from", day("2026-04-05"));
+    let dentist = h.says(at(0.001), dentist);
+
+    h.set(at(35.0));
+    assert!(!h.strength(lisbon).recallable, "closed but not known to be");
+    let left = changing(trivial("state", "Tim left Lisbon on 4 February."))
+        .with("valid_from", day("2026-02-04"));
+    h.labels(at(40.0), left, lisbon, "ends");
+    // The restart is when the end was said, not when it was.
+    h.set(at(41.0));
+    assert!(h.strength(lisbon).recallable);
+
+    // Before the appointment's day is over it has long faded; once it is,
+    // it's back in recall, as strong as a fresh mention then.
+    h.set(ts("2026-04-05T23:59:00Z"));
+    assert!(!h.strength(dentist).recallable);
+    let fresh = h.says(
+        ts("2026-04-06T00:00:00Z"),
+        trivial("fact", "Tim likes tea."),
+    );
+    h.set(ts("2026-04-06T01:00:00Z"));
+    let back = h.show(dentist);
+    assert_eq!(back.phase, Some(Phase::RecentlyPast));
+    assert!(back.strength.recallable);
+    assert_near(back.strength.value, h.strength(fresh).value, EXACT);
 }
 
 #[test]
-fn nothing_is_inherited_along_ended_by() {
-    // "Lives in Berlin" (1) is ended by "moved to Lisbon" (2). An old
-    // reschedule (3 retracted by 4) sits beside them.
-    let links = [
-        link(1, None, Some(2)),
-        link(2, None, None),
-        link(3, Some(4), None),
-        link(4, None, Some(2)),
-    ];
-    assert_eq!(inherits_from(&links, 2), BTreeSet::from([2]));
-    assert_eq!(chain_head(&links, 1), 1);
-    assert_eq!(chain(&links, 1), BTreeSet::from([1]));
-    assert_eq!(chain(&links, 2), BTreeSet::from([2]));
-    assert_eq!(chain(&links, 3), BTreeSet::from([3, 4]));
+fn a_correction_inherits_along_its_chain_but_nothing_passes_along_an_ending() {
+    let h = Harness::new("");
+    let name = |n: &str| changing(minor("fact", &format!("Tim's sister is called {n}.")));
+    // Maya → Mia → Mya, each correcting the one before.
+    let maya = h.says(at(0.0), name("Maya"));
+    let mia = h.labels(at(1.0), name("Mia"), maya, "retracts")[0];
+    let mya = h.labels(at(2.0), name("Mya"), mia, "retracts")[0];
+    assert_eq!(h.show(maya).chain.head, mya);
+    assert_eq!(h.inherits(mia), BTreeSet::from([maya]));
+    assert_eq!(h.inherits(mya), BTreeSet::from([maya, mia]));
+
+    // Two memories refined into one.
+    let acme = h.says(at(3.0), minor("fact", "Tim works at Acme."));
+    let wellington = h.says(at(3.001), minor("fact", "Tim works in Wellington."));
+    let both = changing(minor("fact", "Tim works at Acme in Wellington."));
+    let refines = [(acme, "refines"), (wellington, "refines")];
+    let both = h.turn(at(4.0), "UTC", vec![both], &[], &refines)[0];
+    assert_eq!(h.show(wellington).chain.head, both);
+    assert_eq!(h.inherits(both), BTreeSet::from([acme, wellington]));
+
+    // Moving to Lisbon ends living in Berlin: neither takes the other's
+    // accesses.
+    let berlin = h.says(at(5.0), minor("state", "Tim lives in Berlin."));
+    let lisbon = changing(minor("state", "Tim moved to Lisbon."));
+    let lisbon = h.labels(at(6.0), lisbon, berlin, "ends")[0];
+    let shown = h.show(berlin);
+    assert_eq!(shown.chain.head, berlin);
+    assert_eq!(shown.chain.ended_by, Some(lisbon));
+    assert!(h.inherits(lisbon).is_empty());
 }
 
-// Time precision and phase, on world time in the source's
-// timezone.
-
 #[test]
-fn each_precision_ends_one_unit_later_in_the_source_timezone() {
-    use TimePrecision::*;
-    let cases = [
-        // 3 Oct 2026 in Auckland (NZDT, +13).
+fn phase_follows_the_window_ending_each_unit_in_the_source_timezone() {
+    let h = Harness::new("");
+    let event = |content: &str, from: Value| minor("event", content).with("valid_from", from);
+    let ends = |at: &str| edge(at, Phase::Upcoming, Phase::RecentlyPast);
+    let rows = vec![
+        // 3 Oct in Auckland (NZDT, +13) ends at 11:00 UTC.
         (
-            "2026-10-02T11:00:00Z",
-            Day,
             "Pacific/Auckland",
-            "2026-10-03T11:00:00Z",
+            event("Dinner with Sam on 3 October.", day("2026-10-03")),
+            ends("2026-10-03T11:00:00Z"),
         ),
-        // London's spring-forward day is 23 hours...
+        // London's spring-forward day is 23 hours long.
         (
-            "2026-03-29T00:00:00Z",
-            Day,
             "Europe/London",
-            "2026-03-29T23:00:00Z",
+            event("The fair is on 29 March.", day("2026-03-29")),
+            ends("2026-03-29T23:00:00Z"),
         ),
-        // ...and its fall-back day 25.
+        // March in London ends on BST.
         (
-            "2026-10-24T23:00:00Z",
-            Day,
             "Europe/London",
-            "2026-10-26T00:00:00Z",
+            event("The audit is in March.", local("2026-03-01T00:00", "month")),
+            ends("2026-03-31T23:00:00Z"),
         ),
         (
-            "2026-03-01T00:00:00Z",
-            Month,
-            "Europe/London",
-            "2026-03-31T23:00:00Z",
-        ),
-        ("2028-02-01T00:00:00Z", Month, "UTC", "2028-03-01T00:00:00Z"),
-        (
-            "2026-12-31T11:00:00Z",
-            Year,
             "Pacific/Auckland",
-            "2027-12-31T11:00:00Z",
-        ),
-        // 01:00 BST on the fall-back day: an hour is an hour.
-        (
-            "2026-10-25T00:00:00Z",
-            Hour,
-            "Europe/London",
-            "2026-10-25T01:00:00Z",
+            event("The move is in 2027.", local("2027-01-01T00:00", "year")),
+            ends("2027-12-31T11:00:00Z"),
         ),
         (
-            "2026-10-03T15:00:00Z",
-            Minute,
             "UTC",
-            "2026-10-03T15:01:00Z",
+            event("The call is at 3pm.", local("2026-10-03T15:00", "hour")),
+            ends("2026-10-03T16:00:00Z"),
+        ),
+        // A span is current between its start and end units.
+        (
+            "UTC",
+            event("Tim is in Rome from 5 to 9 October.", day("2026-10-05"))
+                .with("valid_until", day("2026-10-09")),
+            [
+                edge("2026-10-06T00:00:00Z", Phase::Upcoming, Phase::Current),
+                edge("2026-10-10T00:00:00Z", Phase::Current, Phase::RecentlyPast),
+            ]
+            .concat(),
+        ),
+        // A task is current until its due day ends, then overdue until it's
+        // done; the completion below makes it past.
+        (
+            "UTC",
+            minor("task", "Tim needs to renew his passport by 9 October.")
+                .with("due_at", day("2026-10-09")),
+            [
+                edge("2026-10-10T00:00:00Z", Phase::Current, Phase::Overdue),
+                edge("2026-10-12T10:31:00Z", Phase::Overdue, Phase::RecentlyPast),
+            ]
+            .concat(),
+        ),
+        (
+            "UTC",
+            minor("task", "Tim needs to organise the garage."),
+            vec![(ts("2030-01-01T00:00:00Z"), Phase::Current)],
+        ),
+        // Facts, states and routines without an end stay current; a start
+        // still ahead is upcoming.
+        (
+            "UTC",
+            minor("fact", "Tim likes green tea."),
+            vec![(ts("2026-10-01T12:00:00Z"), Phase::Current)],
+        ),
+        (
+            "UTC",
+            minor("state", "Tim has lived in Wellington since March 2020.")
+                .with("valid_from", local("2020-03-01T00:00", "month")),
+            vec![(ts("2026-10-01T12:00:00Z"), Phase::Current)],
+        ),
+        (
+            "UTC",
+            minor("recurring", "Tim does yoga on Tuesdays from 10 October.")
+                .with("valid_from", day("2026-10-10"))
+                .with("recurrence_text", json!("every Tuesday")),
+            vec![(ts("2026-10-01T12:00:00Z"), Phase::Upcoming)],
+        ),
+        // "Lived in Berlin until 12 Sep": recently past, then long past.
+        (
+            "UTC",
+            minor("state", "Tim lived in Berlin until 12 September.")
+                .with("valid_until", day("2026-09-12")),
+            vec![
+                (ts("2026-10-01T12:00:00Z"), Phase::RecentlyPast),
+                (ts("2026-10-13T00:00:00Z"), Phase::LongPast),
+            ],
         ),
     ];
-    for (start, precision, zone, end) in cases {
-        assert_eq!(
-            unit_end(wt(start, precision), &tz(zone)),
-            ts(end),
-            "{precision:?} from {start} in {zone}"
-        );
+
+    let mut checks = Vec::new();
+    let mut passport = None;
+    for (n, (tz, claim, expected)) in rows.into_iter().enumerate() {
+        let is_task = claim["due_at"].is_object();
+        let memory = h.turn(at(n as f64 * 0.001), tz, vec![claim], &[], &[])[0];
+        if is_task {
+            passport = Some(memory);
+        }
+        for (when, phase) in expected {
+            checks.push((when, memory, phase));
+        }
     }
-}
+    checks.sort_by_key(|(when, ..)| *when);
 
-#[test]
-fn a_point_event_goes_from_upcoming_to_past_and_a_span_is_current_between() {
-    let utc = TimeZone::UTC;
-    let mut point = window(Kind::Event);
-    point.valid_from = Some(wt("2026-10-03T15:00:00Z", TimePrecision::Hour));
-    assert_eq!(point.closes_at(&utc), Some(ts("2026-10-03T16:00:00Z")));
-    assert_eq!(
-        point.phase(&utc, ts("2026-10-03T15:59:00Z")),
-        Phase::Upcoming
-    );
-    assert_eq!(
-        point.phase(&utc, ts("2026-10-03T16:00:00Z")),
-        Phase::RecentlyPast
-    );
-
-    let mut span = window(Kind::Event);
-    span.valid_from = Some(wt("2026-10-05T00:00:00Z", TimePrecision::Day));
-    span.valid_until = Some(wt("2026-10-09T00:00:00Z", TimePrecision::Day));
-    assert_eq!(span.closes_at(&utc), Some(ts("2026-10-10T00:00:00Z")));
-    assert_eq!(
-        span.phase(&utc, ts("2026-10-05T12:00:00Z")),
-        Phase::Upcoming
-    );
-    assert_eq!(span.phase(&utc, ts("2026-10-06T00:00:00Z")), Phase::Current);
-    assert_eq!(span.phase(&utc, ts("2026-10-09T23:59:00Z")), Phase::Current);
-    assert_eq!(
-        span.phase(&utc, ts("2026-10-10T00:00:00Z")),
-        Phase::RecentlyPast
-    );
-}
-
-#[test]
-fn a_task_is_current_until_its_due_day_ends_then_overdue_until_it_ends() {
-    let utc = TimeZone::UTC;
-    let mut task = window(Kind::Task);
-    task.due_at = Some(wt("2026-10-09T00:00:00Z", TimePrecision::Day));
-    assert_eq!(task.closes_at(&utc), None);
-    assert_eq!(task.phase(&utc, ts("2026-10-09T23:59:00Z")), Phase::Current);
-    assert_eq!(task.phase(&utc, ts("2026-10-10T00:00:00Z")), Phase::Overdue);
-    assert_eq!(task.phase(&utc, ts("2027-10-10T00:00:00Z")), Phase::Overdue);
-
-    // Completed on 12 Oct: past, not overdue.
-    task.valid_until = Some(wt("2026-10-12T10:30:00Z", TimePrecision::Minute));
-    assert_eq!(task.phase(&utc, ts("2026-10-12T10:30:59Z")), Phase::Overdue);
-    assert_eq!(
-        task.phase(&utc, ts("2026-10-12T10:31:00Z")),
-        Phase::RecentlyPast
-    );
-
-    let undated = window(Kind::Task);
-    assert_eq!(
-        undated.phase(&utc, ts("2030-01-01T00:00:00Z")),
-        Phase::Current
-    );
-}
-
-#[test]
-fn facts_states_and_routines_without_an_end_stay_current() {
-    let utc = TimeZone::UTC;
-    let now = ts("2026-10-01T12:00:00Z");
-    for kind in [Kind::Fact, Kind::State, Kind::Recurring] {
-        let open = window(kind);
-        assert_eq!(open.closes_at(&utc), None);
-        assert_eq!(open.phase(&utc, now), Phase::Current, "{kind:?}");
-
-        let mut started = window(kind);
-        started.valid_from = Some(wt("2020-03-01T00:00:00Z", TimePrecision::Month));
-        assert_eq!(started.closes_at(&utc), None);
-        assert_eq!(started.phase(&utc, now), Phase::Current, "{kind:?}");
-
-        let mut starting = window(kind);
-        starting.valid_from = Some(wt("2026-10-10T00:00:00Z", TimePrecision::Day));
-        assert_eq!(starting.phase(&utc, now), Phase::Upcoming, "{kind:?}");
+    let done_at = ts("2026-10-12T10:30:00Z");
+    for (when, memory, phase) in checks {
+        if when > done_at
+            && let Some(passport) = passport.take()
+        {
+            let renewed = changing(minor("fact", "Tim renewed his passport."));
+            h.labels(done_at, renewed, passport, "ends");
+        }
+        h.set(when);
+        let shown = h.show(memory);
+        assert_eq!(shown.phase, Some(phase), "{} at {when}", shown.sentence);
     }
-
-    // "User lived in Berlin until 12 Sep."
-    let mut ended = window(Kind::State);
-    ended.valid_until = Some(wt("2026-09-12T00:00:00Z", TimePrecision::Day));
-    assert_eq!(ended.closes_at(&utc), Some(ts("2026-09-13T00:00:00Z")));
-    assert_eq!(ended.phase(&utc, now), Phase::RecentlyPast);
-    assert_eq!(
-        ended.phase(&utc, ts("2026-10-13T00:00:00Z")),
-        Phase::LongPast
-    );
 }
 
 // State confidence.
 
 #[test]
-fn state_confidence_is_a_coin_flip_at_t_on_the_log_logistic_curve() {
-    for volatility in Volatility::ALL {
-        let t = volatility.rate_days();
-        for (age, expected) in [
-            (0.0, 1.0),
-            (0.5, 0.8),
-            (1.0, 0.5),
-            (2.0, 0.2),
-            (10.0, 1.0 / 101.0),
-        ] {
-            let c = state_confidence(Some(volatility), at(0.0), &[], at(age * t));
-            assert_near(c, expected, EXACT);
-        }
-    }
-    // T: 3 hours, 3 days, 3 weeks, 3 months, 5 years.
-    let hours = state_confidence(Some(Volatility::Hours), at(0.0), &[], at(0.125));
-    assert_near(hours, 0.5, EXACT);
-    let years = state_confidence(
-        Some(Volatility::Years),
-        at(0.0),
-        &[],
-        at(5.0 * DAYS_PER_YEAR),
+fn only_a_mention_or_a_confirmation_renews_a_stale_states_rank() {
+    // Strength doesn't rank here, and the states are equally relevant and
+    // equally significant, so only state confidence tells them apart: the
+    // longer since a state was last said or confirmed, the lower it ranks.
+    let h = Harness::new("[ranking]\nw_s_recall = 0.0\n");
+    let staying = |city: &str| {
+        minor("state", &format!("Tim is staying in {city}.")).with("volatility", json!("days"))
+    };
+    let lisbon = h.says(at(0.0), staying("Lisbon"));
+    let porto = h.says(at(0.001), staying("Porto"));
+    let rome = h.says(at(0.002), staying("Rome"));
+    let oslo = h.says(at(2.0), staying("Oslo"));
+    // Porto is mentioned again on day 9, Rome confirmed on day 10 and Oslo
+    // used in a reply then, which doesn't count as hearing it again.
+    assert!(
+        h.labels(at(9.0), staying("Porto"), porto, "mentioned_again")
+            .is_empty()
     );
-    assert_near(years, 0.5, EXACT);
-}
+    assert!(
+        h.labels(at(10.0), staying("Rome"), rome, "confirmed")
+            .is_empty()
+    );
+    h.uses(at(10.001), oslo);
 
-#[test]
-fn only_a_mention_or_a_confirmation_resets_state_confidence() {
-    // Days volatility (T = 3). The anchor is the confirmation on day 20;
-    // the use on day 30 doesn't move it, nor does anything after now.
-    let accesses = [
-        created(0.0),
-        mentioned(10.0),
-        confirmed(20.0),
-        used(30.0),
-        confirmed(50.0),
-    ];
-    let c = state_confidence(Some(Volatility::Days), at(0.0), &accesses, at(23.0));
-    assert_near(c, 0.5, EXACT);
-    let c = state_confidence(Some(Volatility::Days), at(0.0), &accesses, at(33.0));
-    assert_near(c, 1.0 / (1.0 + (13.0f64 / 3.0).powi(2)), EXACT);
-
-    // A later observed_at wins over earlier accesses.
-    let c = state_confidence(Some(Volatility::Days), at(25.0), &accesses, at(28.0));
-    assert_near(c, 0.5, EXACT);
-
-    // An anchor ahead of now is age 0.
-    let c = state_confidence(Some(Volatility::Days), at(25.0), &[], at(24.0));
-    assert_near(c, 1.0, EXACT);
-}
-
-// Purge eligibility.
-
-#[test]
-fn a_memory_is_purged_strictly_below_tau_minus_delta() {
-    let fact = window(Kind::Fact);
-    let utc = TimeZone::UTC;
-    let now = at(0.0);
-    let line = TAU - DELTA;
-    assert!(!purge_eligible(&rule(Some(DELTA)), line, &fact, &utc, now));
-    assert!(purge_eligible(
-        &rule(Some(DELTA)),
-        line.next_down(),
-        &fact,
-        &utc,
-        now
-    ));
-
-    // δ = 0 purges on fading.
-    assert!(!purge_eligible(&rule(Some(0.0)), TAU, &fact, &utc, now));
-    assert!(purge_eligible(
-        &rule(Some(0.0)),
-        TAU.next_down(),
-        &fact,
-        &utc,
-        now
-    ));
-}
-
-#[test]
-fn a_null_delta_never_purges() {
-    let utc = TimeZone::UTC;
-    for kind in [
-        Kind::Fact,
-        Kind::Event,
-        Kind::State,
-        Kind::Task,
-        Kind::Recurring,
-    ] {
-        assert!(!purge_eligible(
-            &rule(None),
-            -1e9,
-            &window(kind),
-            &utc,
-            at(FAR_DAYS)
-        ));
-    }
-}
-
-#[test]
-fn one_mention_purges_reproduce_adr_0008() {
-    let fact = window(Kind::Fact);
-    let utc = TimeZone::UTC;
-    let purged = |significance: f64, day: f64| {
-        let s = strength_at(significance, &[created(0.0)], day);
-        purge_eligible(&rule(Some(DELTA)), s.value, &fact, &utc, at(day))
+    h.set(at(10.5));
+    let request = RecallRequest {
+        query: "Where is Tim staying?".into(),
+        ..RecallRequest::default()
     };
-    for (level, days, _) in PURGES {
-        let significance = level.value();
-        match days {
-            Some(days) => {
-                let exact = one_mention_days(significance, TAU - DELTA);
-                assert_relative(exact, days, TABLE);
-                assert!(!purged(significance, exact * 0.99), "{level:?}");
-                assert!(purged(significance, exact * 1.01), "{level:?}");
-            }
-            None => assert!(!purged(significance, FAR_DAYS), "{level:?}"),
-        }
-    }
+    let recall = h.service.recall(BANK, &request).unwrap();
+    let ranked: Vec<Uuid> = recall.results.iter().map(|r| r.id).collect();
+    assert_eq!(ranked, [rome, porto, oslo, lisbon]);
 }
 
 #[test]
-fn separate_occasions_make_a_memory_unpurgeable() {
-    let fact = window(Kind::Fact);
-    let utc = TimeZone::UTC;
-    let now = at(FAR_DAYS);
-    for (level, _, hold) in PURGES {
-        let significance = level.value();
-        let held = strength_at(significance, &occasions(hold), FAR_DAYS);
-        assert!(
-            !purge_eligible(&rule(Some(DELTA)), held.value, &fact, &utc, now),
-            "{level:?}"
-        );
-        if hold > 1 {
-            let fewer = strength_at(significance, &occasions(hold - 1), FAR_DAYS);
-            assert!(
-                purge_eligible(&rule(Some(DELTA)), fewer.value, &fact, &utc, now),
-                "{level:?}"
-            );
-        }
-    }
-    // Minor with two occasions misses by 0.257.
-    let minor = strength_at(Significance::Minor.value(), &occasions(2), FAR_DAYS);
-    assert_near(minor.value, -1.957_779_661_868_975_1, EXACT);
-}
+fn purge_waits_below_its_line_for_dates_still_ahead_and_overdue_tasks() {
+    // Every memory here is trivial and said once in January, so by July
+    // each head is far below τ − δ and only its dates can hold it back.
+    let h = Harness::new("");
+    let dinner =
+        trivial("event", "Dinner with Sam on 3 October.").with("valid_from", day("2026-10-03"));
+    let dinner = h.turn(at(0.0), "Pacific/Auckland", vec![dinner], &[], &[])[0];
+    let lease = trivial("state", "Tim rents the flat until 1 December at 9:30.")
+        .with("valid_until", local("2026-12-01T09:30", "minute"));
+    let lease = h.says(at(0.001), lease);
+    let passport = trivial("task", "Tim needs to renew his passport by 9 October.")
+        .with("due_at", day("2026-10-09"));
+    let passport = h.says(at(0.002), passport);
+    let yoga = trivial("recurring", "Tim goes to yoga every Tuesday.")
+        .with("recurrence_text", json!("every Tuesday"));
+    let yoga = h.says(at(0.003), yoga);
+    let garage = h.says(at(0.004), trivial("task", "Tim needs to tidy the garage."));
+    // A reschedule from 20 October to 1 May.
+    let old =
+        trivial("event", "The dentist is on 20 October.").with("valid_from", day("2026-10-20"));
+    let old = h.says(at(0.005), old);
+    let new = changing(trivial("event", "The dentist moved to 1 May."))
+        .with("valid_from", day("2026-05-01"));
+    let new = h.labels(at(0.006), new, old, "retracts")[0];
 
-#[test]
-fn a_date_still_ahead_holds_the_head_back() {
-    let faded = -5.0;
-    let auckland = tz("Pacific/Auckland");
-
-    // A trivial appointment on 3 Oct in Auckland stays until that day ends
-    // there.
-    let mut event = window(Kind::Event);
-    event.valid_from = Some(wt("2026-10-02T11:00:00Z", TimePrecision::Day));
-    let r = rule(Some(DELTA));
-    assert!(!purge_eligible(
-        &r,
-        faded,
-        &event,
-        &auckland,
-        ts("2026-06-01T00:00:00Z")
-    ));
-    assert!(!purge_eligible(
-        &r,
-        faded,
-        &event,
-        &auckland,
-        ts("2026-10-03T10:59:00Z")
-    ));
-    assert!(purge_eligible(
-        &r,
-        faded,
-        &event,
-        &auckland,
-        ts("2026-10-03T11:00:00Z")
-    ));
-
-    let mut state = window(Kind::State);
-    state.valid_from = Some(wt("2026-01-01T00:00:00Z", TimePrecision::Day));
-    state.valid_until = Some(wt("2026-12-01T09:30:00Z", TimePrecision::Minute));
-    assert!(!purge_eligible(
-        &r,
-        faded,
-        &state,
-        &TimeZone::UTC,
-        ts("2026-12-01T09:30:59Z")
-    ));
-    assert!(purge_eligible(
-        &r,
-        faded,
-        &state,
-        &TimeZone::UTC,
-        ts("2026-12-01T09:31:00Z")
-    ));
-}
-
-#[test]
-fn a_task_is_held_until_its_overdue_window_ends() {
-    let utc = TimeZone::UTC;
-    let faded = -5.0;
-    let mut task = window(Kind::Task);
+    h.set(ts("2026-07-01T00:00:00Z"));
+    let guards = |memory| h.show(memory).purge.guards;
+    let until = ts("2026-10-03T11:00:00Z");
+    assert_eq!(guards(dinner), [Guard::DateAhead { until }]);
+    let lease_ends = ts("2026-12-01T09:31:00Z");
+    assert_eq!(guards(lease), [Guard::DateAhead { until: lease_ends }]);
     // Due 9 Oct: overdue from 10 Oct, held for 30 days after that.
-    task.due_at = Some(wt("2026-10-09T00:00:00Z", TimePrecision::Day));
-    let r = rule(Some(DELTA));
-    assert!(!purge_eligible(
-        &r,
-        faded,
-        &task,
-        &utc,
-        ts("2026-11-08T23:59:00Z")
-    ));
-    assert!(purge_eligible(
-        &r,
-        faded,
-        &task,
-        &utc,
-        ts("2026-11-09T00:00:00Z")
-    ));
+    let held = ts("2026-11-09T00:00:00Z");
+    assert_eq!(guards(passport), [Guard::OverdueTask { until: held }]);
+    for memory in [yoga, garage] {
+        assert!(h.show(memory).purge.eligible_now, "{memory}");
+    }
 
-    let short = PurgeRule {
-        delta: Some(DELTA),
-        overdue_days: 10,
+    // Once the dinner's day is over its date no longer holds it, though
+    // the close's fresh boost lifts it above the line again. The dentist's
+    // new slot has been past long enough; its old slot is still ahead, but
+    // only the head counts.
+    h.set(until);
+    assert_eq!(guards(dinner), [Guard::Strength]);
+    let rescheduled = h.show(old).purge;
+    assert_eq!(rescheduled.head, new);
+    assert!(rescheduled.eligible_now, "{rescheduled:?}");
+
+    // δ = 0 purges on fading, and a null δ never purges.
+    let projection = |extra: &str| {
+        let h = Harness::new(extra);
+        let tea = h.says(at(0.0), trivial("fact", "Tim likes green tea."));
+        h.set(at(1.0));
+        h.show(tea)
     };
-    assert!(!purge_eligible(
-        &short,
-        faded,
-        &task,
-        &utc,
-        ts("2026-10-19T23:59:00Z")
-    ));
-    assert!(purge_eligible(
-        &short,
-        faded,
-        &task,
-        &utc,
-        ts("2026-10-20T00:00:00Z")
-    ));
-}
-
-#[test]
-fn routines_undated_tasks_and_retracted_dates_hold_nothing() {
-    let utc = TimeZone::UTC;
-    let r = rule(Some(DELTA));
-    let now = ts("2026-10-01T00:00:00Z");
-    assert!(purge_eligible(
-        &r,
-        -5.0,
-        &window(Kind::Recurring),
-        &utc,
-        now
-    ));
-    assert!(purge_eligible(&r, -5.0, &window(Kind::Task), &utc, now));
-
-    // A rescheduled appointment: the old slot (1) is still ahead, but it was
-    // retracted by the new one (2), which has passed. Only the head counts.
-    let links = [link(1, Some(2), None), link(2, None, None)];
-    assert_eq!(chain_head(&links, 1), 2);
-    let mut head = window(Kind::Event);
-    head.valid_from = Some(wt("2026-09-01T00:00:00Z", TimePrecision::Day));
-    assert!(purge_eligible(&r, -5.0, &head, &utc, now));
+    let zero = projection("[purge]\ndelta = 0.0\n");
+    assert!(zero.projection.purge.is_some());
+    assert_eq!(zero.projection.purge, zero.projection.fade);
+    let never = projection("[purge]\ndelta = \"never\"\n");
+    assert_eq!(never.projection.purge, None);
+    assert!(never.purge.guards.contains(&Guard::PurgeDisabled));
 }

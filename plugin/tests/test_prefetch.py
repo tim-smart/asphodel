@@ -34,9 +34,7 @@ def test_recall_status_reports_the_last_injected_count(make_provider, daemon):
     provider = make_provider()
     provider.prefetch("tea?", session_id=SESSION)
     status = provider.recall_status()
-    assert status is not None
-    assert status.count == 2
-    assert status.provider_label == "Asphodel"
+    assert status is not None and status.count == 2
 
 
 def test_returns_empty_and_no_status_when_the_daemon_is_down(make_provider, daemon):

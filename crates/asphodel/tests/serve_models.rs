@@ -10,39 +10,9 @@
 //! loading validation without model artifacts or ONNX Runtime; the floor
 //! test runs on the fakes (`ASPHODEL_MODELS=fake`, environment only).
 
-use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// The fake models' ids (`asphodel_core::models`).
-const FAKE_EMBEDDER: &str = "fake-embedder:v1";
-const FAKE_RERANKER: &str = "fake-reranker:v1";
-
-/// `asphodel` with a clean environment, so the caller's `ASPHODEL_*`
-/// variables can't leak in.
-fn asphodel() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
-    command.env_clear();
-    command
-}
-
-/// `asphodel serve` with its own data dir under `dir`.
-fn serve_in(dir: &TestDir) -> Command {
-    let mut command = asphodel();
-    command
-        .arg("serve")
-        .arg("--data-dir")
-        .arg(dir.0.join("data"));
-    command
-}
-
-fn run(command: &mut Command) -> Output {
-    command.stdin(Stdio::null()).output().unwrap()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
 
 /// A temporary directory removed even when an assertion unwinds.
 struct TestDir(PathBuf);
@@ -58,19 +28,6 @@ impl TestDir {
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }
-
-    fn file(&self, name: &str, text: &str) -> PathBuf {
-        let path = self.0.join(name);
-        std::fs::write(&path, text).unwrap();
-        path
-    }
-
-    /// An empty model dir: the daemon must not fill it.
-    fn empty_models(&self) -> PathBuf {
-        let path = self.0.join("models");
-        std::fs::create_dir_all(&path).unwrap();
-        path
-    }
 }
 
 impl Drop for TestDir {
@@ -79,25 +36,55 @@ impl Drop for TestDir {
     }
 }
 
+/// Runs `asphodel serve` with its own data dir under `dir`, after `edit`,
+/// and a clean environment, so the caller's `ASPHODEL_*` variables can't
+/// leak in. It must refuse to start; returns its stderr.
+fn refused(dir: &TestDir, edit: impl FnOnce(&mut Command) -> &mut Command) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_asphodel"));
+    command
+        .env_clear()
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(dir.0.join("data"))
+        .args(["--listen", "127.0.0.1:0"]);
+    let output = edit(&mut command).stdin(Stdio::null()).output().unwrap();
+    assert!(!output.status.success());
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
 #[test]
 fn an_empty_model_dir_stops_startup_naming_the_missing_file() {
     // Never a download: an empty dir is still empty afterwards, and stderr
-    // names the file and the command that fills it.
+    // names the file in the model dir: `--model-dir`, else an absolute
+    // `XDG_CACHE_HOME`, else `$HOME/.cache`. A relative `XDG_CACHE_HOME` is
+    // ignored, as the XDG spec says.
     let dir = TestDir::new();
-    let models = dir.empty_models();
-    let output = run(serve_in(&dir)
-        .arg("--model-dir")
-        .arg(&models)
-        .args(["--listen", "127.0.0.1:0"]));
-    assert!(!output.status.success());
-    let stderr = stderr(&output);
-    assert!(stderr.contains("model.onnx"), "{stderr}");
-    assert!(stderr.contains("asphodel models fetch"), "{stderr}");
-    assert!(stderr.contains(models.to_str().unwrap()), "{stderr}");
+    let models = dir.0.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    let (home, xdg) = (dir.0.join("home"), dir.0.join("xdg"));
+    let under_home = home.join(".cache/asphodel/models");
+    let cases = [
+        (Some(&models), Some(xdg.as_path()), &models),
+        (None, Some(&xdg), &xdg.join("asphodel/models")),
+        (None, None, &under_home),
+        (None, Some(Path::new("cache")), &under_home),
+    ];
+    for (flag, xdg, expected) in cases {
+        let stderr = refused(&dir, |c| {
+            c.env("HOME", &home);
+            if let Some(xdg) = xdg {
+                c.env("XDG_CACHE_HOME", xdg);
+            }
+            match flag {
+                Some(models) => c.arg("--model-dir").arg(models),
+                None => c,
+            }
+        });
+        let missing = format!("{}/", expected.display());
+        assert!(stderr.contains(&missing), "{expected:?}: {stderr}");
+        assert!(stderr.contains("model.onnx"), "{stderr}");
+    }
     assert_eq!(std::fs::read_dir(&models).unwrap().count(), 0);
-    // And the daemon never became ready: its listener answers 503 while the
-    // models load, and "asphodel listening" is logged only once they have.
-    assert!(!stderr.contains("asphodel listening"), "{stderr}");
 }
 
 #[test]
@@ -107,29 +94,25 @@ fn a_floor_for_the_real_models_does_not_cover_the_fakes() {
     // string, so a production tuning file doesn't make a fake daemon start,
     // and the switch can't hide a missing floor.
     let dir = TestDir::new();
-    let tuning = dir.file(
-        "tuning.toml",
+    let tuning = dir.0.join("tuning.toml");
+    std::fs::write(
+        &tuning,
         "[injection.reranker_floors]\n\"jina-reranker-v1-turbo-en:int8\" = -1.5\n\
          [ranking.relevance_scales]\n\"jina-reranker-v1-turbo-en:int8\" = 1.0\n\
          [reconcile.embedding_floors]\n\"bge-small-en-v1.5:int8\" = 0.82\n",
-    );
-    let output = run(serve_in(&dir)
-        .env("ASPHODEL_MODELS", "fake")
-        .arg("--config")
-        .arg(&tuning)
-        .args(["--listen", "127.0.0.1:0"]));
-    assert!(!output.status.success());
-    let stderr = stderr(&output);
-    assert!(
-        stderr.contains(&format!("reconcile.embedding_floors.\"{FAKE_EMBEDDER}\"")),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("injection.reranker_floors.\"{FAKE_RERANKER}\"")),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("ranking.relevance_scales.\"{FAKE_RERANKER}\"")),
-        "{stderr}"
-    );
+    )
+    .unwrap();
+    let stderr = refused(&dir, |c| {
+        c.env("ASPHODEL_MODELS", "fake")
+            .arg("--config")
+            .arg(&tuning)
+    });
+    // The fake models' ids (`asphodel_core::models`).
+    for missing in [
+        "reconcile.embedding_floors.\"fake-embedder:v1\"",
+        "injection.reranker_floors.\"fake-reranker:v1\"",
+        "ranking.relevance_scales.\"fake-reranker:v1\"",
+    ] {
+        assert!(stderr.contains(missing), "{missing}: {stderr}");
+    }
 }

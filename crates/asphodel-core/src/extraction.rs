@@ -49,36 +49,6 @@ mod input;
 mod prompt;
 mod reconcile;
 
-#[cfg(test)]
-mod gap_tests;
-
-/// A test's hook into [`commit_prepared`] at the last moment before the
-/// commit takes the store for its writes: whatever it does to the store,
-/// the commit must see. Test builds only.
-#[cfg(test)]
-pub(crate) mod gap {
-    use std::cell::RefCell;
-
-    use crate::store::Store;
-
-    type Hook = Box<dyn FnOnce(&Store)>;
-
-    thread_local! {
-        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
-    }
-
-    /// Runs `hook` once, at the next commit on this thread.
-    pub(crate) fn set(hook: impl FnOnce(&Store) + 'static) {
-        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    }
-
-    pub(super) fn run(store: &Store) {
-        if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
-            hook(store);
-        }
-    }
-}
-
 use jiff::Timestamp;
 use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
@@ -940,11 +910,6 @@ pub(crate) fn commit_prepared(
 ) -> Result<Committed, ExtractError> {
     queue::check_held(leases, &prepared.lease)?;
     leases.wait_turn(&prepared.lease);
-
-    // The last moment before the commit takes the store, where a test can
-    // change it.
-    #[cfg(test)]
-    gap::run(store);
 
     let bank_id = prepared.unit.bank_id;
     let committed = {

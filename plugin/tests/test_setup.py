@@ -4,17 +4,21 @@ activating the provider."""
 
 import json
 
-from conftest import plugin
+from conftest import plugin, write_config
 
 
-def test_save_config_writes_non_secret_values(hermes_home):
-    provider = plugin.AsphodelMemoryProvider()
-    provider.save_config({"url": "http://a:1", "bank": "tim", "owner_platform_ids": "discord:111, telegram:222", "token": "x"}, str(hermes_home))
-    saved = json.loads((hermes_home / "asphodel" / "config.json").read_text())
-    assert saved["url"] == "http://a:1"
-    assert saved["bank"] == "tim"
-    assert saved["owner_platform_ids"] == ["discord:111", "telegram:222"]
-    assert "token" not in saved
+def test_save_config_merges_the_non_secret_values_by_rename(hermes_home):
+    path = write_config(hermes_home, url="http://a:1", bank="old", owner_name="Tim")
+    values = {"bank": "tim", "owner_platform_ids": "discord:111, telegram:222", "ingest": "false", "token": "x"}
+    plugin.AsphodelMemoryProvider().save_config(values, str(hermes_home))
+    assert json.loads(path.read_text()) == {
+        "url": "http://a:1",
+        "bank": "tim",
+        "owner_name": "Tim",
+        "owner_platform_ids": ["discord:111", "telegram:222"],
+        "ingest": False,
+    }
+    assert [p.name for p in path.parent.iterdir()] == ["config.json"]
 
 
 def test_post_setup_turns_builtin_memory_off_and_activates_the_provider(hermes_home, hermes):

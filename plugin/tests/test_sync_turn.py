@@ -31,22 +31,64 @@ def test_posts_the_turn_body(make_provider, daemon, hermes):
     assert body["forget_requested"] is False
 
 
-def test_message_at_is_the_user_rows_epoch_as_rfc3339_utc(make_provider, daemon):
+def test_message_at_is_this_turns_user_row_epoch_in_utc(make_provider, daemon):
     provider = make_provider()
-    sync(provider)
-    message_at = daemon.requests_for("turns")[0].body["message_at"]
-    assert message_at.endswith("Z")
-    parsed = datetime.fromisoformat(message_at.replace("Z", "+00:00"))
+    earlier = transcript("yesterday's message", "ok", epoch=EPOCH - 86400)
+    sync(provider, messages=transcript("today", "ok", epoch=EPOCH, earlier=earlier))
+    parsed = datetime.fromisoformat(daemon.requests_for("turns")[0].body["message_at"].replace("Z", "+00:00"))
     assert parsed.tzinfo is not None
     assert parsed.timestamp() == pytest.approx(EPOCH, abs=0.001)
 
 
-def test_message_at_comes_from_this_turns_user_row_not_an_earlier_one(make_provider, daemon):
+BACKFILL = (
+    "[Recent channel history]\n"
+    "[Maya] I'm moving to Wellington next month.\n"
+    "[Jo] Congratulations!\n"
+    "\n[New message]\n"
+    "[Tim] Remind me to book the dentist."
+)
+
+
+@pytest.mark.parametrize(
+    "user, sent",
+    [
+        (BACKFILL, "[Tim] Remind me to book the dentist."),
+        ("[Jo] someone wrote [New message] in chat\n[New message]\nreal message", "real message"),
+    ],
+    ids=["backfill", "last-marker-wins"],
+)
+def test_the_backfill_before_the_new_message_marker_is_stripped(make_provider, daemon, user, sent):
+    """The gateway puts other people's recent messages and a ``[New
+    message]`` marker in front of the user text; the ``[Name] `` prefix of a
+    shared thread stays."""
     provider = make_provider()
-    earlier = transcript("yesterday's message", "ok", epoch=EPOCH - 86400)
-    sync(provider, messages=transcript("today", "ok", epoch=EPOCH, earlier=earlier))
-    message_at = daemon.requests_for("turns")[0].body["message_at"]
-    assert datetime.fromisoformat(message_at.replace("Z", "+00:00")).timestamp() == pytest.approx(EPOCH, abs=0.001)
+    sync(provider, user=user, messages=transcript(user, "Booked."))
+    body = daemon.requests_for("turns")[0].body
+    assert body["user_text"] == sent
+    assert "Wellington" not in str(body) and "someone wrote" not in str(body)
+
+
+@pytest.mark.parametrize(
+    "messages, requested",
+    [
+        (transcript("forget that", "Done.", tool_calls=[("memory_recall", {"query": "x"}), ("memory_forget", {"ids": ["m1"]})]), True),
+        (transcript("forget that", "Done.", tool_calls=[("memory_recall", {"query": "x"})]), False),
+        (
+            transcript(
+                "thanks, what's next?",
+                "Nothing.",
+                epoch=2000.0,
+                earlier=transcript("forget that", "Done.", epoch=1000.0, tool_calls=[("memory_forget", {"ids": ["m1"]})]),
+            ),
+            False,
+        ),
+    ],
+    ids=["forget-among-other-calls", "no-forget", "forget-in-an-earlier-turn"],
+)
+def test_forget_requested_marks_a_turn_that_called_memory_forget(make_provider, daemon, messages, requested):
+    provider = make_provider()
+    sync(provider, messages=messages)
+    assert daemon.requests_for("turns")[0].body["forget_requested"] is requested
 
 
 def test_timezone_falls_back_to_config_then_null(make_provider, daemon, hermes):
@@ -79,17 +121,16 @@ def test_recall_id_is_per_session(make_provider, daemon):
     assert daemon.requests_for("turns")[0].body["recall_id"] is None
 
 
-def test_only_primary_agents_ingest(make_provider, daemon):
-    provider = make_provider(init={"agent_context": "cron"})
+@pytest.mark.parametrize(
+    "setup",
+    [dict(init={"agent_context": "cron"}), dict(ingest=False)],
+    ids=["not-a-primary-agent", "ingest-off"],
+)
+def test_nothing_is_ingested_but_recall_still_works(make_provider, daemon, setup):
+    provider = make_provider(**setup)
     sync(provider)
     assert daemon.requests_for("turns") == []
     assert provider.prefetch("tea?", session_id=SESSION) != ""
-
-
-def test_ingest_false_sends_nothing(make_provider, daemon):
-    provider = make_provider(ingest=False)
-    sync(provider)
-    assert daemon.requests_for("turns") == []
 
 
 # -- recall ids across overlapping turns -----------------------------------------
