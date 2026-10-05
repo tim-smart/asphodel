@@ -174,8 +174,16 @@ _Avoid_: Calendar, schedule, reminders
 A document that an LLM keeps up to date from memories, to answer a standing question such as "who is the user?". It's one answer, a heading and a paragraph for each part of the question, with one set of citations: the memories it rests on. The memories always win: while a cited memory is retracted or ended the model isn't shown at all, and forgetting one blanks the answer until the next refresh writes it again.
 _Avoid_: Observation, reflection, summary, profile (a profile is one mental model)
 
+**Answer**:
+A mental model's text: connected prose, a heading and a paragraph per facet, with one set of citations for the whole. Only a refresh writes it, replacing it whole, and forget blanks it whole. A token budget may cut trailing sentences off the end, at the refresh or in the prompt block, and what's left still cites the whole set; no sentence in it is cited or edited on its own.
+_Avoid_: Entry (the old unit, one cited sentence), summary, line, bullet, block
+
+**Facet**:
+One part of a mental model's question, with a heading and a recall query of its own. The seeded profile's facets are built in; any other question is planned once by an LLM call.
+_Avoid_: Section (that's how a facet renders), sub-question, topic
+
 **Refresh**:
-Bringing a mental model up to date: one retrieval for each part of its question, then one LLM call that writes the whole answer again with the previous one in view. It runs shortly after a conversation adds or changes something the model would care about, and once a day besides, and only when the selected memories have changed.
+Bringing a mental model up to date: one retrieval for each facet of its question, then one LLM call that writes the whole answer again with the previous one in view. It runs shortly after a conversation adds or changes something the model would care about, and once a day besides, and only when the selected memories have changed. A correction or forget of a cited memory asks for one urgently, ahead of the usual minimum interval.
 _Avoid_: Reflect, consolidation, rebuild, regenerate
 
 **Explain**:
