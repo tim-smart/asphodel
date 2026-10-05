@@ -2,6 +2,8 @@
 
 ## Running tests
 
+Use `cargo nextest run` to run all tests, not `cargo test`.
+
 ```
 TMPDIR=/dev/shm nix develop -c cargo nextest run
 ```
