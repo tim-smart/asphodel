@@ -231,17 +231,11 @@ pub(super) fn check(
     let mut used = Vec::new();
     let mut seen = BTreeSet::new();
     for handle in &reply.used_injected_ids {
-        let handle = handle.trim();
-        // An entry the reply relied on is used on every memory it cites, once
-        // each however it's named.
-        let memories = match unit.in_context.get(handle) {
-            Some(memory) => std::slice::from_ref(memory),
-            None => unit.entries.get(handle).map_or(&[][..], Vec::as_slice),
-        };
-        for &(memory_id, memory) in memories {
-            if seen.insert(memory_id) {
-                used.push((memory_id, memory));
-            }
+        // A handle call 1 wasn't given is ignored.
+        if let Some(&(memory_id, memory)) = unit.in_context.get(handle.trim())
+            && seen.insert(memory_id)
+        {
+            used.push((memory_id, memory));
         }
     }
     Ok(Checked {

@@ -39,7 +39,6 @@ use crate::chunking::{chunk_hash, hex, split_document};
 use crate::secrets::{SecretKind, scan};
 use crate::store::bank::{add_alias, log_edit, set_speaker_id};
 use crate::store::{Store, StoreError, micros, nfc};
-use crate::system_prompt::BlockEntry;
 
 /// Hermes' `turn_author`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,17 +177,11 @@ pub const TURN_SEPARATOR: &str = "\n\n";
 /// stored with the turn in the same transaction, and extraction judges the
 /// turn's `used` verdicts against it alone. A duplicate or a tombstone
 /// stores none.
-///
-/// `entries` are the mental model entries of the block the session holds.
-/// Those whose cited memories are all in `in_context` are stored with it,
-/// and call 1 is shown them, so a reply relying on one is `used` on every
-/// memory it cites.
 pub fn ingest_turn(
     store: &Store,
     bank: &str,
     turn: &Turn,
     in_context: &[Uuid],
-    entries: &[BlockEntry],
 ) -> Result<Ingested, IngestError> {
     let mut conn = store.connection();
     let tx = conn.transaction()?;
@@ -282,13 +275,6 @@ pub fn ingest_turn(
     )?;
     let source_id = tx.last_insert_rowid();
     if !in_context.is_empty() {
-        let entries: Vec<&BlockEntry> = entries
-            .iter()
-            .filter(|entry| {
-                !entry.cites.is_empty()
-                    && entry.cites.iter().all(|memory| in_context.contains(memory))
-            })
-            .collect();
         tx.execute(
             "INSERT INTO turn_in_context (source_id, memories) VALUES (?1, ?2)",
             (
@@ -296,15 +282,6 @@ pub fn ingest_turn(
                 serde_json::to_string(in_context).expect("a list of ids serialises"),
             ),
         )?;
-        if !entries.is_empty() {
-            tx.execute(
-                "INSERT INTO turn_entries (source_id, entries) VALUES (?1, ?2)",
-                (
-                    source_id,
-                    serde_json::to_string(&entries).expect("entries serialise"),
-                ),
-            )?;
-        }
     }
 
     let text = [user.text.as_str(), TURN_SEPARATOR, reply.text.as_str()].concat();

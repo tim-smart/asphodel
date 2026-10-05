@@ -196,12 +196,8 @@ impl Worker {
                         // shutdown waits for the chunks in flight rather than
                         // abandoning them.
                         in_flight.spawn_blocking(move || {
-                            let Claimed {
-                                lease,
-                                in_context,
-                                entries,
-                            } = claimed;
-                            service.extract_leased(lease, llm.as_ref(), &in_context, &entries)
+                            let Claimed { lease, in_context } = claimed;
+                            service.extract_chunk(lease, llm.as_ref(), &in_context)
                         });
                         continue;
                     }

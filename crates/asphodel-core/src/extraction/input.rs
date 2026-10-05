@@ -12,15 +12,14 @@ use uuid::Uuid;
 
 use super::{
     CALENDAR_DAYS, CANDIDATE_MEMORIES, CONTEXT_CHARS, CONTEXT_TURNS, Call1Input, Candidate,
-    ContextTurnTime, ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, InContextEntry,
-    InContextMemory, PREVIOUS_CHUNK_CHARS, SpeakerRef,
+    ContextTurnTime, ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, InContextMemory,
+    PREVIOUS_CHUNK_CHARS, SpeakerRef,
 };
 use crate::config::Tuning;
 use crate::ingest::TURN_SEPARATOR;
 use crate::queue::{Lease, SourceKind};
 use crate::store::strength::StrengthLoader;
 use crate::store::timestamp;
-use crate::system_prompt::BlockEntry;
 
 /// What the checks and the commit need beyond the input itself.
 pub(super) struct Unit {
@@ -46,8 +45,6 @@ pub(super) struct Unit {
     pub candidates: BTreeMap<String, i64>,
     /// In-context handle to memory rowid and public id.
     pub in_context: BTreeMap<String, (i64, Uuid)>,
-    /// Entry handle to the memories the entry cites, rowid and public id.
-    pub entries: BTreeMap<String, Vec<(i64, Uuid)>>,
 }
 
 impl Unit {
@@ -83,7 +80,6 @@ pub(super) fn assemble(
     now: Timestamp,
     lease: &Lease,
     in_context: &[Uuid],
-    entries: &[BlockEntry],
 ) -> Result<(Call1Input, Unit), ExtractError> {
     let bank_id = lease.bank_id();
     let chunk_id = lease.chunk_id();
@@ -217,45 +213,6 @@ pub(super) fn assemble(
         }
     }
 
-    // An entry is shown only when every memory it cites is: one citing a
-    // memory forgotten since can't be credited.
-    let mut in_context_entries = Vec::new();
-    let mut entry_handles = BTreeMap::new();
-    if is_turn {
-        let by_memory: BTreeMap<Uuid, (&String, i64)> = in_context_handles
-            .iter()
-            .map(|(handle, (id, memory))| (*memory, (handle, *id)))
-            .collect();
-        for entry in entries {
-            let cited: Option<Vec<(&String, i64, Uuid)>> = entry
-                .cites
-                .iter()
-                .map(|memory| {
-                    by_memory
-                        .get(memory)
-                        .map(|(handle, id)| (*handle, *id, *memory))
-                })
-                .collect();
-            let Some(cited) = cited.filter(|cited| !cited.is_empty()) else {
-                continue;
-            };
-            let handle = format!("n{}", in_context_entries.len() + 1);
-            entry_handles.insert(
-                handle.clone(),
-                cited.iter().map(|(_, id, memory)| (*id, *memory)).collect(),
-            );
-            in_context_entries.push(InContextEntry {
-                handle,
-                entry: entry.entry,
-                text: entry.text.clone(),
-                cites: cited
-                    .iter()
-                    .map(|(handle, _, _)| (*handle).clone())
-                    .collect(),
-            });
-        }
-    }
-
     let turn = turn_number(conn, bank_id, source.source_id, is_turn)?;
     let entity_boundary: i64 =
         conn.query_row("SELECT COALESCE(MAX(id), 0) FROM entities", [], |row| {
@@ -273,7 +230,6 @@ pub(super) fn assemble(
         owner_speaking: speaker_ref.as_ref().is_some_and(|speaker| speaker.owner),
         candidates: handles,
         in_context: in_context_handles,
-        entries: entry_handles,
     };
     let input = Call1Input {
         chunk: source.chunk,
@@ -289,7 +245,6 @@ pub(super) fn assemble(
         context_times,
         candidates,
         in_context: in_context_memories,
-        entries: in_context_entries,
         language: tuning.llm.language.clone(),
         guidance: tuning.extraction.guidance.clone(),
     };

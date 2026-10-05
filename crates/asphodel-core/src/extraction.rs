@@ -60,7 +60,6 @@ use crate::config::Tuning;
 use crate::models::{Embedder, LlmClient, LlmError, ModelError};
 use crate::queue::{self, ChunkError, Failure, Lease, Leases, QueueError, SourceKind};
 use crate::store::{Store, StoreError, VectorIndex};
-use crate::system_prompt::BlockEntry;
 
 pub use call2::call2_request;
 pub(crate) use input::{entities_named, phrase, survivor};
@@ -129,9 +128,9 @@ pub const CANDIDATE_MEMORIES: usize = 3;
 pub const CALENDAR_DAYS: i64 = 21;
 
 /// Everything call 1 is given for one chunk. Handles are short ids local to
-/// the call (`e1`, `e2`, … for candidates, `m1`, `m2`, … for in-context
-/// memories and `n1`, `n2`, … for mental model entries), which the reply
-/// refers back to; they're cheaper and harder to garble than UUIDs.
+/// the call (`e1`, `e2`, … for candidates and `m1`, `m2`, … for in-context
+/// memories), which the reply refers back to; they're cheaper and harder to
+/// garble than UUIDs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call1Input {
     pub chunk: Uuid,
@@ -172,11 +171,6 @@ pub struct Call1Input {
     /// The in-context memories call 1 judges `used` against. Always empty
     /// for a document, which has no reply to have used anything.
     pub in_context: Vec<InContextMemory>,
-    /// The mental model entries of the block the turn's session held, each
-    /// with the in-context memories it cites. A reply that relied on one is
-    /// `used` on every memory it cites. Always empty
-    /// for a document.
-    pub entries: Vec<InContextEntry>,
     /// `[llm] language`: the language every claim is written in. `None`
     /// writes each in the language of the passage it quotes.
     pub language: Option<String>,
@@ -253,15 +247,6 @@ pub struct InContextMemory {
     pub handle: String,
     pub memory: Uuid,
     pub content: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct InContextEntry {
-    pub handle: String,
-    pub entry: Uuid,
-    pub text: String,
-    /// The handles of the in-context memories it cites.
-    pub cites: Vec<String>,
 }
 
 /// What a claim does to a neighbour (CONTEXT.md "Reconciliation").
@@ -520,7 +505,7 @@ pub(crate) fn call1_input(
 ) -> Result<Call1Input, ExtractError> {
     queue::check_held(leases, lease)?;
     let conn = store.connection();
-    let (input, _) = input::assemble(&conn, tuning, store.now(), lease, in_context, &[])?;
+    let (input, _) = input::assemble(&conn, tuning, store.now(), lease, in_context)?;
     Ok(input)
 }
 
@@ -538,7 +523,7 @@ pub(crate) fn call2_input(
     queue::check_held(leases, lease)?;
     let (input, unit) = {
         let conn = store.connection();
-        input::assemble(&conn, tuning, store.now(), lease, in_context, &[])?
+        input::assemble(&conn, tuning, store.now(), lease, in_context)?
     };
     let checked =
         claims::check(reply, &input, &unit).map_err(|reason| ExtractError::Rejected { reason })?;
@@ -674,11 +659,8 @@ pub(crate) fn extract(
     lease: Lease,
     llm: &dyn LlmClient,
     in_context: &[Uuid],
-    entries: &[BlockEntry],
 ) -> Result<Extracted, ExtractError> {
-    let mut prepared = prepare(
-        store, leases, tuning, embedder, lease, llm, in_context, entries,
-    )?;
+    let mut prepared = prepare(store, leases, tuning, embedder, lease, llm, in_context)?;
     loop {
         match commit_prepared(store, leases, prepared)? {
             Committed::Extracted(extracted) => return Ok(extracted),
@@ -698,7 +680,6 @@ pub(crate) fn prepare(
     lease: Lease,
     llm: &dyn LlmClient,
     in_context: &[Uuid],
-    entries: &[BlockEntry],
 ) -> Result<Prepared, ExtractError> {
     queue::check_held(leases, &lease)?;
     if queue::source_removed(&store.connection(), lease.chunk_id())? {
@@ -707,8 +688,7 @@ pub(crate) fn prepare(
     }
     let (input, mut unit, saved) = {
         let conn = store.connection();
-        let (input, unit) =
-            input::assemble(&conn, tuning, store.now(), &lease, in_context, entries)?;
+        let (input, unit) = input::assemble(&conn, tuning, store.now(), &lease, in_context)?;
         let saved: Option<String> = conn.query_row(
             "SELECT call1_output FROM chunks WHERE id = ?1",
             [lease.chunk_id()],
@@ -1130,17 +1110,6 @@ fn save(store: &Store, lease: &Lease, reply: &Value, unit: &input::Unit) -> Resu
             .iter()
             .map(|(handle, (id, uuid))| (handle.clone(), json!([id, uuid.to_string()])))
             .collect::<serde_json::Map<_, _>>(),
-        "entries": unit
-            .entries
-            .iter()
-            .map(|(handle, cites)| {
-                let cites: Vec<Value> = cites
-                    .iter()
-                    .map(|(id, uuid)| json!([id, uuid.to_string()]))
-                    .collect();
-                (handle.clone(), Value::Array(cites))
-            })
-            .collect::<serde_json::Map<_, _>>(),
     });
     store.connection().execute(
         "UPDATE chunks SET call1_output = ?1 WHERE id = ?2",
@@ -1170,31 +1139,10 @@ fn restore(saved: &str, unit: &mut input::Unit) -> Option<Value> {
             Some((handle.clone(), (id, uuid)))
         })
         .collect::<Option<_>>()?;
-    // A reply saved before version 6 has no entries: none were shown.
-    let entries = match saved.get("entries") {
-        Some(entries) => entries
-            .as_object()?
-            .iter()
-            .map(|(handle, cites)| {
-                let cites = cites
-                    .as_array()?
-                    .iter()
-                    .map(|pair| {
-                        let id = pair.get(0)?.as_i64()?;
-                        let uuid = pair.get(1)?.as_str()?.parse().ok()?;
-                        Some((id, uuid))
-                    })
-                    .collect::<Option<Vec<_>>>()?;
-                Some((handle.clone(), cites))
-            })
-            .collect::<Option<_>>()?,
-        None => Default::default(),
-    };
     let reply = saved.get_mut("reply")?.take();
     unit.entity_boundary = entity_boundary;
     unit.candidates = candidates;
     unit.in_context = in_context;
-    unit.entries = entries;
     Some(reply)
 }
 

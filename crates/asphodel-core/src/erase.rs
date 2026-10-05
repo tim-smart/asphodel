@@ -50,7 +50,6 @@ use crate::queue::QueueError;
 use crate::store::bank::log_edit;
 use crate::store::{Store, StoreError, VectorIndex, micros};
 use crate::strength::{Link, chain};
-use crate::system_prompt::BlockEntry;
 
 /// The edit kind forget writes when it's called: the audit row, which the
 /// turn that asked for the forget is linked to once it's ingested.
@@ -665,14 +664,9 @@ fn delete_recalls(conn: &Connection, members: &BTreeSet<i64>) -> Result<(), rusq
     Ok(())
 }
 
-/// Rewrites a stored JSON set without the forgotten memories, or `None`
-/// when nothing in it changes.
-type Keep<'a> = &'a dyn Fn(&str) -> Option<String>;
-
 /// Takes `memories` out of every stored in-context set of the bank: queued
-/// and failed turns' sets and entries, built blocks, and session mappings
-/// (schema versions 5 and 6). An entry citing any of them goes whole, since
-/// its text restates the memory.
+/// and failed turns' sets, built blocks, and session mappings (schema
+/// versions 5 and 6).
 fn scrub_stored(
     conn: &Connection,
     bank_id: i64,
@@ -683,45 +677,22 @@ fn scrub_stored(
         let kept: Vec<&Uuid> = ids.iter().filter(|id| !memories.contains(id)).collect();
         (kept.len() != ids.len()).then(|| serde_json::to_string(&kept).expect("ids serialise"))
     };
-    let keep_entries = |json: &str| -> Option<String> {
-        let entries: Vec<BlockEntry> = serde_json::from_str(json).ok()?;
-        let kept: Vec<&BlockEntry> = entries
-            .iter()
-            .filter(|entry| !entry.cites.iter().any(|id| memories.contains(id)))
-            .collect();
-        (kept.len() != entries.len())
-            .then(|| serde_json::to_string(&kept).expect("entries serialise"))
-    };
-    let tables: [(&str, &str, Keep<'_>); 5] = [
+    let tables = [
         (
             "SELECT t.id, t.memories FROM turn_in_context t
              JOIN sources s ON s.id = t.source_id WHERE s.bank_id = ?1",
             "UPDATE turn_in_context SET memories = ?2 WHERE id = ?1",
-            &keep_ids,
-        ),
-        (
-            "SELECT t.id, t.entries FROM turn_entries t
-             JOIN sources s ON s.id = t.source_id WHERE s.bank_id = ?1",
-            "UPDATE turn_entries SET entries = ?2 WHERE id = ?1",
-            &keep_entries,
         ),
         (
             "SELECT id, in_context FROM prompt_blocks WHERE bank_id = ?1",
             "UPDATE prompt_blocks SET in_context = ?2 WHERE id = ?1",
-            &keep_ids,
-        ),
-        (
-            "SELECT id, entries FROM prompt_blocks WHERE bank_id = ?1",
-            "UPDATE prompt_blocks SET entries = ?2 WHERE id = ?1",
-            &keep_entries,
         ),
         (
             "SELECT rowid, cited FROM session_blocks WHERE bank_id = ?1",
             "UPDATE session_blocks SET cited = ?2 WHERE rowid = ?1",
-            &keep_ids,
         ),
     ];
-    for (select, update, keep) in tables {
+    for (select, update) in tables {
         let rows: Vec<(i64, String)> = {
             let mut statement = conn.prepare_cached(select)?;
             statement
@@ -729,7 +700,7 @@ fn scrub_stored(
                 .collect::<Result<_, _>>()?
         };
         for (id, json) in rows {
-            if let Some(kept) = keep(&json) {
+            if let Some(kept) = keep_ids(&json) {
                 conn.execute(update, (id, kept))?;
             }
         }

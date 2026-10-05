@@ -1,0 +1,15 @@
+-- Asphodel schema, version 14: call 1 no longer sees a block's rendered
+-- entries.
+--
+-- Call 1 is given every memory a session's block cites under its own
+-- handle, so a reply that relied on a fact read in the block is `used` on
+-- that memory, as one that relied on an injected memory is. The entries'
+-- text, which version 6 kept with each built block and snapshotted with
+-- each turn, has no reader left, and is one less copy of restated memory
+-- text for forget to scrub.
+--
+-- A queued turn's snapshot goes with the table; the turn is extracted with
+-- its in-context set alone. `prompt_blocks.entries` is dropped by the
+-- migration runner, which skips the drop when the column is already gone,
+-- so running this again is harmless.
+DROP TABLE IF EXISTS turn_entries;

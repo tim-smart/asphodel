@@ -78,7 +78,7 @@ Link each claim to the entities it is about. Known entities have handles (`e1`, 
 
 # Used
 
-Context memories have handles (`m1`, `m2`, ...). Standing-note entries have handles (`n1`, `n2`, ...) and list the memories they rest on. In `used_injected_ids`, return only handles the assistant's reply actually relied on: the memory's handle, or the entry's if the reply relied on the entry. Being shown an item is not using it. Return an empty list for documents, which have no reply."#;
+Context memories have handles (`m1`, `m2`, ...). In `used_injected_ids`, return only the handles of memories the assistant's reply actually relied on. Being shown a memory is not using it. Return an empty list for documents, which have no reply."#;
 
 /// The language rule without `[llm] language`.
 const INFERRED_LANGUAGE: &str = "Write the claim in the language of the passage it quotes and never translate. Entity names and dates stay as they appear.";
@@ -186,18 +186,6 @@ fn render(input: &Call1Input) -> String {
     }
     for memory in &input.in_context {
         let _ = writeln!(out, "- {}: {}", memory.handle, memory.content);
-    }
-    if !input.entries.is_empty() {
-        out.push_str("\nEntries in the assistant's context, with the memories each rests on:\n");
-        for entry in &input.entries {
-            let _ = writeln!(
-                out,
-                "- {}: {} [rests on {}]",
-                entry.handle,
-                entry.text,
-                entry.cites.join(", ")
-            );
-        }
     }
 
     if !input.context.is_empty() {

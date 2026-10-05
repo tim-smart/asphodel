@@ -78,10 +78,6 @@ pub struct Record {
     /// the SHA-256 of its sentence.
     #[serde(default)]
     pub in_context: Vec<HandleHash>,
-    /// The mental model entries call 1 was shown, each with the handles it
-    /// cites.
-    #[serde(default)]
-    pub entries: Vec<EntryHandles>,
     /// SHA-256 of the assistant's reply in the chunk.
     #[serde(default)]
     pub reply_hash: Option<String>,
@@ -95,7 +91,7 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     /// Recorded by `--prime-concurrency` before a simulation, shown no
-    /// in-context memories or entries.
+    /// in-context memories.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub primed: bool,
     pub request: LlmRequest,
@@ -114,12 +110,6 @@ pub struct HandleHash {
     pub sentence: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EntryHandles {
-    pub handle: String,
-    pub cites: Vec<String>,
-}
-
 /// What the engine tells the recorder about the chunk being extracted,
 /// before the calls for it.
 #[derive(Debug, Clone)]
@@ -128,7 +118,6 @@ pub struct ChunkContext {
     pub reply_text: String,
     pub reply_hash: String,
     pub in_context: Vec<InContext>,
-    pub entries: Vec<EntryHandles>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,14 +146,6 @@ impl ChunkContext {
                     memory: memory.memory,
                     sentence: memory.content.clone(),
                     hash: sha256(&memory.content),
-                })
-                .collect(),
-            entries: input
-                .entries
-                .iter()
-                .map(|entry| EntryHandles {
-                    handle: entry.handle.clone(),
-                    cites: entry.cites.clone(),
                 })
                 .collect(),
         }
@@ -220,13 +201,22 @@ impl Index {
         }
         if let Some(reply_hash) = &record.reply_hash {
             let used = used_handles(&record);
+            // A reply naming a handle the record doesn't list, such as a
+            // mental model entry's from before call 1 credited by memory
+            // alone, may have relied on any of them through it: only its
+            // used verdicts stand, and the rest are left for a top-up.
+            let complete = used.iter().all(|handle| {
+                record
+                    .in_context
+                    .iter()
+                    .any(|memory| &memory.handle == handle)
+            });
             for memory in &record.in_context {
-                let judged = used.contains(&memory.handle)
-                    || record.entries.iter().any(|entry| {
-                        used.contains(&entry.handle) && entry.cites.contains(&memory.handle)
-                    });
-                self.pairs
-                    .insert((reply_hash.clone(), memory.sentence.clone()), judged);
+                let judged = used.contains(&memory.handle);
+                if judged || complete {
+                    self.pairs
+                        .insert((reply_hash.clone(), memory.sentence.clone()), judged);
+                }
             }
         }
         self.records.push(record);
@@ -614,7 +604,6 @@ impl Recorder {
             reply_text: context.reply_text.clone(),
             reply_hash: context.reply_hash.clone(),
             in_context: unknown.to_vec(),
-            entries: Vec::new(),
         };
         let response = self.answer(&request, Some(&subset), &[])?;
         let judged: Vec<String> = response
@@ -735,10 +724,6 @@ impl Recorder {
                         })
                         .collect()
                 })
-                .unwrap_or_default(),
-            entries: context
-                .filter(|_| request.template.name != CALL2_TEMPLATE)
-                .map(|context| context.entries.clone())
                 .unwrap_or_default(),
             reply_hash: context
                 .filter(|_| request.template.name != CALL2_TEMPLATE)

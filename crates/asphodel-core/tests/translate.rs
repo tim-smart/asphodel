@@ -467,7 +467,7 @@ fn a_translation_cant_commit_while_an_extraction_is_prepared() {
     let extractor = FakeLlm::scripted(MODEL, vec![call1, call2]);
     let prepared = h
         .service
-        .prepare_extraction(lease, &extractor, in_context, &claimed.entries)
+        .prepare_extraction(lease, &extractor, in_context)
         .unwrap();
 
     let next = turn("s2", at("2026-10-01T06:31:00Z"), "Sam walks to work.");
