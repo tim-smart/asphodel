@@ -1,0 +1,1 @@
+ALTER TABLE mental_models ADD COLUMN refresh_urgent INTEGER NOT NULL DEFAULT 0;

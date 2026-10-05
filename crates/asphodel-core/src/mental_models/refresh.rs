@@ -358,7 +358,8 @@ pub(crate) fn refresh(
         let conn = cx.store.connection();
         conn.execute(
             "UPDATE mental_models SET last_error_kind = NULL, last_error_at = NULL,
-                    refresh_requested_at = CASE WHEN ?2 THEN NULL ELSE refresh_requested_at END
+                    refresh_requested_at = CASE WHEN ?2 THEN NULL ELSE refresh_requested_at END,
+                    refresh_urgent = CASE WHEN ?2 THEN 0 ELSE refresh_urgent END
              WHERE id = ?1",
             (model.id, started.unchanged()),
         )?;
@@ -855,6 +856,7 @@ fn completed(
         "UPDATE mental_models SET last_fingerprint = ?2, last_refreshed_at = ?3,
                 last_error_kind = NULL, last_error_at = NULL,
                 refresh_requested_at = CASE WHEN ?4 THEN NULL ELSE refresh_requested_at END,
+                refresh_urgent = CASE WHEN ?4 THEN 0 ELSE refresh_urgent END,
                 updated_at = ?3
          WHERE id = ?1",
         (

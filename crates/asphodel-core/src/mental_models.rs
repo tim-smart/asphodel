@@ -323,6 +323,7 @@ pub(crate) struct ModelRow {
     pub last_fingerprint: Option<String>,
     pub last_refreshed_at: Option<Timestamp>,
     pub refresh_requested_at: Option<Timestamp>,
+    pub refresh_urgent: bool,
     pub last_error: Option<FailureKind>,
     pub last_error_at: Option<Timestamp>,
     /// The plan made for a question by an LLM call, if any.
@@ -398,7 +399,7 @@ impl ModelRow {
 
 const MODEL_COLUMNS: &str = "id, uuid, bank_id, name, question, filter_kinds, filter_entity_id,
      filter_min_volatility, max_tokens, enabled, last_fingerprint, last_refreshed_at,
-     refresh_requested_at, last_error_kind, last_error_at, plan, answer";
+     refresh_requested_at, last_error_kind, last_error_at, plan, answer, refresh_urgent";
 
 fn model_row(row: &rusqlite::Row<'_>) -> Result<ModelRow, rusqlite::Error> {
     let uuid: String = row.get(1)?;
@@ -432,6 +433,7 @@ fn model_row(row: &rusqlite::Row<'_>) -> Result<ModelRow, rusqlite::Error> {
             .get::<_, Option<String>>(15)?
             .and_then(|plan| serde_json::from_str(&plan).ok()),
         answer: row.get(16)?,
+        refresh_urgent: row.get(17)?,
     })
 }
 
@@ -767,6 +769,8 @@ fn linked(conn: &Connection, memory: i64, entity: i64) -> Result<bool, rusqlite:
 pub(crate) struct Effects {
     /// Models to refresh.
     pub triggered: BTreeSet<i64>,
+    /// Cited memories changed, so these repairs bypass the success interval.
+    pub urgent: BTreeSet<i64>,
     /// The block's content may have changed.
     pub invalidates: bool,
 }
@@ -881,6 +885,7 @@ pub(crate) fn effects(
                 let model = model?;
                 if models.iter().any(|enabled| enabled.id == model) {
                     effects.triggered.insert(model);
+                    effects.urgent.insert(model);
                 }
             }
         }
@@ -908,14 +913,16 @@ pub(crate) fn request(
     schedule: &Schedule,
     models: &BTreeSet<i64>,
     now: Timestamp,
+    urgent: bool,
 ) -> Result<(), rusqlite::Error> {
     let mut statement = conn.prepare_cached(
-        "UPDATE mental_models SET refresh_requested_at = COALESCE(refresh_requested_at, ?2)
+        "UPDATE mental_models SET refresh_requested_at = COALESCE(refresh_requested_at, ?2),
+                refresh_urgent = refresh_urgent OR ?3
          WHERE id = ?1 AND enabled = 1",
     )?;
     for model in models {
         schedule.requested(*model);
-        statement.execute((model, micros(now)))?;
+        statement.execute((model, micros(now), urgent))?;
     }
     Ok(())
 }

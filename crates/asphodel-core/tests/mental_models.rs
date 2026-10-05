@@ -921,6 +921,69 @@ fn a_refresh_held_by_the_gate_waits_for_the_hold_not_thirty_minutes() {
 }
 
 #[test]
+fn an_urgent_correction_does_not_bypass_the_wait_after_a_failed_refresh() {
+    let h = Harness::new();
+    let tea = h.seed(fact(TEA));
+    let cat = h.seed(fact(CAT));
+    h.profile_adding(&[(TEA, &[tea]), (CAT_ENTRY, &[cat])]);
+    h.advance(minutes(1));
+    h.service.retract(BANK, &tea.to_string()).unwrap();
+    let down = FakeLlm::failing(MODEL, || LlmError::Transport {
+        reason: "connection refused".into(),
+    });
+    // A manual refresh can attempt the repair immediately, but its failure
+    // must hold even a subsequent urgent correction for thirty minutes.
+    let failed_at = h.now();
+    assert_eq!(
+        h.refresh(PROFILE_NAME, &down, true),
+        Outcome::Failed(FailureKind::Llm)
+    );
+    h.advance(minutes(1));
+    h.service.retract(BANK, &cat.to_string()).unwrap();
+    let h = h.restart();
+    let llm = quiet_llm(1);
+    h.set(failed_at + minutes(30) - secs(1));
+    let waiting = h.tick(&llm);
+    assert!(waiting.ran.is_empty());
+    assert_eq!(writes(&llm), 0);
+    assert_eq!(waiting.next_due, Some(failed_at + minutes(30)));
+    h.advance(secs(1));
+    assert_eq!(h.tick(&llm).ran.len(), 1);
+    assert_eq!(h.profile().last_error, None);
+    assert_eq!(h.profile().last_refreshed_at, Some(h.now()));
+}
+
+#[test]
+fn forgetting_a_citation_repairs_the_model_after_the_debounce() {
+    let h = Harness::new();
+    let tea = h.seed(fact(TEA));
+    let cat = h.seed(fact(CAT));
+    h.profile_adding(&[(TEA, &[tea]), (CAT_ENTRY, &[cat])]);
+    h.advance(minutes(1));
+    let removed_at = h.now();
+    h.service.forget(BANK, &[tea.to_string()]).unwrap();
+    assert!(answer(&h.profile()).is_empty());
+    assert!(!h.block(None).text.contains(CAT_ENTRY));
+    let h = h.restart();
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![written(
+            &[(SECTION, CAT_ENTRY)],
+            &handles(&h.input(PROFILE_NAME), &[cat]),
+        )],
+    );
+    h.set(removed_at + minutes(5) - secs(1));
+    let waiting = h.tick(&llm);
+    assert!(waiting.ran.is_empty());
+    assert_eq!(waiting.next_due, Some(removed_at + minutes(5)));
+    h.advance(secs(1));
+    assert_eq!(h.tick(&llm).ran.len(), 1);
+    assert_eq!(writes(&llm), 1);
+    assert!(h.block(None).text.contains(CAT_ENTRY));
+    assert_eq!(cites(&h.profile()), BTreeSet::from([cat]));
+}
+
+#[test]
 fn a_disabled_model_is_never_refreshed() {
     let h = Harness::new();
     h.edit(PROFILE_NAME, json!({"enabled": false})).unwrap();
@@ -1690,7 +1753,7 @@ fn an_answer_renders_whole_and_a_retracted_citation_takes_the_model_out() {
     let cited: BTreeSet<Uuid> = block.cited.iter().copied().collect();
     assert_eq!(cited, BTreeSet::from([tea, maya, cat]));
 
-    h.advance(minutes(30));
+    h.advance(minutes(1));
     let corrected = h.now();
     let mia = fact(MIA).with("changes_something", json!(true));
     h.says_changing(mia, maya, "retracts");
@@ -1704,7 +1767,25 @@ fn an_answer_renders_whole_and_a_retracted_citation_takes_the_model_out() {
     // The stored answer waits for the refresh, which the retraction of a
     // cited memory triggers.
     assert!(answer(&h.profile()).contains(daughter));
-    assert_eq!(h.tick(&quiet_llm(1)).next_due, Some(corrected + minutes(5)));
+    // Urgency survives a restart, but still waits for the debounce.
+    let h = h.restart();
+    let llm = quiet_llm(2);
+    h.set(corrected + minutes(5) - secs(1));
+    let waiting = h.tick(&llm);
+    assert!(waiting.ran.is_empty());
+    assert_eq!(waiting.next_due, Some(corrected + minutes(5)));
+    h.advance(secs(1));
+    assert_eq!(h.tick(&llm).ran.len(), 1);
+    assert_eq!(writes(&llm), 1);
+
+    // Completing the urgent refresh restores the ordinary write interval.
+    let refreshed = h.now();
+    h.advance(minutes(1));
+    h.says(fact("Tim keeps bees."));
+    h.advance(minutes(5));
+    let waiting = h.tick(&llm);
+    assert!(waiting.ran.is_empty());
+    assert_eq!(waiting.next_due, Some(refreshed + minutes(30)));
 }
 
 #[test]

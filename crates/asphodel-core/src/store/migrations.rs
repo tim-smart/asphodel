@@ -21,7 +21,7 @@ use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
 
 /// The schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// How long a pre-migration copy is kept after its migration completes.
 pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
@@ -59,6 +59,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("../../migrations/0014_no_entry_snapshots.sql"),
     ),
     (15, include_str!("../../migrations/0015_model_answers.sql")),
+    (16, include_str!("../../migrations/0016_refresh_urgent.sql")),
 ];
 
 /// The columns a migration adds, by version. Every migration is safe to run
@@ -72,6 +73,7 @@ const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (13, "mental_models", "plan"),
     (13, "mental_model_entries", "section"),
     (15, "mental_models", "answer"),
+    (16, "mental_models", "refresh_urgent"),
 ];
 
 /// The columns a migration drops, by version, after its SQL runs. SQLite
