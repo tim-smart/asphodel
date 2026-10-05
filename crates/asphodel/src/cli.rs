@@ -1088,6 +1088,12 @@ pub struct RescoreArgs {
     #[arg(long)]
     pub out: PathBuf,
 
+    /// A TOML table of refresh facet heading to another query: every
+    /// refresh sample of that facet is scored again against it. Without it
+    /// the refresh samples are copied unchanged.
+    #[arg(long)]
+    pub refresh_queries: Option<PathBuf>,
+
     /// Where the real models are.
     #[arg(long, env = "ASPHODEL_MODEL_DIR")]
     pub model_dir: Option<PathBuf>,

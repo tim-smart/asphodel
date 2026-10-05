@@ -974,7 +974,7 @@ A conversation run injects differently, so call 1's requests change and
 ```
 asphodel report rescore --material <file> --corpus <file> \
     --rerank-query message|conversation --out <file> \
-    [--model-dir DIR] [--onnx-threads N]
+    [--refresh-queries <file>] [--model-dir DIR] [--onnx-threads N]
 ```
 
 scores each recall sample's candidates in the material again with the
@@ -988,7 +988,27 @@ as `rerank_query`. Sample and candidate ids, memories, sentences and each
 sample's `query` are kept, so labels apply unchanged in either form:
 candidate ids name the same candidates, and keyed labels match the same
 query and memory. Call 2's lists, with their chunks and ordinals, are
-copied as they were.
+copied as they were, and so are the refresh samples unless
+`--refresh-queries` is given.
+
+`--refresh-queries <file>` scores refresh pools against other facet
+queries. The file is TOML, a table of facet heading to query:
+
+```toml
+"People" = "Who are the important people in Tim's life?"
+```
+
+Every refresh sample whose `facet` has that heading, of any model, is
+scored again against the query, which becomes its `rerank_query`; the
+other refresh samples are copied as they were. Only the logits change.
+The sample's `query` is kept, so facet labels match the same candidates,
+and its candidates stay in the order the refresh ranked them, with the
+`strength`, `score`, `rank`, `cited`, `taken` and `input` the refresh
+recorded: those describe the run, not the new query. A sample whose facet
+missed the reranker in the run gets logits now and is marked
+`reranked: true`, so a null logit still means the reranker never scored
+it. A heading no refresh sample has is refused, as is a blank query,
+naming the file and quoting neither, and nothing is written.
 
 The pools are the ones the material's run gathered, so the comparison
 isolates the reranker's query. Ordering is by logit alone, so it says
@@ -997,8 +1017,8 @@ confidence and phase.
 
 A sample with no prefetch at its session and time in the corpus is
 refused, naming the sample, and nothing is written. The material, the
-corpus and the output must be inside the private dir, and the output may
-not be either input.
+corpus, the refresh queries and the output must be inside the private
+dir, and the output may not be any input.
 
 To compare the two queries on accepted labels, rescore the labelled material
 both ways, with the corpus its run replayed and the real models, and read
@@ -1021,6 +1041,11 @@ the corpus aren't the ones that run used. Compare `recall.top8` and the
 recall curves. Only the labelled candidates count, and they're the same in
 both, so a relevant memory the conversation query would have pulled into a
 pool from outside it isn't measured.
+
+To compare refresh facet queries the same way, rescore with
+`--refresh-queries` and read the `refresh` section against the same facet
+labels. The curves and input sizes move with the new logits; `budget` and
+`taken` still show what the run's own queries took.
 
 ### Bench
 
