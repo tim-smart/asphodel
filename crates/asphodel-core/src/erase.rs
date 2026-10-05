@@ -1284,6 +1284,7 @@ pub(crate) fn delete_bank(
         "DELETE FROM sweep_progress WHERE bank_id = ?1",
         "DELETE FROM extraction_queue WHERE bank_id = ?1",
         "DELETE FROM accesses WHERE bank_id = ?1",
+        "DELETE FROM pending_credits WHERE bank_id = ?1",
         "DELETE FROM mention_passages
          WHERE chunk_id IN (SELECT id FROM chunks WHERE bank_id = ?1)",
         "DELETE FROM chunks WHERE bank_id = ?1",

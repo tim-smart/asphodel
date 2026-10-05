@@ -29,6 +29,8 @@ pub struct DeletionInputs {
     pub min_access_age_days: f64,
     pub floor_spacing_days: f64,
     pub weight_created: f64,
+    /// `strength.access_weights.used`, under the name it had when it was a
+    /// constant, so its default keeps every stored fingerprint.
     pub weight_used: f64,
     pub weight_mentioned_again: f64,
     pub weight_confirmed: f64,
@@ -37,6 +39,10 @@ pub struct DeletionInputs {
     /// The tuned values of [`Significance::ALL`], lowest first.
     pub significance: [f64; 5],
     pub significance_kept: f64,
+    /// `strength.corroborate_used`. Inputs recorded before it existed read
+    /// as off.
+    #[serde(default)]
+    pub corroborate_used: bool,
     pub quiet_rate: f64,
     pub delta: Option<f64>,
     pub overdue_days: u32,
@@ -58,13 +64,14 @@ impl DeletionInputs {
             min_access_age_days: constants::MIN_ACCESS_AGE_DAYS,
             floor_spacing_days: constants::FLOOR_SPACING_DAYS,
             weight_created: constants::WEIGHT_CREATED,
-            weight_used: constants::WEIGHT_USED,
+            weight_used: tuning.strength.access_weights.used,
             weight_mentioned_again: constants::WEIGHT_MENTIONED_AGAIN,
             weight_confirmed: constants::WEIGHT_CONFIRMED,
             weight_window_close: constants::WEIGHT_WINDOW_CLOSE,
             full_speed_window_secs: constants::FULL_SPEED_WINDOW.as_secs(),
             significance: tuning.strength.significance.values(),
             significance_kept: constants::SIGNIFICANCE_KEPT,
+            corroborate_used: tuning.strength.corroborate_used,
             quiet_rate: tuning.clock.quiet_rate,
             delta: tuning.purge.delta,
             overdue_days: tuning.agenda.overdue_days,
@@ -79,7 +86,9 @@ impl DeletionInputs {
     pub fn changed_from(&self, stored: &DeletionInputs) -> Vec<String> {
         let mut changed = Vec::new();
         let constants = |inputs: &DeletionInputs| DeletionInputs {
+            weight_used: 0.0,
             significance: [0.0; 5],
+            corroborate_used: false,
             quiet_rate: 0.0,
             delta: None,
             overdue_days: 0,
@@ -89,8 +98,14 @@ impl DeletionInputs {
         if constants(self) != constants(stored) {
             changed.push("constants".to_string());
         }
+        if self.weight_used != stored.weight_used {
+            changed.push("strength.access_weights.used".to_string());
+        }
         if self.significance != stored.significance {
             changed.push("strength.significance".to_string());
+        }
+        if self.corroborate_used != stored.corroborate_used {
+            changed.push("strength.corroborate_used".to_string());
         }
         if self.quiet_rate != stored.quiet_rate {
             changed.push("clock.quiet_rate".to_string());
@@ -142,7 +157,8 @@ impl Serialize for Fingerprint {
 /// Each value goes in under its name, so two values can't swap without
 /// changing the hash. Floats go in as their IEEE 754 bits, with −0 folded
 /// into 0. Renaming or adding a field changes every stored fingerprint and
-/// pauses purge once, which is the safe direction.
+/// pauses purge once, which is the safe direction. A switch added later goes
+/// in only when it's on, so its default keeps every stored fingerprint.
 pub fn deletion_fingerprint(inputs: &DeletionInputs) -> Fingerprint {
     let mut hash = Hasher(Sha256::new());
     hash.0.update(b"asphodel deletion fingerprint v1\n");
@@ -165,6 +181,7 @@ pub fn deletion_fingerprint(inputs: &DeletionInputs) -> Fingerprint {
         full_speed_window_secs,
         significance,
         significance_kept,
+        corroborate_used,
         quiet_rate,
         delta,
         overdue_days,
@@ -190,6 +207,9 @@ pub fn deletion_fingerprint(inputs: &DeletionInputs) -> Fingerprint {
         hash.float(&format!("significance.{level:?}"), *value);
     }
     hash.float("significance.kept", *significance_kept);
+    if *corroborate_used {
+        hash.field("strength.corroborate_used", b"on");
+    }
     hash.float("clock.quiet_rate", *quiet_rate);
     match delta {
         Some(delta) => hash.float("purge.delta", *delta),

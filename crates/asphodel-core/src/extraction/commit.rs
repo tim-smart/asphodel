@@ -50,6 +50,7 @@ pub(super) fn commit(
     vectors: &[Vec<f32>],
     plan: &Plan,
     neighbours: &[Neighbour],
+    corroborate_used: bool,
 ) -> Result<Extracted, StoreError> {
     let now = store.now();
     let (proposed, entities_created) = resolve_proposals(tx, store, lease, unit, checked, plan)?;
@@ -262,9 +263,14 @@ pub(super) fn commit(
 
     // At most one access per memory per turn and source, keeping the
     // strongest. `used` weighs least, so an access already in this
-    // turn always stays.
+    // turn always stays. With `strength.corroborate_used` on, a chain's
+    // first credited turn is held as pending and writes nothing.
     for (memory_id, _) in &checked.used {
-        insert_access(tx, unit, *memory_id, "used")?;
+        if corroborate_used && !credited_before(tx, unit, *memory_id)? {
+            hold_credit(tx, unit, *memory_id)?;
+        } else {
+            insert_access(tx, unit, *memory_id, "used")?;
+        }
     }
 
     queue::finish(tx, now, lease)?;
@@ -541,6 +547,44 @@ fn insert_access(
     Ok(())
 }
 
+/// Whether `memory_id`'s chain was credited `used` in another turn: a
+/// pending credit, or a `used` access, on the memory or on anything it
+/// inherits from along `superseded_by`.
+fn credited_before(
+    tx: &Transaction<'_>,
+    unit: &Unit,
+    memory_id: i64,
+) -> Result<bool, rusqlite::Error> {
+    tx.query_row(
+        "WITH RECURSIVE chain(id) AS (
+           SELECT ?1
+           UNION
+           SELECT m.id FROM memories m JOIN chain c ON m.superseded_by = c.id
+         )
+         SELECT EXISTS (SELECT 1 FROM pending_credits
+                        WHERE memory_id IN (SELECT id FROM chain) AND turn <> ?2)
+             OR EXISTS (SELECT 1 FROM accesses
+                        WHERE memory_id IN (SELECT id FROM chain)
+                          AND kind = 'used' AND turn <> ?2)",
+        (memory_id, unit.turn),
+        |row| row.get(0),
+    )
+}
+
+/// Holds a first `used` credit for `memory_id` at the unit's turn. It
+/// writes no access, so strength never counts it.
+fn hold_credit(tx: &Transaction<'_>, unit: &Unit, memory_id: i64) -> Result<(), rusqlite::Error> {
+    if !exists(tx, memory_id)? {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO pending_credits (bank_id, memory_id, turn, at)
+         VALUES (?1, ?2, ?3, ?4)",
+        (unit.bank_id, memory_id, unit.turn, micros(unit.ingested_at)),
+    )?;
+    Ok(())
+}
+
 /// Records where the chunk restated `memory_id` without making a memory of
 /// it, so a forget can redact those passages (schema version 8). Kept
 /// apart from strength: a later version of the same document repeating
@@ -573,6 +617,9 @@ fn exists(tx: &Transaction<'_>, memory_id: i64) -> Result<bool, rusqlite::Error>
         .is_some())
 }
 
+/// Orders kinds within one turn, so the strongest access stays. It reads
+/// the fixed weights, never `strength.access_weights`: tuning `used` changes
+/// how much a `used` access counts, not which access a turn keeps.
 fn weight(kind: &str) -> f64 {
     match kind {
         "confirmed" => WEIGHT_CONFIRMED,

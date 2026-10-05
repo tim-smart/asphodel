@@ -201,6 +201,25 @@ pauses" below). Measure a change in replay with `--mode fast` first: it
 changes what's injected, and so the in-context set call 1 sees
 (`docs/replay.md`).
 
+Two more `[strength]` keys change how much a `used` verdict counts. Both
+are off at their defaults, which leave retention as it was:
+
+```toml
+[strength]
+corroborate_used = false
+
+[strength.access_weights]
+used = 1.0
+```
+
+`access_weights.used` is the weight of a `used` access in recent use,
+between 0 and 1. The lasting floor still counts the access as an occasion
+whatever its weight, and the other kinds' weights are fixed. With
+`corroborate_used` on, the first turn a memory is judged used in writes no
+access and is held as pending; a `used` verdict in any later turn writes one
+as usual. A correction counts its predecessor's credits. Both are deletion
+inputs. They're meant for replay `--overrides` comparisons, not production.
+
 An unknown key or an out-of-range value stops the daemon too. The LLM's two
 modes, an API key or a ChatGPT subscription, are in `docs/models.md`. For
 the subscription, log in once the pod is up:
@@ -833,7 +852,8 @@ from you.
 
 The store keeps a fingerprint of every setting that decides an
 irreversible deletion: the fixed strength constants, `clock.quiet_rate`,
-`strength.significance`, `purge.delta`, `agenda.overdue_days` and
+`strength.significance`, `strength.access_weights.used`,
+`strength.corroborate_used`, `purge.delta`, `agenda.overdue_days` and
 `purge.source_horizon_days`. A significance change alters every memory's
 strength at once, so it pauses purge like the others, and nothing purges
 under the new values until you acknowledge them.
