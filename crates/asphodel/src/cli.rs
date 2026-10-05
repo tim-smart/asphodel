@@ -2058,6 +2058,15 @@ fn print_status(status: &Value, attention: &[&str]) {
             );
         }
     }
+    for call in list(status, "llm_retrying") {
+        println!(
+            "LLM retrying for {} since {}: {} attempts failed, the last with: {}",
+            text(call, "caller"),
+            text(call, "since"),
+            count(call, "attempts"),
+            text(call, "error"),
+        );
+    }
     match &status["last_sweep"] {
         Value::Null => println!("last sweep: never"),
         sweep => println!(

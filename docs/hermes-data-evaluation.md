@@ -645,9 +645,9 @@ so rather than improvise.
 - Manual, daemon resilience, no real LLM: `ASPHODEL_LLM_SCRIPT=<file>
   asphodel serve ...` plays scripted replies and failures
   (`docs/models.md`, "The LLM"). Confirm a `usage_limited` step holds the
-  queue until `resets_at` and a `status` 500 step is retried within the
-  call, counting toward the chunk's retry cap only once every attempt has
-  failed.
+  queue until `resets_at`, a `status` 503 step is retried within the call
+  without counting, and a `status` 500 step counts toward the chunk's retry
+  cap at once.
 - Not implemented: a metrics endpoint. `status` exiting non-zero is the
   only alert signal.
 

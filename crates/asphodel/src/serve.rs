@@ -16,14 +16,14 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use asphodel_core::clock::ThreadSleeper;
+use asphodel_core::clock::{Sleeper, StopSleeper, ThreadSleeper};
 use asphodel_core::config::{
     Deployment, LLM_API_KEY_ENV, LlmAuth, ModelsConfig, Secret, TOKEN_ENV,
 };
 use asphodel_core::models::{
     CodexResponses, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, LlmGate,
-    LlmRetry, LlmSettings, LlmStatus, ModelOptions, Models, OpenAiCompatible, RetryPolicy,
-    TokenStore,
+    LlmRetry, LlmSettings, LlmStatus, ModelOptions, Models, OpenAiCompatible, RetryBoard,
+    RetryPolicy, TokenStore,
 };
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::{Clock, ResolvedConfig, Service, SystemClock, Tuning};
@@ -78,7 +78,8 @@ pub(crate) struct Ready {
     config: ResolvedConfig,
     /// `None` when no LLM is configured: chunks wait on the queue.
     workers: Option<Arc<Workers>>,
-    /// The LLM extraction and refresh share, when one is configured.
+    /// The LLM translate calls, when one is configured: through the shared
+    /// gate, on translate's own bounded retries.
     llm: Option<Arc<dyn LlmClient>>,
 }
 
@@ -96,6 +97,8 @@ impl App {
 struct Started {
     service: Service,
     config: ResolvedConfig,
+    /// The gate every caller's LLM calls go through, when one is
+    /// configured. Each caller retries above it on its own policy.
     llm: Option<Arc<dyn LlmClient>>,
     /// Every bank in the store, each of which gets a worker at once, since
     /// the queue may hold chunks from before a restart.
@@ -143,6 +146,7 @@ pub(crate) async fn run_with(
     // daemon before it exists to a client.
     let models = models_switch()?;
     let script = llm_script()?;
+    let retry_wait = retry_wait()?;
     let gate = startup_gate();
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -210,27 +214,48 @@ pub(crate) async fn run_with(
 
     let service = Arc::new(started.service);
     tokio::spawn(housekeeping(Arc::downgrade(&service)));
-    if let Some(llm) = &started.llm {
+    let retries = Arc::new(Retries {
+        clock: Arc::clone(&clock),
+        sleeper: Arc::new(StopSleeper::default()),
+        board: service.llm_retries(),
+        wait: retry_wait,
+    });
+    // A call waiting out an outage wakes on the stop and gives up without
+    // counting anything, so shutdown never waits for the provider.
+    tokio::spawn({
+        let retries = Arc::clone(&retries);
+        let stop = stop.clone();
+        async move {
+            stopped(stop).await;
+            retries.sleeper.stop();
+        }
+    });
+    if let Some(gate) = &started.llm {
         tokio::spawn(refreshes(
             Arc::downgrade(&service),
-            Arc::clone(llm),
+            retries.client(gate, RetryPolicy::daemon(), Some("refresh")),
             stop.clone(),
         ));
     }
     let workers = match &started.llm {
-        Some(llm) => Some(Workers::start(
+        Some(gate) => Some(Workers::start(
             Arc::clone(&service),
-            Arc::clone(llm),
+            Arc::clone(gate),
+            Arc::clone(&retries),
             &started.banks,
             stop.clone(),
         )),
         None => None,
     };
+    let translate = started
+        .llm
+        .as_ref()
+        .map(|gate| retries.client(gate, RetryPolicy::translate(), None));
     let _ = app.ready.set(Ready {
         service: Arc::clone(&service),
         config: started.config,
         workers: workers.clone(),
-        llm: started.llm,
+        llm: translate,
     });
     info!(version = asphodel_core::VERSION, listen = %address, "asphodel listening");
     // A re-embed a restart stopped resumes from where it got to.
@@ -390,19 +415,15 @@ fn start(
     let service = service.with_purge_pause(config.purge.clone());
     let llm = llm_client(&config, &args.data_dir, Arc::clone(&clock), script)?;
     config.fake_llm = llm.as_ref().is_some_and(|(_, fake)| *fake);
-    // Extraction and refresh share one gate: `[llm] concurrency` calls in
-    // flight at most, and one hold when any of them hits a limit. A
-    // transient failure is retried under it, so the gate sees only the
-    // final result.
+    // Extraction, refresh and translate share one gate: `[llm]
+    // concurrency` calls in flight at most, and one hold when any of them
+    // hits a limit. Each retries above it, so a call waiting to retry
+    // frees its slot, and a hold set meanwhile stops its next attempt.
     let concurrency = config.tuning.llm.concurrency as usize;
-    let llm = match llm {
-        Some((llm, fake)) => {
-            let retried = retrying(llm, Arc::clone(&clock))?;
-            let gate: Arc<dyn LlmClient> = Arc::new(LlmGate::new(retried, concurrency, clock));
-            Some((gate, fake))
-        }
-        None => None,
-    };
+    let llm = llm.map(|(llm, fake)| {
+        let gate: Arc<dyn LlmClient> = Arc::new(LlmGate::new(llm, concurrency, clock));
+        (gate, fake)
+    });
     info!(
         config = %serde_json::to_string(&config)?,
         "resolved config"
@@ -438,37 +459,80 @@ fn llm_script() -> anyhow::Result<Option<String>> {
     Ok(Some(script))
 }
 
-/// `ASPHODEL_LLM_RETRY_WAIT_MS=<ms>` replaces the first and the longest
-/// wait between the attempts of an LLM call, in the daemon and in replay's
-/// live calls, so an integration test can retry without sleeping. It is for
-/// integration tests, environment only, never in `--help`.
+/// `ASPHODEL_LLM_RETRY_WAIT_MS=<ms>` replaces every wait between the
+/// attempts of an LLM call, in the daemon and in replay's live calls, so an
+/// integration test can retry without sleeping. It is for integration
+/// tests, environment only, never in `--help`.
 pub(crate) const LLM_RETRY_WAIT_ENV: &str = "ASPHODEL_LLM_RETRY_WAIT_MS";
 
-/// `llm` retrying a transient failure within the call ([`LlmRetry`]), with
-/// the budget measured on `clock`.
+/// The wait [`LLM_RETRY_WAIT_ENV`] sets, if it's set.
+fn retry_wait() -> anyhow::Result<Option<Duration>> {
+    let Some(value) = std::env::var_os(LLM_RETRY_WAIT_ENV) else {
+        return Ok(None);
+    };
+    let wait = value
+        .to_str()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_millis)
+        .with_context(|| format!("{LLM_RETRY_WAIT_ENV} isn't a whole number of milliseconds"))?;
+    warn!("{LLM_RETRY_WAIT_ENV} is set: LLM retries wait {wait:?}");
+    Ok(Some(wait))
+}
+
+/// `policy` with every wait [`LLM_RETRY_WAIT_ENV`] set, if it's set.
+fn waiting(mut policy: RetryPolicy, wait: Option<Duration>) -> RetryPolicy {
+    if let Some(wait) = wait {
+        policy.first_wait = wait;
+        policy.max_wait = wait;
+    }
+    policy
+}
+
+/// Replay's live client: `llm` retrying on [`RetryPolicy::replay`], timed
+/// on `clock`.
 pub(crate) fn retrying(
     llm: Arc<dyn LlmClient>,
     clock: Arc<dyn Clock>,
 ) -> anyhow::Result<Arc<dyn LlmClient>> {
-    let mut policy = RetryPolicy::default();
-    if let Some(value) = std::env::var_os(LLM_RETRY_WAIT_ENV) {
-        let wait = value
-            .to_str()
-            .and_then(|value| value.parse().ok())
-            .map(Duration::from_millis)
-            .with_context(|| {
-                format!("{LLM_RETRY_WAIT_ENV} isn't a whole number of milliseconds")
-            })?;
-        warn!("{LLM_RETRY_WAIT_ENV} is set: LLM retries wait {wait:?}");
-        policy.first_wait = wait;
-        policy.max_wait = wait;
-    }
+    let policy = waiting(RetryPolicy::replay(), retry_wait()?);
     Ok(Arc::new(LlmRetry::new(
         llm,
         policy,
         clock,
         Arc::new(ThreadSleeper),
     )))
+}
+
+/// What every daemon caller's retries share: the clock, the sleeper the
+/// stop wakes, and the board `status` reads.
+pub(crate) struct Retries {
+    clock: Arc<dyn Clock>,
+    sleeper: Arc<StopSleeper>,
+    board: RetryBoard,
+    wait: Option<Duration>,
+}
+
+impl Retries {
+    /// `gate` retrying on `policy`, and listed on the board as `caller`
+    /// while it waits to retry, if it has one.
+    pub(crate) fn client(
+        &self,
+        gate: &Arc<dyn LlmClient>,
+        policy: RetryPolicy,
+        caller: Option<&str>,
+    ) -> Arc<dyn LlmClient> {
+        let sleeper: Arc<dyn Sleeper> = self.sleeper.clone();
+        let retry = LlmRetry::new(
+            Arc::clone(gate),
+            waiting(policy, self.wait),
+            Arc::clone(&self.clock),
+            sleeper,
+        );
+        Arc::new(match caller {
+            Some(caller) => retry.reporting(self.board.clone(), caller),
+            None => retry,
+        })
+    }
 }
 
 /// `ASPHODEL_STARTUP_GATE=<path>` holds startup, after the listener is bound
