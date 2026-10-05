@@ -112,6 +112,9 @@ and the date doesn't go stale in meaning. Cost 5 was accepted.
 
 Still open after TIM-186: no `write_model` v2 or v3 cassettes were
 recorded for the scenarios under `scenarios/`, which run against the
-scripted LLM instead. Recording against private history needs its own
-authorization under `AGENTS.md`. This is a validation gap, not a design
-one.
+scripted LLM instead. Recording against private history follows
+`AGENTS.md`: it's routed through Mac Developer, stays within the standing
+authorization's backend, auth, model and reasoning boundary, keeps every
+private artifact inside `ASPHODEL_REPLAY_DIR`, and any evaluation decision
+drawn from it waits on the independent review that file requires. This is
+a validation gap, not a design one.

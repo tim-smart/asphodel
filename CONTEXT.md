@@ -175,7 +175,7 @@ A document that an LLM keeps up to date from memories, to answer a standing ques
 _Avoid_: Observation, reflection, summary, profile (a profile is one mental model)
 
 **Answer**:
-A mental model's text: connected prose, a heading and a paragraph per facet, with one set of citations for the whole. Only a refresh writes it, and it's stored, rendered and blanked whole; nothing edits it sentence by sentence.
+A mental model's text: connected prose, a heading and a paragraph per facet, with one set of citations for the whole. Only a refresh writes it, replacing it whole, and forget blanks it whole. A token budget may cut trailing sentences off the end, at the refresh or in the prompt block, and what's left still cites the whole set; no sentence in it is cited or edited on its own.
 _Avoid_: Entry (the old unit, one cited sentence), summary, line, bullet, block
 
 **Facet**:
