@@ -1902,11 +1902,11 @@ fn the_block_is_cached_until_its_content_changes() {
     assert!(refreshed.text.contains(TEA));
 }
 
-test]
+#[test]
 fn taking_a_model_out_of_the_prompt_and_back_shows_in_the_next_block_and_survives_a_restart() {
     let h = Harness::new();
     let tea = h.seed(fact(TEA));
-    h.profile_adding( &[("Tim likes green tea.", &[tea])]);
+    h.profile_adding(&[("Tim likes green tea.", &[tea])]);
     assert!(h.block(None).text.contains("Tim likes green tea."));
 
     let toggle = |h: &Harness, enabled: bool| {
@@ -1944,7 +1944,7 @@ fn taking_a_model_out_of_the_prompt_and_back_shows_in_the_next_block_and_survive
 fn the_cached_block_is_read_without_building_one() {
     let h = Harness::new();
     let tea = h.seed(fact(TEA));
-    h.profile_adding( &[("Tim likes green tea.", &[tea])]);
+    h.profile_adding(&[("Tim likes green tea.", &[tea])]);
     let accesses = h.accesses(tea, "injection");
 
     // Nothing has fetched the block, so nothing is cached, and looking
@@ -1972,10 +1972,12 @@ fn the_cached_block_is_read_without_building_one() {
     h.block(None);
     h.set(at("2026-10-01T11:00:00Z"));
     assert_eq!(h.service.cached_system_prompt(BANK).unwrap(), None);
-    assert_eq!(h.accesses(tea, "injection"), accesses, "reading the cache never counts");
+    assert_eq!(
+        h.accesses(tea, "injection"),
+        accesses,
+        "reading the cache never counts"
+    );
 }
-
-
 
 #[test]
 fn the_clock_alone_changes_the_block_only_at_local_midnight() {

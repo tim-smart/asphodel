@@ -1504,10 +1504,7 @@ fn the_model_list_carries_the_budget_and_enabling_past_it_changes_nothing() {
         refused.json()["error"],
         "801 tokens is over the 800-token budget for mental models"
     );
-    assert_eq!(
-        enabled(&daemon.get_ok("/v1/banks/main/models")),
-        before
-    );
+    assert_eq!(enabled(&daemon.get_ok("/v1/banks/main/models")), before);
 }
 
 /// The dashboard shows the block the daemon has cached without building
