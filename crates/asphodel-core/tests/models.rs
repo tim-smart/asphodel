@@ -655,7 +655,7 @@ fn reply_content_is_json_fenced_or_not_and_anything_else_is_an_error() {
     let refused = complete(StubResponse::json(reply)).unwrap_err();
     assert!(matches!(refused, LlmError::Refused), "{refused:?}");
     for error in [not_json, no_choices, refused] {
-        assert!(!error.is_retryable(), "{error:?}");
+        assert_eq!(error.retry(), Retry::Never, "{error:?}");
     }
 }
 
@@ -672,10 +672,13 @@ fn an_http_error_is_retried_or_held_or_neither() {
     // A hold says when to come back, so every caller waits that long and
     // nothing is counted: a deferral, not a retry. A Retry-After that's
     // neither seconds nor a date counts like none, and on any status but
-    // 429 it changes nothing.
+    // 429 it changes nothing. A 429 without one, 502, 503 and 504 say the
+    // provider is down; 408, 500 and any other 5xx may be the request's
+    // own doing.
     enum Expected {
         Fatal,
-        Retry,
+        Down,
+        Request,
         Hold(RangeInclusive<Duration>),
     }
     use Expected::*;
@@ -686,14 +689,17 @@ fn an_http_error_is_retried_or_held_or_neither() {
         (400, None, Fatal),
         (401, None, Fatal),
         (404, None, Fatal),
-        (408, None, Retry),
-        (429, None, Retry),
-        (500, None, Retry),
-        (502, None, Retry),
-        (503, None, Retry),
+        (408, None, Request),
+        (429, None, Down),
+        (500, None, Request),
+        (501, None, Request),
+        (502, None, Down),
+        (503, None, Down),
+        (504, None, Down),
+        (505, None, Request),
         (429, after("30"), Hold(secs(30)..=secs(30))),
-        (429, after("soon"), Retry),
-        (503, after("30"), Retry),
+        (429, after("soon"), Down),
+        (503, after("30"), Down),
         (429, at(10), Hold(secs(8 * 60)..=secs(10 * 60))),
         (429, at(-10), Hold(Duration::ZERO..=Duration::ZERO)),
     ];
@@ -715,12 +721,17 @@ fn an_http_error_is_retried_or_held_or_neither() {
                 "{case}"
             );
         }
-        assert_eq!(error.is_retryable(), matches!(expected, Retry), "{case}");
+        let retry = match expected {
+            Fatal | Hold(_) => Retry::Never,
+            Down => Retry::ProviderDown,
+            Request => Retry::MaybeTheRequest,
+        };
+        assert_eq!(error.retry(), retry, "{case}");
     }
 }
 
 #[test]
-fn a_slow_or_dead_endpoint_is_a_retryable_transport_failure() {
+fn a_slow_endpoint_may_be_the_requests_fault_and_a_dead_one_is_the_providers() {
     let mut slow = StubResponse::completion("{}");
     slow.delay = Duration::from_secs(3);
     let server = StubServer::start(slow);
@@ -729,7 +740,8 @@ fn a_slow_or_dead_endpoint_is_a_retryable_transport_failure() {
     })
     .unwrap_err();
     assert!(matches!(error, LlmError::Timeout), "{error:?}");
-    assert!(error.is_retryable());
+    // A reply that reliably runs past the timeout is the request's doing.
+    assert_eq!(error.retry(), Retry::MaybeTheRequest);
 
     // Bind and drop, so the port is closed.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -740,7 +752,7 @@ fn a_slow_or_dead_endpoint_is_a_retryable_transport_failure() {
     })
     .unwrap_err();
     assert!(matches!(error, LlmError::Transport { .. }), "{error:?}");
-    assert!(error.is_retryable());
+    assert_eq!(error.retry(), Retry::ProviderDown);
 }
 
 // Retrying a transient error within the call.
@@ -788,29 +800,29 @@ impl Sleeper for Waits {
     }
 }
 
-/// A bounded policy, as translate has: four attempts at most, waiting 1s,
-/// 2s, then 3s (capped from 4s) before them, and none started 30s after
-/// the first, whatever the error.
+/// A bounded policy, the shape translate has: four attempts at most for
+/// either kind of failure, waiting 1s, 2s, then 3s (capped from 4s) before
+/// them, and none started 30s after the first.
 fn retry_policy() -> RetryPolicy {
     RetryPolicy {
-        attempts: 4,
         first_wait: Duration::from_secs(1),
         max_wait: Duration::from_secs(3),
-        budget: Duration::from_secs(30),
-        unbounded: false,
+        provider_attempts: Some(4),
+        request_attempts: 4,
+        budget: Some(Duration::from_secs(30)),
     }
 }
 
-/// The policy extraction and refresh run on: an outage is retried for as
-/// long as it lasts, backing off from 1s to 60s, and an error that may be
-/// the request's own gets three attempts within 30s.
-fn outage_policy() -> RetryPolicy {
+/// The shape extraction and refresh have: the provider being down is
+/// retried until it recovers, backing off from 1s to 60s, and a failure
+/// the request may cause is returned at once for the caller to count.
+fn daemon_policy() -> RetryPolicy {
     RetryPolicy {
-        attempts: 3,
         first_wait: Duration::from_secs(1),
         max_wait: Duration::from_secs(60),
-        budget: Duration::from_secs(30),
-        unbounded: true,
+        provider_attempts: None,
+        request_attempts: 1,
+        budget: None,
     }
 }
 
@@ -903,15 +915,15 @@ fn a_transient_error_is_retried_within_the_call_and_nothing_else_is() {
 
     // Exhausting the attempts returns the last error.
     let (result, calls, waits) = retried(vec![
-        quick(status(500)),
         quick(status(502)),
         quick(status(503)),
         quick(status(504)),
+        quick(status(503)),
         quick(ok()),
     ]);
     let error = result.unwrap_err();
     assert!(
-        matches!(error, LlmError::Status { status: 504 }),
+        matches!(error, LlmError::Status { status: 503 }),
         "{error:?}"
     );
     assert_eq!((calls, waits.len()), (4, 3));
@@ -977,7 +989,7 @@ fn a_transient_error_is_retried_within_the_call_and_nothing_else_is() {
 }
 
 #[test]
-fn an_outage_is_retried_for_as_long_as_it_lasts_and_a_doubtful_error_is_not() {
+fn the_provider_being_down_is_retried_until_it_recovers_and_a_request_fault_as_the_caller_allows() {
     let ok = || Ok(json!({"claims": []}));
     let status = |status| Err(LlmError::Status { status });
     let backend = |code: &str| {
@@ -986,16 +998,15 @@ fn an_outage_is_retried_for_as_long_as_it_lasts_and_a_doubtful_error_is_not() {
         })
     };
 
-    // The provider unreachable, overloaded or limiting: retried past any
-    // attempt count or budget, the backoff doubling from 1s to its 60s cap.
-    let outage = vec![
+    // Unreachable, overloaded or limiting: retried past any attempt count,
+    // the backoff doubling from 1s to its 60s cap.
+    let down = vec![
         quick(Err(LlmError::Transport {
             reason: "connection refused".into(),
         })),
         quick(status(502)),
         quick(status(503)),
         quick(status(504)),
-        quick(status(408)),
         quick(status(429)),
         quick(backend("server_is_overloaded")),
         quick(backend("slow_down")),
@@ -1005,8 +1016,8 @@ fn an_outage_is_retried_for_as_long_as_it_lasts_and_a_doubtful_error_is_not() {
         quick(status(503)),
         quick(ok()),
     ];
-    let failures = outage.len() - 1;
-    let (result, calls, waits) = retried_under(outage_policy(), outage, None);
+    let failures = down.len() - 1;
+    let (result, calls, waits) = retried_under(daemon_policy(), down, None);
     assert_eq!(result.unwrap().json, json!({"claims": []}));
     assert_eq!((calls, waits.len()), (failures + 1, failures));
     for (doublings, wait) in waits.iter().enumerate() {
@@ -1017,34 +1028,54 @@ fn an_outage_is_retried_for_as_long_as_it_lasts_and_a_doubtful_error_is_not() {
         );
     }
 
-    // A timeout, a plain 500 or `server_error` may be the request's own
-    // doing, so it keeps the bounded attempts and returns the last error
-    // for the caller to count.
-    let doubtful = vec![
-        quick(Err(LlmError::Timeout)),
-        quick(status(500)),
-        quick(backend("server_error")),
-        quick(ok()),
+    // A failure the request may cause goes back at once when the caller
+    // counts it itself, as extraction and refresh do.
+    let request_faults: Vec<(&str, Result<Value, LlmError>)> = vec![
+        ("timeout", Err(LlmError::Timeout)),
+        ("408", status(408)),
+        ("500", status(500)),
+        ("501", status(501)),
+        ("server_error", backend("server_error")),
+        ("interrupted", backend("interrupted")),
     ];
-    let (result, calls, _) = retried_under(outage_policy(), doubtful, None);
-    let error = result.unwrap_err();
-    assert!(
-        matches!(&error, LlmError::Backend { code } if code == "server_error"),
-        "{error:?}"
-    );
-    assert_eq!(calls, 3);
+    for (case, outcome) in request_faults {
+        let expected = format!("{:?}", outcome.as_ref().unwrap_err());
+        let (result, calls, waits) =
+            retried_under(daemon_policy(), vec![quick(outcome), quick(ok())], None);
+        assert_eq!(format!("{:?}", result.unwrap_err()), expected, "{case}");
+        assert_eq!((calls, waits), (1, vec![]), "{case}");
+    }
 
-    // An outage before them uses up none of their attempts, nor their
-    // budget, though its backoff alone passes 30s.
-    let mut after_outage: Vec<Step> = (0..6).map(|_| quick(status(503))).collect();
-    after_outage.extend([
-        quick(Err(LlmError::Timeout)),
-        quick(status(500)),
-        quick(ok()),
-    ]);
-    let (result, calls, _) = retried_under(outage_policy(), after_outage, None);
+    // A caller with no count of its own, as replay, retries them a few
+    // times. The provider being down in between uses up none of those.
+    let replay = RetryPolicy {
+        request_attempts: 5,
+        ..daemon_policy()
+    };
+    let faults = |n| {
+        (0..n)
+            .map(|_| quick(backend("server_error")))
+            .collect::<Vec<Step>>()
+    };
+    let mut recovers = faults(4);
+    recovers.push(quick(ok()));
+    let (result, calls, _) = retried_under(replay, recovers, None);
     assert!(result.is_ok(), "{result:?}");
-    assert_eq!(calls, 9);
+    assert_eq!(calls, 5);
+    let mut never = faults(5);
+    never.push(quick(ok()));
+    let (result, calls, _) = retried_under(replay, never, None);
+    assert!(
+        matches!(result, Err(LlmError::Backend { .. })),
+        "{result:?}"
+    );
+    assert_eq!(calls, 5);
+    let mut mixed: Vec<Step> = (0..6).map(|_| quick(status(503))).collect();
+    mixed.extend(faults(4));
+    mixed.push(quick(ok()));
+    let (result, calls, _) = retried_under(replay, mixed, None);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(calls, 11);
 }
 
 /// Records each wait and then reports itself stopped, as the daemon's
@@ -1080,10 +1111,10 @@ fn a_retry_its_sleeper_stops_gives_up_as_stopped() {
         calls: AtomicUsize::new(0),
     });
     let sleeper = Arc::new(Stopping::default());
-    let retry = LlmRetry::new(inner.clone(), outage_policy(), clock, sleeper.clone());
+    let retry = LlmRetry::new(inner.clone(), daemon_policy(), clock, sleeper.clone());
     let result = retry.complete(&request());
     assert!(matches!(result, Err(LlmError::Stopped)), "{result:?}");
-    assert!(!LlmError::Stopped.is_retryable());
+    assert_eq!(LlmError::Stopped.retry(), Retry::Never);
     assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
     assert_eq!(sleeper.waits.load(Ordering::SeqCst), 1);
 }
@@ -1142,7 +1173,7 @@ fn a_call_retrying_through_an_outage_shows_in_status_until_it_ends() {
     let policy = RetryPolicy {
         first_wait: Duration::from_secs(20 * 60),
         max_wait: Duration::from_secs(20 * 60),
-        ..outage_policy()
+        ..daemon_policy()
     };
     let before = seen(&service);
     assert_eq!(before.0, vec![]);

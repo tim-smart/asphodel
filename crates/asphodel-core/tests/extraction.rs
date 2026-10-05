@@ -1871,16 +1871,12 @@ impl Sleeper for NoSleep {
     }
 }
 
-/// `script` ([`FakeLlm::from_script`]) behind [`LlmRetry`] as the daemon
-/// calls the LLM: an outage retried for as long as it lasts, any other
-/// transient error three times. Returns the fake too, to count its calls.
+/// `script` ([`FakeLlm::from_script`]) behind [`LlmRetry`] on the
+/// daemon's policy for extraction. Returns the fake too, to count its
+/// calls.
 fn retrying_with(h: &Harness, script: Value, sleeper: NoSleep) -> (LlmRetry, Arc<FakeLlm>) {
     let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
-    let policy = RetryPolicy {
-        attempts: 3,
-        unbounded: true,
-        ..RetryPolicy::default()
-    };
+    let policy = RetryPolicy::daemon();
     let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), Arc::new(sleeper));
     (llm, inner)
 }
@@ -1890,7 +1886,7 @@ fn retrying(h: &Harness, script: Value) -> LlmRetry {
 }
 
 #[test]
-fn a_transient_error_retried_within_the_call_counts_only_its_last_failure() {
+fn the_provider_being_down_counts_nothing_and_a_request_fault_counts_each_attempt() {
     let tea = reply(vec![claim("Tim likes tea.", "fact", "I like tea")], &[]);
     let tea = json!({"reply": tea});
     let status = |status: u16| json!({"fail": "status", "status": status});
@@ -1898,7 +1894,7 @@ fn a_transient_error_retried_within_the_call_counts_only_its_last_failure() {
     // Two blips, then call 1 answers: the chunk is extracted, nothing counted.
     let h = Harness::new();
     let ingested = h.say(T1, "I like tea.", "Noted.");
-    let llm = retrying(&h, json!([status(502), {"fail": "timeout"}, tea]));
+    let llm = retrying(&h, json!([status(502), {"fail": "transport"}, tea.clone()]));
     assert_eq!(run(&h, &llm, &[]).unwrap().memories.len(), 1);
     assert_eq!(attempts(&h, ingested.source), (ChunkState::Extracted, 0));
 
@@ -1912,23 +1908,34 @@ fn a_transient_error_retried_within_the_call_counts_only_its_last_failure() {
     assert_eq!(run(&h, &llm, &[]).unwrap().memories.len(), 1);
     assert_eq!(attempts(&h, ingested.source), (ChunkState::Extracted, 0));
 
-    // A timeout or a plain 500 may be the chunk's own doing: once its
-    // attempts are spent, the last error, counted once toward the chunk's
-    // retry cap, so a chunk that always times out can't stall the bank.
-    let h = Harness::new();
-    let ingested = h.say(T1, "I like tea.", "Noted.");
-    let doubtful = json!([status(500), {"fail": "timeout"}, status(500), tea]);
-    let error = run(&h, &retrying(&h, doubtful), &[]).unwrap_err();
-    let last = matches!(
-        &error,
-        ExtractError::Call1 {
-            error: LlmError::Status { status: 500 },
-            ..
-        }
-    );
-    assert!(last, "{error:?}");
-    assert_eq!(error.failure(), Some(Failure::Retry { error_count: 1 }));
-    assert_eq!(attempts(&h, ingested.source), (ChunkState::Queued, 1));
+    // A timeout, a 408 or a 500 may be the chunk's own doing: the attempt
+    // fails and counts toward the chunk's retry cap, as any failed attempt
+    // does, so a chunk that always times out leaves the queue rather than
+    // stalling the bank. The worker's wait between attempts is the retry.
+    for fault in [json!({"fail": "timeout"}), status(408), status(500)] {
+        let h = Harness::new();
+        let ingested = h.say(T1, "I like tea.", "Noted.");
+        let script = json!([fault.clone(), tea.clone()]);
+        let (llm, inner) = retrying_with(&h, script, NoSleep::default());
+        let error = run(&h, &llm, &[]).unwrap_err();
+        assert!(
+            matches!(&error, ExtractError::Call1 { .. }),
+            "{fault}: {error:?}"
+        );
+        assert_eq!(
+            error.failure(),
+            Some(Failure::Retry { error_count: 1 }),
+            "{fault}"
+        );
+        assert_eq!(inner.requests().len(), 1, "{fault}");
+        assert_eq!(
+            attempts(&h, ingested.source),
+            (ChunkState::Queued, 1),
+            "{fault}"
+        );
+        // The next attempt is the worker's, and it succeeds.
+        assert_eq!(run(&h, &llm, &[]).unwrap().memories.len(), 1, "{fault}");
+    }
 }
 
 #[test]

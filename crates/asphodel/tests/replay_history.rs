@@ -213,10 +213,11 @@ fn sse(kind: &str, mut data: Value) -> String {
     format!("event: {kind}\ndata: {data}\n\n")
 }
 
-/// A loopback stand-in for the Codex backend. Its first request streams
-/// `response.failed` with `code`; every later one streams `reply` as the
-/// answer. Returns its URL and the number of requests it has answered.
-fn codex_failing_once(code: &str, reply: &Value) -> (String, Arc<AtomicUsize>) {
+/// A loopback stand-in for the Codex backend. Its first `failures`
+/// requests stream `response.failed` with `code`; every later one streams
+/// `reply` as the answer. Returns its URL and the number of requests it has
+/// answered.
+fn codex_failing(code: &str, failures: usize, reply: &Value) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let failed = sse(
@@ -249,8 +250,8 @@ fn codex_failing_once(code: &str, reply: &Value) -> (String, Arc<AtomicUsize>) {
                 }
             }
             reader.read_exact(&mut vec![0; length]).unwrap();
-            let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
-            let body = if first { &failed } else { &answered };
+            let failing = counted.fetch_add(1, Ordering::SeqCst) < failures;
+            let body = if failing { &failed } else { &answered };
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -298,46 +299,64 @@ fn logged_in(token_dir: &Path) {
     TokenStore::open(token_dir).save(&tokens).unwrap();
 }
 
-/// The ChatGPT backend reports overload inside the stream, as a
-/// `response.failed` event, not as an HTTP status. A `live` run retries
-/// that call within it, waiting nothing here (`ASPHODEL_LLM_RETRY_WAIT_MS`),
-/// and completes with every call answered.
-#[test]
-fn a_live_call_the_backend_fails_as_overloaded_is_retried() {
-    let dir = TestDir::new();
-    let corpus = imported_small_history(&dir);
+/// A `live` run whose LLM is the Codex stub `codex_failing` starts:
+/// its output and report path, and the stub's request count.
+fn live_against_codex(dir: &TestDir, code: &str, failures: usize) -> (Run, u64) {
+    let corpus = imported_small_history(dir);
     let reply = support::reply_to_everything(vec![home_claim()], vec![]);
-    let (url, requests) = codex_failing_once("server_is_overloaded", &reply);
+    let (url, requests) = codex_failing(code, failures, &reply);
     let token_dir = dir.private_path("tokens");
     logged_in(&token_dir);
     let llm = format!("[llm]\nauth = \"chatgpt\"\nendpoint = \"{url}\"\nmodel = \"gpt-test\"\n");
     let probes = dir.private_file("probes.toml", PASSING_PROBES);
-    let report_path = dir.private_path("reports/overloaded.json");
-    let output = asphodel(&dir)
+    let report_path = dir.private_path(&format!("reports/{code}.json"));
+    let output = asphodel(dir)
         .arg("replay")
         .arg("--corpus")
         .arg(&corpus)
         .args(["--mode", "live"])
         .arg("--cassette")
-        .arg(cassette_path(&dir))
+        .arg(cassette_path(dir))
         .arg("--probes")
         .arg(&probes)
         .arg("--report")
         .arg(&report_path)
-        .args(["--overrides", &overrides(&dir, &llm)])
+        .args(["--overrides", &overrides(dir, &llm)])
         .arg("--token-dir")
         .arg(&token_dir)
         .env("ASPHODEL_LLM_RETRY_WAIT_MS", "0")
         .output()
         .unwrap();
-    let report = Run {
+    let run = Run {
         output,
         report_path,
-    }
-    .ok();
-    let requests = requests.load(Ordering::SeqCst) as u64;
-    assert!(requests > 1, "{requests} requests");
-    assert_eq!(report["llm"]["live"], requests - 1, "{report}");
+    };
+    (run, requests.load(Ordering::SeqCst) as u64)
+}
+
+/// The ChatGPT backend reports overload inside the stream, as a
+/// `response.failed` event, not as an HTTP status. The provider is down,
+/// so a `live` run retries that call until it answers, however many
+/// attempts that takes, waiting nothing here (`ASPHODEL_LLM_RETRY_WAIT_MS`),
+/// and completes with every call answered.
+#[test]
+fn a_live_call_the_backend_fails_as_overloaded_is_retried_until_it_answers() {
+    let dir = TestDir::new();
+    let (run, requests) = live_against_codex(&dir, "server_is_overloaded", 8);
+    let report = run.ok();
+    assert!(requests > 8, "{requests} requests");
+    assert_eq!(report["llm"]["live"], requests - 8, "{report}");
+}
+
+/// A `server_error` may be the request's own doing, and replay has no
+/// chunk retry cap to stop a request that always fails, so a `live` run
+/// tries it a few times and then fails rather than retrying forever.
+#[test]
+fn a_live_call_the_backend_always_fails_with_server_error_fails_the_run() {
+    let dir = TestDir::new();
+    let (run, requests) = live_against_codex(&dir, "server_error", usize::MAX);
+    assert!(!run.output.status.success(), "{}", stderr(&run.output));
+    assert!((2..=10).contains(&requests), "{requests} requests");
 }
 
 /// Replay takes `[llm] concurrency` from the overrides like the daemon,

@@ -907,10 +907,7 @@ fn a_transient_error_retried_within_the_call_keeps_the_plan_and_counts_nothing()
         {"reply": quiet()},
     ]);
     let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
-    let policy = RetryPolicy {
-        attempts: 3,
-        ..RetryPolicy::default()
-    };
+    let policy = RetryPolicy::daemon();
     let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), Arc::new(NoSleep));
     let ran = h.tick(&llm);
     assert_eq!(ran.ran.len(), 1);
@@ -920,6 +917,37 @@ fn a_transient_error_retried_within_the_call_keeps_the_plan_and_counts_nothing()
     assert_eq!(h.profile().last_error, None);
     assert_eq!(h.profile().last_refreshed_at, Some(h.now()));
     assert_eq!(h.failures(), (0, vec![]));
+}
+
+#[test]
+fn a_write_the_request_may_have_failed_is_a_failed_refresh_at_once() {
+    // A timeout or a 500 may be the refresh's own doing, so it isn't
+    // retried within the call: the refresh fails as it always has and
+    // waits thirty minutes.
+    for fault in [
+        json!({"fail": "timeout"}),
+        json!({"fail": "status", "status": 500}),
+    ] {
+        let h = Harness::new();
+        h.says(fact(TEA));
+        h.advance(minutes(5));
+        let script = json!([fault.clone(), {"reply": quiet()}]);
+        let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
+        let llm = LlmRetry::new(
+            inner.clone(),
+            RetryPolicy::daemon(),
+            h.clock.clone(),
+            Arc::new(NoSleep),
+        );
+        let ran = h.tick(&llm);
+        assert_eq!(
+            ran.ran[0].outcome,
+            Outcome::Failed(FailureKind::Llm),
+            "{fault}"
+        );
+        assert_eq!(writes(&inner), 1, "{fault}");
+        assert_eq!(h.profile().last_error, Some(FailureKind::Llm), "{fault}");
+    }
 }
 
 /// A [`Sleeper`] that reports itself stopped once asked to wait, as the
@@ -946,10 +974,7 @@ fn a_refresh_stopped_by_shutdown_mid_outage_is_not_a_failure() {
     h.advance(minutes(5));
     let script = json!([{"fail": "status", "status": 503}, {"reply": quiet()}]);
     let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
-    let policy = RetryPolicy {
-        unbounded: true,
-        ..RetryPolicy::default()
-    };
+    let policy = RetryPolicy::daemon();
     let sleeper = Arc::new(StoppedWhileWaiting::default());
     let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), sleeper);
     let ran = h.tick(&llm);
