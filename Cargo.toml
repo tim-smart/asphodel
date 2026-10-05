@@ -41,3 +41,12 @@ uuid = { version = "1", features = ["v5", "v7", "serde"] }
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"
+
+# The tests and replay scenarios spend most of their time inside SQLite,
+# which is C built by these crates' build scripts at the profile's
+# opt-level. Unoptimized, it more than doubles the test suite's run time.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 2
+
+[profile.dev.package.sqlite-vec]
+opt-level = 2

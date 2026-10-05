@@ -69,10 +69,17 @@ skips that last step.
 ```sh
 nix develop -c cargo fmt --check
 nix develop -c cargo clippy --all-targets -- -D warnings
-nix develop -c cargo test
+nix develop -c cargo nextest run
+nix develop -c cargo test --doc
 nix develop -c python -m pytest plugin/tests
 ```
 
-The dev shell provides the toolchain and points `ORT_DYLIB_PATH` at
-nixpkgs' ONNX Runtime. Tests run on deterministic fake models and never
-touch the network.
+`cargo test` works too, but it runs the test binaries one at a time and
+takes several times as long; nextest runs them side by side. nextest
+skips doc tests, hence the second line. The replay tests write a lot of SQLite to
+the temp dir, so on a busy disk `TMPDIR=/dev/shm` (Linux) can make the run
+several times faster.
+
+The dev shell provides the toolchain, cargo-nextest included, and points
+`ORT_DYLIB_PATH` at nixpkgs' ONNX Runtime. Tests run on deterministic fake
+models and never touch the network.
