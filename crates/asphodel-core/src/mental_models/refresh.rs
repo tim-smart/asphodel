@@ -63,14 +63,14 @@ use super::{
     PLAN_VERSION, RefreshInput, RejectReason, Rejected, StoredPlan, WRITE_TEMPLATE, WRITE_VERSION,
     load_cites, volatility_str,
 };
-use crate::constants::TAU;
+use crate::constants::{STATE_AGE_SHOWN_BELOW, TAU};
 use crate::models::{LlmClient, LlmError, LlmRequest, Template};
 use crate::retrieval::candidates::Candidate;
 use crate::retrieval::{
     Context, REFRESH_RERANK_DEADLINE, Selected, estimate_tokens, linked_memories,
 };
 use crate::store::micros;
-use crate::strength::Phase;
+use crate::strength::{Kind, Phase};
 
 /// What a refresh works from.
 struct Selection {
@@ -170,7 +170,7 @@ fn select(
             .map(|(item, facet)| InputMemory {
                 handle: handles[&item.candidate.id].clone(),
                 memory: item.candidate.uuid,
-                sentence: item.candidate.content.clone(),
+                sentence: write_sentence(&item.candidate),
                 facet: facets
                     .get(*facet)
                     .map(|facet| facet.heading.clone())
@@ -256,9 +256,26 @@ fn interleave(
     (selected, found_by)
 }
 
-/// The selection's memory ids and sentence hashes, in id order so a change
-/// of score alone doesn't count, with the question, the plan, the filters
-/// and `max_tokens`.
+fn stale_state(candidate: &Candidate) -> bool {
+    candidate.window.kind == Kind::State && candidate.state_confidence < STATE_AGE_SHOWN_BELOW
+}
+
+/// Dates belong in the write input, not annotations on the stored answer.
+fn write_sentence(candidate: &Candidate) -> String {
+    if stale_state(candidate) {
+        let observed = candidate
+            .last_observed
+            .to_zoned(candidate.tz.clone())
+            .strftime("%a %-d %b %Y");
+        format!("{} [observed {observed}, may be stale]", candidate.content)
+    } else {
+        candidate.content.clone()
+    }
+}
+
+/// Hash the selection's ids, sentence hashes and stale-state ids in id order,
+/// with the question, plan, filters and token budget. Score changes alone
+/// do not count.
 fn fingerprint(model: &ModelRow, facets: &[Facet], selected: &[Selected]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!(
@@ -284,6 +301,16 @@ fn fingerprint(model: &ModelRow, facets: &[Facet], selected: &[Selected]) -> Str
     memories.sort();
     for (uuid, sentence) in memories {
         hasher.update(format!("memory:{uuid}:{sentence}\n"));
+    }
+    // Only threshold crossings count, not another day of staleness.
+    let mut stale: Vec<Uuid> = selected
+        .iter()
+        .filter(|item| stale_state(&item.candidate))
+        .map(|item| item.candidate.uuid)
+        .collect();
+    stale.sort();
+    for uuid in stale {
+        hasher.update(format!("stale:{uuid}\n"));
     }
     format!("{:x}", hasher.finalize())
 }
@@ -608,6 +635,8 @@ about the user, built only from their memories. Write it as connected prose, a s
 facet listed, in that order and under the facet's heading, and leave out a facet the memories say \
 nothing about. A section is one paragraph that reads as a whole, with what matters most first. Say \
 nothing the memories you cite don't support, and use names, not pronouns, for the people in it. \
+When a memory is marked with an observed date and may be stale, write its fact with that absolute \
+date (for example, 'as of 1 Sep'), not as an unqualified current fact or a relative age. \
 {language_rule}
 
 The previous answer is there to keep the wording steady. Restate what the memories listed still \
