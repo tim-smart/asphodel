@@ -91,10 +91,11 @@ impl LlmRetry {
                 return Err(error);
             }
             let elapsed = started.duration_until(self.clock.now());
-            if Duration::try_from(elapsed).unwrap_or(Duration::ZERO) >= self.policy.budget {
+            let elapsed = Duration::try_from(elapsed).unwrap_or(Duration::ZERO);
+            let wait = jittered(self.policy.backoff(attempt));
+            if wait >= self.policy.budget.saturating_sub(elapsed) {
                 return Err(error);
             }
-            let wait = jittered(self.policy.backoff(attempt));
             tracing::warn!(
                 attempt,
                 attempts = self.policy.attempts,
@@ -103,6 +104,10 @@ impl LlmRetry {
                 "an LLM call failed and will be retried"
             );
             self.sleeper.sleep(wait);
+            let elapsed = started.duration_until(self.clock.now());
+            if Duration::try_from(elapsed).unwrap_or(Duration::ZERO) >= self.policy.budget {
+                return Err(error);
+            }
             attempt += 1;
         }
     }

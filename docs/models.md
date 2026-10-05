@@ -132,8 +132,11 @@ or `rate_limit_exceeded`. A call gets three attempts, with a backoff of 1s
 then 2s (doubling, capped at 4s) between them, each wait jittered down to
 no less than half. No new attempt starts once 30s have passed since the
 first began, so a call that timed out after the 120s request timeout isn't
-tried again. Each retry is logged at `warn` with the attempt and the
-error, never the request or the reply. Nothing else is retried: a reply
+tried again. If the planned backoff would reach or exceed the remaining
+budget, the call returns its last error without waiting. The budget is
+checked again after sleeping, so an oversleep cannot start a late attempt.
+Each retry is logged at `warn` with the attempt and the error, never the
+request or the reply. Nothing else is retried: a reply
 that came back wrong, a refusal, a missing login, a backend code for a
 reply cut short (`max_output_tokens`, `interrupted`), a content or policy
 refusal, a spent quota or an unknown code. Usage limits and a 429 with
