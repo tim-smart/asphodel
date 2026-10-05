@@ -168,6 +168,8 @@ fn values_at_the_edge_of_their_range_load_unchanged() {
         "[strength.access_weights]\nused = 1.0\n",
         "[reconcile.embedding_floors]\nm = -1.0\n",
         "[reconcile.embedding_floors]\nm = 1.0\n",
+        "[reconcile]\npromotion_gap = 1\n",
+        "[reconcile]\npromotion_gap = 4\n",
     ] {
         load(text).unwrap_or_else(|e| panic!("{text}: {e}"));
     }
@@ -285,6 +287,9 @@ fn out_of_range_values_are_reported_together_by_key() {
         // Floors are cosines.
         ("reconcile.embedding_floors.\"m\"", "1.5"),
         ("reconcile.embedding_floors.\"m\"", "nan"),
+        // A gap of levels between trivial and critical.
+        ("reconcile.promotion_gap", "0"),
+        ("reconcile.promotion_gap", "5"),
         // The scale divides the reranker logit into relevance.
         ("ranking.relevance_scales.\"m\"", "0.0"),
         ("ranking.relevance_scales.\"m\"", "-1.0"),

@@ -24,7 +24,8 @@ use asphodel_core::config::Tuning;
 use asphodel_core::entities::LinkRequest;
 use asphodel_core::extraction::{
     Call2Input, Committed, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT,
-    EDIT_REFINED, EDIT_RETRACTED, ExtractError, Extracted, Prepared, call2_request,
+    EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, ExtractError, Extracted, Prepared,
+    call2_request,
 };
 use asphodel_core::ingest::{Document, Ingested, Turn};
 use asphodel_core::inspect::{AccessEntry, BankOverview, ChunkState, ChunkView, MemoryView};
@@ -961,6 +962,94 @@ fn a_repeat_that_matters_more_than_the_memory_becomes_its_head() {
     }
 }
 
+#[test]
+fn a_repeat_is_weighed_against_the_owners_setting_and_the_promotion_gap() {
+    // The neighbour counts at the higher of extraction's level and the
+    // owner's, and a kept one is never outweighed, so a repeat never undoes
+    // the owner's word. Short of the gap, or from an older claim, a mention
+    // raises a neighbour the owner hasn't set instead.
+    struct Case {
+        extracted: &'static str,
+        owner: Option<&'static str>,
+        claim: &'static str,
+        gap: u8,
+        older: bool,
+        /// The neighbour's significance after an absorbing mention, or
+        /// `None` when the claim becomes the head.
+        absorbed: Option<&'static str>,
+    }
+    let case = |extracted, owner, claim, gap, older, absorbed| Case {
+        extracted,
+        owner,
+        claim,
+        gap,
+        older,
+        absorbed,
+    };
+    for c in [
+        case(
+            "trivial",
+            Some("kept"),
+            "critical",
+            1,
+            false,
+            Some("trivial"),
+        ),
+        case("minor", Some("trivial"), "minor", 1, false, Some("minor")),
+        case("minor", Some("trivial"), "major", 1, false, None),
+        case("trivial", Some("major"), "major", 1, false, Some("trivial")),
+        case("trivial", Some("major"), "critical", 1, false, None),
+        case("minor", None, "notable", 2, false, Some("notable")),
+        case("minor", None, "major", 2, false, None),
+        case("minor", None, "major", 1, true, Some("major")),
+    ] {
+        let name = format!(
+            "{} set {:?}, claim {}, gap {}, older {}",
+            c.extracted, c.owner, c.claim, c.gap, c.older
+        );
+        let mut tuning = tuning(FLOOR);
+        tuning.reconcile.promotion_gap = c.gap;
+        let h = Harness::open(tuning);
+        let old = h.fixture(said(FLOWERS, "event").significance(c.extracted));
+        if let Some(level) = c.owner {
+            h.service
+                .set_significance("main", &old.to_string(), Some(level))
+                .unwrap();
+        }
+        let before = (h.edits(old), h.accesses(old).len());
+        let quote = "I sent flowers to Sam, my wife";
+        if c.older {
+            h.doc("old-notes", &format!("{quote}."), date(2026, 8, 1));
+        } else {
+            h.says(&format!("{quote}."));
+        }
+        let wife = claim(FLOWERS_WIFE, "fact", quote).significance(c.claim);
+        let extracted = one_label(&h, reply(vec![wife]), old, "mentioned_again");
+
+        let owner = c.owner.map(String::from);
+        match c.absorbed {
+            Some(level) => {
+                assert!(extracted.memories.is_empty(), "{name}: absorbed");
+                assert_eq!(h.show(old).chain.head, old, "{name}");
+                assert_eq!(h.significance(old), (level.into(), owner), "{name}");
+                let mut edits = before.0;
+                if level != c.extracted {
+                    edits.push(EDIT_SIGNIFICANCE_RAISED.into());
+                }
+                assert_eq!(h.edits(old), edits, "{name}");
+                assert_eq!(h.accesses(old).len(), before.1 + 1, "{name}");
+            }
+            None => {
+                assert_eq!(extracted.memories.len(), 1, "{name}: a new head");
+                let new = extracted.memories[0];
+                assert_eq!(h.show(old).chain.head, new, "{name}");
+                assert_eq!(h.significance(new), (c.claim.into(), None), "{name}");
+                assert_eq!(h.significance(old), (c.extracted.into(), owner), "{name}");
+            }
+        }
+    }
+}
+
 /// The owner says `first` on 1 October, extracted alone, and `again` the
 /// next day, which call 2 labels `label` on the first's memory. Returns the
 /// first's memory as it stood before `again`.
@@ -1099,10 +1188,15 @@ fn a_related_claim_of_another_kind_never_replaces_an_open_task() {
     // A status event and a general preference on the same topic say
     // nothing about whether the renewal is done or was wrong. Whatever call
     // 2 labels them, the task stays the head of its chain and on the agenda.
-    // Only `ends` or a corrected task replaces it.
+    // Only `ends` or a corrected task replaces it. A repeat that matters more
+    // than the task, which would otherwise refine it, leaves it alone too.
     let asked = "I asked the post office how to renew my passport";
     let online = "I prefer to renew my passport online";
-    for label in ["retracts", "refines"] {
+    for (label, significance) in [
+        ("retracts", "minor"),
+        ("refines", "minor"),
+        ("mentioned_again", "critical"),
+    ] {
         let h = Harness::new();
         h.says("I need to renew my passport by 9 October.");
         let task = claim(PASSPORT, "task", "I need to renew my passport").at(
@@ -1116,8 +1210,10 @@ fn a_related_claim_of_another_kind_never_replaces_an_open_task() {
         let extracted = label_each(
             &h,
             reply(vec![
-                claim("Tim asked the post office about renewing.", "event", asked),
-                claim("Tim prefers to renew his passport online.", "fact", online),
+                claim("Tim asked the post office about renewing.", "event", asked)
+                    .significance(significance),
+                claim("Tim prefers to renew his passport online.", "fact", online)
+                    .significance(significance),
             ]),
             &[(task, label), (task, label)],
         );

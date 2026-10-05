@@ -200,6 +200,10 @@ fn every_checked_in_scenario_passes_its_probes() {
                     assert_eq!(shadow["purged"], 5, "{shadow}");
                     assert_eq!(shadow["re_mentioned"], 1, "{shadow}");
                 }
+                if stem == "relationship-outweighs-repeat" {
+                    // The weightier repeat is the one new chain head.
+                    assert_eq!(report["call2_rate"]["promoted"], 1, "{stem}");
+                }
             });
         }
     });
