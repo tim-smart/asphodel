@@ -777,12 +777,14 @@ impl LlmClient for Steps {
 struct Waits {
     clock: Arc<SimulatedClock>,
     waits: Mutex<Vec<Duration>>,
+    elapsed: Option<Duration>,
 }
 
 impl Sleeper for Waits {
     fn sleep(&self, wait: Duration) {
         self.waits.lock().unwrap().push(wait);
-        self.clock.advance(SignedDuration::try_from(wait).unwrap());
+        self.clock
+            .advance(SignedDuration::try_from(self.elapsed.unwrap_or(wait)).unwrap());
     }
 }
 
@@ -800,6 +802,14 @@ fn retry_policy() -> RetryPolicy {
 /// One call through [`LlmRetry`] to a client playing `steps`: its result,
 /// how many calls reached the client, and the waits between them.
 fn retried(steps: Vec<Step>) -> (Result<LlmResponse, LlmError>, usize, Vec<Duration>) {
+    retried_with_sleep(steps, None)
+}
+
+/// Optionally simulate scheduler oversleep instead of the requested wait.
+fn retried_with_sleep(
+    steps: Vec<Step>,
+    elapsed: Option<Duration>,
+) -> (Result<LlmResponse, LlmError>, usize, Vec<Duration>) {
     let clock = Arc::new(SimulatedClock::new(start()));
     let inner = Arc::new(Steps {
         clock: clock.clone(),
@@ -809,6 +819,7 @@ fn retried(steps: Vec<Step>) -> (Result<LlmResponse, LlmError>, usize, Vec<Durat
     let waits = Arc::new(Waits {
         clock: clock.clone(),
         waits: Mutex::new(Vec::new()),
+        elapsed,
     });
     let retry = LlmRetry::new(inner.clone(), retry_policy(), clock, waits.clone());
     let result = retry.complete(&request());
@@ -924,6 +935,21 @@ fn a_transient_error_is_retried_within_the_call_and_nothing_else_is() {
     let (result, calls, _) = retried(vec![(inside, Err(LlmError::Timeout)), quick(ok())]);
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(calls, 2);
+
+    // The planned wait fits, but scheduler oversleep reaches or passes
+    // the cutoff. Return the last error without starting another call.
+    for sleep_secs in [10, 11] {
+        let (result, calls, waits) = retried_with_sleep(
+            vec![(inside, status(503)), quick(ok())],
+            Some(Duration::from_secs(sleep_secs)),
+        );
+        assert!(
+            matches!(result, Err(LlmError::Status { status: 503 })),
+            "slept {sleep_secs}s: {result:?}"
+        );
+        assert_eq!((calls, waits.len()), (1, 1), "slept {sleep_secs}s");
+        assert_backed_off(&waits, "oversleep");
+    }
 }
 
 // The real models. Ignored: they run only when the models are present.
