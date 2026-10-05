@@ -54,7 +54,7 @@ pub(crate) use schedule::Schedule;
 pub const PLAN_TEMPLATE: &str = "plan_model";
 pub const PLAN_VERSION: u32 = 1;
 pub const WRITE_TEMPLATE: &str = "write_model";
-pub const WRITE_VERSION: u32 = 4;
+pub const WRITE_VERSION: u32 = 5;
 
 /// The least time between two refreshes of one model, and the wait before
 /// a failed refresh is tried again. Fixed

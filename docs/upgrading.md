@@ -336,24 +336,26 @@ question the owner changed is left alone. No table changes and no action
 is needed. The changed question changes the refresh fingerprint, so each
 seeded profile writes again at its next refresh.
 
-## Write template version 4: significance and a durability rule
+## Write template version 5: significance and a durability rule
 
 Each memory in the write's input now carries its significance: the owner's
 setting over the extracted level, or `kept`. The write is asked to keep
 the more significant memories when the budget is tight. For the seeded
 profile ("User profile") it's also asked to keep only what will still be
-true in months, to leave out quoted messages, orders, bookings and one-off
-purchase or trip details, to put personal dates with the person they're
-about, and to say how each person is related to the user. Other models
+true in months, to leave messages the user sent, received, quoted or
+forwarded, orders, bookings and one-off purchase or trip details out of
+both the prose and the citations whatever their significance, to drop
+them from the previous answer, to put personal dates with the person
+they're about, and to say how each person is related to the user. Other models
 get the significance guidance only. A memory's significance is part of
 the refresh fingerprint, so every model writes again at its next refresh,
 and a significance change to a selected memory makes the next refresh
 write rather than skip.
 
 Replay substitutions require the current template version, so v3 writes
-don't stand in for v4, and the seeded profile's question changed as well.
+don't stand in for v5, and the seeded profile's question changed as well.
 `fast --refresh recorded` finds nothing to substitute until refreshes are
-recorded again under v4. Re-recording private history follows the
+recorded again under v5. Re-recording private history follows the
 evaluation policy.
 
 ## Write template version 3: dates for possibly stale states

@@ -560,12 +560,16 @@ lost beneath results for the others:
    (the owner's setting over the extracted level, or `kept`), and the
    stored answer as the previous one. The write is asked to keep the more
    significant memories when the budget is tight. For the seeded profile
-   it's also asked to keep only what will still be true in months: a
-   quoted message, an order, a booking or a one-off purchase or trip isn't
-   profile material, personal dates such as birthdays go with the person
-   they're about, and each person is named with their relationship to the
-   user when the memories give it. It returns the whole answer as connected prose, a heading
-   and a paragraph per facet, and one list of the memories it rests on.
+   it's also asked to keep only what will still be true in months. A
+   message the user sent, received, quoted or forwarded, an order, a
+   booking or a one-off purchase or trip isn't profile material, whatever
+   its significance: it stays out of the prose and the citations, and is
+   dropped from the previous answer. Personal dates such as birthdays go
+   with the person they're about, and each person is named with their
+   relationship to the user when the memories give it. This rule comes
+   last in the prompt, after the previous answer's instructions. It
+   returns the whole answer as connected prose, a heading and a paragraph
+   per facet, and one list of the memories it rests on.
    Code joins the sections into the stored text and refuses a reply with
    no text, no citations or a citation outside the input: that refresh
    changes nothing and fails as malformed, to be tried again in 30

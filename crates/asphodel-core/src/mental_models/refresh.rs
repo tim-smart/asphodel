@@ -656,22 +656,29 @@ date (for example, 'as of 1 Sep'), not as an unqualified current fact or a relat
 Each memory is listed with its significance: trivial, minor, notable, major or critical, or kept \
 when the user asked for it to be remembered. When the budget is tight, keep the more significant \
 memories and leave out the less significant ones.
-{profile_rule}
+
 The previous answer is there to keep the wording steady. Restate what the memories listed still \
 support, reword what they change, and leave out what they no longer support or what no longer \
 answers the question: anything you leave out is gone. Cite by handle every memory the answer rests \
 on, as one list for the whole answer, and only the handles listed (m1, m2, ...). Keep the whole \
-answer, headings included, within the token budget, about four characters to a token.";
+answer, headings included, within the token budget, about four characters to a token.\
+{profile_rule}";
 
 /// The seeded profile's durability rule. Other models keep whatever time
-/// scale their question asks about, such as upcoming trips.
+/// scale their question asks about, such as upcoming trips. It comes last,
+/// after the previous answer's paragraph, so restating what a listed memory
+/// still supports doesn't carry a message over from the previous answer.
 const PROFILE_RULE: &str = "
+
 This answer is the user's profile: it holds what will still be true about them in months. A \
-quoted or forwarded message, an order, a booking, or the details of a one-off purchase or trip is \
-not profile material, even when a heading seems to fit it. Recurring personal dates, such as \
-birthdays and anniversaries, belong with the people they are about. Say how each person is related \
-to the user when the memories say so.
-";
+message the user sent, received, quoted or forwarded, an order, a booking, or the details of a \
+one-off purchase or trip is not profile material, whatever its significance and even when a \
+heading seems to fit it. Leave such a memory out of the answer, quoted or paraphrased, and out of \
+the citations, and drop it from the previous answer even though the memory is still listed. When a \
+lasting fact it mentions, such as a person's name, is also in another memory, write it from that \
+memory and cite that one. Recurring personal dates, such as birthdays and anniversaries, belong \
+with the people they are about. Say how each person is related to the user when the memories say \
+so.";
 
 /// The write's system prompt, with the language rule for `language`, and
 /// the durability rule when it writes the seeded profile.

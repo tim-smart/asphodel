@@ -109,7 +109,7 @@ and the date doesn't go stale in meaning. Cost 5 was accepted.
 | Stale-state dates in the prose, in the fingerprint | `write_model` v3, TIM-184 |
 | `###` name, `Prompt:`, `Output:`, `####` facet headings | TIM-185 |
 | Operator docs, upgrade notes, replay notes | TIM-186 |
-| Significance in the write input and fingerprint, profile durability rule, reworded profile question | `write_model` v4, schema 18, TIM-193 |
+| Significance in the write input and fingerprint, profile durability rule, reworded profile question | `write_model` v5, schema 18, TIM-193 |
 
 Still open after TIM-186: no `write_model` v2 or v3 cassettes were
 recorded for the scenarios under `scenarios/`, which run against the
