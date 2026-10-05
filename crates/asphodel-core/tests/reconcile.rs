@@ -1126,6 +1126,30 @@ fn an_undated_repeat_is_absorbed_into_the_dated_memory() {
 }
 
 #[test]
+fn a_weightier_undated_repeat_keeps_the_dated_memorys_window() {
+    // A repeat that matters more than the memory may become its head, but
+    // saying it without the dates doesn't cancel them: the chain's head
+    // keeps the deadline or booking, and the task stays on the agenda.
+    let task = passport_task().at("due_at", "2026-10-09T08:00", "minute");
+    for (first, label) in [
+        (task.clone(), "mentioned_again"),
+        (task, "confirmed"),
+        (booking(), "mentioned_again"),
+        (booking(), "confirmed"),
+    ] {
+        let kind = first["kind"].as_str().unwrap().to_owned();
+        let again = undated(first.clone()).significance("major");
+        let (h, before, _) = restate(first, again, label);
+        let head = h.show(h.show(before.id).chain.head);
+        assert_eq!(head.window, before.window, "{kind} {label}");
+        if kind == "task" {
+            let agenda = h.service.agenda("main").unwrap();
+            assert!(agenda.listed().contains(&head.id), "{kind} {label}");
+        }
+    }
+}
+
+#[test]
 fn an_undated_retraction_inherits_the_window_of_its_own_kind_only() {
     // Carry-over, not relabelling as mentioned_again: a genuine correction
     // must still retract its predecessor, and missing times aren't evidence
