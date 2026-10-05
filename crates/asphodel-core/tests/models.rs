@@ -909,12 +909,17 @@ fn a_transient_error_is_retried_within_the_call_and_nothing_else_is() {
     }
 
     // A call that ends past the budget isn't retried, however it failed: a
-    // stalled endpoint doesn't hold a call for minutes. One that ends inside
-    // it is.
+    // stalled endpoint doesn't hold a call for minutes. Nor is one whose
+    // backoff, at least 0.5s here, would start the next attempt past it,
+    // and it doesn't wait for nothing. One that ends well inside it is.
     let slow = SignedDuration::from_secs(31);
     let (result, calls, _) = retried(vec![(slow, Err(LlmError::Timeout)), quick(ok())]);
     assert!(matches!(result, Err(LlmError::Timeout)), "{result:?}");
     assert_eq!(calls, 1);
+    let edge = SignedDuration::from_millis(29_800);
+    let (result, calls, waits) = retried(vec![(edge, Err(LlmError::Timeout)), quick(ok())]);
+    assert!(matches!(result, Err(LlmError::Timeout)), "{result:?}");
+    assert_eq!((calls, waits), (1, vec![]));
     let inside = SignedDuration::from_secs(20);
     let (result, calls, _) = retried(vec![(inside, Err(LlmError::Timeout)), quick(ok())]);
     assert!(result.is_ok(), "{result:?}");

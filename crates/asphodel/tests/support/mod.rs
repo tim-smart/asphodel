@@ -81,6 +81,7 @@ pub fn asphodel(dir: &TestDir) -> Command {
         .env("ASPHODEL_MODELS", "fake")
         .env_remove("ASPHODEL_MODEL_DIR")
         .env_remove("ASPHODEL_LLM_SCRIPT")
+        .env_remove("ASPHODEL_LLM_RETRY_WAIT_MS")
         .env_remove("ASPHODEL_LLM_API_KEY")
         .env_remove("ASPHODEL_CONFIG");
     command
