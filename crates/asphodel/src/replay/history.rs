@@ -145,10 +145,14 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         .as_deref()
         .map(|text| super::scenario::duration(text).map_err(|error| anyhow!("--latency: {error}")))
         .transpose()?;
-    // `replay` never calls the LLM, whatever is configured.
+    // `replay` never calls the LLM, whatever is configured. A live call
+    // retries a transient failure as the daemon's does; its budget runs on
+    // the system clock, since the simulated one stands still while it waits.
     let live = match mode {
         ReplayMode::Replay => None,
-        ReplayMode::Live | ReplayMode::Fast => live_client(&tuning, args, &dir)?,
+        ReplayMode::Live | ReplayMode::Fast => live_client(&tuning, args, &dir)?
+            .map(|llm| crate::serve::retrying(llm, Arc::new(SystemClock)))
+            .transpose()?,
     };
     if mode == ReplayMode::Live && live.is_none() {
         bail!(

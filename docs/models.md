@@ -125,6 +125,45 @@ cassette records the logical request (template, prompts, schema), never
 the wire body or headers, so a recording made in one mode replays in the
 other.
 
+**Retries.** A failed call is retried according to why it failed.
+
+- **The provider is down:** a transport or connection error, a 429 without
+  `Retry-After`, a 502, 503 or 504, or a ChatGPT backend failure coded
+  `server_is_overloaded`, `slow_down` or `rate_limit_exceeded`. The same
+  request succeeds once the provider recovers, so nothing about it is at
+  fault.
+- **The request may be the cause:** a timeout, a 408, a 500 or any other
+  5xx, or a backend failure coded `server_error` or `interrupted`. A
+  passage whose reply always runs past the timeout fails every time.
+- **Nothing else is retried:** a reply that came back wrong, a refusal, a
+  missing login, a reply cut short by its size (`max_output_tokens`), a
+  content or policy refusal, a spent quota or an unknown code. Usage limits
+  and a 429 with `Retry-After` are holds (see "Usage limits" below).
+
+Each caller applies its own policy:
+
+| Caller | Provider down | Request may be the cause |
+|---|---|---|
+| Extraction | retried until the provider recovers; nothing counted | the attempt fails and counts toward the chunk's retry cap, and the worker waits before the next (`docs/operations.md`) |
+| Mental model refresh | retried until the provider recovers; nothing recorded | the refresh fails with `llm` and waits thirty minutes |
+| Replay `live` and `fast` | retried until the provider recovers | five attempts, then the run fails, since replay has no retry cap |
+| Translate | three attempts within 30s, then the error | the same |
+
+The wait between attempts starts at 1s and doubles with each failed
+attempt, up to 60s (4s for translate), each jittered down to no less than
+half so callers that failed together don't retry in lockstep. Translate
+starts no attempt 30s after its first, and returns its last error without
+waiting when the next wait would cross that. Each retry is logged at
+`warn` with the attempt, the kind of failure and the error, never the
+request or the reply.
+
+In the daemon each caller retries above the shared gate, so a call waiting
+to retry frees its slot, and a hold another call sets meanwhile stops its
+next attempt. A call waiting out an outage is listed in `asphodel status`
+(`docs/operations.md`, "Health and failures"). Shutdown wakes it: it makes
+no more attempts, and the chunk or refresh it was for counts nothing and
+runs again after the restart.
+
 **Language.** Unset, `[llm] language` leaves call 1 writing each claim in
 the language of the passage it quotes and a refresh writing an answer in
 the language of the memories it cites. Set to a language name such as
@@ -161,8 +200,10 @@ of `{"reply": <json>}` or `{"fail": "<kind>"}` steps, each with an optional
 `delay_ms`. The kinds are `transport`, `timeout`, `status` (with `status`,
 default 500), `no_content`, `not_json`, `refused`, `login_required` and
 `usage_limited` (with `resets_at`). Once the script runs out, every call
-fails with `no_content`. It is for integration tests, environment only, and
-the resolved config shows `fake_llm = true`.
+fails with `no_content`. The scripted fake is retried like a real LLM, so a
+step that says the provider is down uses up an attempt, not a whole call.
+It is for integration tests, environment only, and the resolved config
+shows `fake_llm = true`.
 
 ### `auth = "api_key"` (the default)
 
@@ -217,8 +258,8 @@ time the window resets. The client returns `UsageLimited { resets_at }`,
 which is not a retry: extraction holds the queue until then. A 429 from
 either mode with a `Retry-After`, in seconds or as an HTTP date (RFC 9110),
 is `RateLimited { retry_after }`, held the same way; a date already past
-holds for no time. A 429 without one, or with a value that's neither, is
-a counted, retryable failure. The `api_key` client reads a date against
+holds for no time. A 429 without one, or with a value that's neither, says
+the provider is down and is retried until it recovers. The `api_key` client reads a date against
 the system clock, since it's the server's wall time. The daemon shares
 either hold: once one call hits it, every call, refreshes included, holds
 until it lifts. No chunk counts a failure for it, and a refresh it holds
@@ -240,4 +281,7 @@ Asphodel sends none).
 
 **Settings that aren't exposed.** `ASPHODEL_LLM_API_KEY` set together with
 `auth = "chatgpt"` stops the daemon. `ASPHODEL_LLM_ISSUER` points the
-login at another issuer; it exists for tests and is not in `--help`. `llm.reasoning_effort` (for example `"low"`) is sent as `reasoning.effort`, or `reasoning_effort` in `api_key` mode; unset leaves it to the backend's default. A cassette records the effort with the model, so recordings at another effort are never replayed.
+login at another issuer; it exists for tests and is not in `--help`.
+`ASPHODEL_LLM_RETRY_WAIT_MS` replaces every wait between a call's
+attempts, in the daemon and in replay, so tests can retry without
+sleeping; it too is environment only and not in `--help`. `llm.reasoning_effort` (for example `"low"`) is sent as `reasoning.effort`, or `reasoning_effort` in `api_key` mode; unset leaves it to the backend's default. A cassette records the effort with the model, so recordings at another effort are never replayed.

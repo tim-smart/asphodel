@@ -290,7 +290,8 @@ impl From<TranslateError> for ApiError {
                 LlmError::NotConfigured { .. }
                 | LlmError::LoginRequired
                 | LlmError::UsageLimited { .. }
-                | LlmError::RateLimited { .. },
+                | LlmError::RateLimited { .. }
+                | LlmError::Stopped,
             ) => Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
             TranslateError::Llm(_) | TranslateError::BadReply => {
                 Self::new(StatusCode::BAD_GATEWAY, error.to_string())

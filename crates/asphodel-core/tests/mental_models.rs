@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use asphodel_core::agenda::Agenda;
+use asphodel_core::clock::Sleeper;
 use asphodel_core::config::{AgendaTuning, ConfigError, MentalModelsTuning};
 use asphodel_core::constants::Significance;
 use asphodel_core::extraction::{Call1Input, Extracted};
@@ -39,7 +40,7 @@ use asphodel_core::mental_models::{
 };
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmGate, LlmRequest,
-    LlmResponse, ModelError as EmbedError, Models,
+    LlmResponse, LlmRetry, ModelError as EmbedError, Models, RetryPolicy,
 };
 use asphodel_core::operations::{Audit, AuditList, RecallRow};
 use asphodel_core::retrieval::{Prefetch, PrefetchRequest, estimate_tokens};
@@ -877,6 +878,111 @@ fn a_failed_refresh_is_retried_after_thirty_minutes_not_at_the_next_trigger() {
     let profile = h.profile();
     assert_eq!(profile.last_error, None);
     assert_eq!(profile.last_refreshed_at, Some(failed_at + minutes(30)));
+    assert_eq!(h.failures(), (0, vec![]));
+}
+
+/// A [`Sleeper`] that returns at once.
+struct NoSleep;
+
+impl Sleeper for NoSleep {
+    fn sleep(&self, _: Duration) {}
+}
+
+#[test]
+fn a_transient_error_retried_within_the_call_keeps_the_plan_and_counts_nothing() {
+    // The daemon retries a blip inside the call, so a write that fails
+    // twice and then answers doesn't throw the plan away or start the
+    // thirty-minute wait.
+    let h = Harness::new();
+    h.seed(fact(TEA));
+    applied(h.refresh(PROFILE_NAME, &quiet_llm(1), true));
+    let question = "What does Tim like to drink?";
+    h.edit(PROFILE_NAME, json!({"question": question})).unwrap();
+    h.advance(minutes(30));
+
+    let script = json!([
+        {"reply": planned(&[("Drinks", question)])},
+        {"fail": "status", "status": 503},
+        {"fail": "transport"},
+        {"reply": quiet()},
+    ]);
+    let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
+    let policy = RetryPolicy::daemon();
+    let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), Arc::new(NoSleep));
+    let ran = h.tick(&llm);
+    assert_eq!(ran.ran.len(), 1);
+    assert!(matches!(ran.ran[0].outcome, Outcome::Applied(_)));
+    assert_eq!(calls(&inner, PLAN_TEMPLATE).len(), 1);
+    assert_eq!(writes(&inner), 3);
+    assert_eq!(h.profile().last_error, None);
+    assert_eq!(h.profile().last_refreshed_at, Some(h.now()));
+    assert_eq!(h.failures(), (0, vec![]));
+}
+
+#[test]
+fn a_write_the_request_may_have_failed_is_a_failed_refresh_at_once() {
+    // A timeout or a 500 may be the refresh's own doing, so it isn't
+    // retried within the call: the refresh fails as it always has and
+    // waits thirty minutes.
+    for fault in [
+        json!({"fail": "timeout"}),
+        json!({"fail": "status", "status": 500}),
+    ] {
+        let h = Harness::new();
+        h.says(fact(TEA));
+        h.advance(minutes(5));
+        let script = json!([fault.clone(), {"reply": quiet()}]);
+        let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
+        let llm = LlmRetry::new(
+            inner.clone(),
+            RetryPolicy::daemon(),
+            h.clock.clone(),
+            Arc::new(NoSleep),
+        );
+        let ran = h.tick(&llm);
+        assert_eq!(
+            ran.ran[0].outcome,
+            Outcome::Failed(FailureKind::Llm),
+            "{fault}"
+        );
+        assert_eq!(writes(&inner), 1, "{fault}");
+        assert_eq!(h.profile().last_error, Some(FailureKind::Llm), "{fault}");
+    }
+}
+
+/// A [`Sleeper`] that reports itself stopped once asked to wait, as the
+/// daemon's does when shutdown wakes it.
+#[derive(Default)]
+struct StoppedWhileWaiting(AtomicBool);
+
+impl Sleeper for StoppedWhileWaiting {
+    fn sleep(&self, _: Duration) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn stopped(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[test]
+fn a_refresh_stopped_by_shutdown_mid_outage_is_not_a_failure() {
+    // The daemon stops while the write waits out an outage. Nothing is
+    // recorded against the model, and no thirty-minute wait starts.
+    let h = Harness::new();
+    h.says(fact(TEA));
+    h.advance(minutes(5));
+    let script = json!([{"fail": "status", "status": 503}, {"reply": quiet()}]);
+    let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
+    let policy = RetryPolicy::daemon();
+    let sleeper = Arc::new(StoppedWhileWaiting::default());
+    let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), sleeper);
+    let ran = h.tick(&llm);
+    assert_eq!(writes(&inner), 1);
+    let outcomes: Vec<_> = ran.ran.iter().map(|run| &run.outcome).collect();
+    let failed = outcomes.iter().any(|o| matches!(o, Outcome::Failed(_)));
+    assert!(!failed, "{outcomes:?}");
+    assert_eq!(h.profile().last_error, None);
     assert_eq!(h.failures(), (0, vec![]));
 }
 

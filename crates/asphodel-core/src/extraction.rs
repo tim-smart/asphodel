@@ -1171,14 +1171,16 @@ const COMMIT: ChunkError = ChunkError {
 
 /// How a failed call is recorded on the chunk, or `None` when the queue
 /// holds instead: the LLM can't be used at all, which is no fault of the
-/// chunk's and would otherwise burn every queued chunk to failed.
+/// chunk's and would otherwise burn every queued chunk to failed, or the
+/// daemon stopped the call while it waited to retry.
 fn chunk_error(error: &LlmError) -> Option<ChunkError> {
     let (kind, status) = match error {
         LlmError::NotConfigured { .. }
         | LlmError::Conflicting { .. }
         | LlmError::LoginRequired
         | LlmError::UsageLimited { .. }
-        | LlmError::RateLimited { .. } => return None,
+        | LlmError::RateLimited { .. }
+        | LlmError::Stopped => return None,
         LlmError::Transport { .. } => ("llm_transport", None),
         LlmError::Timeout => ("llm_timeout", None),
         LlmError::Status { status } => ("llm_status", Some(*status)),

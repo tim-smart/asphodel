@@ -609,10 +609,10 @@ change facet recall limits or admission filters.
 
 ### Health and failures
 
-`asphodel status` shows queue depth, failed chunks, failed refreshes, the
-purge pause and both fingerprint hashes, the last sweep, the pre-migration
-copy, banks recorded under an embedding model the daemon doesn't carry, and
-when
+`asphodel status` shows queue depth, failed chunks, failed refreshes, LLM
+calls retrying through an outage, the purge pause and both fingerprint
+hashes, the last sweep, the pre-migration copy, banks recorded under an
+embedding model the daemon doesn't carry, and when
 `POST /v1/backup` last completed. That last one says nothing about whether
 the stream reached its destination. It exits non-zero when anything needs
 attention, which is what to alert on; there's no Prometheus endpoint.
@@ -620,6 +620,22 @@ attention, which is what to alert on; there's no Prometheus endpoint.
 ```sh
 kubectl exec hermes-0 -c asphodel -- asphodel status
 ```
+
+A chunk whose extraction fails is tried again, up to five times. An LLM
+call that fails because the provider is down is retried within the call
+until it recovers, however long that takes, and counts nothing
+(`docs/models.md`, "The LLM"). A failure the chunk itself may cause, such
+as a timeout or a 500, counts at once. After it, or after the store fails,
+the bank's worker waits 1s before the next attempt, doubling each time up
+to 60s, so a chunk that fails every time leaves the queue at the cap
+rather than stalling the bank. A held queue (a usage limit, a 429 with
+`Retry-After`, no login) waits for the hold instead and counts nothing.
+
+While a call is waiting out an outage, `asphodel status` lists it under
+`llm_retrying`: the caller (the bank whose chunk it is, or `refresh`), when
+it first failed, the attempts so far and the last error. Once one has been
+retrying for five minutes it needs attention, so `status` exits non-zero.
+The list empties as soon as the provider answers.
 
 `asphodel chunks --bank B [--failed [--retry]]` lists a bank's extraction
 chunks. `--failed` lists only those whose extraction failed past the retry

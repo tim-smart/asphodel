@@ -7,7 +7,8 @@
 //! `clippy.toml` denies the direct calls workspace-wide.
 
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use jiff::{SignedDuration, Timestamp};
 
@@ -84,5 +85,59 @@ impl fmt::Debug for SimulatedClock {
         f.debug_struct("SimulatedClock")
             .field("now", &self.now())
             .finish()
+    }
+}
+
+/// How code that waits between attempts waits, so tests can stand in for
+/// the sleep the way [`SimulatedClock`] stands in for the time.
+pub trait Sleeper: Send + Sync {
+    /// Returns after `wait`, or sooner once stopped.
+    fn sleep(&self, wait: Duration);
+
+    /// Whether the caller should give up waiting altogether, because the
+    /// process is stopping.
+    fn stopped(&self) -> bool {
+        false
+    }
+}
+
+/// The sleeper replay's live calls use: the calling thread sleeps.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ThreadSleeper;
+
+impl Sleeper for ThreadSleeper {
+    fn sleep(&self, wait: Duration) {
+        std::thread::sleep(wait);
+    }
+}
+
+/// The sleeper the daemon's LLM calls use: the calling thread sleeps until
+/// the wait is over or [`StopSleeper::stop`] wakes it, after which every
+/// sleep returns at once and [`Sleeper::stopped`] is true.
+#[derive(Debug, Default)]
+pub struct StopSleeper {
+    stopped: Mutex<bool>,
+    woken: Condvar,
+}
+
+impl StopSleeper {
+    /// Wakes every sleeper and stops them sleeping again.
+    pub fn stop(&self) {
+        *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.woken.notify_all();
+    }
+}
+
+impl Sleeper for StopSleeper {
+    fn sleep(&self, wait: Duration) {
+        let stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self
+            .woken
+            .wait_timeout_while(stopped, wait, |stopped| !*stopped)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+
+    fn stopped(&self) -> bool {
+        *self.stopped.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

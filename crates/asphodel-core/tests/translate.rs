@@ -12,13 +12,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use asphodel_core::Service;
-use asphodel_core::clock::SimulatedClock;
+use asphodel_core::clock::{SimulatedClock, Sleeper};
 use asphodel_core::config::Tuning;
 use asphodel_core::extraction::Call2Input;
 use asphodel_core::ingest::Turn;
 use asphodel_core::inspect::MemoryView;
 use asphodel_core::models::{
-    Embedder, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, ModelError, Models,
+    Embedder, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, LlmRetry, ModelError,
+    Models, RetryPolicy,
 };
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::{DB_FILE, OpenOptions, Store};
@@ -338,6 +339,50 @@ fn a_translation_supersedes_the_memory_and_keeps_its_strength_accesses_and_prove
     assert!(again.requests().is_empty());
     assert_eq!(h.show(head).chain.members.len(), 2);
     assert!(h.neighbours(ENGLISH).contains(&head));
+}
+
+/// A [`Sleeper`] that returns at once.
+struct NoSleep;
+
+impl Sleeper for NoSleep {
+    fn sleep(&self, _: Duration) {}
+}
+
+#[test]
+fn a_transient_error_retried_within_the_call_still_translates() {
+    let h = Harness::new(Some("English"));
+    let original = h.memory(RUSSIAN);
+    let script = json!([
+        {"fail": "timeout"},
+        {"fail": "status", "status": 502},
+        {"reply": {"sentence": ENGLISH}},
+    ]);
+    let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
+    let policy = RetryPolicy::translate();
+    let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), Arc::new(NoSleep));
+    let head = translated(h.translate(original, &llm));
+    assert_eq!(h.show(head).sentence, ENGLISH);
+    assert_eq!(inner.requests().len(), 3);
+
+    // An operator waits on the answer, so neither kind of failure is
+    // retried for long: six of either is more than translate tries.
+    for fault in [
+        json!({"fail": "status", "status": 503}),
+        json!({"fail": "timeout"}),
+    ] {
+        let mut script = vec![fault.clone(); 6];
+        script.push(json!({"reply": {"sentence": ENGLISH}}));
+        let inner = Arc::new(FakeLlm::from_script(MODEL, &json!(script).to_string()).unwrap());
+        let h = Harness::new(Some("English"));
+        let original = h.memory(RUSSIAN);
+        let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), Arc::new(NoSleep));
+        let refused = h.translate(original, &llm);
+        assert!(
+            matches!(refused, Err(TranslateError::Llm(_))),
+            "{fault}: {refused:?}"
+        );
+        assert!(inner.requests().len() < 6, "{fault}");
+    }
 }
 
 // Concurrency with the bank's other writers

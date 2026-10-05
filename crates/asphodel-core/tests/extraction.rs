@@ -15,9 +15,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::time::Duration;
 
 use asphodel_core::Service;
-use asphodel_core::clock::{Clock, SimulatedClock};
+use asphodel_core::clock::{Clock, SimulatedClock, Sleeper};
 use asphodel_core::config::Tuning;
 use asphodel_core::entities::MergeRequest;
 use asphodel_core::extraction::{
@@ -31,7 +32,7 @@ use asphodel_core::inspect::{
 };
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest, LlmResponse,
-    ModelError, Models,
+    LlmRetry, ModelError, Models, RetryPolicy,
 };
 use asphodel_core::queue::{Failure, Lease, SourceKind};
 use asphodel_core::store::bank::BankIdentity;
@@ -1850,6 +1851,111 @@ fn a_failed_step_writes_nothing_and_counts_the_attempt() {
         assert_eq!(h.named("main", "Lisbon").len(), 1, "{step}");
         assert_eq!(h.memory(tea).accesses.len(), 2, "{step}");
     }
+}
+
+/// A [`Sleeper`] that returns at once, or reports itself stopped after
+/// its first wait, as the daemon's does once shutdown wakes it.
+#[derive(Default)]
+struct NoSleep {
+    stops: bool,
+    slept: AtomicBool,
+}
+
+impl Sleeper for NoSleep {
+    fn sleep(&self, _: Duration) {
+        self.slept.store(true, Ordering::SeqCst);
+    }
+
+    fn stopped(&self) -> bool {
+        self.stops && self.slept.load(Ordering::SeqCst)
+    }
+}
+
+/// `script` ([`FakeLlm::from_script`]) behind [`LlmRetry`] on the
+/// daemon's policy for extraction. Returns the fake too, to count its
+/// calls.
+fn retrying_with(h: &Harness, script: Value, sleeper: NoSleep) -> (LlmRetry, Arc<FakeLlm>) {
+    let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
+    let policy = RetryPolicy::daemon();
+    let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), Arc::new(sleeper));
+    (llm, inner)
+}
+
+fn retrying(h: &Harness, script: Value) -> LlmRetry {
+    retrying_with(h, script, NoSleep::default()).0
+}
+
+#[test]
+fn the_provider_being_down_counts_nothing_and_a_request_fault_counts_each_attempt() {
+    let tea = reply(vec![claim("Tim likes tea.", "fact", "I like tea")], &[]);
+    let tea = json!({"reply": tea});
+    let status = |status: u16| json!({"fail": "status", "status": status});
+
+    // Two blips, then call 1 answers: the chunk is extracted, nothing counted.
+    let h = Harness::new();
+    let ingested = h.say(T1, "I like tea.", "Noted.");
+    let llm = retrying(&h, json!([status(502), {"fail": "transport"}, tea.clone()]));
+    assert_eq!(run(&h, &llm, &[]).unwrap().memories.len(), 1);
+    assert_eq!(attempts(&h, ingested.source), (ChunkState::Extracted, 0));
+
+    // An outage outlasting any attempt count: still extracted, nothing
+    // counted.
+    let h = Harness::new();
+    let ingested = h.say(T1, "I like tea.", "Noted.");
+    let mut outage = vec![status(503); 8];
+    outage.extend([json!({"fail": "transport"}), tea.clone()]);
+    let llm = retrying(&h, json!(outage));
+    assert_eq!(run(&h, &llm, &[]).unwrap().memories.len(), 1);
+    assert_eq!(attempts(&h, ingested.source), (ChunkState::Extracted, 0));
+
+    // A timeout, a 408 or a 500 may be the chunk's own doing: the attempt
+    // fails and counts toward the chunk's retry cap, as any failed attempt
+    // does, so a chunk that always times out leaves the queue rather than
+    // stalling the bank. The worker's wait between attempts is the retry.
+    for fault in [json!({"fail": "timeout"}), status(408), status(500)] {
+        let h = Harness::new();
+        let ingested = h.say(T1, "I like tea.", "Noted.");
+        let script = json!([fault.clone(), tea.clone()]);
+        let (llm, inner) = retrying_with(&h, script, NoSleep::default());
+        let error = run(&h, &llm, &[]).unwrap_err();
+        assert!(
+            matches!(&error, ExtractError::Call1 { .. }),
+            "{fault}: {error:?}"
+        );
+        assert_eq!(
+            error.failure(),
+            Some(Failure::Retry { error_count: 1 }),
+            "{fault}"
+        );
+        assert_eq!(inner.requests().len(), 1, "{fault}");
+        assert_eq!(
+            attempts(&h, ingested.source),
+            (ChunkState::Queued, 1),
+            "{fault}"
+        );
+        // The next attempt is the worker's, and it succeeds.
+        assert_eq!(run(&h, &llm, &[]).unwrap().memories.len(), 1, "{fault}");
+    }
+}
+
+#[test]
+fn a_retry_stopped_by_shutdown_counts_nothing_and_releases_the_chunk() {
+    // The daemon stops while call 1 waits out an outage: the chunk goes
+    // back on the queue uncounted, and the next claim gets it again.
+    let h = Harness::new();
+    let ingested = h.say(T1, "I like tea.", "Noted.");
+    let tea = reply(vec![claim("Tim likes tea.", "fact", "I like tea")], &[]);
+    let script = json!([{"fail": "status", "status": 503}, {"reply": tea}]);
+    let stops = NoSleep {
+        stops: true,
+        ..NoSleep::default()
+    };
+    let (llm, inner) = retrying_with(&h, script, stops);
+    let error = run(&h, &llm, &[]).unwrap_err();
+    assert_eq!(error.failure(), None, "{error:?}");
+    assert_eq!(inner.requests().len(), 1);
+    assert_eq!(attempts(&h, ingested.source), (ChunkState::Queued, 0));
+    assert_eq!(lease(&h, "main").chunk, h.chunk(ingested.source, 0).id);
 }
 
 #[test]

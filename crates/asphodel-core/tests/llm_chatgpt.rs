@@ -784,6 +784,48 @@ fn a_stream_ends_in_its_reply_or_a_fixed_backend_code() {
     }
 }
 
+#[test]
+fn a_backend_code_says_the_provider_is_down_the_request_may_be_at_fault_or_neither() {
+    // Overloaded or limiting is the provider's state, and passes. A server
+    // error or a reply cut off may be the request's own doing. A reply cut
+    // short by its size, a policy refusal, a spent quota or an unknown code
+    // won't change on a retry.
+    let down = ["server_is_overloaded", "slow_down", "rate_limit_exceeded"];
+    let request_faults = ["server_error", "interrupted"];
+    let lasting = [
+        "context_length_exceeded",
+        "insufficient_quota",
+        "usage_not_included",
+        "invalid_prompt",
+        "cyber_policy",
+        "max_output_tokens",
+        "content_filter",
+        "not_a_known_code",
+        "",
+    ];
+    let codes = (down.iter().map(|code| (*code, Retry::ProviderDown)))
+        .chain(
+            request_faults
+                .iter()
+                .map(|code| (*code, Retry::MaybeTheRequest)),
+        )
+        .chain(lasting.iter().map(|code| (*code, Retry::Never)));
+    for (code, retry) in codes {
+        for (shape, body) in terminal_events(code) {
+            let backend = StubServer::backend(StubResponse::stream(body));
+            let dir = TestDir::new();
+            let error = client(&backend, logged_in_store(&dir))
+                .complete(&request())
+                .unwrap_err();
+            assert!(
+                matches!(error, LlmError::Backend { .. }),
+                "{shape} {code:?}: {error:?}"
+            );
+            assert_eq!(error.retry(), retry, "{shape} {code:?}");
+        }
+    }
+}
+
 // Refresh.
 
 #[test]
@@ -892,7 +934,11 @@ fn a_failed_credential_asks_for_a_login_and_a_transient_issuer_error_does_not() 
                 "{case}: {error:?}"
             ),
         }
-        assert_eq!(error.is_retryable(), transient.is_some(), "{case}");
+        let retry = match transient {
+            Some(_) => Retry::ProviderDown,
+            None => Retry::Never,
+        };
+        assert_eq!(error.retry(), retry, "{case}");
         assert!(!format!("{error:?}").contains("rt-one"), "{error:?}");
         assert_eq!(server.paths(), paths, "{case}");
         let file = TokenStore::open(&dir.data()).load().unwrap();
@@ -996,11 +1042,11 @@ fn a_429_is_a_usage_limit_a_rate_limit_hold_or_a_retryable_status() {
             Status => matches!(error, LlmError::Status { status: 429 }),
         };
         assert!(matched, "{case}: {error:?}");
-        assert_eq!(
-            error.is_retryable(),
-            matches!(expected, Status),
-            "{case}: {error:?}"
-        );
+        let retry = match expected {
+            Status => Retry::ProviderDown,
+            Usage(_) | Hold(_) => Retry::Never,
+        };
+        assert_eq!(error.retry(), retry, "{case}: {error:?}");
         assert_eq!(backend.requests().len(), 1, "{case}");
     }
 }

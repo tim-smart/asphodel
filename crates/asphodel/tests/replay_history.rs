@@ -11,9 +11,15 @@ mod support;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use asphodel_core::config::Secret;
+use asphodel_core::models::{ChatgptTokens, TokenStore};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::hermes::{self, StateDb, epoch, start};
@@ -199,6 +205,158 @@ fn replay_of_a_live_cassette_simulates_the_same_run_without_an_llm() {
         second.report_bytes(),
         "two replays of the same configuration differ"
     );
+}
+
+/// One server-sent event of `kind` carrying `data`.
+fn sse(kind: &str, mut data: Value) -> String {
+    data["type"] = json!(kind);
+    format!("event: {kind}\ndata: {data}\n\n")
+}
+
+/// A loopback stand-in for the Codex backend. Its first `failures`
+/// requests stream `response.failed` with `code`; every later one streams
+/// `reply` as the answer. Returns its URL and the number of requests it has
+/// answered.
+fn codex_failing(code: &str, failures: usize, reply: &Value) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let failed = sse(
+        "response.failed",
+        json!({"response": {"id": "resp_f", "status": "failed", "error": {"code": code, "message": "busy"}}}),
+    );
+    let text = reply.to_string();
+    let item = json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]});
+    let answered = sse("response.output_item.done", json!({ "item": item }))
+        + &sse(
+            "response.completed",
+            json!({"response": {"id": "resp_1", "status": "completed"}}),
+        );
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end().to_ascii_lowercase();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            let failing = counted.fetch_add(1, Ordering::SeqCst) < failures;
+            let body = if failing { &failed } else { &answered };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    (url, requests)
+}
+
+/// A JWT-shaped token with `claims`; nothing checks the signature.
+fn jwt(claims: Value) -> String {
+    let header = base64url(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload = base64url(claims.to_string().as_bytes());
+    format!("{header}.{payload}.{}", base64url(b"signature"))
+}
+
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let mut buffer = [0u8; 3];
+        buffer[..chunk.len()].copy_from_slice(chunk);
+        let n = u32::from_be_bytes([0, buffer[0], buffer[1], buffer[2]]);
+        for i in 0..chunk.len() + 1 {
+            out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// A ChatGPT login in `token_dir` whose access token outlives the test, so
+/// no refresh is attempted.
+fn logged_in(token_dir: &Path) {
+    fs::create_dir_all(token_dir).unwrap();
+    let auth = json!({"chatgpt_account_id": "acct-test"});
+    let tokens = ChatgptTokens {
+        access_token: Secret::new(jwt(json!({"sub": "test", "exp": 4_102_444_800_i64}))),
+        refresh_token: Secret::new("rt-test"),
+        id_token: Secret::new(jwt(json!({ "https://api.openai.com/auth": auth }))),
+        account_id: "acct-test".into(),
+        last_refresh: "2026-01-01T00:00:00Z".parse().unwrap(),
+    };
+    TokenStore::open(token_dir).save(&tokens).unwrap();
+}
+
+/// A `live` run whose LLM is the Codex stub `codex_failing` starts:
+/// its output and report path, and the stub's request count.
+fn live_against_codex(dir: &TestDir, code: &str, failures: usize) -> (Run, u64) {
+    let corpus = imported_small_history(dir);
+    let reply = support::reply_to_everything(vec![home_claim()], vec![]);
+    let (url, requests) = codex_failing(code, failures, &reply);
+    let token_dir = dir.private_path("tokens");
+    logged_in(&token_dir);
+    let llm = format!("[llm]\nauth = \"chatgpt\"\nendpoint = \"{url}\"\nmodel = \"gpt-test\"\n");
+    let probes = dir.private_file("probes.toml", PASSING_PROBES);
+    let report_path = dir.private_path(&format!("reports/{code}.json"));
+    let output = asphodel(dir)
+        .arg("replay")
+        .arg("--corpus")
+        .arg(&corpus)
+        .args(["--mode", "live"])
+        .arg("--cassette")
+        .arg(cassette_path(dir))
+        .arg("--probes")
+        .arg(&probes)
+        .arg("--report")
+        .arg(&report_path)
+        .args(["--overrides", &overrides(dir, &llm)])
+        .arg("--token-dir")
+        .arg(&token_dir)
+        .env("ASPHODEL_LLM_RETRY_WAIT_MS", "0")
+        .output()
+        .unwrap();
+    let run = Run {
+        output,
+        report_path,
+    };
+    (run, requests.load(Ordering::SeqCst) as u64)
+}
+
+/// The ChatGPT backend reports overload inside the stream, as a
+/// `response.failed` event, not as an HTTP status. The provider is down,
+/// so a `live` run retries that call until it answers, however many
+/// attempts that takes, waiting nothing here (`ASPHODEL_LLM_RETRY_WAIT_MS`),
+/// and completes with every call answered.
+#[test]
+fn a_live_call_the_backend_fails_as_overloaded_is_retried_until_it_answers() {
+    let dir = TestDir::new();
+    let (run, requests) = live_against_codex(&dir, "server_is_overloaded", 8);
+    let report = run.ok();
+    assert!(requests > 8, "{requests} requests");
+    assert_eq!(report["llm"]["live"], requests - 8, "{report}");
+}
+
+/// A `server_error` may be the request's own doing, and replay has no
+/// chunk retry cap to stop a request that always fails, so a `live` run
+/// tries it a few times and then fails rather than retrying forever.
+#[test]
+fn a_live_call_the_backend_always_fails_with_server_error_fails_the_run() {
+    let dir = TestDir::new();
+    let (run, requests) = live_against_codex(&dir, "server_error", usize::MAX);
+    assert!(!run.output.status.success(), "{}", stderr(&run.output));
+    assert!((2..=10).contains(&requests), "{requests} requests");
 }
 
 /// Replay takes `[llm] concurrency` from the overrides like the daemon,

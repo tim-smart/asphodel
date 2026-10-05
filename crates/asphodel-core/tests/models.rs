@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asphodel_core::clock::{Clock, SimulatedClock};
+use asphodel_core::clock::{Clock, SimulatedClock, Sleeper};
 use asphodel_core::config::{ConfigError, Deployment, Secret, Tuning};
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::vector::EMBEDDING_DIMENSIONS;
@@ -655,7 +655,7 @@ fn reply_content_is_json_fenced_or_not_and_anything_else_is_an_error() {
     let refused = complete(StubResponse::json(reply)).unwrap_err();
     assert!(matches!(refused, LlmError::Refused), "{refused:?}");
     for error in [not_json, no_choices, refused] {
-        assert!(!error.is_retryable(), "{error:?}");
+        assert_eq!(error.retry(), Retry::Never, "{error:?}");
     }
 }
 
@@ -672,10 +672,13 @@ fn an_http_error_is_retried_or_held_or_neither() {
     // A hold says when to come back, so every caller waits that long and
     // nothing is counted: a deferral, not a retry. A Retry-After that's
     // neither seconds nor a date counts like none, and on any status but
-    // 429 it changes nothing.
+    // 429 it changes nothing. A 429 without one, 502, 503 and 504 say the
+    // provider is down; 408, 500 and any other 5xx may be the request's
+    // own doing.
     enum Expected {
         Fatal,
-        Retry,
+        Down,
+        Request,
         Hold(RangeInclusive<Duration>),
     }
     use Expected::*;
@@ -686,14 +689,17 @@ fn an_http_error_is_retried_or_held_or_neither() {
         (400, None, Fatal),
         (401, None, Fatal),
         (404, None, Fatal),
-        (408, None, Retry),
-        (429, None, Retry),
-        (500, None, Retry),
-        (502, None, Retry),
-        (503, None, Retry),
+        (408, None, Request),
+        (429, None, Down),
+        (500, None, Request),
+        (501, None, Request),
+        (502, None, Down),
+        (503, None, Down),
+        (504, None, Down),
+        (505, None, Request),
         (429, after("30"), Hold(secs(30)..=secs(30))),
-        (429, after("soon"), Retry),
-        (503, after("30"), Retry),
+        (429, after("soon"), Down),
+        (503, after("30"), Down),
         (429, at(10), Hold(secs(8 * 60)..=secs(10 * 60))),
         (429, at(-10), Hold(Duration::ZERO..=Duration::ZERO)),
     ];
@@ -715,12 +721,17 @@ fn an_http_error_is_retried_or_held_or_neither() {
                 "{case}"
             );
         }
-        assert_eq!(error.is_retryable(), matches!(expected, Retry), "{case}");
+        let retry = match expected {
+            Fatal | Hold(_) => Retry::Never,
+            Down => Retry::ProviderDown,
+            Request => Retry::MaybeTheRequest,
+        };
+        assert_eq!(error.retry(), retry, "{case}");
     }
 }
 
 #[test]
-fn a_slow_or_dead_endpoint_is_a_retryable_transport_failure() {
+fn a_slow_endpoint_may_be_the_requests_fault_and_a_dead_one_is_the_providers() {
     let mut slow = StubResponse::completion("{}");
     slow.delay = Duration::from_secs(3);
     let server = StubServer::start(slow);
@@ -729,7 +740,8 @@ fn a_slow_or_dead_endpoint_is_a_retryable_transport_failure() {
     })
     .unwrap_err();
     assert!(matches!(error, LlmError::Timeout), "{error:?}");
-    assert!(error.is_retryable());
+    // A reply that reliably runs past the timeout is the request's doing.
+    assert_eq!(error.retry(), Retry::MaybeTheRequest);
 
     // Bind and drop, so the port is closed.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -740,7 +752,444 @@ fn a_slow_or_dead_endpoint_is_a_retryable_transport_failure() {
     })
     .unwrap_err();
     assert!(matches!(error, LlmError::Transport { .. }), "{error:?}");
-    assert!(error.is_retryable());
+    assert_eq!(error.retry(), Retry::ProviderDown);
+}
+
+// Retrying a transient error within the call.
+
+/// One call's outcome, and how long the call takes on the simulated clock.
+type Step = (SignedDuration, Result<Value, LlmError>);
+
+/// A client that plays one [`Step`] per call, so a test can fail a call
+/// with any [`LlmError`] and make it slow.
+struct Steps {
+    clock: Arc<SimulatedClock>,
+    steps: Mutex<std::collections::VecDeque<Step>>,
+    calls: AtomicUsize,
+}
+
+impl LlmClient for Steps {
+    fn model(&self) -> &str {
+        "steps"
+    }
+
+    fn complete(&self, _: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let (takes, outcome) = self.steps.lock().unwrap().pop_front().expect("a step");
+        self.clock.advance(takes);
+        outcome.map(|json| LlmResponse {
+            json,
+            usage: None,
+            latency: Duration::ZERO,
+        })
+    }
+}
+
+/// Records each wait instead of sleeping, and moves the clock on by it.
+struct Waits {
+    clock: Arc<SimulatedClock>,
+    waits: Mutex<Vec<Duration>>,
+    elapsed: Option<Duration>,
+}
+
+impl Sleeper for Waits {
+    fn sleep(&self, wait: Duration) {
+        self.waits.lock().unwrap().push(wait);
+        self.clock
+            .advance(SignedDuration::try_from(self.elapsed.unwrap_or(wait)).unwrap());
+    }
+}
+
+/// A bounded policy, the shape translate has: four attempts at most for
+/// either kind of failure, waiting 1s, 2s, then 3s (capped from 4s) before
+/// them, and none started 30s after the first.
+fn retry_policy() -> RetryPolicy {
+    RetryPolicy {
+        first_wait: Duration::from_secs(1),
+        max_wait: Duration::from_secs(3),
+        provider_attempts: Some(4),
+        request_attempts: 4,
+        budget: Some(Duration::from_secs(30)),
+    }
+}
+
+/// The shape extraction and refresh have: the provider being down is
+/// retried until it recovers, backing off from 1s to 60s, and a failure
+/// the request may cause is returned at once for the caller to count.
+fn daemon_policy() -> RetryPolicy {
+    RetryPolicy {
+        first_wait: Duration::from_secs(1),
+        max_wait: Duration::from_secs(60),
+        provider_attempts: None,
+        request_attempts: 1,
+        budget: None,
+    }
+}
+
+/// One call through [`LlmRetry`] to a client playing `steps`: its result,
+/// how many calls reached the client, and the waits between them.
+fn retried(steps: Vec<Step>) -> (Result<LlmResponse, LlmError>, usize, Vec<Duration>) {
+    retried_with_sleep(steps, None)
+}
+
+/// Optionally simulate scheduler oversleep instead of the requested wait.
+fn retried_with_sleep(
+    steps: Vec<Step>,
+    elapsed: Option<Duration>,
+) -> (Result<LlmResponse, LlmError>, usize, Vec<Duration>) {
+    retried_under(retry_policy(), steps, elapsed)
+}
+
+/// [`retried_with_sleep`] under `policy`.
+fn retried_under(
+    policy: RetryPolicy,
+    steps: Vec<Step>,
+    elapsed: Option<Duration>,
+) -> (Result<LlmResponse, LlmError>, usize, Vec<Duration>) {
+    let clock = Arc::new(SimulatedClock::new(start()));
+    let inner = Arc::new(Steps {
+        clock: clock.clone(),
+        steps: Mutex::new(steps.into()),
+        calls: AtomicUsize::new(0),
+    });
+    let waits = Arc::new(Waits {
+        clock: clock.clone(),
+        waits: Mutex::new(Vec::new()),
+        elapsed,
+    });
+    let retry = LlmRetry::new(inner.clone(), policy, clock, waits.clone());
+    let result = retry.complete(&request());
+    let waits = waits.waits.lock().unwrap().clone();
+    (result, inner.calls.load(Ordering::SeqCst), waits)
+}
+
+fn quick(outcome: Result<Value, LlmError>) -> Step {
+    (SignedDuration::ZERO, outcome)
+}
+
+/// Each wait is jittered down to no less than half its backoff: 1s, 2s,
+/// then 3s once doubling passes the cap.
+fn assert_backed_off(waits: &[Duration], case: &str) {
+    let secs = Duration::from_secs;
+    let backoffs = [secs(1), secs(2), secs(3)];
+    assert!(waits.len() <= backoffs.len(), "{case}: {waits:?}");
+    for (wait, backoff) in waits.iter().zip(backoffs) {
+        assert!(
+            *wait >= backoff / 2 && *wait <= backoff,
+            "{case}: waited {wait:?} for a {backoff:?} backoff"
+        );
+    }
+}
+
+#[test]
+fn a_transient_error_is_retried_within_the_call_and_nothing_else_is() {
+    let ok = || Ok(json!({"claims": []}));
+    let status = |status| Err(LlmError::Status { status });
+    let backend = |code: &str| {
+        Err(LlmError::Backend {
+            code: code.to_string(),
+        })
+    };
+
+    // Transient failures short of the cap end in the reply.
+    let transient = [
+        vec![quick(Err(LlmError::Timeout)), quick(ok())],
+        vec![quick(status(429)), quick(status(408)), quick(ok())],
+        vec![
+            quick(Err(LlmError::Transport {
+                reason: "connection reset".into(),
+            })),
+            quick(status(502)),
+            quick(backend("server_error")),
+            quick(ok()),
+        ],
+    ];
+    for steps in transient {
+        let attempts = steps.len();
+        let (result, calls, waits) = retried(steps);
+        let case = format!("{attempts} attempts");
+        assert_eq!(result.unwrap().json, json!({"claims": []}), "{case}");
+        assert_eq!((calls, waits.len()), (attempts, attempts - 1), "{case}");
+        assert_backed_off(&waits, &case);
+    }
+
+    // Exhausting the attempts returns the last error.
+    let (result, calls, waits) = retried(vec![
+        quick(status(502)),
+        quick(status(503)),
+        quick(status(504)),
+        quick(status(503)),
+        quick(ok()),
+    ]);
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, LlmError::Status { status: 503 }),
+        "{error:?}"
+    );
+    assert_eq!((calls, waits.len()), (4, 3));
+    assert_backed_off(&waits, "exhausted");
+
+    // Anything else is returned at once: a wrong reply, a hold the gate
+    // shares, a login, a deterministic backend failure.
+    let resets_at = start() + SignedDuration::from_hours(1);
+    let fatal: Vec<(&str, Result<Value, LlmError>)> = vec![
+        ("not json", Err(LlmError::NotJson { bytes: 3 })),
+        ("no content", Err(LlmError::NoContent)),
+        ("refused", Err(LlmError::Refused)),
+        ("login", Err(LlmError::LoginRequired)),
+        ("usage", Err(LlmError::UsageLimited { resets_at })),
+        (
+            "rate",
+            Err(LlmError::RateLimited {
+                retry_after: Duration::from_secs(5),
+            }),
+        ),
+        ("bad request", status(400)),
+        ("max_output_tokens", backend("max_output_tokens")),
+    ];
+    for (case, outcome) in fatal {
+        let expected = format!("{:?}", outcome.as_ref().unwrap_err());
+        let (result, calls, waits) = retried(vec![quick(outcome), quick(ok())]);
+        let error = result.unwrap_err();
+        assert_eq!(format!("{error:?}"), expected, "{case}");
+        assert_eq!((calls, waits), (1, vec![]), "{case}");
+    }
+
+    // A call that ends past the budget isn't retried, however it failed: a
+    // stalled endpoint doesn't hold a call for minutes. Nor is one whose
+    // backoff, at least 0.5s here, would start the next attempt past it,
+    // and it doesn't wait for nothing. One that ends well inside it is.
+    let slow = SignedDuration::from_secs(31);
+    let (result, calls, _) = retried(vec![(slow, Err(LlmError::Timeout)), quick(ok())]);
+    assert!(matches!(result, Err(LlmError::Timeout)), "{result:?}");
+    assert_eq!(calls, 1);
+    let edge = SignedDuration::from_millis(29_800);
+    let (result, calls, waits) = retried(vec![(edge, Err(LlmError::Timeout)), quick(ok())]);
+    assert!(matches!(result, Err(LlmError::Timeout)), "{result:?}");
+    assert_eq!((calls, waits), (1, vec![]));
+    let inside = SignedDuration::from_secs(20);
+    let (result, calls, _) = retried(vec![(inside, Err(LlmError::Timeout)), quick(ok())]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(calls, 2);
+
+    // The planned wait fits, but scheduler oversleep reaches or passes
+    // the cutoff. Return the last error without starting another call.
+    for sleep_secs in [10, 11] {
+        let (result, calls, waits) = retried_with_sleep(
+            vec![(inside, status(503)), quick(ok())],
+            Some(Duration::from_secs(sleep_secs)),
+        );
+        assert!(
+            matches!(result, Err(LlmError::Status { status: 503 })),
+            "slept {sleep_secs}s: {result:?}"
+        );
+        assert_eq!((calls, waits.len()), (1, 1), "slept {sleep_secs}s");
+        assert_backed_off(&waits, "oversleep");
+    }
+}
+
+#[test]
+fn the_provider_being_down_is_retried_until_it_recovers_and_a_request_fault_as_the_caller_allows() {
+    let ok = || Ok(json!({"claims": []}));
+    let status = |status| Err(LlmError::Status { status });
+    let backend = |code: &str| {
+        Err(LlmError::Backend {
+            code: code.to_string(),
+        })
+    };
+
+    // Unreachable, overloaded or limiting: retried past any attempt count,
+    // the backoff doubling from 1s to its 60s cap.
+    let down = vec![
+        quick(Err(LlmError::Transport {
+            reason: "connection refused".into(),
+        })),
+        quick(status(502)),
+        quick(status(503)),
+        quick(status(504)),
+        quick(status(429)),
+        quick(backend("server_is_overloaded")),
+        quick(backend("slow_down")),
+        quick(backend("rate_limit_exceeded")),
+        quick(status(503)),
+        quick(status(503)),
+        quick(status(503)),
+        quick(ok()),
+    ];
+    let failures = down.len() - 1;
+    let (result, calls, waits) = retried_under(daemon_policy(), down, None);
+    assert_eq!(result.unwrap().json, json!({"claims": []}));
+    assert_eq!((calls, waits.len()), (failures + 1, failures));
+    for (doublings, wait) in waits.iter().enumerate() {
+        let backoff = Duration::from_secs(1 << doublings.min(16)).min(Duration::from_secs(60));
+        assert!(
+            *wait >= backoff / 2 && *wait <= backoff,
+            "waited {wait:?} for a {backoff:?} backoff"
+        );
+    }
+
+    // A failure the request may cause goes back at once when the caller
+    // counts it itself, as extraction and refresh do.
+    let request_faults: Vec<(&str, Result<Value, LlmError>)> = vec![
+        ("timeout", Err(LlmError::Timeout)),
+        ("408", status(408)),
+        ("500", status(500)),
+        ("501", status(501)),
+        ("server_error", backend("server_error")),
+        ("interrupted", backend("interrupted")),
+    ];
+    for (case, outcome) in request_faults {
+        let expected = format!("{:?}", outcome.as_ref().unwrap_err());
+        let (result, calls, waits) =
+            retried_under(daemon_policy(), vec![quick(outcome), quick(ok())], None);
+        assert_eq!(format!("{:?}", result.unwrap_err()), expected, "{case}");
+        assert_eq!((calls, waits), (1, vec![]), "{case}");
+    }
+
+    // A caller with no count of its own, as replay, retries them a few
+    // times. The provider being down in between uses up none of those.
+    let replay = RetryPolicy {
+        request_attempts: 5,
+        ..daemon_policy()
+    };
+    let faults = |n| {
+        (0..n)
+            .map(|_| quick(backend("server_error")))
+            .collect::<Vec<Step>>()
+    };
+    let mut recovers = faults(4);
+    recovers.push(quick(ok()));
+    let (result, calls, _) = retried_under(replay, recovers, None);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(calls, 5);
+    let mut never = faults(5);
+    never.push(quick(ok()));
+    let (result, calls, _) = retried_under(replay, never, None);
+    assert!(
+        matches!(result, Err(LlmError::Backend { .. })),
+        "{result:?}"
+    );
+    assert_eq!(calls, 5);
+    let mut mixed: Vec<Step> = (0..6).map(|_| quick(status(503))).collect();
+    mixed.extend(faults(4));
+    mixed.push(quick(ok()));
+    let (result, calls, _) = retried_under(replay, mixed, None);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(calls, 11);
+}
+
+/// Records each wait and then reports itself stopped, as the daemon's
+/// sleeper does once shutdown wakes it.
+#[derive(Default)]
+struct Stopping {
+    waits: AtomicUsize,
+}
+
+impl Sleeper for Stopping {
+    fn sleep(&self, _: Duration) {
+        self.waits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn stopped(&self) -> bool {
+        self.waits.load(Ordering::SeqCst) > 0
+    }
+}
+
+#[test]
+fn a_retry_its_sleeper_stops_gives_up_as_stopped() {
+    // Shutdown wakes a retry in the middle of an outage. It makes no more
+    // attempts and returns `Stopped`, not the outage's error, so nothing
+    // counts it as a failure.
+    let clock = Arc::new(SimulatedClock::new(start()));
+    let steps = vec![
+        quick(Err(LlmError::Status { status: 503 })),
+        quick(Ok(json!({}))),
+    ];
+    let inner = Arc::new(Steps {
+        clock: clock.clone(),
+        steps: Mutex::new(steps.into()),
+        calls: AtomicUsize::new(0),
+    });
+    let sleeper = Arc::new(Stopping::default());
+    let retry = LlmRetry::new(inner.clone(), daemon_policy(), clock, sleeper.clone());
+    let result = retry.complete(&request());
+    assert!(matches!(result, Err(LlmError::Stopped)), "{result:?}");
+    assert_eq!(LlmError::Stopped.retry(), Retry::Never);
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sleeper.waits.load(Ordering::SeqCst), 1);
+}
+
+/// What `status` says while a retry waits: who is retrying, since when and
+/// how many attempts have failed, and how many lines need attention.
+type Seen = (Vec<(String, Timestamp, u32)>, usize);
+
+/// Reads the service's status each time the retry waits, then moves the
+/// clock on by the wait.
+struct Watching {
+    service: Arc<Service>,
+    clock: Arc<SimulatedClock>,
+    seen: Mutex<Vec<Seen>>,
+}
+
+fn seen(service: &Service) -> Seen {
+    let status = service.status().unwrap();
+    let retrying = status
+        .llm_retrying
+        .iter()
+        .map(|call| (call.caller.clone(), call.since, call.attempts))
+        .collect();
+    (retrying, status.attention.len())
+}
+
+impl Sleeper for Watching {
+    fn sleep(&self, wait: Duration) {
+        self.seen.lock().unwrap().push(seen(&self.service));
+        self.clock.advance(SignedDuration::try_from(wait).unwrap());
+    }
+}
+
+#[test]
+fn a_call_retrying_through_an_outage_shows_in_status_until_it_ends() {
+    // A long outage must not look like a quiet queue: `status` names the
+    // caller, when its retrying began and the attempts so far, and once it
+    // has gone on for minutes, needs attention.
+    let dir = TestDir::new();
+    let clock = Arc::new(SimulatedClock::new(start()));
+    let store = Store::open(&dir.join("data"), OpenOptions::default(), clock.clone()).unwrap();
+    let tuning = tuning(FakeReranker::MODEL_ID);
+    let service = Service::with_models(clock.clone(), store, tuning, Models::fake()).unwrap();
+    let service = Arc::new(service);
+    let down = || quick(Err(LlmError::Status { status: 503 }));
+    let inner = Arc::new(Steps {
+        clock: clock.clone(),
+        steps: Mutex::new(vec![down(), down(), quick(Ok(json!({})))].into()),
+        calls: AtomicUsize::new(0),
+    });
+    let watching = Arc::new(Watching {
+        service: Arc::clone(&service),
+        clock: clock.clone(),
+        seen: Mutex::new(Vec::new()),
+    });
+    let policy = RetryPolicy {
+        first_wait: Duration::from_secs(20 * 60),
+        max_wait: Duration::from_secs(20 * 60),
+        ..daemon_policy()
+    };
+    let before = seen(&service);
+    assert_eq!(before.0, vec![]);
+
+    let retry = LlmRetry::new(inner, policy, clock.clone(), watching.clone())
+        .reporting(service.llm_retries(), "main");
+    retry.complete(&request()).unwrap();
+
+    let seen_while = watching.seen.lock().unwrap().clone();
+    let main = |attempts| vec![("main".to_string(), start(), attempts)];
+    assert_eq!(seen_while.len(), 2);
+    assert_eq!(seen_while[0], (main(1), before.1));
+    // Ten minutes or more on, it needs attention.
+    assert_eq!(seen_while[1].0, main(2));
+    assert!(seen_while[1].1 > before.1, "{seen_while:?}");
+    assert_eq!(seen(&service), before);
 }
 
 // The real models. Ignored: they run only when the models are present.

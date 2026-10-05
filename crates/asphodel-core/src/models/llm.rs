@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use jiff::Timestamp;
 
-use super::chatgpt::CODEX_ENDPOINT;
+use super::chatgpt::{CODEX_ENDPOINT, PROVIDER_DOWN_CODES, REQUEST_FAULT_CODES};
 use crate::clock::{Clock, SystemClock};
 use crate::config::{Deployment, LLM_API_KEY_ENV, LlmAuth, Secret, Tuning};
 
@@ -192,18 +192,51 @@ pub enum LlmError {
     /// is kept.
     #[error("the LLM backend failed the request: {code}")]
     Backend { code: String },
+
+    /// A retry's wait was cut short because the daemon is stopping. Not a
+    /// failure: whatever was asked is asked again after the restart.
+    #[error("the LLM call stopped because the daemon is stopping")]
+    Stopped,
+}
+
+/// Whether a failed call may succeed if it's made again, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    /// The provider is unreachable, overloaded or limiting. The same
+    /// request succeeds once it recovers, so nothing about it is at fault.
+    ProviderDown,
+    /// The request itself may be the cause, such as a reply that always
+    /// runs past the timeout. It may succeed next time, or fail every time.
+    MaybeTheRequest,
+    /// A reply that came back wrong, a refusal, a missing login, or a hold
+    /// that says when to come back: making the call again changes nothing.
+    Never,
 }
 
 impl LlmError {
-    /// Whether the caller's retry policy may try again: transport errors,
-    /// timeouts, 408, 429 and 5xx. Never for a reply that came back and was
-    /// wrong, and never for a usage limit or a 429 that said when to come
-    /// back, which are deferred to then instead.
-    pub fn is_retryable(&self) -> bool {
+    /// Why the call failed, for the retry policy ([`super::RetryPolicy`]).
+    /// Transport errors, a 429 without `Retry-After`, 502, 503, 504 and
+    /// the backend's overload and rate codes say the provider is down. A
+    /// timeout, 408, 500 and any other 5xx, `server_error` and
+    /// `interrupted` may be the request's own doing. A usage limit and a
+    /// 429 that said when to come back are holds, deferred to then.
+    pub fn retry(&self) -> Retry {
         match self {
-            Self::Transport { .. } | Self::Timeout => true,
-            Self::Status { status } => matches!(status, 408 | 429 | 500..=599),
-            Self::NotConfigured { .. }
+            Self::Transport { .. } => Retry::ProviderDown,
+            Self::Timeout => Retry::MaybeTheRequest,
+            Self::Status { status } => match status {
+                429 | 502..=504 => Retry::ProviderDown,
+                408 | 500..=599 => Retry::MaybeTheRequest,
+                _ => Retry::Never,
+            },
+            Self::Backend { code } if PROVIDER_DOWN_CODES.contains(&code.as_str()) => {
+                Retry::ProviderDown
+            }
+            Self::Backend { code } if REQUEST_FAULT_CODES.contains(&code.as_str()) => {
+                Retry::MaybeTheRequest
+            }
+            Self::Backend { .. }
+            | Self::NotConfigured { .. }
             | Self::NoContent
             | Self::NotJson { .. }
             | Self::Refused
@@ -211,7 +244,7 @@ impl LlmError {
             | Self::LoginRequired
             | Self::UsageLimited { .. }
             | Self::RateLimited { .. }
-            | Self::Backend { .. } => false,
+            | Self::Stopped => Retry::Never,
         }
     }
 }
