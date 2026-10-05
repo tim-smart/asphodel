@@ -315,6 +315,35 @@ fn massed_use_spikes_then_falls_below_spaced_use() {
 }
 
 #[test]
+fn one_used_credit_strengthens_at_once_and_the_floor_counts_it_like_any_access() {
+    // Three memories said together, the one left alone last so it starts
+    // freshest. Five world days on, one is used in a reply once and another
+    // is mentioned again. The single use lifts recent use straight away,
+    // with no second credit needed, and the floor counts it as an occasion
+    // whatever its kind.
+    let h = Harness::new("");
+    let used = h.says(at(0.0), trivial("fact", "Tim's desk is by the window."));
+    let mentioned = h.says(at(0.001), trivial("fact", "Tim's car is blue."));
+    let cold = h.says(at(0.002), trivial("fact", "Tim's locker is number 12."));
+    h.uses(at(5.0), used);
+    let again = trivial("fact", "Tim's car is blue.");
+    assert!(
+        h.labels(at(5.001), again, mentioned, "mentioned_again")
+            .is_empty()
+    );
+
+    h.set(at(5.5));
+    let (cold, used, mentioned) = (h.strength(cold), h.strength(used), h.strength(mentioned));
+    assert!(used.recent_use > cold.recent_use, "{used:?} {cold:?}");
+    assert_eq!(
+        (cold.occasions, used.occasions, mentioned.occasions),
+        (1, 2, 2)
+    );
+    assert_eq!(used.lasting_floor, mentioned.lasting_floor);
+    assert!(used.lasting_floor > cold.lasting_floor, "{used:?} {cold:?}");
+}
+
+#[test]
 fn separate_occasions_in_world_time_make_a_memory_permanent_even_once_it_ends() {
     // A quiet bank, where three world days between turns are only 1.2 bank
     // days. Berlin is mentioned on four occasions exactly three world days
