@@ -788,14 +788,29 @@ impl Sleeper for Waits {
     }
 }
 
-/// Four attempts at most, waiting 1s, 2s, then 3s (capped from 4s) before
-/// them, and none started 30s after the first.
+/// A bounded policy, as translate has: four attempts at most, waiting 1s,
+/// 2s, then 3s (capped from 4s) before them, and none started 30s after
+/// the first, whatever the error.
 fn retry_policy() -> RetryPolicy {
     RetryPolicy {
         attempts: 4,
         first_wait: Duration::from_secs(1),
         max_wait: Duration::from_secs(3),
         budget: Duration::from_secs(30),
+        unbounded: false,
+    }
+}
+
+/// The policy extraction and refresh run on: an outage is retried for as
+/// long as it lasts, backing off from 1s to 60s, and an error that may be
+/// the request's own gets three attempts within 30s.
+fn outage_policy() -> RetryPolicy {
+    RetryPolicy {
+        attempts: 3,
+        first_wait: Duration::from_secs(1),
+        max_wait: Duration::from_secs(60),
+        budget: Duration::from_secs(30),
+        unbounded: true,
     }
 }
 
@@ -810,6 +825,15 @@ fn retried_with_sleep(
     steps: Vec<Step>,
     elapsed: Option<Duration>,
 ) -> (Result<LlmResponse, LlmError>, usize, Vec<Duration>) {
+    retried_under(retry_policy(), steps, elapsed)
+}
+
+/// [`retried_with_sleep`] under `policy`.
+fn retried_under(
+    policy: RetryPolicy,
+    steps: Vec<Step>,
+    elapsed: Option<Duration>,
+) -> (Result<LlmResponse, LlmError>, usize, Vec<Duration>) {
     let clock = Arc::new(SimulatedClock::new(start()));
     let inner = Arc::new(Steps {
         clock: clock.clone(),
@@ -821,7 +845,7 @@ fn retried_with_sleep(
         waits: Mutex::new(Vec::new()),
         elapsed,
     });
-    let retry = LlmRetry::new(inner.clone(), retry_policy(), clock, waits.clone());
+    let retry = LlmRetry::new(inner.clone(), policy, clock, waits.clone());
     let result = retry.complete(&request());
     let waits = waits.waits.lock().unwrap().clone();
     (result, inner.calls.load(Ordering::SeqCst), waits)
@@ -950,6 +974,191 @@ fn a_transient_error_is_retried_within_the_call_and_nothing_else_is() {
         assert_eq!((calls, waits.len()), (1, 1), "slept {sleep_secs}s");
         assert_backed_off(&waits, "oversleep");
     }
+}
+
+#[test]
+fn an_outage_is_retried_for_as_long_as_it_lasts_and_a_doubtful_error_is_not() {
+    let ok = || Ok(json!({"claims": []}));
+    let status = |status| Err(LlmError::Status { status });
+    let backend = |code: &str| {
+        Err(LlmError::Backend {
+            code: code.to_string(),
+        })
+    };
+
+    // The provider unreachable, overloaded or limiting: retried past any
+    // attempt count or budget, the backoff doubling from 1s to its 60s cap.
+    let outage = vec![
+        quick(Err(LlmError::Transport {
+            reason: "connection refused".into(),
+        })),
+        quick(status(502)),
+        quick(status(503)),
+        quick(status(504)),
+        quick(status(408)),
+        quick(status(429)),
+        quick(backend("server_is_overloaded")),
+        quick(backend("slow_down")),
+        quick(backend("rate_limit_exceeded")),
+        quick(status(503)),
+        quick(status(503)),
+        quick(status(503)),
+        quick(ok()),
+    ];
+    let failures = outage.len() - 1;
+    let (result, calls, waits) = retried_under(outage_policy(), outage, None);
+    assert_eq!(result.unwrap().json, json!({"claims": []}));
+    assert_eq!((calls, waits.len()), (failures + 1, failures));
+    for (doublings, wait) in waits.iter().enumerate() {
+        let backoff = Duration::from_secs(1 << doublings.min(16)).min(Duration::from_secs(60));
+        assert!(
+            *wait >= backoff / 2 && *wait <= backoff,
+            "waited {wait:?} for a {backoff:?} backoff"
+        );
+    }
+
+    // A timeout, a plain 500 or `server_error` may be the request's own
+    // doing, so it keeps the bounded attempts and returns the last error
+    // for the caller to count.
+    let doubtful = vec![
+        quick(Err(LlmError::Timeout)),
+        quick(status(500)),
+        quick(backend("server_error")),
+        quick(ok()),
+    ];
+    let (result, calls, _) = retried_under(outage_policy(), doubtful, None);
+    let error = result.unwrap_err();
+    assert!(
+        matches!(&error, LlmError::Backend { code } if code == "server_error"),
+        "{error:?}"
+    );
+    assert_eq!(calls, 3);
+
+    // An outage before them uses up none of their attempts, nor their
+    // budget, though its backoff alone passes 30s.
+    let mut after_outage: Vec<Step> = (0..6).map(|_| quick(status(503))).collect();
+    after_outage.extend([
+        quick(Err(LlmError::Timeout)),
+        quick(status(500)),
+        quick(ok()),
+    ]);
+    let (result, calls, _) = retried_under(outage_policy(), after_outage, None);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(calls, 9);
+}
+
+/// Records each wait and then reports itself stopped, as the daemon's
+/// sleeper does once shutdown wakes it.
+#[derive(Default)]
+struct Stopping {
+    waits: AtomicUsize,
+}
+
+impl Sleeper for Stopping {
+    fn sleep(&self, _: Duration) {
+        self.waits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn stopped(&self) -> bool {
+        self.waits.load(Ordering::SeqCst) > 0
+    }
+}
+
+#[test]
+fn a_retry_its_sleeper_stops_gives_up_as_stopped() {
+    // Shutdown wakes a retry in the middle of an outage. It makes no more
+    // attempts and returns `Stopped`, not the outage's error, so nothing
+    // counts it as a failure.
+    let clock = Arc::new(SimulatedClock::new(start()));
+    let steps = vec![
+        quick(Err(LlmError::Status { status: 503 })),
+        quick(Ok(json!({}))),
+    ];
+    let inner = Arc::new(Steps {
+        clock: clock.clone(),
+        steps: Mutex::new(steps.into()),
+        calls: AtomicUsize::new(0),
+    });
+    let sleeper = Arc::new(Stopping::default());
+    let retry = LlmRetry::new(inner.clone(), outage_policy(), clock, sleeper.clone());
+    let result = retry.complete(&request());
+    assert!(matches!(result, Err(LlmError::Stopped)), "{result:?}");
+    assert!(!LlmError::Stopped.is_retryable());
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sleeper.waits.load(Ordering::SeqCst), 1);
+}
+
+/// What `status` says while a retry waits: who is retrying, since when and
+/// how many attempts have failed, and how many lines need attention.
+type Seen = (Vec<(String, Timestamp, u32)>, usize);
+
+/// Reads the service's status each time the retry waits, then moves the
+/// clock on by the wait.
+struct Watching {
+    service: Arc<Service>,
+    clock: Arc<SimulatedClock>,
+    seen: Mutex<Vec<Seen>>,
+}
+
+fn seen(service: &Service) -> Seen {
+    let status = service.status().unwrap();
+    let retrying = status
+        .llm_retrying
+        .iter()
+        .map(|call| (call.caller.clone(), call.since, call.attempts))
+        .collect();
+    (retrying, status.attention.len())
+}
+
+impl Sleeper for Watching {
+    fn sleep(&self, wait: Duration) {
+        self.seen.lock().unwrap().push(seen(&self.service));
+        self.clock.advance(SignedDuration::try_from(wait).unwrap());
+    }
+}
+
+#[test]
+fn a_call_retrying_through_an_outage_shows_in_status_until_it_ends() {
+    // A long outage must not look like a quiet queue: `status` names the
+    // caller, when its retrying began and the attempts so far, and once it
+    // has gone on for minutes, needs attention.
+    let dir = TestDir::new();
+    let clock = Arc::new(SimulatedClock::new(start()));
+    let store = Store::open(&dir.join("data"), OpenOptions::default(), clock.clone()).unwrap();
+    let tuning = tuning(FakeReranker::MODEL_ID);
+    let service = Service::with_models(clock.clone(), store, tuning, Models::fake()).unwrap();
+    let service = Arc::new(service);
+    let down = || quick(Err(LlmError::Status { status: 503 }));
+    let inner = Arc::new(Steps {
+        clock: clock.clone(),
+        steps: Mutex::new(vec![down(), down(), quick(Ok(json!({})))].into()),
+        calls: AtomicUsize::new(0),
+    });
+    let watching = Arc::new(Watching {
+        service: Arc::clone(&service),
+        clock: clock.clone(),
+        seen: Mutex::new(Vec::new()),
+    });
+    let policy = RetryPolicy {
+        first_wait: Duration::from_secs(20 * 60),
+        max_wait: Duration::from_secs(20 * 60),
+        ..outage_policy()
+    };
+    let before = seen(&service);
+    assert_eq!(before.0, vec![]);
+
+    let retry = LlmRetry::new(inner, policy, clock.clone(), watching.clone())
+        .reporting(service.llm_retries(), "main");
+    retry.complete(&request()).unwrap();
+
+    let seen_while = watching.seen.lock().unwrap().clone();
+    let main = |attempts| vec![("main".to_string(), start(), attempts)];
+    assert_eq!(seen_while.len(), 2);
+    assert_eq!(seen_while[0], (main(1), before.1));
+    // Ten minutes or more on, it needs attention.
+    assert_eq!(seen_while[1].0, main(2));
+    assert!(seen_while[1].1 > before.1, "{seen_while:?}");
+    assert_eq!(seen(&service), before);
 }
 
 // The real models. Ignored: they run only when the models are present.

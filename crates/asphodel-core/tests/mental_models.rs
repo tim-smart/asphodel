@@ -922,6 +922,45 @@ fn a_transient_error_retried_within_the_call_keeps_the_plan_and_counts_nothing()
     assert_eq!(h.failures(), (0, vec![]));
 }
 
+/// A [`Sleeper`] that reports itself stopped once asked to wait, as the
+/// daemon's does when shutdown wakes it.
+#[derive(Default)]
+struct StoppedWhileWaiting(AtomicBool);
+
+impl Sleeper for StoppedWhileWaiting {
+    fn sleep(&self, _: Duration) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn stopped(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[test]
+fn a_refresh_stopped_by_shutdown_mid_outage_is_not_a_failure() {
+    // The daemon stops while the write waits out an outage. Nothing is
+    // recorded against the model, and no thirty-minute wait starts.
+    let h = Harness::new();
+    h.says(fact(TEA));
+    h.advance(minutes(5));
+    let script = json!([{"fail": "status", "status": 503}, {"reply": quiet()}]);
+    let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
+    let policy = RetryPolicy {
+        unbounded: true,
+        ..RetryPolicy::default()
+    };
+    let sleeper = Arc::new(StoppedWhileWaiting::default());
+    let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), sleeper);
+    let ran = h.tick(&llm);
+    assert_eq!(writes(&inner), 1);
+    let outcomes: Vec<_> = ran.ran.iter().map(|run| &run.outcome).collect();
+    let failed = outcomes.iter().any(|o| matches!(o, Outcome::Failed(_)));
+    assert!(!failed, "{outcomes:?}");
+    assert_eq!(h.profile().last_error, None);
+    assert_eq!(h.failures(), (0, vec![]));
+}
+
 #[test]
 fn a_refresh_held_by_the_gate_waits_for_the_hold_not_thirty_minutes() {
     // The daemon's gate holds every call once any call hits a limit,
