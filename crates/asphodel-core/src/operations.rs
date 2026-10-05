@@ -30,6 +30,7 @@ use uuid::Uuid;
 use crate::clock::Clock;
 use crate::config::{Fingerprint, PurgePause};
 use crate::erase::{EDIT_FORGET, EDIT_PURGED};
+use crate::models::LlmRetrying;
 use crate::store::fs::check_data_dir;
 use crate::store::ids::IdSource;
 use crate::store::migrations::{self, SCHEMA_VERSION, integrity_problems};
@@ -468,6 +469,9 @@ pub struct Status {
     /// When `POST /v1/backup` last completed, which says nothing about
     /// whether the stream reached its destination.
     pub last_backup_at: Option<Timestamp>,
+    /// LLM calls waiting to retry because the provider is down, oldest
+    /// first. Empty while every call succeeds or fails at once.
+    pub llm_retrying: Vec<LlmRetrying>,
 }
 
 /// One bank's queue and failures.
@@ -586,6 +590,7 @@ pub(crate) fn status(
         last_sweep,
         pre_migration_copy,
         last_backup_at: last_backup_at.and_then(|at| at.parse().ok()),
+        llm_retrying: Vec::new(),
     })
 }
 

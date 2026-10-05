@@ -6,7 +6,8 @@
 //! - [`Embedder`] over bge-small-en-v1.5 int8;
 //! - [`Reranker`] over ms-marco-MiniLM-L-6-v2 int8;
 //! - [`LlmClient`] over any OpenAI-compatible endpoint, with structured JSON
-//!   output. [`LlmRetry`] retries a transient failure within the call, and
+//!   output. [`LlmRetry`] retries a failed call as each caller's
+//!   [`RetryPolicy`] allows, and
 //!   replay's recording and cassette modes wrap it.
 //!
 //! The ONNX models load from a [`ModelDir`] that `asphodel models fetch`
@@ -44,13 +45,13 @@ pub use fetch::{FetchError, FetchFailure, FetchReport, Fetcher, HttpFetcher, fet
 pub use gate::LlmGate;
 pub use llm::{
     FakeLlm, LlmClient, LlmError, LlmRequest, LlmResponse, LlmSettings, LlmUsage, OpenAiCompatible,
-    ScriptError, ScriptStep, ScriptedFailure, Template,
+    Retry, ScriptError, ScriptStep, ScriptedFailure, Template,
 };
 pub use manifest::{
     EMBEDDING_MODEL_ID, MODEL_FILES, ModelFile, ModelSpec, RERANKER_MODEL_ID, manifest,
 };
 pub use onnx::{OnnxEmbedder, OnnxReranker};
-pub use retry::{LlmRetry, RetryPolicy};
+pub use retry::{LlmRetry, LlmRetrying, RetryBoard, RetryPolicy};
 
 /// How to run the ONNX models.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

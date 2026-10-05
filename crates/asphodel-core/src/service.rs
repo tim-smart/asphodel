@@ -37,7 +37,7 @@ use crate::mental_models::{
     Model, ModelEdit, ModelError, ModelSpec, Outcome as RefreshOutcome, RefreshInput, RefreshRun,
     Refreshes, Schedule,
 };
-use crate::models::{Embedder, LlmClient, Models};
+use crate::models::{Embedder, LlmClient, Models, RetryBoard};
 use crate::operations::{Audit, AuditError, AuditList, Backup, BackupError, Status};
 use crate::queue::{
     ChunkError, ChunkList, FailedChunk, Failure, Lease, Leases, QueueError, Retried, SourceKind,
@@ -53,6 +53,10 @@ use crate::store::{Store, StoreError};
 use crate::sweep::{PurgeError, PurgePlan, SweepSchedule, Sweeps};
 use crate::system_prompt::{Block, Blocks};
 use crate::translate::{Found, TranslateError, Translation};
+
+/// How long an LLM call may go on retrying before `status` says it needs
+/// attention: past a few backoffs, the provider is down rather than blipped.
+const LLM_RETRYING_ATTENTION: jiff::SignedDuration = jiff::SignedDuration::from_mins(5);
 
 /// One running store: the daemon's banks, models, extraction queue and jobs,
 /// driven by a clock.
@@ -87,6 +91,8 @@ pub struct Service {
     /// Held while a refresh runs, so the timer and `model refresh` never
     /// refresh at once.
     refreshing: Mutex<()>,
+    /// The LLM calls waiting to retry, which `status` lists.
+    llm_retries: RetryBoard,
     /// Whether purge and the source sweep run, from the stored deletion
     /// fingerprint at startup and any ack since.
     purge: Mutex<PurgePause>,
@@ -147,6 +153,7 @@ impl Service {
             schedule,
             blocks: Blocks::default(),
             refreshing: Mutex::new(()),
+            llm_retries: RetryBoard::default(),
             purge: Mutex::new(PurgePause::Running),
             sweeps: SweepSchedule::new(started),
             sweeping: Mutex::new(()),
@@ -187,6 +194,7 @@ impl Service {
             schedule,
             blocks: Blocks::default(),
             refreshing: Mutex::new(()),
+            llm_retries: RetryBoard::default(),
             purge: Mutex::new(PurgePause::Running),
             sweeps: SweepSchedule::new(started),
             sweeping: Mutex::new(()),
@@ -907,7 +915,23 @@ impl Service {
                 "{bank}: its recorded embedding model {model} isn't loaded, so recall and extraction are refused; run `asphodel reembed --bank {bank}`"
             ));
         }
+        let now = self.now();
+        status.llm_retrying = self.llm_retries.retrying();
+        for call in &status.llm_retrying {
+            if call.since.duration_until(now) >= LLM_RETRYING_ATTENTION {
+                status.attention.push(format!(
+                    "{}: the LLM has been unavailable since {}, and its call is still retrying ({})",
+                    call.caller, call.since, call.error
+                ));
+            }
+        }
         Ok(status)
+    }
+
+    /// The board the daemon's LLM calls list themselves on while they wait
+    /// to retry, for `status`.
+    pub fn llm_retries(&self) -> RetryBoard {
+        self.llm_retries.clone()
     }
 
     /// `GET /v1/banks/{bank}/{purges,forgets,sweeps,recalls}`, newest first.

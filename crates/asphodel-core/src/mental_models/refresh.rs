@@ -456,9 +456,12 @@ impl Started<'_> {
     }
 }
 
-/// When a limit the LLM reported lifts, or `None` for any other error.
+/// When a limit the LLM reported lifts, or `None` for any other error. A
+/// call the daemon's shutdown stopped is held too, due again at once: the
+/// next start makes it.
 fn held_until(error: &LlmError, now: jiff::Timestamp) -> Option<jiff::Timestamp> {
     match error {
+        LlmError::Stopped => Some(now),
         LlmError::UsageLimited { resets_at } => Some(*resets_at),
         LlmError::RateLimited { retry_after } => Some(
             jiff::SignedDuration::try_from(*retry_after)

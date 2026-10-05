@@ -821,16 +821,17 @@ const BACKEND_CODES: &[&str] = &[
     "interrupted",
 ];
 
-/// The codes among [`BACKEND_CODES`] that say the backend failed or was
-/// busy rather than that the request can't succeed, so the same request may
-/// succeed next time. A reply cut short (`max_output_tokens`,
-/// `interrupted`), a refusal, a spent quota and an unknown code are not.
-pub(super) const TRANSIENT_BACKEND_CODES: &[&str] = &[
-    "server_error",
-    "server_is_overloaded",
-    "slow_down",
-    "rate_limit_exceeded",
-];
+/// The codes among [`BACKEND_CODES`] that say the provider is overloaded
+/// or limiting, whatever was asked: the same request succeeds once it
+/// recovers.
+pub(super) const PROVIDER_DOWN_CODES: &[&str] =
+    &["server_is_overloaded", "slow_down", "rate_limit_exceeded"];
+
+/// The codes among [`BACKEND_CODES`] for a failure the request itself may
+/// cause, such as a reply that reliably breaks the backend or is cut off.
+/// It may succeed next time, or fail every time. A reply cut short by its
+/// size, a refusal, a spent quota and an unknown code never change.
+pub(super) const REQUEST_FAULT_CODES: &[&str] = &["server_error", "interrupted"];
 
 /// A known code as itself, any other as `unknown`, and none as `missing`
 /// (the event's own fixed name).

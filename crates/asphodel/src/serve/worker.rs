@@ -8,9 +8,11 @@
 //! ([`asphodel_core::extraction`]). When the queue is empty, or the bank has
 //! as many chunks out as it may, the worker sleeps until a chunk finishes or
 //! an ingest or a retry wakes it. A held queue (no login, a usage limit, a
-//! 429 that said when to retry) waits without counting anything, and a
-//! counted failure waits before the retry when the LLM might recover, so
-//! an outage of a few minutes doesn't burn through the retry cap.
+//! 429 that said when to retry) waits without counting anything, and so
+//! does an outage, which each call retries until the provider recovers. A
+//! counted failure waits a little before the retry when it may not recur,
+//! so a chunk that fails every time leaves the queue at the retry cap
+//! rather than stalling the bank.
 //!
 //! A forget's erase waits on the same queue, behind the chunks queued
 //! before it, and nothing queued after it is claimed until it has run, so
@@ -25,13 +27,15 @@ use std::time::Duration;
 
 use asphodel_core::Service;
 use asphodel_core::extraction::{ExtractError, Extracted};
-use asphodel_core::models::{LlmClient, LlmError};
+use asphodel_core::models::{LlmClient, LlmError, Retry, RetryPolicy};
 use asphodel_core::queue::{Failure, QueueError};
 use asphodel_core::service::Claimed;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
+
+use super::Retries;
 
 /// How long a held queue waits before trying again, unless the LLM said
 /// when its usage window resets.
@@ -40,13 +44,13 @@ const HELD_WAIT: Duration = Duration::from_secs(60);
 /// The shortest a held queue waits, even when the hold has already lifted.
 const HELD_WAIT_MIN: Duration = Duration::from_secs(1);
 
-/// The first wait after a counted failure the LLM might recover from. It
-/// doubles with each failure of the same chunk, up to [`RETRY_WAIT_MAX`]:
-/// 30s, 1m, 2m and 4m between the five attempts, so a chunk outlasts an
-/// outage of about seven minutes before it fails. Each attempt has already
-/// retried a blip within the call (`LlmRetry`).
-const RETRY_WAIT: Duration = Duration::from_secs(30);
-const RETRY_WAIT_MAX: Duration = Duration::from_secs(5 * 60);
+/// The first wait after a counted failure that may not recur, such as a
+/// timeout the chunk may have caused or the store failing. It doubles with
+/// each failure of the same chunk, up to [`RETRY_WAIT_MAX`]. The provider
+/// being down never gets here: each call retries that until it recovers
+/// (`LlmRetry`), counting nothing.
+const RETRY_WAIT: Duration = Duration::from_secs(1);
+const RETRY_WAIT_MAX: Duration = Duration::from_secs(60);
 
 /// The wait after an error that isn't the chunk's, such as the store
 /// failing to claim.
@@ -55,7 +59,10 @@ const ERROR_WAIT: Duration = Duration::from_secs(5);
 /// The running workers, by bank name.
 pub(crate) struct Workers {
     service: Arc<Service>,
+    /// The shared gate. Each bank's worker retries above it on the
+    /// daemon's policy, listed under the bank's name.
     llm: Arc<dyn LlmClient>,
+    retries: Arc<Retries>,
     stop: watch::Receiver<bool>,
     banks: Registry,
     tasks: Mutex<JoinSet<()>>,
@@ -72,12 +79,14 @@ impl Workers {
     pub(crate) fn start(
         service: Arc<Service>,
         llm: Arc<dyn LlmClient>,
+        retries: Arc<Retries>,
         banks: &[String],
         stop: watch::Receiver<bool>,
     ) -> Arc<Self> {
         let workers = Arc::new(Self {
             service,
             llm,
+            retries,
             stop,
             banks: Registry::default(),
             tasks: Mutex::new(JoinSet::new()),
@@ -108,7 +117,9 @@ impl Workers {
         banks.insert(bank.clone(), Arc::clone(&notify));
         let worker = Worker {
             service: Arc::clone(&self.service),
-            llm: Arc::clone(&self.llm),
+            llm: self
+                .retries
+                .client(&self.llm, RetryPolicy::daemon(), Some(&bank)),
             bank,
             notify,
             stop: self.stop.clone(),
@@ -301,7 +312,7 @@ impl Worker {
                 Next::Wait(wait)
             }
             ExtractError::Call1 { error, failure } | ExtractError::Call2 { error, failure } => {
-                if error.is_retryable() {
+                if error.retry() != Retry::Never {
                     Next::Wait(retry_wait(*failure))
                 } else {
                     Next::Continue

@@ -358,14 +358,31 @@ fn a_transient_error_retried_within_the_call_still_translates() {
         {"reply": {"sentence": ENGLISH}},
     ]);
     let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
-    let policy = RetryPolicy {
-        attempts: 3,
-        ..RetryPolicy::default()
-    };
+    let policy = RetryPolicy::translate();
     let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), Arc::new(NoSleep));
     let head = translated(h.translate(original, &llm));
     assert_eq!(h.show(head).sentence, ENGLISH);
     assert_eq!(inner.requests().len(), 3);
+
+    // An operator waits on the answer, so neither kind of failure is
+    // retried for long: six of either is more than translate tries.
+    for fault in [
+        json!({"fail": "status", "status": 503}),
+        json!({"fail": "timeout"}),
+    ] {
+        let mut script = vec![fault.clone(); 6];
+        script.push(json!({"reply": {"sentence": ENGLISH}}));
+        let inner = Arc::new(FakeLlm::from_script(MODEL, &json!(script).to_string()).unwrap());
+        let h = Harness::new(Some("English"));
+        let original = h.memory(RUSSIAN);
+        let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), Arc::new(NoSleep));
+        let refused = h.translate(original, &llm);
+        assert!(
+            matches!(refused, Err(TranslateError::Llm(_))),
+            "{fault}: {refused:?}"
+        );
+        assert!(inner.requests().len() < 6, "{fault}");
+    }
 }
 
 // Concurrency with the bank's other writers

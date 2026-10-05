@@ -252,6 +252,8 @@ struct Serve<'a> {
     token: Option<&'a str>,
     /// More tuning TOML, after the floors.
     tuning: &'a str,
+    /// `ASPHODEL_LLM_RETRY_WAIT_MS`: every wait between attempts.
+    retry_wait_ms: Option<u64>,
 }
 
 impl<'a> Serve<'a> {
@@ -265,6 +267,7 @@ impl<'a> Serve<'a> {
             gate: None,
             token: None,
             tuning: "",
+            retry_wait_ms: None,
         }
     }
 
@@ -311,6 +314,11 @@ impl<'a> Serve<'a> {
         self
     }
 
+    fn retry_wait_ms(mut self, wait: u64) -> Self {
+        self.retry_wait_ms = Some(wait);
+        self
+    }
+
     fn command(&self) -> Command {
         let mut command = asphodel();
         command
@@ -331,6 +339,9 @@ impl<'a> Serve<'a> {
         }
         if let Some(token) = self.token {
             command.env("ASPHODEL_TOKEN", token);
+        }
+        if let Some(wait) = self.retry_wait_ms {
+            command.env("ASPHODEL_LLM_RETRY_WAIT_MS", wait.to_string());
         }
         command
     }
@@ -1189,6 +1200,75 @@ fn a_usage_limit_or_a_429_pauses_every_caller_and_counts_no_failure() {
 
         daemon.wait_extracted("main");
     }
+}
+
+#[test]
+fn sigterm_cancels_a_call_retrying_through_an_outage_and_counts_nothing() {
+    // The provider is down for longer than the test runs, and each retry
+    // waits ten minutes. `status` shows bank main's call retrying, SIGTERM
+    // wakes it and the daemon exits promptly, and the chunk is queued
+    // again with no failure counted.
+    let dir = TestDir::new();
+    let outage = vec![json!({"fail": "status", "status": 503}); 64];
+    let mut daemon = Serve::new(&dir)
+        .script(&outage)
+        .retry_wait_ms(10 * 60 * 1000)
+        .ready();
+    daemon.create_bank("main");
+    daemon.ingest_notes();
+    let status = daemon.wait_until(
+        "a call retrying",
+        |daemon| daemon.get_ok("/v1/status"),
+        |status| {
+            status["llm_retrying"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty())
+        },
+    );
+    assert_eq!(status["llm_retrying"][0]["caller"], "main", "{status}");
+    assert!(status["llm_retrying"][0]["attempts"].as_u64() >= Some(1));
+
+    daemon.sigterm();
+    let exited = daemon.wait_exit();
+    assert!(exited.success(), "{exited}\n{}", daemon.log);
+    drop(daemon);
+
+    let restarted = Serve::new(&dir).ready();
+    let chunks = restarted.chunks("main");
+    assert_eq!(chunks["failed"], json!([]), "{chunks}");
+    let queued = chunks["queued"].as_array().unwrap();
+    assert_eq!(queued.len(), 1, "{chunks}");
+    assert_eq!(queued[0]["error_count"], 0, "{chunks}");
+}
+
+#[test]
+fn a_translation_gives_up_on_an_outage_instead_of_waiting_it_out() {
+    // An operator waits on the request, so translate keeps a few attempts
+    // where extraction would retry for as long as the outage lasts: five
+    // 503s before the answer is more than it tries.
+    let dir = TestDir::new();
+    let mut steps = vec![auckland()];
+    steps.extend(vec![json!({"fail": "status", "status": 503}); 5]);
+    steps.push(json!({"reply": {"sentence": "Tim habite à Auckland."}}));
+    let mut daemon = Serve::new(&dir)
+        .tuning("[llm]\nlanguage = \"French\"\n")
+        .script(&steps)
+        .retry_wait_ms(0)
+        .ready();
+    let memory = daemon.seed_notes();
+
+    let reply = daemon.post(
+        &format!("/v1/banks/main/memories/{memory}/translate"),
+        &json!({}),
+    );
+    assert!(
+        (500..600).contains(&reply.status),
+        "{} {}",
+        reply.status,
+        reply.body
+    );
+    let shown = daemon.get_ok(&format!("/v1/banks/main/memories/{memory}"));
+    assert_eq!(shown["sentence"], SENTENCE, "{shown}");
 }
 
 // The CLI as a client. Every operator command is an HTTP client of the daemon.
