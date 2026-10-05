@@ -27,6 +27,8 @@
 //!   every memory the answer cites is current: not retracted, forgotten or
 //!   ended. Otherwise it's left out whole, heading included, until a
 //!   refresh rewrites it.
+//!   Dates for possibly stale states belong in the written answer; the
+//!   block adds no age annotations of its own.
 //! - **In context.** A fetch with a session id persists which block the
 //!   session holds and the memories it lists or cites (`session_blocks`),
 //!   and they join the session's in-context set: injection skips them, and

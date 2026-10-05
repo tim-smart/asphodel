@@ -22,12 +22,16 @@
 //!    The facets share one reranker deadline: a facet that misses it scores
 //!    on strength alone, and the refresh goes on.
 //! 3. **Fingerprint.** The selection's memory ids and sentence hashes, the
-//!    question, the plan, the filters and `max_tokens` are hashed. Unless
+//!    ids of states whose confidence is below 0.9, the question, the plan,
+//!    the filters and `max_tokens` are hashed. Crossing the confidence
+//!    threshold changes the hash, but another day below it does not. Unless
 //!    forced, a refresh whose hash matches the last completed one's stops
 //!    here, with no write call.
 //! 4. **The write.** The LLM gets the question, the facets, the selection
 //!    by handle under the facet that first found each memory, and the
-//!    stored answer as the previous one. It replies with the whole answer,
+//!    stored answer as the previous one. Possibly stale states carry their
+//!    absolute observed date in the memory's timezone; the write is asked
+//!    to include it in the prose. It replies with the whole answer,
 //!    a heading and a paragraph per section, and the handles of every
 //!    memory it rests on. A memory that left the selection isn't listed, so
 //!    the reply can't cite it, and the prompt says that what the listed

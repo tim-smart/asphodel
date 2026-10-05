@@ -14,10 +14,18 @@
 //! rewrites it, and a forget blanks the answer at once.
 //!
 //! A refresh is triggered by a write a model would care about, debounced
-//! per bank, at most every [`MIN_REFRESH_INTERVAL`] per model, and once a
-//! day besides at `mental_models.sweep_time` bank-local ([`schedule`]). It
-//! never runs inside a request. Nothing here ever writes an access, embeds
-//! an answer or ingests one.
+//! per bank, ordinarily at most every [`MIN_REFRESH_INTERVAL`] per model,
+//! and once a day besides at `mental_models.sweep_time` bank-local
+//! ([`schedule`]). Corrections to cited memories and forget request urgent
+//! repairs that bypass the interval after success, not debounce, failure
+//! retry waits or LLM holds. Requests survive a restart and a refresh cannot
+//! clear one made while it ran. It never runs inside a prompt block fetch.
+//! Nothing here ever writes an access, embeds an answer or ingests one.
+//!
+//! Possibly stale states are supplied to the write with absolute observed
+//! dates for the prose to carry. Rendering adds no age annotations and
+//! cuts an answer only at a sentence end to fit the shared block budget
+//! ([`crate::system_prompt`]); even a cut answer cites its whole set.
 
 mod answer;
 mod refresh;

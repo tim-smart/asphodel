@@ -47,7 +47,7 @@ pub struct Report {
     pub refresh_calls_per_day: Vec<DayCount>,
     pub injected_tokens: InjectedTokens,
     pub injection_usage: InjectionUsage,
-    /// The tokens the mental models' entries hold, sampled daily.
+    /// The tokens the mental models' answers hold, sampled daily.
     pub profile_tokens: Percentiles,
     pub call2_rate: Call2Rate,
     pub agenda_lines_per_day: Vec<DayCount>,

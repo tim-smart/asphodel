@@ -308,3 +308,28 @@ one re-record of live refresh calls, which needs its own authorization.
 `--refresh recorded` now reuses a recorded answer only when every memory
 it cites is in the run's input, and otherwise skips the write. `--refresh
 off` skips every write rather than answering it with an empty reply.
+
+## Schema version 16: urgent citation repair
+
+The migration adds `mental_models.refresh_urgent`, initially false.
+Corrections to cited memories and forget now request urgent repairs that
+bypass the 30-minute interval after a successful refresh. Debounce, LLM
+holds and retry delays after a failed refresh still apply. The flag is
+stored, so an urgent request survives a restart. No action is needed.
+
+## Write template version 3: dates for possibly stale states
+
+Schema version 15 introduced `write_model` v2 and the one-answer reply
+shape. The current template is v3, with the same shape. A state whose
+confidence is below 0.9 is now shown to the write with its absolute
+observed date in the memory's timezone, and the write is asked to include
+that date in its prose. The block no longer adds age annotations itself.
+Crossing that threshold changes the refresh fingerprint; another day
+below it does not. Existing answers stay as stored until a refresh
+rewrites them.
+
+Replay substitutions require the current template version, so neither
+v1 nor v2 writes stand in for v3. To carry recorded answers over in
+`fast --refresh recorded`, use recordings made with v3 and this run's LLM
+model, with every cited memory present in the new input. Re-recording
+private history still requires authorization under the evaluation policy.
