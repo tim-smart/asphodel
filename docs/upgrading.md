@@ -324,6 +324,38 @@ The migration adds an empty `pending_credits` table. Only
 the deletion fingerprint are unchanged and purge doesn't pause. No action is
 needed.
 
+## Schema version 18: the profile question asks for personal dates
+
+The seeded profile's question ended "Not upcoming events, tasks or
+routines.", which the write read as leaving out birthdays and anniversaries
+too. It now asks for the important people with their birthdays and
+anniversaries and leaves out one-off events, tasks and routines. The
+migration rewords every model still asking the earlier question, so a
+seeded profile keeps its built-in plan and makes no `plan_model` call. A
+question the owner changed is left alone. No table changes and no action
+is needed. The changed question changes the refresh fingerprint, so each
+seeded profile writes again at its next refresh.
+
+## Write template version 4: significance and a durability rule
+
+Each memory in the write's input now carries its significance: the owner's
+setting over the extracted level, or `kept`. The write is asked to keep
+the more significant memories when the budget is tight. For the seeded
+profile ("User profile") it's also asked to keep only what will still be
+true in months, to leave out quoted messages, orders, bookings and one-off
+purchase or trip details, to put personal dates with the person they're
+about, and to say how each person is related to the user. Other models
+get the significance guidance only. A memory's significance is part of
+the refresh fingerprint, so every model writes again at its next refresh,
+and a significance change to a selected memory makes the next refresh
+write rather than skip.
+
+Replay substitutions require the current template version, so v3 writes
+don't stand in for v4, and the seeded profile's question changed as well.
+`fast --refresh recorded` finds nothing to substitute until refreshes are
+recorded again under v4. Re-recording private history follows the
+evaluation policy.
+
 ## Write template version 3: dates for possibly stale states
 
 Schema version 15 introduced `write_model` v2 and the one-answer reply

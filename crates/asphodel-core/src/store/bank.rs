@@ -10,7 +10,7 @@
 //! on the next Hermes start.
 
 use jiff::tz::TimeZone;
-use rusqlite::{OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,16 +19,24 @@ use super::{Store, StoreError, micros, nfc};
 /// The timezone a bank gets when none was given at creation.
 pub const DEFAULT_TIMEZONE: &str = "UTC";
 
-/// The seeded profile's question.
+/// The seeded profile's question. It leaves out one-off events, not dates
+/// about people: the write reads it, and a birthday or anniversary belongs
+/// in a profile.
 pub const PROFILE_NAME: &str = "User profile";
-pub const PROFILE_QUESTION: &str = "Who is the user: their preferences, important people, work and home, \
-     the platforms they use, and how they like to be helped. Not upcoming events, tasks or routines.";
+pub const PROFILE_QUESTION: &str = "Who is the user: their preferences, important people and their \
+     birthdays and anniversaries, work and home, the platforms they use, and how they like to be \
+     helped. Not one-off events, tasks or routines.";
+
+/// The profile question banks were seeded with before schema version 18,
+/// which rewords it to [`PROFILE_QUESTION`] wherever it's still stored.
+const EARLIER_PROFILE_QUESTION: &str = "Who is the user: their preferences, important people, \
+     work and home, the platforms they use, and how they like to be helped. Not upcoming events, \
+     tasks or routines.";
 
 /// The seeded question's plan, built in: one facet per part of it, each a
 /// heading and the query its retrieval runs. A model asking exactly
 /// [`PROFILE_QUESTION`] uses it and makes no plan call, so it replays
-/// exactly. No query repeats the question's "not upcoming events", so a
-/// personal date such as an anniversary is still asked for under People.
+/// exactly. Personal dates such as anniversaries are asked for under People.
 pub const PROFILE_FACETS: &[(&str, &str)] = &[
     (
         "Preferences",
@@ -473,6 +481,18 @@ pub(crate) fn log_memory_edit(
             details,
             micros(store.now()),
         ),
+    )?;
+    Ok(())
+}
+
+/// Schema 18's conversion: a model still asking the profile question it
+/// was seeded with asks the reworded one, and so keeps the built-in plan.
+/// A question the owner changed is left alone. Does nothing once no model
+/// asks the earlier question.
+pub(crate) fn reword_profile_question(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE mental_models SET question = ?1 WHERE question = ?2",
+        (PROFILE_QUESTION, EARLIER_PROFILE_QUESTION),
     )?;
     Ok(())
 }

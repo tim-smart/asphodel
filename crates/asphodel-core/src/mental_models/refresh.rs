@@ -21,18 +21,20 @@
 //!    that still qualifies, best first, up to `input_budget_with_cited`.
 //!    The facets share one reranker deadline: a facet that misses it scores
 //!    on strength alone, and the refresh goes on.
-//! 3. **Fingerprint.** The selection's memory ids and sentence hashes, the
-//!    ids of states whose confidence is below 0.9, the question, the plan,
-//!    the filters and `max_tokens` are hashed. Crossing the confidence
-//!    threshold changes the hash, but another day below it does not. Unless
-//!    forced, a refresh whose hash matches the last completed one's stops
-//!    here, with no write call.
+//! 3. **Fingerprint.** The selection's memory ids, sentence hashes and
+//!    significance levels, the ids of states whose confidence is below 0.9,
+//!    the question, the plan, the filters and `max_tokens` are hashed.
+//!    Crossing the confidence threshold changes the hash, but another day
+//!    below it does not. Unless forced, a refresh whose hash matches the
+//!    last completed one's stops here, with no write call.
 //! 4. **The write.** The LLM gets the question, the facets, the selection
-//!    by handle under the facet that first found each memory, and the
-//!    stored answer as the previous one. Possibly stale states carry their
-//!    absolute observed date in the memory's timezone; the write is asked
-//!    to include it in the prose. It replies with the whole answer,
-//!    a heading and a paragraph per section, and the handles of every
+//!    by handle and significance under the facet that first found each
+//!    memory, and the stored answer as the previous one. It's asked to
+//!    prefer the more significant memories when the budget is tight, and,
+//!    for the seeded profile, to keep only what will still hold in months.
+//!    Possibly stale states carry their absolute observed date in the
+//!    memory's timezone; the write is asked to include it in the prose. It
+//!    replies with the whole answer, a heading and a paragraph per section, and the handles of every
 //!    memory it rests on. A memory that left the selection isn't listed, so
 //!    the reply can't cite it, and the prompt says that what the listed
 //!    memories no longer support goes. With nothing selected there's
@@ -179,6 +181,7 @@ fn select(
                     .get(*facet)
                     .map(|facet| facet.heading.clone())
                     .unwrap_or_default(),
+                significance: item.candidate.significance.clone(),
             })
             .collect(),
         previous,
@@ -277,9 +280,9 @@ fn write_sentence(candidate: &Candidate) -> String {
     }
 }
 
-/// Hash the selection's ids, sentence hashes and stale-state ids in id order,
-/// with the question, plan, filters and token budget. Score changes alone
-/// do not count.
+/// Hash the selection's ids, sentence hashes, significance levels and
+/// stale-state ids in id order, with the question, plan, filters and token
+/// budget. Score changes alone do not count.
 fn fingerprint(model: &ModelRow, facets: &[Facet], selected: &[Selected]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!(
@@ -293,18 +296,19 @@ fn fingerprint(model: &ModelRow, facets: &[Facet], selected: &[Selected]) -> Str
     for facet in facets {
         hasher.update(format!("facet:{}\t{}\n", facet.heading, facet.query));
     }
-    let mut memories: Vec<(Uuid, String)> = selected
+    let mut memories: Vec<(Uuid, String, &str)> = selected
         .iter()
         .map(|item| {
             (
                 item.candidate.uuid,
                 format!("{:x}", Sha256::digest(item.candidate.content.as_bytes())),
+                item.candidate.significance.as_str(),
             )
         })
         .collect();
     memories.sort();
-    for (uuid, sentence) in memories {
-        hasher.update(format!("memory:{uuid}:{sentence}\n"));
+    for (uuid, sentence, significance) in memories {
+        hasher.update(format!("memory:{uuid}:{sentence}:{significance}\n"));
     }
     // Only threshold crossings count, not another day of staleness.
     let mut stale: Vec<Uuid> = selected
@@ -403,7 +407,10 @@ pub(crate) fn refresh(
         store(cx, model, &selection, None, started)?;
         return Ok(Outcome::Applied(Applied::default()));
     }
-    let request = write_request(&selection.input);
+    let request = write_request(
+        &selection.input,
+        model.name == crate::store::bank::PROFILE_NAME,
+    );
     let identities: Vec<(String, Uuid)> = selection
         .input
         .memories
@@ -646,14 +653,29 @@ When a memory is marked with an observed date and may be stale, write its fact w
 date (for example, 'as of 1 Sep'), not as an unqualified current fact or a relative age. \
 {language_rule}
 
+Each memory is listed with its significance: trivial, minor, notable, major or critical, or kept \
+when the user asked for it to be remembered. When the budget is tight, keep the more significant \
+memories and leave out the less significant ones.
+{profile_rule}
 The previous answer is there to keep the wording steady. Restate what the memories listed still \
 support, reword what they change, and leave out what they no longer support or what no longer \
 answers the question: anything you leave out is gone. Cite by handle every memory the answer rests \
 on, as one list for the whole answer, and only the handles listed (m1, m2, ...). Keep the whole \
 answer, headings included, within the token budget, about four characters to a token.";
 
-/// The write's system prompt, with the language rule for `language`.
-fn write_system(language: Option<&str>) -> String {
+/// The seeded profile's durability rule. Other models keep whatever time
+/// scale their question asks about, such as upcoming trips.
+const PROFILE_RULE: &str = "
+This answer is the user's profile: it holds what will still be true about them in months. A \
+quoted or forwarded message, an order, a booking, or the details of a one-off purchase or trip is \
+not profile material, even when a heading seems to fit it. Recurring personal dates, such as \
+birthdays and anniversaries, belong with the people they are about. Say how each person is related \
+to the user when the memories say so.
+";
+
+/// The write's system prompt, with the language rule for `language`, and
+/// the durability rule when it writes the seeded profile.
+fn write_system(language: Option<&str>, profile: bool) -> String {
     let rule = match language {
         None => "Write in the language of the memories you cite.".to_owned(),
         Some(language) => format!(
@@ -661,12 +683,15 @@ fn write_system(language: Option<&str>) -> String {
             language.trim()
         ),
     };
-    WRITE_SYSTEM.replace("{language_rule}", &rule)
+    WRITE_SYSTEM
+        .replace("{language_rule}", &rule)
+        .replace("{profile_rule}", if profile { PROFILE_RULE } else { "" })
 }
 
 /// The write request. Its first line is the question, which recorded-
-/// refresh carry-over in replay matches records on.
-fn write_request(input: &RefreshInput) -> LlmRequest {
+/// refresh carry-over in replay matches records on. `profile` is whether
+/// it writes the seeded profile.
+fn write_request(input: &RefreshInput, profile: bool) -> LlmRequest {
     let mut user = format!(
         "Question: {}\nToken budget: {}\n\nSections:\n",
         input.question, input.max_tokens
@@ -691,7 +716,10 @@ fn write_request(input: &RefreshInput) -> LlmRequest {
         user.push_str(&format!("### {}\n", facet.heading));
         let mut any = false;
         for memory in input.memories.iter().filter(|m| m.facet == facet.heading) {
-            user.push_str(&format!("{}: {}\n", memory.handle, memory.sentence));
+            user.push_str(&format!(
+                "{} ({}): {}\n",
+                memory.handle, memory.significance, memory.sentence
+            ));
             any = true;
         }
         if !any {
@@ -704,7 +732,7 @@ fn write_request(input: &RefreshInput) -> LlmRequest {
             version: WRITE_VERSION,
             guidance: None,
         },
-        system: write_system(input.language.as_deref()),
+        system: write_system(input.language.as_deref(), profile),
         user,
         schema_name: "mental_model_answer".into(),
         schema: write_schema(),
