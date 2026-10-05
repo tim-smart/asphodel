@@ -629,7 +629,7 @@ fn a_chunk_in_flight_when_its_document_is_removed_leaves_no_memory_behind() {
     let v1 = h.doc(NOTES, NOTES_V1);
     let lease = h.service.claim_chunk(BANK).unwrap().expect("queued");
     assert_eq!(lease.source, v1.source);
-    let prepared = h.service.prepare_extraction(lease, &states(TEA), &[], &[]);
+    let prepared = h.service.prepare_extraction(lease, &states(TEA), &[]);
 
     let removed = h.remove(NOTES);
     assert_eq!(removed.sources, [v1.source]);

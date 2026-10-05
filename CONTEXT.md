@@ -125,7 +125,7 @@ An event that counts towards strength: a memory being created, used, mentioned a
 _Avoid_: Hit, retrieval, view, read
 
 **Used**:
-The kind of access where a reply actually relied on a recalled memory, or on a mental model entry that cites it, as opposed to just being shown it.
+The kind of access where a reply actually relied on a recalled memory, whether it was injected or read in a mental model, as opposed to just being shown it.
 _Avoid_: Retrieved, returned, injected
 
 **Mentioned again**:

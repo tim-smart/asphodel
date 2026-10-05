@@ -772,11 +772,7 @@ impl<'a> Engine<'a> {
     /// after is the settings' constant, or, when it's taken from the recording,
     /// how long the calls that answered took.
     fn prepare_chunk(&mut self, claimed: Claimed) -> Result<Ready, Failure> {
-        let Claimed {
-            lease,
-            in_context,
-            entries,
-        } = claimed;
+        let Claimed { lease, in_context } = claimed;
         let source = lease.source;
         let position = lease.position;
         let input = self.service.call1_input(&lease, &in_context)?;
@@ -829,15 +825,13 @@ impl<'a> Engine<'a> {
                 }
                 let reply2 = self.call2_reply(&mine, call2.as_ref(), &name)?;
                 let llm = FakeLlm::scripted(MODEL, vec![reply1, reply2]);
-                let prepared =
-                    self.service
-                        .prepare_extraction(lease, &llm, &in_context, &entries)?;
+                let prepared = self.service.prepare_extraction(lease, &llm, &in_context)?;
                 self.llm_calls += llm.requests().len() as u64;
                 (prepared, self.settings.latency)
             }
             Llm::Recorded(recorder, mode) => {
                 let (prepared, served) =
-                    self.prepare_recorded(recorder, mode, lease, &in_context, &entries, &input)?;
+                    self.prepare_recorded(recorder, mode, lease, &in_context, &input)?;
                 let latency = if self.settings.latency_from_cassette {
                     SignedDuration::try_from(served).unwrap_or(SignedDuration::MAX)
                 } else {
@@ -981,7 +975,6 @@ impl<'a> Engine<'a> {
         mode: ReplayMode,
         lease: asphodel_core::queue::Lease,
         in_context: &[Uuid],
-        entries: &[asphodel_core::system_prompt::BlockEntry],
         input: &Call1Input,
     ) -> Result<(Prepared, Duration), Failure> {
         let context = ChunkContext::new(
@@ -1001,16 +994,14 @@ impl<'a> Engine<'a> {
         let result = match composed {
             Ok(Some(reply1)) => {
                 let chained = Chained::new(reply1, recorder);
-                self.service
-                    .prepare_extraction(lease, &chained, in_context, entries)
+                self.service.prepare_extraction(lease, &chained, in_context)
             }
             Ok(None) => {
                 recorder.with_counts(|counts| match mode {
                     ReplayMode::Replay => counts.verdicts.recorded += judged,
                     ReplayMode::Live | ReplayMode::Fast => counts.verdicts.live += judged,
                 });
-                self.service
-                    .prepare_extraction(lease, recorder, in_context, entries)
+                self.service.prepare_extraction(lease, recorder, in_context)
             }
             Err(error) => Err(asphodel_core::extraction::ExtractError::Held { error }),
         };

@@ -2005,7 +2005,7 @@ fn a_neighbour_purged_between_prepare_and_commit_leaves_the_claim_new() {
         let lease = head(&h, current.source, 0);
         let call1 = reply(vec![claim(content, "fact", user)], &[]);
         let llm = labelled(&h, &lease, call1, lisbon, label, &[]);
-        let prepared = h.service.prepare_extraction(lease, &llm, &[], &[]).unwrap();
+        let prepared = h.service.prepare_extraction(lease, &llm, &[]).unwrap();
 
         // Years later, Lisbon has faded past the purge line.
         h.advance(24 * 365 * 3);

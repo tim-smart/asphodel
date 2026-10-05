@@ -426,6 +426,76 @@ fn fast_tops_up_unjudged_pairs_once_per_chunk_and_records_them() {
     );
 }
 
+/// A recorded call 1 reply naming a handle its record doesn't list, as one
+/// naming a mental model entry (`n1`) could before call 1 credited `used`
+/// by memory alone, may have relied on any listed memory through it. In
+/// `fast` its claims are still reused and the memories it names are still
+/// used, but its other pairs are judged by a top-up rather than read as not
+/// used. A reply naming only listed handles leaves nothing to judge.
+#[test]
+fn fast_tops_up_the_pairs_a_reply_naming_an_unlisted_handle_leaves_open() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let script = live_script(&dir);
+    replay_history(&dir, &corpus, "live", PASSING_PROBES, Some(&script), &[]).ok();
+    let report = replay_history(&dir, &corpus, "fast", PASSING_PROBES, None, &[]).ok();
+    assert_eq!(report["llm"]["top_up"], 0, "{report}");
+
+    // The first reply with memories in context also names its first one.
+    let mut records = cassette_records(&dir);
+    let mut named = None;
+    let mut open = BTreeSet::new();
+    for record in records.iter_mut().filter(|record| is_call1(record)) {
+        let shown: Vec<Value> = record["in_context"].as_array().unwrap().clone();
+        if shown.is_empty() {
+            continue;
+        }
+        let mut used = vec![json!("n1")];
+        if named.is_none() {
+            used.push(shown[0]["handle"].clone());
+            named = Some((record["chunk"].clone(), shown[0]["sentence"].clone()));
+        }
+        if shown.len() >= used.len() {
+            open.insert(record["chunk"].to_string());
+        }
+        record["response"]["json"]["used_injected_ids"] = json!(used);
+    }
+    let (named_chunk, named_sentence) = named.expect("a later turn has the home memory in context");
+    assert!(!open.is_empty(), "some reply leaves a memory unnamed");
+    write_cassette(&dir, &records);
+
+    let judge = support::script(&dir, "judge-script", json!({ "used": [] }));
+    let report = replay_history(&dir, &corpus, "fast", PASSING_PROBES, Some(&judge), &[]).ok();
+    let top_ups: Vec<Value> = cassette_records(&dir)
+        .into_iter()
+        .filter(|record| record["template"]["name"] == "judge_used")
+        .collect();
+    let judged: BTreeSet<String> = top_ups
+        .iter()
+        .map(|record| record["chunk"].to_string())
+        .collect();
+    assert_eq!(judged, open, "{report}");
+    assert_eq!(
+        report["llm"]["live"], report["llm"]["top_up"],
+        "only top-ups call the LLM; claims are reused: {report}"
+    );
+    for record in top_ups
+        .iter()
+        .filter(|record| record["chunk"] == named_chunk)
+    {
+        let sentences: Vec<&Value> = record["in_context"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|memory| &memory["sentence"])
+            .collect();
+        assert!(
+            !sentences.contains(&&named_sentence),
+            "the memory the reply named was judged again: {record}"
+        );
+    }
+}
+
 /// The `[extraction] guidance` the guided runs use.
 const GUIDANCE: &str = "Skip routine checks.";
 

@@ -2138,17 +2138,41 @@ fn undo_latest_migration() -> String {
         "the newest migration file, {}, is the latest registered one",
         path.display()
     );
-    let sql = fs::read_to_string(path).unwrap();
+    let statements = |path: &Path| -> Vec<String> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    // A dropped table comes back as the earlier migration that made it
+    // created it.
+    let created = |table: &str| -> String {
+        files
+            .iter()
+            .filter(|(earlier, _)| earlier < version)
+            .flat_map(|(_, path)| statements(path))
+            .find(|statement| {
+                let words: Vec<&str> = statement.split_whitespace().collect();
+                words.len() > 5
+                    && words[..5]
+                        .iter()
+                        .map(|word| word.to_uppercase())
+                        .eq(["CREATE", "TABLE", "IF", "NOT", "EXISTS"])
+                    && words[5].trim_end_matches('(') == table
+            })
+            .map(|statement| format!("{statement};"))
+            .unwrap_or_else(|| panic!("no earlier migration creates {table}"))
+    };
     let mut undo = Vec::new();
-    for statement in sql
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("--"))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-    {
+    for statement in statements(path) {
+        let statement = statement.as_str();
         let words: Vec<&str> = statement.split_whitespace().collect();
         let upper: Vec<String> = words.iter().map(|word| word.to_uppercase()).collect();
         let name = |at: usize| {
@@ -2172,11 +2196,21 @@ fn undo_latest_migration() -> String {
             ["ALTER", "TABLE", ..] if upper.get(3..5) == Some(&["ADD".into(), "COLUMN".into()]) => {
                 undo.push(format!("ALTER TABLE {} DROP COLUMN {};", name(2), name(5)))
             }
+            ["DROP", "TABLE", "IF"] if upper.get(3) == Some(&"EXISTS".into()) => {
+                undo.push(created(words[4]))
+            }
             _ => panic!(
-                "{} does more than create tables and indexes; extend this downgrade for it",
+                "{} does more than create or drop tables and indexes; extend this downgrade for it",
                 path.display()
             ),
         }
+    }
+    // The runner drops these columns itself (`DROPPED_COLUMNS`), so the SQL
+    // doesn't show them.
+    if *version == 14 {
+        undo.push(
+            "ALTER TABLE prompt_blocks ADD COLUMN entries TEXT NOT NULL DEFAULT '[]';".into(),
+        );
     }
     assert!(!undo.is_empty(), "{} creates nothing", path.display());
     undo.join("\n")

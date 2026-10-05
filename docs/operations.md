@@ -558,6 +558,12 @@ still trims entries to fit; the profile is not guaranteed its full cap
 when the agenda or other models use the budget. An entry written before
 sections renders as a line until its model's next refresh.
 
+The memories the block's sentences cite join the session's in-context set.
+Extraction shows call 1 each of them by its own handle, with its content,
+so a reply that relied on something the agent read in the block is `used`
+on the memory that says it. Call 1 isn't shown the block's text, and
+nothing stores it with the turn, so forget has no copy of it to scrub.
+
 The profile cap is stored on the model row when the bank is created.
 Changing the default or tuning alone does not resize an existing profile.
 See `docs/upgrading.md`, "Existing banks: opt in to larger summaries", for

@@ -21,7 +21,7 @@ use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
 
 /// The schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// How long a pre-migration copy is kept after its migration completes.
 pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
@@ -54,6 +54,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("../../migrations/0012_document_removal.sql"),
     ),
     (13, include_str!("../../migrations/0013_model_plans.sql")),
+    (
+        14,
+        include_str!("../../migrations/0014_no_entry_snapshots.sql"),
+    ),
 ];
 
 /// The columns a migration adds, by version. Every migration is safe to run
@@ -66,6 +70,11 @@ const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (13, "mental_models", "plan"),
     (13, "mental_model_entries", "section"),
 ];
+
+/// The columns a migration drops, by version, after its SQL runs. SQLite
+/// has no `DROP COLUMN IF EXISTS` either, so each is dropped only while
+/// it's there.
+const DROPPED_COLUMNS: &[(u32, &str, &str)] = &[(14, "prompt_blocks", "entries")];
 
 /// What one open applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +188,14 @@ pub fn apply(
         }
         if !added {
             tx.execute_batch(sql)?;
+        }
+        for (_, table, column) in DROPPED_COLUMNS
+            .iter()
+            .filter(|(version, ..)| *version == to)
+        {
+            if has_column(&tx, table, column)? {
+                tx.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))?;
+            }
         }
         current = to;
     }

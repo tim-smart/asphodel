@@ -33,11 +33,12 @@
 //!   again, so the mapping lives in the store and expires after
 //!   `sessions.mapping_expiry_days` without a turn.
 //! - **The fallback.** Every built block is kept by id (`prompt_blocks`),
-//!   with what it lists and cites and its rendered entries. A plugin that
-//!   got a block without a session id sends the id with its first prefetch,
-//!   and the session is mapped to that block then, even if the cache has
-//!   rebuilt since. The block's entries are also what a turn's snapshot
-//!   takes, so call 1 is shown the entries the session could see.
+//!   with what it lists and cites. A plugin that got a block without a
+//!   session id sends the id with its first prefetch, and the session is
+//!   mapped to that block then, even if the cache has rebuilt since. The
+//!   rendered text isn't kept: call 1 is shown each memory the block cites
+//!   by its own handle, and a reply that relied on a fact read in the block
+//!   is credited to that memory.
 //! - **The agenda update.** Hermes rebuilds the prompt only on compaction,
 //!   so a long-lived session's agenda goes stale. Prefetch, which runs every
 //!   turn, puts an `Agenda update for <date>` section ahead of relevance
@@ -91,16 +92,6 @@ impl Block {
         }
         ids
     }
-}
-
-/// A rendered entry as the block held it, with the memories it cites. It's
-/// what call 1 is shown, by handle, for a turn in a session holding the
-/// block.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlockEntry {
-    pub entry: Uuid,
-    pub text: String,
-    pub cites: Vec<Uuid>,
 }
 
 /// Each bank's block, with the local date it was built for. Each clear
@@ -248,7 +239,6 @@ pub(crate) fn build(
     // stored order until the next one doesn't fit. Only what's rendered is
     // recorded as cited, and so put in a session's context.
     let mut cited: Vec<Uuid> = Vec::new();
-    let mut entries: Vec<BlockEntry> = Vec::new();
     for model in load_models(&conn, bank_id)?
         .into_iter()
         .filter(|model| model.enabled)
@@ -271,11 +261,6 @@ pub(crate) fn build(
                     cited.push(*uuid);
                 }
             }
-            entries.push(BlockEntry {
-                entry: entry.uuid,
-                text: entry.text.clone(),
-                cites: entry.cites.iter().map(|(_, uuid)| *uuid).collect(),
-            });
         }
         // An empty model renders nothing, not even a header.
         if !pieces.is_empty() {
@@ -291,16 +276,14 @@ pub(crate) fn build(
         agenda: shown.listed(&agenda.agenda),
         cited,
     };
-    // Kept by id, for the plugin that sends it with its first prefetch and
-    // for the entries a turn's snapshot takes.
+    // Kept by id, for the plugin that sends it with its first prefetch.
     conn.execute(
-        "INSERT INTO prompt_blocks (uuid, bank_id, in_context, entries, built_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO prompt_blocks (uuid, bank_id, in_context, built_at)
+         VALUES (?1, ?2, ?3, ?4)",
         (
             block.id.to_string(),
             bank_id,
             serde_json::to_string(&block.in_context()).unwrap_or_else(|_| "[]".into()),
-            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into()),
             micros(now),
         ),
     )?;
@@ -735,32 +718,6 @@ pub(crate) fn map_held_block(
         (bank_id, session, block.to_string(), micros(now)),
     )?;
     Ok(mapped > 0)
-}
-
-/// The entries of the block the session holds, for the turn's snapshot.
-/// Empty when the session has no live mapping or its block is gone.
-pub(crate) fn mapped_entries(
-    conn: &Connection,
-    bank_id: i64,
-    session: &str,
-    now: Timestamp,
-    expiry: SignedDuration,
-) -> Result<Vec<BlockEntry>, rusqlite::Error> {
-    let found: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT b.entries, s.last_turn_at FROM session_blocks s
-             JOIN prompt_blocks b ON b.uuid = s.block_id AND b.bank_id = s.bank_id
-             WHERE s.bank_id = ?1 AND s.session_id = ?2",
-            (bank_id, session),
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    match found {
-        Some((entries, last_turn_at)) if !expired(timestamp(last_turn_at), now, expiry) => {
-            Ok(serde_json::from_str(&entries).unwrap_or_default())
-        }
-        _ => Ok(Vec::new()),
-    }
 }
 
 /// A turn arrived in the session: its mapping's expiry starts over.

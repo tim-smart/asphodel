@@ -51,7 +51,7 @@ use crate::sessions::Sessions;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
 use crate::sweep::{PurgeError, PurgePlan, SweepSchedule, Sweeps};
-use crate::system_prompt::{Block, BlockEntry, Blocks};
+use crate::system_prompt::{Block, Blocks};
 use crate::translate::{Found, TranslateError, Translation};
 
 /// One running store: the daemon's banks, models, extraction queue and jobs,
@@ -104,12 +104,11 @@ pub struct Service {
 
 /// A chunk claimed by [`Service::next_extraction`], with what call 1 is
 /// shown besides its text: the session's in-context set as the turn stored
-/// it, and the block entries it held.
+/// it.
 #[derive(Debug)]
 pub struct Claimed {
     pub lease: Lease,
     pub in_context: Vec<Uuid>,
-    pub entries: Vec<BlockEntry>,
 }
 
 /// What [`Service`] keeps in memory about re-embeds.
@@ -362,21 +361,9 @@ impl Service {
             let conn = self.store.connection();
             crate::ingest::find_bank(&conn, bank)?.map(|(bank_id, _)| bank_id)
         };
-        let entries = match bank_id {
-            Some(bank_id) => {
-                self.restore_block(bank_id, &turn.session_id)?;
-                let conn = self.store.connection();
-                crate::system_prompt::mapped_entries(
-                    &conn,
-                    bank_id,
-                    &turn.session_id,
-                    self.now(),
-                    self.mapping_expiry(),
-                )
-                .map_err(StoreError::Sqlite)?
-            }
-            None => Vec::new(),
-        };
+        if let Some(bank_id) = bank_id {
+            self.restore_block(bank_id, &turn.session_id)?;
+        }
         let in_context = bank_id.map_or_else(Vec::new, |bank_id| {
             self.sessions.after_turn(
                 bank_id,
@@ -385,7 +372,7 @@ impl Service {
                 self.now(),
             )
         });
-        let ingested = crate::ingest::ingest_turn(&self.store, bank, turn, &in_context, &entries)?;
+        let ingested = crate::ingest::ingest_turn(&self.store, bank, turn, &in_context)?;
         if ingested.outcome == Outcome::Duplicate {
             return Ok(ingested);
         }
@@ -484,18 +471,6 @@ impl Service {
         llm: &dyn LlmClient,
         in_context: &[Uuid],
     ) -> Result<Extracted, ExtractError> {
-        self.extract_with_entries(lease, llm, in_context, &[])
-    }
-
-    /// [`Service::extract_chunk`] with the entries of the block the turn's
-    /// session held, which call 1 is shown with the memories they cite.
-    fn extract_with_entries(
-        &self,
-        lease: Lease,
-        llm: &dyn LlmClient,
-        in_context: &[Uuid],
-        entries: &[BlockEntry],
-    ) -> Result<Extracted, ExtractError> {
         let models = self.models.as_ref().ok_or(ExtractError::NoModels)?;
         let bank_id = lease.bank_id();
         let watermark = {
@@ -510,7 +485,6 @@ impl Service {
             lease,
             llm,
             in_context,
-            entries,
         )?;
         self.after_writes(bank_id, watermark, &extracted.memories)?;
         Ok(extracted)
@@ -640,72 +614,55 @@ impl Service {
         bank: &str,
         llm: &dyn LlmClient,
     ) -> Result<Option<Extracted>, ExtractError> {
-        let Some(Claimed {
-            lease,
-            in_context,
-            entries,
-        }) = self.next_extraction(bank)?
-        else {
+        let Some(Claimed { lease, in_context }) = self.next_extraction(bank)? else {
             return Ok(None);
         };
-        self.extract_leased(lease, llm, &in_context, &entries)
-            .map(Some)
+        self.extract_chunk(lease, llm, &in_context).map(Some)
     }
 
     /// The first half of [`Service::extract_next`]: claims the head of
-    /// `bank`'s queue and reads the in-context set and block entries stored
-    /// with it. The replay harness takes the lease from here so it can
-    /// script the LLM's replies against what call 1 and call 2 are shown,
-    /// then finishes with [`Service::extract_leased`].
+    /// `bank`'s queue and reads the in-context set stored with it. The
+    /// replay harness takes the lease from here so it can script the LLM's
+    /// replies against what call 1 and call 2 are shown, then finishes with
+    /// [`Service::extract_chunk`].
     pub fn next_extraction(&self, bank: &str) -> Result<Option<Claimed>, ExtractError> {
         let Some(lease) = self.claim_chunk(bank)? else {
             return Ok(None);
         };
-        let (in_context, entries) = match lease.source_kind {
-            SourceKind::Document => (Vec::new(), Vec::new()),
+        let in_context = match lease.source_kind {
+            SourceKind::Document => Vec::new(),
             SourceKind::Turn => {
-                let stored: Option<(String, Option<String>)> = {
+                let stored: Option<String> = {
                     let conn = self.store.connection();
                     conn.query_row(
-                        "SELECT t.memories, e.entries FROM turn_in_context t
+                        "SELECT t.memories FROM turn_in_context t
                          JOIN sources s ON s.id = t.source_id
-                         LEFT JOIN turn_entries e ON e.source_id = t.source_id
                          WHERE s.uuid = ?1",
                         [lease.source.to_string()],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
+                        |row| row.get(0),
                     )
                     .optional()
                     .map_err(StoreError::Sqlite)?
                 };
                 // No row is an empty set, including for a turn ingested
-                // before version 5: the session can't stand in for it. No
-                // entries is none, including for a turn before version 6.
+                // before version 5: the session can't stand in for it.
                 match stored {
-                    Some((memories, entries)) => (
-                        serde_json::from_str(&memories).unwrap_or_else(|error| {
-                            tracing::warn!(
-                                source = %lease.source,
-                                %error,
-                                "a turn's stored in-context set doesn't parse; extracting without it"
-                            );
-                            Vec::new()
-                        }),
-                        entries
-                            .and_then(|entries| serde_json::from_str(&entries).ok())
-                            .unwrap_or_default(),
-                    ),
-                    None => (Vec::new(), Vec::new()),
+                    Some(memories) => serde_json::from_str(&memories).unwrap_or_else(|error| {
+                        tracing::warn!(
+                            source = %lease.source,
+                            %error,
+                            "a turn's stored in-context set doesn't parse; extracting without it"
+                        );
+                        Vec::new()
+                    }),
+                    None => Vec::new(),
                 }
             }
         };
-        Ok(Some(Claimed {
-            lease,
-            in_context,
-            entries,
-        }))
+        Ok(Some(Claimed { lease, in_context }))
     }
 
-    /// The first half of [`Service::extract_leased`]: runs the LLM calls
+    /// The first half of [`Service::extract_chunk`]: runs the LLM calls
     /// and plans the chunk, holding its lease, without writing anything.
     /// Replay runs it when the worker claims the chunk and
     /// [`Service::commit_extraction`] a latency later.
@@ -714,7 +671,6 @@ impl Service {
         lease: Lease,
         llm: &dyn LlmClient,
         in_context: &[Uuid],
-        entries: &[BlockEntry],
     ) -> Result<crate::extraction::Prepared, ExtractError> {
         let models = self.models.as_ref().ok_or(ExtractError::NoModels)?;
         let bank_id = lease.bank_id();
@@ -726,7 +682,6 @@ impl Service {
             lease,
             llm,
             in_context,
-            entries,
         )
     }
 
@@ -740,7 +695,7 @@ impl Service {
         crate::extraction::call2_lists(&self.store, prepared)
     }
 
-    /// The second half of [`Service::extract_leased`]: commits a prepared
+    /// The second half of [`Service::extract_chunk`]: commits a prepared
     /// chunk, then runs what follows writes. It waits for every chunk of
     /// the bank handed out before this one to commit or fail first. A chunk
     /// that another commit made stale since its search
@@ -794,19 +749,6 @@ impl Service {
         llm: &dyn LlmClient,
     ) -> Result<crate::extraction::Prepared, ExtractError> {
         crate::extraction::redo(&self.store, &self.leases, llm, prepared)
-    }
-
-    /// The second half of [`Service::extract_next`]: extracts a chunk
-    /// claimed by [`Service::next_extraction`] with the in-context set and
-    /// entries it returned.
-    pub fn extract_leased(
-        &self,
-        lease: Lease,
-        llm: &dyn LlmClient,
-        in_context: &[Uuid],
-        entries: &[BlockEntry],
-    ) -> Result<Extracted, ExtractError> {
-        self.extract_with_entries(lease, llm, in_context, entries)
     }
 
     /// The names of every bank in the store, so the daemon can start a

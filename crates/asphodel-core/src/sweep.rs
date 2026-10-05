@@ -484,7 +484,6 @@ fn sweep_sources(
             (source, now),
         )?;
         tx.execute("DELETE FROM turn_in_context WHERE source_id = ?1", [source])?;
-        tx.execute("DELETE FROM turn_entries WHERE source_id = ?1", [source])?;
     }
 
     tx.execute(

@@ -30,6 +30,7 @@ use std::time::Duration;
 use asphodel_core::agenda::Agenda;
 use asphodel_core::config::{AgendaTuning, ConfigError, MentalModelsTuning};
 use asphodel_core::constants::Significance;
+use asphodel_core::extraction::{Call1Input, Extracted};
 use asphodel_core::ingest::Turn;
 use asphodel_core::inspect::{BankOverview, MemoryView};
 use asphodel_core::mental_models::{
@@ -2571,38 +2572,154 @@ fn a_refresh_whose_retrieval_fails_waits_thirty_minutes_like_any_failure() {
     assert_eq!(profile.last_refreshed_at, Some(failed_at + minutes(30)));
 }
 
-// Call 1 sees the entries a session's block holds, with handles `n1`,
-// `n2`, ... of their own; naming one in `used_injected_ids` credits each
-// memory it cites. They're snapshotted with the turn when it's ingested.
+// `used` is credited by memory handle alone (docs/mental-model-answer.md,
+// section 5): call 1 is given every memory the session's block cites as an
+// in-context memory with its own handle, so a reply that relied on a fact
+// the agent read in the block is credited to that memory. The block's
+// rendered text gets no handles of its own and isn't kept with the turn.
 
-#[test]
-fn a_reply_relying_on_an_entry_its_turn_held_is_credited_on_every_memory_it_cites() {
-    // Session `s1` holds a block whose profile entry cites `cat` and `tea`,
-    // and the owner's turn in it is queued. The worker reaches the turn
-    // later: a refresh rewording the entry in between changes neither what
-    // call 1 is shown nor what's credited.
+/// The profile sentence session `s1`'s block shows, citing `cat` and `tea`.
+const BLOCK_SENTENCE: &str = "Tim drinks green tea with his cat Miso nearby.";
+
+/// Session `s1` holds a block whose profile cites `cat` and `tea` in one
+/// sentence, and the owner's turn in it is queued.
+fn a_turn_after_the_block() -> (Harness, Uuid, Uuid) {
     let h = Harness::new();
     let cat = h.seed(fact(CAT));
     let tea = h.seed(fact(TEA));
-    let entry = "Tim drinks green tea with his cat Miso nearby.";
-    h.profile_adding(&[(entry, &[cat, tea])]);
+    h.profile_adding(&[(BLOCK_SENTENCE, &[cat, tea])]);
     h.block(Some("s1"));
     let tea_time = turn("s1", h.now() - minutes(1), "Tea time?");
     h.service.ingest_turn(BANK, &tea_time).unwrap();
+    (h, cat, tea)
+}
 
+/// Extracts the queued turn with a call 1 that says the reply relied on
+/// `relied_on`, named by the handle call 1's input gives it, and returns
+/// what was extracted, that input, and the request call 1 was sent.
+fn extract_relying_on(h: &Harness, relied_on: Uuid) -> (Extracted, Call1Input, LlmRequest) {
+    let claimed = h.service.next_extraction(BANK).unwrap().unwrap();
+    let input = h
+        .service
+        .call1_input(&claimed.lease, &claimed.in_context)
+        .unwrap();
+    let handle = input
+        .in_context
+        .iter()
+        .find(|memory| memory.memory == relied_on)
+        .unwrap_or_else(|| panic!("{relied_on} is in call 1's context"))
+        .handle
+        .clone();
+    let call1 = json!({"claims": [], "used_injected_ids": [handle]});
+    let llm = FakeLlm::scripted(MODEL, vec![call1]);
+    let extracted = h
+        .service
+        .extract_chunk(claimed.lease, &llm, &claimed.in_context)
+        .unwrap();
+    let request = llm.requests().remove(0);
+    (extracted, input, request)
+}
+
+#[test]
+fn a_reply_relying_on_a_fact_read_in_the_block_is_credited_to_that_memory_alone() {
+    // Both memories are shown, by handle; the block's sentence isn't. A
+    // refresh rewording it before the worker gets there changes nothing.
+    let (h, cat, tea) = a_turn_after_the_block();
     let asleep = "Tim only drinks tea when Miso the cat is asleep.";
     h.profile_adding(&[(asleep, &[cat, tea])]);
 
+    let (extracted, input, request) = extract_relying_on(&h, cat);
+    let shown: BTreeSet<Uuid> = input.in_context.iter().map(|m| m.memory).collect();
+    assert_eq!(shown, BTreeSet::from([cat, tea]));
+    for sentence in [BLOCK_SENTENCE, asleep] {
+        assert!(
+            !request.user.contains(sentence),
+            "call 1 was shown the block's text:\n{}",
+            request.user
+        );
+    }
+    assert_eq!(extracted.used, vec![cat]);
+    assert_eq!(h.accesses(cat, "used"), 1);
+    assert_eq!(
+        h.accesses(tea, "used"),
+        0,
+        "the memory sharing its sentence was credited"
+    );
+}
+
+#[test]
+fn a_reply_naming_a_handle_call_1_wasnt_given_credits_nothing() {
+    // `n1` was the block sentence's handle; nothing has it now.
+    let (h, cat, tea) = a_turn_after_the_block();
     let call1 = json!({"claims": [], "used_injected_ids": ["n1"]});
     let llm = FakeLlm::scripted(MODEL, vec![call1]);
     let extracted = h.service.extract_next(BANK, &llm).unwrap().unwrap();
-    let user = &llm.requests()[0].user;
-    assert!(user.contains(entry), "{user}");
-    assert!(!user.contains("asleep"), "{user}");
-    let used: BTreeSet<Uuid> = extracted.used.iter().copied().collect();
-    assert_eq!(used, BTreeSet::from([cat, tea]));
-    assert_eq!(h.accesses(cat, "used"), 1);
-    assert_eq!(h.accesses(tea, "used"), 1);
+    assert!(extracted.used.is_empty(), "{:?}", extracted.used);
+    assert_eq!(h.accesses(cat, "used"), 0);
+    assert_eq!(h.accesses(tea, "used"), 0);
+}
+
+#[test]
+fn an_upgrade_from_version_13_extracts_a_queued_turn_without_its_snapshot() {
+    // Version 13 kept the block's rendered sentences with each built block
+    // and each queued turn. Put the queued turn's snapshot back as it was
+    // left, and the store back at 13.
+    let (h, cat, tea) = a_turn_after_the_block();
+    let snapshot = json!([{
+        "entry": Uuid::from_u128(1),
+        "text": BLOCK_SENTENCE,
+        "cites": [cat, tea],
+    }]);
+    {
+        let store = h.service.store().unwrap();
+        let conn = store.connection();
+        let has_entries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('prompt_blocks') WHERE name = 'entries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if has_entries == 0 {
+            conn.execute(
+                "ALTER TABLE prompt_blocks ADD COLUMN entries TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turn_entries (
+               id        INTEGER PRIMARY KEY AUTOINCREMENT,
+               source_id INTEGER NOT NULL UNIQUE REFERENCES sources(id) ON DELETE CASCADE,
+               entries   TEXT NOT NULL
+             );
+             DELETE FROM migrations;
+             INSERT INTO migrations (from_version, to_version, binary_version, started_at,
+                                     completed_at)
+               VALUES (0, 13, 'v13', 0, 0);
+             PRAGMA user_version = 13;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO turn_entries (source_id, entries)
+             SELECT source_id, ?1 FROM turn_in_context",
+            [snapshot.to_string()],
+        )
+        .unwrap();
+    }
+    let h = h.restart();
+
+    let (extracted, _, request) = extract_relying_on(&h, cat);
+    assert!(
+        !request.user.contains(BLOCK_SENTENCE),
+        "call 1 was shown the snapshot:\n{}",
+        request.user
+    );
+    assert_eq!(extracted.used, vec![cat]);
+    assert_eq!(h.accesses(tea, "used"), 0);
+    // The block still puts what it cites in the session's context.
+    let in_context: BTreeSet<Uuid> = h.in_context("s1").into_iter().collect();
+    assert_eq!(in_context, BTreeSet::from([cat, tea]));
 }
 
 // The block-id fallback: a session that fetched its block without an id is

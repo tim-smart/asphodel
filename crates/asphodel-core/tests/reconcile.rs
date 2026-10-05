@@ -1580,7 +1580,7 @@ fn prepared(h: &Harness, replies: Vec<Value>) -> Prepared {
     let claimed = h.service.next_extraction("main").unwrap().unwrap();
     let llm = FakeLlm::scripted(MODEL, replies);
     h.service
-        .prepare_extraction(claimed.lease, &llm, &claimed.in_context, &claimed.entries)
+        .prepare_extraction(claimed.lease, &llm, &claimed.in_context)
         .unwrap()
 }
 

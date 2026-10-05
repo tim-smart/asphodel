@@ -247,3 +247,25 @@ Hermes turn, and the agenda and other enabled models still share the
 2560-token block. Bounded recall and admission filters are unchanged.
 These are opt-in operator steps, not automatic production changes or
 authorization for private replay or live backend calls.
+
+## Schema version 14: `used` by memory alone
+
+Call 1 used to be shown each sentence of the session's prompt block under
+its own handle (`n1`, `n2`, …), and a reply naming one was `used` on every
+memory it cited. It now sees only the memories the block cites, each by its
+own `m` handle, as before, and credits the one the reply relied on. The
+migration drops `turn_entries`, where each queued turn kept the block's
+sentences, and `prompt_blocks.entries`. No action is needed.
+
+A turn queued when you upgrade loses its snapshot and is extracted with its
+in-context set alone. A chunk whose call 2 failed before the upgrade
+resumes from its saved call 1 reply, and an entry handle in that reply
+credits nothing.
+
+Replay: `CALL1_VERSION` stays 7. The claim rules haven't changed, so
+`fast` keeps reusing recorded claims by chunk, and `used` verdicts are
+still keyed by (reply hash, sentence hash). A recorded call 1 reply that
+names a handle its record doesn't list, such as an entry's, keeps its
+`used` verdicts, and its other pairs are judged again by a top-up. Call 1's
+request text has changed, so `replay` mode misses on every call 1 recorded
+before this version, as it does after any prompt edit.
