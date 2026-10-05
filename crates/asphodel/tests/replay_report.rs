@@ -29,6 +29,11 @@
 //!   again against the query the mode gives, keeping every id, and writes
 //!   them in logit order. It compares rerankers' queries on fixed pools;
 //!   it says nothing about prefetch's final ranking.
+//! - `--refresh-queries Q`, a TOML table of facet heading to another
+//!   query, scores each refresh sample of those facets again against its
+//!   query, keeping the sample's `query` and every candidate with what the
+//!   refresh recorded of it. Without it the refresh samples stay as they
+//!   were.
 //!
 //! Everything these read or write is derived from history, so all of it
 //! stays under the private dir and errors never quote it.
@@ -727,6 +732,116 @@ fn refresh_samples_take_ten_refreshes_the_profiles_first() {
     let many = sampled_models(&material);
     assert_eq!(many.len(), 10, "{many:?}");
     assert!(!many.iter().any(|model| model == "home"), "{many:?}");
+}
+
+/// A refresh candidate with its logit left out: what the refresh recorded
+/// of it, which a rescore keeps.
+fn recorded(candidate: &Value) -> Value {
+    let mut candidate = candidate.clone();
+    candidate.as_object_mut().unwrap().remove("logit");
+    candidate
+}
+
+/// `report rescore --refresh-queries` scores the fixed refresh pools again
+/// against another query for a facet, named by its heading: every sample of
+/// that facet records the query as `rerank_query`, and each candidate's
+/// logit is the fake reranker's for it. The sample keeps its `query`, so
+/// facet labels match the same candidates, and keeps every candidate with
+/// what the refresh recorded of it: its strength, score, rank, citation,
+/// what took it and its handle. Samples of other facets stay as they were,
+/// and the same rescore writes the same bytes.
+#[test]
+fn refresh_queries_rescore_the_fixed_pools_keeping_label_keys_and_selection() {
+    let dir = TestDir::new();
+    let (material, corpus) = refresh_material(&dir, &REFRESH_FACTS[..3], hermes::MANIFEST);
+    let samples = material["refresh"].as_array().expect("a refresh list");
+    let heading = samples.first().expect("a refresh is sampled")["facet"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let alternative = "Tim pasta family";
+    let queries = toml::to_string(&json!({ heading.as_str(): alternative })).unwrap();
+    let queries = dir.private_file("labelling/refresh-queries.toml", &queries);
+    let flags = ["--refresh-queries", queries.to_str().unwrap()];
+
+    let input = dir.private_path("labelling/material.json");
+    let out = dir.private_path("labelling/rescored.json");
+    assert_ok(&rescore_with(
+        &dir, &input, &corpus, "message", &out, &flags,
+    ));
+    let rescored = read_json(&out);
+    let after = rescored["refresh"].as_array().expect("a refresh list");
+    assert_eq!(after.len(), samples.len());
+
+    let mut changed = 0;
+    for (before, after) in samples.iter().zip(after) {
+        if before["facet"] != heading.as_str() {
+            assert_eq!(after, before, "another facet's sample is as it was");
+            continue;
+        }
+        for key in [
+            "sample",
+            "at",
+            "model",
+            "facet",
+            "facet_index",
+            "query",
+            "reranked",
+        ] {
+            assert_eq!(after[key], before[key], "{key} is kept: {after}");
+        }
+        assert_eq!(after["rerank_query"], alternative, "{after}");
+        let by_id = |sample: &Value| -> BTreeMap<String, Value> {
+            candidates(sample)
+                .iter()
+                .map(|c| (c["id"].as_str().unwrap().to_string(), c.clone()))
+                .collect()
+        };
+        let (was, now) = (by_id(before), by_id(after));
+        assert_eq!(
+            was.keys().collect::<Vec<_>>(),
+            now.keys().collect::<Vec<_>>(),
+            "the same candidates: {after}"
+        );
+        for (id, candidate) in &now {
+            assert_eq!(recorded(candidate), recorded(&was[id]), "{candidate}");
+            let sentence = candidate["sentence"].as_str().unwrap();
+            let logit = candidate["logit"].as_f64().expect("a rescored logit");
+            assert_eq!(logit, fake_logit(alternative, sentence), "{candidate}");
+            changed += usize::from(Some(logit) != was[id]["logit"].as_f64());
+        }
+    }
+    assert!(changed > 0, "the other query moves some logit");
+
+    let again = dir.private_path("labelling/rescored-again.json");
+    assert_ok(&rescore_with(
+        &dir, &input, &corpus, "message", &again, &flags,
+    ));
+    assert_eq!(fs::read(&again).unwrap(), fs::read(&out).unwrap());
+
+    // Facet labels keyed by the stored query reach the same candidates.
+    let keys: BTreeSet<(&str, &str)> = samples
+        .iter()
+        .flat_map(|sample| {
+            let query = sample["query"].as_str().unwrap();
+            candidates(sample)
+                .iter()
+                .map(move |candidate| (query, candidate["memory"].as_str().unwrap()))
+        })
+        .collect();
+    let labels: Vec<Value> = keys
+        .into_iter()
+        .map(|(query, memory)| json!({ "query": query, "memory": memory, "relevant": true }))
+        .collect();
+    let labels = dir.private_file(
+        "labelling/facets.toml",
+        &toml::to_string(&json!({ "facet": labels })).unwrap(),
+    );
+    let (before, after) = (curve(&dir, &labels, &input), curve(&dir, &labels, &out));
+    for key in ["labelled", "unlabelled", "matched", "unmatched"] {
+        assert_eq!(after["refresh"][key], before["refresh"][key], "{key}");
+    }
+    assert_eq!(before["refresh"]["unlabelled"], 0, "{before}");
 }
 
 // Refresh curves, worked by hand.
@@ -1656,6 +1771,18 @@ fn sampling_prefers_labelled_queries_so_labels_carry_over() {
 // Rescoring fixed pools.
 
 fn rescore(dir: &TestDir, material: &Path, corpus: &Path, mode: &str, out: &Path) -> Output {
+    rescore_with(dir, material, corpus, mode, out, &[])
+}
+
+/// [`rescore`] with `extra` flags.
+fn rescore_with(
+    dir: &TestDir,
+    material: &Path,
+    corpus: &Path,
+    mode: &str,
+    out: &Path,
+    extra: &[&str],
+) -> Output {
     asphodel(dir)
         .args(["report", "rescore", "--material"])
         .arg(material)
@@ -1664,6 +1791,7 @@ fn rescore(dir: &TestDir, material: &Path, corpus: &Path, mode: &str, out: &Path
         .args(["--rerank-query", mode])
         .arg("--out")
         .arg(out)
+        .args(extra)
         .output()
         .unwrap()
 }
