@@ -2205,6 +2205,13 @@ fn undo_latest_migration() -> String {
             ),
         }
     }
+    // The runner drops these columns itself (`DROPPED_COLUMNS`), so the SQL
+    // doesn't show them.
+    if *version == 14 {
+        undo.push(
+            "ALTER TABLE prompt_blocks ADD COLUMN entries TEXT NOT NULL DEFAULT '[]';".into(),
+        );
+    }
     assert!(!undo.is_empty(), "{} creates nothing", path.display());
     undo.join("\n")
 }
