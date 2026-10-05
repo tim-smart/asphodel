@@ -70,6 +70,15 @@ impl Answer {
         self.render("###")
     }
 
+    /// The system prompt output: a lone section needs no facet heading;
+    /// multiple sections sit one level below the model heading.
+    pub(crate) fn render_output(&self) -> String {
+        match self.sections.as_slice() {
+            [section] => section.text.clone(),
+            _ => self.render("####"),
+        }
+    }
+
     /// The text with each heading marked as `marks`.
     pub(crate) fn render(&self, marks: &str) -> String {
         self.sections
