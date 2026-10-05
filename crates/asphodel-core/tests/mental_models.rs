@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use asphodel_core::agenda::Agenda;
+use asphodel_core::clock::Sleeper;
 use asphodel_core::config::{AgendaTuning, ConfigError, MentalModelsTuning};
 use asphodel_core::constants::Significance;
 use asphodel_core::extraction::{Call1Input, Extracted};
@@ -39,7 +40,7 @@ use asphodel_core::mental_models::{
 };
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmGate, LlmRequest,
-    LlmResponse, ModelError as EmbedError, Models,
+    LlmResponse, LlmRetry, ModelError as EmbedError, Models, RetryPolicy,
 };
 use asphodel_core::operations::{Audit, AuditList, RecallRow};
 use asphodel_core::retrieval::{Prefetch, PrefetchRequest, estimate_tokens};
@@ -877,6 +878,47 @@ fn a_failed_refresh_is_retried_after_thirty_minutes_not_at_the_next_trigger() {
     let profile = h.profile();
     assert_eq!(profile.last_error, None);
     assert_eq!(profile.last_refreshed_at, Some(failed_at + minutes(30)));
+    assert_eq!(h.failures(), (0, vec![]));
+}
+
+/// A [`Sleeper`] that returns at once.
+struct NoSleep;
+
+impl Sleeper for NoSleep {
+    fn sleep(&self, _: Duration) {}
+}
+
+#[test]
+fn a_transient_error_retried_within_the_call_keeps_the_plan_and_counts_nothing() {
+    // The daemon retries a blip inside the call, so a write that fails
+    // twice and then answers doesn't throw the plan away or start the
+    // thirty-minute wait.
+    let h = Harness::new();
+    h.seed(fact(TEA));
+    applied(h.refresh(PROFILE_NAME, &quiet_llm(1), true));
+    let question = "What does Tim like to drink?";
+    h.edit(PROFILE_NAME, json!({"question": question})).unwrap();
+    h.advance(minutes(30));
+
+    let script = json!([
+        {"reply": planned(&[("Drinks", question)])},
+        {"fail": "status", "status": 503},
+        {"fail": "transport"},
+        {"reply": quiet()},
+    ]);
+    let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
+    let policy = RetryPolicy {
+        attempts: 3,
+        ..RetryPolicy::default()
+    };
+    let llm = LlmRetry::new(inner.clone(), policy, h.clock.clone(), Arc::new(NoSleep));
+    let ran = h.tick(&llm);
+    assert_eq!(ran.ran.len(), 1);
+    assert!(matches!(ran.ran[0].outcome, Outcome::Applied(_)));
+    assert_eq!(calls(&inner, PLAN_TEMPLATE).len(), 1);
+    assert_eq!(writes(&inner), 3);
+    assert_eq!(h.profile().last_error, None);
+    assert_eq!(h.profile().last_refreshed_at, Some(h.now()));
     assert_eq!(h.failures(), (0, vec![]));
 }
 
