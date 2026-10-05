@@ -87,6 +87,10 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/v1/banks/{bank}/chunks", get(chunks))
         .route("/v1/banks/{bank}/chunks/retry", post(retry_chunks))
         .route("/v1/banks/{bank}/system-prompt", get(system_prompt))
+        .route(
+            "/v1/banks/{bank}/system-prompt/cached",
+            get(cached_system_prompt),
+        )
         .route("/v1/banks/{bank}/agenda", get(agenda))
         .route(
             "/v1/banks/{bank}/models",
@@ -901,6 +905,24 @@ async fn system_prompt(
     Ok(Json(block))
 }
 
+#[derive(Serialize)]
+struct CachedBlock {
+    block: Option<Block>,
+}
+
+/// `GET /v1/banks/{bank}/system-prompt/cached`: the block the daemon has
+/// cached, or `null`, for the dashboard. Unlike `/system-prompt` it never
+/// builds one, so looking writes nothing.
+async fn cached_system_prompt(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+) -> Result<Json<CachedBlock>, ApiError> {
+    let block = app
+        .call(move |service| service.cached_system_prompt(&bank))
+        .await?;
+    Ok(Json(CachedBlock { block }))
+}
+
 /// `GET /v1/banks/{bank}/agenda`: the agenda as the block would list it.
 async fn agenda(
     State(app): State<Shared>,
@@ -910,13 +932,29 @@ async fn agenda(
     Ok(Json(agenda))
 }
 
+/// The models with the budget their enabled `max_tokens` must fit, so a
+/// client can show what's left without knowing the tuning.
+#[derive(Serialize)]
+struct ModelList {
+    models: Vec<Model>,
+    /// `mental_models.budget`.
+    budget: u32,
+}
+
 /// `GET /v1/banks/{bank}/models`: `asphodel model list`.
 async fn list_models(
     State(app): State<Shared>,
     Path(bank): Path<String>,
-) -> Result<Json<Vec<Model>>, ApiError> {
-    let models = app.call(move |service| service.list_models(&bank)).await?;
-    Ok(Json(models))
+) -> Result<Json<ModelList>, ApiError> {
+    let list = app
+        .call(move |service| {
+            Ok::<_, ModelError>(ModelList {
+                models: service.list_models(&bank)?,
+                budget: service.tuning().mental_models.budget,
+            })
+        })
+        .await?;
+    Ok(Json(list))
 }
 
 /// `POST /v1/banks/{bank}/models`: `asphodel model create`. 201.

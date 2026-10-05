@@ -2,6 +2,7 @@
 // title and content; actions go through `ctx.act`, destructive ones after
 // `ctx.confirm`.
 
+import { ApiError } from "./api.js";
 import { capitalize, fadeStage, goneReason, plural, shortId } from "./dom.js";
 
 const STATUSES = ["live", "superseded", "ended", "retracted", "forgetting"];
@@ -49,7 +50,9 @@ export function route(hash) {
             ? "chunks"
             : section === "recall" && !id
               ? "recall"
-              : "missing";
+              : section === "models" && !id
+                ? "models"
+                : "missing";
   return { page, bank, section, id, params };
 }
 
@@ -214,7 +217,8 @@ async function banks(ctx) {
         "footer",
         { class: "quiet-text" },
         bank.last_turn_at ? ["Last turn ", time(bank.last_turn_at, { withTime: true })] : "No turns yet",
-        ` · ${plural(bank.models, "mental model")}`,
+        " · ",
+        h("a", { href: bankHash(bank.name, "models") }, plural(bank.models, "mental model")),
       ),
     );
   });
@@ -1488,6 +1492,165 @@ function candidateRow(ctx, c, reason) {
   );
 }
 
+// The bank's mental models, and which of them go into Hermes's system
+// prompt. A model is in the prompt while it's enabled; the daemon refuses an
+// enable past the budget, and the page shows its reason. The block the
+// daemon has cached is read without building one, so looking writes nothing.
+
+const REFRESH_FAILURES = {
+  llm: "The LLM call failed",
+  malformed: "The reply was malformed",
+  retrieval: "Retrieval failed",
+};
+
+async function models(ctx) {
+  const { api, ui, bank } = ctx;
+  const { h, time, pill } = ui;
+  const [{ models: list, budget }, { block: cached }] = await Promise.all([
+    api.models(bank),
+    api.cachedSystemPrompt(bank),
+  ]);
+  const enabled = list.filter((m) => m.enabled);
+  const used = enabled.reduce((sum, m) => sum + m.max_tokens, 0);
+  const left = budget - used;
+
+  const setEnabled = (model, on) =>
+    ctx.act(async () => {
+      try {
+        await api.editModel(bank, model.name, { enabled: on });
+      } catch (error) {
+        if (on && error instanceof ApiError && error.status === 422) {
+          error.message = `That model stays out of the prompt: ${error.message}. Take another model out first.`;
+        }
+        throw error;
+      }
+      return on
+        ? "Back in the prompt for new Hermes sessions. A refresh is on its way."
+        : "Out of the prompt for new Hermes sessions, and its refreshes are paused.";
+    });
+
+  const usage = h(
+    "section",
+    { class: "panel budget", "aria-labelledby": "budget-title" },
+    h("h2", { id: "budget-title" }, "System prompt budget"),
+    h(
+      "p",
+      { class: "budget-figure" },
+      h("strong", {}, String(used)),
+      ` of ${budget} tokens`,
+    ),
+    h(
+      "div",
+      { class: "budget-bar", "aria-hidden": "true" },
+      enabled.map((m) =>
+        h("span", { title: `${m.name}: ${m.max_tokens} tokens`, style: { "--share": `${Math.min(100, (m.max_tokens / budget) * 100).toFixed(2)}%` } }),
+      ),
+    ),
+    h(
+      "p",
+      { class: "quiet-text" },
+      left >= 0
+        ? `${plural(enabled.length, "enabled model")}, ${left} tokens to spare. `
+        : `${plural(enabled.length, "enabled model")}, ${-left} tokens over. `,
+      "The agenda comes out of the same budget first, so a model can get less than its limit.",
+    ),
+  );
+
+  const notes = h(
+    "ul",
+    { class: "model-notes" },
+    h("li", {}, "Changes reach new Hermes sessions only. A running session keeps the system prompt it started with."),
+    h("li", {}, "Taking a model out also pauses its refreshes. Putting it back in starts one."),
+  );
+
+  const prompt = h(
+    "section",
+    { class: "panel cached-prompt", "aria-labelledby": "cached-title" },
+    h(
+      "div",
+      { class: "section-head" },
+      h("h2", { id: "cached-title" }, "Cached system prompt"),
+      cached ? h("p", { class: "quiet-text" }, "Built ", time(cached.built_at, { withTime: true })) : null,
+    ),
+    cached
+      ? [
+          h("p", { class: "quiet-text" }, "What a new Hermes session gets now, exactly as it gets it."),
+          h("pre", { class: "injection-text", tabindex: "0", "aria-label": "The cached system prompt" }, cached.text),
+        ]
+      : h(
+          "p",
+          { class: "empty" },
+          "Nothing is cached right now. The next Hermes session to start builds the block, from the agenda and the enabled models as they are then.",
+        ),
+  );
+
+  const cards = list.map((m, i) => {
+    const nameId = `model-${i}-name`;
+    const stateId = `model-${i}-state`;
+    const toggle = h("input", {
+      type: "checkbox",
+      role: "switch",
+      class: "switch-input",
+      checked: m.enabled,
+      "aria-labelledby": `${nameId} ${stateId}`,
+      onchange: () => {
+        toggle.disabled = true;
+        setEnabled(m, toggle.checked);
+      },
+    });
+    const kinds = m.kinds.length ? m.kinds.join(", ") : "every kind";
+    return h(
+      "article",
+      { class: "card model", "data-enabled": m.enabled ? "true" : "false" },
+      h(
+        "header",
+        { class: "model-head" },
+        h("h2", { id: nameId }, m.name),
+        h(
+          "label",
+          { class: "switch" },
+          toggle,
+          h("span", { class: "switch-track", "aria-hidden": "true" }),
+          h("span", { id: stateId }, "In the prompt"),
+        ),
+      ),
+      h("p", { class: "question" }, m.question),
+      h(
+        "ul",
+        { class: "meta inline-list" },
+        h("li", {}, h("span", { class: "num" }, String(m.max_tokens)), " tokens"),
+        h("li", {}, plural(m.entries.length, "entry", "entries")),
+        h("li", {}, kinds),
+        h("li", {}, m.last_refreshed_at ? ["Refreshed ", time(m.last_refreshed_at, { withTime: true })] : "Never refreshed"),
+        m.enabled ? null : h("li", {}, "Refreshes paused"),
+      ),
+      m.last_error
+        ? h(
+            "p",
+            { class: "model-error" },
+            pill("refresh failed", "failed"),
+            " ",
+            REFRESH_FAILURES[m.last_error] ?? m.last_error,
+            m.last_error_at ? [" ", time(m.last_error_at, { withTime: true })] : null,
+          )
+        : null,
+    );
+  });
+
+  return {
+    title: `Mental models · ${bank}`,
+    content: [
+      heading(h, "Mental models", h("p", { class: "quiet-text" }, "Each enabled model's entries go into Hermes's system prompt, after the agenda.")),
+      usage,
+      notes,
+      list.length
+        ? h("div", { class: "model-grid" }, cards)
+        : h("p", { class: "empty" }, "No mental models yet. Create one with asphodel model create."),
+      prompt,
+    ],
+  };
+}
+
 async function missing(ctx) {
   const { h } = ctx.ui;
   return {
@@ -1496,4 +1659,4 @@ async function missing(ctx) {
   };
 }
 
-export const pages = { banks, memories, memory, documents, source, chunks, recall, missing };
+export const pages = { banks, memories, memory, documents, source, chunks, recall, models, missing };

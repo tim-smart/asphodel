@@ -1356,7 +1356,7 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     let memory = daemon.seed_notes();
 
     // Only "User profile" is seeded, empty and never refreshed.
-    let models = daemon.get_ok("/v1/banks/main/models");
+    let models = daemon.get_ok("/v1/banks/main/models")["models"].clone();
     assert_eq!(models.as_array().unwrap().len(), 1);
     assert_eq!(models[0]["name"], "User profile");
     assert_eq!(models[0]["entries"], json!([]));
@@ -1400,7 +1400,7 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     let unchanged = daemon.post_ok(refresh, &Value::Null);
     assert_eq!(unchanged["outcome"], "unchanged", "{unchanged}");
 
-    let profile = &daemon.get_ok("/v1/banks/main/models")[0];
+    let profile = &daemon.get_ok("/v1/banks/main/models")["models"][0];
     assert_eq!(profile["entries"][0]["text"], ENTRY);
     assert_eq!(profile["entries"][0]["section"], "Home");
     assert_eq!(profile["entries"][0]["cites"], json!([memory]));
@@ -1458,6 +1458,71 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     assert_eq!(
         agenda,
         json!({"dated": [], "folded": 0, "routines": [], "undated_tasks": []})
+    );
+}
+
+/// The dashboard shows the enabled models' `max_tokens` against the budget,
+/// so the list carries the budget beside the models.
+#[test]
+fn the_model_list_carries_the_budget_and_enabling_past_it_changes_nothing() {
+    let dir = TestDir::new();
+    let daemon = Serve::new(&dir)
+        .tuning("[mental_models]\nbudget = 800\nprofile_max_tokens = 500\n")
+        .ready();
+    daemon.create_bank("main");
+    // The profile takes 500 of the 800 tokens; a disabled model doesn't count.
+    let created = daemon.post(
+        "/v1/banks/main/models",
+        &json!({"name": "Plans", "question": "Where is Tim going?", "max_tokens": 301,
+                "enabled": false}),
+    );
+    assert_eq!(created.status, 201, "{}", created.body);
+
+    let listed = daemon.get_ok("/v1/banks/main/models");
+    assert_eq!(listed["budget"], 800, "{listed}");
+    let enabled = |listed: &Value| -> Vec<(String, bool)> {
+        listed["models"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no models array: {listed}"))
+            .iter()
+            .map(|m| (m["name"].as_str().unwrap().to_owned(), m["enabled"] == true))
+            .collect()
+    };
+    let before = vec![
+        ("User profile".to_owned(), true),
+        ("Plans".to_owned(), false),
+    ];
+    assert_eq!(enabled(&listed), before);
+
+    let refused = daemon.send(
+        "PATCH",
+        "/v1/banks/main/models/Plans",
+        Some(&json!({"enabled": true})),
+    );
+    assert_eq!(refused.status, 422, "{}", refused.body);
+    assert_eq!(
+        refused.json()["error"],
+        "801 tokens is over the 800-token budget for mental models"
+    );
+    assert_eq!(enabled(&daemon.get_ok("/v1/banks/main/models")), before);
+}
+
+/// The dashboard shows the block the daemon has cached without building
+/// one, so looking writes nothing.
+#[test]
+fn the_cached_system_prompt_is_null_until_a_fetch_builds_it() {
+    let dir = TestDir::new();
+    let daemon = Serve::new(&dir).ready();
+    daemon.create_bank("main");
+    let cached = || daemon.get_ok("/v1/banks/main/system-prompt/cached");
+
+    assert_eq!(cached(), json!({"block": null}));
+    assert_eq!(cached(), json!({"block": null}), "looking built a block");
+    let block = daemon.get_ok("/v1/banks/main/system-prompt");
+    assert_eq!(cached(), json!({ "block": block }));
+    assert_eq!(
+        daemon.get("/v1/banks/nope/system-prompt/cached").status,
+        404
     );
 }
 

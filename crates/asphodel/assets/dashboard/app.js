@@ -1,6 +1,6 @@
 // The dashboard: hash routes over the daemon's read-only list routes, the
 // Recall page's explain (which logs nothing), and the owner's actions (keep, retract, forget, remove a document, retry
-// chunks, resume purge), each destructive one behind a confirmation.
+// chunks, resume purge, a model in or out of the prompt), each destructive one behind a confirmation.
 //
 // `mount(root, { fetch })` renders into `root` and returns a function that
 // stops it. Everything else (location, session storage, timers) comes from
@@ -46,6 +46,7 @@ export function mount(root, { fetch }) {
             ["documents", "Documents"],
             ["chunks", "Ingestion"],
             ["recall", "Recall"],
+            ["models", "Models"],
           ].map(([name, label]) =>
             h(
               "a",
@@ -97,6 +98,15 @@ export function mount(root, { fetch }) {
       tabs,
     );
     root.replaceChildren(h("div", { class: "shell" }, skip, header, banner, main));
+  }
+
+  /// On a narrow screen the tabs scroll sideways: scrolls this page's tab
+  /// into view, sideways only.
+  function showCurrentTab() {
+    const current = tabs?.querySelector('[aria-current="page"]');
+    if (!current) return;
+    const over = current.getBoundingClientRect().right - tabs.getBoundingClientRect().right;
+    if (over > 0) tabs.scrollLeft += over;
   }
 
   /// The daemon writes commands in its attention lines between backticks;
@@ -299,6 +309,7 @@ export function mount(root, { fetch }) {
       document.title = view.title ? `${view.title} · Asphodel` : "Asphodel";
       main.replaceChildren(...[noticeElement(), view.content].flat().filter(Boolean));
       main.setAttribute("aria-busy", "false");
+      showCurrentTab();
       showStatus(status, at);
       if (focusNotice) main.querySelector(".notice")?.focus();
       else if (focusHeading) main.querySelector("h1")?.focus();

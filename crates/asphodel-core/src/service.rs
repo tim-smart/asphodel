@@ -1724,6 +1724,16 @@ impl Service {
         Ok(block)
     }
 
+    /// The block `system_prompt` would serve now without building one, or
+    /// `None` when nothing is cached for the bank's local day. It writes
+    /// nothing: no block row, no session mapping, no access. The cache
+    /// lives in memory, so it's empty after a restart until the next fetch.
+    pub fn cached_system_prompt(&self, bank: &str) -> Result<Option<Block>, ModelError> {
+        let (bank_id, tz) = self.model_bank(bank)?;
+        let today = self.now().to_zoned(tz).date();
+        Ok(self.blocks.get(bank_id, today).ok())
+    }
+
     fn mapping_expiry(&self) -> SignedDuration {
         SignedDuration::from_hours(24 * i64::from(self.tuning.sessions.mapping_expiry_days))
     }

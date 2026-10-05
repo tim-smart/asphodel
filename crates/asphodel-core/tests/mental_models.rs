@@ -1621,6 +1621,10 @@ fn creating_resizing_or_enabling_past_the_budget_is_refused() {
     let resizing = h.edit(PROFILE_NAME, json!({"max_tokens": 801}));
     assert!(matches!(resizing, Err(ModelError::OverBudget { .. })));
     assert_eq!(h.profile().max_tokens, 800);
+    assert!(
+        !h.model("Plans").enabled,
+        "a refused enable changed the model"
+    );
 }
 
 /// A fact-only model asking what Tim drinks in the morning, in
@@ -1896,6 +1900,83 @@ fn the_block_is_cached_until_its_content_changes() {
     assert_ne!(refreshed.id, haircut.id);
     assert_eq!(refreshed.built_at, h.now());
     assert!(refreshed.text.contains(TEA));
+}
+
+#[test]
+fn taking_a_model_out_of_the_prompt_and_back_shows_in_the_next_block_and_survives_a_restart() {
+    let h = Harness::new();
+    let tea = h.seed(fact(TEA));
+    h.profile_adding(&[("Tim likes green tea.", &[tea])]);
+    assert!(h.block(None).text.contains("Tim likes green tea."));
+
+    let toggle = |h: &Harness, enabled: bool| {
+        h.service
+            .edit_model(
+                BANK,
+                PROFILE_NAME,
+                &ModelEdit {
+                    enabled: Some(enabled),
+                    ..ModelEdit::default()
+                },
+            )
+            .unwrap();
+    };
+
+    // The cached block goes with the edit.
+    toggle(&h, false);
+    assert!(
+        !h.block(None).text.contains("Tim likes green tea."),
+        "a model taken out of the prompt was rendered"
+    );
+    let h = h.restart();
+    assert!(!h.profile().enabled);
+    assert!(!h.block(None).text.contains("Tim likes green tea."));
+
+    // Its entries were kept, so they're back as soon as it is.
+    toggle(&h, true);
+    assert!(h.block(None).text.contains("Tim likes green tea."));
+    let h = h.restart();
+    assert!(h.profile().enabled);
+    assert!(h.block(None).text.contains("Tim likes green tea."));
+}
+
+#[test]
+fn the_cached_block_is_read_without_building_one() {
+    let h = Harness::new();
+    let tea = h.seed(fact(TEA));
+    h.profile_adding(&[("Tim likes green tea.", &[tea])]);
+    let accesses = h.accesses(tea, "injection");
+
+    // Nothing has fetched the block, so nothing is cached, and looking
+    // doesn't build one.
+    assert_eq!(h.service.cached_system_prompt(BANK).unwrap(), None);
+
+    let served = h.block(None);
+    assert_eq!(
+        h.service.cached_system_prompt(BANK).unwrap(),
+        Some(served.clone())
+    );
+
+    // Whatever clears the cache empties it: an edit, and local midnight.
+    h.service
+        .edit_model(
+            BANK,
+            PROFILE_NAME,
+            &ModelEdit {
+                enabled: Some(false),
+                ..ModelEdit::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(h.service.cached_system_prompt(BANK).unwrap(), None);
+    h.block(None);
+    h.set(at("2026-10-01T11:00:00Z"));
+    assert_eq!(h.service.cached_system_prompt(BANK).unwrap(), None);
+    assert_eq!(
+        h.accesses(tea, "injection"),
+        accesses,
+        "reading the cache never counts"
+    );
 }
 
 #[test]
