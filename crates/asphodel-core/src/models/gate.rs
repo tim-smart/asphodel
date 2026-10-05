@@ -158,4 +158,8 @@ impl LlmClient for LlmGate {
         self.note(&result);
         result
     }
+
+    fn skips_write(&self, request: &LlmRequest, identities: &[(String, uuid::Uuid)]) -> bool {
+        self.inner.skips_write(request, identities)
+    }
 }

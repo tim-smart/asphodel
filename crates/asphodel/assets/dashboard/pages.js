@@ -1450,6 +1450,19 @@ function explainResults(ctx, explained, sent, timeZone) {
   return [summary, injected, madeIt, leftOut].filter(Boolean);
 }
 
+/// A model's stored answer, each `### heading` and its paragraph, or that it
+/// has none yet.
+function modelAnswer(h, answer) {
+  if (!answer) return h("p", { class: "answer quiet-text" }, "No answer yet.");
+  const sections = answer.split("\n\n").map((block) => {
+    const [first, ...rest] = block.split("\n");
+    return first.startsWith("### ")
+      ? [h("h3", {}, first.slice(4)), h("p", {}, rest.join(" "))]
+      : h("p", {}, block);
+  });
+  return h("div", { class: "answer" }, sections);
+}
+
 function candidateRow(ctx, c, reason) {
   const { h, pill } = ctx.ui;
   const score = c.score;
@@ -1615,11 +1628,12 @@ async function models(ctx) {
         ),
       ),
       h("p", { class: "question" }, m.question),
+      modelAnswer(h, m.answer),
       h(
         "ul",
         { class: "meta inline-list" },
         h("li", {}, h("span", { class: "num" }, String(m.max_tokens)), " tokens"),
-        h("li", {}, plural(m.entries.length, "entry", "entries")),
+        h("li", {}, plural(m.cites.length, "memory cited", "memories cited")),
         h("li", {}, kinds),
         h("li", {}, m.last_refreshed_at ? ["Refreshed ", time(m.last_refreshed_at, { withTime: true })] : "Never refreshed"),
         m.enabled ? null : h("li", {}, "Refreshes paused"),
@@ -1640,7 +1654,7 @@ async function models(ctx) {
   return {
     title: `Mental models · ${bank}`,
     content: [
-      heading(h, "Mental models", h("p", { class: "quiet-text" }, "Each enabled model's entries go into Hermes's system prompt, after the agenda.")),
+      heading(h, "Mental models", h("p", { class: "quiet-text" }, "Each enabled model's answer goes into Hermes's system prompt, after the agenda.")),
       usage,
       notes,
       list.length

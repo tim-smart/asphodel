@@ -55,9 +55,6 @@ pub enum InspectError {
     #[error("unknown model")]
     UnknownModel,
 
-    #[error("the model has no such entry")]
-    UnknownEntry,
-
     #[error("no such source in the bank")]
     UnknownSource,
 
@@ -916,23 +913,12 @@ pub struct ModelView {
     pub refresh_requested_at: Option<Timestamp>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-    /// Every entry, or the one `--entry` names, with what it cites.
-    pub entry_views: Vec<EntryView>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct EntryView {
-    pub id: Uuid,
-    pub position: i64,
-    /// The heading it's written under; `None` for an entry from before
-    /// sections.
-    pub section: Option<String>,
-    pub text: String,
-    pub created_at: Timestamp,
-    pub updated_at: Timestamp,
-    /// Whether the block shows it: every memory it cites is current.
+    /// Each memory the answer cites, with its status.
+    pub cited: Vec<CitedMemory>,
+    /// Whether the block shows the model: it has an answer and every memory
+    /// the answer cites is current. One that doesn't fit what's left of the
+    /// budget is cut, and shows in part.
     pub renders: bool,
-    pub cites: Vec<CitedMemory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -951,13 +937,8 @@ pub enum CitedStatus {
     Forgotten,
 }
 
-/// `model show <name> [--entry <id>]`.
-pub(crate) fn model_view(
-    store: &Store,
-    bank: &str,
-    name: &str,
-    entry: Option<&str>,
-) -> Result<ModelView, InspectError> {
+/// `model show <name>`.
+pub(crate) fn model_view(store: &Store, bank: &str, name: &str) -> Result<ModelView, InspectError> {
     let now = store.now();
     let conn = store.connection();
     let (bank_id, _) = find_bank(&conn, bank)?.ok_or(InspectError::UnknownBank)?;
@@ -968,92 +949,48 @@ pub(crate) fn model_view(
         [row.id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let entry = match entry {
-        Some(entry) => Some(
-            entry
-                .trim()
-                .parse::<Uuid>()
-                .map_err(|_| InspectError::UnknownEntry)?,
-        ),
-        None => None,
-    };
-    type Row = (i64, Uuid, i64, Option<String>, String, i64, i64);
-    let rows: Vec<Row> = {
-        let mut statement = conn.prepare(
-            "SELECT id, uuid, position, section, text, created_at, updated_at
-             FROM mental_model_entries WHERE model_id = ?1 ORDER BY position",
-        )?;
-        statement
-            .query_map([row.id], |row| {
-                Ok((
-                    row.get(0)?,
-                    parse(&row.get::<_, String>(1)?),
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            })?
-            .collect::<Result<_, _>>()?
-    };
-    let mut cited = conn.prepare(
+    let mut statement = conn.prepare(
         "SELECT m.uuid, m.content, m.invalidated_at IS NOT NULL, m.hidden_at IS NOT NULL,
                 m.valid_until, m.valid_until_precision, s.timezone
-         FROM mental_model_citations c
+         FROM mental_model_cites c
          JOIN memories m ON m.id = c.memory_id
          JOIN chunks k ON k.id = m.chunk_id JOIN sources s ON s.id = k.source_id
-         WHERE c.entry_id = ?1 ORDER BY c.rowid",
+         WHERE c.model_id = ?1 ORDER BY c.rowid",
     )?;
-    let mut entry_views = Vec::new();
-    for (id, uuid, position, section, text, created, updated) in rows {
-        if entry.is_some_and(|wanted| wanted != uuid) {
-            continue;
-        }
-        let cites: Vec<CitedMemory> = cited
-            .query_map([id], |row| {
-                let retracted: bool = row.get(2)?;
-                let hidden: bool = row.get(3)?;
-                let until = world_time(row.get(4)?, row.get(5)?);
-                let tz = TimeZone::get(&row.get::<_, String>(6)?).unwrap_or(TimeZone::UTC);
-                let status = if hidden {
-                    CitedStatus::Forgotten
-                } else if retracted {
-                    CitedStatus::Retracted
-                } else if crate::agenda::has_ended(until, &tz, now) {
-                    CitedStatus::Ended
-                } else {
-                    CitedStatus::Current
-                };
-                Ok(CitedMemory {
-                    id: parse(&row.get::<_, String>(0)?),
-                    sentence: row.get(1)?,
-                    status,
-                })
-            })?
-            .collect::<Result<_, _>>()?;
-        entry_views.push(EntryView {
-            id: uuid,
-            position,
-            section,
-            text,
-            created_at: timestamp(created),
-            updated_at: timestamp(updated),
-            renders: !cites.is_empty()
-                && cites.iter().all(|cite| cite.status == CitedStatus::Current),
-            cites,
-        });
-    }
-    if entry.is_some() && entry_views.is_empty() {
-        return Err(InspectError::UnknownEntry);
-    }
+    let cited: Vec<CitedMemory> = statement
+        .query_map([row.id], |row| {
+            let retracted: bool = row.get(2)?;
+            let hidden: bool = row.get(3)?;
+            let until = world_time(row.get(4)?, row.get(5)?);
+            let tz = TimeZone::get(&row.get::<_, String>(6)?).unwrap_or(TimeZone::UTC);
+            let status = if hidden {
+                CitedStatus::Forgotten
+            } else if retracted {
+                CitedStatus::Retracted
+            } else if crate::agenda::has_ended(until, &tz, now) {
+                CitedStatus::Ended
+            } else {
+                CitedStatus::Current
+            };
+            Ok(CitedMemory {
+                id: parse(&row.get::<_, String>(0)?),
+                sentence: row.get(1)?,
+                status,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    let renders = row.enabled
+        && shown.answer.is_some()
+        && !cited.is_empty()
+        && cited.iter().all(|cite| cite.status == CitedStatus::Current);
     Ok(ModelView {
         model: shown,
         entity_id: row.entity_id.map(|id| uuid_of(&conn, id)).transpose()?,
         refresh_requested_at: row.refresh_requested_at,
         created_at: timestamp(created_at),
         updated_at: timestamp(updated_at),
-        entry_views,
+        cited,
+        renders,
     })
 }
 

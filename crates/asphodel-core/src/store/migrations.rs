@@ -21,7 +21,7 @@ use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
 
 /// The schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// How long a pre-migration copy is kept after its migration completes.
 pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
@@ -58,23 +58,33 @@ const MIGRATIONS: &[(u32, &str)] = &[
         14,
         include_str!("../../migrations/0014_no_entry_snapshots.sql"),
     ),
+    (15, include_str!("../../migrations/0015_model_answers.sql")),
 ];
 
 /// The columns a migration adds, by version. Every migration is safe to run
 /// again over a store that already has what it adds, and SQLite has no
 /// `ADD COLUMN IF NOT EXISTS`, so a migration whose columns are all already
-/// there is skipped.
+/// there is skipped. A column whose table a later migration dropped counts
+/// as there.
 const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (11, "recalls", "raw_query"),
     (12, "sources", "removed_at"),
     (13, "mental_models", "plan"),
     (13, "mental_model_entries", "section"),
+    (15, "mental_models", "answer"),
 ];
 
 /// The columns a migration drops, by version, after its SQL runs. SQLite
 /// has no `DROP COLUMN IF EXISTS` either, so each is dropped only while
 /// it's there.
 const DROPPED_COLUMNS: &[(u32, &str, &str)] = &[(14, "prompt_blocks", "entries")];
+
+/// A migration's step in code.
+type Conversion = fn(&Connection) -> Result<(), rusqlite::Error>;
+
+/// What a migration does in code, by version, after its SQL runs. Each is
+/// safe to run again, and does nothing once what it converts is gone.
+const CONVERSIONS: &[(u32, Conversion)] = &[(15, crate::mental_models::entries_to_answers)];
 
 /// What one open applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,7 +191,7 @@ pub fn apply(
         }
         let mut added = false;
         for (_, table, column) in ADDED_COLUMNS.iter().filter(|(version, ..)| *version == to) {
-            added = has_column(&tx, table, column)?;
+            added = !has_table(&tx, table)? || has_column(&tx, table, column)?;
             if !added {
                 break;
             }
@@ -196,6 +206,9 @@ pub fn apply(
             if has_column(&tx, table, column)? {
                 tx.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))?;
             }
+        }
+        for (_, convert) in CONVERSIONS.iter().filter(|(version, _)| *version == to) {
+            convert(&tx)?;
         }
         current = to;
     }
@@ -219,6 +232,15 @@ pub fn apply(
         to: current,
         copy,
     })
+}
+
+/// Whether the database has `table`.
+fn has_table(conn: &Connection, table: &str) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
 }
 
 /// Whether `table` has `column`.

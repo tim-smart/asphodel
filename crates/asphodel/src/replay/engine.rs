@@ -225,8 +225,8 @@ struct Snapshot {
 }
 
 /// Answers every refresh without writing anything: a plan of one facet,
-/// the question itself, and an empty summary. Counts the writes, which are
-/// the refresh calls, and the plans.
+/// the question itself, and a write skipped ([`LlmClient::skips_write`]).
+/// Counts the writes, which are the refresh calls, and the plans.
 pub struct NoEdits {
     calls: Mutex<Vec<Timestamp>>,
     plans: Mutex<u64>,
@@ -239,30 +239,32 @@ impl LlmClient for NoEdits {
     }
 
     fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let json = if request.template.name == PLAN_TEMPLATE {
-            *self
-                .plans
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
-            let question = request
-                .user
-                .lines()
-                .next()
-                .and_then(|line| line.strip_prefix("Question: "))
-                .unwrap_or_default();
-            json!({ "facets": [{ "heading": "Answer", "query": question }] })
-        } else {
-            self.calls
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(self.clock.now());
-            json!({ "sections": [] })
-        };
+        if request.template.name != PLAN_TEMPLATE {
+            return Err(LlmError::NoContent);
+        }
+        *self
+            .plans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+        let question = request
+            .user
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("Question: "))
+            .unwrap_or_default();
         Ok(LlmResponse {
-            json,
+            json: json!({ "facets": [{ "heading": "Answer", "query": question }] }),
             usage: None,
             latency: Duration::ZERO,
         })
+    }
+
+    fn skips_write(&self, _request: &LlmRequest, _identities: &[(String, Uuid)]) -> bool {
+        self.calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(self.clock.now());
+        true
     }
 }
 
@@ -1219,18 +1221,17 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// The tokens the bank's mental model entries hold now.
+    /// The tokens the bank's mental model answers that the block shows
+    /// hold now.
     fn sample_profile_tokens(&mut self) -> Result<(), Failure> {
         let bank = &self.settings.bank;
         let mut tokens = 0u64;
         for model in self.service.list_models(bank)? {
-            let view = self.service.show_model(bank, &model.name, None)?;
-            tokens += view
-                .entry_views
-                .iter()
-                .filter(|entry| entry.renders)
-                .map(|entry| estimate_tokens(&entry.text) as u64)
-                .sum::<u64>();
+            let view = self.service.show_model(bank, &model.name)?;
+            if view.renders {
+                let answer = view.model.answer.as_deref().unwrap_or_default();
+                tokens += estimate_tokens(answer) as u64;
+            }
         }
         self.profile_tokens.push(tokens);
         Ok(())
@@ -1432,12 +1433,8 @@ impl<'a> Engine<'a> {
                 )
             }
             Check::ProfileHas { model, .. } | Check::ProfileLacks { model, .. } => {
-                let view = self.service.show_model(bank, model, None)?;
-                let cited: Vec<Uuid> = view
-                    .entry_views
-                    .iter()
-                    .flat_map(|entry| entry.cites.iter().map(|cite| cite.id))
-                    .collect();
+                let view = self.service.show_model(bank, model)?;
+                let cited = view.model.cites;
                 let has = memory.is_some_and(|id| cited.contains(&id));
                 let wants = matches!(probe.check, Check::ProfileHas { .. });
                 (has == wants, json!({ "id": memory, "cited": cited }))

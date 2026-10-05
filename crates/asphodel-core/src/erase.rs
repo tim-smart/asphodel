@@ -8,7 +8,7 @@
 //! **Forget splits in two.** Everything that can be undone
 //! happens when it's called: the chain is hidden (`hidden_at`), which keeps
 //! it out of recall, injection, the agenda, refresh inputs and `used`
-//! credit; model entries citing it are dropped; recall rows naming it are
+//! credit; a model citing it has its answer blanked; recall rows naming it are
 //! deleted; and it's scrubbed from every stored in-context set. The service
 //! scrubs the live sessions and clears the block. Deleting the rows,
 //! redacting the passages and the tombstone wait on the bank's queue as an
@@ -22,8 +22,8 @@
 //! **The erase** takes a chain and a reason. In common it deletes the
 //! memory rows (their vectors, FTS rows, entity links, accesses, recall
 //! results and citations go with them, and `ended_by` and `superseded_by`
-//! pointing in are cleared), drops model entries citing the chain for a
-//! refresh, deletes orphan entities, and writes one edit row of ids, never
+//! pointing in are cleared), blanks the answer of every model citing the
+//! chain for a refresh, deletes orphan entities, and writes one edit row of ids, never
 //! content. Forget also redacts every passage the chain rests on or was
 //! mentioned in, deletes the chain's recall rows and scrubs it from stored
 //! in-context sets again, for what joined it after the forget. Purge also
@@ -180,8 +180,8 @@ pub struct Erased {
 }
 
 /// What a forget or an erase leaves the service to do in memory: refresh
-/// the models whose entries went, clear the bank's block, and take the
-/// memories out of live sessions.
+/// the models whose answers were blanked, clear the bank's block, and take
+/// the memories out of live sessions.
 #[derive(Debug, Default)]
 pub(crate) struct Aftermath {
     pub models: BTreeSet<i64>,
@@ -382,7 +382,7 @@ fn hide(
             hide.execute((member, now))?;
         }
         drop(hide);
-        aftermath.models = drop_entries(tx, &members)?;
+        aftermath.models = blank_answers(tx, &members)?;
         delete_recalls(tx, &members)?;
         let scrub: BTreeSet<Uuid> = uuids.iter().copied().collect();
         scrub_stored(tx, bank_id, &scrub)?;
@@ -516,7 +516,7 @@ pub(crate) fn erase_chain(
         }
     }
 
-    aftermath.models = drop_entries(tx, members)?;
+    aftermath.models = blank_answers(tx, members)?;
     let mut redacted = Redacted::default();
     if reason == EraseReason::Forget {
         redacted = redact_chain(tx, members, &rows)?;
@@ -625,29 +625,30 @@ fn passages(conn: &Connection, members: &BTreeSet<i64>) -> Result<Vec<Passage>, 
     Ok(rows)
 }
 
-/// Deletes the model entries citing any of `members` and returns their
-/// models: code drops an entry when a memory it cites goes, and the model
-/// refreshes.
-fn drop_entries(
+/// Blanks the answer of every model citing any of `members`, deletes its
+/// citations, and returns the models: the answer restates what it cites,
+/// so it goes with the memory, and the model refreshes.
+fn blank_answers(
     conn: &Connection,
     members: &BTreeSet<i64>,
 ) -> Result<BTreeSet<i64>, rusqlite::Error> {
-    let mut citing = conn.prepare_cached(
-        "SELECT e.id, e.model_id FROM mental_model_citations c
-         JOIN mental_model_entries e ON e.id = c.entry_id
-         WHERE c.memory_id = ?1",
-    )?;
-    let mut entries = BTreeSet::new();
+    let mut citing =
+        conn.prepare_cached("SELECT model_id FROM mental_model_cites WHERE memory_id = ?1")?;
     let mut models = BTreeSet::new();
     for member in members {
-        for row in citing.query_map([member], |row| Ok((row.get::<_, i64>(0)?, row.get(1)?)))? {
-            let (entry, model) = row?;
-            entries.insert(entry);
-            models.insert(model);
+        for model in citing.query_map([member], |row| row.get::<_, i64>(0))? {
+            models.insert(model?);
         }
     }
-    for entry in entries {
-        conn.execute("DELETE FROM mental_model_entries WHERE id = ?1", [entry])?;
+    for model in &models {
+        conn.execute(
+            "UPDATE mental_models SET answer = NULL WHERE id = ?1",
+            [model],
+        )?;
+        conn.execute(
+            "DELETE FROM mental_model_cites WHERE model_id = ?1",
+            [model],
+        )?;
     }
     Ok(models)
 }
@@ -1235,8 +1236,8 @@ impl From<rusqlite::Error> for BankDeleteError {
 }
 
 /// Deletes a bank. Every memory goes
-/// through the erase path as one purge, which drops the model entries
-/// citing them and their vectors; then everything else the bank holds goes
+/// through the erase path as one purge, which blanks the model answers
+/// citing them and drops their vectors; then everything else the bank holds goes
 /// too, its tombstones, edit rows and session mappings included, and one
 /// daemon-wide `bank_deleted` row records the counts. The caller holds the
 /// bank's lease, so no chunk is in flight.

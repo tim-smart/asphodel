@@ -278,7 +278,7 @@ probes run on sessions named
 | `agenda_has`, `agenda_lacks` | `memory` | The bank's agenda at `at` lists, or doesn't list, the memory. |
 | `recall_finds`, `recall_lacks` | `memory`, `query` | Explicit recall for `query`, with no session, returns, or doesn't return, the memory. |
 | `injects`, `not_injects` | `memory`, `query` | A prefetch for `query` on a session no turn uses injects, or doesn't inject, the memory. Group `models` only. |
-| `profile_has`, `profile_lacks` | `model`, `memory` | The mental model has, or lacks, an entry citing the memory. Not in the first set: scripted refresh replies are open. |
+| `profile_has`, `profile_lacks` | `model`, `memory` | The mental model's answer cites, or doesn't cite, the memory. Not in the first set: scripted refresh replies are open. |
 
 `agenda_lacks` and `recall_lacks` are the negatives of `agenda_has` and `recall_finds`, the way `not_injects`
 negates `injects`, and the rescheduled appointment and Maya to Mia need
@@ -353,7 +353,7 @@ owner review after re-recording.
   follows the purge. A scenario's `[[model]]` sections create mental
   models before the first event so there is something to refresh. The
   scripted LLM plans a question as one facet, the question itself, and
-  writes an empty summary, so entries stay empty and
+  skips every write, as `--refresh off` does, so answers stay empty and
   `refresh_calls_per_day`, which counts the writes, is what a scenario can
   watch; scripted refresh replies are still open.
 - **Bank time** comes from the turns the engine ingests, chatter included.
@@ -561,15 +561,18 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   default) substitutes the recorded write of the same mental model, by the
   `Question:` line its request starts with, nearest in simulated time,
   among those made with this run's LLM model and template version; `live`
-  calls on a miss, and `off` answers with an empty summary. Memory handles
-  (`m1`, …) are positional, so a write's record keeps the memory each
-  stood for, and a substituted reply is carried over by identity: a
-  handle goes to the memory it meant, then to that memory's handle now.
-  A sentence citing any memory that isn't in this run's input is dropped,
-  and the rest of its section is kept. Citations are checked by identity
-  rather than by name. A write recorded before identities were kept
-  carries nothing over, and a `refresh_model` record from before schema
-  version 13 never stands in for a write. Triggers are counted
+  calls on a miss, and `off` skips every write: it's counted, and nothing
+  is written. Memory handles (`m1`, …) are positional, so a write's record
+  keeps the memory each stood for, and a substituted reply is carried
+  over by identity: a handle goes to the memory it meant, then to that
+  memory's handle now. The answer is carried over whole, and only when
+  every memory it cites is in this run's input; otherwise the write is
+  skipped as with `off`, since the text would rest on something the LLM
+  never saw here. Citations are checked by identity rather than by name.
+  A write recorded before identities were kept carries nothing over. A
+  `write_model` v1 record, sentence by sentence, never stands in for a v2
+  write, and a `refresh_model` record from before schema version 13
+  never stands in either. Triggers are counted
   by code in every mode. The mental models to refresh are the manifest's
   `[[model]]` tables, carried in the corpus header.
 - **Priming** (`--prime-concurrency [N]`, `fast` only) records call 1 for

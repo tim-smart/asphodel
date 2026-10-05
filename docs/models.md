@@ -126,8 +126,8 @@ the wire body or headers, so a recording made in one mode replays in the
 other.
 
 **Language.** Unset, `[llm] language` leaves call 1 writing each claim in
-the language of the passage it quotes and a refresh writing entries in the
-language of the memories they cite. Set to a language name such as
+the language of the passage it quotes and a refresh writing an answer in
+the language of the memories it cites. Set to a language name such as
 `"English"`, both write in that language and translate when the text is in
 another. A claim's `quote` and `surface_form` still match the text exactly,
 since a quote that isn't in the text throws the claim away, and entity names

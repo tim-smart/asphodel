@@ -1,5 +1,5 @@
 //! One refresh: a plan, one retrieval per facet, then one LLM call that
-//! writes the whole summary.
+//! writes the whole answer.
 //!
 //! 1. **Plan.** The facets of the model's question, each a heading and a
 //!    recall query. The seeded profile's question has them built in
@@ -25,29 +25,30 @@
 //!    question, the plan, the filters and `max_tokens` are hashed. Unless
 //!    forced, a refresh whose hash matches the last completed one's stops
 //!    here, with no write call.
-//! 4. **Drops.** An entry citing a memory that isn't in the selection is
-//!    dropped before the call: fading, retraction and ending take entries
-//!    out of the model, and the LLM can't keep them.
-//! 5. **The write.** The LLM gets the question, the facets, the selection
+//! 4. **The write.** The LLM gets the question, the facets, the selection
 //!    by handle under the facet that first found each memory, and the
-//!    remaining entries as the previous summary. It replies with the whole
-//!    summary: sections of sentences, each citing handles. With nothing
-//!    selected there's nothing to ask, and no call.
-//! 6. **Apply.** Code refuses a sentence citing outside the selection,
-//!    citing nothing, or with no text. A sentence whose text matches an
-//!    entry keeps that entry's id, and one citing exactly what an entry
-//!    cited keeps its id under new words, but citations and section always
-//!    come from the write. Every other sentence is new, and an entry the
-//!    write leaves out is removed. A reply that doesn't parse changes
-//!    nothing and records the error.
-//! 7. **Trim.** Over `max_tokens`, headings included, the lowest-ranked
-//!    entries go, ranked by the best score among each one's cited memories.
+//!    stored answer as the previous one. It replies with the whole answer,
+//!    a heading and a paragraph per section, and the handles of every
+//!    memory it rests on. A memory that left the selection isn't listed, so
+//!    the reply can't cite it, and the prompt says that what the listed
+//!    memories no longer support goes. With nothing selected there's
+//!    nothing to ask: the answer is cleared, with no call.
+//! 5. **Apply.** Code joins the sections into the stored text. A section
+//!    with no text is left out. A reply with no text, no citations or a
+//!    citation outside the selection changes nothing and is recorded like
+//!    one that doesn't parse. Code can check the citations, not the prose.
+//! 6. **Trim.** Over `max_tokens`, measured on the stored text with its
+//!    headings, sentences go from the end ([`Answer::trim_to`]).
+//! 7. **Store.** The answer and its citations replace the old ones whole,
+//!    unless a memory it cites was forgotten while it was written, or a
+//!    forget blanked the answer meanwhile: then nothing is stored, and the
+//!    refresh the forget requested writes it again.
 //!
 //! The prompts and replies are never written to disk, so forget has nothing
 //! to scrub there. Each facet's retrieval writes one `refresh` row to the
 //! recall log, with its query, and nothing writes an access.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use rusqlite::OptionalExtension;
@@ -58,9 +59,9 @@ use uuid::Uuid;
 
 use super::schedule::Schedule;
 use super::{
-    Applied, Facet, FailureKind, InputEntry, InputMemory, ModelError, ModelRow, Outcome,
-    PLAN_TEMPLATE, PLAN_VERSION, RefreshInput, RejectReason, Rejected, StoredEntry, StoredPlan,
-    WRITE_TEMPLATE, WRITE_VERSION, load_entries, volatility_str,
+    Answer, Applied, Facet, FailureKind, InputMemory, ModelError, ModelRow, Outcome, PLAN_TEMPLATE,
+    PLAN_VERSION, RefreshInput, RejectReason, Rejected, StoredPlan, WRITE_TEMPLATE, WRITE_VERSION,
+    load_cites, volatility_str,
 };
 use crate::constants::TAU;
 use crate::models::{LlmClient, LlmError, LlmRequest, Template};
@@ -73,12 +74,8 @@ use crate::strength::Phase;
 
 /// What a refresh works from.
 struct Selection {
-    selected: Vec<Selected>,
     /// Memory rowid to handle.
     handles: BTreeMap<i64, String>,
-    /// The entries whose citations are all in the selection, in order.
-    survivors: Vec<StoredEntry>,
-    dropped: Vec<StoredEntry>,
     input: RefreshInput,
 }
 
@@ -88,23 +85,23 @@ fn select(
     facets: Vec<Facet>,
     log: bool,
 ) -> Result<Selection, ModelError> {
-    let (entries, linked) = {
+    let (previous, cited, linked) = {
         let conn = cx.store.connection();
-        let entries = load_entries(&conn, model.id)?;
+        let previous: Option<String> = conn.query_row(
+            "SELECT answer FROM mental_models WHERE id = ?1",
+            [model.id],
+            |row| row.get(0),
+        )?;
+        let cited: Vec<i64> = load_cites(&conn, model.id)?
+            .into_iter()
+            .map(|(memory, _)| memory)
+            .collect();
         let linked = match model.entity_id {
             Some(entity) => Some(linked_memories(&conn, model.bank_id, entity)?),
             None => None,
         };
-        (entries, linked)
+        (previous, cited, linked)
     };
-    let mut cited: Vec<i64> = Vec::new();
-    for entry in &entries {
-        for (memory, _) in &entry.cites {
-            if !cited.contains(memory) {
-                cited.push(*memory);
-            }
-        }
-    }
     let keep = |candidate: &Candidate| {
         // Only current memories: nothing retracted (clean-up drops those),
         // ended or long past.
@@ -163,14 +160,6 @@ fn select(
         .enumerate()
         .map(|(index, item)| (item.candidate.id, format!("m{}", index + 1)))
         .collect();
-    let (survivors, dropped): (Vec<StoredEntry>, Vec<StoredEntry>) =
-        entries.into_iter().partition(|entry| {
-            !entry.cites.is_empty()
-                && entry
-                    .cites
-                    .iter()
-                    .all(|(memory, _)| handles.contains_key(memory))
-        });
     let input = RefreshInput {
         question: model.question.clone(),
         language: cx.tuning.llm.language.clone(),
@@ -188,37 +177,19 @@ fn select(
                     .unwrap_or_default(),
             })
             .collect(),
-        entries: survivors
-            .iter()
-            .map(|entry| InputEntry {
-                entry: entry.uuid,
-                section: entry.section.clone(),
-                text: entry.text.clone(),
-                cites: entry
-                    .cites
-                    .iter()
-                    .map(|(memory, _)| handles[memory].clone())
-                    .collect(),
-            })
-            .collect(),
+        previous,
         fingerprint: fingerprint(model, &facets, &selected),
         facets,
     };
-    Ok(Selection {
-        selected,
-        handles,
-        survivors,
-        dropped,
-        input,
-    })
+    Ok(Selection { handles, input })
 }
 
 /// The selection from each facet's best, in rank order: the first of each
 /// facet in turn, then the second of each, and so on, skipping a memory
 /// already in, until there are `budget`. Then the memories in `cited` that
 /// any facet scored, best first, until there are `with_cited`. A memory
-/// keeps the best score any facet gave it, which trimming ranks by. Returns
-/// the selection with the index of the facet that first found each memory,
+/// keeps the best score any facet gave it, which the cited fill ranks by.
+/// Returns the selection with the index of the facet that first found each memory,
 /// or, for one the cited fill took, the facet that scored it best.
 /// `extras` are the cited memories each facet scored past its best.
 fn interleave(
@@ -395,14 +366,10 @@ pub(crate) fn refresh(
     }
 
     if selection.input.memories.is_empty() {
-        // Nothing qualifies, so every entry has already been dropped and
-        // there's nothing to ask: an empty model costs no write call.
-        let applied = Applied {
-            dropped: selection.dropped.iter().map(|entry| entry.uuid).collect(),
-            ..Applied::default()
-        };
-        write(cx, model, &selection, &[], started)?;
-        return Ok(Outcome::Applied(applied));
+        // Nothing qualifies, so there's nothing for an answer to rest on
+        // and nothing to ask: the answer is cleared, with no write call.
+        store(cx, model, &selection, None, started)?;
+        return Ok(Outcome::Applied(Applied::default()));
     }
     let request = write_request(&selection.input);
     let identities: Vec<(String, Uuid)> = selection
@@ -411,28 +378,33 @@ pub(crate) fn refresh(
         .iter()
         .map(|memory| (memory.handle.clone(), memory.memory))
         .collect();
+    if llm.skips_write(&request, &identities) {
+        // Replay's `--refresh off`: the write counts as made and changes
+        // nothing, so the schedule runs as it would have.
+        settle(cx, model, &selection, started)?;
+        return Ok(Outcome::Applied(Applied::default()));
+    }
     let reply = match llm.complete_identified(&request, &identities) {
         Ok(response) => response.json,
         Err(error) => return llm_failed(cx, schedule, model, &error),
     };
-    let Ok(reply) = serde_json::from_value::<Written>(reply) else {
-        tracing::warn!(model = %model.uuid, "a mental model refresh got a malformed summary");
+    let Some((mut written, applied)) = serde_json::from_value::<Written>(reply)
+        .ok()
+        .and_then(|reply| apply(&selection, reply))
+    else {
+        tracing::warn!(model = %model.uuid, "a mental model refresh got a malformed answer");
         return failed(cx, model, FailureKind::Malformed);
     };
-
-    let mut applied = Applied {
-        dropped: selection.dropped.iter().map(|entry| entry.uuid).collect(),
-        ..Applied::default()
-    };
-    let mut drafts = apply(cx, &selection, reply, &mut applied);
-    trim(
-        &selection.selected,
-        model.max_tokens,
-        &mut drafts,
-        &mut applied,
-    );
-    write(cx, model, &selection, &drafts, started)?;
-    Ok(Outcome::Applied(applied))
+    let max_tokens = model.max_tokens as usize;
+    let trimmed = written
+        .answer
+        .trim_to(|answer| estimate_tokens(&answer.text()) <= max_tokens);
+    let stored = store(cx, model, &selection, Some(&written), started)?;
+    Ok(Outcome::Applied(Applied {
+        written: stored,
+        trimmed,
+        ..applied
+    }))
 }
 
 /// The model's generation when a refresh started.
@@ -630,26 +602,25 @@ fn plan(
 
 // The write.
 
-const WRITE_SYSTEM: &str = "You write a mental model: a short summary that answers a standing \
-question about the user, built only from their memories. Write it in sections, one for each facet \
-listed, in that order and under the facet's heading, and leave out a section the memories say \
-nothing about. A section is a few plain sentences that read as a paragraph. Each sentence is an \
-entry of about 25 words at most, says nothing the memories it cites don't support, and cites by \
-handle every memory it rests on. Use names, not pronouns. {language_rule}
+const WRITE_SYSTEM: &str = "You write a mental model: a short answer to a standing question \
+about the user, built only from their memories. Write it as connected prose, a section for each \
+facet listed, in that order and under the facet's heading, and leave out a facet the memories say \
+nothing about. A section is one paragraph that reads as a whole, with what matters most first. Say \
+nothing the memories you cite don't support, and use names, not pronouns, for the people in it. \
+{language_rule}
 
-The previous summary is there to keep the wording steady. Restate a sentence word for word when \
-the memories listed still support it, reword it when they say something new, and leave it out \
-when they no longer support it or it no longer answers the question: anything you leave out is \
-removed. Cite only the memory handles listed (m1, m2, ...); every sentence must cite at least one. \
-Keep the whole summary, headings included, within the token budget, about four characters to a \
-token, and put what matters most first in each section.";
+The previous answer is there to keep the wording steady. Restate what the memories listed still \
+support, reword what they change, and leave out what they no longer support or what no longer \
+answers the question: anything you leave out is gone. Cite by handle every memory the answer rests \
+on, as one list for the whole answer, and only the handles listed (m1, m2, ...). Keep the whole \
+answer, headings included, within the token budget, about four characters to a token.";
 
 /// The write's system prompt, with the language rule for `language`.
 fn write_system(language: Option<&str>) -> String {
     let rule = match language {
-        None => "Write the entries in the language of the memories they cite.".to_owned(),
+        None => "Write in the language of the memories you cite.".to_owned(),
         Some(language) => format!(
-            "Write every entry in {}, translating if the memories are in another language.",
+            "Write in {}, translating if the memories are in another language.",
             language.trim()
         ),
     };
@@ -667,24 +638,15 @@ fn write_request(input: &RefreshInput) -> LlmRequest {
         user.push_str(&format!("- {}\n", facet.heading));
     }
 
-    user.push_str("\nPrevious summary:\n");
-    if input.entries.is_empty() {
-        user.push_str("(none)\n");
-    }
-    let mut heading: Option<&Option<String>> = None;
-    for entry in &input.entries {
-        if heading != Some(&entry.section) {
-            match &entry.section {
-                Some(section) => user.push_str(&format!("### {section}\n")),
-                None => user.push_str("### (no heading)\n"),
-            }
-            heading = Some(&entry.section);
+    user.push_str("\nPrevious answer:\n");
+    // Its headings a level under the facets' below, which are what the
+    // reply's sections are written under.
+    match &input.previous {
+        Some(previous) => {
+            user.push_str(&Answer::parse(previous).render("####"));
+            user.push('\n');
         }
-        user.push_str(&format!(
-            "- {} [cites {}]\n",
-            entry.text,
-            entry.cites.join(", ")
-        ));
+        None => user.push_str("(none)\n"),
     }
 
     user.push_str("\nMemories, under the facet that found each:\n");
@@ -707,7 +669,7 @@ fn write_request(input: &RefreshInput) -> LlmRequest {
         },
         system: write_system(input.language.as_deref()),
         user,
-        schema_name: "mental_model_summary".into(),
+        schema_name: "mental_model_answer".into(),
         schema: write_schema(),
         max_tokens: None,
     }
@@ -723,240 +685,90 @@ fn write_schema() -> Value {
                     "type": "object",
                     "properties": {
                         "heading": {"type": "string"},
-                        "sentences": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "text": {"type": "string"},
-                                    "cites": {"type": "array", "items": {"type": "string"}},
-                                },
-                                "required": ["text", "cites"],
-                                "additionalProperties": false,
-                            },
-                        },
+                        "text": {"type": "string"},
                     },
-                    "required": ["heading", "sentences"],
+                    "required": ["heading", "text"],
                     "additionalProperties": false,
                 },
             },
+            "cites": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["sections"],
+        "required": ["sections", "cites"],
         "additionalProperties": false,
     })
 }
 
+/// The write's reply. A first-version reply, sentence by sentence, has no
+/// `text` or `cites`, and doesn't parse.
 #[derive(Deserialize)]
 struct Written {
     sections: Vec<WrittenSection>,
+    cites: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct WrittenSection {
     #[serde(default)]
     heading: Option<String>,
-    sentences: Vec<WrittenSentence>,
-}
-
-#[derive(Deserialize)]
-struct WrittenSentence {
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    cites: Vec<String>,
-}
-
-/// An entry as the refresh leaves it.
-struct Draft {
-    /// The stored row, for an entry that was there before.
-    stored: Option<i64>,
-    uuid: Uuid,
-    section: Option<String>,
     text: String,
-    cites: Vec<i64>,
-    /// The text, citations or section differ from the stored row's.
-    changed: bool,
 }
 
-/// A sentence that passed the citation checks.
+/// A reply that passed the checks: its answer and the memories it cites,
+/// by rowid, each once in the order given.
 struct Accepted {
-    section: Option<String>,
-    text: String,
+    answer: Answer,
     cites: Vec<i64>,
 }
 
-fn apply(
-    cx: &Context<'_>,
-    selection: &Selection,
-    reply: Written,
-    applied: &mut Applied,
-) -> Vec<Draft> {
+/// The reply as an answer, or `None` when it has no text, cites nothing or
+/// cites a handle that isn't in the selection.
+fn apply(selection: &Selection, reply: Written) -> Option<(Accepted, Applied)> {
     let memories: BTreeMap<&str, i64> = selection
         .handles
         .iter()
         .map(|(memory, handle)| (handle.as_str(), *memory))
         .collect();
-    let cites = |handles: &[String]| -> Result<Vec<i64>, RejectReason> {
-        if handles.is_empty() {
-            return Err(RejectReason::NoCitations);
-        }
-        let mut ids = Vec::new();
-        for handle in handles {
-            let id = memories
-                .get(handle.trim())
-                .ok_or(RejectReason::CitesOutsideInput)?;
-            if !ids.contains(id) {
-                ids.push(*id);
-            }
-        }
-        Ok(ids)
-    };
-
-    let mut accepted: Vec<Accepted> = Vec::new();
-    let mut index = 0;
-    for section in reply.sections {
-        let heading = section
-            .heading
-            .as_deref()
-            .map(str::trim)
-            .filter(|heading| !heading.is_empty())
-            .map(str::to_owned);
-        for sentence in section.sentences {
-            let outcome = (|| {
-                let text = match sentence.text.as_deref().map(str::trim) {
-                    Some(text) if !text.is_empty() => text.to_owned(),
-                    _ => return Err(RejectReason::EmptyText),
-                };
-                Ok(Accepted {
-                    section: heading.clone(),
-                    text,
-                    cites: cites(&sentence.cites)?,
-                })
-            })();
-            match outcome {
-                Ok(sentence) => accepted.push(sentence),
-                Err(reason) => applied.rejected.push(Rejected { index, reason }),
-            }
-            index += 1;
+    let mut cites: Vec<i64> = Vec::new();
+    for handle in &reply.cites {
+        let memory = *memories.get(handle.trim())?;
+        if !cites.contains(&memory) {
+            cites.push(memory);
         }
     }
-
-    // Which entry each sentence restates: the same text first, then, among
-    // the rest, the same citations.
-    let survivors = &selection.survivors;
-    let mut claimed: Vec<Option<usize>> = vec![None; accepted.len()];
-    let mut taken = vec![false; survivors.len()];
-    let same_cites = |entry: &StoredEntry, cites: &[i64]| {
-        let stored: BTreeSet<i64> = entry.cites.iter().map(|(memory, _)| *memory).collect();
-        stored == cites.iter().copied().collect()
-    };
-    for matches in [
-        &(|entry: &StoredEntry, sentence: &Accepted| entry.text == sentence.text)
-            as &dyn Fn(&StoredEntry, &Accepted) -> bool,
-        &|entry: &StoredEntry, sentence: &Accepted| same_cites(entry, &sentence.cites),
-    ] {
-        for (sentence, claim) in accepted.iter().zip(claimed.iter_mut()) {
-            if claim.is_some() {
-                continue;
-            }
-            if let Some(found) =
-                (0..survivors.len()).find(|&at| !taken[at] && matches(&survivors[at], sentence))
-            {
-                taken[found] = true;
-                *claim = Some(found);
-            }
+    if cites.is_empty() {
+        return None;
+    }
+    let mut applied = Applied::default();
+    for (index, section) in reply.sections.iter().enumerate() {
+        if section.text.trim().is_empty() {
+            applied.rejected.push(Rejected {
+                index,
+                reason: RejectReason::EmptyText,
+            });
         }
     }
-
-    let mut drafts = Vec::with_capacity(accepted.len());
-    for (sentence, claim) in accepted.into_iter().zip(claimed) {
-        match claim {
-            Some(at) => {
-                let entry = &survivors[at];
-                let changed = entry.text != sentence.text
-                    || entry.section != sentence.section
-                    || !same_cites(entry, &sentence.cites);
-                if changed {
-                    applied.edited.push(entry.uuid);
-                }
-                drafts.push(Draft {
-                    stored: Some(entry.id),
-                    uuid: entry.uuid,
-                    section: sentence.section,
-                    text: sentence.text,
-                    cites: sentence.cites,
-                    changed,
-                });
-            }
-            None => {
-                let uuid = cx.store.new_id();
-                applied.added.push(uuid);
-                drafts.push(Draft {
-                    stored: None,
-                    uuid,
-                    section: sentence.section,
-                    text: sentence.text,
-                    cites: sentence.cites,
-                    changed: true,
-                });
-            }
-        }
+    let answer = Answer::new(
+        reply
+            .sections
+            .into_iter()
+            .map(|section| (section.heading, section.text)),
+    );
+    if answer.is_empty() {
+        return None;
     }
-    for (entry, taken) in survivors.iter().zip(taken) {
-        if !taken {
-            applied.removed.push(entry.uuid);
-        }
-    }
-    drafts
+    Some((Accepted { answer, cites }, applied))
 }
 
-/// Drops the lowest-ranked entries until the rest, with a heading line for
-/// each section they leave, fit `max_tokens`. An entry ranks by the best
-/// score among its cited memories; of two equal, the later one goes.
-fn trim(selected: &[Selected], max_tokens: u32, drafts: &mut Vec<Draft>, applied: &mut Applied) {
-    let scores: BTreeMap<i64, f64> = selected
-        .iter()
-        .map(|item| (item.candidate.id, item.score))
-        .collect();
-    let rank = |draft: &Draft| {
-        draft
-            .cites
-            .iter()
-            .filter_map(|memory| scores.get(memory))
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max)
-    };
-    let tokens = |drafts: &[Draft]| -> usize {
-        let headings: BTreeSet<&str> = drafts
-            .iter()
-            .filter_map(|draft| draft.section.as_deref())
-            .collect();
-        drafts
-            .iter()
-            .map(|d| estimate_tokens(&d.text))
-            .sum::<usize>()
-            + headings
-                .iter()
-                .map(|heading| estimate_tokens(&crate::system_prompt::heading_line(heading)))
-                .sum::<usize>()
-    };
-    while !drafts.is_empty() && tokens(drafts) > max_tokens as usize {
-        let mut lowest = 0;
-        for (index, draft) in drafts.iter().enumerate() {
-            if rank(draft) <= rank(&drafts[lowest]) {
-                lowest = index;
-            }
-        }
-        let draft = drafts.remove(lowest);
-        applied.edited.retain(|uuid| *uuid != draft.uuid);
-        applied.trimmed.push(draft.uuid);
-    }
-}
-
-/// Whether every memory `draft` cites is still there and visible, and the
-/// entry it restates, if any, still exists.
-fn still_standing(tx: &rusqlite::Transaction<'_>, draft: &Draft) -> Result<bool, rusqlite::Error> {
-    for memory in &draft.cites {
+/// Whether a reply made from `selection` can still be stored: no memory it
+/// cites was forgotten or erased while it was written, and no forget has
+/// blanked the answer it was shown.
+fn still_standing(
+    tx: &rusqlite::Transaction<'_>,
+    model: &ModelRow,
+    selection: &Selection,
+    cites: &[i64],
+) -> Result<bool, rusqlite::Error> {
+    for memory in cites {
         let visible: Option<bool> = tx
             .query_row(
                 "SELECT hidden_at IS NULL FROM memories WHERE id = ?1",
@@ -968,93 +780,77 @@ fn still_standing(tx: &rusqlite::Transaction<'_>, draft: &Draft) -> Result<bool,
             return Ok(false);
         }
     }
-    match draft.stored {
-        Some(entry) => Ok(tx
-            .query_row(
-                "SELECT 1 FROM mental_model_entries WHERE id = ?1",
-                [entry],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some()),
-        None => Ok(true),
-    }
+    let answer: Option<Option<String>> = tx
+        .query_row(
+            "SELECT answer FROM mental_models WHERE id = ?1",
+            [model.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(answer.is_some_and(|answer| answer == selection.input.previous))
 }
 
-fn write(
+/// Stores `written`, or clears the answer when it's `None` or trimmed to
+/// nothing, and records the refresh as completed. Returns whether an
+/// answer was stored. A reply that no longer stands
+/// ([`still_standing`]) stores nothing and leaves the refresh requested.
+fn store(
     cx: &Context<'_>,
     model: &ModelRow,
     selection: &Selection,
-    drafts: &[Draft],
+    written: Option<&Accepted>,
     started: Started<'_>,
-) -> Result<(), ModelError> {
-    let now = micros(cx.store.now());
+) -> Result<bool, ModelError> {
     let mut conn = cx.store.connection();
     let tx = conn.transaction()?;
-    // The LLM answered from a selection made before its call. A memory
-    // forgotten or erased since can't be cited again, and an entry a forget
-    // dropped meanwhile can't be restated: such a draft goes, as one failing
-    // the citation check does.
-    let drafts: Vec<&Draft> = {
-        let mut standing = Vec::with_capacity(drafts.len());
-        for draft in drafts {
-            if still_standing(&tx, draft)? {
-                standing.push(draft);
-            }
-        }
-        standing
-    };
-    let kept: BTreeSet<i64> = drafts.iter().filter_map(|draft| draft.stored).collect();
-    for entry in selection.survivors.iter().chain(&selection.dropped) {
-        if !kept.contains(&entry.id) {
-            tx.execute("DELETE FROM mental_model_entries WHERE id = ?1", [entry.id])?;
-        }
+    let written = written.filter(|written| !written.answer.is_empty());
+    if let Some(written) = written
+        && !still_standing(&tx, model, selection, &written.cites)?
+    {
+        return Ok(false);
     }
-    for (position, draft) in drafts.iter().enumerate() {
-        let entry = match draft.stored {
-            Some(entry) => {
-                tx.execute(
-                    "UPDATE mental_model_entries SET position = ?2 WHERE id = ?1",
-                    (entry, position as i64),
-                )?;
-                if !draft.changed {
-                    continue;
-                }
-                tx.execute(
-                    "UPDATE mental_model_entries SET text = ?2, section = ?3, updated_at = ?4
-                     WHERE id = ?1",
-                    (entry, &draft.text, &draft.section, now),
-                )?;
-                tx.execute(
-                    "DELETE FROM mental_model_citations WHERE entry_id = ?1",
-                    [entry],
-                )?;
-                entry
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO mental_model_entries (uuid, model_id, position, text, section,
-                                                       created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                    (
-                        draft.uuid.to_string(),
-                        model.id,
-                        position as i64,
-                        &draft.text,
-                        &draft.section,
-                        now,
-                    ),
-                )?;
-                tx.last_insert_rowid()
-            }
-        };
-        for memory in &draft.cites {
-            tx.execute(
-                "INSERT OR IGNORE INTO mental_model_citations (entry_id, memory_id) VALUES (?1, ?2)",
-                (entry, memory),
-            )?;
-        }
+    tx.execute(
+        "UPDATE mental_models SET answer = ?2 WHERE id = ?1",
+        (model.id, written.map(|written| written.answer.text())),
+    )?;
+    tx.execute(
+        "DELETE FROM mental_model_cites WHERE model_id = ?1",
+        [model.id],
+    )?;
+    for memory in written.iter().flat_map(|written| &written.cites) {
+        tx.execute(
+            "INSERT OR IGNORE INTO mental_model_cites (model_id, memory_id) VALUES (?1, ?2)",
+            (model.id, memory),
+        )?;
     }
+    completed(&tx, cx, model, selection, started)?;
+    tx.commit()?;
+    Ok(written.is_some())
+}
+
+/// Records the refresh as completed without touching the answer.
+fn settle(
+    cx: &Context<'_>,
+    model: &ModelRow,
+    selection: &Selection,
+    started: Started<'_>,
+) -> Result<(), ModelError> {
+    let mut conn = cx.store.connection();
+    let tx = conn.transaction()?;
+    completed(&tx, cx, model, selection, started)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The refresh's fingerprint and time, with the error and, unless a request
+/// came in while it ran, the request cleared.
+fn completed(
+    tx: &rusqlite::Transaction<'_>,
+    cx: &Context<'_>,
+    model: &ModelRow,
+    selection: &Selection,
+    started: Started<'_>,
+) -> Result<(), rusqlite::Error> {
     tx.execute(
         "UPDATE mental_models SET last_fingerprint = ?2, last_refreshed_at = ?3,
                 last_error_kind = NULL, last_error_at = NULL,
@@ -1064,10 +860,9 @@ fn write(
         (
             model.id,
             &selection.input.fingerprint,
-            now,
+            micros(cx.store.now()),
             started.unchanged(),
         ),
     )?;
-    tx.commit()?;
     Ok(())
 }

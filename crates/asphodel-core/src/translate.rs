@@ -286,11 +286,11 @@ pub(crate) fn commit(
     repoint_ends(&tx, store, named, head)?;
     // A citation moves to the head, where its accesses are inherited.
     tx.execute(
-        "UPDATE OR IGNORE mental_model_citations SET memory_id = ?2 WHERE memory_id = ?1",
+        "UPDATE OR IGNORE mental_model_cites SET memory_id = ?2 WHERE memory_id = ?1",
         (named.id, head),
     )?;
     tx.execute(
-        "DELETE FROM mental_model_citations WHERE memory_id = ?1",
+        "DELETE FROM mental_model_cites WHERE memory_id = ?1",
         [named.id],
     )?;
     tx.commit()?;

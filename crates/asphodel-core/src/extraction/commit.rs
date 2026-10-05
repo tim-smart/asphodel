@@ -194,12 +194,12 @@ pub(super) fn commit(
                 // A citation of a refined memory moves to
                 // the head of its chain, where its accesses are inherited.
                 tx.execute(
-                    "UPDATE OR IGNORE mental_model_citations SET memory_id = ?2
+                    "UPDATE OR IGNORE mental_model_cites SET memory_id = ?2
                      WHERE memory_id = ?1",
                     (neighbour, by.id),
                 )?;
                 tx.execute(
-                    "DELETE FROM mental_model_citations WHERE memory_id = ?1",
+                    "DELETE FROM mental_model_cites WHERE memory_id = ?1",
                     [neighbour],
                 )?;
             }
