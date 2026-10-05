@@ -1432,12 +1432,13 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     }
     assert!(!detail.contains(ENTRY), "{detail}");
 
-    // The block holds the section, and a session's fetch puts the cited
+    // The block joins the entries, and a session's fetch puts the cited
     // memory in context, so prefetch doesn't inject it.
     let block = daemon.get_ok("/v1/banks/main/system-prompt?session_id=s1");
     let text = block["text"].as_str().unwrap();
     assert!(text.contains("User profile"), "{text}");
-    assert!(paragraph_after(text, "Home"), "{text}");
+    let (_, output) = text.split_once("\nOutput:\n").expect("model output");
+    assert_eq!(output, format!("{ENTRY} {SECOND}"), "{text}");
     assert!(!text.contains("Plans"), "a disabled model was rendered");
     assert_eq!(block["cited"], json!([memory]));
     assert_eq!(
