@@ -40,6 +40,7 @@
           pkgs.clippy
           pkgs.rustfmt
           pkgs.rust-analyzer
+          pkgs.cargo-nextest
           pkgs.pkg-config
           pkgs.openssl
           pkgs.sqlite
