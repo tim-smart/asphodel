@@ -8,6 +8,9 @@
 //!   with recall candidates at sampled turns, scored with the
 //!   reranker logit the gate floor compares, and call 2's candidate lists,
 //!   scored with the cosine similarity the reconcile floor compares.
+//! - It also writes, for a sample of refreshes, each facet's whole pool
+//!   before the facet budget cut it: every candidate's reranker logit, what
+//!   took or cut it and the writer handle it reached, if any.
 //! - `asphodel report precision --labels L --material M` prints the
 //!   precision curve for each list as JSON, with how many labels matched a
 //!   candidate, how many found nothing and how many candidates have none,
@@ -32,7 +35,7 @@
 
 mod support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -438,6 +441,236 @@ fn labelling_material_holds_scored_candidates_at_sampled_turns_and_call2_lists()
         !curve["recall"]["curve"].as_array().unwrap().is_empty(),
         "{curve}"
     );
+}
+
+// Refresh calibration material.
+
+/// What Tim says, one turn each, and the memory each makes. The first four
+/// share "family" with the profile's People facet; the rest share no word
+/// with any profile facet's query, so the fake reranker scores them below
+/// zero under every facet.
+const REFRESH_FACTS: [(&str, &str); 12] = [
+    (
+        "I cook pasta for family every Friday",
+        "Tim cooks pasta for family every Friday.",
+    ),
+    (
+        "I drive family north each summer",
+        "Tim drives family north each summer.",
+    ),
+    (
+        "I keep a family recipe book",
+        "Tim keeps a family recipe book.",
+    ),
+    (
+        "I play chess with family on Sundays",
+        "Tim plays chess with family on Sundays.",
+    ),
+    (
+        "I measured a fridge at sixty centimetres",
+        "Tim measured a fridge at sixty centimetres.",
+    ),
+    (
+        "I set a webhook timeout at thirty seconds",
+        "Tim set a webhook timeout at thirty seconds.",
+    ),
+    ("I own a blue kayak", "Tim owns a blue kayak."),
+    ("I bought a cordless drill", "Tim bought a cordless drill."),
+    (
+        "I ran a marathon last October",
+        "Tim ran a marathon last October.",
+    ),
+    (
+        "I grow tomatoes on a balcony",
+        "Tim grows tomatoes on a balcony.",
+    ),
+    ("I read maps for fun", "Tim reads maps for fun."),
+    ("I collect old stamps", "Tim collects old stamps."),
+];
+
+/// One session per fact, an hour apart.
+fn refresh_history(dir: &TestDir) -> PathBuf {
+    import_history(dir, |path| {
+        let db = StateDb::create(path);
+        for (turn, (quote, _)) in REFRESH_FACTS.iter().enumerate() {
+            let session = format!("s{turn:02}");
+            let at = start() + 3600.0 * turn as f64;
+            db.owner_session(&session, at);
+            db.turn(&session, at, &format!("By the way, {quote}."), "Noted.");
+        }
+        db
+    })
+}
+
+/// Every call 1 claims every fact, kept only in the turn that quotes it,
+/// and call 2 labels nothing.
+fn refresh_script(dir: &TestDir) -> PathBuf {
+    let claims = REFRESH_FACTS
+        .iter()
+        .map(|(quote, sentence)| {
+            let mut claim = claim(sentence, quote, "fact");
+            claim["claim"] = json!("c1");
+            claim["labels"] = json!([]);
+            claim
+        })
+        .collect();
+    script_answering_everything(dir, "refresh-script", claims, vec![])
+}
+
+/// A probe the facts pass, since the home memory isn't among them.
+const REFRESH_PROBES: &str = r#"
+[[probe]]
+id = "p001"
+at = "2026-01-06T12:00:00Z"
+kind = "exists"
+memory = "family recipe book"
+"#;
+
+/// A `replay` of the recorded cassette with `flags`, writing its material
+/// to `labelling/<name>.json` when `name` is given; returns the report and
+/// the material's path.
+fn refresh_replay(
+    dir: &TestDir,
+    corpus: &Path,
+    name: Option<&str>,
+    flags: &[&str],
+) -> (Value, PathBuf) {
+    let path = dir.private_path(&format!("labelling/{}.json", name.unwrap_or("none")));
+    let mut flags = flags.to_vec();
+    if name.is_some() {
+        flags.extend(["--labelling", path.to_str().unwrap()]);
+    }
+    let run = replay_history(dir, corpus, "replay", REFRESH_PROBES, None, &flags);
+    (run.ok(), path)
+}
+
+/// The refresh samples of `material`, by refresh: its time and model.
+fn refreshes(material: &Value) -> BTreeMap<(String, String), Vec<&Value>> {
+    let mut by_refresh = BTreeMap::new();
+    for sample in material["refresh"]
+        .as_array()
+        .expect("a refresh list beside recall and call 2")
+    {
+        let at = sample["at"].as_str().expect("a refresh sample's time");
+        let model = sample["model"].as_str().expect("a refresh sample's model");
+        by_refresh
+            .entry((at.to_string(), model.to_string()))
+            .or_insert_with(Vec::new)
+            .push(sample);
+    }
+    by_refresh
+}
+
+/// `--labelling` also writes, for a sample of refreshes, every facet's whole
+/// pool before it was cut to `facet_budget`: each candidate's raw reranker
+/// logit against the query the facet scored, whether the facet's budget took
+/// it or cut it, and the handle it reached the writer under. So a memory the
+/// writer never saw is still in the material, scored, which is what a
+/// refresh floor is calibrated from. Writing it doesn't change the run, the
+/// same run writes the same bytes, and `report precision` reads facet labels
+/// keyed by the facet's query and the memory.
+#[test]
+fn labelling_material_holds_each_refresh_facets_whole_scored_pool() {
+    let dir = TestDir::new();
+    let corpus = refresh_history(&dir);
+    let script = refresh_script(&dir);
+    let budget = overrides(&dir, "[mental_models]\nfacet_budget = 2\n");
+    let tuned = ["--overrides", budget.as_str()];
+    replay_history(&dir, &corpus, "live", REFRESH_PROBES, Some(&script), &tuned).ok();
+    let (plain, _) = refresh_replay(&dir, &corpus, None, &tuned);
+
+    let (labelled, material_path) = refresh_replay(&dir, &corpus, Some("material"), &tuned);
+    assert_eq!(
+        simulation(&plain),
+        simulation(&labelled),
+        "writing the material changes nothing the run simulated"
+    );
+    let bytes = fs::read(&material_path).expect("the material is written");
+    let material: Value = serde_json::from_slice(&bytes).expect("the material is JSON");
+    let (_, again) = refresh_replay(&dir, &corpus, Some("again"), &tuned);
+    assert_eq!(
+        fs::read(again).unwrap(),
+        bytes,
+        "the same run samples the same refreshes"
+    );
+
+    let by_refresh = refreshes(&material);
+    assert!(!by_refresh.is_empty(), "a refresh is sampled: {material}");
+    let mut excluded = None;
+    let mut below_zero = 0;
+    for samples in by_refresh.values() {
+        let mut indexes: Vec<u64> = samples
+            .iter()
+            .map(|sample| sample["facet_index"].as_u64().expect("a facet index"))
+            .collect();
+        indexes.sort_unstable();
+        let every_facet: Vec<u64> = (0..samples.len() as u64).collect();
+        assert_eq!(
+            indexes, every_facet,
+            "every facet of a refresh: {samples:?}"
+        );
+
+        // A handle names one memory in a refresh, and a memory found under
+        // several facets keeps its handle.
+        let mut memory_of = BTreeMap::new();
+        let mut handle_of = BTreeMap::new();
+        for sample in samples {
+            assert!(sample["facet"].is_string(), "{sample}");
+            assert_eq!(
+                sample["reranked"], true,
+                "the fake reranker answers: {sample}"
+            );
+            let rerank_query = sample["rerank_query"].as_str().expect("a rerank query");
+            let pool = candidates(sample);
+            let taken = pool.iter().filter(|c| c["taken"] == "budget").count();
+            assert!(taken <= 2, "the facet budget is 2: {sample}");
+            for candidate in pool {
+                let sentence = candidate["sentence"].as_str().unwrap();
+                let logit = candidate["logit"]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("a reranked candidate's logit: {candidate}"));
+                assert_eq!(logit, fake_logit(rerank_query, sentence), "{candidate}");
+                below_zero += usize::from(logit < 0.0);
+                let taken = candidate["taken"]
+                    .as_str()
+                    .expect("what took the candidate");
+                assert!(["budget", "cited", "cut"].contains(&taken), "{candidate}");
+                let memory = candidate["memory"].as_str().unwrap();
+                match candidate["input"].as_str() {
+                    Some(handle) => {
+                        let named = memory_of.entry(handle.to_string()).or_insert(memory);
+                        assert_eq!(*named, memory, "{handle} names one memory: {samples:?}");
+                        let kept = handle_of.entry(memory.to_string()).or_insert(handle);
+                        assert_eq!(*kept, handle, "{memory} keeps its handle: {samples:?}");
+                    }
+                    None if taken == "cut" => {
+                        excluded.get_or_insert((sample["query"].clone(), memory, logit));
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    assert!(
+        below_zero > 0,
+        "memories sharing nothing with a facet are scored"
+    );
+    let (query, memory, logit) =
+        excluded.expect("a cut candidate the writer never saw is in the material");
+
+    let label = json!({ "query": query, "memory": memory, "relevant": true });
+    let labels = dir.private_file(
+        "labelling/facets.toml",
+        &toml::to_string(&json!({ "facet": [label] })).unwrap(),
+    );
+    let curve = curve(&dir, &labels, &material_path);
+    assert_eq!(curve["refresh"]["matched"], 1, "{curve}");
+    let points = curve["refresh"]["curve"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a refresh curve: {curve}"));
+    assert_eq!(points.len(), 1, "{curve}");
+    assert_eq!(points[0]["floor"].as_f64(), Some(logit), "{curve}");
+    assert_eq!(points[0]["precision"].as_f64(), Some(1.0), "{curve}");
 }
 
 /// Tim's home turn, then a session whose second message leans on the
