@@ -331,5 +331,6 @@ rewrites them.
 Replay substitutions require the current template version, so neither
 v1 nor v2 writes stand in for v3. To carry recorded answers over in
 `fast --refresh recorded`, use recordings made with v3 and this run's LLM
-model, with every cited memory present in the new input. Re-recording
-private history still requires authorization under the evaluation policy.
+model and language, with every cited memory present in the new input.
+Re-recording private history still requires authorization under the
+evaluation policy.

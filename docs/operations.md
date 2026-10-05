@@ -579,8 +579,9 @@ requests an urgent refresh. It does not keep a shortened answer with just
 the other citations.
 
 The prompt block renders each model's answer under its heading and
-question, each section a `####` heading and a paragraph. A model renders
-only while every memory its answer cites is current; one citing a memory
+question. Multi-section answers use `####` section headings and paragraphs;
+a lone section renders only its paragraph, without a section heading. A
+model renders only while every memory its answer cites is current; one citing a memory
 that's retracted or ended is left out whole until its refresh rewrites it.
 The block adds no age annotations; dates for possibly stale states belong
 in the answer written at refresh time. The seeded profile defaults to a
