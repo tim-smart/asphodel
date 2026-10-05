@@ -1011,9 +1011,11 @@ it. A heading no refresh sample has is refused, as is a blank query,
 naming the file and quoting neither, and nothing is written.
 
 The pools are the ones the material's run gathered, so the comparison
-isolates the reranker's query. Ordering is by logit alone, so it says
-nothing about prefetch's final ranking, which adds strength, state
-confidence and phase.
+isolates the reranker's query. Recall samples are reordered by logit
+alone, so they say nothing about prefetch's final ranking, which adds
+strength, state confidence and phase. Refresh samples aren't reordered:
+their order, `score` and `rank` stay the run's, and only their logits
+change.
 
 A sample with no prefetch at its session and time in the corpus is
 refused, naming the sample, and nothing is written. The material, the
