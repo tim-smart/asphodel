@@ -24,8 +24,7 @@ use asphodel_core::config::Tuning;
 use asphodel_core::entities::LinkRequest;
 use asphodel_core::extraction::{
     Call2Input, Committed, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT,
-    EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, ExtractError, Extracted, Prepared,
-    call2_request,
+    EDIT_REFINED, EDIT_RETRACTED, ExtractError, Extracted, Prepared, call2_request,
 };
 use asphodel_core::ingest::{Document, Ingested, Turn};
 use asphodel_core::inspect::{AccessEntry, BankOverview, ChunkState, ChunkView, MemoryView};
@@ -97,6 +96,8 @@ const ANA: &str = "Tim's sister Ana lives in Porto.";
 const ANA_DOG: &str = "Ana adopted a greyhound.";
 const PASSPORT: &str = "Tim needs to renew his passport.";
 const BOOKING: &str = "Tim has a hotel booking.";
+const FLOWERS: &str = "Tim sent flowers to Sam.";
+const FLOWERS_WIFE: &str = "Tim sent flowers to Sam, his wife.";
 
 fn at(text: &str) -> Timestamp {
     text.parse().unwrap()
@@ -874,43 +875,32 @@ fn a_repeat_is_one_access_on_the_memory_and_outranks_used() {
 }
 
 #[test]
-fn a_mention_raises_significance_and_keeps_only_on_the_owners_word() {
+fn a_mention_that_matters_no_more_than_the_memory_is_absorbed_and_keeps_only_on_the_owners_word() {
     let h = Harness::new();
     let tea = h.fact(TEA);
     let acme = h.fixture(said(ACME, "fact").significance("major"));
-    let cat = h.fact(CAT);
-    h.service
-        .set_significance("main", &cat.to_string(), Some("trivial"))
-        .unwrap();
-    let cat_edits = h.edits(cat);
     let bike = h.fact(BIKE);
-    h.says(
-        "I like green tea. I work at Acme. My cat is called Miso. \
-         Remember this: my bike is a Brompton.",
-    );
+    h.says("I like green tea. I work at Acme. Remember this: my bike is a Brompton.");
     let again = |memory: Uuid| (memory, "mentioned_again");
-    label_each(
+    let extracted = label_each(
         &h,
         reply(vec![
-            claim(TEA, "fact", "I like green tea").significance("notable"),
+            claim(TEA, "fact", "I like green tea"),
             claim(ACME, "fact", "I work at Acme").significance("trivial"),
-            claim(CAT, "fact", "My cat is called Miso").significance("critical"),
             claim(BIKE, "fact", "my bike is a Brompton").remember_this(),
         ]),
-        &[again(tea), again(acme), again(cat), again(bike)],
+        &[again(tea), again(acme), again(bike)],
     );
 
-    // The larger of the existing and the new score, logged. A weaker
-    // mention never lowers it, and there's nothing to log.
-    assert_eq!(h.significance(tea), ("notable".into(), None));
-    assert_eq!(h.edits(tea), [EDIT_SIGNIFICANCE_RAISED]);
+    // An equal or weaker mention is an access on the memory, and leaves its
+    // significance as it was.
+    assert!(extracted.memories.is_empty());
+    assert_eq!(h.memories(), 3);
+    assert_eq!(h.significance(tea), ("minor".into(), None));
+    assert!(h.edits(tea).is_empty());
+    assert_eq!(h.accesses(tea).len(), 2);
     assert_eq!(h.significance(acme), ("major".into(), None));
     assert!(h.edits(acme).is_empty());
-    // Never over the owner's setting, though the access still counts.
-    let trivial = ("minor".into(), Some("trivial".into()));
-    assert_eq!(h.significance(cat), trivial);
-    assert_eq!(h.edits(cat), cat_edits);
-    assert_eq!(h.accesses(cat).len(), 2);
     // Remember-this on a mention keeps the neighbour.
     assert_eq!(h.significance(bike), ("minor".into(), Some("kept".into())));
     assert_eq!(h.edits(bike), [EDIT_KEPT]);
@@ -923,9 +913,52 @@ fn a_mention_raises_significance_and_keeps_only_on_the_owners_word() {
     );
     let doc_tea = claim(TEA, "fact", "I like green tea").remember_this();
     one_label(&h, reply(vec![doc_tea]), tea, "mentioned_again");
-    assert_eq!(h.significance(tea), ("notable".into(), None));
-    assert_eq!(h.edits(tea), [EDIT_SIGNIFICANCE_RAISED]);
+    assert_eq!(h.significance(tea), ("minor".into(), None));
+    assert!(h.edits(tea).is_empty());
     assert_eq!(h.accesses(tea).len(), 3);
+}
+
+#[test]
+fn a_repeat_that_matters_more_than_the_memory_becomes_its_head() {
+    // Call 2 can label a claim that says more than a memory, such as a
+    // relationship the memory only names a person in, a repeat. A newer
+    // claim well above the memory's significance isn't absorbed: it becomes
+    // the chain head with its own sentence and significance, the memory is
+    // superseded but not wrong, and the head inherits its accesses, as on
+    // refines.
+    for label in ["mentioned_again", "confirmed"] {
+        let h = Harness::new();
+        let old = h.fixture(said(FLOWERS, "event").significance("trivial"));
+        let before = h.accesses(old);
+        h.says("I sent flowers to Sam, my wife.");
+        let wife = claim(FLOWERS_WIFE, "fact", "I sent flowers to Sam, my wife");
+        let wife = reply(vec![wife.significance("major")]);
+        let extracted = one_label(&h, wife, old, label);
+
+        assert_eq!(extracted.memories.len(), 1, "{label}: a new memory");
+        let new = extracted.memories[0];
+        let view = h.show(new);
+        assert_eq!(view.sentence, FLOWERS_WIFE, "{label}");
+        assert_eq!(view.chain.head, new, "{label}");
+        assert_eq!(h.significance(new), ("major".into(), None), "{label}");
+        let change = h.change(old);
+        assert_eq!(change.superseded_by, Some(new), "{label}");
+        assert_eq!(change.retracted_at, None, "{label}");
+        assert_eq!(h.edits(old), [EDIT_REFINED], "{label}");
+        assert_eq!(h.significance(old), ("trivial".into(), None), "{label}");
+        assert_eq!(h.accesses(old), before, "{label}");
+        let inherited: Vec<AccessEntry> = view
+            .accesses
+            .into_iter()
+            .filter(|access| access.inherited_from == Some(old))
+            .map(|access| AccessEntry {
+                inherited_from: None,
+                ..access
+            })
+            .collect();
+        assert_eq!(inherited, before, "{label}");
+        assert_eq!(h.access_kinds(new), ["created"], "{label}");
+    }
 }
 
 /// The owner says `first` on 1 October, extracted alone, and `again` the
@@ -1638,17 +1671,17 @@ fn a_memory_committed_since_the_search_at_the_floor_reconciles_the_chunk_again()
 
 #[test]
 fn an_edit_since_the_search_on_a_shown_neighbour_reconciles_the_chunk_again() {
-    // The first chunk's mention raises the neighbour's significance, an
-    // edit and no new memory, so only the edit can send the second back.
+    // The first chunk's mention keeps the neighbour, an edit and no new
+    // memory, so only the edit can send the second back.
     let h = Harness::with_concurrency(2);
     let tea = h.fact(TEA);
-    h.says("I love green tea.");
+    h.says("Remember this: I like green tea.");
     h.says_at("2026-10-01T06:40:00Z", "I like green tea.");
     let mention = |input: &Call2Input| each(input, &[(tea, "mentioned_again")]);
-    let major = claim(TEA, "fact", "I love green tea").significance("major");
-    let major = reply(vec![major]);
-    let first_call2 = mention(&call2(&h, &major).expect("call 2 runs"));
-    let first = prepared(&h, vec![major, first_call2]);
+    let kept = claim(TEA, "fact", "I like green tea").remember_this();
+    let kept = reply(vec![kept]);
+    let first_call2 = mention(&call2(&h, &kept).expect("call 2 runs"));
+    let first = prepared(&h, vec![kept, first_call2]);
     // The second chunk is shown the same neighbour, under the same handles.
     let second_call2 = mention(first.call2_input().unwrap());
     let minor = reply(vec![claim(TEA, "fact", "I like green tea")]);
@@ -1656,7 +1689,7 @@ fn an_edit_since_the_search_on_a_shown_neighbour_reconciles_the_chunk_again() {
     assert_eq!(shown(second.call2_input().unwrap()), BTreeSet::from([tea]));
 
     committed(&h, first);
-    assert_eq!(h.edits(tea), [EDIT_SIGNIFICANCE_RAISED]);
+    assert_eq!(h.edits(tea), [EDIT_KEPT]);
     assert_eq!(h.memories(), 1, "the first chunk made no memory");
     let second = stale(&h, second);
     let second = redone(&h, second, second_call2);
