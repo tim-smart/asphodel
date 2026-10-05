@@ -24,6 +24,7 @@ use crate::strength::Kind;
 /// A new memory's row, as the edits on its neighbours need it.
 struct Written {
     id: i64,
+    uuid: Uuid,
     end: (Stamp, bool),
     said_at: Stamp,
 }
@@ -114,6 +115,7 @@ pub(super) fn commit(
             index,
             Written {
                 id: memory_id,
+                uuid,
                 // Where a neighbour this claim ends, or a memory whose ender
                 // it replaces, ends.
                 end: match memory.valid_from {
@@ -281,6 +283,11 @@ pub(super) fn commit(
         used: checked.used.iter().map(|(_, uuid)| *uuid).collect(),
         entities_created,
         dropped: checked.dropped.clone(),
+        promoted: plan
+            .promoted
+            .iter()
+            .map(|index| written[index].uuid)
+            .collect(),
     })
 }
 

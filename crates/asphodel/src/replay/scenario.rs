@@ -264,14 +264,6 @@ pub struct Outcome {
     pub outcome: Label,
 }
 
-impl Outcome {
-    /// Whether the outcome absorbs the claim into the memory rather than
-    /// creating one.
-    pub fn absorbs(&self) -> bool {
-        matches!(self.outcome, Label::MentionedAgain | Label::Confirmed)
-    }
-}
-
 /// A time and an expectation. Never changes the run.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Probe {
@@ -533,11 +525,6 @@ pub fn check(scenario: &Scenario) -> Vec<String> {
         if let Some(label) = &claim.label {
             if labels.iter().any(|(known, _)| known == label) {
                 errors.push(format!("the label {label:?} is used twice"));
-            }
-            if !claim.reconcile.is_empty() && claim.reconcile.iter().all(Outcome::absorbs) {
-                errors.push(format!(
-                    "the claim {label:?} is absorbed by its outcomes, so its label names nothing"
-                ));
             }
             labels.push((label.clone(), *at));
         }

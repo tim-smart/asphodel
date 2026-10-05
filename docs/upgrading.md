@@ -23,6 +23,20 @@ strength affects injection and injected memories are part of the recorded
 request. `fast` mode reuses recorded claims but may make top-up LLM calls;
 get approval before using it on private data.
 
+## Reconcile template version 4: a weightier repeat becomes the head
+
+A newer claim that call 2 labels `mentioned_again` or `confirmed` now
+becomes a new chain head refining the memory, rather than an access on it,
+when it's at least `reconcile.promotion_gap` significance levels (default
+1) above the memory. Below that gap, a mention still raises the memory's
+significance. Call 2's prompt (`reconcile_claims` v4) adds that a claim
+saying more than the memory is never mentioned again.
+
+Stored memories are unchanged and nothing is re-extracted: claims absorbed
+before the upgrade stay absorbed. No schema migration is needed and purge
+doesn't pause. Replay cassettes recorded with v3 don't answer v4's call 2,
+so `replay` misses and `fast` tops up every call 2.
+
 ## Schema version 2: send each bank's config again
 
 Schema version 2 adds `speaker_ids`, the only mapping a turn's speaker is

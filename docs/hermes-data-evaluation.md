@@ -573,7 +573,8 @@ so rather than improvise.
 - Shipped: probe pass/fail by id (`probes_passed`, `probes_failed` in the
   aggregate).
 - Shipped: `injected_tokens` per session and per turn p50/p95, with cron
-  apart; `call2_rate`; `llm.used_verdicts` by source (recorded, top-up,
+  apart; `call2_rate`, with `call2_rate.promoted`, the repeat labels
+  promoted to new chain heads for significance; `llm.used_verdicts` by source (recorded, top-up,
   live, none); `injection_usage` (used, not used, unjudged and the used
   fraction among judged memories); `agenda_lines_per_day`; `bands_per_week`;
   `fade_outs_per_week`; `purged_then_re_mentioned.rate`.

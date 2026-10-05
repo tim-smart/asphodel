@@ -228,10 +228,26 @@ chain head instead of losing its schedule through absorption. An omitted
 date does not trigger this guard, and older claims cannot replace newer
 memories. Ended and retracted neighbours still reject newer edits.
 
+Code also promotes a newer claim's `mentioned_again` or `confirmed` to
+`refines` when the claim's significance is at least
+`reconcile.promotion_gap` levels (default 1) above the neighbour's. Call 2
+can call a claim that adds a relationship or a reason a repeat of a memory
+that only names the same person; absorbing it would lose the fact and
+leave it at the trivial memory's significance. The claim becomes the chain
+head with its own sentence and significance, and the neighbour is
+superseded, not retracted. The neighbour counts at the higher of its
+extracted level and the owner's setting, and a kept neighbour is never
+outweighed, so a mention doesn't undo the owner's word. A smaller gap
+raises the neighbour's significance as before, and so does an older claim's
+mention. The report counts promotions as `call2_rate.promoted`.
+
 Call 2 version 3 shows these fields beside both claims and memories, using
 UTC timestamps and `none` for absent dates. Its prompt treats an added
 schedule as a refinement: "needs to pack the carrots" refined by "reminder
-to pack the carrots at 8am on the 30th".
+to pack the carrots at 8am on the 30th". Version 4 adds that a claim saying
+something the memory doesn't, such as a relationship, a reason or a new
+attribute, is never mentioned again, and that a memory naming a person says
+nothing about who they are.
 
 A fully undated `retracts` still corrects and invalidates its predecessor.
 The replacement carries over the first retracted neighbour's whole window
@@ -247,11 +263,10 @@ undated-retraction carry-over; the inherited window replaces that fallback.
 Standalone undated events still keep it. Explicit dates count as supplied
 even when their window confidence is low.
 
-The scenario loader currently rejects a `label` on a claim with only
-`mentioned_again` or `confirmed` outcomes, even when this date guard would
-create a new memory. Leave the claim unlabelled and inspect the original
-memory's chain head, as in `reminder-adds-date.toml`. Without the guard,
-these outcomes absorb the claim and create no memory.
+A claim with only `mentioned_again` or `confirmed` outcomes may carry a
+`label` for the memory either guard makes, as in
+`relationship-outweighs-repeat.toml`. When reconciliation absorbs the claim
+instead, the run stops with a scenario error naming the label.
 
 ### Probes
 
@@ -342,6 +357,8 @@ owner review after re-recording.
   it from the LLM and record it, and `replay` stops.
   The report counts these redos as `call2_rate.redos` and
   `call2_rate.redo_rate`, per chunk, fields that only appear above 1.
+  `call2_rate.promoted` always appears: the repeat labels promoted to
+  `refines` for significance ("Reconcile outcomes"), each a new chain head.
   Scenarios script call 2 against what a serial run shows it, so a
   scenario defaults to 1 and refuses explicit values above 1.
 - **Sweeps** run at `mental_models.sweep_time` bank-local (04:00) on the

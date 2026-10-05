@@ -80,7 +80,7 @@ pub fn guidance_hash(guidance: Option<&str>) -> Option<String> {
 
 /// Call 2's template name and version, which replay's cassette keys include.
 pub const CALL2_TEMPLATE: &str = "reconcile_claims";
-pub const CALL2_VERSION: u32 = 3;
+pub const CALL2_VERSION: u32 = 4;
 
 /// The top five neighbours per claim after fusing vector search and BM25.
 /// A flagged claim's entity-linked open tasks and current states come on top.
@@ -355,6 +355,10 @@ pub struct Extracted {
     pub entities_created: Vec<Uuid>,
     /// Claims code dropped, by their index in the reply.
     pub dropped: Vec<Dropped>,
+    /// The new memories among `memories` that call 2 labelled a repeat of a
+    /// neighbour, made chain heads instead because they matter at least
+    /// `reconcile.promotion_gap` significance levels more than it.
+    pub promoted: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,6 +569,8 @@ pub struct Prepared {
     floor: f64,
     /// `strength.corroborate_used`, read with the rest of the tuning.
     corroborate_used: bool,
+    /// `reconcile.promotion_gap`, read with the rest of the tuning.
+    promotion_gap: u8,
     /// The bank as the search saw it.
     snapshot: reconcile::Snapshot,
     search: Option<reconcile::Search>,
@@ -752,6 +758,7 @@ pub(crate) fn prepare(
             vectors,
             floor: floor(tuning, embedder),
             corroborate_used: tuning.strength.corroborate_used,
+            promotion_gap: tuning.reconcile.promotion_gap,
             snapshot: reconcile::Snapshot::default(),
             search: None,
             labels: Vec::new(),
@@ -812,6 +819,7 @@ fn reconcile_claims(
         vectors,
         floor,
         corroborate_used,
+        promotion_gap,
         ..
     } = prepared;
     // The connection is released before the failure is counted.
@@ -858,7 +866,7 @@ fn reconcile_claims(
                     return Err(ExtractError::Call2 { error, failure });
                 }
             };
-            let plan = reconcile::plan(search, &input, &unit, &checked, &labels);
+            let plan = reconcile::plan(search, &input, &unit, &checked, &labels, promotion_gap);
             (labels, plan)
         }
     };
@@ -872,6 +880,7 @@ fn reconcile_claims(
         vectors,
         floor,
         corroborate_used,
+        promotion_gap,
         snapshot,
         search,
         labels,
@@ -932,6 +941,7 @@ pub(crate) fn commit_prepared(
                     &prepared.unit,
                     &prepared.checked,
                     &prepared.labels,
+                    prepared.promotion_gap,
                 )?
                 .unwrap_or_else(|| prepared.plan.clone()),
                 None => prepared.plan.clone(),
@@ -1020,6 +1030,7 @@ fn without_vanished(
     unit: &input::Unit,
     checked: &claims::Checked,
     labels: &[call2::ClaimLabels],
+    promotion_gap: u8,
 ) -> Result<Option<reconcile::Plan>, StoreError> {
     let gone = vanished(conn, &search.neighbours)?;
     if gone.is_empty() {
@@ -1049,7 +1060,14 @@ fn without_vanished(
         neighbours = gone.len(),
         "neighbours went between call 2 and the commit; their labels are dropped"
     );
-    Ok(Some(reconcile::plan(search, input, unit, checked, &kept)))
+    Ok(Some(reconcile::plan(
+        search,
+        input,
+        unit,
+        checked,
+        &kept,
+        promotion_gap,
+    )))
 }
 
 /// The ids among `neighbours` that are no longer in the store.

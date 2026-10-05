@@ -22,7 +22,7 @@ const SYSTEM: &str = r#"You reconcile new claims with a personal assistant's exi
 # Labels
 
 Give a claim a label on a memory only when the two are about the same thing:
-- `mentioned_again`: the claim states what the memory already says, independently. Rewording, or the same fact with less detail, is still mentioned again.
+- `mentioned_again`: the claim states what the memory already says, independently. Rewording, or the same fact with less detail, is still mentioned again. A claim that adds something the memory doesn't say, such as a relationship, a reason or a new attribute, is never mentioned again: it's a refinement, or new. A memory that only names a person says nothing about who they are: "sent flowers to Sam" doesn't say whose wife Sam is.
 - `confirmed`: the claim says the memory is still right, such as "yes" to a question about it, or "still" true.
 - `refines`: the claim is a more precise version of the same statement, and the memory wasn't wrong ("going to Japan in 2027" refined by "going to Tokyo in April 2027"; "needs to pack the carrots" refined by "reminder to pack the carrots at 8am on the 30th"). Adding a date or schedule is a refinement, not a repeat, even when only the structured time fields show it.
 - `retracts`: the claim is a corrected version of the memory, which was wrong: a correction, or a rescheduled appointment or plan ("the dentist is on Friday, not Thursday", "her name is Mia, not Maya", "I filed the tax return on the 2nd, not the 1st").

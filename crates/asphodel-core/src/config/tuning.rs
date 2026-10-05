@@ -252,13 +252,28 @@ impl Default for InjectionTuning {
     }
 }
 
-/// `[reconcile]`: neighbour search in extraction.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// `[reconcile]`: neighbour search in extraction, and what code does with
+/// call 2's labels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReconcileTuning {
     /// The cosine floor that decides whether call 2 runs, keyed by the exact
     /// embedding model string, quantisation included.
     pub embedding_floors: BTreeMap<String, f64>,
+    /// How many significance levels a newer claim must be above the memory
+    /// call 2 labels it a repeat of (`mentioned_again` or `confirmed`) to
+    /// become a new chain head refining it rather than an access on it.
+    /// From 1 to 4. A smaller gap raises the memory's significance instead.
+    pub promotion_gap: u8,
+}
+
+impl Default for ReconcileTuning {
+    fn default() -> Self {
+        Self {
+            embedding_floors: BTreeMap::new(),
+            promotion_gap: 1,
+        }
+    }
 }
 
 /// `[extraction]`: what call 1 is told beyond its fixed rules.
@@ -687,6 +702,13 @@ impl Tuning {
                     format!("must be a finite logit, got {floor}"),
                 );
             }
+        }
+        let gap = self.reconcile.promotion_gap;
+        if !(1..=4).contains(&gap) {
+            fail(
+                "reconcile.promotion_gap",
+                format!("must be between 1 and 4, got {gap}"),
+            );
         }
         for (model, floor) in &self.reconcile.embedding_floors {
             if model.is_empty() {

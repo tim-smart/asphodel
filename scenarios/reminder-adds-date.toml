@@ -31,8 +31,8 @@ user = "Remind me to bring my insurance card to the dentist at 2pm today."
 assistant = "I'll remind you."
 
 [[turn.claim]]
-# No label: the current loader assumes mentioned_again always absorbs a
-# claim. Probe the original errand and inspect its chain head in the test.
+# No label: the test probes the original errand and inspects its chain
+# head.
 content = "Tim needs to bring his insurance card to the dentist."
 quote = "Remind me to bring my insurance card to the dentist at 2pm today"
 kind = "task"
