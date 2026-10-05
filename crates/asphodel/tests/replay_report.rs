@@ -266,7 +266,8 @@ fn labelling_query(turn: usize) -> String {
 
 /// A stand-in whose every step answers any call: call 1 claims the home
 /// sentence (kept only where the turn quotes it), call 2 labels it
-/// `mentioned_again` on the first neighbour, and a refresh writes nothing.
+/// `mentioned_again` on the first neighbour, and a refresh writes one
+/// sentence citing `m1`.
 fn labelling_script(dir: &TestDir) -> PathBuf {
     let mut home = home_claim();
     home["claim"] = json!("c1");

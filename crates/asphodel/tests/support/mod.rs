@@ -235,9 +235,29 @@ pub fn said(text: &str, cites: &[&str]) -> Value {
     json!({ "text": text, "cites": cites })
 }
 
-/// A refresh's write: the whole summary, one section holding `sentences`.
+/// A refresh's write: the whole answer, one section joining `sentences`,
+/// citing every handle they cite. With no sentence it has no text, which a
+/// refresh refuses, so it writes nothing.
 pub fn write_reply(sentences: &[Value]) -> Value {
-    json!({ "sections": [{ "heading": "Home", "sentences": sentences }] })
+    let texts: Vec<&str> = sentences
+        .iter()
+        .map(|sentence| sentence["text"].as_str().unwrap())
+        .collect();
+    let mut cites: Vec<&Value> = Vec::new();
+    for cite in sentences
+        .iter()
+        .flat_map(|s| s["cites"].as_array().unwrap())
+    {
+        if !cites.contains(&cite) {
+            cites.push(cite);
+        }
+    }
+    let sections = if texts.is_empty() {
+        json!([])
+    } else {
+        json!([{ "heading": "Home", "text": texts.join(" ") }])
+    };
+    json!({ "sections": sections, "cites": cites })
 }
 
 /// A script whose every step answers any call: call 1 with the home claim
@@ -266,10 +286,19 @@ pub fn claim(content: &str, quote: &str, kind: &str) -> Value {
 
 /// The reply of [`script_answering_everything`]: call 1 reads `claims`, a
 /// refresh's plan reads `facets` (one recalling [`HOME_QUESTION`]) and its
-/// write reads `sections`, one holding `sentences`. No reply type refuses
-/// the others' fields, so the order calls come in doesn't matter.
+/// write reads `sections` and `cites`, from `sentences`. With no sentence
+/// the write is one citing `m1`, since a refresh refuses a write with
+/// nothing in it and would try again every half hour; any refresh that
+/// writes lists at least one memory. No reply type refuses the others'
+/// fields, so the order calls come in doesn't matter.
 pub fn reply_to_everything(claims: Vec<Value>, sentences: Vec<Value>) -> Value {
-    let mut reply = write_reply(&sentences);
+    let quiet = [said("Tim has a history here.", &["m1"])];
+    let sentences = if sentences.is_empty() {
+        &quiet[..]
+    } else {
+        &sentences[..]
+    };
+    let mut reply = write_reply(sentences);
     reply["claims"] = json!(claims);
     reply["used_injected_ids"] = json!([]);
     reply["facets"] = json!([{ "heading": "Home", "query": HOME_QUESTION }]);
@@ -277,8 +306,8 @@ pub fn reply_to_everything(claims: Vec<Value>, sentences: Vec<Value>) -> Value {
 }
 
 /// [`live_script`] with every step taking `delay_ms` to answer, so a
-/// `live` run measures that latency. The reply also reads as a plan and an
-/// empty write, so the seeded profile's refreshes succeed.
+/// `live` run measures that latency. The reply also reads as a plan and a
+/// write, so the seeded profile's refreshes succeed.
 pub fn delayed_script(dir: &TestDir, delay_ms: u64) -> PathBuf {
     let reply = reply_to_everything(vec![home_claim()], vec![]);
     let steps = vec![json!({ "reply": reply, "delay_ms": delay_ms }); 64];

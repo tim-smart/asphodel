@@ -278,7 +278,7 @@ impl Harness {
         while self.service.erase_next(BANK).unwrap().is_some() {}
     }
 
-    /// Forces a refresh of the profile whose reply adds one entry citing
+    /// Forces a refresh of the profile whose reply is `text`, citing
     /// `memory`.
     fn cite_in_profile(&self, text: &str, memory: Uuid) {
         let input = self.service.refresh_input(BANK, PROFILE_NAME).unwrap();
@@ -286,9 +286,10 @@ impl Harness {
         let handle = &cited.expect("the profile's selection has it").handle;
         let llm = FakeLlm::scripted(
             MODEL,
-            vec![json!({"sections": [{"heading": "About Tim", "sentences": [
-                {"text": text, "cites": [handle]},
-            ]}]})],
+            vec![json!({
+                "sections": [{"heading": "About Tim", "text": text}],
+                "cites": [handle],
+            })],
         );
         let outcome = self.service.refresh_model(BANK, PROFILE_NAME, &llm, true);
         let applied = matches!(outcome, Ok(RefreshOutcome::Applied(_)));

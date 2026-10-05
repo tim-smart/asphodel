@@ -30,7 +30,6 @@ export const ids = {
   profile: "01a10400-0000-7000-8000-0000000000d1",
   plans: "01a10400-0000-7000-8000-0000000000d2",
   travel: "01a10400-0000-7000-8000-0000000000d3",
-  profileEntry: "01a10400-0000-7000-8000-0000000000e1",
   block: "01a10400-0000-7000-8000-0000000000f1",
 };
 
@@ -62,7 +61,8 @@ function model(key, name, fields) {
     min_volatility: null,
     max_tokens: 100,
     enabled: true,
-    entries: [],
+    answer: null,
+    cites: [],
     last_refreshed_at: null,
     last_error: null,
     last_error_at: null,
@@ -219,7 +219,8 @@ export function fixtures() {
     models: [
       model("profile", "User profile", {
         max_tokens: 500,
-        entries: [{ id: ids.profileEntry, text: sentences.auckland, cites: [ids.auckland] }],
+        answer: `### About Sam\n${sentences.auckland}`,
+        cites: [ids.auckland],
         last_refreshed_at: "2026-10-03T08:30:00Z",
       }),
       model("plans", "Plans", {

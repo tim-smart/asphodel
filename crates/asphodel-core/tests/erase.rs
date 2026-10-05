@@ -396,19 +396,19 @@ impl Harness {
         profile.unwrap()
     }
 
-    /// Forces a refresh of the profile whose reply adds one entry citing
+    /// Forces a refresh of the profile whose reply is `text`, citing
     /// `cites`.
-    fn profile_entry_citing(&self, text: &str, cites: &[Uuid]) {
+    fn profile_citing(&self, text: &str, cites: &[Uuid]) {
         let input: RefreshInput = self.service.refresh_input(BANK, PROFILE_NAME).unwrap();
         let handles: Vec<String> = cites.iter().map(|m| handle(&input, *m)).collect();
-        let reply = sections(json!([{"text": text, "cites": handles}]));
+        let reply = written(text, &handles);
         let llm = FakeLlm::scripted(MODEL, vec![reply]);
         let outcome = self.service.refresh_model(BANK, PROFILE_NAME, &llm, true);
         assert!(
             matches!(outcome, Ok(RefreshOutcome::Applied(_))),
             "{outcome:?}"
         );
-        assert_eq!(self.profile().entries.len(), 1);
+        assert!(self.profile().answer.is_some());
     }
 
     /// The names of the bank's entities.
@@ -585,9 +585,9 @@ fn ids(recall: &Recall) -> Vec<Uuid> {
     recall.results.iter().map(|r| r.id).collect()
 }
 
-/// A refresh write reply with `sentences` under one heading.
-fn sections(sentences: Value) -> Value {
-    json!({"sections": [{"heading": "About Tim", "sentences": sentences}]})
+/// A refresh write reply: `text` under one heading, citing `cites`.
+fn written(text: &str, cites: &[String]) -> Value {
+    json!({"sections": [{"heading": "About Tim", "text": text}], "cites": cites})
 }
 
 fn handle(input: &RefreshInput, memory: Uuid) -> String {
@@ -612,7 +612,7 @@ fn maya_and_tea() -> (Harness, Uuid, Uuid) {
 fn forget_hides_at_once_and_erases_behind_a_queued_chunk() {
     let h = Harness::new();
     let (maya, said) = h.says(notable(MAYA));
-    h.profile_entry_citing("Tim has a daughter called Maya.", &[maya]);
+    h.profile_citing("Tim has a daughter called Maya.", &[maya]);
     let recalled = h.recall(RecallRequest {
         session_id: Some("chat".into()),
         ..query(MAYA)
@@ -630,7 +630,11 @@ fn forget_hides_at_once_and_erases_behind_a_queued_chunk() {
     // Everything that can be undone happens at once, and the recall row
     // naming Maya is deleted.
     assert!(!ids(&h.recall(query(MAYA))).contains(&maya));
-    assert!(h.profile().entries.is_empty());
+    let profile = h.profile();
+    assert_eq!(profile.answer, None);
+    assert!(profile.cites.is_empty());
+    let block = h.service.system_prompt(BANK, None).unwrap();
+    assert!(!block.text.contains("Maya"), "{}", block.text);
     assert!(!h.service.in_context(BANK, "chat").unwrap().contains(&maya));
     let sql = format!(
         "SELECT count(*) FROM recalls WHERE uuid = '{}'",
@@ -855,18 +859,21 @@ fn the_sweep_purges_a_faded_chain_at_four_bank_local_without_redacting() {
 
 #[test]
 fn a_model_citing_a_purged_memory_refreshes_once_that_night() {
-    // The sweep purges before the night's refresh, so a model whose entry
-    // cited a purged memory refreshes once, without it.
+    // The sweep purges before the night's refresh, so a model whose answer
+    // cited a purged memory is blanked and refreshes once, without it.
     let h = Harness::new();
     h.said(EARLIER, notable(TEA));
     let (maya, _) = h.says(trivial(MAYA));
-    h.profile_entry_citing("Tim has a daughter called Maya.", &[maya]);
+    h.profile_citing("Tim has a daughter called Maya.", &[maya]);
 
     h.set(at(LATER_SWEEP));
     h.sweep();
     assert_eq!(h.exist(&[maya]), [false]);
-    assert!(h.profile().entries.is_empty());
-    let llm = FakeLlm::scripted(MODEL, vec![json!({"sections": []}); 3]);
+    let profile = h.profile();
+    assert_eq!(profile.answer, None);
+    assert!(profile.cites.is_empty());
+    // Tea is the one memory left to list, as `m1`.
+    let llm = FakeLlm::scripted(MODEL, vec![written(TEA, &["m1".into()]); 3]);
     h.service.run_refreshes(&llm).unwrap();
     for later in [
         minutes(31),
@@ -1214,7 +1221,9 @@ impl LlmClient for ForgetsDuringCall<'_> {
 }
 
 #[test]
-fn a_refresh_in_flight_drops_an_entry_citing_a_memory_hidden_or_erased_meanwhile() {
+fn a_refresh_in_flight_stores_no_answer_citing_a_memory_hidden_or_erased_meanwhile() {
+    // The answer rests on every memory it cites, so it isn't stored when
+    // one of them was forgotten while the write was being made.
     for erase in [false, true] {
         let (h, maya, tea) = maya_and_tea();
         let input = h.service.refresh_input(BANK, PROFILE_NAME).unwrap();
@@ -1222,18 +1231,16 @@ fn a_refresh_in_flight_drops_an_entry_citing_a_memory_hidden_or_erased_meanwhile
             service: &h.service,
             memory: maya,
             erase,
-            reply: sections(json!([
-                {"text": "Tim has a daughter called Maya.", "cites": [handle(&input, maya)]},
-                {"text": "Tim likes green tea.", "cites": [handle(&input, tea)]},
-            ])),
+            reply: written(
+                "Tim has a daughter called Maya. Tim likes green tea.",
+                &[handle(&input, maya), handle(&input, tea)],
+            ),
         };
         let outcome = h.service.refresh_model(BANK, PROFILE_NAME, &llm, true);
-        assert!(
-            matches!(outcome, Ok(RefreshOutcome::Applied(_))),
-            "{outcome:?}"
-        );
-        let texts: Vec<String> = h.profile().entries.into_iter().map(|e| e.text).collect();
-        assert_eq!(texts, ["Tim likes green tea."], "erase: {erase}");
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let profile = h.profile();
+        assert_eq!(profile.answer, None, "erase: {erase}");
+        assert!(profile.cites.is_empty(), "erase: {erase}");
     }
 }
 
@@ -1246,7 +1253,7 @@ fn a_sweep_that_fails_after_a_purge_settles_it_and_runs_again() {
         let h = Harness::new();
         h.said(EARLIER, notable(TEA));
         let (maya, _) = h.says(trivial(MAYA));
-        h.profile_entry_citing("Tim has a daughter called Maya.", &[maya]);
+        h.profile_citing("Tim has a daughter called Maya.", &[maya]);
         h.set(at(LATER_SWEEP));
         let before = h.service.system_prompt(BANK, None).unwrap();
         // The store's own connection: a temporary trigger fails the run row,
@@ -1257,7 +1264,7 @@ fn a_sweep_that_fails_after_a_purge_settles_it_and_runs_again() {
         );
         assert!(h.service.run_sweeps().is_err());
         assert_eq!(h.exist(&[maya]), [false], "the chain committed");
-        // The block of the model whose entry went was cleared.
+        // The block of the model whose answer went was cleared.
         let after = h.service.system_prompt(BANK, None).unwrap();
         assert_ne!(after.id, before.id);
 

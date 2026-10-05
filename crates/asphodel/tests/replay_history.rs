@@ -219,7 +219,7 @@ fn replay_at_concurrency_five_ends_with_the_memories_of_a_serial_run() {
 
 /// A script whose every step answers any call: call 1 with the home
 /// claim, call 2 labelling it a mention of the one neighbour, and a
-/// refresh writing nothing.
+/// refresh writing one sentence citing `m1`.
 fn mention_script(dir: &TestDir) -> PathBuf {
     let mut claim = home_claim();
     claim["claim"] = json!("c1");
@@ -1287,8 +1287,8 @@ fn identity_corpora(dir: &TestDir) -> (PathBuf, PathBuf) {
 }
 
 /// A `live` run of the identity history on `both` with every write
-/// answering one section of two sentences, one citing `m1` and one `m2`;
-/// returns the cassette and the ids of A and B, resolved by probes.
+/// answering one sentence citing `m1`; returns the cassette and the ids
+/// of A and B, resolved by probes.
 fn record_identities(dir: &TestDir, both: &Path) -> (Vec<Value>, [Value; 2]) {
     let script = script_answering_everything(
         dir,
@@ -1297,10 +1297,7 @@ fn record_identities(dir: &TestDir, both: &Path) -> (Vec<Value>, [Value; 2]) {
             claim("Tim needs to renew his passport.", PASSPORT_QUOTE, "task"),
             home_claim(),
         ],
-        vec![
-            said("Tim lives in Auckland.", &["m1"]),
-            said("Tim has a passport to renew.", &["m2"]),
-        ],
+        vec![said("Tim lives in Auckland.", &["m1"])],
     );
     let probes = probe_on("a", 5, "exists", "memory = \"renew his passport\"")
         + &probe_on("b", 8, "exists", HOME_MEMORY);
@@ -1326,32 +1323,38 @@ fn identities(record: &Value) -> Vec<(String, Value)> {
     pairs
 }
 
-/// A substituted write is carried over sentence by sentence, by what each
-/// handle stood for when recorded, not by the handle's name now. A
-/// sentence citing a memory absent from this run is dropped, even though
-/// its handle names another memory now, and the rest of its section is
-/// kept.
+/// A substituted write is carried over whole, by what each handle stood
+/// for when recorded, not by the handle's name now, and only when every
+/// memory it cites is in this run's input: one that isn't would leave the
+/// text resting on something the LLM never saw here.
 ///
 /// The cassette keeps one of `home`'s writes (`home` is the only model
-/// shown the passport task A) and drops the rest:
-/// - the one recorded when A was its one memory, so `m1` meant A and `m2`
-///   nothing. On `both` the sentence citing `m1` cites A, not the home
-///   fact B that `m1` names there now; on `facts`, where A isn't in the
-///   input, no sentence is kept.
-/// - the one recorded with B as `m1` and A as `m2`. On `facts` the
-///   sentence citing A goes and the one citing B is written.
+/// shown the passport task A), rewritten to cite `cites`, and drops the
+/// rest:
+/// - the one recorded when A was its one memory, citing `m1`, which meant
+///   A. On `both` it cites A, not the home fact B that `m1` names there
+///   now; on `facts`, where A isn't in the input, it isn't written.
+/// - the one recorded with B as `m1` and A as `m2`, citing both. On
+///   `both` it's written; on `facts` it isn't, though B is there.
 #[test]
-fn a_substituted_refresh_cites_the_memory_it_was_recorded_with_or_none() {
+fn a_substituted_refresh_cites_the_memories_it_was_recorded_with_or_isnt_written() {
     let dir = TestDir::new();
     let (both, facts) = identity_corpora(&dir);
     let (records, [a, b]) = record_identities(&dir, &both);
     let is_home =
         |record: &Value| is_refresh(record) && identities(record).iter().any(|(_, id)| *id == a);
-    let keep_only = |handles: &[(String, Value)]| {
+    let keep_only = |handles: &[(String, Value)], cites: &[&str]| {
+        let reply = write_reply(&[said("Tim has a passport and a home.", cites)]);
         let kept: Vec<Value> = records
             .iter()
             .filter(|record| !is_home(record) || identities(record) == handles)
-            .cloned()
+            .map(|record| {
+                let mut record = record.clone();
+                if is_home(&record) {
+                    record["response"]["json"] = reply.clone();
+                }
+                record
+            })
             .collect();
         assert!(
             kept.iter().any(is_home),
@@ -1368,12 +1371,16 @@ fn a_substituted_refresh_cites_the_memory_it_was_recorded_with_or_none() {
         "model = \"home\"\nmemory = \"renew his passport\"",
     );
 
-    keep_only(&[("m1".into(), a.clone())]);
+    keep_only(&[("m1".into(), a.clone())], &["m1"]);
     recorded_refreshes(&dir, &both, &format!("{lacks_b}{has_a}"), &[]);
     recorded_refreshes(&dir, &facts, &lacks_b, &[]);
 
-    keep_only(&[("m1".into(), b.clone()), ("m2".into(), a.clone())]);
-    recorded_refreshes(&dir, &facts, &has_b, &[]);
+    keep_only(
+        &[("m1".into(), b.clone()), ("m2".into(), a.clone())],
+        &["m1", "m2"],
+    );
+    recorded_refreshes(&dir, &both, &format!("{has_b}{has_a}"), &[]);
+    recorded_refreshes(&dir, &facts, &lacks_b, &[]);
 }
 
 /// Nearest-refresh substitution only considers records of the run's own
