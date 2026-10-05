@@ -171,15 +171,11 @@ The upcoming events, tasks due soon and recently overdue tasks, chosen by world 
 _Avoid_: Calendar, schedule, reminders
 
 **Mental model**:
-A document that an LLM keeps up to date from memories, to answer a standing question such as "who is the user?". It's made of entries that each cite the memories they rest on, and the memories always win: a cited memory that's forgotten, retracted or ended takes its entry with it.
+A document that an LLM keeps up to date from memories, to answer a standing question such as "who is the user?". It's one answer, a heading and a paragraph for each part of the question, with one set of citations: the memories it rests on. The memories always win: while a cited memory is retracted or ended the model isn't shown at all, and forgetting one blanks the answer until the next refresh writes it again.
 _Avoid_: Observation, reflection, summary, profile (a profile is one mental model)
 
-**Entry**:
-One sentence of a mental model, citing the memories it rests on. Only a refresh writes or rewords it, and code drops it when a cited memory goes.
-_Avoid_: Claim (that's an extraction term), line, bullet, block
-
 **Refresh**:
-Bringing a mental model up to date: one retrieval for its question, then one LLM call that returns edits to its entries. It runs shortly after a conversation adds or changes something the model would care about, and once a day besides, and only when the selected memories have changed.
+Bringing a mental model up to date: one retrieval for each part of its question, then one LLM call that writes the whole answer again with the previous one in view. It runs shortly after a conversation adds or changes something the model would care about, and once a day besides, and only when the selected memories have changed.
 _Avoid_: Reflect, consolidation, rebuild, regenerate
 
 **Explain**:

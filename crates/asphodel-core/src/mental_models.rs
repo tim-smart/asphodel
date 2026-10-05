@@ -1,28 +1,25 @@
 //! Mental models.
 //!
-//! A model answers a standing question, such as "who is the user?", with a
-//! summary: sections of sentences, each sentence an entry citing the
-//! memories it rests on. Only the owner defines models, through the CLI or
-//! API, and there are no hand edits. A refresh ([`refresh`]) asks one
-//! narrow question per facet of the model's question instead of one
-//! compound one: a plan names the facets, built in for the seeded profile
-//! and otherwise made once per question by an LLM call, each facet is one
-//! retrieval, and one LLM call writes the whole summary from what they
-//! found. Code refuses any sentence that cites outside the refresh's input.
-//! The memories always win: an entry citing a retracted or ended memory
-//! isn't rendered, and one citing a memory that left the input is dropped at
-//! the next refresh.
-//!
-//! The block renders each section as a heading and a paragraph. An entry
-//! written before sections existed has none, and renders as a line until
-//! its model's next write replaces it.
+//! A model answers a standing question, such as "who is the user?", with
+//! one prose answer, a heading and a paragraph per facet, and one set of
+//! citations: the memories the answer rests on. Only the owner defines
+//! models, through the CLI or API, and there are no hand edits. A refresh
+//! ([`refresh`]) asks one narrow question per facet of the model's question
+//! instead of one compound one: a plan names the facets, built in for the
+//! seeded profile and otherwise made once per question by an LLM call, each
+//! facet is one retrieval, and one LLM call writes the whole answer from
+//! what they found. Code refuses a reply that cites outside the refresh's
+//! input. The memories always win: a model citing a memory that's
+//! retracted, ended or forgotten isn't rendered at all until a refresh
+//! rewrites it, and a forget blanks the answer at once.
 //!
 //! A refresh is triggered by a write a model would care about, debounced
 //! per bank, at most every [`MIN_REFRESH_INTERVAL`] per model, and once a
 //! day besides at `mental_models.sweep_time` bank-local ([`schedule`]). It
 //! never runs inside a request. Nothing here ever writes an access, embeds
-//! an entry or ingests one.
+//! an answer or ingests one.
 
+mod answer;
 mod refresh;
 pub(crate) mod schedule;
 
@@ -39,16 +36,17 @@ use crate::store::strength::memory_kind;
 use crate::store::{Store, StoreError, micros, timestamp};
 use crate::strength::Kind;
 
+pub(crate) use answer::{Answer, entries_to_answers};
 pub(crate) use refresh::{refresh, refresh_input};
 pub(crate) use schedule::Schedule;
 
 /// A refresh's two calls by template name and version, which replay's
 /// cassette keys include: the plan, made once per question for a model
-/// without a built-in one, and the write of the summary.
+/// without a built-in one, and the write of the answer.
 pub const PLAN_TEMPLATE: &str = "plan_model";
 pub const PLAN_VERSION: u32 = 1;
 pub const WRITE_TEMPLATE: &str = "write_model";
-pub const WRITE_VERSION: u32 = 1;
+pub const WRITE_VERSION: u32 = 2;
 
 /// The least time between two refreshes of one model, and the wait before
 /// a failed refresh is tried again. Fixed
@@ -122,30 +120,20 @@ pub struct Model {
     pub min_volatility: Option<Volatility>,
     pub max_tokens: u32,
     pub enabled: bool,
-    /// In position order, as stored. An entry citing an ended or retracted
-    /// memory stays stored until the next refresh; only rendering drops it.
-    pub entries: Vec<Entry>,
+    /// The answer as stored: each section a `### heading` line and one
+    /// paragraph, sections separated by a blank line. `None` until the
+    /// first refresh, and once a forget has blanked it. An answer citing an
+    /// ended or retracted memory stays stored until the next refresh; only
+    /// rendering leaves it out.
+    pub answer: Option<String>,
+    /// The memories the answer rests on, in the order they were written.
+    pub cites: Vec<Uuid>,
     pub last_refreshed_at: Option<Timestamp>,
     pub last_error: Option<FailureKind>,
     pub last_error_at: Option<Timestamp>,
 }
 
-/// One sentence citing the memories it rests on, under its section's
-/// heading. Code assigns `id`, and keeps it when a write restates the
-/// sentence or rewords it citing the same memories.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Entry {
-    pub id: Uuid,
-    /// The heading it's written under, or `None` for an entry written
-    /// before sections.
-    #[serde(default)]
-    pub section: Option<String>,
-    pub text: String,
-    /// In the order the refresh gave them.
-    pub cites: Vec<Uuid>,
-}
-
-/// One part of a model's question: the heading its sentences are written
+/// One part of a model's question: the heading its section is written
 /// under and the query its retrieval runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facet {
@@ -159,8 +147,8 @@ pub struct Facet {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RefreshInput {
     pub question: String,
-    /// `[llm] language`: the language every entry is written in. `None`
-    /// writes them in the language of the memories they cite.
+    /// `[llm] language`: the language the answer is written in. `None`
+    /// writes it in the language of the memories it cites.
     pub language: Option<String>,
     pub max_tokens: u32,
     /// The plan the selection was recalled by. Until a new question is
@@ -168,9 +156,9 @@ pub struct RefreshInput {
     pub facets: Vec<Facet>,
     /// The selection.
     pub memories: Vec<InputMemory>,
-    /// The entries whose citations are all in the selection, as the write
-    /// is shown them. The others are dropped by the refresh before the call.
-    pub entries: Vec<InputEntry>,
+    /// The stored answer, which the write is shown to keep the wording
+    /// steady.
+    pub previous: Option<String>,
     /// The hash of the selection, the question, the plan, the filters and
     /// `max_tokens`.
     pub fingerprint: String,
@@ -183,15 +171,6 @@ pub struct InputMemory {
     pub sentence: String,
     /// The heading of the first facet that found it.
     pub facet: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InputEntry {
-    pub entry: Uuid,
-    pub section: Option<String>,
-    pub text: String,
-    /// Memory handles.
-    pub cites: Vec<String>,
 }
 
 /// What a refresh did.
@@ -213,26 +192,21 @@ pub enum Outcome {
     },
 }
 
-/// What a write did to the entries. A sentence whose text matches an
-/// entry's keeps that entry's id, and one citing exactly what an entry
-/// cited keeps its id under new words; either is `edited` when its text,
-/// citations or section changed. Every other sentence is `added`, and an
-/// entry the write left out is `removed`.
+/// What a write did. A reply with no text, no citations or a citation
+/// outside the input isn't applied at all: it's a malformed reply.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Applied {
-    pub added: Vec<Uuid>,
-    pub edited: Vec<Uuid>,
-    pub removed: Vec<Uuid>,
+    /// An answer was stored. With nothing selected the answer is cleared
+    /// without a call, and a reply resting on a memory forgotten while it
+    /// was written isn't stored.
+    pub written: bool,
+    /// The reply's sections left out.
     pub rejected: Vec<Rejected>,
-    /// Entries dropped because a memory they cite left the input: fading,
-    /// retraction or ending takes an entry out of the model.
-    pub dropped: Vec<Uuid>,
-    /// Entries trimmed to fit `max_tokens`, lowest-ranked first.
-    pub trimmed: Vec<Uuid>,
+    /// The sentences trimmed from the end to fit `max_tokens`.
+    pub trimmed: usize,
 }
 
-/// A sentence code refused, by its index in the reply, counted across its
-/// sections.
+/// A section of the reply left out, by its index in the reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rejected {
     pub index: usize,
@@ -242,11 +216,7 @@ pub struct Rejected {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectReason {
-    /// A citation that isn't a memory handle in this refresh's input.
-    CitesOutsideInput,
-    /// A sentence citing nothing.
-    NoCitations,
-    /// A sentence with no text.
+    /// A section with no text.
     EmptyText,
 }
 
@@ -255,7 +225,9 @@ pub enum RejectReason {
 pub enum FailureKind {
     /// The LLM call failed.
     Llm,
-    /// The reply didn't parse as a plan or a summary, or planned nothing.
+    /// The reply didn't parse as a plan or an answer, planned nothing, or
+    /// wrote an answer with no text, no citations or a citation outside the
+    /// input.
     Malformed,
     /// The retrieval for the question failed, such as the embedder
     /// erroring, so there was nothing to send.
@@ -355,6 +327,8 @@ pub(crate) struct ModelRow {
     pub last_error_at: Option<Timestamp>,
     /// The plan made for a question by an LLM call, if any.
     pub plan: Option<StoredPlan>,
+    /// The stored answer.
+    pub answer: Option<String>,
 }
 
 /// A planned question's facets, kept with the question they were made for,
@@ -422,19 +396,9 @@ impl ModelRow {
     }
 }
 
-/// An entry as stored, with its citations' rowids and public ids.
-#[derive(Debug, Clone)]
-pub(crate) struct StoredEntry {
-    pub id: i64,
-    pub uuid: Uuid,
-    pub section: Option<String>,
-    pub text: String,
-    pub cites: Vec<(i64, Uuid)>,
-}
-
 const MODEL_COLUMNS: &str = "id, uuid, bank_id, name, question, filter_kinds, filter_entity_id,
      filter_min_volatility, max_tokens, enabled, last_fingerprint, last_refreshed_at,
-     refresh_requested_at, last_error_kind, last_error_at, plan";
+     refresh_requested_at, last_error_kind, last_error_at, plan, answer";
 
 fn model_row(row: &rusqlite::Row<'_>) -> Result<ModelRow, rusqlite::Error> {
     let uuid: String = row.get(1)?;
@@ -467,6 +431,7 @@ fn model_row(row: &rusqlite::Row<'_>) -> Result<ModelRow, rusqlite::Error> {
         plan: row
             .get::<_, Option<String>>(15)?
             .and_then(|plan| serde_json::from_str(&plan).ok()),
+        answer: row.get(16)?,
     })
 }
 
@@ -532,42 +497,23 @@ pub(crate) fn find_model(
     .optional()
 }
 
-/// The model's entries in position order, with their citations in the
+/// The memories the model's answer cites, by rowid and public id, in the
 /// order they were written.
-pub(crate) fn load_entries(
+pub(crate) fn load_cites(
     conn: &Connection,
     model_id: i64,
-) -> Result<Vec<StoredEntry>, rusqlite::Error> {
-    let mut entries = conn.prepare_cached(
-        "SELECT id, uuid, text, section FROM mental_model_entries WHERE model_id = ?1
-         ORDER BY position, id",
+) -> Result<Vec<(i64, Uuid)>, rusqlite::Error> {
+    let mut cites = conn.prepare_cached(
+        "SELECT c.memory_id, m.uuid FROM mental_model_cites c
+         JOIN memories m ON m.id = c.memory_id
+         WHERE c.model_id = ?1 ORDER BY c.rowid",
     )?;
-    let mut entries: Vec<StoredEntry> = entries
+    cites
         .query_map([model_id], |row| {
             let uuid: String = row.get(1)?;
-            Ok(StoredEntry {
-                id: row.get(0)?,
-                uuid: uuid.parse().unwrap_or_default(),
-                section: row.get(3)?,
-                text: row.get(2)?,
-                cites: Vec::new(),
-            })
+            Ok((row.get(0)?, uuid.parse().unwrap_or_default()))
         })?
-        .collect::<Result<_, _>>()?;
-    let mut cites = conn.prepare_cached(
-        "SELECT c.memory_id, m.uuid FROM mental_model_citations c
-         JOIN memories m ON m.id = c.memory_id
-         WHERE c.entry_id = ?1 ORDER BY c.rowid",
-    )?;
-    for entry in &mut entries {
-        entry.cites = cites
-            .query_map([entry.id], |row| {
-                let uuid: String = row.get(1)?;
-                Ok((row.get(0)?, uuid.parse().unwrap_or_default()))
-            })?
-            .collect::<Result<_, _>>()?;
-    }
-    Ok(entries)
+        .collect()
 }
 
 /// A model as the API shows it.
@@ -580,14 +526,9 @@ pub(crate) fn model(conn: &Connection, row: &ModelRow) -> Result<Model, rusqlite
             .optional()?,
         None => None,
     };
-    let entries = load_entries(conn, row.id)?
+    let cites = load_cites(conn, row.id)?
         .into_iter()
-        .map(|entry| Entry {
-            id: entry.uuid,
-            section: entry.section,
-            text: entry.text,
-            cites: entry.cites.into_iter().map(|(_, uuid)| uuid).collect(),
-        })
+        .map(|(_, uuid)| uuid)
         .collect();
     Ok(Model {
         id: row.uuid,
@@ -598,7 +539,8 @@ pub(crate) fn model(conn: &Connection, row: &ModelRow) -> Result<Model, rusqlite
         min_volatility: row.min_volatility,
         max_tokens: row.max_tokens,
         enabled: row.enabled,
-        entries,
+        answer: row.answer.clone(),
+        cites,
         last_refreshed_at: row.last_refreshed_at,
         last_error: row.last_error,
         last_error_at: row.last_error_at,
@@ -847,7 +789,7 @@ fn agenda_kind(kind: Kind) -> bool {
 /// The block changes when a memory the agenda would list is written,
 /// ended, retracted, kept or unkept, which is a check on its kind, and when
 /// a cited memory is ended or retracted, so the next fetch can't serve an
-/// entry that rendering would drop.
+/// answer that rendering would leave out.
 pub(crate) fn effects(
     conn: &Connection,
     bank_id: i64,
@@ -930,10 +872,9 @@ pub(crate) fn effects(
 
     if !cited_changes.is_empty() {
         let mut citing = conn.prepare_cached(
-            "SELECT DISTINCT e.model_id FROM mental_model_citations c
-             JOIN mental_model_entries e ON e.id = c.entry_id
-             WHERE c.memory_id = ?1
-                OR c.memory_id = (SELECT superseded_by FROM memories WHERE id = ?1)",
+            "SELECT DISTINCT model_id FROM mental_model_cites
+             WHERE memory_id = ?1
+                OR memory_id = (SELECT superseded_by FROM memories WHERE id = ?1)",
         )?;
         for memory in cited_changes {
             for model in citing.query_map([memory], |row| row.get::<_, i64>(0))? {

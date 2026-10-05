@@ -457,10 +457,10 @@ pub struct ListArgs {
 /// `asphodel model`: only the owner defines models, through here or the API.
 #[derive(Debug, Subcommand)]
 pub enum ModelCommand {
-    /// Define a model: a standing question its entries answer.
+    /// Define a model: a standing question its answer answers.
     Create(ModelCreateArgs),
 
-    /// List the bank's models with their entries and citations.
+    /// List the bank's models with their answers.
     List(ModelListArgs),
 
     /// Change a model's question, filters, size, or whether it's enabled.
@@ -470,9 +470,9 @@ pub enum ModelCommand {
     /// unless `--force`.
     Refresh(ModelRefreshArgs),
 
-    /// Show a model's summary as the block reads it, each section a
-    /// heading and a paragraph. `--entry` shows one entry with the memories
-    /// it cites and whether the block shows it.
+    /// Show a model's answer as the block reads it, each section a heading
+    /// and a paragraph, then the memories it cites with their status and
+    /// whether the block shows the model.
     Show(ModelShowArgs),
 }
 
@@ -486,11 +486,6 @@ pub struct ModelShowArgs {
 
     /// The model's name.
     pub name: String,
-
-    /// Only this entry, by id, with its id, the memories it cites and
-    /// whether the block shows it. `--json` lists every entry's id.
-    #[arg(long)]
-    pub entry: Option<String>,
 }
 
 /// `asphodel memory`: a memory's metadata can be edited, never its sentence,
@@ -1665,15 +1660,15 @@ fn model(command: ModelCommand) -> anyhow::Result<()> {
                     println!("unchanged: its inputs are the same as at the last refresh")
                 }
                 Some("applied") => {
-                    let count = |key: &str| list(detail, key).len();
+                    let written = if detail.get("written").and_then(Value::as_bool) == Some(true) {
+                        "answer written"
+                    } else {
+                        "no answer written"
+                    };
                     println!(
-                        "refreshed: {} added, {} edited, {} removed, {} rejected, {} dropped, {} trimmed",
-                        count("added"),
-                        count("edited"),
-                        count("removed"),
-                        count("rejected"),
-                        count("dropped"),
-                        count("trimmed"),
+                        "refreshed: {written}, {} empty sections left out, {} sentences trimmed",
+                        list(detail, "rejected").len(),
+                        count(detail, "trimmed"),
                     );
                 }
                 Some("held") => println!(
@@ -1689,28 +1684,25 @@ fn model(command: ModelCommand) -> anyhow::Result<()> {
         }
         ModelCommand::Show(args) => {
             let client = Client::new(&args.client)?;
-            let mut path = format!(
+            let path = format!(
                 "/v1/banks/{}/models/{}",
                 segment(&args.bank),
                 segment(&args.name)
             );
-            if let Some(entry) = &args.entry {
-                path.push_str(&format!("?entry={}", segment(entry)));
-            }
             let view: Value = client.get(&path)?;
             if args.client.json {
                 return print_json(&view);
             }
-            print_model_view(&view, args.entry.is_some());
+            print_model_view(&view);
             Ok(())
         }
     }
 }
 
-/// A model's view: its settings, then its summary as the block reads,
-/// each section a heading and one paragraph. With `detail`, as for
-/// `--entry`, each entry instead, with its id and what it cites.
-fn print_model_view(view: &Value, detail: bool) {
+/// A model's view: its settings, its answer as the block reads it, each
+/// section a heading and one paragraph, then the memories it cites with
+/// their status, and whether the block shows the model.
+fn print_model_view(view: &Value) {
     let enabled = if view.get("enabled").and_then(Value::as_bool) == Some(false) {
         ", disabled"
     } else {
@@ -1749,44 +1741,28 @@ fn print_model_view(view: &Value, detail: bool) {
             text(view, "last_error_at")
         );
     }
-    let entries = list(view, "entry_views");
-    if !detail {
-        let shown: Vec<&Value> = entries
-            .iter()
-            .filter(|entry| entry.get("renders").and_then(Value::as_bool) == Some(true))
-            .collect();
-        print_summary(&shown);
-        let hidden = entries.len() - shown.len();
-        if hidden > 0 {
-            println!("  ({hidden} more not shown: a memory each cites isn't current; see --json)");
-        }
-        return;
+    print_answer(view);
+    let cited = list(view, "cited");
+    if !cited.is_empty() {
+        println!("  cites:");
     }
-    let mut heading: Option<&str> = None;
-    for entry in entries {
-        let section = entry.get("section").and_then(Value::as_str);
-        if section.is_some() && section != heading {
-            println!("  ### {}", section.unwrap_or_default());
-        }
-        heading = section;
-        let renders = if entry.get("renders").and_then(Value::as_bool) == Some(true) {
-            ""
-        } else {
-            "  (not shown: a memory it cites isn't current)"
-        };
+    for cite in cited {
         println!(
-            "  - {}  {}{renders}",
-            text(entry, "id"),
-            text(entry, "text")
+            "    {} [{}]  {}",
+            text(cite, "id"),
+            text(cite, "status"),
+            text(cite, "sentence")
         );
-        for cite in list(entry, "cites") {
-            println!(
-                "      cites {} [{}]  {}",
-                text(cite, "id"),
-                text(cite, "status"),
-                text(cite, "sentence")
-            );
-        }
+    }
+    let answer = view.get("answer").and_then(Value::as_str);
+    match view.get("shown_answer").and_then(Value::as_str) {
+        Some(shown) if Some(shown) == answer => println!("  the block shows it"),
+        Some(_) => println!("  the block shows it cut short, to fit what the agenda leaves"),
+        None if answer.is_some() => println!(
+            "  the block leaves it out: it's disabled, a memory it cites isn't current, \
+             or not one sentence fits what the agenda leaves"
+        ),
+        None => {}
     }
 }
 
@@ -1812,39 +1788,18 @@ fn print_model(model: &Value) {
             text(model, "last_error_at")
         );
     }
-    let entries = list(model, "entries");
-    print_summary(&entries.iter().collect::<Vec<_>>());
+    print_answer(model);
 }
 
-/// Entries as the block renders them: each section, in the order its
-/// heading first comes, as the heading and its sentences joined into one
-/// paragraph. An entry written before sections is a line of its own.
-fn print_summary(entries: &[&Value]) {
-    let mut groups: Vec<(Option<&str>, Vec<&str>)> = Vec::new();
-    for entry in entries {
-        let section = entry.get("section").and_then(Value::as_str);
-        let sentence = text(entry, "text");
-        let found = match section {
-            Some(_) => groups.iter_mut().find(|(heading, _)| *heading == section),
-            None => groups.last_mut().filter(|(heading, _)| heading.is_none()),
-        };
-        match found {
-            Some((_, sentences)) => sentences.push(sentence),
-            None => groups.push((section, vec![sentence])),
-        }
-    }
-    for (heading, sentences) in groups {
-        match heading {
-            Some(heading) => {
-                println!("  ### {heading}");
-                println!("  {}", sentences.join(" "));
-            }
-            None => {
-                for sentence in sentences {
-                    println!("  - {sentence}");
-                }
+/// A model's answer as the block reads it, indented, or that it has none.
+fn print_answer(model: &Value) {
+    match model.get("answer").and_then(Value::as_str) {
+        Some(answer) => {
+            for line in answer.lines() {
+                println!("  {line}");
             }
         }
+        None => println!("  no answer yet"),
     }
 }
 

@@ -5,11 +5,11 @@
 //! These tests drive the service on a `SimulatedClock` and refresh models
 //! with `FakeLlm`, scripted as the calls a refresh makes: a plan, only for
 //! a model whose question has no built-in or stored plan, then a write of
-//! the whole summary as sections of cited sentences. Every memory comes
-//! from extraction: the owner says it in a turn, call 1 (a scripted
-//! `FakeLlm`) finds the claim, and call 2's labels make retractions,
-//! endings and refinements. `keep`, `retract`, `forget` and the owner's
-//! model edits do the rest.
+//! the whole answer as sections of prose and the memories it cites. Every
+//! memory comes from extraction: the owner says it in a turn, call 1 (a
+//! scripted `FakeLlm`) finds the claim, and call 2's labels make
+//! retractions, endings and refinements. `keep`, `retract`, `forget` and
+//! the owner's model edits do the rest.
 //!
 //! The API under test is `asphodel_core::mental_models`,
 //! `asphodel_core::agenda`, `asphodel_core::system_prompt` and the
@@ -35,7 +35,7 @@ use asphodel_core::ingest::Turn;
 use asphodel_core::inspect::{BankOverview, MemoryView};
 use asphodel_core::mental_models::{
     Applied, FailureKind, Model, ModelEdit, ModelError, ModelSpec, Outcome, PLAN_TEMPLATE,
-    RefreshInput, Refreshes, RejectReason, WRITE_TEMPLATE,
+    RefreshInput, Refreshes, WRITE_TEMPLATE,
 };
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmGate, LlmRequest,
@@ -345,14 +345,25 @@ impl Harness {
     }
 
     /// As [`Harness::refresh_with`], writing `sections`, each a heading and
-    /// its sentences as `(text, cites)`.
+    /// its sentences as `(text, cites)`: a section's sentences join into
+    /// its paragraph, and the write cites every memory any sentence does.
     fn rewrite(&self, name: &str, sections: &[Section<'_>]) -> Applied {
         self.refresh_with(name, |input| {
-            let said = |(text, cites): &(&str, &[Uuid])| said(text, &handles(input, cites));
-            let sections = sections
-                .iter()
-                .map(|(heading, sentences)| (*heading, sentences.iter().map(said).collect()));
-            written(sections.collect())
+            let mut cited = Vec::new();
+            let mut paragraphs = Vec::new();
+            for (heading, sentences) in sections {
+                let texts: Vec<&str> = sentences.iter().map(|(text, _)| *text).collect();
+                paragraphs.push((*heading, texts.join(" ")));
+                for memory in sentences.iter().flat_map(|(_, cites)| *cites) {
+                    let handle = handle(input, *memory);
+                    if !cited.contains(&handle) {
+                        cited.push(handle);
+                    }
+                }
+            }
+            let paragraphs: Vec<(&str, &str)> =
+                paragraphs.iter().map(|(h, t)| (*h, t.as_str())).collect();
+            written(&paragraphs, &cited)
         })
     }
 
@@ -363,9 +374,9 @@ impl Harness {
 
     /// Plans `name` with one facet per `(heading, query)`: a forced refresh
     /// whose plan call returns them and whose write, if there's anything to
-    /// write from, is empty. Returns the plan request.
+    /// write from, is [`quiet`]. Returns the plan request.
     fn plan(&self, name: &str, facets: &[(&str, &str)]) -> LlmRequest {
-        let llm = FakeLlm::scripted(MODEL, vec![planned(facets), written(vec![])]);
+        let llm = FakeLlm::scripted(MODEL, vec![planned(facets), quiet()]);
         applied(self.refresh(name, &llm, true));
         calls(&llm, PLAN_TEMPLATE)
             .pop()
@@ -621,17 +632,22 @@ fn planned(facets: &[(&str, &str)]) -> Value {
     json!({"facets": facets.collect::<Vec<_>>()})
 }
 
-/// A write: the whole summary, one section per `(heading, sentences)`.
-fn written(sections: Vec<(&str, Vec<Value>)>) -> Value {
+/// A write: the whole answer, one section per `(heading, text)`, citing
+/// `cites`.
+fn written(sections: &[(&str, &str)], cites: &[String]) -> Value {
     let sections = sections
-        .into_iter()
-        .map(|(heading, sentences)| json!({"heading": heading, "sentences": sentences}));
-    json!({"sections": sections.collect::<Vec<_>>()})
+        .iter()
+        .map(|(heading, text)| json!({"heading": heading, "text": text}));
+    json!({"sections": sections.collect::<Vec<_>>(), "cites": cites})
 }
 
-/// A sentence of a write, citing memory handles.
-fn said(text: &str, cites: &[String]) -> Value {
-    json!({"text": text, "cites": cites})
+/// What [`quiet`] writes.
+const QUIET: &str = "Tim is known here.";
+
+/// A write with one sentence, citing the first memory listed. Any refresh
+/// that calls the LLM lists at least one.
+fn quiet() -> Value {
+    written(&[(SECTION, QUIET)], &["m1".into()])
 }
 
 fn applied(outcome: Outcome) -> Applied {
@@ -641,9 +657,9 @@ fn applied(outcome: Outcome) -> Applied {
     }
 }
 
-/// An LLM that answers every write with an empty summary.
+/// An LLM that answers every write with [`quiet`].
 fn quiet_llm(calls: usize) -> FakeLlm {
-    FakeLlm::scripted(MODEL, vec![written(vec![]); calls])
+    FakeLlm::scripted(MODEL, vec![quiet(); calls])
 }
 
 /// The requests `llm` was sent with `template`, in order.
@@ -683,8 +699,12 @@ fn inputs(input: &RefreshInput) -> BTreeSet<Uuid> {
     input.memories.iter().map(|m| m.memory).collect()
 }
 
-fn texts(model: &Model) -> Vec<&str> {
-    model.entries.iter().map(|e| e.text.as_str()).collect()
+fn answer(model: &Model) -> &str {
+    model.answer.as_deref().unwrap_or_default()
+}
+
+fn cites(model: &Model) -> BTreeSet<Uuid> {
+    model.cites.iter().copied().collect()
 }
 
 fn plans_model(max_tokens: u32) -> ModelSpec {
@@ -809,15 +829,12 @@ fn an_owner_edit_triggers_a_refresh_that_isnt_skipped() {
     // same memories still get an LLM call. A new question is planned first.
     let h = Harness::new();
     h.seed(fact(TEA));
-    h.profile_adding(&[]);
+    applied(h.refresh(PROFILE_NAME, &quiet_llm(1), true));
     let question = "What does Tim like to drink?";
     h.edit(PROFILE_NAME, json!({"question": question})).unwrap();
 
     h.advance(minutes(30));
-    let llm = FakeLlm::scripted(
-        MODEL,
-        vec![planned(&[("Drinks", question)]), written(vec![])],
-    );
+    let llm = FakeLlm::scripted(MODEL, vec![planned(&[("Drinks", question)]), quiet()]);
     let ran = h.tick(&llm);
     assert_eq!(ran.ran.len(), 1);
     assert!(matches!(ran.ran[0].outcome, Outcome::Applied(_)));
@@ -878,7 +895,7 @@ fn a_refresh_held_by_the_gate_waits_for_the_hold_not_thirty_minutes() {
         let h = Harness::new();
         h.says(fact(TEA));
         h.advance(minutes(5));
-        let script = json!([limit, {"reply": written(vec![])}]).to_string();
+        let script = json!([limit, {"reply": quiet()}]).to_string();
         let inner = Arc::new(FakeLlm::from_script(MODEL, &script).unwrap());
         let gate = LlmGate::new(inner.clone(), 1, h.clock.clone());
         let hello = turn("gated", h.now(), "Hello.");
@@ -1183,28 +1200,25 @@ fn a_faded_memory_leaves_the_model_at_the_next_sweep() {
     let tea = faded[0];
     let cat = h.seed(fact(CAT));
     h.keep(tea);
-    let applied = h.profile_adding(&[(CAT_ENTRY, &[cat]), (TEA, &[tea])]);
-    let tea_entry = applied.added[1];
+    h.profile_adding(&[(CAT_ENTRY, &[cat]), (TEA, &[tea])]);
     h.service.unkeep(BANK, &[tea.to_string()]).unwrap();
 
     let input = inputs(&h.input(PROFILE_NAME));
     assert!(!input.contains(&tea) && input.contains(&cat), "{input:?}");
 
-    // The write is never shown the faded memory or the entry citing it, so
-    // it can't keep them.
+    // The write is never shown the faded memory, so it can't cite it.
     h.set(at(SWEEP));
     let input = h.input(PROFILE_NAME);
-    let shown: Vec<Uuid> = input.entries.iter().map(|e| e.entry).collect();
-    assert_eq!(shown, [applied.added[0]]);
-    let cat_entry = said(CAT_ENTRY, &handles(&input, &[cat]));
-    let llm = FakeLlm::scripted(MODEL, vec![written(vec![(SECTION, vec![cat_entry])])]);
-    let ran = h.tick(&llm);
+    let reply = written(&[(SECTION, CAT_ENTRY)], &handles(&input, &[cat]));
+    let ran = h.tick(&FakeLlm::scripted(MODEL, vec![reply]));
     assert_eq!(ran.ran.len(), 1);
-    let Outcome::Applied(applied) = &ran.ran[0].outcome else {
-        panic!("the selection changed, so the LLM is called: {ran:?}");
-    };
-    assert_eq!(applied.dropped, vec![tea_entry]);
-    assert_eq!(texts(&h.profile()), [CAT_ENTRY]);
+    assert!(
+        matches!(ran.ran[0].outcome, Outcome::Applied(_)),
+        "the selection changed, so the LLM is called: {ran:?}"
+    );
+    let profile = h.profile();
+    assert_eq!(paragraph(answer(&profile), SECTION), Some(CAT_ENTRY));
+    assert_eq!(cites(&profile), BTreeSet::from([cat]));
 }
 
 #[test]
@@ -1408,10 +1422,10 @@ fn the_total_goes_round_the_facets_instead_of_taking_the_best_scores() {
 }
 
 #[test]
-fn a_changed_question_rewrites_the_summary_even_with_the_same_facets() {
+fn a_changed_question_rewrites_the_answer_even_with_the_same_facets() {
     // The question is compared with the plan. Here the new question plans
     // the same facet and selects the same memories, and the refresh still
-    // isn't skipped: the write is shown the previous summary, and what it
+    // isn't skipped: the write is shown the previous answer, and what it
     // leaves out goes.
     let h = Harness::new();
     let question = mornings(&h, 100);
@@ -1424,135 +1438,98 @@ fn a_changed_question_rewrites_the_summary_even_with_the_same_facets() {
         "Tim has juice.",
     ];
     let sentences = [0, 1, 2].map(|n| (wording[n], std::slice::from_ref(&m[n])));
-    let first = h.rewrite("Mornings", &[("Drinks", &sentences)]);
+    h.rewrite("Mornings", &[("Drinks", &sentences)]);
     let input = h.input("Mornings");
 
     let breakfast = "What does Tim have with breakfast?";
     h.edit("Mornings", json!({"question": breakfast})).unwrap();
-    let keep = |n: usize| said(wording[n], &handles(&input, &[m[n]]));
-    let write = written(vec![("Drinks", vec![keep(0), keep(1)])]);
+    let kept = wording[..2].join(" ");
+    let write = written(&[("Drinks", &kept)], &handles(&input, &m[..2]));
     let llm = FakeLlm::scripted(MODEL, vec![planned(&[("Drinks", question)]), write]);
     let rewritten = applied(h.refresh("Mornings", &llm, false));
-    assert_eq!(rewritten.removed, [first.added[2]]);
-    assert_eq!(texts(&h.model("Mornings")), wording[..2]);
+    assert!(rewritten.written);
+    let mornings = h.model("Mornings");
+    assert_eq!(
+        paragraph(answer(&mornings), "Drinks"),
+        Some(wording[..2].join(" ").as_str())
+    );
+    assert_eq!(cites(&mornings), BTreeSet::from([m[0], m[1]]));
     let write = &calls(&llm, WRITE_TEMPLATE)[0].user;
     assert!(write.contains(wording[2]), "{write}");
 }
 
-// The written summary
+// The written answer
 
 #[test]
-fn a_write_keeps_ids_for_matching_text_or_citations_and_replaces_the_rest() {
-    // Every write restates the whole summary. A sentence whose text matches
-    // an entry keeps that entry's id, but never its citations or section:
-    // those come from the write. One citing exactly what an entry cited, in
-    // new words, keeps the id as an edit. Anything else is added, and an
-    // entry the write leaves out is removed.
+fn a_write_stores_its_sections_as_one_text_citing_what_the_whole_reply_cites() {
+    // Each section is its heading's line and then its paragraph, with a
+    // blank line between sections. A section with no text is left out,
+    // heading and all. The next write replaces the text and the citations
+    // whole.
     let h = Harness::new();
-    let claims = [
-        TEA,
-        "Tim walks to work.",
-        CAT,
-        "Tim still has Miso.",
-        "Tim keeps bees.",
-        MAYA,
-    ];
+    let claims = [TEA, "Tim walks to work.", CAT, MAYA];
     let m = h.seed_all(BANK, at(EARLIER), claims.map(fact).into());
-    let [tea, walk, cat, still, bees, maya] = m[..] else {
+    let [tea, walk, cat, maya] = m[..] else {
         unreachable!()
     };
-    let first = h.rewrite(
-        PROFILE_NAME,
-        &[
-            (
-                "Preferences",
-                &[(TEA, &[tea]), ("Tim walks to work.", &[walk])],
-            ),
-            (
-                "People",
-                &[(CAT_ENTRY, &[cat]), ("Tim keeps bees.", &[bees])],
-            ),
-        ],
-    );
-    let [tea_entry, walk_entry, cat_entry, bees_entry] = first.added[..] else {
-        panic!("four adds: {first:?}");
-    };
-    let before = h.profile();
-
-    let hives = "Tim keeps two hives of bees.";
-    let second = h.rewrite(
-        PROFILE_NAME,
-        &[
-            ("Preferences", &[(TEA, &[tea])]),
-            ("Pets", &[(CAT_ENTRY, &[still]), (hives, &[bees])]),
-            ("People", &[(MAYA, &[maya])]),
-        ],
-    );
-    assert_eq!(second.edited, vec![cat_entry, bees_entry]);
-    assert_eq!(second.removed, vec![walk_entry]);
-    let [maya_entry] = second.added[..] else {
-        panic!("one add: {second:?}");
-    };
-    let after = h.profile();
-    let entries = after.entries.iter().map(|e| {
-        (
-            e.id,
-            e.section.as_deref(),
-            e.text.as_str(),
-            e.cites.as_slice(),
-        )
+    let first = h.refresh_with(PROFILE_NAME, |input| {
+        let sections = [
+            ("Preferences", "Tim likes green tea. Tim walks to work."),
+            ("Hobbies", "  "),
+            ("People", MAYA),
+        ];
+        written(&sections, &handles(input, &[tea, walk, maya]))
     });
+    assert!(first.written);
+    assert_eq!(first.trimmed, 0);
+    let profile = h.profile();
     assert_eq!(
-        entries.collect::<Vec<_>>(),
-        [
-            (tea_entry, Some("Preferences"), TEA, &[tea][..]),
-            (cat_entry, Some("Pets"), CAT_ENTRY, &[still][..]),
-            (bees_entry, Some("Pets"), hives, &[bees][..]),
-            (maya_entry, Some("People"), MAYA, &[maya][..]),
-        ]
+        answer(&profile),
+        "### Preferences\nTim likes green tea. Tim walks to work.\n\n### People\nTim's daughter is called Maya."
     );
-    assert_eq!(
-        after.entries[0], before.entries[0],
-        "the restated entry changed"
-    );
+    assert_eq!(cites(&profile), BTreeSet::from([tea, walk, maya]));
+
+    h.rewrite(PROFILE_NAME, &[("Pets", &[(CAT_ENTRY, &[cat])])]);
+    let profile = h.profile();
+    assert_eq!(answer(&profile), "### Pets\nTim has a cat called Miso.");
+    assert_eq!(cites(&profile), BTreeSet::from([cat]));
 }
 
 #[test]
-fn unsupported_sentences_are_rejected_and_the_rest_are_written() {
-    // Code refuses a sentence citing outside the refresh's input, citing
-    // nothing, or with no text, by its index in the reply counted across
-    // its sections.
+fn a_reply_without_text_or_citations_or_citing_outside_the_input_changes_nothing() {
+    // Code can check the citations, not the prose, so one bad citation
+    // refuses the whole reply. It's recorded as a malformed reply.
     let h = Harness::new();
     let tea = h.seed(fact(TEA));
     let outside = h.seed(event("Tim went surfing in Raglan.", "2026-09-01"));
     h.profile_adding(&[(TEA, &[tea])]);
-    assert!(!inputs(&h.input(PROFILE_NAME)).contains(&outside));
-    let applied = h.refresh_with(PROFILE_NAME, |input| {
-        let tea = handle(input, tea);
-        let hobbies = vec![
-            said("Tim surfs.", &["m99".into()]),
-            said("Tim surfs in Raglan.", &[outside.to_string()]),
-            said("Tim likes tea and surfing.", &[tea.clone(), "m99".into()]),
-        ];
-        let preferences = vec![
-            said("Tim is lovely.", &[]),
-            said("  ", std::slice::from_ref(&tea)),
-            said("Tim drinks green tea.", &[tea]),
-        ];
-        written(vec![("Hobbies", hobbies), ("Preferences", preferences)])
-    });
-    let rejected = applied.rejected.iter().map(|r| (r.index, r.reason));
-    assert_eq!(
-        rejected.collect::<Vec<_>>(),
-        [
-            (0, RejectReason::CitesOutsideInput),
-            (1, RejectReason::CitesOutsideInput),
-            (2, RejectReason::CitesOutsideInput),
-            (3, RejectReason::NoCitations),
-            (4, RejectReason::EmptyText),
-        ]
-    );
-    assert_eq!(texts(&h.profile()), ["Tim drinks green tea."]);
+    let before = h.profile();
+    let input = h.input(PROFILE_NAME);
+    assert!(!inputs(&input).contains(&outside));
+    let tea = handle(&input, tea);
+    for reply in [
+        written(&[("Hobbies", "Tim surfs.")], &["m99".into()]),
+        written(
+            &[("Hobbies", "Tim surfs in Raglan.")],
+            &[outside.to_string()],
+        ),
+        written(
+            &[("Hobbies", "Tim likes tea and surfing.")],
+            &[tea.clone(), "m99".into()],
+        ),
+        written(&[("Preferences", "Tim is lovely.")], &[]),
+        written(&[("Preferences", "  ")], std::slice::from_ref(&tea)),
+        written(&[], std::slice::from_ref(&tea)),
+    ] {
+        h.advance(minutes(1));
+        let llm = FakeLlm::scripted(MODEL, vec![reply.clone()]);
+        let outcome = h.refresh(PROFILE_NAME, &llm, true);
+        assert_eq!(outcome, Outcome::Failed(FailureKind::Malformed), "{reply}");
+        let after = h.profile();
+        assert_eq!(answer(&after), answer(&before), "{reply}");
+        assert_eq!(cites(&after), cites(&before), "{reply}");
+        assert_eq!(after.last_error, Some(FailureKind::Malformed), "{reply}");
+    }
 }
 
 #[test]
@@ -1565,16 +1542,22 @@ fn a_malformed_reply_or_plan_writes_nothing_and_records_an_error() {
 
     h.advance(minutes(1));
     let malformed = Outcome::Failed(FailureKind::Malformed);
+    // The last is a reply as the first version of the write took it,
+    // sentence by sentence.
     for nonsense in [
         json!({"operations": []}),
-        json!({"sections": [{"heading": "Tea", "sentences": "all of them"}]}),
-        json!({"sections": "everything"}),
+        json!({"sections": [{"heading": "Tea", "text": ["all of it"]}], "cites": ["m1"]}),
+        json!({"sections": "everything", "cites": ["m1"]}),
+        json!({"sections": [{"heading": "Tea", "sentences": [
+            {"text": TEA, "cites": ["m1"]},
+        ]}]}),
     ] {
         let llm = FakeLlm::scripted(MODEL, vec![nonsense.clone()]);
         let outcome = h.refresh(PROFILE_NAME, &llm, false);
         assert_eq!(outcome, malformed, "{nonsense}");
         let after = h.profile();
-        assert_eq!(after.entries, before.entries);
+        assert_eq!(after.answer, before.answer);
+        assert_eq!(after.cites, before.cites);
         assert_eq!(after.last_refreshed_at, before.last_refreshed_at);
         assert_eq!(after.last_error, Some(FailureKind::Malformed));
         assert_eq!(after.last_error_at, Some(h.now()));
@@ -1590,7 +1573,7 @@ fn a_malformed_reply_or_plan_writes_nothing_and_records_an_error() {
         json!({"facets": []}),
         json!({"sections": []}),
     ] {
-        let llm = FakeLlm::scripted(MODEL, vec![nonsense.clone(), written(vec![])]);
+        let llm = FakeLlm::scripted(MODEL, vec![nonsense.clone(), quiet()]);
         assert_eq!(h.refresh("Plans", &llm, true), malformed, "{nonsense}");
         let calls = (calls(&llm, PLAN_TEMPLATE).len(), writes(&llm));
         assert_eq!(calls, (1, 0), "{nonsense}");
@@ -1645,100 +1628,87 @@ fn mornings(h: &Harness, max_tokens: u32) -> &'static str {
 }
 
 #[test]
-fn entries_past_max_tokens_are_trimmed_lowest_ranked_first_headings_included() {
-    // Code trims the lowest-ranked entries, ranked by the best score among
-    // each entry's cited memories. The three memories here share the same
-    // words with the question, so strength decides.
+fn an_answer_past_max_tokens_loses_sentences_from_the_end_headings_included() {
+    // Measured on the stored text, headings and all. The last sentence of
+    // the last section goes first, and a section left empty takes its
+    // heading with it. A sentence ends at `.`, `!` or `?` before a space or
+    // the end, so "2.5" doesn't end one.
     let h = Harness::new();
-    mornings(&h, 34);
-    let drinks = [("tea", "critical"), ("coffee", "minor"), ("juice", "major")];
-    let drinks =
-        drinks.map(|(d, level)| fact(&format!("Tim drinks {d} in the morning.")).level(level));
-    let m = h.seed_all(BANK, at(EARLIER), drinks.into());
-    // 60 characters each: 15 tokens, so two and their heading fit in 34.
-    let texts = [
-        "Tim starts every single day with a large pot of green tea..",
-        "Tim sometimes has a strong black coffee in the morning too.",
-        "Tim drinks a glass of fresh orange juice with his breakfast.",
-    ];
-    let s = |n: usize| (texts[n], std::slice::from_ref(&m[n]));
-    let applied = h.rewrite("Mornings", &[("Drinks", &[s(0), s(1), s(2)])]);
-    assert_eq!(applied.trimmed, vec![applied.added[1]]);
-    let model = h.model("Mornings");
-    assert_eq!(model.entries.len(), 2);
-    let tokens: usize = model.entries.iter().map(|e| estimate_tokens(&e.text)).sum();
-    assert!(tokens <= 34, "{tokens} tokens");
-
-    // Two fill 30 exactly, so with two headings they don't fit, and the
-    // lower-ranked goes with its heading.
-    h.edit("Mornings", json!({"max_tokens": 30})).unwrap();
-    let applied = h.rewrite("Mornings", &[("Tea", &[s(0)]), ("Coffee", &[s(1)])]);
-    assert_eq!(applied.trimmed, applied.added, "the coffee");
-    let text = h.block(None).text;
-    assert_eq!(paragraph(&text, "Output:"), Some(texts[0]), "{text}");
-    assert!(!text.contains(texts[1]), "{text}");
+    mornings(&h, 27);
+    let tea = h.seed(fact("Tim drinks tea in the morning."));
+    let kept = "Tim starts every day with a pot of tea. Then he has a strong black coffee too!";
+    let drinks = format!("{kept} Does he drink 2.5 litres before noon?");
+    let applied = h.refresh_with("Mornings", |input| {
+        let sections = [
+            ("Drinks", drinks.as_str()),
+            ("Later", "Tim has juice at lunch."),
+        ];
+        written(&sections, &handles(input, &[tea]))
+    });
+    assert!(applied.written);
+    assert_eq!(applied.trimmed, 2);
+    let mornings = h.model("Mornings");
+    assert_eq!(answer(&mornings), format!("### Drinks\n{kept}"));
+    assert!(estimate_tokens(answer(&mornings)) <= 27);
 }
 
 // Memories win
 
 #[test]
-fn sections_render_as_paragraphs_and_an_entry_citing_a_retracted_memory_is_dropped() {
-    // Stored sections join into one model paragraph in entry order.
+fn an_answer_renders_whole_and_a_retracted_citation_takes_the_model_out() {
+    // One citation that's no longer current taints the whole text, so the
+    // model is left out of the block, question and all, until the refresh
+    // the retraction requests rewrites it.
     let h = Harness::new();
     let tea = h.seed(fact(TEA));
     let maya = h.seed(fact(MAYA));
     let cat = h.seed(fact(CAT));
     let daughter = "Tim's daughter is Maya.";
-    let applied = h.rewrite(
+    h.rewrite(
         PROFILE_NAME,
         &[
             ("People", &[(daughter, &[maya])]),
             ("Preferences", &[(TEA, &[tea]), (CAT_ENTRY, &[cat])]),
         ],
     );
-    let text = h.block(None).text;
+    let question = h.profile().question;
+    let block = h.block(None);
     assert_eq!(
-        paragraph(&text, "Output:"),
-        Some(format!("{daughter} {TEA} {CAT_ENTRY}").as_str()),
-        "{text}"
+        paragraph(&block.text, "People"),
+        Some(daughter),
+        "{}",
+        block.text
     );
+    let preferences = format!("{TEA} {CAT_ENTRY}");
+    assert_eq!(
+        paragraph(&block.text, "Preferences"),
+        Some(preferences.as_str()),
+        "{}",
+        block.text
+    );
+    assert!(block.text.contains(&question), "{}", block.text);
+    let cited: BTreeSet<Uuid> = block.cited.iter().copied().collect();
+    assert_eq!(cited, BTreeSet::from([tea, maya, cat]));
 
     h.advance(minutes(30));
     let corrected = h.now();
     let mia = fact(MIA).with("changes_something", json!(true));
     h.says_changing(mia, maya, "retracts");
     let block = h.block(None);
-    assert!(!block.text.contains(daughter));
-    assert_eq!(
-        paragraph(&block.text, "Output:"),
-        Some(format!("{TEA} {CAT_ENTRY}").as_str()),
-        "{}",
-        block.text
-    );
-    assert!(!block.cited.contains(&maya));
-    // Dropped at render time, and the model is refreshed: the retraction of
-    // a cited memory is a triggering write.
-    assert_eq!(h.profile().entries[0].id, applied.added[0]);
+    for text in [daughter, TEA, CAT_ENTRY, question.as_str()] {
+        assert!(!block.text.contains(text), "{text:?}:\n{}", block.text);
+    }
+    for memory in [tea, maya, cat] {
+        assert!(!block.cited.contains(&memory), "{:?}", block.cited);
+    }
+    // The stored answer waits for the refresh, which the retraction of a
+    // cited memory triggers.
+    assert!(answer(&h.profile()).contains(daughter));
     assert_eq!(h.tick(&quiet_llm(1)).next_due, Some(corrected + minutes(5)));
-
-    // Entries written before sections existed join the same paragraph.
-    let store = h.service.store().unwrap();
-    let conn = store.connection();
-    conn.execute("UPDATE mental_model_entries SET section = NULL", [])
-        .unwrap();
-    drop(conn);
-    let text = h.restart().block(None).text;
-    assert_eq!(
-        paragraph(&text, "Output:"),
-        Some(format!("{TEA} {CAT_ENTRY}").as_str()),
-        "{text}"
-    );
 }
 
 #[test]
-fn an_entry_is_dropped_when_any_one_of_its_memories_ends() {
-    // It isn't enough for one citation to survive: the wording rests on all
-    // of them.
+fn the_model_is_left_out_when_any_one_of_its_memories_ends() {
     let h = Harness::new();
     let berlin = h.seed(fact(BERLIN));
     let cat = h.seed(fact(CAT));
@@ -1746,12 +1716,13 @@ fn an_entry_is_dropped_when_any_one_of_its_memories_ends() {
         ("Tim lives in Berlin with his cat Miso.", &[berlin, cat]),
         (CAT_ENTRY, &[cat]),
     ]);
+    assert!(h.block(None).text.contains(CAT_ENTRY));
     let moved = event(MOVED, "2026-09-12").with("changes_something", json!(true));
     h.says_changing(moved, berlin, "ends");
     let block = h.block(None);
     assert!(!block.text.contains("Tim lives in Berlin"));
-    assert!(block.text.contains(CAT_ENTRY));
-    assert_eq!(block.cited, vec![cat]);
+    assert!(!block.text.contains(CAT_ENTRY));
+    assert!(block.cited.is_empty(), "{:?}", block.cited);
 }
 
 #[test]
@@ -1761,38 +1732,20 @@ fn a_refinement_moves_the_citation_to_the_head_of_the_chain() {
     h.plan("Plans", &[("Trips", "Where is Tim going and when?")]);
     let year = json!({"at": "2027", "precision": "year"});
     let japan = h.seed(claim(JAPAN, "event", "notable").with("valid_from", year));
-    let added = h.refresh_adding("Plans", &[("Tim is going to Japan next year.", &[japan])]);
+    h.refresh_adding("Plans", &[("Tim is going to Japan next year.", &[japan])]);
 
     h.advance(minutes(30));
     let refined = h.now();
     let tokyo = claim(TOKYO, "event", "notable").with("valid_from", month("2027-04"));
     let tokyo = h.says_changing(tokyo, japan, "refines");
-    let plans = h.model("Plans");
-    assert_eq!(plans.entries[0].id, added.added[0]);
-    assert_eq!(plans.entries[0].cites, vec![tokyo]);
-    // The entry still renders, and the next refresh, which isn't skipped,
+    assert_eq!(h.model("Plans").cites, vec![tokyo]);
+    // The answer still renders, and the next refresh, which isn't skipped,
     // rewords it.
-    let text = h.block(None).text;
-    assert!(text.contains("Tim is going to Japan next year."));
+    let block = h.block(None);
+    assert!(block.text.contains("Tim is going to Japan next year."));
+    assert!(block.cited.contains(&tokyo));
     assert_eq!(h.tick(&quiet_llm(1)).next_due, Some(refined + minutes(5)));
     applied(h.refresh("Plans", &quiet_llm(1), false));
-}
-
-#[test]
-fn an_entry_citing_a_low_confidence_state_shows_its_age() {
-    // As in injection, show when it was said, Tuesday 1 September, after
-    // the sentence in its paragraph.
-    let h = Harness::new();
-    let job = h.seed(state("Tim is job hunting.", "weeks"));
-    let tea = h.seed(fact(TEA));
-    h.profile_adding(&[("Tim is looking for a new job.", &[job]), (TEA, &[tea])]);
-    let text = h.block(None).text;
-    let line = paragraph(&text, "Output:").unwrap_or_default();
-    let order = ["a new job.", "Tue 1 Sep", TEA].map(|needle| line.find(needle));
-    assert!(
-        order.iter().all(Option::is_some) && order.is_sorted(),
-        "{text}"
-    );
 }
 
 // The block
@@ -2659,11 +2612,16 @@ fn a_reply_naming_a_handle_call_1_wasnt_given_credits_nothing() {
     assert_eq!(h.accesses(tea, "used"), 0);
 }
 
+/// The profile's entries as version 13 kept them: `(section, text, cites)`
+/// in position order.
+type OldEntry<'a> = (Option<&'a str>, &'a str, &'a [Uuid]);
+
 #[test]
-fn an_upgrade_from_version_13_extracts_a_queued_turn_without_its_snapshot() {
+fn an_upgrade_from_version_13_keeps_each_answer_and_extracts_a_queued_turn_without_its_snapshot() {
     // Version 13 kept the block's rendered sentences with each built block
-    // and each queued turn. Put the queued turn's snapshot back as it was
-    // left, and the store back at 13.
+    // and each queued turn, and a model's answer as entries, each citing
+    // its own memories. Put the queued turn's snapshot and the profile's
+    // entries back as they were left, and the store back at 13.
     let (h, cat, tea) = a_turn_after_the_block();
     let snapshot = json!([{
         "entry": Uuid::from_u128(1),
@@ -2706,8 +2664,85 @@ fn an_upgrade_from_version_13_extracts_a_queued_turn_without_its_snapshot() {
             [snapshot.to_string()],
         )
         .unwrap();
+
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS mental_model_cites;
+             ALTER TABLE mental_models DROP COLUMN answer;",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS mental_model_entries (
+               id         INTEGER PRIMARY KEY AUTOINCREMENT,
+               uuid       TEXT NOT NULL UNIQUE,
+               model_id   INTEGER NOT NULL REFERENCES mental_models(id) ON DELETE CASCADE,
+               position   INTEGER NOT NULL,
+               text       TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               section    TEXT
+             );
+             CREATE TABLE IF NOT EXISTS mental_model_citations (
+               entry_id  INTEGER NOT NULL REFERENCES mental_model_entries(id) ON DELETE CASCADE,
+               memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+               PRIMARY KEY (entry_id, memory_id)
+             );
+             CREATE INDEX IF NOT EXISTS mental_model_entries_model
+               ON mental_model_entries(model_id, position);
+             CREATE INDEX IF NOT EXISTS mental_model_citations_memory
+               ON mental_model_citations(memory_id);
+             DELETE FROM mental_model_entries;",
+        )
+        .unwrap();
+        let model: i64 = conn
+            .query_row(
+                "SELECT id FROM mental_models WHERE name = ?1",
+                [PROFILE_NAME],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // An entry from before sections comes first, whatever its position.
+        let entries: [OldEntry<'_>; 4] = [
+            (Some("Drinks"), TEA, &[tea]),
+            (None, CAT_ENTRY, &[cat]),
+            (Some("Drinks"), BLOCK_SENTENCE, &[cat, tea]),
+            (Some("Pets"), "Miso is Tim's cat.", &[cat]),
+        ];
+        for (position, (section, text, cites)) in entries.into_iter().enumerate() {
+            conn.execute(
+                "INSERT INTO mental_model_entries
+                   (uuid, model_id, position, section, text, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0)",
+                rusqlite::params![
+                    Uuid::from_u128(position as u128 + 10).to_string(),
+                    model,
+                    position as i64,
+                    section,
+                    text
+                ],
+            )
+            .unwrap();
+            let entry = conn.last_insert_rowid();
+            for memory in cites {
+                conn.execute(
+                    "INSERT INTO mental_model_citations (entry_id, memory_id)
+                     SELECT ?1, id FROM memories WHERE uuid = ?2",
+                    rusqlite::params![entry, memory.to_string()],
+                )
+                .unwrap();
+            }
+        }
     }
     let h = h.restart();
+
+    // Each section's entries join into its paragraph, in position order.
+    let profile = h.profile();
+    assert_eq!(
+        answer(&profile),
+        format!(
+            "{CAT_ENTRY}\n\n### Drinks\n{TEA} {BLOCK_SENTENCE}\n\n### Pets\nMiso is Tim's cat."
+        )
+    );
+    assert_eq!(cites(&profile), BTreeSet::from([cat, tea]));
 
     let (extracted, _, request) = extract_relying_on(&h, cat);
     assert!(
@@ -2788,7 +2823,7 @@ impl LlmClient for KeepsDuringCall<'_> {
             self.service.keep(BANK, &[self.keep.to_string()]).unwrap();
         }
         Ok(LlmResponse {
-            json: written(vec![]),
+            json: quiet(),
             usage: None,
             latency: Duration::ZERO,
         })
@@ -2844,34 +2879,42 @@ fn a_stated_end_holds_through_its_unit_in_the_block_and_on_the_agenda() {
     let yoga = h.seed(recurring(yoga, Some("FREQ=WEEKLY;BYDAY=TH"), "2026-01-01"));
     let stopping = event("Tim does yoga until 1 December 2026.", "2026-12-01");
     h.seed_changing(at(EARLIER), stopping, yoga, "ends");
-    let entries = [
+    let sentences = [
         "Tim is in Lisbon for now.",
         "Tim is doing a pottery course.",
         "Tim works at Acme.",
     ];
     let cites: [&[Uuid]; 3] = [&[lisbon], &[course], &[acme]];
-    h.profile_adding(&entries.into_iter().zip(cites).collect::<Vec<_>>());
+    h.profile_adding(&sentences.into_iter().zip(cites).collect::<Vec<_>>());
 
     let block = h.block(None);
-    for entry in entries {
-        assert!(block.text.contains(entry), "{entry:?}:\n{}", block.text);
+    for sentence in sentences {
+        assert!(
+            block.text.contains(sentence),
+            "{sentence:?}:\n{}",
+            block.text
+        );
     }
     let agenda = h.agenda();
     assert_eq!(agenda.undated_tasks, vec![gutters]);
     let routines: BTreeSet<Uuid> = agenda.routines.iter().copied().collect();
     assert_eq!(routines, BTreeSet::from([swim, yoga]));
 
-    // The day ends at local midnight; the month and November go on.
+    // The day ends at local midnight, which takes the model out with
+    // Lisbon; the month and November go on, so an answer without Lisbon
+    // renders.
     h.set(local("2026-10-02T00:00"));
-    let block = h.block(None);
-    assert!(!block.text.contains(entries[0]));
-    assert!(block.text.contains(entries[1]));
-    assert!(block.text.contains(entries[2]));
+    assert!(!h.block(None).text.contains(sentences[1]));
     let agenda = h.agenda();
     assert!(agenda.undated_tasks.is_empty());
     assert!(agenda.routines.contains(&swim));
+    h.profile_adding(&[(sentences[1], &[course]), (sentences[2], &[acme])]);
+    let block = h.block(None);
+    assert!(block.text.contains(sentences[1]), "{}", block.text);
+    assert!(block.text.contains(sentences[2]), "{}", block.text);
     h.set(local("2026-11-01T00:00"));
-    assert!(!h.block(None).text.contains(entries[1]));
+    let block = h.block(None);
+    assert!(!block.text.contains(sentences[2]), "{}", block.text);
 }
 
 #[test]
@@ -2881,10 +2924,13 @@ fn the_whole_block_stays_within_the_budget_and_records_only_what_it_renders() {
     // caps and is laid out first, so today's appointment can't be pushed
     // out by a model; the models get what's left. What the block lists or
     // cites, and so puts in a session's context, is only what it rendered.
+    // A model too long for what's left is cut at a sentence end, and one
+    // with no sentence that fits is left out. `model show` says which.
     let h = Harness::new();
     let today = "Tim has a dentist appointment this evening at the clinic on Queen Street.";
     let mut claims = vec![event(today, "2026-10-01")];
-    claims.extend((0..14).map(|n| {
+    // Leave room for some, but not all, of the profile after the agenda.
+    claims.extend((0..7).map(|n| {
         let text = format!(
             "Tim has appointment number {n} with the planning committee about the new library."
         );
@@ -2916,12 +2962,46 @@ fn the_whole_block_stays_within_the_budget_and_records_only_what_it_renders() {
     assert!(block.agenda.contains(&today), "today's appointment");
     assert!(block.text.contains("dentist appointment this evening"));
 
-    // Only what's rendered is recorded, and so put in context.
-    for (text, fact) in texts.iter().zip(facts) {
-        let rendered = block.text.contains(text.as_str());
-        assert_eq!(block.cited.contains(fact), rendered, "{text:?}");
+    // The answer is cut at a sentence end, and the block cites the model's
+    // whole citation set, which goes in context, since some of it renders.
+    let rendered = texts
+        .iter()
+        .take_while(|text| block.text.contains(text.as_str()))
+        .count();
+    assert!(0 < rendered && rendered < texts.len(), "{}", block.text);
+    let cut = texts[..rendered].join(" ");
+    assert!(
+        block.text.contains(&format!("{cut}\n")) || block.text.ends_with(&cut),
+        "{}",
+        block.text
+    );
+    for text in &texts[rendered..] {
+        assert!(!block.text.contains(text.as_str()), "{text:?}");
     }
+    let cited: BTreeSet<Uuid> = block.cited.iter().copied().collect();
+    assert_eq!(cited, facts.iter().copied().collect());
     let in_context: BTreeSet<Uuid> = h.in_context("s1").into_iter().collect();
     let shown: BTreeSet<Uuid> = block.agenda.iter().chain(&block.cited).copied().collect();
     assert_eq!(in_context, shown);
+    let renders = || h.service.show_model(BANK, PROFILE_NAME).unwrap().renders;
+    assert!(renders(), "a cut answer still shows");
+
+    // Seven more appointments leave no room for the model's heading,
+    // question and first sentence.
+    let more = (7..14).map(|n| {
+        let text = format!(
+            "Tim has appointment number {n} with the planning committee about the new library."
+        );
+        event(&text, &format!("2026-10-{:02}", 2 + n % 7))
+    });
+    h.seed_all(BANK, at(EARLIER), more.collect());
+    let block = h.block(Some("s2"));
+    assert!(estimate_tokens(&block.text) <= budget, "{}", block.text);
+    assert!(!block.text.contains(&texts[0]), "{}", block.text);
+    assert!(
+        facts.iter().all(|fact| !block.cited.contains(fact)),
+        "{:?}",
+        block.cited
+    );
+    assert!(!renders(), "the block left the model out");
 }

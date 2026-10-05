@@ -17,7 +17,7 @@ Content means:
 - recall queries, including the previous user message sent with a prefetch;
 - entity names and aliases;
 - LLM request and response bodies;
-- mental model entries and the system prompt block.
+- mental model answers and the system prompt block.
 
 This applies everywhere: the daemon, the CLI's error paths, HTTP access logs,
 the replay harness and the Hermes plugin. Failed chunk rows store the error

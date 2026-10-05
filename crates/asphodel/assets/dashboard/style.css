@@ -1409,6 +1409,16 @@ legend {
   color: var(--ink);
 }
 
+.model .answer h3 {
+  margin: 0.6rem 0 0.2rem;
+  font: 650 0.95rem var(--sans);
+}
+
+.model .answer p {
+  margin: 0;
+  font: 400 1rem/1.45 var(--serif);
+}
+
 .model[data-enabled="false"] {
   background: transparent;
   border-style: dashed;

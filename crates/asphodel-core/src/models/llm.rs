@@ -230,7 +230,7 @@ pub trait LlmClient: Send + Sync {
     fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
 
     /// [`LlmClient::complete`] for a request whose handles (`m1`, `e1`, …)
-    /// stand for the memories and entries `identities` names. Handles are
+    /// stand for the memories `identities` names. Handles are
     /// positional, so only the identities say which memory a recorded
     /// reply meant: replay's cassette keeps them, to carry a recorded
     /// refresh over to a run where the handles name other memories. Every other
@@ -242,6 +242,15 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<LlmResponse, LlmError> {
         let _ = identities;
         self.complete(request)
+    }
+
+    /// Whether a mental model refresh skips its write `request`, whose
+    /// handles stand for `identities`, instead of sending it: the write
+    /// counts as made and changes nothing. Replay's `--refresh off` skips
+    /// every write. Every other client sends it.
+    fn skips_write(&self, request: &LlmRequest, identities: &[(String, uuid::Uuid)]) -> bool {
+        let _ = (request, identities);
+        false
     }
 }
 

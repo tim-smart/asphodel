@@ -15,7 +15,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { FakeDaemon, TOKEN, questions } from "./fake-daemon.js";
+import { FakeDaemon, TOKEN, questions, sentences } from "./fake-daemon.js";
 import {
   click,
   findRow,
@@ -90,11 +90,12 @@ test("a bank's model count on the banks page opens its mental models", async (t)
   await findText(page.root, questions.plans);
 });
 
-test("each model shows its question, token limit, whether it's in the prompt, its last refresh and error", async (t) => {
+test("each model shows its question, answer, token limit, whether it's in the prompt, its last refresh and error", async (t) => {
   const page = await open(t, new FakeDaemon(), { hash: MODELS, token: TOKEN });
 
   const profile = await findModel(page, "User profile");
   assert.ok(textOf(profile).includes(questions.profile), textOf(profile));
+  assert.ok(textOf(profile).includes(sentences.auckland), textOf(profile));
   assert.match(textOf(profile), /(^|\D)500(\D|$)/);
   assert.ok(profile.querySelector('time[datetime="2026-10-03T08:30:00Z"]'), profile.innerHTML);
   assert.ok(isOn(toggleIn(profile)), "the profile is in the prompt");

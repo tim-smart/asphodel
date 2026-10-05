@@ -136,7 +136,7 @@ in replay before applying them
 (`docs/replay.md`, "Concurrency").
 
 `[llm] language` (unset by default) is the language memories and mental
-model entries are written in, such as `"English"`. Unset, each is written in
+model answers are written in, such as `"English"`. Unset, each is written in
 the language of the text it comes from. The local models are English-only,
 so set it to `"English"` if the assistant is used in another language
 (`docs/models.md`). It applies to new extraction and refreshes only; a
@@ -505,12 +505,13 @@ Only the owner defines mental models, through these commands or the API.
   --disable]`
 - `asphodel model refresh --bank B <name> [--force]` refreshes now. It's
   skipped when the inputs haven't changed, unless `--force`.
-- `asphodel model show --bank B <name> [--entry ID]` prints the summary as
-  the prompt block reads it: each section a heading and one paragraph,
-  with a count of entries the block doesn't show. To answer "why does the
-  profile say X?", find the sentence's entry id with `--json`, then
-  `--entry ID` shows that entry with the memories it cites, their status,
-  and whether the prompt block shows it.
+- `asphodel model show --bank B <name>` prints the answer as the prompt
+  block reads it, each section a heading and one paragraph, then the
+  memories it cites with their status (current, ended, retracted or
+  forgotten), and whether the prompt block shows the model: whole, cut
+  short to fit what the agenda and older models leave of the budget, or
+  not at all. That's how to answer "why does the profile say X?". `model list` prints each answer
+  without the citations.
 
 A refresh asks one narrow question per part of the model's question, its
 facets, instead of one compound question, so a memory about one part isn't
@@ -535,30 +536,39 @@ lost beneath results for the others:
    refresh goes on. Each facet writes one `refresh` row to the recall log,
    its query in both `query` and `raw_query`, and no access.
 3. **Write.** One `write_model` call gets the question, the facets, the
-   memories under the facet that found each, and the current entries as
-   the previous summary, and returns the whole summary as sections of
-   sentences citing memories. Code refuses a sentence citing outside the
-   input, citing nothing, or with no text. A sentence whose text matches
-   an entry keeps that entry's id, and one citing exactly what an entry
-   cited keeps its id under new words, but citations and section always
-   come from the write. What the write leaves out is removed. Over
-   `max_tokens`, headings included, the lowest-ranked entries are trimmed.
+   memories under the facet that found each, and the stored answer as the
+   previous one. It returns the whole answer as connected prose, a heading
+   and a paragraph per facet, and one list of the memories it rests on.
+   Code joins the sections into the stored text and refuses a reply with
+   no text, no citations or a citation outside the input: that refresh
+   changes nothing and fails as malformed, to be tried again in 30
+   minutes. Code can check the citations, not the prose. A memory that left
+   the input isn't listed, so the answer can't cite it, and the prompt
+   says that what the listed memories no longer support goes. Over
+   `max_tokens`, measured on the text with its headings, sentences are
+   trimmed from the end, and a section left empty loses its heading. A
+   sentence ends at `.`, `!`, `?`, `。`, `！` or `？` before whitespace or
+   the end. With nothing selected the answer is cleared, with no call.
 
 A refresh is skipped, unless forced, when its inputs haven't changed: the
 selection, the question, the plan, the filters and the size. A changed
 question always writes again, even when it plans the same facets.
 
-The prompt block renders each section as a heading and a paragraph. A
-sentence citing a low-confidence state says how old it is after it, as
-"(as of 30 days ago, Tue 1 Sep)". The seeded profile defaults to a
-2048-token output cap (`mental_models.profile_max_tokens`), within a
-2560-token prompt block (`mental_models.budget`) shared with the agenda
-and every enabled model. Headings count toward these caps, and the block
-still trims entries to fit; the profile is not guaranteed its full cap
-when the agenda or other models use the budget. An entry written before
-sections renders as a line until its model's next refresh.
+The prompt block renders each model's answer under its heading and
+question, each section a `####` heading and a paragraph. A model renders
+only while every memory its answer cites is current; one citing a memory
+that's retracted or ended is left out whole until its refresh rewrites it.
+The block doesn't mark a low-confidence state's age; the answer is the
+LLM's text as written. The seeded profile defaults to a 2048-token output
+cap (`mental_models.profile_max_tokens`), within a 2560-token prompt block
+(`mental_models.budget`) shared with the agenda and every enabled model.
+Headings count toward these caps. An answer that doesn't fit what's left
+of the block is cut at a sentence end, by the same trim as the refresh's;
+the profile is not guaranteed its full cap when the agenda or other models
+use the budget.
 
-The memories the block's sentences cite join the session's in-context set.
+Every memory a rendered model cites joins the session's in-context set,
+even when the block cut the answer short.
 Extraction shows call 1 each of them by its own handle, with its content,
 so a reply that relied on something the agent read in the block is `used`
 on the memory that says it. Call 1 isn't shown the block's text, and
@@ -805,8 +815,9 @@ and erases a memory, every earlier and later version of it, and the
 passages they came from.
 
 The erase happens in two parts. At once, the chain is hidden from recall,
-injection, the agenda, mental model refreshes and `used` credit; model
-entries citing it are dropped; the prompt block cache is cleared; in-context
+injection, the agenda, mental model refreshes and `used` credit; every
+model citing it has its answer blanked and a refresh requested; the prompt
+block cache is cleared; in-context
 sets are scrubbed; and recall rows naming it are deleted. Deleting the
 rows, redacting the passages and writing the tombstone wait on the bank's
 extraction queue, behind the chunks queued before the forget, so those
@@ -971,7 +982,8 @@ Open Font License (`OFL.txt` beside them, also at `/dashboard/OFL.txt`). Node ru
 
 Each bank has a Models tab, `#/banks/{bank}/models`, also linked
 from the bank's model count on the banks page. It lists each model with
-its question, `max_tokens`, entries, last refresh and last refresh error,
+its question, answer, `max_tokens`, how many memories the answer cites,
+last refresh and last refresh error,
 and shows the enabled models' `max_tokens` against `mental_models.budget`.
 The agenda takes its share of that budget first, so a model can get less
 than its limit.

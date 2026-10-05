@@ -942,14 +942,9 @@ impl Service {
         crate::inspect::entities(&self.store, bank)
     }
 
-    /// `model show [--entry]`: a model with each entry's citations.
-    pub fn show_model(
-        &self,
-        bank: &str,
-        name: &str,
-        entry: Option<&str>,
-    ) -> Result<ModelView, InspectError> {
-        crate::inspect::model_view(&self.store, bank, name, entry)
+    /// `model show`: a model with the memories its answer cites.
+    pub fn show_model(&self, bank: &str, name: &str) -> Result<ModelView, InspectError> {
+        crate::inspect::model_view(&self.store, &self.tuning, bank, name)
     }
 
     /// The dashboard's bank list: every bank with its counts by memory
@@ -1419,8 +1414,8 @@ impl Service {
     }
 
     /// What a forget or an erase leaves in memory: live sessions lose the
-    /// memories, models whose entries went are requested for a refresh, and
-    /// the bank's block is cleared.
+    /// memories, models whose answers were blanked are requested for a
+    /// refresh, and the bank's block is cleared.
     fn settle(&self, bank_id: i64, aftermath: Aftermath) -> Result<(), StoreError> {
         let now = self.now();
         if !aftermath.scrub.is_empty() {
@@ -1484,7 +1479,7 @@ impl Service {
         Ok(crate::mental_models::model(&conn, &edited.row)?)
     }
 
-    /// Every model of the bank with its entries (`model list`).
+    /// Every model of the bank with its answer (`model list`).
     pub fn list_models(&self, bank: &str) -> Result<Vec<Model>, ModelError> {
         let (bank_id, _) = self.model_bank(bank)?;
         let conn = self.store.connection();
@@ -1639,7 +1634,7 @@ impl Service {
 
     /// The bank's system prompt block, `GET /v1/banks/{bank}/system-prompt`:
     /// the cached one, or a new one built from the agenda and each enabled
-    /// model's entries as of its last completed refresh. It never calls the
+    /// model's answer as of its last completed refresh. It never calls the
     /// LLM. With a session id, the daemon records which block the session
     /// holds, and what the block lists or cites joins the session's
     /// in-context set.

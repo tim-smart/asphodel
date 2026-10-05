@@ -1,7 +1,7 @@
 //! The block `system_prompt_block()` returns.
 //!
 //! It opens with memory usage guidance and the build time, followed by the
-//! agenda and every enabled model's entries. Building it costs queries only,
+//! agenda and every enabled model's answer. Building it costs queries only,
 //! never an LLM call, so the plugin's 2 s fetch never waits on a refresh.
 //!
 //! - **The budget.** The whole text stays within `mental_models.budget`
@@ -9,22 +9,24 @@
 //!   always there. The agenda is laid out first and whole, and folds
 //!   only when it and the guidance alone are over: undated tasks, then
 //!   routines, least-ranked first, then dated lines in the agenda's fold
-//!   order. The models fill what's left, oldest first, each with its
-//!   entries in stored order until the next doesn't fit. A model's entries
-//!   render as one paragraph under its heading and question, including
-//!   entries from before sections. What the block lists, cites and keeps by
-//!   id is only what it rendered.
+//!   order. The models fill what's left, oldest first, each whole under its
+//!   heading and question when it fits, cut at a sentence end when it
+//!   doesn't ([`Answer::trim_to`]), the same helper rendering and
+//!   measuring it. A model with no sentence left renders nothing. The
+//!   answer's section headings sit a level under the model's. What the
+//!   block lists, cites and keeps by id is only what it rendered, and a
+//!   model that renders at all cites its whole citation set.
 //!
 //! - **The cache.** One block per bank, in memory, rebuilt lazily on the
 //!   next fetch once it's cleared. It's cleared when a model completes a
 //!   refresh or is edited, when a memory the agenda would list is written,
 //!   ended, retracted, kept or unkept, when any memory is ended or
-//!   retracted (an entry citing it would otherwise be served until the
+//!   retracted (an answer citing it would otherwise be served until the
 //!   next refresh), and when the bank-local day rolls over.
-//! - **Memories win.** An entry is rendered only while every memory it
-//!   cites is current: not retracted, forgotten or ended. An entry citing a
-//!   state whose confidence is below 0.9 shows its age, as injection does:
-//!   "(as of …)" after a sentence, "[observed …]" on a line.
+//! - **Memories win.** A model is rendered only while it has an answer and
+//!   every memory the answer cites is current: not retracted, forgotten or
+//!   ended. Otherwise it's left out whole, heading included, until a
+//!   refresh rewrites it.
 //! - **In context.** A fetch with a session id persists which block the
 //!   session holds and the memories it lists or cites (`session_blocks`),
 //!   and they join the session's in-context set: injection skips them, and
@@ -62,10 +64,9 @@ use uuid::Uuid;
 
 use crate::agenda::{Agenda, Built};
 use crate::config::Tuning;
-use crate::mental_models::{load_entries, load_models};
-use crate::retrieval::candidates::Cleanup;
+use crate::mental_models::{Answer, load_cites, load_models};
 use crate::retrieval::estimate_tokens;
-use crate::retrieval::format::{self, Line};
+use crate::retrieval::format::Line;
 use crate::store::strength::world_time;
 use crate::store::{Store, micros, timestamp};
 
@@ -77,7 +78,7 @@ pub struct Block {
     pub text: String,
     /// The memories the agenda lists, in the order it lists them.
     pub agenda: Vec<Uuid>,
-    /// The memories the rendered entries cite, each once.
+    /// The memories the rendered models cite, each once.
     pub cited: Vec<Uuid>,
 }
 
@@ -176,7 +177,19 @@ pub(crate) fn minimum_budget() -> usize {
     ))
 }
 
-/// Builds the bank's block at `now`.
+/// The block's content as laid out at one time, before it's kept by id.
+pub(crate) struct Layout {
+    pub text: String,
+    /// The memories the agenda lists, in the order it lists them.
+    pub agenda: Vec<Uuid>,
+    /// The memories the rendered models cite, each once.
+    pub cited: Vec<Uuid>,
+    /// Each model the block shows, by rowid, with its answer as shown:
+    /// whole, or cut at a sentence end. A model left out isn't here.
+    pub models: HashMap<i64, String>,
+}
+
+/// Builds the bank's block at `now` and keeps it by id.
 pub(crate) fn build(
     store: &Store,
     tuning: &Tuning,
@@ -185,7 +198,39 @@ pub(crate) fn build(
 ) -> Result<Block, rusqlite::Error> {
     let now = store.now();
     let conn = store.connection();
-    let agenda = crate::agenda::build(&conn, tuning, bank_id, tz, now)?;
+    let layout = lay_out(&conn, tuning, bank_id, tz, now)?;
+    let block = Block {
+        id: store.new_id(),
+        built_at: now,
+        text: layout.text,
+        agenda: layout.agenda,
+        cited: layout.cited,
+    };
+    // Kept by id, for the plugin that sends it with its first prefetch.
+    conn.execute(
+        "INSERT INTO prompt_blocks (uuid, bank_id, in_context, built_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        (
+            block.id.to_string(),
+            bank_id,
+            serde_json::to_string(&block.in_context()).unwrap_or_else(|_| "[]".into()),
+            micros(now),
+        ),
+    )?;
+    Ok(block)
+}
+
+/// Lays the bank's block out at `now`: what [`build`] keeps, and what
+/// `model show` reports of each model, from the one layout so the two
+/// can't disagree.
+pub(crate) fn lay_out(
+    conn: &Connection,
+    tuning: &Tuning,
+    bank_id: i64,
+    tz: &TimeZone,
+    now: Timestamp,
+) -> Result<Layout, rusqlite::Error> {
+    let agenda = crate::agenda::build(conn, tuning, bank_id, tz, now)?;
     let budget = tuning.mental_models.budget as usize;
     let guidance = guidance(
         &now.to_zoned(tz.clone())
@@ -235,59 +280,49 @@ pub(crate) fn build(
     }
     let mut sections: Vec<String> = agenda_section.into_iter().collect();
 
-    // Then each enabled model, oldest first, in what's left: its entries in
-    // stored order until the next one doesn't fit. Only what's rendered is
-    // recorded as cited, and so put in a session's context.
+    // Then each enabled model, oldest first, in what's left: its answer
+    // whole, or cut at a sentence end to fit. A model renders only while
+    // every memory its answer cites is current, and then cites them all,
+    // which puts them in a session's context.
     let mut cited: Vec<Uuid> = Vec::new();
-    for model in load_models(&conn, bank_id)?
+    let mut models = HashMap::new();
+    for model in load_models(conn, bank_id)?
         .into_iter()
         .filter(|model| model.enabled)
     {
-        let mut pieces: Vec<Piece> = Vec::new();
-        for entry in load_entries(&conn, model.id)? {
-            let Some(piece) = entry_piece(&conn, tuning, bank_id, now, &entry)? else {
-                continue;
-            };
-            let mut with = pieces.clone();
-            with.push(piece);
-            let mut tried = sections.clone();
-            tried.push(render_model(&model.name, &model.question, &with));
-            if !fits(&tried) {
-                break;
-            }
-            pieces = with;
-            for (_, uuid) in &entry.cites {
-                if !cited.contains(uuid) {
-                    cited.push(*uuid);
-                }
-            }
+        let Some(text) = &model.answer else {
+            continue;
+        };
+        let cites = load_cites(conn, model.id)?;
+        if !all_current(conn, now, &cites)? {
+            continue;
         }
+        let mut answer = Answer::parse(text);
+        answer.trim_to(|answer| {
+            let mut tried = sections.clone();
+            tried.push(render_model(&model.name, &model.question, answer));
+            fits(&tried)
+        });
         // An empty model renders nothing, not even a header.
-        if !pieces.is_empty() {
-            sections.push(render_model(&model.name, &model.question, &pieces));
+        if answer.is_empty() {
+            continue;
+        }
+        sections.push(render_model(&model.name, &model.question, &answer));
+        models.insert(model.id, answer.text());
+        for (_, uuid) in cites {
+            if !cited.contains(&uuid) {
+                cited.push(uuid);
+            }
         }
     }
     sections.insert(0, guidance);
 
-    let block = Block {
-        id: store.new_id(),
-        built_at: now,
+    Ok(Layout {
         text: sections.join("\n\n"),
         agenda: shown.listed(&agenda.agenda),
         cited,
-    };
-    // Kept by id, for the plugin that sends it with its first prefetch.
-    conn.execute(
-        "INSERT INTO prompt_blocks (uuid, bank_id, in_context, built_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        (
-            block.id.to_string(),
-            bank_id,
-            serde_json::to_string(&block.in_context()).unwrap_or_else(|_| "[]".into()),
-            micros(now),
-        ),
-    )?;
-    Ok(block)
+        models,
+    })
 }
 
 /// How much of the agenda the block shows: which dated lines, how many
@@ -353,43 +388,25 @@ impl Shown {
     }
 }
 
-/// An entry as the block renders it: a sentence of the model's paragraph,
-/// including entries written before sections.
-#[derive(Clone)]
-struct Piece {
-    text: String,
+/// A model's heading and question, then its answer, the answer's section
+/// headings a level under the model's. Budget trials use this same
+/// renderer.
+fn render_model(name: &str, question: &str, answer: &Answer) -> String {
+    format!(
+        "### {name}\n\nPrompt:\n{question}\n\nOutput:\n{}",
+        answer.render("####")
+    )
 }
 
-/// A section heading's line, which also counts toward a model's
-/// `max_tokens` when a refresh trims.
-pub(crate) fn heading_line(heading: &str) -> String {
-    format!("### {heading}")
-}
-
-/// A model's heading and question, then its sentences in stored order as one
-/// paragraph. Budget trials use this same renderer.
-fn render_model(name: &str, question: &str, pieces: &[Piece]) -> String {
-    let answer = pieces
-        .iter()
-        .map(|piece| piece.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("### {name}\n\nPrompt:\n{question}\n\nOutput:\n{answer}")
-}
-
-/// An entry's piece, or `None` when any memory it cites is retracted,
-/// forgotten, ended or gone. A sentence citing a low-confidence state says
-/// how old it is after it, "(as of 30 days ago, Tue 1 Sep)"; a legacy entry says
-/// "[observed 30 days ago, Tue 1 Sep]", as injection does.
-fn entry_piece(
+/// Whether every memory in `cites` is current: there, not retracted,
+/// forgotten or ended. An answer citing nothing isn't.
+fn all_current(
     conn: &Connection,
-    tuning: &Tuning,
-    bank_id: i64,
     now: Timestamp,
-    entry: &crate::mental_models::StoredEntry,
-) -> Result<Option<Piece>, rusqlite::Error> {
-    if entry.cites.is_empty() {
-        return Ok(None);
+    cites: &[(i64, Uuid)],
+) -> Result<bool, rusqlite::Error> {
+    if cites.is_empty() {
+        return Ok(false);
     }
     let mut statement = conn.prepare_cached(
         "SELECT m.invalidated_at IS NULL AND m.hidden_at IS NULL, m.valid_until,
@@ -397,35 +414,21 @@ fn entry_piece(
          FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
          WHERE m.id = ?1",
     )?;
-    for (memory, _) in &entry.cites {
+    for (memory, _) in cites {
         let found: Option<(bool, Option<i64>, Option<String>, String)> = statement
             .query_row([memory], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .optional()?;
         let Some((shown, until, precision, timezone)) = found else {
-            return Ok(None);
+            return Ok(false);
         };
         let tz = TimeZone::get(&timezone).unwrap_or(TimeZone::UTC);
         if !shown || crate::agenda::has_ended(world_time(until, precision), &tz, now) {
-            return Ok(None);
+            return Ok(false);
         }
     }
-    let keep_all = |_: &crate::retrieval::candidates::Candidate| true;
-    let mut cleanup = Cleanup::new(conn, bank_id, tuning, now, &keep_all)?;
-    let ids: Vec<i64> = entry.cites.iter().map(|(memory, _)| *memory).collect();
-    cleanup.list(&ids)?;
-    let age = cleanup
-        .take(&ids)
-        .iter()
-        .find_map(|candidate| format::state_observed(candidate, now));
-    let text = match (&entry.section, age) {
-        (Some(_), Some(age)) => format!("{} (as of {age})", entry.text),
-        (Some(_), None) => entry.text.clone(),
-        (None, Some(age)) => format!("{} [observed {age}]", entry.text),
-        (None, None) => entry.text.clone(),
-    };
-    Ok(Some(Piece { text }))
+    Ok(true)
 }
 
 /// Records that `session` holds `block`, with what it puts in context. A

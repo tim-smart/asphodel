@@ -81,11 +81,11 @@ pub struct Record {
     /// SHA-256 of the assistant's reply in the chunk.
     #[serde(default)]
     pub reply_hash: Option<String>,
-    /// For a refresh, the memory or entry each of its handles stood for,
+    /// For a refresh, the memory each of its handles stood for,
     /// so a substituted reply can be carried over by identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub identities: Vec<(String, Uuid)>,
-    /// The run's `[llm] language`, which call 1 claims and refresh entries
+    /// The run's `[llm] language`, which call 1 claims and refresh answers
     /// are written in. A record from before the setting has none, as did
     /// the run that made it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -761,19 +761,17 @@ impl Recorder {
 
     /// `fast` with `--refresh recorded`: the recorded write of the same
     /// mental model, by the question line the request starts with, nearest
-    /// in simulated time, among those made with this run's LLM model, language, and
-    /// the request's template version. Its sentences are carried over by
-    /// identity: each handle goes to the memory it stood for when recorded,
-    /// then to that one's handle now, and a sentence citing any memory that
-    /// isn't in this input is dropped, since it would say something the LLM
-    /// never said about what's here. The rest of its section is kept. A
-    /// plan isn't substituted: it holds only the question and the language,
-    /// so it replays by key.
+    /// in simulated time, among those made with this run's LLM model,
+    /// language, and the request's template version, so a first-version
+    /// write, sentence by sentence, never stands in for this one. `None`
+    /// when there's none; `Some(None)` when its answer can't be carried over
+    /// ([`carry_over`]). A plan isn't substituted: it holds only the
+    /// question and the language, so it replays by key.
     fn nearest_refresh(
         &self,
         request: &LlmRequest,
         identities: &[(String, Uuid)],
-    ) -> Option<LlmResponse> {
+    ) -> Option<Option<LlmResponse>> {
         let question = request.user.lines().next().unwrap_or("").to_string();
         let now = self.clock.now();
         let index = lock(&self.index);
@@ -795,10 +793,14 @@ impl Recorder {
     }
 }
 
-/// A recorded write's response with its handles carried over to
-/// `identities` (see [`Recorder::nearest_refresh`]). A record without
-/// identities, from before they were kept, carries nothing over.
-fn carry_over(record: &Record, identities: &[(String, Uuid)]) -> LlmResponse {
+/// A recorded write's response with its citations carried over to
+/// `identities` (see [`Recorder::nearest_refresh`]): each handle goes to
+/// the memory it stood for when recorded, then to that one's handle now.
+/// The answer is carried over whole or not at all: `None` when any memory
+/// it cites isn't in this input, since the text would rest on something the
+/// LLM never saw here, and for a record without identities, from before
+/// they were kept.
+fn carry_over(record: &Record, identities: &[(String, Uuid)]) -> Option<LlmResponse> {
     let meant: BTreeMap<&str, Uuid> = record
         .identities
         .iter()
@@ -808,50 +810,27 @@ fn carry_over(record: &Record, identities: &[(String, Uuid)]) -> LlmResponse {
         .iter()
         .map(|(handle, id)| (*id, handle.as_str()))
         .collect();
-    let carry = |handle: &str| -> Option<String> {
+    let carry = |handle: &str| -> Option<Value> {
         let id = meant.get(handle.trim())?;
-        current.get(id).map(|handle| (*handle).to_string())
+        current.get(id).map(|handle| Value::from(*handle))
     };
-    let sections = record
+    let cites = record
         .response
         .json
-        .get("sections")
+        .get("cites")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut kept_sections = Vec::new();
-    for mut section in sections {
-        let sentences = section
-            .get("sentences")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut kept = Vec::new();
-        for mut sentence in sentences {
-            let cites = sentence
-                .get("cites")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let carried: Option<Vec<Value>> = cites
-                .iter()
-                .map(|cite| cite.as_str().and_then(carry).map(Value::from))
-                .collect();
-            match carried {
-                Some(cites) => sentence["cites"] = Value::Array(cites),
-                None => continue,
-            }
-            kept.push(sentence);
-        }
-        section["sentences"] = Value::Array(kept);
-        kept_sections.push(section);
-    }
+    let carried: Vec<Value> = cites
+        .iter()
+        .map(|cite| cite.as_str().and_then(carry))
+        .collect::<Option<_>>()?;
     let mut json = record.response.json.clone();
-    json["sections"] = Value::Array(kept_sections);
-    LlmResponse {
+    json["cites"] = Value::Array(carried);
+    Some(LlmResponse {
         json,
         ..record.response.clone()
-    }
+    })
 }
 
 impl LlmClient for Recorder {
@@ -870,29 +849,38 @@ impl LlmClient for Recorder {
     ) -> Result<LlmResponse, LlmError> {
         if request.template.name == WRITE_TEMPLATE {
             lock(&self.counts).refresh_times.push(self.clock.now());
-            if self.mode == ReplayMode::Fast {
-                match self.refresh {
-                    RefreshMode::Off => {
-                        return Ok(LlmResponse {
-                            json: json!({ "sections": [] }),
-                            usage: None,
-                            latency: Duration::ZERO,
-                        });
-                    }
-                    RefreshMode::Recorded => {
-                        if let Some(response) = self.nearest_refresh(request, identities) {
-                            lock(&self.counts).cache += 1;
-                            return Ok(response);
-                        }
-                    }
-                    RefreshMode::Live => {}
-                }
+            if self.mode == ReplayMode::Fast
+                && self.refresh == RefreshMode::Recorded
+                && let Some(Some(response)) = self.nearest_refresh(request, identities)
+            {
+                lock(&self.counts).cache += 1;
+                return Ok(response);
             }
         }
         if request.template.name == CALL2_TEMPLATE {
             lock(&self.counts).call2 += 1;
         }
         self.answer(request, None, identities)
+    }
+
+    /// `fast` skips a write with `--refresh off`, and with `--refresh
+    /// recorded` when the nearest recorded write can't be carried over: the
+    /// write is counted, and nothing is written.
+    fn skips_write(&self, request: &LlmRequest, identities: &[(String, Uuid)]) -> bool {
+        if self.mode != ReplayMode::Fast || request.template.name != WRITE_TEMPLATE {
+            return false;
+        }
+        let skips = match self.refresh {
+            RefreshMode::Off => true,
+            RefreshMode::Recorded => {
+                matches!(self.nearest_refresh(request, identities), Some(None))
+            }
+            RefreshMode::Live => false,
+        };
+        if skips {
+            lock(&self.counts).refresh_times.push(self.clock.now());
+        }
+        skips
     }
 }
 

@@ -269,3 +269,42 @@ names a handle its record doesn't list, such as an entry's, keeps its
 `used` verdicts, and its other pairs are judged again by a top-up. Call 1's
 request text has changed, so `replay` mode misses on every call 1 recorded
 before this version, as it does after any prompt edit.
+
+## Schema version 15: one answer per mental model
+
+A mental model's answer is now one prose text with one set of citations,
+in place of entries that each cited their own memories
+(`docs/operations.md`, "Mental models"). The migration adds
+`mental_models.answer` and `mental_model_cites`, builds each model's
+answer from its entries, grouped by section in position order with
+entries from before sections first as a paragraph of their own, takes the
+union of their citations, and drops `mental_model_entries` and
+`mental_model_citations`. Every model keeps its text and what it cites,
+and no refresh is forced; the next one rewrites the answer as connected
+prose. No action is needed.
+
+What changes in use:
+
+- A model whose answer cites a memory that's retracted or ended is left
+  out of the prompt block whole until its refresh rewrites it, where
+  before only that sentence went. Forget blanks the answer of every model
+  citing the chain at once, and requests a refresh.
+- The block no longer marks a low-confidence state's age after a
+  sentence.
+- The API's `Model` carries `answer` and `cites` in place of `entries`.
+  `GET /v1/banks/{bank}/models/{model}` carries `cited` (each memory with
+  its status), `renders` and `shown_answer` (the answer as the block shows
+  it now, whole or cut) in place of `entry_views`, and no longer takes
+  `?entry=`. `asphodel model show` drops `--entry` and prints the cited
+  memories after the answer. A refresh's `applied` detail is `{written,
+  rejected, trimmed}`, with `trimmed` a count of sentences.
+
+Replay: `write_model` is now version 2, and its reply is `{"sections":
+[{"heading", "text"}], "cites": [...]}`. A `write_model` v1 record,
+sentence by sentence, can't stand in for a v2 write, so `--refresh
+recorded` finds nothing to substitute in a cassette recorded before this
+version, and the first replay of private history after upgrading needs
+one re-record of live refresh calls, which needs its own authorization.
+`--refresh recorded` now reuses a recorded answer only when every memory
+it cites is in the run's input, and otherwise skips the write. `--refresh
+off` skips every write rather than answering it with an empty reply.

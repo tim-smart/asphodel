@@ -1343,12 +1343,12 @@ fn paragraph_after(text: &str, heading: &str) -> bool {
 
 #[test]
 fn models_are_created_listed_edited_and_refreshed_over_http() {
-    // The refresh writes two sentences under "Home", each citing the first
+    // The refresh writes two sentences under "Home", citing the first
     // memory in its input.
-    let sentences: Vec<Value> = [ENTRY, SECOND]
-        .map(|text| json!({"text": text, "cites": ["m1"]}))
-        .into();
-    let writes = json!({"sections": [{"heading": "Home", "sentences": sentences}]});
+    let writes = json!({
+        "sections": [{"heading": "Home", "text": format!("{ENTRY} {SECOND}")}],
+        "cites": ["m1"],
+    });
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir)
         .script(&[auckland(), step(writes, 0)])
@@ -1359,7 +1359,8 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     let models = daemon.get_ok("/v1/banks/main/models")["models"].clone();
     assert_eq!(models.as_array().unwrap().len(), 1);
     assert_eq!(models[0]["name"], "User profile");
-    assert_eq!(models[0]["entries"], json!([]));
+    assert_eq!(models[0]["answer"], Value::Null);
+    assert_eq!(models[0]["cites"], json!([]));
     assert_eq!(models[0]["last_refreshed_at"], Value::Null);
 
     // Plans takes what the profile leaves of the budget, so nothing more fits.
@@ -1396,49 +1397,39 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     let refresh = "/v1/banks/main/models/User%20profile/refresh";
     let refreshed = daemon.post_ok(&format!("{refresh}?force=true"), &Value::Null);
     assert_eq!(refreshed["outcome"], "applied", "{refreshed}");
-    assert_eq!(refreshed["detail"]["added"].as_array().unwrap().len(), 2);
+    assert_eq!(refreshed["detail"]["written"], true, "{refreshed}");
     let unchanged = daemon.post_ok(refresh, &Value::Null);
     assert_eq!(unchanged["outcome"], "unchanged", "{unchanged}");
 
     let profile = &daemon.get_ok("/v1/banks/main/models")["models"][0];
-    assert_eq!(profile["entries"][0]["text"], ENTRY);
-    assert_eq!(profile["entries"][0]["section"], "Home");
-    assert_eq!(profile["entries"][0]["cites"], json!([memory]));
+    let answer = format!("### Home\n{ENTRY} {SECOND}");
+    assert_eq!(profile["answer"], answer.as_str(), "{profile}");
+    assert_eq!(profile["cites"], json!([memory]));
     assert!(profile["last_refreshed_at"].is_string());
     let shown = daemon.get_ok("/v1/banks/main/models/User%20profile");
-    assert_eq!(shown["entry_views"][0]["section"], "Home", "{shown}");
+    assert_eq!(shown["answer"], answer.as_str(), "{shown}");
 
-    // `model show` and `model list` read like the block: the section's
-    // sentences are one paragraph under its heading, without entry ids or
-    // cited memories. `--entry` shows one entry, its id and what it cites.
-    let ids: Vec<&str> = profile["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| entry["id"].as_str().unwrap())
-        .collect();
+    // `model list` reads like the block: the section's paragraph under its
+    // heading, without the cited memories. `model show` adds the memories
+    // the answer cites.
     let model = ["model", "show", "--bank", "main", "User profile"];
     let list = ["model", "list", "--bank", "main"];
     for args in [&model[..], &list[..]] {
         let text = succeeded(run(cli(&daemon).args(args)));
         assert!(paragraph_after(&text, "Home"), "{args:?}:\n{text}");
-        for hidden in ids.iter().chain([&memory.as_str()]) {
-            assert!(!text.contains(hidden), "{args:?}:\n{text}");
-        }
     }
-    let detail = succeeded(run(cli(&daemon).args(model).args(["--entry", ids[1]])));
-    for shown in [ids[1], SECOND, &memory] {
-        assert!(detail.contains(shown), "{detail}");
-    }
-    assert!(!detail.contains(ENTRY), "{detail}");
+    let listed = succeeded(run(cli(&daemon).args(list)));
+    assert!(!listed.contains(memory.as_str()), "{listed}");
+    let detail = succeeded(run(cli(&daemon).args(model)));
+    assert!(detail.contains(memory.as_str()), "{detail}");
 
-    // The block joins the entries, and a session's fetch puts the cited
+    // The block shows the answer, and a session's fetch puts the cited
     // memory in context, so prefetch doesn't inject it.
     let block = daemon.get_ok("/v1/banks/main/system-prompt?session_id=s1");
     let text = block["text"].as_str().unwrap();
     assert!(text.contains("User profile"), "{text}");
     let (_, output) = text.split_once("\nOutput:\n").expect("model output");
-    assert_eq!(output, format!("{ENTRY} {SECOND}"), "{text}");
+    assert!(paragraph_after(output, "Home"), "{text}");
     assert!(!text.contains("Plans"), "a disabled model was rendered");
     assert_eq!(block["cited"], json!([memory]));
     assert_eq!(
@@ -2113,10 +2104,10 @@ fn a_restored_store_keeps_its_fingerprint_and_pauses_purge_under_another() {
 
 /// SQL that undoes the latest registered migration, `SCHEMA_VERSION`'s, by
 /// dropping the tables, indexes and added columns it creates. It only
-/// handles a migration that creates tables and indexes or adds columns and
-/// nothing else, and fails loudly on any other, so this test is extended
-/// when such a migration lands rather than downgrading to a schema no older
-/// binary wrote.
+/// handles SQL that creates or drops tables and indexes or adds columns,
+/// plus the runner changes below, and fails loudly on any other. Extend
+/// this test when such a migration lands rather than downgrading to a
+/// schema no older binary wrote.
 fn undo_latest_migration() -> String {
     use asphodel_core::store::SCHEMA_VERSION;
 
@@ -2210,6 +2201,31 @@ fn undo_latest_migration() -> String {
     if *version == 14 {
         undo.push(
             "ALTER TABLE prompt_blocks ADD COLUMN entries TEXT NOT NULL DEFAULT '[]';".into(),
+        );
+    }
+    // Version 15 drops the entry tables in the runner after copying their
+    // answers and cites. Put back the v14 schema, including v13's section
+    // column and both indexes; these drops do not appear in the SQL.
+    if *version == 15 {
+        undo.push(
+            "CREATE TABLE mental_model_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                model_id INTEGER NOT NULL REFERENCES mental_models(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                section TEXT
+            );
+            CREATE INDEX mental_model_entries_model ON mental_model_entries(model_id, position);
+            CREATE TABLE mental_model_citations (
+                entry_id INTEGER NOT NULL REFERENCES mental_model_entries(id) ON DELETE CASCADE,
+                memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                PRIMARY KEY (entry_id, memory_id)
+            );
+            CREATE INDEX mental_model_citations_memory ON mental_model_citations(memory_id);"
+                .into(),
         );
     }
     assert!(!undo.is_empty(), "{} creates nothing", path.display());

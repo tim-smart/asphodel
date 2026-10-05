@@ -327,7 +327,6 @@ impl From<InspectError> for ApiError {
             InspectError::UnknownBank
             | InspectError::UnknownMemory
             | InspectError::UnknownModel
-            | InspectError::UnknownEntry
             | InspectError::UnknownSource => Self::new(StatusCode::NOT_FOUND, error.to_string()),
             InspectError::InvalidQuery { .. } => {
                 Self::new(StatusCode::BAD_REQUEST, error.to_string())
@@ -891,7 +890,7 @@ struct SystemPromptQuery {
 }
 
 /// `GET /v1/banks/{bank}/system-prompt[?session_id=...]`:
-/// `system_prompt_block()`. Built from the agenda and the models' entries
+/// `system_prompt_block()`. Built from the agenda and the models' answers
 /// with queries only, never an LLM call.
 async fn system_prompt(
     State(app): State<Shared>,
@@ -1167,23 +1166,13 @@ async fn show_entity(
     Ok(Json(view))
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct ShowModelQuery {
-    /// Only this entry.
-    #[serde(default)]
-    entry: Option<String>,
-}
-
-/// `GET /v1/banks/{bank}/models/{model}[?entry=<id>]`: `asphodel model
-/// show`.
+/// `GET /v1/banks/{bank}/models/{model}`: `asphodel model show`.
 async fn show_model(
     State(app): State<Shared>,
     Path((bank, name)): Path<(String, String)>,
-    query: Result<Query<ShowModelQuery>, QueryRejection>,
 ) -> Result<Json<ModelView>, ApiError> {
-    let Query(query) = query?;
     let view = app
-        .call(move |service| service.show_model(&bank, &name, query.entry.as_deref()))
+        .call(move |service| service.show_model(&bank, &name))
         .await?;
     Ok(Json(view))
 }
