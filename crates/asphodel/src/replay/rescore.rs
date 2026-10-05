@@ -1,6 +1,6 @@
-//! `asphodel report rescore`: the labelling material's recall pools scored
-//! again against another rerank query (`docs/replay.md`, "Rescoring fixed
-//! pools").
+//! `asphodel report rescore`: the labelling material's recall pools, and
+//! with `--refresh-queries` its refresh pools, scored again against another
+//! rerank query (`docs/replay.md`, "Rescoring fixed pools").
 //!
 //! Each recall sample is found in the corpus by its session and time, and
 //! its rerank query rebuilt from the corpus as replay builds it: the message
@@ -22,9 +22,9 @@
 //! refresh samples, and all of them without the option, are copied
 //! unchanged.
 //!
-//! The pools are fixed and the order is by logit alone, so this compares
-//! rerank queries; it says nothing about prefetch's final ranking, which
-//! adds strength, state confidence and phase. Everything read and written
+//! The pools are fixed and recall samples are ordered by logit alone, so
+//! this compares rerank queries; it says nothing about prefetch's final
+//! ranking, which adds strength, state confidence and phase. Everything read and written
 //! is history, so all of it stays under the private dir and no error
 //! quotes it.
 
