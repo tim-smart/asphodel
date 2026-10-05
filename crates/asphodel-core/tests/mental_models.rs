@@ -1674,15 +1674,15 @@ fn entries_past_max_tokens_are_trimmed_lowest_ranked_first_headings_included() {
     let applied = h.rewrite("Mornings", &[("Tea", &[s(0)]), ("Coffee", &[s(1)])]);
     assert_eq!(applied.trimmed, applied.added, "the coffee");
     let text = h.block(None).text;
-    assert!(paragraph(&text, "Tea").is_some(), "{text}");
-    assert_eq!(paragraph(&text, "Coffee"), None, "{text}");
+    assert_eq!(paragraph(&text, "Output:"), Some(texts[0]), "{text}");
+    assert!(!text.contains(texts[1]), "{text}");
 }
 
 // Memories win
 
 #[test]
 fn sections_render_as_paragraphs_and_an_entry_citing_a_retracted_memory_is_dropped() {
-    // Each section is its heading, then its sentences as one paragraph.
+    // Stored sections join into one model paragraph in entry order.
     let h = Harness::new();
     let tea = h.seed(fact(TEA));
     let maya = h.seed(fact(MAYA));
@@ -1696,11 +1696,11 @@ fn sections_render_as_paragraphs_and_an_entry_citing_a_retracted_memory_is_dropp
         ],
     );
     let text = h.block(None).text;
-    let people = paragraph(&text, "People");
-    assert!(people.is_some_and(|p| p.contains(daughter)), "{text}");
-    let preferences = paragraph(&text, "Preferences").unwrap_or_default();
-    let order = (preferences.find(TEA), preferences.find(CAT_ENTRY));
-    assert!(matches!(order, (Some(a), Some(b)) if a < b), "{text}");
+    assert_eq!(
+        paragraph(&text, "Output:"),
+        Some(format!("{daughter} {TEA} {CAT_ENTRY}").as_str()),
+        "{text}"
+    );
 
     h.advance(minutes(30));
     let corrected = h.now();
@@ -1708,26 +1708,30 @@ fn sections_render_as_paragraphs_and_an_entry_citing_a_retracted_memory_is_dropp
     h.says_changing(mia, maya, "retracts");
     let block = h.block(None);
     assert!(!block.text.contains(daughter));
-    // A heading with nothing left to show under it isn't rendered.
-    assert_eq!(paragraph(&block.text, "People"), None, "{}", block.text);
-    assert!(block.text.contains(CAT_ENTRY));
+    assert_eq!(
+        paragraph(&block.text, "Output:"),
+        Some(format!("{TEA} {CAT_ENTRY}").as_str()),
+        "{}",
+        block.text
+    );
     assert!(!block.cited.contains(&maya));
     // Dropped at render time, and the model is refreshed: the retraction of
     // a cited memory is a triggering write.
     assert_eq!(h.profile().entries[0].id, applied.added[0]);
     assert_eq!(h.tick(&quiet_llm(1)).next_due, Some(corrected + minutes(5)));
 
-    // An entry written before sections existed has none, and renders as a
-    // line of its own until its model's next write replaces it.
+    // Entries written before sections existed join the same paragraph.
     let store = h.service.store().unwrap();
     let conn = store.connection();
     conn.execute("UPDATE mental_model_entries SET section = NULL", [])
         .unwrap();
     drop(conn);
     let text = h.restart().block(None).text;
-    assert_eq!(paragraph(&text, "Preferences"), None, "{text}");
-    let line = text.lines().find(|line| line.contains(TEA));
-    assert!(line.is_some_and(|line| !line.contains(CAT_ENTRY)), "{text}");
+    assert_eq!(
+        paragraph(&text, "Output:"),
+        Some(format!("{TEA} {CAT_ENTRY}").as_str()),
+        "{text}"
+    );
 }
 
 #[test]
@@ -1782,9 +1786,12 @@ fn an_entry_citing_a_low_confidence_state_shows_its_age() {
     let tea = h.seed(fact(TEA));
     h.profile_adding(&[("Tim is looking for a new job.", &[job]), (TEA, &[tea])]);
     let text = h.block(None).text;
-    let line = paragraph(&text, SECTION).unwrap_or_default();
+    let line = paragraph(&text, "Output:").unwrap_or_default();
     let order = ["a new job.", "Tue 1 Sep", TEA].map(|needle| line.find(needle));
-    assert!(order.is_sorted() && order[0].is_some(), "{text}");
+    assert!(
+        order.iter().all(Option::is_some) && order.is_sorted(),
+        "{text}"
+    );
 }
 
 // The block
