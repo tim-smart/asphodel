@@ -571,7 +571,9 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   never saw here. Citations are checked by identity rather than by name.
   A write recorded before identities were kept carries nothing over. A
   `write_model` v1 record, sentence by sentence, never stands in for a v2
-  write, and a `refresh_model` record from before schema version 13
+  write. The current write template is v3, which asks for absolute dates
+  for possibly stale states; v2 records do not substitute for v3 either.
+  A `refresh_model` record from before schema version 13
   never stands in either. Triggers are counted
   by code in every mode. The mental models to refresh are the manifest's
   `[[model]]` tables, carried in the corpus header.
@@ -595,8 +597,8 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   simulation twice.
 
   It's an approximation, the one `fast` already makes by reusing claims
-  by chunk. A primed call 1 is shown no in-context memories and no mental
-  model entries, and its candidates are only the entities ingestion
+  by chunk. A primed call 1 is shown no in-context memories or prompt block
+  text, and its candidates are only the entities ingestion
   makes, with no memories linked, where a serial run's are what the
   store holds at the claim. Its reply has no `used` verdicts to reuse,
   so each pair is judged by a top-up when the simulation first meets
@@ -823,7 +825,7 @@ they survive a re-record while call 1 splits a turn the same way. When it
 splits it differently the ids shift, and the labels on them stop matching.
 Expect partial carry-over; the counts below show how much. The same
 judgement given twice with different answers is refused, naming the
-entries by number.
+labels by number.
 
 The old form, one key per candidate id, is still read against the
 material it was written for:

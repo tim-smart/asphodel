@@ -7,7 +7,10 @@
 //!    context (up to [`CONTEXT_TURNS`] earlier turns of the session, or the
 //!    text before a document chunk), the reference date and a calendar strip
 //!    in the source's timezone, the speaker, the entity candidates found
-//!    through the alias FTS, and the in-context memories.
+//!    through the alias FTS, and the in-context memories. Memories cited
+//!    by the session's prompt block are shown under their own handles,
+//!    never as a copy of the block's prose; `used` credits the memory the
+//!    reply relied on.
 //! 2. **Call 1.** One structured-output call ([`call1_request`]) returns the
 //!    claims and the `used` verdicts.
 //! 3. **Checks in code.** A claim whose quote isn't in the chunk is dropped.

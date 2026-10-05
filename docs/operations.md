@@ -505,13 +505,14 @@ Only the owner defines mental models, through these commands or the API.
   --disable]`
 - `asphodel model refresh --bank B <name> [--force]` refreshes now. It's
   skipped when the inputs haven't changed, unless `--force`.
-- `asphodel model show --bank B <name>` prints the answer as the prompt
-  block reads it, each section a heading and one paragraph, then the
-  memories it cites with their status (current, ended, retracted or
+- `asphodel model show --bank B <name>` prints the stored answer, each
+  section a heading and one paragraph, then the memories it cites with
+  their status (current, ended, retracted or
   forgotten), and whether the prompt block shows the model: whole, cut
   short to fit what the agenda and older models leave of the budget, or
-  not at all. That's how to answer "why does the profile say X?". `model list` prints each answer
-  without the citations.
+  not at all. That's how to answer "why does the profile say X?". `model list`
+  prints each stored answer without the citations, even when the block
+  would leave it out.
 
 A refresh asks one narrow question per part of the model's question, its
 facets, instead of one compound question, so a memory about one part isn't
@@ -551,21 +552,47 @@ lost beneath results for the others:
    the end. With nothing selected the answer is cleared, with no call.
 
 A refresh is skipped, unless forced, when its inputs haven't changed: the
-selection, the question, the plan, the filters and the size. A changed
-question always writes again, even when it plans the same facets.
+selection, which states may be stale, the question, the plan, the filters
+and the size. A changed question always writes again, even when it plans
+the same facets. A state whose confidence falls below 0.9 is supplied to
+the write with its absolute observed date in the memory's timezone and a
+"may be stale" marker. The write is asked to put that date in the prose
+rather than assert the state as current. Crossing the threshold changes
+the fingerprint; another day below it does not.
+
+New memories and significance changes that pass a model's filters request
+a refresh at `mental_models.trigger_level` or above; kept memories trigger
+regardless of significance. Requests are
+debounced per bank, by default for 5 minutes after the last trigger and
+at most 30 minutes after the first. Ordinary refreshes also wait at least
+30 minutes after a successful refresh. A correction that retracts, ends,
+refines or reopens a cited memory requests an urgent repair, including
+models citing its successor. Urgent repairs bypass the interval after a
+success, but still respect the debounce, the LLM hold and the 30-minute
+retry wait after a failure. Requests survive a restart, and a request
+made during a refresh is not cleared by that refresh. The daily bank-local
+sweep checks every enabled model too. None of this runs inside a prompt
+block fetch.
+
+Forget blanks the answer of every model citing the forgotten chain and
+requests an urgent refresh. It does not keep a shortened answer with just
+the other citations.
 
 The prompt block renders each model's answer under its heading and
-question, each section a `####` heading and a paragraph. A model renders
-only while every memory its answer cites is current; one citing a memory
+question. Multi-section answers use `####` section headings and paragraphs;
+a lone section renders only its paragraph, without a section heading. A
+model renders only while every memory its answer cites is current; one citing a memory
 that's retracted or ended is left out whole until its refresh rewrites it.
-The block doesn't mark a low-confidence state's age; the answer is the
-LLM's text as written. The seeded profile defaults to a 2048-token output
-cap (`mental_models.profile_max_tokens`), within a 2560-token prompt block
+The block adds no age annotations; dates for possibly stale states belong
+in the answer written at refresh time. The seeded profile defaults to a
+2048-token output cap (`mental_models.profile_max_tokens`), within a
+2560-token prompt block
 (`mental_models.budget`) shared with the agenda and every enabled model.
 Headings count toward these caps. An answer that doesn't fit what's left
-of the block is cut at a sentence end, by the same trim as the refresh's;
-the profile is not guaranteed its full cap when the agenda or other models
-use the budget.
+of the block is cut at a sentence end, by the same trim as the refresh's.
+A section left empty loses its heading, and a model with no sentence left
+is omitted. The profile is not guaranteed its full cap when the agenda or
+other models use the budget.
 
 Every memory a rendered model cites joins the session's in-context set,
 even when the block cut the answer short.
@@ -1128,5 +1155,5 @@ A bank already refused because the daemon dropped its model recovers the
 same way: `asphodel reembed --bank B` needs only the daemon's model.
 
 A reranker-only change needs only its new `injection.reranker_floors` and
-`ranking.relevance_scales` entries. Reranker scores aren't stored, so
+`ranking.relevance_scales` keys. Reranker scores aren't stored, so
 there's nothing to re-embed.

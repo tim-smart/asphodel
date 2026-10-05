@@ -6,7 +6,7 @@
 //! ingests the timeline's turns and documents into the run's store in the
 //! order the simulation syncs them, takes each chunk off the queue in the
 //! order a serial run claims it, and builds its call 1 with nothing in
-//! context: no in-context memories, no mental model entries, and no
+//! context: no in-context memories, no prompt block text, and no
 //! entities but those ingestion makes. Chunks the cassette already has
 //! claims for are skipped. The simulation's `open_store` resets the store
 //! afterwards.
