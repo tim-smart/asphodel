@@ -2665,21 +2665,11 @@ fn an_upgrade_from_version_13_keeps_each_answer_and_extracts_a_queued_turn_witho
         )
         .unwrap();
 
-        let model_keyed: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('mental_model_citations')
-                 WHERE name = 'model_id'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        if model_keyed > 0 {
-            conn.execute_batch(
-                "DROP TABLE mental_model_citations;
-                 ALTER TABLE mental_models DROP COLUMN answer;",
-            )
-            .unwrap();
-        }
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS mental_model_cites;
+             ALTER TABLE mental_models DROP COLUMN answer;",
+        )
+        .unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS mental_model_entries (
                id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2934,7 +2924,8 @@ fn the_whole_block_stays_within_the_budget_and_records_only_what_it_renders() {
     // caps and is laid out first, so today's appointment can't be pushed
     // out by a model; the models get what's left. What the block lists or
     // cites, and so puts in a session's context, is only what it rendered.
-    // A model too long for what's left is cut at a sentence end.
+    // A model too long for what's left is cut at a sentence end, and one
+    // with no sentence that fits is left out. `model show` says which.
     let h = Harness::new();
     let today = "Tim has a dentist appointment this evening at the clinic on Queen Street.";
     let mut claims = vec![event(today, "2026-10-01")];
@@ -2992,4 +2983,25 @@ fn the_whole_block_stays_within_the_budget_and_records_only_what_it_renders() {
     let in_context: BTreeSet<Uuid> = h.in_context("s1").into_iter().collect();
     let shown: BTreeSet<Uuid> = block.agenda.iter().chain(&block.cited).copied().collect();
     assert_eq!(in_context, shown);
+    let renders = || h.service.show_model(BANK, PROFILE_NAME).unwrap().renders;
+    assert!(renders(), "a cut answer still shows");
+
+    // Seven more appointments leave no room for the model's heading,
+    // question and first sentence.
+    let more = (7..14).map(|n| {
+        let text = format!(
+            "Tim has appointment number {n} with the planning committee about the new library."
+        );
+        event(&text, &format!("2026-10-{:02}", 2 + n % 7))
+    });
+    h.seed_all(BANK, at(EARLIER), more.collect());
+    let block = h.block(Some("s2"));
+    assert!(estimate_tokens(&block.text) <= budget, "{}", block.text);
+    assert!(!block.text.contains(&texts[0]), "{}", block.text);
+    assert!(
+        facts.iter().all(|fact| !block.cited.contains(fact)),
+        "{:?}",
+        block.cited
+    );
+    assert!(!renders(), "the block left the model out");
 }
