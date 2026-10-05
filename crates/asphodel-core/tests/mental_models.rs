@@ -1254,6 +1254,88 @@ fn an_unchanged_selection_skips_the_llm_and_force_doesnt() {
 }
 
 #[test]
+fn a_stale_state_write_includes_its_observed_date_but_a_fresh_state_doesnt() {
+    let h = Harness::new();
+    let stale_text = "Tim is training for a marathon.";
+    let fresh_text = "Tim is learning to swim.";
+    let stale = h.seed(state(stale_text, "weeks"));
+    let fresh = h.says(state(fresh_text, "weeks"));
+    let input = h.input(PROFILE_NAME);
+    assert_eq!(inputs(&input), BTreeSet::from([stale, fresh]));
+    let llm = quiet_llm(1);
+    applied(h.refresh(PROFILE_NAME, &llm, true));
+    let requests = calls(&llm, WRITE_TEMPLATE);
+    let request = &requests[0].user;
+    let stale_line = request
+        .lines()
+        .find(|line| line.contains(stale_text))
+        .unwrap();
+    let fresh_line = request
+        .lines()
+        .find(|line| line.contains(fresh_text))
+        .unwrap();
+    // Pin the absolute date supplied to the writer, not the annotation wording.
+    assert!(stale_line.contains("1 Sep"), "{stale_line}");
+    assert!(!fresh_line.contains("1 Oct"), "{fresh_line}");
+}
+
+#[test]
+fn a_state_crossing_the_stale_threshold_refreshes_an_unchanged_selection() {
+    let h = Harness::new();
+    let memory = h.seed_at(at(START), state("Tim is training for a marathon.", "weeks"));
+    // A weekly state is still fresh at six days and stale at eight.
+    h.advance(SignedDuration::from_hours(6 * 24));
+    let fresh = h.input(PROFILE_NAME);
+    assert_eq!(inputs(&fresh), BTreeSet::from([memory]));
+    applied(h.refresh(PROFILE_NAME, &quiet_llm(1), false));
+    assert_eq!(
+        h.refresh(PROFILE_NAME, &quiet_llm(0), false),
+        Outcome::Unchanged
+    );
+
+    h.advance(SignedDuration::from_hours(2 * 24));
+    let stale = h.input(PROFILE_NAME);
+    assert_eq!(inputs(&stale), inputs(&fresh));
+    let llm = quiet_llm(1);
+    applied(h.refresh(PROFILE_NAME, &llm, false));
+    assert_eq!(writes(&llm), 1);
+    assert_ne!(stale.fingerprint, fresh.fingerprint);
+
+    // Once stale, another day alone must not cause another write.
+    h.advance(SignedDuration::from_hours(24));
+    let llm = quiet_llm(0);
+    assert_eq!(h.refresh(PROFILE_NAME, &llm, false), Outcome::Unchanged);
+    assert_eq!(writes(&llm), 0);
+}
+
+#[test]
+fn rendering_a_stale_state_keeps_the_written_absolute_date_without_adding_age() {
+    let h = Harness::new();
+    let memory = h.seed(state("Tim is training for a marathon.", "weeks"));
+    let text = "As of 1 Sep, Tim is training for a marathon.";
+    h.profile_adding(&[(text, &[memory])]);
+    let first = h.block(None);
+    assert!(
+        first.text.ends_with(&format!("Output:\n{text}")),
+        "{}",
+        first.text
+    );
+    assert_eq!(first.cited, vec![memory]);
+
+    // A new local day rebuilds the block, but does not date the answer again.
+    h.advance(SignedDuration::from_hours(24));
+    let next = h.block(None);
+    assert_ne!(first.id, next.id);
+    assert!(
+        next.text.ends_with(&format!("Output:\n{text}")),
+        "{}",
+        next.text
+    );
+    assert_eq!(next.cited, vec![memory]);
+    assert_eq!(paragraph(answer(&h.profile()), SECTION), Some(text));
+}
+
+#[test]
 fn a_faded_memory_leaves_the_model_at_the_next_sweep() {
     // When a cited memory fades below τ it leaves the input set,
     // and so leaves the model. A model can't keep a memory alive by itself.

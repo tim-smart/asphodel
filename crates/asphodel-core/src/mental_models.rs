@@ -46,7 +46,7 @@ pub(crate) use schedule::Schedule;
 pub const PLAN_TEMPLATE: &str = "plan_model";
 pub const PLAN_VERSION: u32 = 1;
 pub const WRITE_TEMPLATE: &str = "write_model";
-pub const WRITE_VERSION: u32 = 2;
+pub const WRITE_VERSION: u32 = 3;
 
 /// The least time between two refreshes of one model, and the wait before
 /// a failed refresh is tried again. Fixed
@@ -159,7 +159,7 @@ pub struct RefreshInput {
     /// The stored answer, which the write is shown to keep the wording
     /// steady.
     pub previous: Option<String>,
-    /// The hash of the selection, the question, the plan, the filters and
+    /// The hash of the selection, stale-state ids, question, plan, filters and
     /// `max_tokens`.
     pub fingerprint: String,
 }
@@ -168,6 +168,7 @@ pub struct RefreshInput {
 pub struct InputMemory {
     pub handle: String,
     pub memory: Uuid,
+    /// The sentence, with an absolute observed date when a state may be stale.
     pub sentence: String,
     /// The heading of the first facet that found it.
     pub facet: String,
