@@ -1,5 +1,15 @@
 # Tests
 
+## Running tests
+
+```
+nix develop -c cargo nextest run
+```
+
+On linux, prefix the nextest run with `TMPDIR=/dev/shm`.
+
+## Writing tests
+
 Test behavior through public seams only:
 
 - `Service` and the other public core API it hands out
