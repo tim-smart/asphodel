@@ -78,7 +78,7 @@ Link each claim to the entities it is about. Known entities have handles (`e1`, 
 
 # Used
 
-Context memories have handles (`m1`, `m2`, ...). In `used_injected_ids`, return only the handles of memories the assistant's reply actually relied on. Being shown a memory is not using it. Return an empty list for documents, which have no reply."#;
+Context memories have handles (`m1`, `m2`, ...). In `used_injected_ids`, return only the handles of memories the assistant's reply actually relied on. Being shown a memory is not using it, and topical overlap is not use. A fact the reply could take from the speaker's message, from an earlier context turn, or from a file the assistant reads in the reply before stating it does not count as relied on from a memory, even when one also carries it. Return an empty list for documents, which have no reply."#;
 
 /// The language rule without `[llm] language`.
 const INFERRED_LANGUAGE: &str = "Write the claim in the language of the passage it quotes and never translate. Entity names and dates stay as they appear.";

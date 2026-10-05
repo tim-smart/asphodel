@@ -70,7 +70,7 @@ pub use prompt::call1_request;
 
 /// Call 1's template name and version, which replay's cassette keys include.
 pub const CALL1_TEMPLATE: &str = "extract_claims";
-pub const CALL1_VERSION: u32 = 7;
+pub const CALL1_VERSION: u32 = 8;
 
 /// The hash call 1's template carries for `[extraction] guidance`:
 /// lower-case hex SHA-256 of the text as the prompt inserts it, trimmed.
