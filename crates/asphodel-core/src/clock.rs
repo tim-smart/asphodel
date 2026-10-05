@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use jiff::{SignedDuration, Timestamp};
 
@@ -84,5 +85,23 @@ impl fmt::Debug for SimulatedClock {
         f.debug_struct("SimulatedClock")
             .field("now", &self.now())
             .finish()
+    }
+}
+
+/// How code that waits between attempts waits, so tests can stand in for
+/// the sleep the way [`SimulatedClock`] stands in for the time.
+pub trait Sleeper: Send + Sync {
+    /// Returns after `wait`.
+    fn sleep(&self, wait: Duration);
+}
+
+/// The sleeper `serve` and replay's live calls use: the calling thread
+/// sleeps.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ThreadSleeper;
+
+impl Sleeper for ThreadSleeper {
+    fn sleep(&self, wait: Duration) {
+        std::thread::sleep(wait);
     }
 }

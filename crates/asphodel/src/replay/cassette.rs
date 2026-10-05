@@ -58,11 +58,6 @@ Reply with an empty list when none does.";
 /// record says otherwise.
 const UNRECORDED_MODEL: &str = "unrecorded";
 
-/// How many times a live call is tried on a retryable error, and the wait
-/// between tries, the worker's policy in small.
-const ATTEMPTS: u32 = 3;
-const RETRY_WAIT: Duration = Duration::from_millis(500);
-
 /// One recorded call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
@@ -522,7 +517,7 @@ impl Recorder {
                         let Some(chunk) = chunks.get(index) else {
                             break;
                         };
-                        let reply = call_with_retries(live.as_ref(), &chunk.request);
+                        let reply = live.complete(&chunk.request);
                         if reply.is_err() {
                             failed.store(true, Ordering::Relaxed);
                         }
@@ -670,7 +665,7 @@ impl Recorder {
                 return Err(LlmError::Transport { reason: message });
             }
         };
-        let response = call_with_retries(live.as_ref(), request)?;
+        let response = live.complete(request)?;
         let latency_ms = u64::try_from(response.latency.as_millis()).unwrap_or(u64::MAX);
         *lock(&self.served_ms) += latency_ms;
         {
@@ -916,22 +911,6 @@ impl LlmClient for Chained<'_> {
             });
         }
         self.rest.complete(request)
-    }
-}
-
-/// The worker's retry policy in small: a retryable error is tried again a
-/// few times after a short wait, anything else fails at once.
-fn call_with_retries(live: &dyn LlmClient, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-    let mut attempt = 1;
-    loop {
-        match live.complete(request) {
-            Ok(response) => return Ok(response),
-            Err(error) if error.is_retryable() && attempt < ATTEMPTS => {
-                attempt += 1;
-                std::thread::sleep(RETRY_WAIT);
-            }
-            Err(error) => return Err(error),
-        }
     }
 }
 

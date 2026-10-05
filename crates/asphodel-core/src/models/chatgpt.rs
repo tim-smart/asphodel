@@ -821,6 +821,17 @@ const BACKEND_CODES: &[&str] = &[
     "interrupted",
 ];
 
+/// The codes among [`BACKEND_CODES`] that say the backend failed or was
+/// busy rather than that the request can't succeed, so the same request may
+/// succeed next time. A reply cut short (`max_output_tokens`,
+/// `interrupted`), a refusal, a spent quota and an unknown code are not.
+pub(super) const TRANSIENT_BACKEND_CODES: &[&str] = &[
+    "server_error",
+    "server_is_overloaded",
+    "slow_down",
+    "rate_limit_exceeded",
+];
+
 /// A known code as itself, any other as `unknown`, and none as `missing`
 /// (the event's own fixed name).
 fn backend_code(code: Option<&str>, missing: &'static str) -> String {

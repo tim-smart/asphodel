@@ -621,6 +621,15 @@ attention, which is what to alert on; there's no Prometheus endpoint.
 kubectl exec hermes-0 -c asphodel -- asphodel status
 ```
 
+A chunk whose extraction fails is tried again, up to five times. Each LLM
+call has already retried a transient failure within it (`docs/models.md`,
+"The LLM"), so a counted failure is one that outlasted a few seconds. After
+a failure the LLM or the store might recover from, the bank's worker waits
+30s before the next attempt, doubling each time up to 5m: 30s, 1m, 2m and
+4m. A chunk survives an outage of about seven and a half minutes before it
+fails. A held queue (a usage limit, a 429 with `Retry-After`, no login)
+waits for the hold instead and counts nothing.
+
 `asphodel chunks --bank B [--failed [--retry]]` lists a bank's extraction
 chunks. `--failed` lists only those whose extraction failed past the retry
 cap, with the error kind and HTTP status (never the response), and

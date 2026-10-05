@@ -784,6 +784,45 @@ fn a_stream_ends_in_its_reply_or_a_fixed_backend_code() {
     }
 }
 
+#[test]
+fn only_a_transient_backend_code_is_retryable() {
+    // The backend failing or overloaded may answer next time; a reply cut
+    // short, a policy refusal, a spent quota or an unknown code won't.
+    let transient = [
+        "server_error",
+        "server_is_overloaded",
+        "slow_down",
+        "rate_limit_exceeded",
+    ];
+    let lasting = [
+        "context_length_exceeded",
+        "insufficient_quota",
+        "usage_not_included",
+        "invalid_prompt",
+        "cyber_policy",
+        "max_output_tokens",
+        "content_filter",
+        "interrupted",
+        "not_a_known_code",
+        "",
+    ];
+    let codes = transient.iter().map(|code| (*code, true));
+    for (code, retryable) in codes.chain(lasting.iter().map(|code| (*code, false))) {
+        for (shape, body) in terminal_events(code) {
+            let backend = StubServer::backend(StubResponse::stream(body));
+            let dir = TestDir::new();
+            let error = client(&backend, logged_in_store(&dir))
+                .complete(&request())
+                .unwrap_err();
+            assert!(
+                matches!(error, LlmError::Backend { .. }),
+                "{shape} {code:?}: {error:?}"
+            );
+            assert_eq!(error.is_retryable(), retryable, "{shape} {code:?}");
+        }
+    }
+}
+
 // Refresh.
 
 #[test]

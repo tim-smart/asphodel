@@ -15,9 +15,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::time::Duration;
 
 use asphodel_core::Service;
-use asphodel_core::clock::{Clock, SimulatedClock};
+use asphodel_core::clock::{Clock, SimulatedClock, Sleeper};
 use asphodel_core::config::Tuning;
 use asphodel_core::entities::MergeRequest;
 use asphodel_core::extraction::{
@@ -31,7 +32,7 @@ use asphodel_core::inspect::{
 };
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest, LlmResponse,
-    ModelError, Models,
+    LlmRetry, ModelError, Models, RetryPolicy,
 };
 use asphodel_core::queue::{Failure, Lease, SourceKind};
 use asphodel_core::store::bank::BankIdentity;
@@ -1850,6 +1851,54 @@ fn a_failed_step_writes_nothing_and_counts_the_attempt() {
         assert_eq!(h.named("main", "Lisbon").len(), 1, "{step}");
         assert_eq!(h.memory(tea).accesses.len(), 2, "{step}");
     }
+}
+
+/// A [`Sleeper`] that returns at once.
+struct NoSleep;
+
+impl Sleeper for NoSleep {
+    fn sleep(&self, _: Duration) {}
+}
+
+/// `script` ([`FakeLlm::from_script`]) behind [`LlmRetry`] with three
+/// attempts, as the daemon calls the LLM.
+fn retrying(h: &Harness, script: Value) -> LlmRetry {
+    let inner = Arc::new(FakeLlm::from_script(MODEL, &script.to_string()).unwrap());
+    let policy = RetryPolicy {
+        attempts: 3,
+        ..RetryPolicy::default()
+    };
+    LlmRetry::new(inner, policy, h.clock.clone(), Arc::new(NoSleep))
+}
+
+#[test]
+fn a_transient_error_retried_within_the_call_counts_only_its_last_failure() {
+    let tea = reply(vec![claim("Tim likes tea.", "fact", "I like tea")], &[]);
+    let tea = json!({"reply": tea});
+    let status = |status: u16| json!({"fail": "status", "status": status});
+
+    // Two blips, then call 1 answers: the chunk is extracted, nothing counted.
+    let h = Harness::new();
+    let ingested = h.say(T1, "I like tea.", "Noted.");
+    let llm = retrying(&h, json!([status(502), {"fail": "timeout"}, tea]));
+    assert_eq!(run(&h, &llm, &[]).unwrap().memories.len(), 1);
+    assert_eq!(attempts(&h, ingested.source), (ChunkState::Extracted, 0));
+
+    // Every attempt fails: the last error, counted once.
+    let h = Harness::new();
+    let ingested = h.say(T1, "I like tea.", "Noted.");
+    let llm = retrying(&h, json!([status(500), status(502), status(503), tea]));
+    let error = run(&h, &llm, &[]).unwrap_err();
+    let last = matches!(
+        &error,
+        ExtractError::Call1 {
+            error: LlmError::Status { status: 503 },
+            ..
+        }
+    );
+    assert!(last, "{error:?}");
+    assert_eq!(error.failure(), Some(Failure::Retry { error_count: 1 }));
+    assert_eq!(attempts(&h, ingested.source), (ChunkState::Queued, 1));
 }
 
 #[test]

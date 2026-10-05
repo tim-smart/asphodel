@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asphodel_core::clock::{Clock, SimulatedClock};
+use asphodel_core::clock::{Clock, SimulatedClock, Sleeper};
 use asphodel_core::config::{ConfigError, Deployment, Secret, Tuning};
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::vector::EMBEDDING_DIMENSIONS;
@@ -741,6 +741,215 @@ fn a_slow_or_dead_endpoint_is_a_retryable_transport_failure() {
     .unwrap_err();
     assert!(matches!(error, LlmError::Transport { .. }), "{error:?}");
     assert!(error.is_retryable());
+}
+
+// Retrying a transient error within the call.
+
+/// One call's outcome, and how long the call takes on the simulated clock.
+type Step = (SignedDuration, Result<Value, LlmError>);
+
+/// A client that plays one [`Step`] per call, so a test can fail a call
+/// with any [`LlmError`] and make it slow.
+struct Steps {
+    clock: Arc<SimulatedClock>,
+    steps: Mutex<std::collections::VecDeque<Step>>,
+    calls: AtomicUsize,
+}
+
+impl LlmClient for Steps {
+    fn model(&self) -> &str {
+        "steps"
+    }
+
+    fn complete(&self, _: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let (takes, outcome) = self.steps.lock().unwrap().pop_front().expect("a step");
+        self.clock.advance(takes);
+        outcome.map(|json| LlmResponse {
+            json,
+            usage: None,
+            latency: Duration::ZERO,
+        })
+    }
+}
+
+/// Records each wait instead of sleeping, and moves the clock on by it.
+struct Waits {
+    clock: Arc<SimulatedClock>,
+    waits: Mutex<Vec<Duration>>,
+    elapsed: Option<Duration>,
+}
+
+impl Sleeper for Waits {
+    fn sleep(&self, wait: Duration) {
+        self.waits.lock().unwrap().push(wait);
+        self.clock
+            .advance(SignedDuration::try_from(self.elapsed.unwrap_or(wait)).unwrap());
+    }
+}
+
+/// Four attempts at most, waiting 1s, 2s, then 3s (capped from 4s) before
+/// them, and none started 30s after the first.
+fn retry_policy() -> RetryPolicy {
+    RetryPolicy {
+        attempts: 4,
+        first_wait: Duration::from_secs(1),
+        max_wait: Duration::from_secs(3),
+        budget: Duration::from_secs(30),
+    }
+}
+
+/// One call through [`LlmRetry`] to a client playing `steps`: its result,
+/// how many calls reached the client, and the waits between them.
+fn retried(steps: Vec<Step>) -> (Result<LlmResponse, LlmError>, usize, Vec<Duration>) {
+    retried_with_sleep(steps, None)
+}
+
+/// Optionally simulate scheduler oversleep instead of the requested wait.
+fn retried_with_sleep(
+    steps: Vec<Step>,
+    elapsed: Option<Duration>,
+) -> (Result<LlmResponse, LlmError>, usize, Vec<Duration>) {
+    let clock = Arc::new(SimulatedClock::new(start()));
+    let inner = Arc::new(Steps {
+        clock: clock.clone(),
+        steps: Mutex::new(steps.into()),
+        calls: AtomicUsize::new(0),
+    });
+    let waits = Arc::new(Waits {
+        clock: clock.clone(),
+        waits: Mutex::new(Vec::new()),
+        elapsed,
+    });
+    let retry = LlmRetry::new(inner.clone(), retry_policy(), clock, waits.clone());
+    let result = retry.complete(&request());
+    let waits = waits.waits.lock().unwrap().clone();
+    (result, inner.calls.load(Ordering::SeqCst), waits)
+}
+
+fn quick(outcome: Result<Value, LlmError>) -> Step {
+    (SignedDuration::ZERO, outcome)
+}
+
+/// Each wait is jittered down to no less than half its backoff: 1s, 2s,
+/// then 3s once doubling passes the cap.
+fn assert_backed_off(waits: &[Duration], case: &str) {
+    let secs = Duration::from_secs;
+    let backoffs = [secs(1), secs(2), secs(3)];
+    assert!(waits.len() <= backoffs.len(), "{case}: {waits:?}");
+    for (wait, backoff) in waits.iter().zip(backoffs) {
+        assert!(
+            *wait >= backoff / 2 && *wait <= backoff,
+            "{case}: waited {wait:?} for a {backoff:?} backoff"
+        );
+    }
+}
+
+#[test]
+fn a_transient_error_is_retried_within_the_call_and_nothing_else_is() {
+    let ok = || Ok(json!({"claims": []}));
+    let status = |status| Err(LlmError::Status { status });
+    let backend = |code: &str| {
+        Err(LlmError::Backend {
+            code: code.to_string(),
+        })
+    };
+
+    // Transient failures short of the cap end in the reply.
+    let transient = [
+        vec![quick(Err(LlmError::Timeout)), quick(ok())],
+        vec![quick(status(429)), quick(status(408)), quick(ok())],
+        vec![
+            quick(Err(LlmError::Transport {
+                reason: "connection reset".into(),
+            })),
+            quick(status(502)),
+            quick(backend("server_error")),
+            quick(ok()),
+        ],
+    ];
+    for steps in transient {
+        let attempts = steps.len();
+        let (result, calls, waits) = retried(steps);
+        let case = format!("{attempts} attempts");
+        assert_eq!(result.unwrap().json, json!({"claims": []}), "{case}");
+        assert_eq!((calls, waits.len()), (attempts, attempts - 1), "{case}");
+        assert_backed_off(&waits, &case);
+    }
+
+    // Exhausting the attempts returns the last error.
+    let (result, calls, waits) = retried(vec![
+        quick(status(500)),
+        quick(status(502)),
+        quick(status(503)),
+        quick(status(504)),
+        quick(ok()),
+    ]);
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, LlmError::Status { status: 504 }),
+        "{error:?}"
+    );
+    assert_eq!((calls, waits.len()), (4, 3));
+    assert_backed_off(&waits, "exhausted");
+
+    // Anything else is returned at once: a wrong reply, a hold the gate
+    // shares, a login, a deterministic backend failure.
+    let resets_at = start() + SignedDuration::from_hours(1);
+    let fatal: Vec<(&str, Result<Value, LlmError>)> = vec![
+        ("not json", Err(LlmError::NotJson { bytes: 3 })),
+        ("no content", Err(LlmError::NoContent)),
+        ("refused", Err(LlmError::Refused)),
+        ("login", Err(LlmError::LoginRequired)),
+        ("usage", Err(LlmError::UsageLimited { resets_at })),
+        (
+            "rate",
+            Err(LlmError::RateLimited {
+                retry_after: Duration::from_secs(5),
+            }),
+        ),
+        ("bad request", status(400)),
+        ("max_output_tokens", backend("max_output_tokens")),
+    ];
+    for (case, outcome) in fatal {
+        let expected = format!("{:?}", outcome.as_ref().unwrap_err());
+        let (result, calls, waits) = retried(vec![quick(outcome), quick(ok())]);
+        let error = result.unwrap_err();
+        assert_eq!(format!("{error:?}"), expected, "{case}");
+        assert_eq!((calls, waits), (1, vec![]), "{case}");
+    }
+
+    // A call that ends past the budget isn't retried, however it failed: a
+    // stalled endpoint doesn't hold a call for minutes. Nor is one whose
+    // backoff, at least 0.5s here, would start the next attempt past it,
+    // and it doesn't wait for nothing. One that ends well inside it is.
+    let slow = SignedDuration::from_secs(31);
+    let (result, calls, _) = retried(vec![(slow, Err(LlmError::Timeout)), quick(ok())]);
+    assert!(matches!(result, Err(LlmError::Timeout)), "{result:?}");
+    assert_eq!(calls, 1);
+    let edge = SignedDuration::from_millis(29_800);
+    let (result, calls, waits) = retried(vec![(edge, Err(LlmError::Timeout)), quick(ok())]);
+    assert!(matches!(result, Err(LlmError::Timeout)), "{result:?}");
+    assert_eq!((calls, waits), (1, vec![]));
+    let inside = SignedDuration::from_secs(20);
+    let (result, calls, _) = retried(vec![(inside, Err(LlmError::Timeout)), quick(ok())]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(calls, 2);
+
+    // The planned wait fits, but scheduler oversleep reaches or passes
+    // the cutoff. Return the last error without starting another call.
+    for sleep_secs in [10, 11] {
+        let (result, calls, waits) = retried_with_sleep(
+            vec![(inside, status(503)), quick(ok())],
+            Some(Duration::from_secs(sleep_secs)),
+        );
+        assert!(
+            matches!(result, Err(LlmError::Status { status: 503 })),
+            "slept {sleep_secs}s: {result:?}"
+        );
+        assert_eq!((calls, waits.len()), (1, 1), "slept {sleep_secs}s");
+        assert_backed_off(&waits, "oversleep");
+    }
 }
 
 // The real models. Ignored: they run only when the models are present.
