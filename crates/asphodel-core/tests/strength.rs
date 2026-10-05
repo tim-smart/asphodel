@@ -344,6 +344,72 @@ fn one_used_credit_strengthens_at_once_and_the_floor_counts_it_like_any_access()
 }
 
 #[test]
+fn the_used_weight_scales_recent_use_but_never_the_floor() {
+    // The same history under three `used` weights: one memory used in a
+    // reply five days after it was said, beside a twin said with it and
+    // left alone. At 0 the use adds nothing to recent use; the floor counts
+    // it as an occasion whatever it weighs.
+    let run = |used: &str| {
+        let h = Harness::new(&format!("[strength.access_weights]\nused = {used}\n"));
+        let desk = h.says(at(0.0), trivial("fact", "Tim's desk is by the window."));
+        let cold = h.says(at(0.0), trivial("fact", "Tim's locker is number 12."));
+        h.uses(at(5.0), desk);
+        h.set(at(5.5));
+        (h.strength(desk), h.strength(cold))
+    };
+    let (none, cold) = run("0.0");
+    let (quarter, _) = run("0.25");
+    let (half, _) = run("0.5");
+    assert_near(none.recent_use, cold.recent_use, EXACT);
+    assert!(
+        none.recent_use < quarter.recent_use && quarter.recent_use < half.recent_use,
+        "{none:?} {quarter:?} {half:?}"
+    );
+    for used in [&none, &quarter, &half] {
+        assert_eq!((used.occasions, cold.occasions), (2, 1));
+        assert_eq!(used.lasting_floor, half.lasting_floor);
+    }
+}
+
+#[test]
+fn corroboration_counts_a_used_credit_from_its_second_turn_and_a_correction_keeps_it() {
+    let h = Harness::new("[strength]\ncorroborate_used = true\n");
+    // A memory's own `used` accesses, leaving out what it inherits.
+    let used_at = |memory: Uuid| -> Vec<Timestamp> {
+        let accesses = h.show(memory).accesses;
+        accesses
+            .iter()
+            .filter(|a| a.kind == "used" && a.inherited_from.is_none())
+            .map(|a| a.at)
+            .collect()
+    };
+    let desk = h.says(at(0.0), trivial("fact", "Tim's desk is by the window."));
+    let cold = h.says(at(0.0), trivial("fact", "Tim's locker is number 12."));
+
+    // The first credit is held: no access, and no strength over the twin.
+    h.uses(at(2.0), desk);
+    h.set(at(2.5));
+    assert_eq!(h.show(desk).accesses.len(), 1);
+    assert_near(h.strength(desk).value, h.strength(cold).value, EXACT);
+
+    // A credit in a later turn writes its access as usual.
+    h.uses(at(4.0), desk);
+    assert_eq!(used_at(desk), [at(4.0)]);
+    h.set(at(4.5));
+    assert!(h.strength(desk).value > h.strength(cold).value);
+
+    // Maya's credit is held, and Mia, correcting her, counts it: Mia's
+    // first credit of her own writes.
+    let name = |n: &str| changing(minor("fact", &format!("Tim's sister is called {n}.")));
+    let maya = h.says(at(5.0), name("Maya"));
+    h.uses(at(6.0), maya);
+    assert!(used_at(maya).is_empty());
+    let mia = h.labels(at(7.0), name("Mia"), maya, "retracts")[0];
+    h.uses(at(8.0), mia);
+    assert_eq!(used_at(mia), [at(8.0)]);
+}
+
+#[test]
 fn separate_occasions_in_world_time_make_a_memory_permanent_even_once_it_ends() {
     // A quiet bank, where three world days between turns are only 1.2 bank
     // days. Berlin is mentioned on four occasions exactly three world days

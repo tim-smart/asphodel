@@ -135,8 +135,13 @@ impl Harness {
 
     /// A harness on a new data dir with its bank created at `start`.
     fn starting(start: &str) -> Self {
+        Self::starting_with(start, "")
+    }
+
+    /// As [`Harness::starting`], with `extra` tuning.
+    fn starting_with(start: &str, extra: &str) -> Self {
         let clock = Arc::new(SimulatedClock::new(at(start)));
-        let harness = Self::open(TestDir::new(), clock, "");
+        let harness = Self::open(TestDir::new(), clock, extra);
         harness.create_bank(BANK);
         harness
     }
@@ -264,6 +269,18 @@ impl Harness {
         let ingested = self.service.ingest_turn(BANK, &sent).unwrap();
         assert_eq!(ingested.outcome, Outcome::Stored);
         ingested.source
+    }
+
+    /// A turn in `chat` whose reply call 1 judges used `memory`, which was
+    /// in context.
+    fn uses(&self, memory: Uuid) {
+        self.ingest("chat", "And?");
+        let lease = self.claim().expect("queued");
+        let input = self.service.call1_input(&lease, &[memory]).unwrap();
+        let shown = input.in_context.iter().find(|m| m.memory == memory);
+        let call1 = json!({"claims": [], "used_injected_ids": [shown.expect("in context").handle]});
+        let llm = FakeLlm::scripted(MODEL, vec![call1]);
+        self.service.extract_chunk(lease, &llm, &[memory]).unwrap();
     }
 
     /// The head of the queue extracted with no claims.
@@ -720,8 +737,8 @@ fn forget_erases_the_whole_chain_and_clears_what_points_into_it() {
     // forget takes every memory along `superseded_by`, whichever version
     // it names. `ended_by` isn't a chain link: Berlin stays, with its end
     // and without the pointer. Orphan entities go, except seeded ones and
-    // merge tombstones.
-    let h = Harness::new();
+    // merge tombstones, and so does a `used` credit held for the chain.
+    let h = Harness::starting_with(START, "[strength]\ncorroborate_used = true\n");
     let berlin = h.said(EARLIER, naming(notable(BERLIN), &[("Berlin", "place")]));
     let moved_out_claim = changes(notable("Tim moved out of Berlin."));
     let (moved_out, first) = h.says_changing(moved_out_claim, berlin, "ends");
@@ -735,6 +752,8 @@ fn forget_erases_the_whole_chain_and_clears_what_points_into_it() {
     );
     let (moved, second) = h.says_changing(moved_claim, moved_out, "refines");
     assert_eq!(h.superseded_by(moved_out), Some(moved));
+    h.uses(moved);
+    assert_eq!(h.count("SELECT count(*) FROM pending_credits"), 1);
     for entity in ["Berlin", "user"] {
         let memory = moved.to_string();
         let link = LinkRequest {
@@ -769,6 +788,7 @@ fn forget_erases_the_whole_chain_and_clears_what_points_into_it() {
     assert!(!names.contains("Lisbon"));
     let aliases = h.count("SELECT count(*) FROM entity_aliases WHERE alias='Lisbon'");
     assert_eq!(aliases, 0);
+    assert_eq!(h.count("SELECT count(*) FROM pending_credits"), 0);
 
     for source in [first, second] {
         assert!(!h.text(source).contains("Berlin"), "{source}");
