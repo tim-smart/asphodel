@@ -5,7 +5,8 @@
 //!   refresh. The debounce is per bank: a requested model is due
 //!   `refresh_debounce_minutes` after the bank's last trigger, and never
 //!   later than `refresh_max_delay_minutes` after its first.
-//! - A model is refreshed at most every [`MIN_REFRESH_INTERVAL`], and a
+//! - Ordinary refreshes wait at least [`MIN_REFRESH_INTERVAL`]; urgent
+//!   repairs bypass that wait after a successful refresh. A
 //!   failed refresh waits as long before it's tried again. A refresh the
 //!   LLM's hold kept from running isn't a failure: it's due again when the
 //!   hold lifts. Holds live in memory, like the bank's last trigger.
@@ -142,10 +143,15 @@ pub(crate) fn next_local(after: Timestamp, tz: &TimeZone, at: Time) -> Timestamp
 }
 
 /// The earliest a refresh of `model` may run: [`MIN_REFRESH_INTERVAL`]
-/// after its last refresh, and as long after a failure still standing.
+/// after its last refresh unless urgently requested, and as long after a
+/// failure still standing even for an urgent request.
 pub(crate) fn not_before(model: &ModelRow) -> Option<Timestamp> {
     let after = |at: Option<Timestamp>| at.and_then(|at| at.checked_add(MIN_REFRESH_INTERVAL).ok());
-    let refreshed = after(model.last_refreshed_at);
+    let refreshed = if model.refresh_urgent {
+        None
+    } else {
+        after(model.last_refreshed_at)
+    };
     let failed = if model.last_error.is_some() {
         after(model.last_error_at)
     } else {

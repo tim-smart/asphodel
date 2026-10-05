@@ -1070,7 +1070,7 @@ impl Service {
             let now = self.now();
             {
                 let conn = self.store.connection();
-                crate::mental_models::request(&conn, &self.schedule, models, now)?;
+                crate::mental_models::request(&conn, &self.schedule, models, now, true)?;
             }
             self.schedule.triggered(bank_id, now);
         }
@@ -1424,7 +1424,7 @@ impl Service {
         if !aftermath.models.is_empty() {
             {
                 let conn = self.store.connection();
-                crate::mental_models::request(&conn, &self.schedule, &aftermath.models, now)?;
+                crate::mental_models::request(&conn, &self.schedule, &aftermath.models, now, true)?;
             }
             self.schedule.triggered(bank_id, now);
         }
@@ -1551,6 +1551,7 @@ impl Service {
                                 &self.schedule,
                                 &[model.id].into(),
                                 now,
+                                false,
                             )?;
                         }
                         !held
@@ -1739,7 +1740,8 @@ impl Service {
                 created,
                 self.tuning.mental_models.trigger_level,
             )?;
-            crate::mental_models::request(&conn, &self.schedule, &effects.triggered, now)?;
+            crate::mental_models::request(&conn, &self.schedule, &effects.triggered, now, false)?;
+            crate::mental_models::request(&conn, &self.schedule, &effects.urgent, now, true)?;
             effects
         };
         if !effects.triggered.is_empty() {
@@ -1755,7 +1757,7 @@ impl Service {
         let now = self.now();
         {
             let conn = self.store.connection();
-            crate::mental_models::request(&conn, &self.schedule, &[model_id].into(), now)?;
+            crate::mental_models::request(&conn, &self.schedule, &[model_id].into(), now, false)?;
         }
         self.schedule.triggered(bank_id, now);
         Ok(())
