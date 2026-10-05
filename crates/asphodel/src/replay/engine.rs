@@ -1221,16 +1221,15 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// The tokens the bank's mental model answers that the block shows
-    /// hold now.
+    /// The tokens the block holds now of each mental model's answer: what
+    /// it shows, whole or cut, and nothing of a model it leaves out.
     fn sample_profile_tokens(&mut self) -> Result<(), Failure> {
         let bank = &self.settings.bank;
         let mut tokens = 0u64;
         for model in self.service.list_models(bank)? {
             let view = self.service.show_model(bank, &model.name)?;
-            if view.renders {
-                let answer = view.model.answer.as_deref().unwrap_or_default();
-                tokens += estimate_tokens(answer) as u64;
+            if let Some(shown) = &view.shown_answer {
+                tokens += estimate_tokens(shown) as u64;
             }
         }
         self.profile_tokens.push(tokens);

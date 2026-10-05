@@ -293,7 +293,8 @@ What changes in use:
   sentence.
 - The API's `Model` carries `answer` and `cites` in place of `entries`.
   `GET /v1/banks/{bank}/models/{model}` carries `cited` (each memory with
-  its status) and `renders` in place of `entry_views`, and no longer takes
+  its status), `renders` and `shown_answer` (the answer as the block shows
+  it now, whole or cut) in place of `entry_views`, and no longer takes
   `?entry=`. `asphodel model show` drops `--entry` and prints the cited
   memories after the answer. A refresh's `applied` detail is `{written,
   rejected, trimmed}`, with `trimmed` a count of sentences.

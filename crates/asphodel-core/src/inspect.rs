@@ -915,10 +915,14 @@ pub struct ModelView {
     pub updated_at: Timestamp,
     /// Each memory the answer cites, with its status.
     pub cited: Vec<CitedMemory>,
-    /// Whether the block shows the model: it has an answer and every memory
-    /// the answer cites is current. One that doesn't fit what's left of the
-    /// budget is cut, and shows in part.
+    /// Whether the block shows the model, as the block is laid out now:
+    /// it's enabled, has an answer, every memory the answer cites is
+    /// current, and at least its first sentence fits what the agenda and
+    /// the older models leave of the budget.
     pub renders: bool,
+    /// The answer as the block shows it: whole, or cut at a sentence end.
+    /// `None` when the block leaves the model out.
+    pub shown_answer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -938,10 +942,15 @@ pub enum CitedStatus {
 }
 
 /// `model show <name>`.
-pub(crate) fn model_view(store: &Store, bank: &str, name: &str) -> Result<ModelView, InspectError> {
+pub(crate) fn model_view(
+    store: &Store,
+    tuning: &Tuning,
+    bank: &str,
+    name: &str,
+) -> Result<ModelView, InspectError> {
     let now = store.now();
     let conn = store.connection();
-    let (bank_id, _) = find_bank(&conn, bank)?.ok_or(InspectError::UnknownBank)?;
+    let (bank_id, timezone) = find_bank(&conn, bank)?.ok_or(InspectError::UnknownBank)?;
     let row = find_model(&conn, bank_id, name)?.ok_or(InspectError::UnknownModel)?;
     let shown = model(&conn, &row)?;
     let (created_at, updated_at): (i64, i64) = conn.query_row(
@@ -979,10 +988,11 @@ pub(crate) fn model_view(store: &Store, bank: &str, name: &str) -> Result<ModelV
             })
         })?
         .collect::<Result<_, _>>()?;
-    let renders = row.enabled
-        && shown.answer.is_some()
-        && !cited.is_empty()
-        && cited.iter().all(|cite| cite.status == CitedStatus::Current);
+    // What the block would show now, from the same layout it's built by.
+    let tz = TimeZone::get(&timezone).unwrap_or(TimeZone::UTC);
+    let shown_answer = crate::system_prompt::lay_out(&conn, tuning, bank_id, &tz, now)?
+        .models
+        .remove(&row.id);
     Ok(ModelView {
         model: shown,
         entity_id: row.entity_id.map(|id| uuid_of(&conn, id)).transpose()?,
@@ -990,7 +1000,8 @@ pub(crate) fn model_view(store: &Store, bank: &str, name: &str) -> Result<ModelV
         created_at: timestamp(created_at),
         updated_at: timestamp(updated_at),
         cited,
-        renders,
+        renders: shown_answer.is_some(),
+        shown_answer,
     })
 }
 

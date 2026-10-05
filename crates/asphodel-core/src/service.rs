@@ -944,7 +944,7 @@ impl Service {
 
     /// `model show`: a model with the memories its answer cites.
     pub fn show_model(&self, bank: &str, name: &str) -> Result<ModelView, InspectError> {
-        crate::inspect::model_view(&self.store, bank, name)
+        crate::inspect::model_view(&self.store, &self.tuning, bank, name)
     }
 
     /// The dashboard's bank list: every bank with its counts by memory

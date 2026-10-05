@@ -508,8 +508,9 @@ Only the owner defines mental models, through these commands or the API.
 - `asphodel model show --bank B <name>` prints the answer as the prompt
   block reads it, each section a heading and one paragraph, then the
   memories it cites with their status (current, ended, retracted or
-  forgotten), and whether the prompt block shows the model. That's how to
-  answer "why does the profile say X?". `model list` prints each answer
+  forgotten), and whether the prompt block shows the model: whole, cut
+  short to fit what the agenda and older models leave of the budget, or
+  not at all. That's how to answer "why does the profile say X?". `model list` prints each answer
   without the citations.
 
 A refresh asks one narrow question per part of the model's question, its

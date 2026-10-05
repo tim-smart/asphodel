@@ -177,7 +177,19 @@ pub(crate) fn minimum_budget() -> usize {
     ))
 }
 
-/// Builds the bank's block at `now`.
+/// The block's content as laid out at one time, before it's kept by id.
+pub(crate) struct Layout {
+    pub text: String,
+    /// The memories the agenda lists, in the order it lists them.
+    pub agenda: Vec<Uuid>,
+    /// The memories the rendered models cite, each once.
+    pub cited: Vec<Uuid>,
+    /// Each model the block shows, by rowid, with its answer as shown:
+    /// whole, or cut at a sentence end. A model left out isn't here.
+    pub models: HashMap<i64, String>,
+}
+
+/// Builds the bank's block at `now` and keeps it by id.
 pub(crate) fn build(
     store: &Store,
     tuning: &Tuning,
@@ -186,7 +198,39 @@ pub(crate) fn build(
 ) -> Result<Block, rusqlite::Error> {
     let now = store.now();
     let conn = store.connection();
-    let agenda = crate::agenda::build(&conn, tuning, bank_id, tz, now)?;
+    let layout = lay_out(&conn, tuning, bank_id, tz, now)?;
+    let block = Block {
+        id: store.new_id(),
+        built_at: now,
+        text: layout.text,
+        agenda: layout.agenda,
+        cited: layout.cited,
+    };
+    // Kept by id, for the plugin that sends it with its first prefetch.
+    conn.execute(
+        "INSERT INTO prompt_blocks (uuid, bank_id, in_context, built_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        (
+            block.id.to_string(),
+            bank_id,
+            serde_json::to_string(&block.in_context()).unwrap_or_else(|_| "[]".into()),
+            micros(now),
+        ),
+    )?;
+    Ok(block)
+}
+
+/// Lays the bank's block out at `now`: what [`build`] keeps, and what
+/// `model show` reports of each model, from the one layout so the two
+/// can't disagree.
+pub(crate) fn lay_out(
+    conn: &Connection,
+    tuning: &Tuning,
+    bank_id: i64,
+    tz: &TimeZone,
+    now: Timestamp,
+) -> Result<Layout, rusqlite::Error> {
+    let agenda = crate::agenda::build(conn, tuning, bank_id, tz, now)?;
     let budget = tuning.mental_models.budget as usize;
     let guidance = guidance(
         &now.to_zoned(tz.clone())
@@ -241,15 +285,16 @@ pub(crate) fn build(
     // every memory its answer cites is current, and then cites them all,
     // which puts them in a session's context.
     let mut cited: Vec<Uuid> = Vec::new();
-    for model in load_models(&conn, bank_id)?
+    let mut models = HashMap::new();
+    for model in load_models(conn, bank_id)?
         .into_iter()
         .filter(|model| model.enabled)
     {
         let Some(text) = &model.answer else {
             continue;
         };
-        let cites = load_cites(&conn, model.id)?;
-        if !all_current(&conn, now, &cites)? {
+        let cites = load_cites(conn, model.id)?;
+        if !all_current(conn, now, &cites)? {
             continue;
         }
         let mut answer = Answer::parse(text);
@@ -263,6 +308,7 @@ pub(crate) fn build(
             continue;
         }
         sections.push(render_model(&model.name, &model.question, &answer));
+        models.insert(model.id, answer.text());
         for (_, uuid) in cites {
             if !cited.contains(&uuid) {
                 cited.push(uuid);
@@ -271,25 +317,12 @@ pub(crate) fn build(
     }
     sections.insert(0, guidance);
 
-    let block = Block {
-        id: store.new_id(),
-        built_at: now,
+    Ok(Layout {
         text: sections.join("\n\n"),
         agenda: shown.listed(&agenda.agenda),
         cited,
-    };
-    // Kept by id, for the plugin that sends it with its first prefetch.
-    conn.execute(
-        "INSERT INTO prompt_blocks (uuid, bank_id, in_context, built_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        (
-            block.id.to_string(),
-            bank_id,
-            serde_json::to_string(&block.in_context()).unwrap_or_else(|_| "[]".into()),
-            micros(now),
-        ),
-    )?;
-    Ok(block)
+        models,
+    })
 }
 
 /// How much of the agenda the block shows: which dated lines, how many

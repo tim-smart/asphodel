@@ -1754,10 +1754,15 @@ fn print_model_view(view: &Value) {
             text(cite, "sentence")
         );
     }
-    if view.get("renders").and_then(Value::as_bool) == Some(true) {
-        println!("  the block shows it");
-    } else if view.get("answer").is_some_and(Value::is_string) {
-        println!("  the block leaves it out: it's disabled or a memory it cites isn't current");
+    let answer = view.get("answer").and_then(Value::as_str);
+    match view.get("shown_answer").and_then(Value::as_str) {
+        Some(shown) if Some(shown) == answer => println!("  the block shows it"),
+        Some(_) => println!("  the block shows it cut short, to fit what the agenda leaves"),
+        None if answer.is_some() => println!(
+            "  the block leaves it out: it's disabled, a memory it cites isn't current, \
+             or not one sentence fits what the agenda leaves"
+        ),
+        None => {}
     }
 }
 
