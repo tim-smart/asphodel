@@ -16,12 +16,14 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use asphodel_core::clock::ThreadSleeper;
 use asphodel_core::config::{
     Deployment, LLM_API_KEY_ENV, LlmAuth, ModelsConfig, Secret, TOKEN_ENV,
 };
 use asphodel_core::models::{
     CodexResponses, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, LlmGate,
-    LlmSettings, LlmStatus, ModelOptions, Models, OpenAiCompatible, TokenStore,
+    LlmRetry, LlmSettings, LlmStatus, ModelOptions, Models, OpenAiCompatible, RetryPolicy,
+    TokenStore,
 };
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::{Clock, ResolvedConfig, Service, SystemClock, Tuning};
@@ -389,12 +391,18 @@ fn start(
     let llm = llm_client(&config, &args.data_dir, Arc::clone(&clock), script)?;
     config.fake_llm = llm.as_ref().is_some_and(|(_, fake)| *fake);
     // Extraction and refresh share one gate: `[llm] concurrency` calls in
-    // flight at most, and one hold when any of them hits a limit.
+    // flight at most, and one hold when any of them hits a limit. A
+    // transient failure is retried under it, so the gate sees only the
+    // final result.
     let concurrency = config.tuning.llm.concurrency as usize;
-    let llm = llm.map(|(llm, fake)| {
-        let gate: Arc<dyn LlmClient> = Arc::new(LlmGate::new(llm, concurrency, clock));
-        (gate, fake)
-    });
+    let llm = match llm {
+        Some((llm, fake)) => {
+            let retried = retrying(llm, Arc::clone(&clock))?;
+            let gate: Arc<dyn LlmClient> = Arc::new(LlmGate::new(retried, concurrency, clock));
+            Some((gate, fake))
+        }
+        None => None,
+    };
     info!(
         config = %serde_json::to_string(&config)?,
         "resolved config"
@@ -428,6 +436,39 @@ fn llm_script() -> anyhow::Result<Option<String>> {
     let script = fs::read_to_string(&path)
         .with_context(|| format!("reading {LLM_SCRIPT_ENV} {}", Path::new(&path).display()))?;
     Ok(Some(script))
+}
+
+/// `ASPHODEL_LLM_RETRY_WAIT_MS=<ms>` replaces the first and the longest
+/// wait between the attempts of an LLM call, in the daemon and in replay's
+/// live calls, so an integration test can retry without sleeping. It is for
+/// integration tests, environment only, never in `--help`.
+pub(crate) const LLM_RETRY_WAIT_ENV: &str = "ASPHODEL_LLM_RETRY_WAIT_MS";
+
+/// `llm` retrying a transient failure within the call ([`LlmRetry`]), with
+/// the budget measured on `clock`.
+pub(crate) fn retrying(
+    llm: Arc<dyn LlmClient>,
+    clock: Arc<dyn Clock>,
+) -> anyhow::Result<Arc<dyn LlmClient>> {
+    let mut policy = RetryPolicy::default();
+    if let Some(value) = std::env::var_os(LLM_RETRY_WAIT_ENV) {
+        let wait = value
+            .to_str()
+            .and_then(|value| value.parse().ok())
+            .map(Duration::from_millis)
+            .with_context(|| {
+                format!("{LLM_RETRY_WAIT_ENV} isn't a whole number of milliseconds")
+            })?;
+        warn!("{LLM_RETRY_WAIT_ENV} is set: LLM retries wait {wait:?}");
+        policy.first_wait = wait;
+        policy.max_wait = wait;
+    }
+    Ok(Arc::new(LlmRetry::new(
+        llm,
+        policy,
+        clock,
+        Arc::new(ThreadSleeper),
+    )))
 }
 
 /// `ASPHODEL_STARTUP_GATE=<path>` holds startup, after the listener is bound

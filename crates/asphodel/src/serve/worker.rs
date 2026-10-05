@@ -9,9 +9,8 @@
 //! as many chunks out as it may, the worker sleeps until a chunk finishes or
 //! an ingest or a retry wakes it. A held queue (no login, a usage limit, a
 //! 429 that said when to retry) waits without counting anything, and a
-//! counted failure waits a little before the retry when the LLM might
-//! recover, so a dead endpoint doesn't burn through the retry cap in a
-//! second.
+//! counted failure waits before the retry when the LLM might recover, so
+//! an outage of a few minutes doesn't burn through the retry cap.
 //!
 //! A forget's erase waits on the same queue, behind the chunks queued
 //! before it, and nothing queued after it is claimed until it has run, so
@@ -38,10 +37,16 @@ use tracing::{debug, info, warn};
 /// when its usage window resets.
 const HELD_WAIT: Duration = Duration::from_secs(60);
 
+/// The shortest a held queue waits, even when the hold has already lifted.
+const HELD_WAIT_MIN: Duration = Duration::from_secs(1);
+
 /// The first wait after a counted failure the LLM might recover from. It
-/// doubles with each failure of the same chunk, up to [`RETRY_WAIT_MAX`].
-const RETRY_WAIT: Duration = Duration::from_secs(1);
-const RETRY_WAIT_MAX: Duration = Duration::from_secs(60);
+/// doubles with each failure of the same chunk, up to [`RETRY_WAIT_MAX`]:
+/// 30s, 1m, 2m and 4m between the five attempts, so a chunk outlasts an
+/// outage of about seven minutes before it fails. Each attempt has already
+/// retried a blip within the call (`LlmRetry`).
+const RETRY_WAIT: Duration = Duration::from_secs(30);
+const RETRY_WAIT_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// The wait after an error that isn't the chunk's, such as the store
 /// failing to claim.
@@ -288,9 +293,9 @@ impl Worker {
                         let now = self.service.now();
                         Duration::try_from(now.duration_until(*resets_at))
                             .unwrap_or(Duration::ZERO)
-                            .max(RETRY_WAIT)
+                            .max(HELD_WAIT_MIN)
                     }
-                    LlmError::RateLimited { retry_after } => (*retry_after).max(RETRY_WAIT),
+                    LlmError::RateLimited { retry_after } => (*retry_after).max(HELD_WAIT_MIN),
                     _ => HELD_WAIT,
                 };
                 Next::Wait(wait)

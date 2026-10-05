@@ -125,6 +125,27 @@ cassette records the logical request (template, prompts, schema), never
 the wire body or headers, so a recording made in one mode replays in the
 other.
 
+**Retries.** A transient failure is retried within the call: a transport
+error, a timeout, a 408, a 429 without `Retry-After`, a 5xx, or a ChatGPT
+backend failure coded `server_error`, `server_is_overloaded`, `slow_down`
+or `rate_limit_exceeded`. A call gets three attempts, with a backoff of 1s
+then 2s (doubling, capped at 4s) between them, each wait jittered down to
+no less than half. No new attempt starts once 30s have passed since the
+first began, so a call that timed out after the 120s request timeout isn't
+tried again. Each retry is logged at `warn` with the attempt and the
+error, never the request or the reply. Nothing else is retried: a reply
+that came back wrong, a refusal, a missing login, a backend code for a
+reply cut short (`max_output_tokens`, `interrupted`), a content or policy
+refusal, a spent quota or an unknown code. Usage limits and a 429 with
+`Retry-After` are holds (see "Usage limits" below), not retries.
+
+Only a call's last failure counts. A call that succeeds on a later
+attempt counts nothing against a chunk's retry cap or a mental model's
+`last_error`. One whose every attempt fails counts once, and returns its
+last error, which is also what translate reports. The daemon
+retries beneath its shared gate, so the gate sees only the final result;
+replay's `live` and `fast` retry their live calls the same way.
+
 **Language.** Unset, `[llm] language` leaves call 1 writing each claim in
 the language of the passage it quotes and a refresh writing an answer in
 the language of the memories it cites. Set to a language name such as
@@ -161,8 +182,9 @@ of `{"reply": <json>}` or `{"fail": "<kind>"}` steps, each with an optional
 `delay_ms`. The kinds are `transport`, `timeout`, `status` (with `status`,
 default 500), `no_content`, `not_json`, `refused`, `login_required` and
 `usage_limited` (with `resets_at`). Once the script runs out, every call
-fails with `no_content`. It is for integration tests, environment only, and
-the resolved config shows `fake_llm = true`.
+fails with `no_content`. The scripted fake is retried like a real LLM, so a
+retryable step uses up an attempt, not a whole call. It is for integration
+tests, environment only, and the resolved config shows `fake_llm = true`.
 
 ### `auth = "api_key"` (the default)
 
@@ -218,7 +240,7 @@ which is not a retry: extraction holds the queue until then. A 429 from
 either mode with a `Retry-After`, in seconds or as an HTTP date (RFC 9110),
 is `RateLimited { retry_after }`, held the same way; a date already past
 holds for no time. A 429 without one, or with a value that's neither, is
-a counted, retryable failure. The `api_key` client reads a date against
+retried within the call, and counted only if every attempt fails. The `api_key` client reads a date against
 the system clock, since it's the server's wall time. The daemon shares
 either hold: once one call hits it, every call, refreshes included, holds
 until it lifts. No chunk counts a failure for it, and a refresh it holds
@@ -240,4 +262,7 @@ Asphodel sends none).
 
 **Settings that aren't exposed.** `ASPHODEL_LLM_API_KEY` set together with
 `auth = "chatgpt"` stops the daemon. `ASPHODEL_LLM_ISSUER` points the
-login at another issuer; it exists for tests and is not in `--help`. `llm.reasoning_effort` (for example `"low"`) is sent as `reasoning.effort`, or `reasoning_effort` in `api_key` mode; unset leaves it to the backend's default. A cassette records the effort with the model, so recordings at another effort are never replayed.
+login at another issuer; it exists for tests and is not in `--help`.
+`ASPHODEL_LLM_RETRY_WAIT_MS` replaces the first and the longest wait
+between a call's attempts, in the daemon and in replay, so tests can retry
+without sleeping; it too is environment only and not in `--help`. `llm.reasoning_effort` (for example `"low"`) is sent as `reasoning.effort`, or `reasoning_effort` in `api_key` mode; unset leaves it to the backend's default. A cassette records the effort with the model, so recordings at another effort are never replayed.

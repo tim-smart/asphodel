@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use jiff::Timestamp;
 
-use super::chatgpt::CODEX_ENDPOINT;
+use super::chatgpt::{CODEX_ENDPOINT, TRANSIENT_BACKEND_CODES};
 use crate::clock::{Clock, SystemClock};
 use crate::config::{Deployment, LLM_API_KEY_ENV, LlmAuth, Secret, Tuning};
 
@@ -196,13 +196,16 @@ pub enum LlmError {
 
 impl LlmError {
     /// Whether the caller's retry policy may try again: transport errors,
-    /// timeouts, 408, 429 and 5xx. Never for a reply that came back and was
-    /// wrong, and never for a usage limit or a 429 that said when to come
-    /// back, which are deferred to then instead.
+    /// timeouts, 408, 429, 5xx, and a backend failure whose code says it
+    /// was failing or busy (`server_error`, `server_is_overloaded`,
+    /// `slow_down`, `rate_limit_exceeded`). Never for a reply that came back
+    /// and was wrong or cut short, and never for a usage limit or a 429 that
+    /// said when to come back, which are deferred to then instead.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport { .. } | Self::Timeout => true,
             Self::Status { status } => matches!(status, 408 | 429 | 500..=599),
+            Self::Backend { code } => TRANSIENT_BACKEND_CODES.contains(&code.as_str()),
             Self::NotConfigured { .. }
             | Self::NoContent
             | Self::NotJson { .. }
@@ -210,8 +213,7 @@ impl LlmError {
             | Self::Conflicting { .. }
             | Self::LoginRequired
             | Self::UsageLimited { .. }
-            | Self::RateLimited { .. }
-            | Self::Backend { .. } => false,
+            | Self::RateLimited { .. } => false,
         }
     }
 }
