@@ -1775,6 +1775,96 @@ fn the_block_opens_with_guidance_then_holds_the_agenda_and_each_enabled_model() 
         .strip_prefix(&guidance)
         .expect("the guidance first");
     assert!(rest.find(DENTIST) < rest.find(TEA), "the agenda first");
+
+    // A one-facet answer is a paragraph, without a redundant facet heading.
+    let question = h.profile().question;
+    let single_facet_block = block.text;
+
+    // Multiple facets sit below the model heading, with the stored answer
+    // unchanged. An enabled model without an answer has no prompt section.
+    h.edit("Plans", json!({"enabled": true})).unwrap();
+    let empty = h.block(None);
+    assert!(!empty.text.contains("### Plans"), "{}", empty.text);
+    assert!(!empty.text.contains("Where is Tim going and when?"));
+    let cat = h.seed(fact(CAT));
+    h.rewrite(
+        PROFILE_NAME,
+        &[
+            ("Drinks", &[(TEA, &[tea])]),
+            ("Pets", &[(CAT_ENTRY, &[cat])]),
+        ],
+    );
+    let block = h.block(None);
+    assert!(
+        block.text.ends_with(&format!(
+            "### {PROFILE_NAME}\n\nPrompt:\n{question}\n\nOutput:\n#### Drinks\n{TEA}\n\n#### Pets\n{CAT_ENTRY}"
+        )),
+        "{}",
+        block.text
+    );
+    assert_eq!(
+        answer(&h.profile()),
+        format!("### Drinks\n{TEA}\n\n### Pets\n{CAT_ENTRY}")
+    );
+    assert!(
+        single_facet_block.ends_with(&format!(
+            "### {PROFILE_NAME}\n\nPrompt:\n{question}\n\nOutput:\n{TEA}"
+        )),
+        "{single_facet_block}"
+    );
+}
+
+#[test]
+fn model_layout_and_question_count_toward_the_shared_block_budget() {
+    let mut h = Harness::new();
+    let guidance = h.block(None).text;
+    let tea = h.seed(fact(TEA));
+    let cat = h.seed(fact(CAT));
+    h.rewrite(
+        PROFILE_NAME,
+        &[
+            ("Drinks", &[(TEA, &[tea])]),
+            ("Pets", &[(CAT_ENTRY, &[cat])]),
+        ],
+    );
+    let question = h.profile().question;
+    let expected = format!(
+        "{guidance}\n\n### {PROFILE_NAME}\n\nPrompt:\n{question}\n\nOutput:\n#### Drinks\n{TEA}\n\n#### Pets\n{CAT_ENTRY}"
+    );
+    let budget = estimate_tokens(&expected);
+    h.tuning.mental_models.budget = budget as u32;
+    h.tuning.mental_models.profile_max_tokens = 100;
+    h = h.restart();
+    let block = h.block(Some("exact"));
+    assert_eq!(block.text, expected);
+    assert_eq!(estimate_tokens(&block.text), budget);
+    assert_eq!(
+        h.in_context("exact").into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([tea, cat])
+    );
+
+    // One token less must cut the final sentence, not emit an oversized block.
+    h.tuning.mental_models.budget -= 1;
+    h = h.restart();
+    let block = h.block(None);
+    assert!(estimate_tokens(&block.text) < budget, "{}", block.text);
+    assert!(block.text.contains(TEA), "{}", block.text);
+    assert!(!block.text.contains(CAT_ENTRY), "{}", block.text);
+
+    // A long question leaves no room for even one sentence. The model,
+    // including its question and citations, must disappear altogether.
+    let long_question = "What does Tim like to drink and which pets does Tim have? ".repeat(100);
+    h.ask(
+        PROFILE_NAME,
+        &long_question,
+        &[("Drinks", "What does Tim drink?")],
+    );
+    h.profile_adding(&[(TEA, &[tea])]);
+    let block = h.block(Some("excluded"));
+    assert_eq!(block.text, guidance);
+    assert!(block.cited.is_empty());
+    assert!(h.in_context("excluded").is_empty());
+    assert!(!h.service.show_model(BANK, PROFILE_NAME).unwrap().renders);
 }
 
 #[test]

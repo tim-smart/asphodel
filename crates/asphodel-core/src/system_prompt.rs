@@ -389,12 +389,12 @@ impl Shown {
 }
 
 /// A model's heading and question, then its answer, the answer's section
-/// headings a level under the model's. Budget trials use this same
-/// renderer.
+/// headings a level under the model's unless only one section remains.
+/// Budget trials use this same renderer.
 fn render_model(name: &str, question: &str, answer: &Answer) -> String {
     format!(
         "### {name}\n\nPrompt:\n{question}\n\nOutput:\n{}",
-        answer.render("####")
+        answer.render_output()
     )
 }
 

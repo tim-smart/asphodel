@@ -1409,8 +1409,8 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     let shown = daemon.get_ok("/v1/banks/main/models/User%20profile");
     assert_eq!(shown["answer"], answer.as_str(), "{shown}");
 
-    // `model list` reads like the block: the section's paragraph under its
-    // heading, without the cited memories. `model show` adds the memories
+    // `model list` shows the section's paragraph under its heading,
+    // without the cited memories. `model show` adds the memories
     // the answer cites.
     let model = ["model", "show", "--bank", "main", "User profile"];
     let list = ["model", "list", "--bank", "main"];
@@ -1429,7 +1429,7 @@ fn models_are_created_listed_edited_and_refreshed_over_http() {
     let text = block["text"].as_str().unwrap();
     assert!(text.contains("User profile"), "{text}");
     let (_, output) = text.split_once("\nOutput:\n").expect("model output");
-    assert!(paragraph_after(output, "Home"), "{text}");
+    assert_eq!(output.trim(), format!("{ENTRY} {SECOND}"), "{text}");
     assert!(!text.contains("Plans"), "a disabled model was rendered");
     assert_eq!(block["cited"], json!([memory]));
     assert_eq!(
