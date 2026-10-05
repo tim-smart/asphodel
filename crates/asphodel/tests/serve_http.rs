@@ -2104,10 +2104,10 @@ fn a_restored_store_keeps_its_fingerprint_and_pauses_purge_under_another() {
 
 /// SQL that undoes the latest registered migration, `SCHEMA_VERSION`'s, by
 /// dropping the tables, indexes and added columns it creates. It only
-/// handles a migration that creates tables and indexes or adds columns and
-/// nothing else, and fails loudly on any other, so this test is extended
-/// when such a migration lands rather than downgrading to a schema no older
-/// binary wrote.
+/// handles SQL that creates or drops tables and indexes or adds columns,
+/// plus the runner changes below, and fails loudly on any other. Extend
+/// this test when such a migration lands rather than downgrading to a
+/// schema no older binary wrote.
 fn undo_latest_migration() -> String {
     use asphodel_core::store::SCHEMA_VERSION;
 
@@ -2201,6 +2201,31 @@ fn undo_latest_migration() -> String {
     if *version == 14 {
         undo.push(
             "ALTER TABLE prompt_blocks ADD COLUMN entries TEXT NOT NULL DEFAULT '[]';".into(),
+        );
+    }
+    // Version 15 drops the entry tables in the runner after copying their
+    // answers and cites. Put back the v14 schema, including v13's section
+    // column and both indexes; these drops do not appear in the SQL.
+    if *version == 15 {
+        undo.push(
+            "CREATE TABLE mental_model_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                model_id INTEGER NOT NULL REFERENCES mental_models(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                section TEXT
+            );
+            CREATE INDEX mental_model_entries_model ON mental_model_entries(model_id, position);
+            CREATE TABLE mental_model_citations (
+                entry_id INTEGER NOT NULL REFERENCES mental_model_entries(id) ON DELETE CASCADE,
+                memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                PRIMARY KEY (entry_id, memory_id)
+            );
+            CREATE INDEX mental_model_citations_memory ON mental_model_citations(memory_id);"
+                .into(),
         );
     }
     assert!(!undo.is_empty(), "{} creates nothing", path.display());

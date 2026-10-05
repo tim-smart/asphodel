@@ -2938,7 +2938,8 @@ fn the_whole_block_stays_within_the_budget_and_records_only_what_it_renders() {
     let h = Harness::new();
     let today = "Tim has a dentist appointment this evening at the clinic on Queen Street.";
     let mut claims = vec![event(today, "2026-10-01")];
-    claims.extend((0..14).map(|n| {
+    // Leave room for some, but not all, of the profile after the agenda.
+    claims.extend((0..7).map(|n| {
         let text = format!(
             "Tim has appointment number {n} with the planning committee about the new library."
         );
