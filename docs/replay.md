@@ -571,9 +571,9 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   never saw here. Citations are checked by identity rather than by name.
   A write recorded before identities were kept carries nothing over. A
   `write_model` v1 record, sentence by sentence, never stands in for a v2
-  write. The current write template is v5, which lists each memory's
-  significance and gives the seeded profile a durability rule; v2 to v4
-  records do not substitute for v5 either.
+  write. The current write template is v6, which lists each memory's
+  significance and gives the seeded profile a durability rule; v2 to v5
+  records do not substitute for v6 either.
   A `refresh_model` record from before schema version 13
   never stands in either. Triggers are counted
   by code in every mode. The mental models to refresh are the manifest's

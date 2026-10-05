@@ -563,8 +563,12 @@ lost beneath results for the others:
    it's also asked to keep only what will still be true in months. A
    message the user sent, received, quoted or forwarded, an order, a
    booking or a one-off purchase or trip isn't profile material, whatever
-   its significance: it stays out of the prose and the citations, and is
-   dropped from the previous answer. Personal dates such as birthdays go
+   its significance: its wording and the one-off matter stay out of the
+   prose. A lasting fact it states outright, such as a name, relationship,
+   birthday or stated preference, is kept, written from another memory
+   that states it when there is one and otherwise cited to the message's
+   memory. A memory holding nothing lasting isn't cited and is dropped from
+   the previous answer. Personal dates such as birthdays go
    with the person they're about, and each person is named with their
    relationship to the user when the memories give it. This rule comes
    last in the prompt, after the previous answer's instructions. It

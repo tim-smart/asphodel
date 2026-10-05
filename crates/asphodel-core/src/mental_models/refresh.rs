@@ -673,12 +673,15 @@ const PROFILE_RULE: &str = "
 This answer is the user's profile: it holds what will still be true about them in months. A \
 message the user sent, received, quoted or forwarded, an order, a booking, or the details of a \
 one-off purchase or trip is not profile material, whatever its significance and even when a \
-heading seems to fit it. Leave such a memory out of the answer, quoted or paraphrased, and out of \
-the citations, and drop it from the previous answer even though the memory is still listed. When a \
-lasting fact it mentions, such as a person's name, is also in another memory, write it from that \
-memory and cite that one. Recurring personal dates, such as birthdays and anniversaries, belong \
-with the people they are about. Say how each person is related to the user when the memories say \
-so.";
+heading seems to fit it: leave out its wording, quoted or paraphrased, and the one-off matter it \
+was about. A lasting fact that such a memory states outright, such as a person's name, relationship, birthday \
+or a stated preference, still belongs in the profile. When another listed memory states the same \
+fact, write it from that memory and cite that one; otherwise write the fact alone and cite the \
+message's memory for it. Don't read lasting facts into a message's tone or content. Don't cite a \
+memory that holds nothing lasting, and drop what it supported from the previous answer even \
+though the memory is still listed. Recurring personal dates, such as birthdays and anniversaries, \
+belong with the people they are about. Say how each person is related to the user when the \
+memories say so.";
 
 /// The write's system prompt, with the language rule for `language`, and
 /// the durability rule when it writes the seeded profile.
