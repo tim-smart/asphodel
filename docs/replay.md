@@ -256,6 +256,10 @@ confidence). This applies only when both memories have the same kind and
 the claim supplies none of those time fields. A replacement of another kind
 keeps its own window; a partial or explicit window is not filled in. Multiple
 neighbours' windows are not combined. `denies` does not carry dates over.
+A repeat promoted for its significance carries over its refined
+neighbour's window the same way, so restating a dated task or booking
+without its dates doesn't leave an undated head. A `refines` label from
+call 2 keeps its own window.
 
 An undated event's observation-day `valid_from` is a synthetic fallback,
 not a supplied date. It does not trigger the repeat guard or prevent

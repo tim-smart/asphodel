@@ -603,8 +603,9 @@ pub(super) struct Plan {
     /// less than `reconcile.promotion_gap` above the neighbour.
     pub raises: BTreeMap<i64, Significance>,
     /// The checked claims a repeat label would have absorbed but that
-    /// became new chain heads because they matter more than the neighbour.
-    pub promoted: BTreeSet<usize>,
+    /// became new chain heads because they matter more than the neighbour,
+    /// each with the neighbours it refines for that reason.
+    pub promoted: BTreeMap<usize, BTreeSet<i64>>,
     /// Neighbours the owner asked to remember through a mention.
     pub keeps: BTreeSet<i64>,
 }
@@ -757,7 +758,7 @@ pub(super) fn plan(
                     retracted[n] = true;
                     changed = true;
                     if weightier {
-                        plan.promoted.insert(index);
+                        plan.promoted.entry(index).or_default().insert(neighbour.id);
                     }
                 }
                 Label::Ends => {
