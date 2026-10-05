@@ -317,6 +317,13 @@ bypass the 30-minute interval after a successful refresh. Debounce, LLM
 holds and retry delays after a failed refresh still apply. The flag is
 stored, so an urgent request survives a restart. No action is needed.
 
+## Schema version 17: pending `used` credits
+
+The migration adds an empty `pending_credits` table. Only
+`strength.corroborate_used`, off by default, writes to it, so retention and
+the deletion fingerprint are unchanged and purge doesn't pause. No action is
+needed.
+
 ## Write template version 3: dates for possibly stale states
 
 Schema version 15 introduced `write_model` v2 and the one-answer reply

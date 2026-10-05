@@ -563,6 +563,8 @@ pub struct Prepared {
     vectors: Vec<Vec<f32>>,
     /// The reconcile floor the search used.
     floor: f64,
+    /// `strength.corroborate_used`, read with the rest of the tuning.
+    corroborate_used: bool,
     /// The bank as the search saw it.
     snapshot: reconcile::Snapshot,
     search: Option<reconcile::Search>,
@@ -749,6 +751,7 @@ pub(crate) fn prepare(
             checked,
             vectors,
             floor: floor(tuning, embedder),
+            corroborate_used: tuning.strength.corroborate_used,
             snapshot: reconcile::Snapshot::default(),
             search: None,
             labels: Vec::new(),
@@ -808,6 +811,7 @@ fn reconcile_claims(
         checked,
         vectors,
         floor,
+        corroborate_used,
         ..
     } = prepared;
     // The connection is released before the failure is counted.
@@ -867,6 +871,7 @@ fn reconcile_claims(
         checked,
         vectors,
         floor,
+        corroborate_used,
         snapshot,
         search,
         labels,
@@ -945,6 +950,7 @@ pub(crate) fn commit_prepared(
                 &prepared.vectors,
                 &plan,
                 neighbours.unwrap_or_default(),
+                prepared.corroborate_used,
             )?;
             tx.commit()?;
             leases.committed(bank_id);

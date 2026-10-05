@@ -11,14 +11,16 @@
 //!   along `ended_by` ([`inherits_from`]);
 //! - its window's close, when it has one, with the end known at the
 //!   `observed_at` of the `ended_by` memory or else its own;
-//! - the bank's clock ([`BankTime`]), from the bank's turns.
+//! - the bank's clock ([`BankTime`]), from the bank's turns;
+//! - each access's weight in recent use, from its kind and
+//!   `strength.access_weights`.
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::timestamp;
-use crate::config::{SignificanceTuning, Tuning};
+use crate::config::{AccessWeightsTuning, SignificanceTuning, Tuning};
 use crate::constants::{SIGNIFICANCE_KEPT, Significance};
 use crate::strength::{
     Access, AccessKind, BankTime, Kind, Link, Strength, TimePrecision, Window, WindowClose,
@@ -26,17 +28,19 @@ use crate::strength::{
 };
 
 /// One bank's strength inputs that every memory shares: its clock, its
-/// supersession links, the significance values and the instant strength is
-/// taken at. Build it once per bank and operation.
+/// supersession links, the significance values, the access weights and the
+/// instant strength is taken at. Build it once per bank and operation.
 pub(crate) struct StrengthLoader {
     bank_time: BankTime,
     links: Vec<Link>,
     significance: SignificanceTuning,
+    weights: AccessWeightsTuning,
     now: Timestamp,
 }
 
 impl StrengthLoader {
-    /// Reads `clock.quiet_rate` and `strength.significance` from `tuning`.
+    /// Reads `clock.quiet_rate`, `strength.significance` and
+    /// `strength.access_weights` from `tuning`.
     pub(crate) fn new(
         conn: &Connection,
         bank_id: i64,
@@ -68,6 +72,7 @@ impl StrengthLoader {
             bank_time: BankTime::new(&turns, tuning.clock.quiet_rate),
             links,
             significance: tuning.strength.significance,
+            weights: tuning.strength.access_weights,
             now,
         })
     }
@@ -204,6 +209,7 @@ impl StrengthLoader {
                     accesses.push(Access {
                         kind,
                         at: timestamp(at),
+                        weight: kind.weight(&self.weights),
                     });
                 }
             }

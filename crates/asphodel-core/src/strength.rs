@@ -22,9 +22,10 @@ mod window;
 
 use jiff::Timestamp;
 
+use crate::config::AccessWeightsTuning;
 use crate::constants::{
     A, C, D_MAX, FLOOR_SPACING_DAYS, G, MIN_ACCESS_AGE_DAYS, N0, S, TAU, WEIGHT_CONFIRMED,
-    WEIGHT_CREATED, WEIGHT_MENTIONED_AGAIN, WEIGHT_USED, WEIGHT_WINDOW_CLOSE,
+    WEIGHT_CREATED, WEIGHT_MENTIONED_AGAIN, WEIGHT_WINDOW_CLOSE,
 };
 
 pub use crate::constants::RECENTLY_PAST_DAYS;
@@ -53,22 +54,25 @@ pub enum AccessKind {
 }
 
 impl AccessKind {
-    /// The weight of this kind in recent use.
-    pub const fn weight(self) -> f64 {
+    /// The weight of this kind in recent use: `used` is tuned, the rest are
+    /// fixed.
+    pub const fn weight(self, weights: &AccessWeightsTuning) -> f64 {
         match self {
             AccessKind::Created => WEIGHT_CREATED,
-            AccessKind::Used => WEIGHT_USED,
+            AccessKind::Used => weights.used,
             AccessKind::MentionedAgain => WEIGHT_MENTIONED_AGAIN,
             AccessKind::Confirmed => WEIGHT_CONFIRMED,
         }
     }
 }
 
-/// One row of the access log: its kind and when it happened, in world time.
+/// One row of the access log: its kind, when it happened, in world time,
+/// and its kind's weight in recent use, set when the row is loaded.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Access {
     pub kind: AccessKind,
     pub at: Timestamp,
+    pub weight: f64,
 }
 
 /// A validity window's close, which restarts recent use. The lasting floor
@@ -143,12 +147,12 @@ pub fn strength(
         .map(|c| (c.closes_at, c.closes_at.max(c.known_at)))
         .filter(|&(_, restart)| restart <= now);
     let mut counted: Vec<(f64, Timestamp)> = match restart {
-        None => accesses.iter().map(|a| (a.kind.weight(), a.at)).collect(),
+        None => accesses.iter().map(|a| (a.weight, a.at)).collect(),
         Some((closes_at, restart)) => {
             let mut counted: Vec<_> = accesses
                 .iter()
                 .filter(|a| a.at > closes_at)
-                .map(|a| (a.kind.weight(), a.at))
+                .map(|a| (a.weight, a.at))
                 .collect();
             counted.push((WEIGHT_WINDOW_CLOSE, restart));
             counted

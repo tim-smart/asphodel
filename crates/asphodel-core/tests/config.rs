@@ -164,6 +164,8 @@ fn values_at_the_edge_of_their_range_load_unchanged() {
         "[clock]\nquiet_rate = 0.05\n",
         "[agenda]\nupdate_budget = 40\n",
         "[strength.significance]\ntrivial = 0.0\n",
+        "[strength.access_weights]\nused = 0.0\n",
+        "[strength.access_weights]\nused = 1.0\n",
         "[reconcile.embedding_floors]\nm = -1.0\n",
         "[reconcile.embedding_floors]\nm = 1.0\n",
     ] {
@@ -295,6 +297,10 @@ fn out_of_range_values_are_reported_together_by_key() {
         ("strength.significance.critical", "1.1"),
         ("strength.significance.notable", "nan"),
         ("strength.significance.minor", "0.0"),
+        // A `used` access weighs from nothing up to a `created` one.
+        ("strength.access_weights.used", "-0.1"),
+        ("strength.access_weights.used", "1.1"),
+        ("strength.access_weights.used", "nan"),
     ] {
         let (table, name) = key.rsplit_once('.').unwrap();
         let text = format!("[{table}]\n{name} = {value}\n");
@@ -501,6 +507,14 @@ fn only_a_fingerprinted_value_pauses_purge_and_the_plan_names_it() {
         (
             "[strength.significance]\ncritical = 0.95\n",
             "strength.significance",
+        ),
+        (
+            "[strength.access_weights]\nused = 0.25\n",
+            "strength.access_weights.used",
+        ),
+        (
+            "[strength]\ncorroborate_used = true\n",
+            "strength.corroborate_used",
         ),
     ] {
         let (pause, names) = restart("", text);

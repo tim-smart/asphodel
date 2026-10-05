@@ -22,7 +22,8 @@ pub use deployment::{Deployment, LLM_API_KEY_ENV, Secret, TOKEN_ENV};
 pub use fingerprint::{DeletionInputs, Fingerprint, deletion_fingerprint};
 pub use resolved::{ModelsConfig, PurgePause, ResolvedConfig};
 pub use tuning::{
-    AgendaTuning, ClockTuning, ConfigError, ExtractionTuning, InjectionTuning, InvalidValue, Layer,
-    LlmAuth, LlmTuning, MentalModelsTuning, PurgeTuning, RankingTuning, RecallTuning,
-    ReconcileTuning, RerankQuery, SessionsTuning, SignificanceTuning, StrengthTuning, Tuning,
+    AccessWeightsTuning, AgendaTuning, ClockTuning, ConfigError, ExtractionTuning, InjectionTuning,
+    InvalidValue, Layer, LlmAuth, LlmTuning, MentalModelsTuning, PurgeTuning, RankingTuning,
+    RecallTuning, ReconcileTuning, RerankQuery, SessionsTuning, SignificanceTuning, StrengthTuning,
+    Tuning,
 };

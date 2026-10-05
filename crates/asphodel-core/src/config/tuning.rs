@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use jiff::civil::Time;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::constants::{Significance, TAU};
+use crate::constants::{Significance, TAU, WEIGHT_CREATED, WEIGHT_USED};
 
 /// The daemon-wide tuning. `Default` gives the code defaults.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -56,6 +56,30 @@ impl Default for ClockTuning {
 #[serde(default, deny_unknown_fields)]
 pub struct StrengthTuning {
     pub significance: SignificanceTuning,
+    pub access_weights: AccessWeightsTuning,
+    /// Whether a `used` verdict waits for a second one before it counts.
+    /// When on, the first turn a memory is judged used in is remembered
+    /// but writes no access; a `used` verdict in any later turn writes one
+    /// as usual. Credits carry along `superseded_by`, so a correction
+    /// counts what it corrects. Off, every verdict writes its access.
+    pub corroborate_used: bool,
+}
+
+/// `[strength.access_weights]`: the weight of an access kind in recent use.
+/// Only `used` is tunable, since it's the only kind the injection loop can
+/// generate; the other kinds are fixed in [`crate::constants`]. The lasting
+/// floor ignores weights.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccessWeightsTuning {
+    /// In [0, 1]: at most a `created` access's weight.
+    pub used: f64,
+}
+
+impl Default for AccessWeightsTuning {
+    fn default() -> Self {
+        Self { used: WEIGHT_USED }
+    }
 }
 
 /// `[strength.significance]`: the significance value of each level, in
@@ -586,6 +610,14 @@ impl Tuning {
                     ),
                 );
             }
+        }
+
+        let used = self.strength.access_weights.used;
+        if !(0.0..=WEIGHT_CREATED).contains(&used) {
+            fail(
+                "strength.access_weights.used",
+                format!("must be a number between 0 and {WEIGHT_CREATED}, got {used}"),
+            );
         }
 
         if let Some(delta) = self.purge.delta
