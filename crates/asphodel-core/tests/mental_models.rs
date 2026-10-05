@@ -1146,6 +1146,31 @@ fn a_refresh_selects_current_memories_above_tau_that_pass_the_filters() {
 }
 
 #[test]
+fn each_input_memory_carries_its_memorys_significance() {
+    // The write weighs memories by significance, so each one comes with
+    // the level strength uses: the owner's setting over the extracted one.
+    let h = Harness::new();
+    let tea = h.seed(fact(TEA));
+    let maya = h.seed(fact(MAYA).level("critical"));
+    let berlin = h.seed(fact(BERLIN).level("major"));
+    let cat = h.says(fact(CAT).level("minor"));
+    h.keep(tea);
+
+    let input = serde_json::to_value(h.input(PROFILE_NAME)).unwrap();
+    let listed = input["memories"].as_array().unwrap();
+    let selected: BTreeSet<Uuid> = listed
+        .iter()
+        .map(|m| m["memory"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(selected, BTreeSet::from([tea, maya, berlin, cat]));
+    for memory in listed {
+        let id: Uuid = memory["memory"].as_str().unwrap().parse().unwrap();
+        let effective = h.show(id).significance.effective;
+        assert_eq!(memory["significance"], json!(effective), "{memory}");
+    }
+}
+
+#[test]
 fn the_profile_admits_recurring_memories_only_with_periods_longer_than_a_week() {
     let h = Harness::new();
     let tea = h.seed(fact("Alex likes green tea."));
@@ -1552,6 +1577,40 @@ fn the_facet_limit_bounds_built_in_and_stored_plans_without_planning_again() {
         write.contains("Part 2") && !write.contains("Part 3"),
         "{write}"
     );
+}
+
+/// The profile question banks were seeded with before it stopped excluding
+/// personal dates.
+const EARLIER_PROFILE_QUESTION: &str = "Who is the user: their preferences, important people, \
+     work and home, the platforms they use, and how they like to be helped. Not upcoming \
+     events, tasks or routines.";
+
+#[test]
+fn a_profile_seeded_with_the_earlier_question_still_takes_the_built_in_plan() {
+    // A bank created before the question changed still asks the earlier
+    // text. Put it back with the store at the current schema version, so
+    // either a migration on open or the plan lookup has to carry it over.
+    let h = Harness::new();
+    h.seed(fact(TEA));
+    {
+        let store = h.service.store().unwrap();
+        let conn = store.connection();
+        conn.execute(
+            "UPDATE mental_models SET question = ?1 WHERE name = ?2",
+            [EARLIER_PROFILE_QUESTION, PROFILE_NAME],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "DELETE FROM migrations WHERE to_version > 17; PRAGMA user_version = 17;",
+        )
+        .unwrap();
+    }
+    let h = h.restart();
+    let llm = quiet_llm(1);
+    applied(h.refresh(PROFILE_NAME, &llm, true));
+    assert!(calls(&llm, PLAN_TEMPLATE).is_empty(), "planned the profile");
+    let facets = h.input(PROFILE_NAME).facets;
+    assert!(facets.len() > 1, "{facets:?}");
 }
 
 #[test]
