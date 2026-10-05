@@ -3,10 +3,8 @@
 ## Running tests
 
 ```
-nix develop -c cargo nextest run
+TMPDIR=/dev/shm nix develop -c cargo nextest run
 ```
-
-On linux, prefix the nextest run with `TMPDIR=/dev/shm`.
 
 ## Writing tests
 
