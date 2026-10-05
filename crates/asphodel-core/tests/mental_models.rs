@@ -1315,14 +1315,22 @@ fn rendering_a_stale_state_keeps_the_written_absolute_date_without_adding_age() 
     let text = "As of 1 Sep, Tim is training for a marathon.";
     h.profile_adding(&[(text, &[memory])]);
     let first = h.block(None);
-    assert_eq!(paragraph(&first.text, SECTION), Some(text));
+    assert!(
+        first.text.ends_with(&format!("Output:\n{text}")),
+        "{}",
+        first.text
+    );
     assert_eq!(first.cited, vec![memory]);
 
     // A new local day rebuilds the block, but does not date the answer again.
     h.advance(SignedDuration::from_hours(24));
     let next = h.block(None);
     assert_ne!(first.id, next.id);
-    assert_eq!(paragraph(&next.text, SECTION), Some(text));
+    assert!(
+        next.text.ends_with(&format!("Output:\n{text}")),
+        "{}",
+        next.text
+    );
     assert_eq!(next.cited, vec![memory]);
     assert_eq!(paragraph(answer(&h.profile()), SECTION), Some(text));
 }
