@@ -213,24 +213,12 @@ fn sse(kind: &str, mut data: Value) -> String {
     format!("event: {kind}\ndata: {data}\n\n")
 }
 
-/// A loopback stand-in for the Codex backend. Its first `failures`
-/// requests stream `response.failed` with `code`; every later one streams
-/// `reply` as the answer. Returns its URL and the number of requests it has
-/// answered.
-fn codex_failing(code: &str, failures: usize, reply: &Value) -> (String, Arc<AtomicUsize>) {
+/// A loopback server answering its `n`th request, counting from 0, with
+/// `answer(n)`, a whole HTTP response. Returns its URL and the number of
+/// requests it has answered.
+fn loopback(answer: impl Fn(usize) -> String + Send + 'static) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let failed = sse(
-        "response.failed",
-        json!({"response": {"id": "resp_f", "status": "failed", "error": {"code": code, "message": "busy"}}}),
-    );
-    let text = reply.to_string();
-    let item = json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]});
-    let answered = sse("response.output_item.done", json!({ "item": item }))
-        + &sse(
-            "response.completed",
-            json!({"response": {"id": "resp_1", "status": "completed"}}),
-        );
     let requests = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&requests);
     std::thread::spawn(move || {
@@ -250,17 +238,79 @@ fn codex_failing(code: &str, failures: usize, reply: &Value) -> (String, Arc<Ato
                 }
             }
             reader.read_exact(&mut vec![0; length]).unwrap();
-            let failing = counted.fetch_add(1, Ordering::SeqCst) < failures;
-            let body = if failing { &failed } else { &answered };
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.write_all(body.as_bytes());
+            let response = answer(counted.fetch_add(1, Ordering::SeqCst));
+            let _ = stream.write_all(response.as_bytes());
         }
     });
     (url, requests)
+}
+
+/// A 200 response with `body` of `content_type`.
+fn ok(content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The Codex stream answering with `reply`.
+fn codex_answer(reply: &Value) -> String {
+    let text = reply.to_string();
+    let item = json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]});
+    let body = sse("response.output_item.done", json!({ "item": item }))
+        + &sse(
+            "response.completed",
+            json!({"response": {"id": "resp_1", "status": "completed"}}),
+        );
+    ok("text/event-stream", &body)
+}
+
+/// A loopback stand-in for the Codex backend. Its first `failures`
+/// requests stream `response.failed` with `code`; every later one streams
+/// `reply` as the answer. Returns its URL and the number of requests it has
+/// answered.
+fn codex_failing(code: &str, failures: usize, reply: &Value) -> (String, Arc<AtomicUsize>) {
+    let failed = ok(
+        "text/event-stream",
+        &sse(
+            "response.failed",
+            json!({"response": {"id": "resp_f", "status": "failed", "error": {"code": code, "message": "busy"}}}),
+        ),
+    );
+    let answered = codex_answer(reply);
+    loopback(move |n| {
+        if n < failures {
+            failed.clone()
+        } else {
+            answered.clone()
+        }
+    })
+}
+
+/// A Codex stand-in that rejects its first request's login with a 401 and
+/// streams `reply` to every later one.
+fn codex_unauthorized_once(reply: &Value) -> (String, Arc<AtomicUsize>) {
+    let answered = codex_answer(reply);
+    loopback(move |n| {
+        if n == 0 {
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        } else {
+            answered.clone()
+        }
+    })
+}
+
+/// A loopback OAuth issuer that answers every refresh with fresh tokens
+/// for the account [`logged_in`] uses. Returns its URL and the number of
+/// refreshes it has answered.
+fn issuer_refreshing() -> (String, Arc<AtomicUsize>) {
+    let tokens = json!({
+        "id_token": jwt(json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-test"}})),
+        "access_token": jwt(json!({"sub": "refreshed", "exp": 4_102_444_800_i64})),
+        "refresh_token": "rt-refreshed",
+    })
+    .to_string();
+    loopback(move |_| ok("application/json", &tokens))
 }
 
 /// A JWT-shaped token with `claims`; nothing checks the signature.
@@ -1631,13 +1681,28 @@ fn budgeted(
     dir: &TestDir,
     corpus: &Path,
     mode: &str,
-    (ledger, run): (&Path, &str),
+    ledger: (&Path, &str),
     failures: usize,
     tuning: &str,
     extra: &[&str],
 ) -> (std::process::Command, Arc<AtomicUsize>) {
     let reply = support::reply_to_everything(vec![home_claim()], vec![]);
     let (url, requests) = codex_failing("server_is_overloaded", failures, &reply);
+    let command = budgeted_against(dir, corpus, mode, ledger, &url, tuning, extra);
+    (command, requests)
+}
+
+/// [`budgeted`] against the Codex stand-in at `url`, logged in with a
+/// token that isn't due for refresh.
+fn budgeted_against(
+    dir: &TestDir,
+    corpus: &Path,
+    mode: &str,
+    (ledger, run): (&Path, &str),
+    url: &str,
+    tuning: &str,
+    extra: &[&str],
+) -> std::process::Command {
     let token_dir = dir.private_path("tokens");
     logged_in(&token_dir);
     let llm = format!("[llm]\nauth = \"chatgpt\"\nendpoint = \"{url}\"\nmodel = \"gpt-test\"\n");
@@ -1663,7 +1728,7 @@ fn budgeted(
         .args(["--budget-run", run])
         .args(extra)
         .env("ASPHODEL_LLM_RETRY_WAIT_MS", "0");
-    (command, requests)
+    command
 }
 
 /// Priming 4 chunks at a time, with no refreshes, in `fast`.
@@ -1839,6 +1904,48 @@ fn a_ledger_that_cannot_be_trusted_dispatches_nothing() {
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A slot is one post to the model. With ChatGPT auth, a 401 makes the
+/// client refresh the login and post again within the one call; that post
+/// takes a slot of its own, and the refresh, which goes to the issuer
+/// rather than the model, takes none. So a run capped at 1 whose first
+/// post gets a 401 refreshes the login, sends the model nothing more, and
+/// stops with exit 2, and `show` counts the 1 attempt against the run,
+/// its stage and call 1's template.
+#[test]
+fn a_post_after_a_401_refresh_takes_a_slot_of_its_own() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let budget = allocations(&[("s1", 1)], &[("r1", "s1", Some(1))]);
+    let (ledger, init) = budget_init(&dir, "ledger.json", &budget);
+    assert_ok(&init);
+    let reply = support::reply_to_everything(vec![home_claim()], vec![]);
+    let (model, requests) = codex_unauthorized_once(&reply);
+    let (issuer, refreshes) = issuer_refreshing();
+
+    let mut run = budgeted_against(&dir, &corpus, "live", (&ledger, "r1"), &model, "", &[]);
+    let output = run.env("ASPHODEL_LLM_ISSUER", &issuer).output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(
+        refreshes.load(Ordering::SeqCst),
+        1,
+        "the 401 refreshes the login"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "the post after the refresh needs a slot of its own"
+    );
+
+    let (_, shown) = budget_show(&dir, &ledger);
+    assert_eq!(shown["runs"]["r1"]["consumed"], 1, "{shown}");
+    assert_eq!(shown["stages"]["s1"]["consumed"], 1, "{shown}");
+    assert_eq!(
+        shown["runs"]["r1"]["by_template"],
+        json!({"extract_claims": 1}),
+        "{shown}"
+    );
 }
 
 /// The ledger only changes by a complete commit replacing it, and a call
