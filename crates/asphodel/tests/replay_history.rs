@@ -178,6 +178,148 @@ fn probe_resolution_absent_passes_after_a_created_memory_is_purged() {
     assert_eq!(probe["observed"]["present"], false, "{probe}");
 }
 
+/// One synthetic turn, recorded without refresh or simulated latency.
+/// Grounding uses an existing probe kind so failures below belong to the
+/// new probe contract, not to a missing cassette or an empty fixture.
+fn record_not_created_fixture(dir: &TestDir, significance: &str) -> (PathBuf, Value) {
+    let corpus = import_history(dir, |path| {
+        let db = hermes::one_session(path);
+        db.home_turn("s1", start());
+        db
+    });
+    let mut claim = home_claim();
+    claim["significance"] = json!(significance);
+    let script = script_answering_everything(dir, "not-created", vec![claim], vec![]);
+    let quiet = overrides(dir, "[clock]\nquiet_rate = 1.0\n");
+    let report = replay_history(
+        dir,
+        &corpus,
+        "fast",
+        &probe("home", "2026-01-05T09:00:30Z", "exists", HOME_MEMORY),
+        Some(&script),
+        &["--refresh", "off", "--latency", "0s", "--overrides", &quiet],
+    )
+    .ok();
+    (corpus, report)
+}
+
+/// A creation after `at` does not count; one exactly at `at` does.
+#[test]
+fn not_created_checks_creations_through_the_probe_time_inclusively() {
+    let dir = TestDir::new();
+    let (corpus, _) = record_not_created_fixture(&dir, "notable");
+    let probes = probe("before", "2026-01-05T09:00:29Z", "not_created", HOME_MEMORY)
+        + &probe("at", "2026-01-05T09:00:30Z", "not_created", HOME_MEMORY)
+        + &probe("after", "2026-01-05T09:00:31Z", "not_created", HOME_MEMORY);
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &probes,
+        None,
+        &["--refresh", "off", "--latency", "0s"],
+    );
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+    let report = run.report();
+    for (id, passed) in [("before", true), ("at", false), ("after", false)] {
+        let probe = probe_in(&report, id);
+        assert_eq!(probe["kind"], "not_created", "{probe}");
+        assert_eq!(probe["passed"], passed, "{probe}");
+    }
+}
+
+/// Purging a memory does not undo the fact that it was created.
+#[test]
+fn not_created_counts_matching_creations_even_after_purge() {
+    let dir = TestDir::new();
+    let (corpus, grounding) = record_not_created_fixture(&dir, "trivial");
+    let home = observed_id(&grounding, "home");
+    let quiet = overrides(&dir, "[clock]\nquiet_rate = 1.0\n");
+    let at = "2026-11-05T12:00:00Z";
+    replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &probe("purged", at, "absent", HOME_MEMORY),
+        None,
+        &["--refresh", "off", "--latency", "0s", "--overrides", &quiet],
+    )
+    .ok();
+    let probes = probe("purged", at, "absent", HOME_MEMORY)
+        + &probe("was-created", at, "not_created", HOME_MEMORY);
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &probes,
+        None,
+        &["--refresh", "off", "--latency", "0s", "--overrides", &quiet],
+    );
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+    let report = run.report();
+    let memory = report["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|memory| memory["id"] == home)
+        .expect("the fixture created home");
+    assert!(memory["purged_at"].is_string(), "{memory}");
+    assert_eq!(probe_in(&report, "purged")["passed"], true);
+    assert_eq!(probe_in(&report, "was-created")["passed"], false);
+}
+
+/// Unlike `absent`, an unmatched regex is success, even when a grounding
+/// id is supplied. Grounding ids must not replace the creation regex.
+#[test]
+fn not_created_uses_the_regex_without_requiring_a_resolved_memory() {
+    let dir = TestDir::new();
+    let (corpus, grounding) = record_not_created_fixture(&dir, "notable");
+    let home = observed_id(&grounding, "home");
+    let unknown = "memory_id = \"00000000-0000-0000-0000-000000000000\"";
+    let mut probes = String::new();
+    for (id, fields) in [
+        ("unmatched", format!("memory = \"{UNSEEN}\"")),
+        (
+            "unknown-unmatched",
+            format!("{unknown}\nmemory = \"{UNSEEN}\""),
+        ),
+        (
+            "known-unmatched",
+            format!("memory_id = {home}\nmemory = \"{UNSEEN}\""),
+        ),
+    ] {
+        probes += &probe_on(id, 5, "not_created", &fields);
+    }
+    let report = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &probes,
+        None,
+        &["--refresh", "off", "--latency", "0s"],
+    )
+    .ok();
+    for id in ["unmatched", "unknown-unmatched", "known-unmatched"] {
+        assert_eq!(probe_in(&report, id)["passed"], true);
+    }
+    let matching = probe_on(
+        "unknown-matching",
+        5,
+        "not_created",
+        &format!("{unknown}\n{HOME_MEMORY}"),
+    );
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &matching,
+        None,
+        &["--refresh", "off", "--latency", "0s"],
+    );
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+    assert_eq!(probe_in(&run.report(), "unknown-matching")["passed"], false);
+}
+
 // Recording modes.
 
 /// `live` calls the LLM, records, and reports the hash of the completed
