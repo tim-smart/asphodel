@@ -304,6 +304,9 @@ writes an access or joins a session's in-context set. (`injects`,
 `recall_finds` and `recall_lacks` write the recall log, which isn't an
 access, and never a session's set.)
 
+Unknown probe fields are refused before the run, including fields that
+belong to a different kind.
+
 Every probe has `at`, `kind` and an optional `id`; without one the id is
 `p<n>`, counting from 1 in file order, and ids are unique. `memory` is a
 claim label in a scenario. In real history it is a regex over sentences,
@@ -319,9 +322,11 @@ probes run on sessions named
 | `faded_at` | `memory`, `between = [from, to]` | The first instant strength fell below τ is within the range, inclusive. It's computed at `at` from the access log and bank time, to the minute, as `memory show`'s projection does. Not yet faded by `at` fails. |
 | `exists` | `memory`, and any of `memory_kind`, `ended`, `retracted`, `head`, `phase` | The memory is in the store and every given field matches. `head` is whether it's the head of its supersession chain; `phase` is `upcoming`, `current`, `overdue`, `recently_past` or `long_past`. |
 | `absent` | `memory`, optional `memory_id` in real history | The memory isn't in the store. In real history it must resolve to a created memory, then purged or forgotten; scenario labels may also be checked before extraction. |
+| `not_created` | `memory`, optional `since`, `count` | Exactly `count` matching memories were created in the inclusive window `[since, at]`, including creations later purged or forgotten. Without `since`, counts all creations through `at`; without `count`, expects zero. In real history, matches the regex and ignores `memory_id`. In scenarios, matches the claim label. |
 | `restated` | `memory`, `sentence`, optional `label` | The memory keeps an absorbed claim whose sentence is exactly `sentence` as a restatement, with `label` (`mentioned_again` or `confirmed`) when it's given. |
 | `agenda_has`, `agenda_lacks` | `memory` | The bank's agenda at `at` lists, or doesn't list, the memory. |
-| `recall_finds`, `recall_lacks` | `memory`, `query` | Explicit recall for `query`, with no session, returns, or doesn't return, the memory. |
+| `recall_finds` | `memory`, `query`, optional `any_match` | Explicit recall for `query`, with no session, returns the resolved memory. With `any_match = true` in real history, any returned memory's sentence matches the regex instead, independent of `memory_id` or the earliest matching creation. Defaults to false. |
+| `recall_lacks` | `memory`, `query` | Explicit recall for `query`, with no session, doesn't return the resolved memory. |
 | `injects`, `not_injects` | `memory`, `query` | A prefetch for `query` on a session no turn uses injects, or doesn't inject, the memory. Group `models` only. |
 | `profile_has`, `profile_lacks` | `model`, `memory` | The mental model's answer cites, or doesn't cite, the memory. Not in the first set: scripted refresh replies are open. |
 
@@ -332,11 +337,24 @@ probes.
 
 A probe naming a label no claim defines is refused before the run.
 
-In real history, a probe whose memory never resolves fails for every
-kind, including negative checks and `absent`, with
+`not_created` refuses `since > at` before the run. Its `observed.created`
+lists only matching creation ids within the window, including purged ones.
+This supports exact single-creation checks with `count = 1`, even when
+different sentences match the same regex.
+
+Real-history `recall_finds` with `any_match = true` tests only returned
+sentences, not all live memories or retained creation sentences. It needs
+no grounding id or resolved creation; no returned sentence match fails.
+`observed.results` lists the returned memory ids, not their sentences.
+Scenario probes still use claim-label identity, including when `any_match`
+is true. `recall_lacks` keeps identity matching and does not accept this field.
+
+In real history, apart from `not_created` and any-match `recall_finds`,
+a probe whose memory never resolves fails for every kind, including
+negative checks and `absent`, with
 `observed: {"resolved": false}`. Resolved history probes add
 `resolved_by` (`id` or `regex`) and `regex_matches` to `observed`. The
-latter says whether the regex matches the id's current sentence when
+latter says whether the regex matches the id's sentence when
 resolved by id, and is true for a regex match. A false value does not
 change the check's result, but flags a possible claim-ordinal shift for
 owner review after re-recording.
