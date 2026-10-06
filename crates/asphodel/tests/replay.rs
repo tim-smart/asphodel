@@ -200,6 +200,10 @@ fn every_checked_in_scenario_passes_its_probes() {
                     assert_eq!(shadow["purged"], 5, "{shadow}");
                     assert_eq!(shadow["re_mentioned"], 1, "{shadow}");
                 }
+                if stem == "relationship-outweighs-repeat" {
+                    // The weightier repeat is the one new chain head.
+                    assert_eq!(report["call2_rate"]["promoted"], 1, "{stem}");
+                }
             });
         }
     });
@@ -238,7 +242,6 @@ assistant = "You did."
 used = ["nowhere"]
 
 [[turn.claim]]
-label = "home-again"
 content = "Tim lives in Auckland."
 quote = "I live in Auckland"
 kind = "fact"
@@ -304,6 +307,25 @@ significance = "trivial"
 reconcile = [{ memory = "home", outcome = "mentioned_again" }]
 "#;
 
+/// A labelled restatement of `home` that matters no more than it, so the
+/// repeat absorbs it and the label names nothing. The loader can't tell
+/// (code may make a repeat a new memory), so the run refuses it.
+const ABSORBED_LABEL: &str = r#"
+[[turn]]
+at = "2026-01-06T09:00:00Z"
+session = "s1"
+user = "I live in Auckland, as I said."
+assistant = "You did."
+
+[[turn.claim]]
+label = "home-again"
+content = "Tim lives in Auckland."
+quote = "I live in Auckland"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "home", outcome = "mentioned_again" }]
+"#;
+
 /// A new session whose query shares no word with the memory: nothing is
 /// injected, so `home` isn't in context to use.
 const USED_OUT_OF_CONTEXT: &str = r#"
@@ -342,7 +364,6 @@ fn an_invalid_scenario_is_refused_without_a_report() {
     let with_home = |body: &str| format!("{HOME_TURN}{body}");
     let loader = [
         "nowhere",
-        "home-again",
         "future",
         "not in the turn",
         "p1",
@@ -354,7 +375,7 @@ fn an_invalid_scenario_is_refused_without_a_report() {
     // the name is one filename component. A pooled run's call 2 replies
     // are scripted against what a serial run shows.
     let reserved = HOME_TURN.replace("session = \"s1\"", "session = \"probe:p1\"");
-    let cases: [(&str, String, &[&str], &[&str]); 8] = [
+    let cases: [(&str, String, &[&str], &[&str]); 9] = [
         ("loader", with_home(LOADER_ERRORS), &[], &loader),
         (
             "unknown-field",
@@ -370,6 +391,12 @@ fn an_invalid_scenario_is_refused_without_a_report() {
             with_home(NOT_A_NEIGHBOUR),
             &[],
             &["home", "neighbour"],
+        ),
+        (
+            "absorbed-label",
+            with_home(ABSORBED_LABEL),
+            &[],
+            &["home-again"],
         ),
         (
             "used-out-of-context",

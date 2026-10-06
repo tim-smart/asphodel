@@ -24,6 +24,7 @@ use crate::strength::Kind;
 /// A new memory's row, as the edits on its neighbours need it.
 struct Written {
     id: i64,
+    uuid: Uuid,
     end: (Stamp, bool),
     said_at: Stamp,
 }
@@ -81,15 +82,18 @@ pub(super) fn commit(
             &format!("{}:{}", lease.position, memory.claim),
         );
         // A correction of the same kind with no window is silent about dates,
-        // not a request to erase them. Keep the first retracted neighbour's
-        // whole window; never combine windows or inherit another kind's fields.
+        // not a request to erase them, and so is a repeat promoted for its
+        // significance. Keep the first such neighbour's whole window; never
+        // combine windows or inherit another kind's fields. A refinement
+        // call 2 labelled itself keeps its own window.
         let mut memory = memory.clone();
         if memory.due_at.is_none()
             && memory.supplied_valid_from().is_none()
             && memory.valid_until.is_none()
             && memory.until_event.is_none()
             && let Some(neighbour) = plan.edits.iter().find_map(|&(claim, id, edit)| {
-                (claim == index && edit == Edit::Retracts)
+                let promoted = || plan.promoted.get(&index).is_some_and(|ns| ns.contains(&id));
+                (claim == index && (edit == Edit::Retracts || edit == Edit::Refines && promoted()))
                     .then(|| neighbours.iter().find(|neighbour| neighbour.id == id))
                     .flatten()
             })
@@ -114,6 +118,7 @@ pub(super) fn commit(
             index,
             Written {
                 id: memory_id,
+                uuid,
                 // Where a neighbour this claim ends, or a memory whose ender
                 // it replaces, ends.
                 end: match memory.valid_from {
@@ -281,6 +286,11 @@ pub(super) fn commit(
         used: checked.used.iter().map(|(_, uuid)| *uuid).collect(),
         entities_created,
         dropped: checked.dropped.clone(),
+        promoted: plan
+            .promoted
+            .keys()
+            .map(|index| written[index].uuid)
+            .collect(),
     })
 }
 

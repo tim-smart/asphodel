@@ -1,0 +1,64 @@
+# A trivial memory names Sam without saying who Sam is. Days later the owner
+# says Sam is his wife, and call 2 labels that major claim mentioned_again on
+# the trivial memory, as the model did in the evaluation store. The claim
+# says more than the memory and matters more, so code doesn't absorb it: it
+# becomes the chain head, the trivial memory is superseded, and recall for
+# the relationship finds the new memory.
+
+name = "relationship-outweighs-repeat"
+group = "ci"
+description = "A major claim labelled mentioned_again on a trivial memory naming the same person becomes the head instead of being absorbed."
+
+[bank]
+timezone = "UTC"
+
+[[turn]]
+at = "2026-03-02T09:00:00Z"
+session = "s1"
+user = "I sent flowers to Sam."
+assistant = "Lovely."
+
+[[turn.claim]]
+label = "flowers"
+content = "Tim sent flowers to Sam."
+quote = "I sent flowers to Sam"
+kind = "event"
+significance = "trivial"
+
+[[turn]]
+at = "2026-03-05T09:00:00Z"
+session = "s1"
+user = "I sent flowers to Sam, my wife, for our anniversary."
+assistant = "Happy anniversary."
+
+[[turn.claim]]
+label = "wife"
+content = "Tim sent flowers to Sam, his wife."
+quote = "I sent flowers to Sam, my wife"
+kind = "fact"
+significance = "major"
+reconcile = [{ memory = "flowers", outcome = "mentioned_again" }]
+
+[[probe]]
+id = "the-relationship-is-the-head"
+at = "2026-03-05T10:00:00Z"
+kind = "exists"
+memory = "wife"
+memory_kind = "fact"
+head = true
+retracted = false
+
+[[probe]]
+id = "the-trivial-memory-is-superseded"
+at = "2026-03-05T10:00:00Z"
+kind = "exists"
+memory = "flowers"
+head = false
+retracted = false
+
+[[probe]]
+id = "recall-finds-the-relationship"
+at = "2026-03-05T10:00:00Z"
+kind = "recall_finds"
+memory = "wife"
+query = "Who is Tim's wife?"

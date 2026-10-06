@@ -598,8 +598,14 @@ pub(super) struct Plan {
     /// (schema version 8). It's provenance, not strength.
     pub mention_spans: BTreeMap<i64, Vec<(usize, usize)>>,
     /// Significance raises from `mentioned_again`, the larger each, for
-    /// neighbours whose significance the owner hasn't set.
+    /// neighbours whose significance the owner hasn't set. Only a mention
+    /// that isn't promoted to `refines` raises: an older claim's, or one
+    /// less than `reconcile.promotion_gap` above the neighbour.
     pub raises: BTreeMap<i64, Significance>,
+    /// The checked claims a repeat label would have absorbed but that
+    /// became new chain heads because they matter more than the neighbour,
+    /// each with the neighbours it refines for that reason.
+    pub promoted: BTreeMap<usize, BTreeSet<i64>>,
     /// Neighbours the owner asked to remember through a mention.
     pub keeps: BTreeSet<i64>,
 }
@@ -621,14 +627,32 @@ impl Plan {
     }
 }
 
+/// Whether a claim of `significance` matters at least `gap` levels more
+/// than `neighbour`. The neighbour counts at the higher of extraction's level
+/// and the owner's setting, so a mention never undoes the owner's word in
+/// either direction: a level the owner lowered isn't outweighed by
+/// extraction rating the same statement as it did before, and a kept memory,
+/// as significant as a memory gets, is never outweighed.
+fn outweighs(significance: Significance, neighbour: &Neighbour, gap: u8) -> bool {
+    let baseline = match neighbour.owner_significance.as_deref() {
+        Some("kept") => return false,
+        Some(owner) => neighbour.significance.max(level(owner)),
+        None => neighbour.significance,
+    };
+    significance as u8 >= baseline as u8 + gap
+}
+
 /// Turns call 2's labels into a plan. `labels` is by claim handle and
-/// neighbour handle, as [`super::call2::parse`] returns it.
+/// neighbour handle, as [`super::call2::parse`] returns it. A newer claim's
+/// repeat label is promoted to `refines` at `promotion_gap` significance
+/// levels above the neighbour (`reconcile.promotion_gap`).
 pub(super) fn plan(
     search: &Search,
     input: &Call1Input,
     unit: &Unit,
     checked: &Checked,
     labels: &[super::call2::ClaimLabels],
+    promotion_gap: u8,
 ) -> Plan {
     let neighbour_index: BTreeMap<&str, usize> = search
         .input
@@ -673,17 +697,22 @@ pub(super) fn plan(
                 neighbour.ingested_at,
                 neighbour.source_id,
             )) != Ordering::Less;
+            let repeat = newer && matches!(label, Label::MentionedAgain | Label::Confirmed);
             // Repeat labels must not discard a newly supplied or changed date.
-            let label = if newer
-                && matches!(label, Label::MentionedAgain | Label::Confirmed)
+            let dated = repeat
                 && [
                     (memory.due_at, neighbour.due_at),
                     (memory.supplied_valid_from(), neighbour.valid_from),
                     (memory.valid_until, neighbour.valid_until),
                 ]
                 .iter()
-                .any(|(claim, stored)| claim.is_some() && claim != stored)
-            {
+                .any(|(claim, stored)| claim.is_some() && claim != stored);
+            // Nor absorb a claim that matters more than the memory: call 2
+            // can call a claim that adds a relationship or a reason a repeat
+            // of a memory that only names the same person.
+            let weightier =
+                repeat && !dated && outweighs(memory.significance, neighbour, promotion_gap);
+            let label = if dated || weightier {
                 Label::Refines
             } else {
                 label
@@ -728,6 +757,9 @@ pub(super) fn plan(
                     plan.edits.push((index, neighbour.id, Edit::Refines));
                     retracted[n] = true;
                     changed = true;
+                    if weightier {
+                        plan.promoted.entry(index).or_default().insert(neighbour.id);
+                    }
                 }
                 Label::Ends => {
                     older_end.get_or_insert(n);

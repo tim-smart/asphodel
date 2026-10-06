@@ -214,6 +214,11 @@ pub struct Call2Rate {
     pub chunks: u64,
     pub call2: u64,
     pub rate: f64,
+    /// New memories call 2 labelled a repeat of a neighbour that became
+    /// its chain head instead, for mattering more than it
+    /// (`reconcile.promotion_gap`): each one a chain absorption would
+    /// not have made.
+    pub promoted: u64,
     /// Commits that found their chunk stale and reconciled it again, and
     /// that per chunk. Only above `[llm] concurrency = 1`, where a chunk
     /// can be.
@@ -452,6 +457,7 @@ impl Aggregate {
                 chunks: report.call2_rate.chunks,
                 call2: report.call2_rate.call2,
                 rate: report.call2_rate.rate,
+                promoted: report.call2_rate.promoted,
                 redos: report.call2_rate.redos,
                 redo_rate: report.call2_rate.redo_rate,
             },

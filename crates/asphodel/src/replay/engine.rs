@@ -37,8 +37,8 @@
 //! neighbours the real reconciliation found, so nothing in reconciliation is
 //! replay-only. Where the scenario says something production wouldn't do (an
 //! outcome against a memory call 2 isn't shown, a `used` memory that isn't in
-//! context, a label on a claim its outcomes absorb), the run stops with a
-//! scenario error rather than guessing. For real history, through the cassette
+//! context, a label on a claim reconciliation absorbed), the run stops with
+//! a scenario error rather than guessing. For real history, through the cassette
 //! [`Recorder`], with `fast` mode's call 1 composed from the recording and the
 //! rest answered by request.
 
@@ -327,6 +327,8 @@ pub struct Engine<'a> {
     profile_tokens: Vec<u64>,
     chunks: u64,
     call2_chunks: u64,
+    /// Claims a repeat label would have absorbed that became chain heads.
+    promoted: u64,
     agenda_lines: BTreeMap<String, u64>,
     significance_histogram: BTreeMap<String, u64>,
     kind_histogram: BTreeMap<String, u64>,
@@ -409,6 +411,7 @@ impl<'a> Engine<'a> {
             profile_tokens: Vec::new(),
             chunks: 0,
             call2_chunks: 0,
+            promoted: 0,
             agenda_lines: BTreeMap::new(),
             significance_histogram: BTreeMap::new(),
             kind_histogram: BTreeMap::new(),
@@ -881,7 +884,10 @@ impl<'a> Engine<'a> {
             .map(|memory| memory.memory)
             .collect();
         let extracted = match self.service.try_commit_extraction(prepared)? {
-            Committed::Extracted(extracted) => extracted,
+            Committed::Extracted(extracted) => {
+                self.promoted += extracted.promoted.len() as u64;
+                extracted
+            }
             Committed::Stale(stale) => {
                 self.redos += 1;
                 let (prepared, latency) = self.redo_chunk(*stale)?;
@@ -1590,6 +1596,7 @@ impl<'a> Engine<'a> {
             call2_rate: Call2Rate {
                 chunks: self.chunks,
                 call2: self.call2_chunks,
+                promoted: self.promoted,
                 rate: if self.chunks == 0 {
                     0.0
                 } else {

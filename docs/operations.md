@@ -220,6 +220,19 @@ access and is held as pending; a `used` verdict in any later turn writes one
 as usual. A correction counts its predecessor's credits. Both are deletion
 inputs. They're meant for replay `--overrides` comparisons, not production.
 
+`[reconcile] promotion_gap` (default 2, from 1 to 4) is how many
+significance levels a newer claim must be above a memory call 2 labels it
+a repeat of for the claim to become the memory's refinement instead of an
+access on it. A smaller gap raises the memory's significance. The default
+was chosen after an independently reviewed evaluation on private history
+(TIM-192) as the less risky value, not a measured improvement: a gap of 1
+made 16 replacements to a gap of 2's 1, with no measured gain. With the
+shipped call 2 prompt, a gap of 2 made 1 and 3 replacements in two samples
+of the same history. Recovering the relationship that motivated the guard
+isn't measured: a claim one level above the memory that absorbed it is
+still absorbed at a gap of 2. Compare values with replay `--overrides` and
+`call2_rate.promoted`.
+
 An unknown key or an out-of-range value stops the daemon too. The LLM's two
 modes, an API key or a ChatGPT subscription, are in `docs/models.md`. For
 the subscription, log in once the pod is up:
