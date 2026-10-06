@@ -36,7 +36,7 @@ use asphodel_core::ingest::Turn;
 use asphodel_core::inspect::{BankOverview, MemoryView};
 use asphodel_core::mental_models::{
     Applied, FailureKind, Model, ModelEdit, ModelError, ModelSpec, Outcome, PLAN_TEMPLATE,
-    RefreshInput, Refreshes, WRITE_TEMPLATE,
+    RefreshInput, Refreshes, Retried, WRITE_TEMPLATE,
 };
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmGate, LlmRequest,
@@ -1976,13 +1976,18 @@ fn a_write_leaving_out_what_the_answer_pinned_is_sent_again_and_the_better_reply
                 leaving_out(&input, &memories, second),
             ],
         );
-        applied(h.refresh(PROFILE_NAME, &llm, true));
+        let applied = applied(h.refresh(PROFILE_NAME, &llm, true));
         let sent = calls(&llm, WRITE_TEMPLATE);
         assert_eq!(sent.len(), 2, "{case}");
         assert_eq!(sent[1].system, sent[0].system, "{case}");
         assert_eq!(sent[1].user, sent[0].user, "{case}");
-        let kept = if takes_second { second } else { first };
+        let (kept, retried) = if takes_second {
+            (second, Retried::Accepted)
+        } else {
+            (first, Retried::Rejected)
+        };
         assert_eq!(cites(&h.profile()), all_but(&memories, kept), "{case}");
+        assert_eq!(applied.retried, Some(retried), "{case}");
     }
 }
 
@@ -2008,10 +2013,10 @@ fn a_second_write_that_fails_or_is_held_leaves_the_first_reply_standing() {
         let script = json!([{"reply": first}, failure]).to_string();
         let llm = FakeLlm::from_script(MODEL, &script).unwrap();
         let outcome = h.refresh(PROFILE_NAME, &llm, true);
-        assert!(
-            matches!(outcome, Outcome::Applied(_)),
-            "{case}: {outcome:?}"
-        );
+        let Outcome::Applied(applied) = outcome else {
+            panic!("{case}: {outcome:?}");
+        };
+        assert_eq!(applied.retried, Some(Retried::Failed), "{case}");
         assert_eq!(writes(&llm), 2, "{case}");
         assert_eq!(cites(&h.profile()), all_but(&memories, &[0]), "{case}");
         assert_eq!(h.profile().last_error, None, "{case}");

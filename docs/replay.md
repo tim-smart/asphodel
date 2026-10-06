@@ -632,7 +632,9 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   `mental_models.retention_retry` on makes retry calls a recording from
   before retries never made; `replay`, or the retry off, reproduces it.
   Retries aren't counted in `refresh_calls_per_day`; `refresh_retries`
-  counts them by what became of them. The current write template is v7, which lists each memory's
+  counts them by what became of them: `accepted`, `rejected`, `failed`
+  and `skipped`. A skipped retry was never sent, so the retries sent are
+  `accepted + rejected + failed`. The current write template is v7, which lists each memory's
   significance and gives the seeded profile a durability rule; v2 to v6
   records do not substitute for v7 either.
   A `refresh_model` record from before schema version 13

@@ -28,8 +28,9 @@ use support::{
     HOME_MEMORY, PASSING_PROBES, Run, TestDir, asphodel, assert_ok, assert_refused,
     assert_refused_without, cassette_bytes, cassette_path, cassette_records, claim, home_claim,
     import_history, imported_small_history, imported_with_a_model, live_script, overrides, probe,
-    probe_in, record, replay_history, reply_to_everything, said, script_answering_everything,
-    script_steps, simulation, stderr, universal_script, write_cassette, write_reply,
+    probe_in, read_json, record, replay_history, reply_to_everything, said,
+    script_answering_everything, script_steps, simulation, stderr, universal_script,
+    write_cassette, write_reply,
 };
 
 fn sha(bytes: &[u8]) -> String {
@@ -1687,6 +1688,12 @@ fn retention_script(
     script_steps(dir, name, &steps)
 }
 
+/// A report's `refresh_retries`: the writes sent again, by what became of
+/// them.
+fn retried(accepted: u64, rejected: u64, failed: u64, skipped: u64) -> Value {
+    json!({ "accepted": accepted, "rejected": rejected, "failed": failed, "skipped": skipped })
+}
+
 /// The run's calls by template, in order, retries left out.
 fn call_order(records: &[Value]) -> Vec<Value> {
     records
@@ -1711,7 +1718,9 @@ fn a_retried_write_is_recorded_apart_and_replays_with_or_without_it() {
     let has_home = profile_home("profile_has");
     let lacks_home = profile_home("profile_lacks");
 
-    let live = replay_history(&dir, &corpus, "live", &has_home, Some(&script), &[]).report();
+    let aggregate = dir.private_path("aggregate.json");
+    let flags = ["--aggregate", aggregate.to_str().unwrap()];
+    let live = replay_history(&dir, &corpus, "live", &has_home, Some(&script), &flags).report();
     let records = cassette_records(&dir);
     assert_eq!(
         call_order(&records),
@@ -1728,6 +1737,9 @@ fn a_retried_write_is_recorded_apart_and_replays_with_or_without_it() {
     assert_eq!(first["request"]["system"], retries[0]["request"]["system"]);
     assert_eq!(first["request"]["user"], retries[0]["request"]["user"]);
     assert_eq!(probe_in(&live, "p001")["passed"], true, "{live}");
+    assert_eq!(live["refresh_retries"], retried(1, 0, 0, 0), "{live}");
+    let exported = read_json(&aggregate);
+    assert_eq!(exported["refresh_retries"], live["refresh_retries"]);
 
     let replay = replay_history(&dir, &corpus, "replay", &has_home, None, &[]).ok();
     assert_eq!(replay["llm"]["live"], 0, "{replay}");
@@ -1738,6 +1750,7 @@ fn a_retried_write_is_recorded_apart_and_replays_with_or_without_it() {
     let flags = ["--overrides", off.as_str()];
     let without = replay_history(&dir, &corpus, "replay", &lacks_home, None, &flags).ok();
     assert_eq!(without["llm"]["misses"], 0, "{without}");
+    assert_eq!(without["refresh_retries"], retried(0, 0, 0, 0), "{without}");
     assert_eq!(
         without["refresh_calls_per_day"],
         live["refresh_calls_per_day"]
@@ -1747,6 +1760,7 @@ fn a_retried_write_is_recorded_apart_and_replays_with_or_without_it() {
     write_cassette(&dir, &before_retries);
     let old = replay_history(&dir, &corpus, "replay", &lacks_home, None, &[]).ok();
     assert_eq!(old["llm"]["misses"], 0, "{old}");
+    assert_eq!(old["refresh_retries"], retried(0, 0, 0, 1), "{old}");
     assert_eq!(old["refresh_calls_per_day"], live["refresh_calls_per_day"]);
 }
 
@@ -1772,11 +1786,15 @@ fn fast_with_recorded_or_no_writes_sends_no_retry() {
     write_cassette(&dir, &reordered);
 
     let lacks_home = profile_home("profile_lacks");
-    for refresh in ["recorded", "off"] {
+    // With `recorded`, the substituted first reply leaves the home fact
+    // out, so a retry is due and skipped; with `off` nothing is written.
+    for (refresh, skipped) in [("recorded", 1), ("off", 0)] {
         let flags = ["--refresh", refresh];
         let report = replay_history(&dir, &corpus, "fast", &lacks_home, None, &flags).ok();
         assert_eq!(report["llm"]["live"], 0, "{refresh}: {report}");
         assert_eq!(report["llm"]["misses"], 0, "{refresh}: {report}");
+        let expected = retried(0, 0, 0, skipped);
+        assert_eq!(report["refresh_retries"], expected, "{refresh}: {report}");
     }
 }
 
