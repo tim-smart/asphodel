@@ -200,9 +200,24 @@ fn every_checked_in_scenario_passes_its_probes() {
                     assert_eq!(shadow["purged"], 5, "{shadow}");
                     assert_eq!(shadow["re_mentioned"], 1, "{shadow}");
                 }
+                // Refinements rejected across kinds are counted by what made
+                // them refinements; `promoted` counts only those that landed.
+                let rejected = |explicit: u64, date_promoted: u64, weight_promoted: u64| {
+                    json!({
+                        "explicit": explicit,
+                        "date_promoted": date_promoted,
+                        "weight_promoted": weight_promoted,
+                    })
+                };
+                let call2 = &report["call2_rate"];
                 if stem == "relationship-outweighs-repeat" {
-                    // The weightier repeat is the one new chain head.
-                    assert_eq!(report["call2_rate"]["promoted"], 1, "{stem}");
+                    assert_eq!(call2["promoted"], 0, "{stem}");
+                    assert_eq!(call2["refines_rejected"], rejected(0, 0, 1), "{stem}");
+                }
+                if stem == "preference-survives-mislabels" {
+                    // The weightier repeat of the refinement.
+                    assert_eq!(call2["promoted"], 1, "{stem}");
+                    assert_eq!(call2["refines_rejected"], rejected(2, 1, 0), "{stem}");
                 }
             });
         }
@@ -229,6 +244,132 @@ fn injection_usage_counts_mixed_verdicts_in_report_and_aggregate() {
         let path = path.display();
         assert_eq!(run.report()["injection_usage"], expected, "{path}");
         assert_eq!(export["injection_usage"], expected, "{path}");
+    }
+}
+
+/// The private census identifies each incompatible decision, while both
+/// exports count it even in the control arm where it is allowed to land.
+#[test]
+fn refinement_census_and_exports_agree_with_both_kind_guard_settings() {
+    for (cause, outcome, significance, date, older) in [
+        ("explicit", "refines", "minor", "", false),
+        ("explicit", "refines", "minor", "", true),
+        (
+            "date_promoted",
+            "confirmed",
+            "minor",
+            "valid_from = { at = \"2026-01-20\", precision = \"day\" }",
+            false,
+        ),
+        ("weight_promoted", "mentioned_again", "major", "", false),
+    ] {
+        for guard in [true, false] {
+            let dir = TestDir::new();
+            // An accepted older refinement edits the existing head without
+            // creating a memory; a rejected one becomes an independent head.
+            let creates_memory = !older || guard;
+            let label = if creates_memory {
+                "label = \"visit\""
+            } else {
+                ""
+            };
+            let claim_probe = if creates_memory {
+                r#"[[probe]]
+id = "claim"
+at = "2026-01-06T10:00:00Z"
+kind = "exists"
+memory = "visit""#
+            } else {
+                ""
+            };
+            let source = if older {
+                r#"[[document]]
+at = "2026-01-06T09:00:00Z"
+id = "old-notes"
+reference_date = "2026-01-01"
+text = "Tim lived in Auckland."
+
+[[document.claim]]"#
+            } else {
+                r#"[[turn]]
+at = "2026-01-06T09:00:00Z"
+session = "s1"
+user = "Tim lived in Auckland."
+assistant = "Noted."
+
+[[turn.claim]]"#
+            };
+            let path = inline(
+                &dir,
+                "refinement-census",
+                &format!(
+                    r#"{HOME_TURN}
+{source}
+{label}
+content = "Tim lived in Auckland."
+quote = "Tim lived in Auckland"
+kind = "event"
+significance = "{significance}"
+{date}
+reconcile = [{{ memory = "home", outcome = "{outcome}" }}]
+
+[[probe]]
+id = "original"
+at = "2026-01-06T10:00:00Z"
+kind = "exists"
+memory = "home"
+
+{claim_probe}
+"#
+                ),
+            );
+            let overrides = dir.file(
+                "guard.toml",
+                &format!("[reconcile]\nkind_guard = {guard}\n"),
+            );
+            let aggregate = dir.path("aggregate.json");
+            let run = replay(
+                &dir,
+                &path,
+                &[
+                    "--overrides",
+                    overrides.to_str().unwrap(),
+                    "--aggregate",
+                    aggregate.to_str().unwrap(),
+                ],
+            );
+            run.assert_passed();
+            let report = run.report();
+            let rows = report["kind_mismatches"].as_array().unwrap();
+            assert_eq!(rows.len(), 1, "{cause}, older={older}, guard={guard}");
+            let row = &rows[0];
+            assert!(uuid::Uuid::parse_str(row["chunk"].as_str().unwrap()).is_ok());
+            assert_eq!(row["claim"], 0);
+            if creates_memory {
+                assert_eq!(row["memory"], run.probe("claim")["observed"]["id"]);
+            } else {
+                assert!(row["memory"].is_null());
+            }
+            assert_eq!(row["neighbour"], run.probe("original")["observed"]["id"]);
+            assert_eq!(row["claim_kind"], "event");
+            assert_eq!(row["neighbour_kind"], "fact");
+            assert_eq!(row["cause"], cause);
+            assert_eq!(row["older"], older);
+            assert_eq!(row["rejected"], guard);
+
+            let mut across = json!({ "explicit": 0, "date_promoted": 0, "weight_promoted": 0 });
+            across[cause] = json!(1);
+            let rejected = if guard {
+                across.clone()
+            } else {
+                json!({ "explicit": 0, "date_promoted": 0, "weight_promoted": 0 })
+            };
+            let export: Value = serde_json::from_slice(&fs::read(aggregate).unwrap()).unwrap();
+            for counters in [&report["call2_rate"], &export["call2_rate"]] {
+                assert_eq!(counters["refines_across_kinds"], across);
+                assert_eq!(counters["refines_rejected"], rejected);
+            }
+        }
     }
 }
 

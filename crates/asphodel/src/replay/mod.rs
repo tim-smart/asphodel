@@ -255,6 +255,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             significance_histogram: outcome.significance_histogram,
             kind_histogram: outcome.kind_histogram,
             memories: outcome.memories,
+            kind_mismatches: outcome.kind_mismatches,
             llm: outcome.llm,
         })
     })

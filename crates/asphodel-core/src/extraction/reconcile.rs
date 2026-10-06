@@ -23,7 +23,11 @@
 //! **Labels.** Code decides direction from `observed_at`, ties broken by
 //! the later `ingested_at` and then the source's rowid, never from the LLM.
 //! A newer repeat label becomes `refines` if the claim supplies a new or
-//! changed date. A fully undated `retracts` carries the old window over at
+//! changed date, or one that matters `reconcile.promotion_gap` levels more.
+//! A refinement, call 2's or promoted, between kinds that can't be versions
+//! of each other is rejected (`reconcile.kind_guard`): that label is
+//! dropped, not turned into a mention, and the claim's other labels decide
+//! its fate. A fully undated `retracts` carries the old window over at
 //! commit. Labels on neighbours already ended or retracted are rejected.
 //! An older claim's
 //! `mentioned_again` and `confirmed` still write the access, even on an
@@ -581,6 +585,47 @@ pub(super) enum Edit {
     Refines,
 }
 
+/// What `[reconcile]` asks of the plan.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Rules {
+    /// `reconcile.promotion_gap`.
+    pub promotion_gap: u8,
+    /// `reconcile.kind_guard`.
+    pub kind_guard: bool,
+}
+
+impl Rules {
+    pub fn of(tuning: &crate::config::Tuning) -> Self {
+        Self {
+            promotion_gap: tuning.reconcile.promotion_gap,
+            kind_guard: tuning.reconcile.kind_guard,
+        }
+    }
+}
+
+/// An effective refinement between a claim and a neighbour of kinds that
+/// can't be versions of each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Mismatch {
+    /// The checked claim's index.
+    pub claim: usize,
+    pub neighbour: i64,
+    pub cause: super::RefineCause,
+    /// The claim is older than the neighbour.
+    pub older: bool,
+    /// `reconcile.kind_guard` dropped the label.
+    pub rejected: bool,
+}
+
+/// Whether a claim of `claim` kind can be a version of a memory of
+/// `neighbour` kind: the same kind, or a task or a schedule for a task.
+/// Kind is evidence, not proof: two memories of one kind can still be
+/// different statements, and an ongoing state given an end date becomes an
+/// event.
+fn compatible(claim: Kind, neighbour: Kind) -> bool {
+    claim == neighbour || neighbour == Kind::Task && matches!(claim, Kind::Task | Kind::Recurring)
+}
+
 /// Everything the labels decided, for the commit to write.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Plan {
@@ -608,6 +653,9 @@ pub(super) struct Plan {
     pub promoted: BTreeMap<usize, BTreeSet<i64>>,
     /// Neighbours the owner asked to remember through a mention.
     pub keeps: BTreeSet<i64>,
+    /// Refinements between incompatible kinds, in label order, whether or
+    /// not the guard rejected them.
+    pub mismatches: Vec<Mismatch>,
 }
 
 impl Plan {
@@ -644,15 +692,17 @@ fn outweighs(significance: Significance, neighbour: &Neighbour, gap: u8) -> bool
 
 /// Turns call 2's labels into a plan. `labels` is by claim handle and
 /// neighbour handle, as [`super::call2::parse`] returns it. A newer claim's
-/// repeat label is promoted to `refines` at `promotion_gap` significance
-/// levels above the neighbour (`reconcile.promotion_gap`).
+/// repeat label is promoted to `refines` at `rules.promotion_gap`
+/// significance levels above the neighbour. Every route to `refines` then
+/// meets the kind check, after the last promotion and before anything is
+/// written on the neighbour.
 pub(super) fn plan(
     search: &Search,
     input: &Call1Input,
     unit: &Unit,
     checked: &Checked,
     labels: &[super::call2::ClaimLabels],
-    promotion_gap: u8,
+    rules: Rules,
 ) -> Plan {
     let neighbour_index: BTreeMap<&str, usize> = search
         .input
@@ -711,7 +761,14 @@ pub(super) fn plan(
             // can call a claim that adds a relationship or a reason a repeat
             // of a memory that only names the same person.
             let weightier =
-                repeat && !dated && outweighs(memory.significance, neighbour, promotion_gap);
+                repeat && !dated && outweighs(memory.significance, neighbour, rules.promotion_gap);
+            let cause = if dated {
+                Some(super::RefineCause::DatePromoted)
+            } else if weightier {
+                Some(super::RefineCause::WeightPromoted)
+            } else {
+                (label == Label::Refines).then_some(super::RefineCause::Explicit)
+            };
             let label = if dated || weightier {
                 Label::Refines
             } else {
@@ -729,6 +786,24 @@ pub(super) fn plan(
                 )
             {
                 continue;
+            }
+            // Nor can a memory of another kind be its next version. The
+            // label is dropped, not turned into a mention; a label on an
+            // ended neighbour is rejected below anyway.
+            if let Some(cause) = cause
+                && !ended[n]
+                && !compatible(memory.kind.stored(), neighbour.kind)
+            {
+                plan.mismatches.push(Mismatch {
+                    claim: index,
+                    neighbour: neighbour.id,
+                    cause,
+                    older: !newer,
+                    rejected: rules.kind_guard,
+                });
+                if rules.kind_guard {
+                    continue;
+                }
             }
             match label {
                 Label::MentionedAgain | Label::Confirmed => {

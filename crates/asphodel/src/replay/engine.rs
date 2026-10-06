@@ -67,8 +67,8 @@ use uuid::Uuid;
 use super::cassette::{Chained, ChunkContext, ChunkKey, Recorder};
 use super::labelling::{Collector, Material};
 use super::report::{
-    Call2Rate, DayCount, InjectedTokens, InjectionUsage, Lag, LlmCounts, MemoryOutcome,
-    Percentiles, ProbeResult, SessionTokens, WeekBands, WeekCount,
+    Call2Rate, DayCount, InjectedTokens, InjectionUsage, KindMismatchRow, Lag, LlmCounts,
+    MemoryOutcome, Percentiles, ProbeResult, RefineCauses, SessionTokens, WeekBands, WeekCount,
 };
 use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX};
 use super::shadow::{Created, ShadowRow};
@@ -147,6 +147,7 @@ pub struct Outcome {
     pub significance_histogram: BTreeMap<String, u64>,
     pub kind_histogram: BTreeMap<String, u64>,
     pub memories: Vec<MemoryOutcome>,
+    pub kind_mismatches: Vec<KindMismatchRow>,
     pub llm: LlmCounts,
     pub created: Vec<Created>,
     pub shadow: Vec<ShadowRow>,
@@ -329,6 +330,9 @@ pub struct Engine<'a> {
     call2_chunks: u64,
     /// Claims a repeat label would have absorbed that became chain heads.
     promoted: u64,
+    refines_rejected: RefineCauses,
+    refines_across_kinds: RefineCauses,
+    kind_mismatches: Vec<KindMismatchRow>,
     agenda_lines: BTreeMap<String, u64>,
     significance_histogram: BTreeMap<String, u64>,
     kind_histogram: BTreeMap<String, u64>,
@@ -412,6 +416,9 @@ impl<'a> Engine<'a> {
             chunks: 0,
             call2_chunks: 0,
             promoted: 0,
+            refines_rejected: RefineCauses::default(),
+            refines_across_kinds: RefineCauses::default(),
+            kind_mismatches: Vec::new(),
             agenda_lines: BTreeMap::new(),
             significance_histogram: BTreeMap::new(),
             kind_histogram: BTreeMap::new(),
@@ -888,6 +895,14 @@ impl<'a> Engine<'a> {
         let extracted = match self.service.try_commit_extraction(prepared)? {
             Committed::Extracted(extracted) => {
                 self.promoted += extracted.promoted.len() as u64;
+                for mismatch in &extracted.kind_mismatches {
+                    self.refines_across_kinds.add(mismatch.cause);
+                    if mismatch.rejected {
+                        self.refines_rejected.add(mismatch.cause);
+                    }
+                    let row = KindMismatchRow::of(extracted.chunk, mismatch);
+                    self.kind_mismatches.push(row);
+                }
                 extracted
             }
             Committed::Stale(stale) => {
@@ -1599,6 +1614,8 @@ impl<'a> Engine<'a> {
                 chunks: self.chunks,
                 call2: self.call2_chunks,
                 promoted: self.promoted,
+                refines_rejected: self.refines_rejected,
+                refines_across_kinds: self.refines_across_kinds,
                 rate: if self.chunks == 0 {
                     0.0
                 } else {
@@ -1625,6 +1642,7 @@ impl<'a> Engine<'a> {
             significance_histogram: self.significance_histogram,
             kind_histogram: self.kind_histogram,
             memories,
+            kind_mismatches: self.kind_mismatches,
             llm,
             created: self.created,
             shadow: self.shadow,

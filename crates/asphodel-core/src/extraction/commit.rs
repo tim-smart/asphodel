@@ -11,7 +11,7 @@ use super::input::{Unit, survivor};
 use super::reconcile::{Edit, Fate, Neighbour, Plan, end_at};
 use super::{
     Call1Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT, EDIT_REFINED,
-    EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted,
+    EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted, KindMismatch,
 };
 use crate::constants::{
     Significance, Volatility, WEIGHT_CONFIRMED, WEIGHT_CREATED, WEIGHT_MENTIONED_AGAIN, WEIGHT_USED,
@@ -290,6 +290,24 @@ pub(super) fn commit(
             .promoted
             .keys()
             .map(|index| written[index].uuid)
+            .collect(),
+        kind_mismatches: plan
+            .mismatches
+            .iter()
+            .map(|mismatch| {
+                let claim = &checked.memories[mismatch.claim];
+                let neighbour = by_id[&mismatch.neighbour];
+                KindMismatch {
+                    claim: claim.claim,
+                    memory: written.get(&mismatch.claim).map(|written| written.uuid),
+                    neighbour: neighbour.uuid,
+                    claim_kind: claim.kind.stored(),
+                    neighbour_kind: neighbour.kind,
+                    cause: mismatch.cause,
+                    older: mismatch.older,
+                    rejected: mismatch.rejected,
+                }
+            })
             .collect(),
     })
 }

@@ -233,6 +233,17 @@ isn't measured: a claim one level above the memory that absorbed it is
 still absorbed at a gap of 2. Compare values with replay `--overrides` and
 `call2_rate.promoted`.
 
+`[reconcile] kind_guard` (default true) rejects a refinement, call 2's or a
+promoted repeat's, between memories of kinds the containment policy treats
+as incompatible: any two different kinds, except a task or recurring claim
+refining a task. The memory is left as it was, and the claim is a new
+memory only if no other accepted label decides its fate. It contains the cross-kind merges seen on private history (TIM-196);
+it doesn't catch one preference merged into another. Turning it off is for
+replay `--overrides` comparisons: `call2_rate.refines_across_kinds` counts
+the pairs either way, `call2_rate.refines_rejected` only those rejected.
+Neither counts a refinement another guard already drops (`docs/replay.md`,
+"Reconcile outcomes").
+
 An unknown key or an out-of-range value stops the daemon too. The LLM's two
 modes, an API key or a ChatGPT subscription, are in `docs/models.md`. For
 the subscription, log in once the pod is up:

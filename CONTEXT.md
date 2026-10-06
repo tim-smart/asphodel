@@ -91,7 +91,7 @@ The owner can also retract a memory directly, from the CLI or the dashboard. Tha
 _Avoid_: Deleted, invalidated, cancelled
 
 **Refined**:
-A memory replaced by a more precise version of the same statement, without having been wrong.
+A memory replaced by a more precise version of the same statement, without having been wrong. Only a memory of the same kind can refine it, or for a task, a task or recurring one. A containment policy treats other pairs of kinds as incompatible and rejects the refinement; the claim is a new memory only if no other accepted label decides its fate.
 _Avoid_: Updated, merged
 
 **Supersession**:
@@ -129,7 +129,7 @@ The kind of access where a reply actually relied on a recalled memory, whether i
 _Avoid_: Retrieved, returned, injected
 
 **Mentioned again**:
-The kind of access where the user or a document independently states something already remembered. A later version of the same document repeating itself doesn't count. A newer statement that matters much more than the memory isn't one: it refines the memory.
+The kind of access where the user or a document independently states something already remembered. A later version of the same document repeating itself doesn't count. A newer statement of the same kind that matters much more than the memory isn't one: it refines the memory.
 _Avoid_: Duplicate, repeat, re-extraction
 
 **Confirmed**:

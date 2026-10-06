@@ -89,6 +89,17 @@ impl Kind {
             Kind::Recurring => "recurring",
         }
     }
+
+    /// The kind a memory made from the claim is stored as.
+    pub fn stored(self) -> crate::strength::Kind {
+        match self {
+            Kind::Fact => crate::strength::Kind::Fact,
+            Kind::Event => crate::strength::Kind::Event,
+            Kind::State => crate::strength::Kind::State,
+            Kind::Task => crate::strength::Kind::Task,
+            Kind::Recurring => crate::strength::Kind::Recurring,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

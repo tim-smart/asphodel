@@ -265,6 +265,12 @@ pub struct ReconcileTuning {
     /// become a new chain head refining it rather than an access on it.
     /// From 1 to 4. A smaller gap raises the memory's significance instead.
     pub promotion_gap: u8,
+    /// Whether code rejects a refinement, call 2's or a promoted repeat's,
+    /// between memories of kinds that can't be versions of each other: any
+    /// two kinds that differ, except a task or recurring claim on a task.
+    /// On by default. Off is the control arm of an evaluation; the
+    /// mismatches are still reported.
+    pub kind_guard: bool,
 }
 
 impl Default for ReconcileTuning {
@@ -272,6 +278,7 @@ impl Default for ReconcileTuning {
         Self {
             embedding_floors: BTreeMap::new(),
             promotion_gap: 2,
+            kind_guard: true,
         }
     }
 }
