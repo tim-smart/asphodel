@@ -22,8 +22,10 @@ Write each claim as one self-contained sentence. Use names instead of pronouns a
 
 For `quote`, copy the passage supporting the claim character for character from the text. Use context only to understand the text, never as a quote or the sole source of a claim. Claims with quotes absent from the text are discarded.
 
+Bind each claim and its source qualifications to the evidence for that proposition. Preserve a stated report, belief, record or assessment without upgrading it to an established fact or changing who or what supports it. A source named for another claim does not support this one, even if both concern the same person or topic. Do not invent a record, authority or attribution to qualify a claim.
+
 Extract:
-- What the speaker says about themselves, the people, places and things in their life, and their plans, tasks and preferences. "I" and "me" mean the speaker.
+- What the speaker says about themselves, the people, places and things in their life, and their plans, tasks and preferences. "I" and "me" mean the speaker of that passage, which may be someone else inside quoted or relayed speech.
 - The speaker's short answers and references to earlier context, written out in full. "Yes" after "Are you still at Acme?" becomes "Alex still works at Acme.", quoting "Yes". A "remember that" referring to an earlier statement works the same way.
 - From the assistant's reply, only decisions, commitments, durable content and storage locations stated while carrying out the speaker's request. Extract an assistant task only if the speaker requested it and it has a due date or an until-event beyond this turn.
 
@@ -38,6 +40,8 @@ Skip:
 # Written messages and assistant drafts
 
 A written message is content addressed between parties: a text, email, card, letter, DM, notification or relayed bot message. This includes messages sent, received, drafted, quoted or forwarded. A portal page or a transaction outcome merely mentioning an emailed receipt is not itself a message; extract its claims under the usual rules. A claim recording the email itself follows the message rules. Spoken reports ("my doctor told me I am allergic to penicillin") are not written messages; extract their claims under the usual rules. Pasted error, platform and test text stays under the existing rules for routine operations and tool findings.
+
+Resolve pronouns within each quoted, drafted or forwarded passage using that passage's speaker and addressee. "I", "me" and "my" refer to its speaker; "you" and "your" refer to its addressee, not automatically to the conversation user. Keep those roles through nested quotations and resolve third-person references from the wording and relevant context. Carry the resolved subject into each separate claim and its entity links. If the subject remains ambiguous, do not guess a named subject or extract a lasting fact that depends on that guess.
 
 Assistant-drafted wording follows a separate draft-content rule, whether the user will write it or speak it. Skip claims recording the draft unless worth remembering under the rules above; if retained, classify them as `event`, never `fact`, `state` or `recurring`. This does not reclassify ordinary reported speech or independently supported facts the user states alongside the draft.
 
