@@ -35,9 +35,11 @@ Skip:
 - Requests to forget something, including tasks to forget it.
 - Greetings, filler and small talk.
 
-# Written messages
+# Written messages and assistant drafts
 
-A message is a written communication: a text, email, card, letter, DM, notification or relayed bot message. This includes messages sent, received, drafted, quoted or forwarded, and drafts the assistant writes for the user. Spoken reports ("my doctor told me I am allergic to penicillin") are not written messages; extract their claims under the usual rules. Pasted error, platform and test text stays under the existing rules for routine operations and tool findings.
+A written message is content addressed between parties: a text, email, card, letter, DM, notification or relayed bot message. This includes messages sent, received, drafted, quoted or forwarded. A portal page or a transaction outcome merely mentioning an emailed receipt is not itself a message; extract its claims under the usual rules. A claim recording the email itself follows the message rules. Spoken reports ("my doctor told me I am allergic to penicillin") are not written messages; extract their claims under the usual rules. Pasted error, platform and test text stays under the existing rules for routine operations and tool findings.
+
+Assistant-drafted wording follows a separate draft-content rule, whether the user will write it or speak it. Skip claims recording the draft unless worth remembering under the rules above; if retained, classify them as `event`, never `fact`, `state` or `recurring`. This does not reclassify ordinary reported speech or independently supported facts the user states alongside the draft.
 
 Keep a claim recording a message's wording, sending, receipt or one-off occasion separate from any lasting fact it states. Classify the message claim as an `event`, even if undated, never as a `fact`, `state` or `recurring` claim. An intent to send a message is a `task`, or an `event` once completed, not a fact about the user. Extract these only when worth remembering under the rules above.
 
@@ -50,9 +52,9 @@ Do not infer a relationship, preference or recurring date from a salutation, aff
 Choose `kind` in this order:
 - `task`: something to be done. Set `due_at` if the text gives a due date.
 - `recurring`: something scheduled to repeat whose next occurrence matters. An unscheduled habit ("Alex goes to the gym") is a fact.
-- `event`: something that happens at a time or over a span, including anything with an explicit end date ("on holiday until 12 October"). Completed or cancelled tasks and claims recording written messages are events.
+- `event`: something that happens at a time or over a span, including anything with an explicit end date ("on holiday until 12 October"). Completed or cancelled tasks and claims recording written messages or assistant-drafted wording are events.
 - `state`: something ongoing that is expected to change without an announcement, such as mood, location, current work or progress. Keep an explicit end condition as `until_event` ("until the release ships").
-- `fact`: everything else except claims recording written messages or an intent to send them, including preferences, things whose change would be announced (a job, home or relationship), and things not expected to change (a chronic condition).
+- `fact`: everything else except claims recording written messages, assistant-drafted wording or an intent to send a message, including preferences, things whose change would be announced (a job, home or relationship), and things not expected to change (a chronic condition).
 
 Use `volatility` only for states, to describe how quickly they go stale: `hours` (mood, today's location), `days` (an illness, trip or bug being chased), `weeks` (a sprint or visitor), `months` (a project or job hunting), `years` (a degree). Use null when unsure and for all other kinds.
 
