@@ -1344,8 +1344,13 @@ impl<'a> Engine<'a> {
         let probe = &self.timeline.probes[index];
         let id = probe.id(index);
         let bank = &self.settings.bank;
-        let (memory, resolution) = self.probe_memory(index)?;
-        if memory.is_none() && self.regexes[index].is_some() {
+        let not_created = matches!(probe.check, Check::NotCreated { .. });
+        let (memory, resolution) = if not_created {
+            (self.labels.get(probe.check.memory()).copied(), json!({}))
+        } else {
+            self.probe_memory(index)?
+        };
+        if !not_created && memory.is_none() && self.regexes[index].is_some() {
             self.probes.push(ProbeResult {
                 id,
                 at: probe.at,
@@ -1423,6 +1428,21 @@ impl<'a> Engine<'a> {
                 Some(view) => (false, json!({ "id": view.id, "present": true })),
                 None => (true, json!({ "id": memory, "present": false })),
             },
+            Check::NotCreated { .. } => {
+                let matches: Vec<Uuid> = self
+                    .created
+                    .iter()
+                    .filter(|created| {
+                        created.created_at <= probe.at
+                            && match &self.regexes[index] {
+                                Some(regex) => regex.is_match(&created.content),
+                                None => memory == Some(created.memory),
+                            }
+                    })
+                    .map(|created| created.memory)
+                    .collect();
+                (matches.is_empty(), json!({ "created": matches }))
+            }
             Check::Restated {
                 sentence, label, ..
             } => match self.view(memory)? {

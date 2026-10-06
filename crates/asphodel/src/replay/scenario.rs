@@ -307,6 +307,11 @@ pub enum Check {
     Absent {
         memory: String,
     },
+    /// No matching memory was created through `at`, including purged ones.
+    /// In real history, `memory` is a regex; `memory_id` is ignored.
+    NotCreated {
+        memory: String,
+    },
     /// The memory keeps an absorbed claim with this sentence as a
     /// restatement, with this label when one is given.
     Restated {
@@ -355,6 +360,7 @@ impl Check {
             | Check::FadedAt { memory, .. }
             | Check::Exists { memory, .. }
             | Check::Absent { memory }
+            | Check::NotCreated { memory }
             | Check::Restated { memory, .. }
             | Check::AgendaHas { memory }
             | Check::AgendaLacks { memory }
@@ -374,6 +380,7 @@ impl Check {
             Check::FadedAt { .. } => "faded_at",
             Check::Exists { .. } => "exists",
             Check::Absent { .. } => "absent",
+            Check::NotCreated { .. } => "not_created",
             Check::Restated { .. } => "restated",
             Check::AgendaHas { .. } => "agenda_has",
             Check::AgendaLacks { .. } => "agenda_lacks",
