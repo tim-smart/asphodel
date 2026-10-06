@@ -8,6 +8,9 @@
 //!   with recall candidates at sampled turns, scored with the
 //!   reranker logit the gate floor compares, and call 2's candidate lists,
 //!   scored with the cosine similarity the reconcile floor compares.
+//! - It also writes, for a sample of refreshes, each facet's whole pool
+//!   before the facet budget cut it: every candidate's reranker logit, what
+//!   took or cut it and the writer handle it reached, if any.
 //! - `asphodel report precision --labels L --material M` prints the
 //!   precision curve for each list as JSON, with how many labels matched a
 //!   candidate, how many found nothing and how many candidates have none,
@@ -26,23 +29,35 @@
 //!   again against the query the mode gives, keeping every id, and writes
 //!   them in logit order. It compares rerankers' queries on fixed pools;
 //!   it says nothing about prefetch's final ranking.
+//! - `--refresh-queries Q`, a TOML table of facet heading to another
+//!   query, scores each refresh sample of those facets again against its
+//!   query, keeping the sample's `query` and every candidate with what the
+//!   refresh recorded of it. Without it the refresh samples stay as they
+//!   were.
+//! - `asphodel replay ... --refresh-queries Q`, the same table, has every
+//!   refresh facet with a heading in it retrieve and rerank with that
+//!   query instead of its own, recording it as the sample's `rerank_query`
+//!   and keeping its `query` as the label key. The report holds the file's
+//!   SHA-256 as `refresh_queries_hash`, null without it.
 //!
 //! Everything these read or write is derived from history, so all of it
 //! stays under the private dir and errors never quote it.
 
 mod support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use support::hermes::{self, StateDb, start};
 use support::{
-    PASSING_PROBES, TestDir, asphodel, assert_ok, assert_refused, assert_refused_without, claim,
-    home_claim, import_history, imported_small_history, overrides, read_json, record,
-    replay_history, replay_history_to, script_answering_everything, simulation, stderr, stdout,
+    HOME_QUESTION, PASSING_PROBES, TestDir, asphodel, assert_ok, assert_refused,
+    assert_refused_without, claim, home_claim, import_history, import_with, imported_small_history,
+    model_manifest, overrides, probe_in, read_json, record, replay_history, replay_history_to,
+    script_answering_everything, simulation, stderr, stdout,
 };
 
 // The HTML report.
@@ -438,6 +453,926 @@ fn labelling_material_holds_scored_candidates_at_sampled_turns_and_call2_lists()
         !curve["recall"]["curve"].as_array().unwrap().is_empty(),
         "{curve}"
     );
+}
+
+// Refresh calibration material.
+
+/// What Tim says, one turn each, and the memory each makes. The first four
+/// share "family" with the profile's People facet; the rest share no word
+/// with any profile facet's query, so the fake reranker scores them below
+/// zero under every facet.
+const REFRESH_FACTS: [(&str, &str); 12] = [
+    (
+        "I cook pasta for family every Friday",
+        "Tim cooks pasta for family every Friday.",
+    ),
+    (
+        "I drive family north each summer",
+        "Tim drives family north each summer.",
+    ),
+    (
+        "I keep a family recipe book",
+        "Tim keeps a family recipe book.",
+    ),
+    (
+        "I play chess with family on Sundays",
+        "Tim plays chess with family on Sundays.",
+    ),
+    (
+        "I measured a fridge at sixty centimetres",
+        "Tim measured a fridge at sixty centimetres.",
+    ),
+    (
+        "I set a webhook timeout at thirty seconds",
+        "Tim set a webhook timeout at thirty seconds.",
+    ),
+    ("I own a blue kayak", "Tim owns a blue kayak."),
+    ("I bought a cordless drill", "Tim bought a cordless drill."),
+    (
+        "I ran a marathon last October",
+        "Tim ran a marathon last October.",
+    ),
+    (
+        "I grow tomatoes on a balcony",
+        "Tim grows tomatoes on a balcony.",
+    ),
+    ("I read maps for fun", "Tim reads maps for fun."),
+    ("I collect old stamps", "Tim collects old stamps."),
+];
+
+/// One session per fact, an hour apart.
+fn refresh_history(dir: &TestDir) -> PathBuf {
+    refresh_history_of(dir, &REFRESH_FACTS, hermes::MANIFEST)
+}
+
+/// One session per fact of `facts`, an hour apart, imported with
+/// `manifest`.
+fn refresh_history_of(dir: &TestDir, facts: &[(&str, &str)], manifest: &str) -> PathBuf {
+    let state_db = dir.private_path("state.db");
+    let db = StateDb::create(&state_db);
+    for (turn, (quote, _)) in facts.iter().enumerate() {
+        let session = format!("s{turn:02}");
+        let at = start() + 3600.0 * turn as f64;
+        db.owner_session(&session, at);
+        db.turn(&session, at, &format!("By the way, {quote}."), "Noted.");
+    }
+    drop(db);
+    let corpus = dir.private_path("corpus/main.jsonl");
+    assert_ok(&import_with(dir, &state_db, &corpus, manifest, &[]));
+    corpus
+}
+
+/// Every call 1 claims every fact, kept only in the turn that quotes it,
+/// and call 2 labels nothing.
+fn refresh_script(dir: &TestDir) -> PathBuf {
+    let claims = REFRESH_FACTS
+        .iter()
+        .map(|(quote, sentence)| {
+            let mut claim = claim(sentence, quote, "fact");
+            claim["claim"] = json!("c1");
+            claim["labels"] = json!([]);
+            claim
+        })
+        .collect();
+    script_answering_everything(dir, "refresh-script", claims, vec![])
+}
+
+/// A probe the facts pass, since the home memory isn't among them.
+const REFRESH_PROBES: &str = r#"
+[[probe]]
+id = "p001"
+at = "2026-01-06T12:00:00Z"
+kind = "exists"
+memory = "family recipe book"
+"#;
+
+/// A `replay` of the recorded cassette with `flags`, writing its material
+/// to `labelling/<name>.json` when `name` is given; returns the report and
+/// the material's path.
+fn refresh_replay(
+    dir: &TestDir,
+    corpus: &Path,
+    name: Option<&str>,
+    flags: &[&str],
+) -> (Value, PathBuf) {
+    let path = dir.private_path(&format!("labelling/{}.json", name.unwrap_or("none")));
+    let mut flags = flags.to_vec();
+    if name.is_some() {
+        flags.extend(["--labelling", path.to_str().unwrap()]);
+    }
+    let run = replay_history(dir, corpus, "replay", REFRESH_PROBES, None, &flags);
+    (run.ok(), path)
+}
+
+/// The refresh samples of `material`, by refresh: its time and model.
+fn refreshes(material: &Value) -> BTreeMap<(String, String), Vec<&Value>> {
+    let mut by_refresh = BTreeMap::new();
+    for sample in material["refresh"]
+        .as_array()
+        .expect("a refresh list beside recall and call 2")
+    {
+        let at = sample["at"].as_str().expect("a refresh sample's time");
+        let model = sample["model"].as_str().expect("a refresh sample's model");
+        by_refresh
+            .entry((at.to_string(), model.to_string()))
+            .or_insert_with(Vec::new)
+            .push(sample);
+    }
+    by_refresh
+}
+
+/// `--labelling` also writes, for a sample of refreshes, every facet's whole
+/// pool before it was cut to `facet_budget`: each candidate's raw reranker
+/// logit against the query the facet scored, whether the facet's budget took
+/// it or cut it, and the handle it reached the writer under. So a memory the
+/// writer never saw is still in the material, scored, which is what a
+/// refresh floor is calibrated from. Writing it doesn't change the run, the
+/// same run writes the same bytes, and `report precision` reads facet labels
+/// keyed by the facet's query and the memory.
+#[test]
+fn labelling_material_holds_each_refresh_facets_whole_scored_pool() {
+    let dir = TestDir::new();
+    let corpus = refresh_history(&dir);
+    let script = refresh_script(&dir);
+    let budget = overrides(&dir, "[mental_models]\nfacet_budget = 2\n");
+    let tuned = ["--overrides", budget.as_str()];
+    replay_history(&dir, &corpus, "live", REFRESH_PROBES, Some(&script), &tuned).ok();
+    let (plain, _) = refresh_replay(&dir, &corpus, None, &tuned);
+
+    let (labelled, material_path) = refresh_replay(&dir, &corpus, Some("material"), &tuned);
+    assert_eq!(
+        simulation(&plain),
+        simulation(&labelled),
+        "writing the material changes nothing the run simulated"
+    );
+    let bytes = fs::read(&material_path).expect("the material is written");
+    let material: Value = serde_json::from_slice(&bytes).expect("the material is JSON");
+    let (_, again) = refresh_replay(&dir, &corpus, Some("again"), &tuned);
+    assert_eq!(
+        fs::read(again).unwrap(),
+        bytes,
+        "the same run samples the same refreshes"
+    );
+
+    let by_refresh = refreshes(&material);
+    assert!(!by_refresh.is_empty(), "a refresh is sampled: {material}");
+    let mut excluded = None;
+    let mut below_zero = 0;
+    for samples in by_refresh.values() {
+        let mut indexes: Vec<u64> = samples
+            .iter()
+            .map(|sample| sample["facet_index"].as_u64().expect("a facet index"))
+            .collect();
+        indexes.sort_unstable();
+        let every_facet: Vec<u64> = (0..samples.len() as u64).collect();
+        assert_eq!(
+            indexes, every_facet,
+            "every facet of a refresh: {samples:?}"
+        );
+
+        // A handle names one memory in a refresh, and a memory found under
+        // several facets keeps its handle.
+        let mut memory_of = BTreeMap::new();
+        let mut handle_of = BTreeMap::new();
+        for sample in samples {
+            assert!(sample["facet"].is_string(), "{sample}");
+            assert_eq!(
+                sample["reranked"], true,
+                "the fake reranker answers: {sample}"
+            );
+            let rerank_query = sample["rerank_query"].as_str().expect("a rerank query");
+            let pool = candidates(sample);
+            let taken = pool.iter().filter(|c| c["taken"] == "budget").count();
+            assert!(taken <= 2, "the facet budget is 2: {sample}");
+            for candidate in pool {
+                let sentence = candidate["sentence"].as_str().unwrap();
+                let logit = candidate["logit"]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("a reranked candidate's logit: {candidate}"));
+                assert_eq!(logit, fake_logit(rerank_query, sentence), "{candidate}");
+                below_zero += usize::from(logit < 0.0);
+                let taken = candidate["taken"]
+                    .as_str()
+                    .expect("what took the candidate");
+                assert!(["budget", "cited", "cut"].contains(&taken), "{candidate}");
+                let memory = candidate["memory"].as_str().unwrap();
+                match candidate["input"].as_str() {
+                    Some(handle) => {
+                        let named = memory_of.entry(handle.to_string()).or_insert(memory);
+                        assert_eq!(*named, memory, "{handle} names one memory: {samples:?}");
+                        let kept = handle_of.entry(memory.to_string()).or_insert(handle);
+                        assert_eq!(*kept, handle, "{memory} keeps its handle: {samples:?}");
+                    }
+                    None if taken == "cut" => {
+                        excluded.get_or_insert((sample["query"].clone(), memory, logit));
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    assert!(
+        below_zero > 0,
+        "memories sharing nothing with a facet are scored"
+    );
+    let (query, memory, logit) =
+        excluded.expect("a cut candidate the writer never saw is in the material");
+
+    let label = json!({ "query": query, "memory": memory, "relevant": true });
+    let labels = dir.private_file(
+        "labelling/facets.toml",
+        &toml::to_string(&json!({ "facet": [label] })).unwrap(),
+    );
+    let curve = curve(&dir, &labels, &material_path);
+    assert_eq!(curve["refresh"]["matched"], 1, "{curve}");
+    let points = curve["refresh"]["curve"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a refresh curve: {curve}"));
+    assert_eq!(points.len(), 1, "{curve}");
+    assert_eq!(points[0]["floor"].as_f64(), Some(logit), "{curve}");
+    assert_eq!(points[0]["precision"].as_f64(), Some(1.0), "{curve}");
+}
+
+/// The labelled material of a `live` run on `facts` with `manifest`, and
+/// the corpus.
+fn refresh_material(dir: &TestDir, facts: &[(&str, &str)], manifest: &str) -> (Value, PathBuf) {
+    let corpus = refresh_history_of(dir, facts, manifest);
+    let script = refresh_script(dir);
+    replay_history(dir, &corpus, "live", REFRESH_PROBES, Some(&script), &[]).ok();
+    let (_, path) = refresh_replay(dir, &corpus, Some("material"), &[]);
+    (read_json(&path), corpus)
+}
+
+/// The models of `material`'s sampled refreshes, one per refresh.
+fn sampled_models(material: &Value) -> Vec<String> {
+    refreshes(material)
+        .into_keys()
+        .map(|(_, model)| model)
+        .collect()
+}
+
+/// The refresh material samples every refresh when there are 10 or fewer,
+/// the other models' as well as the seeded profile's. When there are more,
+/// it takes 10, the profile's first: with a profile that refreshes more
+/// than 10 times, the other model that refreshes beside it isn't sampled.
+/// `report rescore` leaves the refresh samples as they were.
+#[test]
+fn refresh_samples_take_ten_refreshes_the_profiles_first() {
+    let manifest = model_manifest(HOME_QUESTION);
+
+    let dir = TestDir::new();
+    let (material, corpus) = refresh_material(&dir, &REFRESH_FACTS[..3], &manifest);
+    let few = sampled_models(&material);
+    assert!(few.len() <= 10, "{few:?}");
+    let models: BTreeSet<&str> = few.iter().map(String::as_str).collect();
+    assert_eq!(models.len(), 2, "both models are sampled: {few:?}");
+    assert!(models.contains("home"), "{few:?}");
+
+    let input = dir.private_path("labelling/material.json");
+    let out = dir.private_path("labelling/rescored.json");
+    assert_ok(&rescore(&dir, &input, &corpus, "message", &out));
+    assert_eq!(read_json(&out)["refresh"], material["refresh"]);
+
+    let dir = TestDir::new();
+    let (material, _) = refresh_material(&dir, &REFRESH_FACTS, &manifest);
+    let many = sampled_models(&material);
+    assert_eq!(many.len(), 10, "{many:?}");
+    assert!(!many.iter().any(|model| model == "home"), "{many:?}");
+}
+
+/// A refresh candidate with its logit left out: what the refresh recorded
+/// of it, which a rescore keeps.
+fn recorded(candidate: &Value) -> Value {
+    let mut candidate = candidate.clone();
+    candidate.as_object_mut().unwrap().remove("logit");
+    candidate
+}
+
+/// `report rescore --refresh-queries` scores the fixed refresh pools again
+/// against another query for a facet, named by its heading: every sample of
+/// that facet records the query as `rerank_query`, and each candidate's
+/// logit is the fake reranker's for it. The sample keeps its `query`, so
+/// facet labels match the same candidates, and keeps every candidate with
+/// what the refresh recorded of it: its strength, score, rank, citation,
+/// what took it and its handle. Samples of other facets stay as they were,
+/// and the same rescore writes the same bytes.
+#[test]
+fn refresh_queries_rescore_the_fixed_pools_keeping_label_keys_and_selection() {
+    let dir = TestDir::new();
+    let (material, corpus) = refresh_material(&dir, &REFRESH_FACTS[..3], hermes::MANIFEST);
+    let samples = material["refresh"].as_array().expect("a refresh list");
+    let heading = samples.first().expect("a refresh is sampled")["facet"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let alternative = "Tim pasta family";
+    let queries = toml::to_string(&json!({ heading.as_str(): alternative })).unwrap();
+    let queries = dir.private_file("labelling/refresh-queries.toml", &queries);
+    let flags = ["--refresh-queries", queries.to_str().unwrap()];
+
+    let input = dir.private_path("labelling/material.json");
+    let out = dir.private_path("labelling/rescored.json");
+    assert_ok(&rescore_with(
+        &dir, &input, &corpus, "message", &out, &flags,
+    ));
+    let rescored = read_json(&out);
+    let after = rescored["refresh"].as_array().expect("a refresh list");
+    assert_eq!(after.len(), samples.len());
+
+    let mut changed = 0;
+    for (before, after) in samples.iter().zip(after) {
+        if before["facet"] != heading.as_str() {
+            assert_eq!(after, before, "another facet's sample is as it was");
+            continue;
+        }
+        for key in [
+            "sample",
+            "at",
+            "model",
+            "facet",
+            "facet_index",
+            "query",
+            "reranked",
+        ] {
+            assert_eq!(after[key], before[key], "{key} is kept: {after}");
+        }
+        assert_eq!(after["rerank_query"], alternative, "{after}");
+        let by_id = |sample: &Value| -> BTreeMap<String, Value> {
+            candidates(sample)
+                .iter()
+                .map(|c| (c["id"].as_str().unwrap().to_string(), c.clone()))
+                .collect()
+        };
+        let (was, now) = (by_id(before), by_id(after));
+        assert_eq!(
+            was.keys().collect::<Vec<_>>(),
+            now.keys().collect::<Vec<_>>(),
+            "the same candidates: {after}"
+        );
+        for (id, candidate) in &now {
+            assert_eq!(recorded(candidate), recorded(&was[id]), "{candidate}");
+            let sentence = candidate["sentence"].as_str().unwrap();
+            let logit = candidate["logit"].as_f64().expect("a rescored logit");
+            assert_eq!(logit, fake_logit(alternative, sentence), "{candidate}");
+            changed += usize::from(Some(logit) != was[id]["logit"].as_f64());
+        }
+    }
+    assert!(changed > 0, "the other query moves some logit");
+
+    let again = dir.private_path("labelling/rescored-again.json");
+    assert_ok(&rescore_with(
+        &dir, &input, &corpus, "message", &again, &flags,
+    ));
+    assert_eq!(fs::read(&again).unwrap(), fs::read(&out).unwrap());
+
+    // Facet labels keyed by the stored query reach the same candidates.
+    let keys: BTreeSet<(&str, &str)> = samples
+        .iter()
+        .flat_map(|sample| {
+            let query = sample["query"].as_str().unwrap();
+            candidates(sample)
+                .iter()
+                .map(move |candidate| (query, candidate["memory"].as_str().unwrap()))
+        })
+        .collect();
+    let labels: Vec<Value> = keys
+        .into_iter()
+        .map(|(query, memory)| json!({ "query": query, "memory": memory, "relevant": true }))
+        .collect();
+    let labels = dir.private_file(
+        "labelling/facets.toml",
+        &toml::to_string(&json!({ "facet": labels })).unwrap(),
+    );
+    let (before, after) = (curve(&dir, &labels, &input), curve(&dir, &labels, &out));
+    for key in ["labelled", "unlabelled", "matched", "unmatched"] {
+        assert_eq!(after["refresh"][key], before["refresh"][key], "{key}");
+    }
+    assert_eq!(before["refresh"]["unlabelled"], 0, "{before}");
+}
+
+// Refresh queries in a replay.
+
+/// More memories than a retrieval arm returns (100), every one sharing
+/// several words with one profile facet's query, so they fill that facet's
+/// pool and [`TARGET`], which shares none, is left out of it.
+const FILLERS: usize = 110;
+
+/// The memory a mapped query pulls into the pool: Tim's quote and its
+/// sentence.
+const TARGET: (&str, &str) = ("I own a blue kayak", "Tim owns a blue kayak.");
+
+/// The query the facet is mapped to, sharing words with [`TARGET`] and
+/// none with a filler.
+const MAPPED_QUERY: &str = "blue kayak";
+
+/// Filler `n`: Tim's quote and its sentence.
+fn filler(n: usize) -> (String, String) {
+    (
+        format!("family friends and colleagues include Zed{n:03}"),
+        format!("Tim's family friends and colleagues include Zed{n:03}."),
+    )
+}
+
+/// Ten fillers a turn, one session each, an hour apart. Insert the target
+/// before the last filler turn so it exists during a sampled refresh.
+fn pool_history(dir: &TestDir) -> PathBuf {
+    import_history(dir, |path| {
+        let db = StateDb::create(path);
+        let fillers: Vec<(String, String)> = (0..FILLERS).map(filler).collect();
+        let mut turns: Vec<String> = fillers
+            .chunks(10)
+            .map(|chunk| {
+                let quotes: Vec<&str> = chunk.iter().map(|(quote, _)| quote.as_str()).collect();
+                format!("By the way, {}.", quotes.join(", and "))
+            })
+            .collect();
+        turns.insert(turns.len() - 1, format!("By the way, {}.", TARGET.0));
+        for (turn, user) in turns.iter().enumerate() {
+            let session = format!("s{turn:02}");
+            let at = start() + 3600.0 * turn as f64;
+            db.owner_session(&session, at);
+            db.turn(&session, at, user, "Noted.");
+        }
+        db
+    })
+}
+
+/// Every call 1 claims every filler and the target, each kept only in the
+/// turn that quotes it, and call 2 labels nothing.
+fn pool_script(dir: &TestDir) -> PathBuf {
+    let mut facts: Vec<(String, String)> = (0..FILLERS).map(filler).collect();
+    facts.push((TARGET.0.to_string(), TARGET.1.to_string()));
+    let claims = facts
+        .iter()
+        .map(|(quote, sentence)| {
+            let mut claim = claim(sentence, quote, "fact");
+            claim["claim"] = json!("c1");
+            claim["labels"] = json!([]);
+            claim
+        })
+        .collect();
+    script_answering_everything(dir, "pool-script", claims, vec![])
+}
+
+/// A probe the target passes, which names it.
+const POOL_PROBES: &str = r#"
+[[probe]]
+id = "p001"
+at = "2026-01-06T12:00:00Z"
+kind = "exists"
+memory = "blue kayak"
+"#;
+
+/// A `fast` run with every refresh write skipped, so it calls no LLM,
+/// writing its material to `labelling/<name>.json` and its report to
+/// `reports/<name>.json`, with `extra` flags.
+fn pool_run(dir: &TestDir, corpus: &Path, name: &str, extra: &[&str]) -> support::Run {
+    let material = dir.private_path(&format!("labelling/{name}.json"));
+    let mut flags = vec![
+        "--refresh",
+        "off",
+        "--labelling",
+        material.to_str().unwrap(),
+    ];
+    flags.extend(extra);
+    replay_history_to(dir, corpus, "fast", POOL_PROBES, name, None, &flags)
+}
+
+/// A refresh sample's candidates as retrieval and reranking found them,
+/// leaving out what the selection across facets made of them: what took
+/// each, its handle and its citation can change when another facet's pool
+/// does.
+fn retrieved(sample: &Value) -> Vec<Value> {
+    candidates(sample)
+        .iter()
+        .map(|candidate| {
+            let keys = ["memory", "sentence", "logit", "strength", "score", "rank"];
+            keys.iter()
+                .map(|key| (key.to_string(), candidate[key].clone()))
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        })
+        .collect()
+}
+
+/// `material`'s refresh samples by refresh and facet.
+fn by_facet(material: &Value) -> BTreeMap<(String, String, u64), &Value> {
+    material["refresh"]
+        .as_array()
+        .expect("a refresh list")
+        .iter()
+        .map(|sample| {
+            let key = (
+                sample["at"].as_str().unwrap().to_string(),
+                sample["model"].as_str().unwrap().to_string(),
+                sample["facet_index"].as_u64().unwrap(),
+            );
+            (key, sample)
+        })
+        .collect()
+}
+
+/// Whether `memory` is in `sample`'s pool.
+fn pools(sample: &Value, memory: &str) -> bool {
+    candidates(sample).iter().any(|c| c["memory"] == memory)
+}
+
+/// `replay --refresh-queries` retrieves with the mapped query, not only
+/// reranks with it: the facet whose own query leaves the target out of its
+/// pool (the fillers fill it) finds the target under a query that names it.
+/// Its samples record that query as `rerank_query`, scored with it, and
+/// keep their `query`, so a facet label keyed by it reaches the target in
+/// this run's material and finds nothing in the run without the option.
+/// The other facets retrieve and rerank as they did. The report holds the
+/// file's SHA-256; a run without the option holds none and writes the same
+/// material as before.
+#[test]
+fn refresh_queries_in_a_replay_change_the_retrieved_pool_keeping_label_keys() {
+    let dir = TestDir::new();
+    let corpus = pool_history(&dir);
+    let script = pool_script(&dir);
+    replay_history(&dir, &corpus, "live", POOL_PROBES, Some(&script), &[]).ok();
+
+    let base_run = pool_run(&dir, &corpus, "base", &[]);
+    let base_report = base_run.ok();
+    assert_eq!(base_report["refresh_queries_hash"], Value::Null);
+    let base_path = dir.private_path("labelling/base.json");
+    let base = read_json(&base_path);
+    pool_run(&dir, &corpus, "again", &[]).ok();
+    assert_eq!(
+        fs::read(dir.private_path("labelling/again.json")).unwrap(),
+        fs::read(&base_path).unwrap(),
+        "without the option the material is the same"
+    );
+
+    let target = probe_in(&base_report, "p001")["observed"]["id"]
+        .as_str()
+        .expect("the probe finds the target")
+        .to_string();
+    let base_samples = by_facet(&base);
+    let heading = base_samples
+        .values()
+        .map(|sample| sample["facet"].as_str().unwrap())
+        .find(|heading| {
+            base_samples
+                .values()
+                .filter(|sample| sample["facet"] == *heading)
+                .all(|sample| !pools(sample, &target))
+        })
+        .expect("a facet whose own query leaves the target out of its pool")
+        .to_string();
+
+    let text = toml::to_string(&json!({ heading.as_str(): MAPPED_QUERY })).unwrap();
+    let queries = dir.private_file("refresh-queries.toml", &text);
+    let flags = ["--refresh-queries", queries.to_str().unwrap()];
+    let mapped_report = pool_run(&dir, &corpus, "mapped", &flags).ok();
+    let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+    assert_eq!(mapped_report["refresh_queries_hash"], hash.as_str());
+    let mapped = read_json(&dir.private_path("labelling/mapped.json"));
+    let mapped_samples = by_facet(&mapped);
+    assert_eq!(
+        mapped_samples.keys().collect::<Vec<_>>(),
+        base_samples.keys().collect::<Vec<_>>(),
+        "the same refreshes and facets are sampled"
+    );
+
+    let mut found = 0;
+    for (key, after) in &mapped_samples {
+        let before = base_samples[key];
+        for field in ["facet", "query", "reranked"] {
+            assert_eq!(after[field], before[field], "{field} is kept: {after}");
+        }
+        if after["facet"] != heading.as_str() {
+            assert_eq!(after["rerank_query"], before["rerank_query"], "{after}");
+            assert_eq!(retrieved(after), retrieved(before), "{after}");
+            continue;
+        }
+        assert_eq!(after["rerank_query"], MAPPED_QUERY, "{after}");
+        for candidate in candidates(after) {
+            let sentence = candidate["sentence"].as_str().unwrap();
+            let logit = candidate["logit"].as_f64().expect("a logit");
+            assert_eq!(logit, fake_logit(MAPPED_QUERY, sentence), "{candidate}");
+        }
+        if pools(after, &target) {
+            assert!(
+                !pools(before, &target),
+                "the base pool excludes the target at the same sampled refresh: {key:?}"
+            );
+            found += 1;
+        }
+    }
+    assert!(
+        found > 0,
+        "the mapped query brings the target into the pool"
+    );
+
+    // A facet label keyed by the facet's own query reaches the target only
+    // where the mapped query retrieved it.
+    let query = mapped_samples
+        .values()
+        .find(|sample| sample["facet"] == heading.as_str())
+        .unwrap()["query"]
+        .clone();
+    let label = json!({ "query": query, "memory": target, "relevant": true });
+    let labels = dir.private_file(
+        "labelling/facets.toml",
+        &toml::to_string(&json!({ "facet": [label] })).unwrap(),
+    );
+    let mapped_path = dir.private_path("labelling/mapped.json");
+    assert_eq!(curve(&dir, &labels, &mapped_path)["refresh"]["matched"], 1);
+    assert_eq!(curve(&dir, &labels, &base_path)["refresh"]["unmatched"], 1);
+}
+
+/// The refresh queries file is history: one outside the private dir is
+/// refused, and so is one naming a heading no refresh facet has or giving
+/// a blank query, each before the run, naming the file and quoting
+/// nothing of it, with no report or material written.
+#[test]
+fn refresh_queries_in_a_replay_are_refused_before_the_run() {
+    let dir = TestDir::new();
+    let corpus = refresh_history(&dir);
+    let script = refresh_script(&dir);
+    replay_history(&dir, &corpus, "live", REFRESH_PROBES, Some(&script), &[]).ok();
+    let (_, material) = refresh_replay(&dir, &corpus, Some("material"), &[]);
+    let heading = read_json(&material)["refresh"][0]["facet"]
+        .as_str()
+        .expect("a refresh is sampled")
+        .to_string();
+
+    let sentinel = "SENTINEL-REFRESH-QUERY-6d0e";
+    let cases = [
+        (
+            "unknown",
+            format!("\"{sentinel} heading\" = \"{sentinel}\"\n"),
+        ),
+        (
+            "blank",
+            toml::to_string(&json!({ heading.as_str(): "   " })).unwrap(),
+        ),
+    ];
+    for (name, text) in cases {
+        let file = format!("refresh-queries-{name}.toml");
+        let queries = dir.private_file(&file, &text);
+        let path = dir.private_path(&format!("labelling/{name}.json"));
+        let flags = [
+            "--refresh-queries",
+            queries.to_str().unwrap(),
+            "--labelling",
+            path.to_str().unwrap(),
+        ];
+        let run = replay_history_to(&dir, &corpus, "fast", REFRESH_PROBES, name, None, &flags);
+        assert_refused_without(&run.output, sentinel, &[&file]);
+        assert!(!run.report_path.exists(), "{name}: no report");
+        assert!(!path.exists(), "{name}: no material");
+    }
+
+    let outside = dir.file("refresh-queries.toml", "\"People\" = \"Who?\"\n");
+    let flags = ["--refresh-queries", outside.to_str().unwrap()];
+    let run = replay_history_to(
+        &dir,
+        &corpus,
+        "fast",
+        REFRESH_PROBES,
+        "outside",
+        None,
+        &flags,
+    );
+    assert_refused(&run.output, "private");
+    assert!(!run.report_path.exists());
+}
+
+// Refresh curves, worked by hand.
+
+/// A refresh candidate in the hand-written material.
+fn refresh_candidate(
+    n: u32,
+    logit: Option<f64>,
+    taken: &str,
+    cited: bool,
+    input: Option<&str>,
+) -> Value {
+    let sentence = format!("{MATERIAL_SENTINEL} sentence {n}");
+    json!({
+        "memory": memory(n), "sentence": sentence, "logit": logit, "strength": 0.5,
+        "score": 0.5, "cited": cited, "taken": taken, "input": input
+    })
+}
+
+/// A refresh sample of the profile at 04:00 on `day` of January 2026, for
+/// the facet asking `name`, its candidates numbered and ranked in order.
+fn refresh_sample(
+    sample: &str,
+    day: u8,
+    facet_index: u32,
+    name: &str,
+    candidates: Vec<Value>,
+) -> Value {
+    let reranked = candidates.iter().any(|c| !c["logit"].is_null());
+    let candidates: Vec<Value> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut candidate)| {
+            candidate["id"] = json!(format!("{sample}.{}", index + 1));
+            candidate["rank"] = json!(index + 1);
+            candidate
+        })
+        .collect();
+    json!({
+        "sample": sample,
+        "at": format!("2026-01-{day:02}T04:00:00Z"),
+        "model": "User profile",
+        "facet": format!("{MATERIAL_SENTINEL} heading {name}"),
+        "facet_index": facet_index,
+        "query": query(name),
+        "rerank_query": query(name),
+        "reranked": reranked,
+        "candidates": candidates
+    })
+}
+
+/// Two refreshes of two facets each, "people" and "home".
+///
+/// - Refresh 1: people shows memory 1 at 2.5 and 2 at 0.5, both in its
+///   budget, and 3 at -1.5, cut; home shows 3 at 1.5 in its budget and 4 at
+///   -0.5, taken by the cited fill. The model cites 2, 3 and 4.
+/// - Refresh 2: the reranker missed people, which shows 1 and 5 with no
+///   logit, both in its budget; home shows 4 at 0.5. The model cites 1.
+fn hand_refresh_material() -> Value {
+    let c = refresh_candidate;
+    json!({
+        "version": 3,
+        "recall": [],
+        "call2": [],
+        "refresh": [
+            refresh_sample("f1", 5, 0, "people", vec![
+                c(1, Some(2.5), "budget", false, Some("m1")),
+                c(2, Some(0.5), "budget", true, Some("m2")),
+                c(3, Some(-1.5), "cut", true, Some("m3"))
+            ]),
+            refresh_sample("f2", 5, 1, "home", vec![
+                c(3, Some(1.5), "budget", true, Some("m3")),
+                c(4, Some(-0.5), "cited", true, Some("m4"))
+            ]),
+            refresh_sample("f3", 6, 0, "people", vec![
+                c(1, None, "budget", true, Some("m1")),
+                c(5, None, "budget", false, Some("m2"))
+            ]),
+            refresh_sample("f4", 6, 1, "home", vec![c(4, Some(0.5), "budget", false, Some("m3"))])
+        ]
+    })
+}
+
+/// Facet labels for [`hand_refresh_material`]: under people, 1 and 5 are
+/// relevant and 2 and 3 aren't; under home, 3 is and 4 isn't. One more,
+/// under a query no sample asks, judges nothing shown.
+fn hand_facet_labels() -> String {
+    let labels = [
+        ("people", 1, true),
+        ("people", 2, false),
+        ("people", 3, false),
+        ("people", 5, true),
+        ("home", 3, true),
+        ("home", 4, false),
+        ("gone", 9, true),
+    ]
+    .map(|(name, n, relevant)| {
+        json!({ "query": query(name), "memory": memory(n), "relevant": relevant })
+    });
+    toml::to_string(&json!({ "facet": labels })).unwrap()
+}
+
+/// `curve[list][index]` as a curve of its own, for the helpers.
+fn nested(curve: &Value, list: &str, index: usize) -> Value {
+    json!({ "nested": curve["refresh"][list][index] })
+}
+
+/// The refresh section, worked by hand from [`hand_refresh_material`] and
+/// [`hand_facet_labels`]. A candidate with no logit is labelled but never
+/// kept, never counts toward an input size and never retains a citation.
+///
+/// Pooled: 8 candidates labelled; 6 labels matched and "gone" unmatched.
+/// Logits 2.5 T, 0.5 F, -1.5 F, 1.5 T, -0.5 F, 0.5 F, and two null T.
+/// - floor -1.5: 6 kept, 2 relevant
+/// - floor -0.5: 5 kept, 2 relevant, 0.4
+/// - floor 0.5: 4 kept, 2 relevant, 0.5
+/// - floor 1.5: 2 kept, 2 relevant, 1.0
+/// - floor 2.5: 1 kept, 1 relevant, 1.0
+///
+/// People (first in f1, facet 0): 5 labelled, 4 matched, 0 unmatched;
+/// 2.5 T, 0.5 F, -1.5 F and two null T: floors -1.5 (3, 1), 0.5 (2, 1) and
+/// 2.5 (1, 1). Home (first in f2, facet 1): 3 labelled, 2 matched; 1.5 T,
+/// -0.5 F, 0.5 F: floors -0.5 (3, 1), 0.5 (2, 1) and 1.5 (1, 1). The label
+/// under "gone" belongs to no facet.
+///
+/// Inputs, at the pooled floors: f1's budget took 2.5 and 0.5, f2's 1.5
+/// (the cited fill's -0.5 isn't its budget's), f3's two nulls, f4's 0.5.
+///
+/// Cited: refresh 1 cites 2 (best 0.5), 3 (best 1.5, under home though
+/// people cut it) and 4 (-0.5); refresh 2 cites 1, with no logit. Of 4:
+/// 3 retained at -1.5 and -0.5, 2 at 0.5, 1 at 1.5, none at 2.5.
+#[test]
+fn the_refresh_curves_match_a_hand_computed_example() {
+    let dir = TestDir::new();
+    let material = dir.private_json("labelling/refresh.json", &hand_refresh_material());
+    let labels = dir.private_file("labelling/facets.toml", &hand_facet_labels());
+    let curve = curve(&dir, &labels, &material);
+
+    assert_counts(&curve, "refresh", [8, 0, 6, 1]);
+    assert_points(
+        &curve,
+        "refresh",
+        &[
+            (-1.5, 6, 2, 2.0 / 6.0),
+            (-0.5, 5, 2, 0.4),
+            (0.5, 4, 2, 0.5),
+            (1.5, 2, 2, 1.0),
+            (2.5, 1, 1, 1.0),
+        ],
+    );
+
+    let facets = curve["refresh"]["facets"].as_array().expect("facet curves");
+    assert_eq!(facets.len(), 2, "{curve}");
+    for (index, sample, facet_index) in [(0, "f1", 0), (1, "f2", 1)] {
+        assert_eq!(facets[index]["sample"], sample, "{curve}");
+        assert_eq!(facets[index]["facet_index"], facet_index, "{curve}");
+    }
+    let people = nested(&curve, "facets", 0);
+    assert_counts(&people, "nested", [5, 0, 4, 0]);
+    assert_points(
+        &people,
+        "nested",
+        &[(-1.5, 3, 1, 1.0 / 3.0), (0.5, 2, 1, 0.5), (2.5, 1, 1, 1.0)],
+    );
+    let home = nested(&curve, "facets", 1);
+    assert_counts(&home, "nested", [3, 0, 2, 0]);
+    assert_points(
+        &home,
+        "nested",
+        &[(-0.5, 3, 1, 1.0 / 3.0), (0.5, 2, 1, 0.5), (1.5, 1, 1, 1.0)],
+    );
+
+    let floors = [-1.5, -0.5, 0.5, 1.5, 2.5];
+    let inputs = |sample: &str, budget: u64, sizes: [u64; 5]| {
+        let sizes: Vec<Value> = floors
+            .iter()
+            .zip(sizes)
+            .map(|(floor, size)| json!({ "floor": floor, "size": size }))
+            .collect();
+        json!({ "sample": sample, "budget": budget, "sizes": sizes })
+    };
+    assert_eq!(
+        curve["refresh"]["inputs"],
+        json!([
+            inputs("f1", 2, [2, 2, 2, 1, 1]),
+            inputs("f2", 1, [1, 1, 1, 1, 0]),
+            inputs("f3", 2, [0, 0, 0, 0, 0]),
+            inputs("f4", 1, [1, 1, 1, 0, 0])
+        ]),
+        "{curve}"
+    );
+    let cited: Vec<Value> = floors
+        .iter()
+        .zip([3, 3, 2, 1, 0])
+        .map(|(floor, retained)| {
+            let share = f64::from(retained) / 4.0;
+            json!({ "floor": floor, "cited": 4, "retained": retained, "share": share })
+        })
+        .collect();
+    assert_eq!(curve["refresh"]["cited"], json!(cited), "{curve}");
+}
+
+/// Input sizes and cited retention are read at the floors facet labels
+/// give, so with no facet label matching anything there are none: each
+/// sample still counts what its budget took. Facet labels are keyed only:
+/// a refresh candidate's id in a file of candidate ids is refused, naming
+/// the labels file and quoting nothing.
+#[test]
+fn refresh_floors_come_only_from_keyed_facet_labels() {
+    let dir = TestDir::new();
+    let material = dir.private_json("labelling/refresh.json", &hand_refresh_material());
+    let label = json!({ "query": query("gone"), "memory": memory(9), "relevant": true });
+    let unmatched = toml::to_string(&json!({ "facet": [label] })).unwrap();
+    let labels = dir.private_file("labelling/unmatched.toml", &unmatched);
+    let curve = curve(&dir, &labels, &material);
+    assert_counts(&curve, "refresh", [0, 8, 0, 1]);
+    assert_points(&curve, "refresh", &[]);
+    let budgets: Vec<(Value, Value)> = curve["refresh"]["inputs"]
+        .as_array()
+        .expect("a sample's inputs")
+        .iter()
+        .map(|sample| (sample["budget"].clone(), sample["sizes"].clone()))
+        .collect();
+    let none = json!([]);
+    assert_eq!(
+        budgets,
+        [2, 1, 2, 1].map(|budget| (json!(budget), none.clone())),
+        "{curve}"
+    );
+    assert_eq!(curve["refresh"]["cited"], none, "{curve}");
+
+    let labels = dir.private_file("labelling/ids.toml", "\"f1.1\" = true\n");
+    let output = precision(&dir, &labels, &material, &[]);
+    assert_refused_without(&output, MATERIAL_SENTINEL, &["ids.toml"]);
 }
 
 /// Tim's home turn, then a session whose second message leans on the
@@ -1133,6 +2068,18 @@ fn sampling_prefers_labelled_queries_so_labels_carry_over() {
 // Rescoring fixed pools.
 
 fn rescore(dir: &TestDir, material: &Path, corpus: &Path, mode: &str, out: &Path) -> Output {
+    rescore_with(dir, material, corpus, mode, out, &[])
+}
+
+/// [`rescore`] with `extra` flags.
+fn rescore_with(
+    dir: &TestDir,
+    material: &Path,
+    corpus: &Path,
+    mode: &str,
+    out: &Path,
+    extra: &[&str],
+) -> Output {
     asphodel(dir)
         .args(["report", "rescore", "--material"])
         .arg(material)
@@ -1141,6 +2088,7 @@ fn rescore(dir: &TestDir, material: &Path, corpus: &Path, mode: &str, out: &Path
         .args(["--rerank-query", mode])
         .arg("--out")
         .arg(out)
+        .args(extra)
         .output()
         .unwrap()
 }

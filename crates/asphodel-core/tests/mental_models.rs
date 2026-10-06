@@ -40,10 +40,10 @@ use asphodel_core::mental_models::{
 };
 use asphodel_core::models::{
     Embedder, FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmGate, LlmRequest,
-    LlmResponse, LlmRetry, ModelError as EmbedError, Models, RetryPolicy,
+    LlmResponse, LlmRetry, ModelError as EmbedError, Models, Reranker, RetryPolicy,
 };
 use asphodel_core::operations::{Audit, AuditList, RecallRow};
-use asphodel_core::retrieval::{Prefetch, PrefetchRequest, estimate_tokens};
+use asphodel_core::retrieval::{Prefetch, PrefetchRequest, Taken, estimate_tokens};
 use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME};
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::strength::{Kind, TimePrecision, WorldTime};
@@ -2882,6 +2882,106 @@ fn a_refresh_whose_retrieval_fails_waits_thirty_minutes_like_any_failure() {
     let profile = h.profile();
     assert_eq!(profile.last_error, None);
     assert_eq!(profile.last_refreshed_at, Some(failed_at + minutes(30)));
+}
+
+/// A reranker that never answers.
+struct FailingReranker;
+
+impl Reranker for FailingReranker {
+    fn model_id(&self) -> &str {
+        FakeReranker::MODEL_ID
+    }
+
+    fn rerank(&self, _: &str, _: &[&str]) -> Result<Vec<f32>, EmbedError> {
+        Err(EmbedError::Inference {
+            model: FakeReranker::MODEL_ID.into(),
+            reason: "the test made it fail".into(),
+        })
+    }
+}
+
+#[test]
+fn a_scored_refresh_the_reranker_fails_has_no_logits_and_ranks_on_strength() {
+    // The refresh goes on without the reranker, and what it scored says
+    // so: no facet reranked and no candidate with a logit, rather than the
+    // 0.0 the ranking stands in with, so no floor can count one as passing.
+    let models = Models {
+        embedder: Arc::new(FakeEmbedder),
+        reranker: Arc::new(FailingReranker),
+    };
+    let h = Harness::build(|_| {}, models, Vec::new()).0;
+    let tea = h.says(fact(TEA));
+    let cat = h.says(fact(CAT).level("critical"));
+    h.advance(minutes(5));
+    let llm = quiet_llm(1);
+    let (ran, scored) = h.service.scored_refreshes(&llm).unwrap();
+    assert_eq!(ran.ran.len(), 1);
+    assert!(matches!(ran.ran[0].outcome, Outcome::Applied(_)), "{ran:?}");
+    assert_eq!(writes(&llm), 1, "the refresh still writes");
+
+    let [refresh] = &scored[..] else {
+        panic!("one scored refresh: {scored:?}");
+    };
+    assert_eq!(refresh.model, PROFILE_NAME);
+    assert_eq!(refresh.at, h.now());
+    assert!(!refresh.facets.is_empty());
+    for facet in &refresh.facets {
+        assert!(!facet.pool.reranked, "{facet:?}");
+        let pool = &facet.pool.candidates;
+        let memories: Vec<Uuid> = pool.iter().map(|c| c.memory).collect();
+        assert_eq!(memories, vec![cat, tea], "strength decides: {facet:?}");
+        for candidate in pool {
+            assert_eq!(candidate.logit, None, "{facet:?}");
+            assert_eq!(candidate.taken, Taken::Budget, "{facet:?}");
+            assert!(candidate.input.is_some(), "{facet:?}");
+        }
+    }
+}
+
+#[test]
+fn a_scored_refresh_marks_the_cited_memory_its_fill_took_past_the_budget() {
+    // As in a_cited_memory_stays_in_the_input_past_the_input_budget: the
+    // cited memory ranks below the top 3 under every facet, so each facet's
+    // budget cuts it and the cited fill takes it, while the strong facts
+    // past the budget are cut. Every facet shows it under the one handle
+    // it reached the write under.
+    let h = Harness::with(|t| {
+        t.mental_models.facet_budget = 3;
+        t.mental_models.input_budget = 3;
+        t.mental_models.input_budget_with_cited = 4;
+    });
+    let weak = h.seed(fact("Miso sleeps."));
+    h.profile_adding(&[(CAT_ENTRY, &[weak])]);
+    let strong = (1..=5).map(|n| fact(&format!("Fact {n}.")).level("critical"));
+    h.seed_all(BANK, h.now(), strong.collect());
+    h.advance(minutes(30));
+    let llm = quiet_llm(1);
+    let (ran, scored) = h.service.scored_refreshes(&llm).unwrap();
+    assert_eq!(ran.ran.len(), 1, "{ran:?}");
+    let [refresh] = &scored[..] else {
+        panic!("one scored refresh: {scored:?}");
+    };
+
+    let mut handles = BTreeSet::new();
+    for facet in &refresh.facets {
+        let pool = &facet.pool.candidates;
+        let cited = pool
+            .iter()
+            .find(|candidate| candidate.memory == weak)
+            .unwrap_or_else(|| panic!("the cited memory is scored: {facet:?}"));
+        assert!(cited.cited, "{facet:?}");
+        assert_eq!(cited.taken, Taken::Cited, "{facet:?}");
+        handles.insert(cited.input.clone().expect("the fill took it"));
+        let budget = pool.iter().filter(|c| c.taken == Taken::Budget).count();
+        assert_eq!(budget, 3, "{facet:?}");
+        let cut: Vec<_> = pool.iter().filter(|c| c.taken == Taken::Cut).collect();
+        assert_eq!(cut.len(), 2, "{facet:?}");
+        assert!(
+            cut.iter().all(|c| !c.cited && c.input.is_none()),
+            "{facet:?}"
+        );
+    }
+    assert_eq!(handles.len(), 1, "one handle: {handles:?}");
 }
 
 // `used` is credited by memory handle alone (docs/mental-model-answer.md,

@@ -33,6 +33,8 @@ pub struct Report {
     /// SHA-256 of the cassette as it stood when the run started; null for a
     /// scenario.
     pub cassette_hash: Option<String>,
+    /// SHA-256 of the `--refresh-queries` file; null without one.
+    pub refresh_queries_hash: Option<String>,
     /// The resolved tuning, every layer applied.
     pub tuning: Tuning,
     /// Which call 1 prompt the run extracted with.

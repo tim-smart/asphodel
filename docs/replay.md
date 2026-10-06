@@ -551,7 +551,8 @@ writes nothing; the counts hold no text, so they can be shared.
 ```
 asphodel replay --corpus <file> --mode live|replay|fast \
     [--cassette <file>] [--probes <file>] [--report <file>] [--aggregate <file>] \
-    [--labelling <file>] [--no-cache] [--refresh live|recorded|off] [--self-test] \
+    [--labelling <file>] [--refresh-queries <file>] \
+    [--no-cache] [--refresh live|recorded|off] [--self-test] \
     [--prime-concurrency [N]] \
     [--config FILE] [--overrides FILE] [--latency DURATION] [--until TIMESTAMP] \
     [--onnx-threads N] [--token-dir DIR]
@@ -765,7 +766,7 @@ The material is one JSON object:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "recall": [
     { "sample": "r1", "at": "<prefetch time>", "session": "<session id>",
       "query": "<the query the retrievers searched>",
@@ -778,7 +779,16 @@ The material is one JSON object:
       "chunk": "<uuid>", "ordinal": 0,
       "claim": "<the claim's sentence>",
       "candidates": [
-        { "id": "c1.1", "memory": "<uuid>", "score": 0.93, "sentence": "..." } ] } ]
+        { "id": "c1.1", "memory": "<uuid>", "score": 0.93, "sentence": "..." } ] } ],
+  "refresh": [
+    { "sample": "f1", "at": "<refresh time>", "model": "User profile",
+      "facet": "People", "facet_index": 1,
+      "query": "<the facet's query as the plan holds it>",
+      "rerank_query": "<what the reranker scored against>", "reranked": true,
+      "candidates": [
+        { "id": "f1.1", "memory": "<uuid>", "sentence": "...", "logit": -2.1,
+          "strength": 0.41, "score": 0.73, "rank": 1, "cited": false,
+          "taken": "budget", "input": "m4" } ] } ]
 }
 ```
 
@@ -812,6 +822,28 @@ The material is one JSON object:
   `chunk` is the chunk the claim came from and `ordinal` its index in
   call 1's reply, the two halves of what names the memory the claim
   makes. Material before version 2 has neither.
+- `refresh` holds every facet of 10 of the run's refreshes, or of every
+  refresh when there are fewer: the seeded profile's spread evenly over
+  the run first, then the other models' over what's left, in the order
+  they ran. Only refreshes that made a selection count, whether or not
+  they went on to write; one stopped by its plan call or a failed
+  retrieval has nothing to sample. Each sample is one facet's whole pool
+  after clean-up and before the facet's budget cut it, plus the cited
+  memories it scored, in score order. `logit` is the raw reranker logit,
+  and null when the facet missed the reranker, which `reranked: false`
+  also says; the scores are then strength alone, as the refresh ranked
+  them. `strength` and `score` are the memory's strength and the
+  combined score the facet ranked by, and `rank` its place in that
+  order. `cited` says the model cited the memory when the refresh began.
+  `taken` is `budget` when the facet's `facet_budget` took it, `cited`
+  when the cited fill took it past that, and `cut` otherwise. `input` is
+  the handle the memory reached the write under, whichever facet took it,
+  or null when the selection left it out; the same memory has the same
+  handle under every facet of one refresh. `query` is the facet's query as
+  the plan holds it, which facet labels are keyed by; `rerank_query` is
+  what the reranker scored against, the same query trimmed. Material
+  before version 3 has no `refresh`, and `report precision` still reads
+  it.
 - A candidate's `id` is unique in the file and numbers it within this
   run; `memory` is the memory's id in the replayed store.
 
@@ -833,7 +865,16 @@ chunk = "<the sample's chunk>"
 ordinal = 0
 memory = "<the neighbour's uuid>"
 relevant = false
+
+[[facet]]
+query = "<the refresh sample's query>"
+memory = "<uuid>"
+relevant = true
 ```
+
+A facet label says whether the memory belongs under that facet's
+heading, not whether it's about the user. It matches every candidate with
+that memory under a sample with that query, in every sampled refresh.
 
 A recall label matches every candidate with that memory under a sample
 with that query; a call 2 label, every candidate with that memory under a
@@ -867,6 +908,26 @@ candidates scoring at or above it, `relevant` counts those labelled
 `true`, and `precision` is `relevant / kept`. For recall this matches the
 gate's logit comparison. For call 2 it is a score-threshold curve over
 observed candidates, not a prediction for another reconcile floor.
+
+`refresh` has the same counts and pooled `curve` over every refresh
+sample, scored by logit. A candidate with a null logit is counted but
+never kept at any floor. Beside them:
+
+- `facets`: the same counts and curve for each facet query, in the order
+  the queries first appear, named by `sample`, the first sample with that
+  query, and its `facet_index`, since the query itself is history.
+- `inputs`: for each sample, `budget`, how many candidates the facet's
+  budget took, and at each floor of the pooled curve the `size` of what
+  it would take with that floor too: candidates with `taken = "budget"`
+  scoring at or above it.
+- `cited`: at each floor of the pooled curve, over every sampled refresh,
+  how many memories its model `cited` and how many of those are
+  `retained`, scoring at or above the floor under at least one of the
+  refresh's facets, and `share`, their ratio. Empty when no sampled
+  refresh cited anything.
+
+Facet labels are keyed only; old-form labels never reach a refresh
+candidate.
 
 For `recall` it also prints `top8`: `found` counts the candidates labelled
 `true` that rank in their sample's top 8 by score (logit), highest first
@@ -932,7 +993,7 @@ A conversation run injects differently, so call 1's requests change and
 ```
 asphodel report rescore --material <file> --corpus <file> \
     --rerank-query message|conversation --out <file> \
-    [--model-dir DIR] [--onnx-threads N]
+    [--refresh-queries <file>] [--model-dir DIR] [--onnx-threads N]
 ```
 
 scores each recall sample's candidates in the material again with the
@@ -946,17 +1007,39 @@ as `rerank_query`. Sample and candidate ids, memories, sentences and each
 sample's `query` are kept, so labels apply unchanged in either form:
 candidate ids name the same candidates, and keyed labels match the same
 query and memory. Call 2's lists, with their chunks and ordinals, are
-copied as they were.
+copied as they were, and so are the refresh samples unless
+`--refresh-queries` is given.
+
+`--refresh-queries <file>` scores refresh pools against other facet
+queries. The file is TOML, a table of facet heading to query:
+
+```toml
+"People" = "Who are the important people in Tim's life?"
+```
+
+Every refresh sample whose `facet` has that heading, of any model, is
+scored again against the query, which becomes its `rerank_query`; the
+other refresh samples are copied as they were. Only the logits change.
+The sample's `query` is kept, so facet labels match the same candidates,
+and its candidates stay in the order the refresh ranked them, with the
+`strength`, `score`, `rank`, `cited`, `taken` and `input` the refresh
+recorded: those describe the run, not the new query. A sample whose facet
+missed the reranker in the run gets logits now and is marked
+`reranked: true`, so a null logit still means the reranker never scored
+it. A heading no refresh sample has is refused, as is a blank query,
+naming the file and quoting neither, and nothing is written.
 
 The pools are the ones the material's run gathered, so the comparison
-isolates the reranker's query. Ordering is by logit alone, so it says
-nothing about prefetch's final ranking, which adds strength, state
-confidence and phase.
+isolates the reranker's query. Recall samples are reordered by logit
+alone, so they say nothing about prefetch's final ranking, which adds
+strength, state confidence and phase. Refresh samples aren't reordered:
+their order, `score` and `rank` stay the run's, and only their logits
+change.
 
 A sample with no prefetch at its session and time in the corpus is
 refused, naming the sample, and nothing is written. The material, the
-corpus and the output must be inside the private dir, and the output may
-not be either input.
+corpus, the refresh queries and the output must be inside the private
+dir, and the output may not be any input.
 
 To compare the two queries on accepted labels, rescore the labelled material
 both ways, with the corpus its run replayed and the real models, and read
@@ -979,6 +1062,48 @@ the corpus aren't the ones that run used. Compare `recall.top8` and the
 recall curves. Only the labelled candidates count, and they're the same in
 both, so a relevant memory the conversation query would have pulled into a
 pool from outside it isn't measured.
+
+To compare refresh facet queries the same way, rescore with
+`--refresh-queries` and read the `refresh` section against the same facet
+labels. The curves and input sizes move with the new logits; `budget` and
+`taken` still show what the run's own queries took.
+
+### Refresh queries in a replay
+
+```
+asphodel replay --corpus <file> ... --refresh-queries <file>
+```
+
+runs the replay with other queries for the seeded profile's facets. The
+file has the format `report rescore` takes, a TOML table of facet heading
+to query. Every refresh facet with a heading in it, of any model,
+retrieves and reranks with that query instead of its own: the vector,
+BM25 and entity arms search it and the reranker scores against it, so the
+pool itself changes, not only its logits. Nothing else does. The model's
+stored plan keeps its queries, the write request names facets by heading
+as before, and in the labelling material each refresh sample keeps the
+plan's `query`, so facet labels keep matching, with the query it ran
+recorded as `rerank_query`. The report holds the file's SHA-256 as
+`refresh_queries_hash`, null without one, and `report diff` and the HTML
+page show it beside the corpus and cassette hashes. `serve` has no such
+option and production queries are unchanged.
+
+The file is checked before the run, so only headings known then are
+accepted: the seeded profile's built-in plan, `Preferences`, `People`,
+`Work and home`, `Platforms` and `How to help`. A planned model's
+headings come from its plan call during the run and can't be named; one
+that happens to share a profile heading follows the mapping too. A
+heading the profile doesn't have and a blank query are refused, naming
+the file and quoting neither, before anything runs or is written. The
+file must be inside the private dir and may not be the report, the
+aggregate or the labelling material.
+
+A different query changes what the refresh selects, so with `--refresh
+recorded` a recorded write stands in only while every memory it cites is
+still in the input, and is skipped otherwise: the answers and probes
+then show the recorded queries' writes, not these. To see what the
+queries give, run with `--refresh live`. Selection, the material and its curves need no LLM and
+run with `--refresh off`.
 
 ### Bench
 

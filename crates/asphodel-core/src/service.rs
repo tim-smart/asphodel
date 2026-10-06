@@ -35,7 +35,7 @@ use crate::inspect::{
 use crate::keep::{KeepError, Kept, SignificanceSet, Unkept};
 use crate::mental_models::{
     Model, ModelEdit, ModelError, ModelSpec, Outcome as RefreshOutcome, RefreshInput, RefreshRun,
-    Refreshes, Schedule,
+    Refreshes, Schedule, ScoredRefresh,
 };
 use crate::models::{Embedder, LlmClient, Models, RetryBoard};
 use crate::operations::{Audit, AuditError, AuditList, Backup, BackupError, Status};
@@ -83,6 +83,10 @@ pub struct Service {
     /// The reranker deadline: [`RERANKER_DEADLINE`], fixed in code, unless
     /// [`Service::with_reranker_deadline`] set another.
     reranker_deadline: Duration,
+    /// Replay only: refresh facet heading to the query its retrieval runs
+    /// instead of the plan's ([`Service::with_refresh_queries`]). Empty
+    /// everywhere else.
+    refresh_queries: BTreeMap<String, String>,
     /// Each bank's last refresh trigger and last daily sweep. In memory;
     /// the requests themselves are in the store.
     schedule: Schedule,
@@ -150,6 +154,7 @@ impl Service {
             sessions,
             reranker_permit: Arc::default(),
             reranker_deadline: RERANKER_DEADLINE,
+            refresh_queries: BTreeMap::new(),
             schedule,
             blocks: Blocks::default(),
             refreshing: Mutex::new(()),
@@ -191,6 +196,7 @@ impl Service {
             sessions,
             reranker_permit: Arc::default(),
             reranker_deadline: RERANKER_DEADLINE,
+            refresh_queries: BTreeMap::new(),
             schedule,
             blocks: Blocks::default(),
             refreshing: Mutex::new(()),
@@ -269,6 +275,16 @@ impl Service {
     /// per slow call.
     pub fn with_reranker_deadline(mut self, deadline: Duration) -> Self {
         self.reranker_deadline = deadline;
+        self
+    }
+
+    /// The same service with every refresh facet whose heading `queries`
+    /// names retrieving and reranking with that query instead of its
+    /// plan's. The plan, and the query its scored pools are keyed by, stay
+    /// the plan's. For replay's query experiments only; `serve` never sets
+    /// it.
+    pub fn with_refresh_queries(mut self, queries: BTreeMap<String, String>) -> Self {
+        self.refresh_queries = queries;
         self
     }
 
@@ -571,6 +587,7 @@ impl Service {
             sessions: &self.sessions,
             permit: &self.reranker_permit,
             deadline: self.reranker_deadline,
+            refresh_queries: &self.refresh_queries,
         })
     }
 
@@ -1532,8 +1549,14 @@ impl Service {
     ) -> Result<RefreshOutcome, ModelError> {
         let _refreshing = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
         let row = self.model_row(bank, name)?;
-        let outcome =
-            crate::mental_models::refresh(&self.retrieval()?, &self.schedule, &row, llm, force)?;
+        let outcome = crate::mental_models::refresh(
+            &self.retrieval()?,
+            &self.schedule,
+            &row,
+            llm,
+            force,
+            None,
+        )?;
         if matches!(outcome, RefreshOutcome::Applied(_)) {
             self.blocks.invalidate(row.bank_id);
         }
@@ -1546,6 +1569,27 @@ impl Service {
     /// a timer and the replay harness after advancing its clock. A model that
     /// fails to refresh doesn't stop the rest.
     pub fn run_refreshes(&self, llm: &dyn LlmClient) -> Result<Refreshes, ModelError> {
+        self.refreshes(llm, None)
+    }
+
+    /// [`Service::run_refreshes`], also returning each refresh's selection
+    /// as it was scored: every facet's whole pool before its budget cut it,
+    /// for replay's labelling material. A refresh stopped before its
+    /// selection, by a plan call or a failed retrieval, has none.
+    pub fn scored_refreshes(
+        &self,
+        llm: &dyn LlmClient,
+    ) -> Result<(Refreshes, Vec<ScoredRefresh>), ModelError> {
+        let mut scored = Vec::new();
+        let refreshes = self.refreshes(llm, Some(&mut scored))?;
+        Ok((refreshes, scored))
+    }
+
+    fn refreshes(
+        &self,
+        llm: &dyn LlmClient,
+        mut scored: Option<&mut Vec<ScoredRefresh>>,
+    ) -> Result<Refreshes, ModelError> {
         let _refreshing = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.now();
         let tuning = &self.tuning.mental_models;
@@ -1583,7 +1627,21 @@ impl Service {
                 if !run {
                     continue;
                 }
-                match crate::mental_models::refresh(&cx, &self.schedule, &model, llm, false) {
+                let mut facets = Vec::new();
+                let capture = scored.is_some().then_some(&mut facets);
+                let refreshed =
+                    crate::mental_models::refresh(&cx, &self.schedule, &model, llm, false, capture);
+                if let Some(scored) = scored.as_deref_mut()
+                    && !facets.is_empty()
+                {
+                    scored.push(ScoredRefresh {
+                        bank: bank.clone(),
+                        model: model.name.clone(),
+                        at: now,
+                        facets,
+                    });
+                }
+                match refreshed {
                     Ok(outcome) => {
                         if matches!(outcome, RefreshOutcome::Applied(_)) {
                             self.blocks.invalidate(bank_id);

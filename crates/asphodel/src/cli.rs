@@ -906,6 +906,14 @@ pub struct ReplayArgs {
     #[arg(long, requires = "labelling", conflicts_with = "scenario")]
     pub labels: Option<PathBuf>,
 
+    /// A TOML table, under the private dir, of the seeded profile's facet
+    /// headings to other queries: every refresh facet with such a heading
+    /// retrieves and reranks with that query instead of its own. Facet
+    /// labels stay keyed by the plan's query. For query experiments; the
+    /// report records the file's hash.
+    #[arg(long, conflicts_with = "scenario")]
+    pub refresh_queries: Option<PathBuf>,
+
     /// Where to write the JSON report; `<replay dir>/reports/<name>.json`
     /// by default. Given twice, the last one wins.
     #[arg(long, overrides_with = "report")]
@@ -1087,6 +1095,12 @@ pub struct RescoreArgs {
     /// Where to write the rescored material.
     #[arg(long)]
     pub out: PathBuf,
+
+    /// A TOML table of refresh facet heading to another query: every
+    /// refresh sample of that facet is scored again against it. Without it
+    /// the refresh samples are copied unchanged.
+    #[arg(long)]
+    pub refresh_queries: Option<PathBuf>,
 
     /// Where the real models are.
     #[arg(long, env = "ASPHODEL_MODEL_DIR")]

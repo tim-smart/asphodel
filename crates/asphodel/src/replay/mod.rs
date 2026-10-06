@@ -227,6 +227,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             git_sha: option_env!("ASPHODEL_GIT_SHA"),
             corpus_hash: None,
             cassette_hash: None,
+            refresh_queries_hash: None,
             tuning: tuning.clone(),
             call1: Call1::of(&tuning),
             flags: Flags {
@@ -485,6 +486,52 @@ pub(crate) fn toml_error(path: &Path, text: &str, error: &toml::de::Error) -> an
         }
         None => anyhow!("{} doesn't parse", path.display()),
     }
+}
+
+/// A `--refresh-queries` file: refresh facet heading to the query to use
+/// instead of the facet's own, each trimmed, and the SHA-256 of the file's
+/// bytes.
+pub(crate) struct RefreshQueries {
+    pub queries: std::collections::BTreeMap<String, String>,
+    pub hash: String,
+}
+
+/// Reads a `--refresh-queries` file, refusing a blank query and any
+/// heading `known` doesn't accept, which `unknown_means` describes, as "no
+/// refresh sample has". Errors name the file and never quote it: headings
+/// and queries can hold the owner's name.
+pub(crate) fn load_refresh_queries(
+    path: &Path,
+    known: impl Fn(&str) -> bool,
+    unknown_means: &str,
+) -> anyhow::Result<RefreshQueries> {
+    use sha2::{Digest, Sha256};
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| anyhow!("{} isn't UTF-8 text", path.display()))?;
+    let queries: std::collections::BTreeMap<String, String> =
+        toml::from_str(&text).map_err(|error| toml_error(path, &text, &error))?;
+    let unknown = queries.keys().filter(|heading| !known(heading)).count();
+    if unknown > 0 {
+        bail!(
+            "{} names {unknown} facet heading(s) {unknown_means}",
+            path.display()
+        );
+    }
+    let blank = queries
+        .values()
+        .filter(|query| query.trim().is_empty())
+        .count();
+    if blank > 0 {
+        bail!("{} gives {blank} facet(s) a blank query", path.display());
+    }
+    Ok(RefreshQueries {
+        queries: queries
+            .into_iter()
+            .map(|(heading, query)| (heading, query.trim().to_owned()))
+            .collect(),
+        hash: format!("{:x}", Sha256::digest(text.as_bytes())),
+    })
 }
 
 /// A JSON line that didn't parse, as an error that names the file, the

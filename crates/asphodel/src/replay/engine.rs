@@ -50,7 +50,7 @@ use std::time::Duration;
 use asphodel_core::extraction::{Call1Input, Committed, DropReason, Extracted, Prepared};
 use asphodel_core::ingest::{Document, Outcome as IngestOutcome, Turn, TurnAuthor};
 use asphodel_core::inspect::InspectError;
-use asphodel_core::mental_models::PLAN_TEMPLATE;
+use asphodel_core::mental_models::{PLAN_TEMPLATE, Refreshes};
 use asphodel_core::models::{FakeLlm, LlmClient, LlmError, LlmRequest, LlmResponse};
 use asphodel_core::retrieval::{Band, PrefetchRequest, RecallRequest, band, estimate_tokens};
 use asphodel_core::service::Claimed;
@@ -735,11 +735,13 @@ impl<'a> Engine<'a> {
     }
 
     /// Runs the refreshes due with the run's refresh client and counts
-    /// their calls by bank-local day. Returns when the next is due.
+    /// their calls by bank-local day, collecting their scored selections
+    /// for the labelling material. Returns when the next is due.
     fn run_refreshes(&mut self) -> Result<Option<Timestamp>, Failure> {
         let (next_due, calls) = match self.llm {
             Llm::Scripted => {
-                let refreshes = self.service.run_refreshes(&self.refresh_llm)?;
+                let refreshes =
+                    refreshes_due(self.service, &self.refresh_llm, &mut self.labelling)?;
                 let calls: Vec<Timestamp> = std::mem::take(
                     &mut *self
                         .refresh_llm
@@ -758,7 +760,7 @@ impl<'a> Engine<'a> {
                 (refreshes.next_due, calls)
             }
             Llm::Recorded(recorder, _) => {
-                let refreshes = self.service.run_refreshes(recorder)?;
+                let refreshes = refreshes_due(self.service, recorder, &mut self.labelling)?;
                 (refreshes.next_due, recorder.take_refresh_times())
             }
         };
@@ -1632,6 +1634,24 @@ impl<'a> Engine<'a> {
 }
 
 /// Call 1's reply from the chunk's claims.
+/// The refreshes due, run with `llm`; when the material is collected, each
+/// refresh's scored selection goes to it. Collecting reads what the
+/// selection already computed, so it changes nothing the run simulates.
+fn refreshes_due(
+    service: &Service,
+    llm: &dyn LlmClient,
+    labelling: &mut Option<Collector>,
+) -> Result<Refreshes, Failure> {
+    Ok(match labelling {
+        Some(collector) => {
+            let (refreshes, scored) = service.scored_refreshes(llm)?;
+            collector.refreshes(scored);
+            refreshes
+        }
+        None => service.run_refreshes(llm)?,
+    })
+}
+
 fn call1_reply(claims: &[Claim], used: &[String]) -> Value {
     let when = |when: &Option<super::scenario::When>| match when {
         Some(when) => json!({ "at": when.at, "precision": when.precision.as_str() }),
