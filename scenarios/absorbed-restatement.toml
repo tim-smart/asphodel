@@ -1,8 +1,9 @@
-# Tim says where he lives, then says it again in another session, then
-# confirms it. Call 2 labels the second claim mentioned_again and the third
-# confirmed. Neither matters more than the memory or adds a date, so both are
-# absorbed: no new memory, and the memory keeps each sentence call 1 wrote as
-# a restatement with the label it took.
+# Tim says where he lives, then says it again twice in one turn of another
+# session, then confirms it. Call 2 labels both claims in the second turn
+# mentioned_again and the third turn's confirmed. None matters more than the
+# memory or adds a date, so all three are absorbed: no new memory, and the
+# memory keeps each sentence call 1 wrote as a restatement with the label it
+# took. The two in one turn are one access but two restatements.
 
 name = "absorbed-restatement"
 group = "ci"
@@ -27,12 +28,19 @@ significance = "minor"
 [[turn]]
 at = "2026-02-10T09:00:00Z"
 session = "s2"
-user = "I still live in Auckland, by the way."
+user = "I still live in Auckland, by the way. I've been here for years."
 assistant = "Good to know."
 
 [[turn.claim]]
 content = "Tim still lives in Auckland."
 quote = "I still live in Auckland"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "home", outcome = "mentioned_again" }]
+
+[[turn.claim]]
+content = "Tim has lived in Auckland for years."
+quote = "I've been here for years"
 kind = "fact"
 significance = "minor"
 reconcile = [{ memory = "home", outcome = "mentioned_again" }]
@@ -63,6 +71,14 @@ at = "2026-03-01T10:00:00Z"
 kind = "restated"
 memory = "home"
 sentence = "Tim still lives in Auckland."
+label = "mentioned_again"
+
+[[probe]]
+id = "the-second-mention-in-the-turn-is-restated"
+at = "2026-03-01T10:00:00Z"
+kind = "restated"
+memory = "home"
+sentence = "Tim has lived in Auckland for years."
 label = "mentioned_again"
 
 [[probe]]

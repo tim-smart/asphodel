@@ -379,7 +379,8 @@ memory = "home"
 fn restatements_written_are_counted_in_report_and_aggregate() {
     let dir = TestDir::new();
     for (path, written) in [
-        (scenario("absorbed-restatement"), 2),
+        // Two of the three are in one turn, on one memory.
+        (scenario("absorbed-restatement"), 3),
         (inline(&dir, "nothing-absorbed", HOME_TURN), 0),
     ] {
         let aggregate = dir.path("aggregate.json");
