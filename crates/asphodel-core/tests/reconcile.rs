@@ -305,6 +305,15 @@ impl Harness {
         edits.map(|edit| edit.kind).collect()
     }
 
+    /// The claims absorbed into a memory, newest first: each sentence,
+    /// when it was said and the label it took.
+    fn restated(&self, memory: Uuid) -> Vec<(String, Timestamp, String)> {
+        let restatements = self.show(memory).restatements.into_iter();
+        restatements
+            .map(|r| (r.sentence, r.observed_at, r.label))
+            .collect()
+    }
+
     fn change(&self, memory: Uuid) -> Change {
         let view = self.show(memory);
         let member = view.chain.members.iter().find(|m| m.id == memory);
@@ -930,6 +939,31 @@ fn a_mention_that_matters_no_more_than_the_memory_is_absorbed_and_keeps_only_on_
 }
 
 #[test]
+fn an_absorbed_claim_is_kept_as_a_restatement_newest_first() {
+    // A repeat leaves no memory of its own, so the sentence call 1 wrote
+    // would be lost at commit. The memory keeps it, with when it was said
+    // and the label it took, for a later pass to look at again.
+    let h = Harness::new();
+    let tea = h.fact(TEA);
+    assert!(h.restated(tea).is_empty(), "a new memory restates nothing");
+    h.says_at(T1, "I really like green tea.");
+    let again = claim(TEA_AGAIN, "fact", "I really like green tea");
+    one_label(&h, reply(vec![again]), tea, "mentioned_again");
+    h.says_at(T2, "Yes, I like green tea a lot.");
+    let confirmed = claim(TEA_A_LOT, "fact", "I like green tea a lot");
+    one_label(&h, reply(vec![confirmed]), tea, "confirmed");
+
+    assert_eq!(h.memories(), 1);
+    assert_eq!(
+        h.restated(tea),
+        [
+            (TEA_A_LOT.into(), at(T2), "confirmed".into()),
+            (TEA_AGAIN.into(), at(T1), "mentioned_again".into()),
+        ]
+    );
+}
+
+#[test]
 fn a_repeat_that_matters_more_than_the_memory_becomes_its_head() {
     // Call 2 can label a claim that says more than a memory, such as a
     // relationship the memory only names a person in, a repeat. A newer
@@ -969,6 +1003,7 @@ fn a_repeat_that_matters_more_than_the_memory_becomes_its_head() {
             .collect();
         assert_eq!(inherited, before, "{label}");
         assert_eq!(h.access_kinds(new), ["created"], "{label}");
+        assert!(h.restated(old).is_empty(), "{label}: the claim is a memory");
     }
 }
 
@@ -1431,8 +1466,11 @@ fn a_document_mention_is_an_access_unless_an_earlier_version_said_it() {
     assert_eq!(accesses.len(), 2, "{accesses:?}");
     assert_eq!(accesses[1].kind, "mentioned_again");
     assert_eq!(accesses[1].source, Some(diary.source));
+    let restated = h.restated(bike);
+    assert_eq!(restated.len(), 1, "{restated:?}");
 
-    // A later version of the same document doesn't reinforce itself.
+    // A later version of the same document doesn't reinforce itself, and
+    // isn't a restatement either.
     h.advance(1);
     let text = "My bike is a Brompton. I ride it to work.";
     let edited = h.doc("notes", text, date(2026, 9, 27));
@@ -1441,6 +1479,7 @@ fn a_document_mention_is_an_access_unless_an_earlier_version_said_it() {
     let extracted = one_label(&h, restated, bike, "mentioned_again");
     assert!(extracted.memories.is_empty());
     assert_eq!(h.accesses(bike), accesses);
+    assert_eq!(h.restated(bike).len(), 1);
 }
 
 #[test]
@@ -1644,7 +1683,8 @@ fn an_older_claim_labelled_ends_is_created_already_ended() {
 fn an_older_claim_corrects_nothing_but_its_mention_still_counts() {
     // An old note retracting, refining or denying a newer memory creates
     // nothing and changes nothing, not even the task the denied filing
-    // ended. Only its mention lands, even on an ended neighbour.
+    // ended, and keeps no restatement. Only its mention lands, even on an
+    // ended neighbour.
     const LATER: &str = "2026-09-20T00:00:00Z";
     const LATEST: &str = "2026-09-25T00:00:00Z";
     let h = Harness::new();
@@ -1655,7 +1695,7 @@ fn an_older_claim_corrects_nothing_but_its_mention_still_counts() {
     let filed = h.seed(LATEST, filed, &[(task, "ends")]);
     let acme = h.seed(LATER, said(ACME, "fact"), &[]);
     h.left_acme(LATEST, acme);
-    let state = |h: &Harness, m: Uuid| (h.change(m), h.accesses(m), h.edits(m));
+    let state = |h: &Harness, m: Uuid| (h.change(m), h.accesses(m), h.edits(m), h.restated(m));
     let corrected = [dentist, tokyo, task, filed];
     let before = corrected.map(|m| state(&h, m));
     let acme_before = state(&h, acme);
@@ -1684,7 +1724,7 @@ fn an_older_claim_corrects_nothing_but_its_mention_still_counts() {
 
     assert!(extracted.memories.is_empty());
     assert_eq!(corrected.map(|m| state(&h, m)), before);
-    let (change, mut accesses, edits) = state(&h, acme);
+    let (change, mut accesses, edits, _) = state(&h, acme);
     assert_eq!((&change, &edits), (&acme_before.0, &acme_before.2));
     let mention = accesses.pop().unwrap();
     assert_eq!(accesses, acme_before.1);
