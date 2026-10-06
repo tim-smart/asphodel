@@ -1727,15 +1727,21 @@ impl Harness {
 }
 
 /// Restating a memory gives it accesses, which make it stronger than the
-/// memories it's ranked against. Relevance at four times the logit lets the
-/// words a question shares decide the order instead.
+/// memories it's ranked against: at the default scale, recall over the head
+/// alone already puts the restated memory first, though the question shares
+/// no word with it. Relevance at four times the logit lets the words a
+/// question shares decide the order instead.
 fn by_relevance() -> Harness {
     Harness::with(|t| set_scale(t, 0.25))
 }
 
 /// `days` days after [`EARLIER`], when restatements are said in order.
 fn days_later(days: i64) -> Timestamp {
-    at(EARLIER) + SignedDuration::from_hours(24 * days)
+    hours_later(24 * days)
+}
+
+fn hours_later(hours: i64) -> Timestamp {
+    at(EARLIER) + SignedDuration::from_hours(hours)
 }
 
 /// `memory`'s result in `recall`.
@@ -1811,6 +1817,8 @@ fn a_recalled_memory_reads_as_its_head_then_its_newest_five_restatements_oldest_
         let text = result(&recall, cat).sentence.clone();
         assert!(text.starts_with(CAT), "{question}: {text}");
         assert_eq!(text.matches(CAT).count(), 1, "{question}: {text}");
+        // The recall tool's text gives each memory one line.
+        assert!(!text.contains('\n'), "{question}: {text:?}");
         let places: Vec<usize> = shown
             .iter()
             .map(|sentence| {
@@ -1842,36 +1850,68 @@ fn a_recalled_memory_reads_as_its_head_then_its_newest_five_restatements_oldest_
 }
 
 #[test]
-fn a_sentence_said_again_is_shown_once() {
-    // Rua's sentence is restated word for word, and so is one restatement.
+fn a_sentence_said_again_is_shown_once_where_it_was_last_said() {
+    // Restatements are told apart by their exact sentence, the head's
+    // included, before the newest five are taken. A sentence said again
+    // takes one place, at the last time it was said, so the five are the
+    // newest distinct sentences: a repeat of the head or of a restatement
+    // doesn't push an older one out.
     let dog = "Tim's dog is called Rua.";
-    let park = "Tim's dog is called Rua and loves the park.";
+    let loves = |place: &str| format!("Tim's dog is called Rua and loves the {place}.");
     let h = Harness::new();
     let rua = h.seed(fact(dog));
-    h.restate(rua, days_later(1), dog);
-    h.restate(rua, days_later(2), park);
-    h.restate(rua, days_later(3), park);
+    let said = [
+        dog.to_owned(),
+        loves("park"),
+        loves("beach"),
+        loves("river"),
+        loves("hills"),
+        loves("forest"),
+        loves("sea"),
+        loves("park"),
+        loves("sea"),
+    ];
+    for (day, sentence) in (1..).zip(&said) {
+        h.restate(rua, days_later(day), sentence);
+    }
+    let shown = ["river", "hills", "forest", "park", "sea"].map(loves);
 
-    let recall = h.recall(query("Rua park"));
+    let recall = h.recall(query("Rua"));
     let text = &result(&recall, rua).sentence;
     assert!(text.starts_with(dog), "{text}");
     assert_eq!(text.matches(dog).count(), 1, "{text}");
-    assert_eq!(text.matches(park).count(), 1, "{text}");
+    let places: Vec<usize> = shown
+        .iter()
+        .map(|sentence| {
+            assert_eq!(text.matches(sentence.as_str()).count(), 1, "{text}");
+            text.find(sentence.as_str()).unwrap()
+        })
+        .collect();
+    assert!(places.is_sorted(), "{text}");
+    assert!(!text.contains(&loves("beach")), "{text}");
+
+    // The reranker is shown the same five: the oldest of them scores, and
+    // the beach, past them, is searched but scores as if nothing matched.
+    for (question, logit) in [("river", 0.5), ("beach", -0.5)] {
+        let explain = h.explain(explain_recall(&query(question)));
+        let shown = explained(&explain, rua);
+        let bm25 = arm_rank(shown, Arm::Bm25);
+        assert!(bm25.is_some(), "{question}: {shown:#?}");
+        assert_eq!(shown.logit, Some(logit), "{question}: {shown:#?}");
+    }
 }
 
 #[test]
 fn a_memory_restated_many_times_takes_one_candidate_slot() {
-    // Every restatement of the cat matches the question better than Sam's
-    // cat does, and the cat still holds one place in each arm and one in
-    // the results.
+    // The cat is restated as many times as an arm takes hits, and every
+    // restatement matches the question better than Sam's cat does. The cat
+    // still holds one place in each arm and one in the results, and Sam's
+    // cat is still found: the restatements don't fill the arm.
     let h = by_relevance();
     let cat = h.seed(fact(CAT));
-    let likes = [
-        "sardines", "boxes", "sunbeams", "string", "naps", "cushions",
-    ];
-    for (day, thing) in (1..).zip(likes) {
-        let sentence = format!("Tim's cat is called Miso, a ginger tabby who likes {thing}.");
-        h.restate(cat, days_later(day), &sentence);
+    for n in 1..=CANDIDATES_PER_ARM {
+        let sentence = format!("Tim's cat is called Miso, a ginger tabby who likes toy {n}.");
+        h.restate(cat, hours_later(n as i64), &sentence);
     }
     let [sam, ..] = h.seed_many([
         fact("Sam has a ginger cat too, and it is called Rangi and it sleeps a lot."),
@@ -1959,6 +1999,8 @@ fn explain_names_the_sentence_that_matched() {
         let explain = h.explain(explain_recall(&query(question)));
         let shown = explained_json(&explain, memory);
         assert_eq!(shown["matched"], sentence, "{question}: {shown:#}");
+        let head = if memory == cat { CAT } else { BIKE };
+        assert_eq!(shown["sentence"], head, "{question}: {shown:#}");
         for arm in ["vector", "bm25"] {
             let arms = shown["arms"].as_array().unwrap();
             let found = arms.iter().find(|a| a["arm"] == arm);
@@ -1966,4 +2008,38 @@ fn explain_names_the_sentence_that_matched() {
             assert_eq!(found["sentence"], sentence, "{question}, {arm}: {shown:#}");
         }
     }
+}
+
+#[test]
+fn injection_never_sees_restatements() {
+    // Restatements are for explicit recall. Prefetch searches, reranks and
+    // injects each memory by its head alone, as it did before.
+    let h = Harness::new();
+    let cat = h.seed(fact(CAT));
+    h.restate(cat, days_later(1), TABBY);
+    h.restate(cat, days_later(2), PORIRUA);
+
+    // Only the restatements answer this, so nothing passes the gate.
+    let restated = "ginger tabby Porirua";
+    assert!(h.prefetch("a", restated).injected.is_empty());
+    let explain = h.explain(explain_injection(restated, None, None));
+    let shown = explained(&explain, cat);
+    assert_eq!(arm_rank(shown, Arm::Bm25), None, "{shown:#?}");
+    assert_eq!(shown.sentence, CAT, "{shown:#?}");
+    assert!(explain.injection.unwrap().injected.is_empty());
+
+    // The head answers this, and the cat is injected as her head.
+    let head = "Tim's cat Miso";
+    let prefetch = h.prefetch("b", head);
+    assert_eq!(prefetch.injected, vec![cat]);
+    assert!(prefetch.text.contains(CAT), "{}", prefetch.text);
+    for sentence in [TABBY, PORIRUA] {
+        assert!(!prefetch.text.contains(sentence), "{}", prefetch.text);
+    }
+    let scored = h
+        .service
+        .scored_prefetch(BANK, &request("c", head, None, None));
+    let scored = scored.unwrap();
+    let candidate = scored.candidates.iter().find(|c| c.memory == cat);
+    assert_eq!(candidate.expect("a candidate").sentence, CAT);
 }
