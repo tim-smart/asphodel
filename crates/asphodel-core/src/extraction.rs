@@ -359,6 +359,42 @@ pub struct Extracted {
     /// neighbour, made chain heads instead because they matter at least
     /// `reconcile.promotion_gap` significance levels more than it.
     pub promoted: Vec<Uuid>,
+    /// Refinements between kinds that can't be versions of each other, in
+    /// label order, and whether `reconcile.kind_guard` rejected each.
+    pub kind_mismatches: Vec<KindMismatch>,
+}
+
+/// What made reconciliation treat a claim as a refinement of a neighbour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefineCause {
+    /// Call 2 labelled it `refines`.
+    Explicit,
+    /// A repeat label on a claim that supplies a new or changed date.
+    DatePromoted,
+    /// A repeat label on a claim that matters `reconcile.promotion_gap`
+    /// levels more than the neighbour.
+    WeightPromoted,
+}
+
+/// A refinement between a claim and a neighbour of kinds that can't be
+/// versions of each other: any two kinds that differ, except a task or
+/// recurring claim on a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KindMismatch {
+    /// The claim's index in call 1's reply.
+    pub claim: usize,
+    /// The memory the claim made, if it made one.
+    pub memory: Option<Uuid>,
+    pub neighbour: Uuid,
+    pub claim_kind: crate::strength::Kind,
+    pub neighbour_kind: crate::strength::Kind,
+    pub cause: RefineCause,
+    /// The claim was said before the neighbour.
+    pub older: bool,
+    /// `reconcile.kind_guard` dropped the label. When it's off, the
+    /// refinement went ahead as call 2 or the promotion asked.
+    pub rejected: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,8 +605,8 @@ pub struct Prepared {
     floor: f64,
     /// `strength.corroborate_used`, read with the rest of the tuning.
     corroborate_used: bool,
-    /// `reconcile.promotion_gap`, read with the rest of the tuning.
-    promotion_gap: u8,
+    /// `[reconcile]`'s rules for the plan, read with the rest of the tuning.
+    rules: reconcile::Rules,
     /// The bank as the search saw it.
     snapshot: reconcile::Snapshot,
     search: Option<reconcile::Search>,
@@ -758,7 +794,7 @@ pub(crate) fn prepare(
             vectors,
             floor: floor(tuning, embedder),
             corroborate_used: tuning.strength.corroborate_used,
-            promotion_gap: tuning.reconcile.promotion_gap,
+            rules: reconcile::Rules::of(tuning),
             snapshot: reconcile::Snapshot::default(),
             search: None,
             labels: Vec::new(),
@@ -819,7 +855,7 @@ fn reconcile_claims(
         vectors,
         floor,
         corroborate_used,
-        promotion_gap,
+        rules,
         ..
     } = prepared;
     // The connection is released before the failure is counted.
@@ -866,7 +902,7 @@ fn reconcile_claims(
                     return Err(ExtractError::Call2 { error, failure });
                 }
             };
-            let plan = reconcile::plan(search, &input, &unit, &checked, &labels, promotion_gap);
+            let plan = reconcile::plan(search, &input, &unit, &checked, &labels, rules);
             (labels, plan)
         }
     };
@@ -880,7 +916,7 @@ fn reconcile_claims(
         vectors,
         floor,
         corroborate_used,
-        promotion_gap,
+        rules,
         snapshot,
         search,
         labels,
@@ -941,7 +977,7 @@ pub(crate) fn commit_prepared(
                     &prepared.unit,
                     &prepared.checked,
                     &prepared.labels,
-                    prepared.promotion_gap,
+                    prepared.rules,
                 )?
                 .unwrap_or_else(|| prepared.plan.clone()),
                 None => prepared.plan.clone(),
@@ -1030,7 +1066,7 @@ fn without_vanished(
     unit: &input::Unit,
     checked: &claims::Checked,
     labels: &[call2::ClaimLabels],
-    promotion_gap: u8,
+    rules: reconcile::Rules,
 ) -> Result<Option<reconcile::Plan>, StoreError> {
     let gone = vanished(conn, &search.neighbours)?;
     if gone.is_empty() {
@@ -1061,12 +1097,7 @@ fn without_vanished(
         "neighbours went between call 2 and the commit; their labels are dropped"
     );
     Ok(Some(reconcile::plan(
-        search,
-        input,
-        unit,
-        checked,
-        &kept,
-        promotion_gap,
+        search, input, unit, checked, &kept, rules,
     )))
 }
 

@@ -241,6 +241,23 @@ outweighed, so a mention doesn't undo the owner's word. A smaller gap
 raises the neighbour's significance as before, and so does an older claim's
 mention. The report counts promotions as `call2_rate.promoted`.
 
+Every route to `refines`, call 2's label or either promotion, then meets a
+kind check (`reconcile.kind_guard`, on by default). A claim can refine a
+memory of its own kind, and a `task` or `recurring` claim can refine a
+task; any other pair of kinds can't be versions of each other, so the
+`refines` is rejected, from a newer claim or an older one. The label is
+dropped, not turned into a mention: the memory gets no access, raise,
+passage or edit. The claim's other labels still decide its fate, and with
+none left it's a new memory. The open-task guard and `ends`, `retracts`
+and `denies` are unchanged. The check contains merges; it doesn't prove two
+memories say different things. A preference refined by another preference
+still merges, and a rejected repeat can leave two heads whose sentences
+overlap: forget takes the named chain only, `ends` only its target, and
+recall can return both. `call2_rate.refines_rejected` counts the rejections
+as `explicit`, `date_promoted` and `weight_promoted`;
+`call2_rate.refines_across_kinds` counts the same pairs whether or not the
+guard was on, and the report's `kind_mismatches` lists each one.
+
 Call 2 version 3 shows these fields beside both claims and memories, using
 UTC timestamps and `none` for absent dates. Its prompt treats an added
 schedule as a refinement: "needs to pack the carrots" refined by "reminder
@@ -360,6 +377,8 @@ owner review after re-recording.
   `call2_rate.redo_rate`, per chunk, fields that only appear above 1.
   `call2_rate.promoted` always appears: the repeat labels promoted to
   `refines` for significance ("Reconcile outcomes"), each a new chain head.
+  So do `call2_rate.refines_rejected` and `call2_rate.refines_across_kinds`,
+  counted from the plan each chunk committed, so a redo doesn't count twice.
   Scenarios script call 2 against what a serial run shows it, so a
   scenario defaults to 1 and refuses explicit values above 1.
 - **Sweeps** run at `mental_models.sweep_time` bank-local (04:00) on the
@@ -668,7 +687,10 @@ scripted fields: `injected_tokens` (per session with a synced turn, the
 per-turn p50 and p95, and cron apart), `profile_tokens` (sampled daily),
 `call2_rate`, `agenda_lines_per_day`, `significance_histogram`,
 `kind_histogram`, `memories` (each created memory with when it faded and
-whether it was purged), and `llm` with `cache`, `top_up`, `live`,
+whether it was purged), `kind_mismatches` (each refinement between
+incompatible kinds: the chunk, the claim's index and the memory it made,
+the neighbour, both kinds, the cause, whether the claim was older and
+whether `reconcile.kind_guard` rejected it), and `llm` with `cache`, `top_up`, `live`,
 `primed`, `misses`, `used_verdicts` by source and `latency_ms`. A `live` run and the `replay`
 of its cassette differ only in `kind`, `flags`, `llm` and `cassette_hash`.
 
@@ -684,7 +706,9 @@ do not add another outcome. `report diff` compares all four numbers.
 is a set of booleans, days are days since the epoch, weeks are two
 integers, and the hashes and the git SHA are byte arrays. It carries
 `call1` as the report has it, `prime_concurrency`, the probe results, the purge, fade and band series, the token, lag and call
-counts, and the histograms.
+counts with `call2_rate.refines_rejected` and
+`call2_rate.refines_across_kinds`, and the histograms. `kind_mismatches`
+stays in the report.
 
 ### Claims agreement
 

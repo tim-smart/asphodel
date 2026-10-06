@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 
 use asphodel_core::Tuning;
-use asphodel_core::extraction::{CALL1_VERSION, guidance_hash};
+use asphodel_core::extraction::{CALL1_VERSION, KindMismatch, RefineCause, guidance_hash};
+use asphodel_core::strength::Kind;
 use jiff::Timestamp;
 use jiff::civil::Date;
 use serde::Serialize;
@@ -58,6 +59,10 @@ pub struct Report {
     /// Every memory the run created, with when it faded and whether it was
     /// purged, so the A/B diff can name the ones that differ.
     pub memories: Vec<MemoryOutcome>,
+    /// Every refinement between kinds that can't be versions of each other,
+    /// in commit order, whether `reconcile.kind_guard` rejected it or not:
+    /// the census an on/off comparison labels.
+    pub kind_mismatches: Vec<KindMismatchRow>,
     /// Where each LLM reply came from, and what the run identifies by:
     /// everything that differs between a `live` run and the `replay` of
     /// its cassette sits here.
@@ -219,6 +224,12 @@ pub struct Call2Rate {
     /// (`reconcile.promotion_gap`): each one a chain absorption would
     /// not have made.
     pub promoted: u64,
+    /// Refinements `reconcile.kind_guard` rejected between kinds that can't
+    /// be versions of each other, by what made each a refinement.
+    pub refines_rejected: RefineCauses,
+    /// Every refinement between such kinds, rejected or not: with the guard
+    /// off, the ones it would have rejected.
+    pub refines_across_kinds: RefineCauses,
     /// Commits that found their chunk stale and reconciled it again, and
     /// that per chunk. Only above `[llm] concurrency = 1`, where a chunk
     /// can be.
@@ -226,6 +237,56 @@ pub struct Call2Rate {
     pub redos: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redo_rate: Option<f64>,
+}
+
+/// Refinements counted by what made each one: call 2's label, a repeat
+/// with a new date, or a repeat that matters more.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RefineCauses {
+    pub explicit: u64,
+    pub date_promoted: u64,
+    pub weight_promoted: u64,
+}
+
+impl RefineCauses {
+    pub fn add(&mut self, cause: RefineCause) {
+        match cause {
+            RefineCause::Explicit => self.explicit += 1,
+            RefineCause::DatePromoted => self.date_promoted += 1,
+            RefineCause::WeightPromoted => self.weight_promoted += 1,
+        }
+    }
+}
+
+/// One refinement between incompatible kinds, by id: the chunk, the claim's
+/// index in call 1's reply and the memory it made, if any.
+#[derive(Debug, Serialize)]
+pub struct KindMismatchRow {
+    pub chunk: Uuid,
+    pub claim: usize,
+    pub memory: Option<Uuid>,
+    pub neighbour: Uuid,
+    pub claim_kind: Kind,
+    pub neighbour_kind: Kind,
+    pub cause: RefineCause,
+    pub older: bool,
+    pub rejected: bool,
+}
+
+impl KindMismatchRow {
+    pub fn of(chunk: Uuid, mismatch: &KindMismatch) -> Self {
+        Self {
+            chunk,
+            claim: mismatch.claim,
+            memory: mismatch.memory,
+            neighbour: mismatch.neighbour,
+            claim_kind: mismatch.claim_kind,
+            neighbour_kind: mismatch.neighbour_kind,
+            cause: mismatch.cause,
+            older: mismatch.older,
+            rejected: mismatch.rejected,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -458,6 +519,8 @@ impl Aggregate {
                 call2: report.call2_rate.call2,
                 rate: report.call2_rate.rate,
                 promoted: report.call2_rate.promoted,
+                refines_rejected: report.call2_rate.refines_rejected,
+                refines_across_kinds: report.call2_rate.refines_across_kinds,
                 redos: report.call2_rate.redos,
                 redo_rate: report.call2_rate.redo_rate,
             },

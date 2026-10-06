@@ -23,6 +23,21 @@ strength affects injection and injected memories are part of the recorded
 request. `fast` mode reuses recorded claims but may make top-up LLM calls;
 get approval before using it on private data.
 
+## A refinement across kinds is rejected
+
+Code now rejects a `refines`, call 2's or a repeat promoted for a date or
+for significance, between memories of different kinds, except a task or
+recurring claim on a task (`reconcile.kind_guard`, on by default). The claim
+becomes a memory of its own and the neighbour is left as it was, with no
+access or edit. A weightier repeat of another kind, such as a fact naming a
+relationship labelled a repeat of an event, is therefore a second head
+beside the event rather than its replacement.
+
+Stored memories and chains are unchanged and nothing is re-extracted. No
+schema migration is needed, purge doesn't pause, and call 2's prompt is
+unchanged, so recorded replies still answer the same requests. Set
+`kind_guard = false` under `[reconcile]` to compare the old behaviour.
+
 ## A weightier repeat becomes the head
 
 A newer claim that call 2 labels `mentioned_again` or `confirmed` now
