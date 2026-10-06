@@ -1785,11 +1785,15 @@ fn a_resumed_or_concurrent_run_cannot_spend_past_its_ledger() {
     let (ledger, init) = budget_init(&dir, "ledger.json", &budget);
     assert_ok(&init);
 
-    for spent in [2, 0] {
-        let (mut run, requests) = budgeted(&dir, &corpus, "fast", (&ledger, "r1"), 0, "", &PRIMED);
+    // One stub for both, so the second matches the run's binding and is
+    // a resume, refused for having spent its budget.
+    let reply = support::reply_to_everything(vec![home_claim()], vec![]);
+    let (url, requests) = codex_failing("server_is_overloaded", 0, &reply);
+    for _ in 0..2 {
+        let mut run = budgeted_against(&dir, &corpus, "fast", (&ledger, "r1"), &url, "", &PRIMED);
         let output = run.output().unwrap();
         assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
-        assert_eq!(requests.load(Ordering::SeqCst), spent);
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "the resume spent more");
     }
 
     let (_, again) = budget_init(&dir, "ledger.json", &budget);
@@ -1946,6 +1950,98 @@ fn a_post_after_a_401_refresh_takes_a_slot_of_its_own() {
         json!({"extract_claims": 1}),
         "{shown}"
     );
+}
+
+/// Once one attempt finds the ledger untrustworthy, no attempt in that
+/// run goes out, not even one already waiting its turn when the fault
+/// cleared. The fault here is a ledger that reads malformed once: the
+/// ledger is a FIFO, so the test decides what each read sees. The run
+/// opens on a valid ledger, and its first priming worker takes the
+/// admission lock and blocks reading. While it waits, the other three
+/// workers queue behind it. The test then puts a valid ledger back in
+/// place and lets the blocked read see a malformed one, so the first
+/// worker stops the run's calls and every queued worker would find a
+/// healthy ledger. None may call the model.
+#[test]
+fn a_ledger_fault_stops_attempts_already_waiting_to_be_admitted() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let budget = allocations(&[("s1", 0)], &[("r1", "s1", Some(0))]);
+    let (ledger, init) = budget_init(&dir, "ledger.json", &budget);
+    assert_ok(&init);
+    // Binds the run with nothing to spend, then gives it room, so the
+    // run below, against the same stub, reopens a bound ledger without
+    // writing it.
+    let reply = support::reply_to_everything(vec![home_claim()], vec![]);
+    let (url, requests) = codex_failing("server_is_overloaded", 0, &reply);
+    let mut bind = budgeted_against(&dir, &corpus, "fast", (&ledger, "r1"), &url, "", &PRIMED);
+    assert_eq!(bind.output().unwrap().status.code(), Some(2));
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    let mut room: Value = serde_json::from_slice(&fs::read(&ledger).unwrap()).unwrap();
+    assert!(room["runs"]["r1"]["binding"].is_object(), "{room}");
+    room["stages"]["s1"]["cap"] = json!(10);
+    room["runs"]["r1"]["cap"] = json!(10);
+    let valid = room.to_string();
+    let healthy = dir.private_file("healthy.json", &valid);
+
+    fs::remove_file(&ledger).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(&ledger)
+        .status()
+        .unwrap();
+    assert!(
+        made.success(),
+        "mkfifo is needed to fault the ledger's reads"
+    );
+
+    let mut run = budgeted_against(&dir, &corpus, "fast", (&ledger, "r1"), &url, "", &PRIMED);
+    let child = run
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The run's open reads the valid ledger.
+    feed(&ledger, valid.into_bytes(), || {}, &child);
+    // The first worker's read: by the time it ends, three workers wait
+    // behind it and the ledger they'll read is healthy again.
+    let path = ledger.clone();
+    let fault = move || {
+        std::thread::sleep(Duration::from_millis(500));
+        fs::rename(&healthy, &path).unwrap();
+    };
+    feed(&ledger, b"{".to_vec(), fault, &child);
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "a worker admitted after the fault called the model"
+    );
+}
+
+/// Writes `bytes` to the FIFO at `fifo` for its next reader, once that
+/// reader has opened it and `before` has run. Fails the test if no reader
+/// comes within 30 s or `child` exits first.
+fn feed(
+    fifo: &Path,
+    bytes: Vec<u8>,
+    before: impl FnOnce() + Send + 'static,
+    child: &std::process::Child,
+) {
+    let (sent, done) = std::sync::mpsc::channel();
+    let path = fifo.to_owned();
+    std::thread::spawn(move || {
+        // Opening for writing waits for a reader.
+        let mut writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        before();
+        writer.write_all(&bytes).unwrap();
+        drop(writer);
+        let _ = sent.send(());
+    });
+    if done.recv_timeout(Duration::from_secs(30)).is_err() {
+        panic!("the run (pid {}) never read the ledger", child.id());
+    }
 }
 
 /// The ledger only changes by a complete commit replacing it, and a call
