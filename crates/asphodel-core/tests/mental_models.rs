@@ -1898,6 +1898,181 @@ fn a_malformed_reply_or_plan_writes_nothing_and_records_an_error() {
     }
 }
 
+// The retention retry. A write that leaves out a memory the stored answer
+// cites, still in its input and major, critical or kept, is sent once more
+// as it was. The second reply is kept only when what it leaves out of those
+// memories is a strict part of what the first left out; otherwise the
+// first stands.
+
+const PIANO: &str = "Tim plays the piano.";
+
+/// A profile whose answer cites Berlin (major), Maya (critical), the kept
+/// tea and the cat (notable), and the piano (major) said since, never
+/// cited. The next refresh is shown all five. Returns them in that order.
+fn pinned_profile(h: &Harness) -> [Uuid; 5] {
+    let berlin = h.seed(fact(BERLIN).level("major"));
+    let maya = h.seed(fact(MAYA).level("critical"));
+    let tea = h.seed(fact(TEA));
+    let cat = h.seed(fact(CAT));
+    h.keep(tea);
+    h.profile_adding(&[
+        (BERLIN, &[berlin]),
+        (MAYA, &[maya]),
+        (TEA, &[tea]),
+        (CAT, &[cat]),
+    ]);
+    let piano = h.says(fact(PIANO).level("major"));
+    [berlin, maya, tea, cat, piano]
+}
+
+const PINNED_SENTENCES: [&str; 5] = [BERLIN, MAYA, TEA, CAT, PIANO];
+
+/// A write of [`pinned_profile`]'s memories, one sentence each, leaving
+/// out those at the indices in `omits`.
+fn leaving_out(input: &RefreshInput, memories: &[Uuid; 5], omits: &[usize]) -> Value {
+    let kept: Vec<usize> = (0..5).filter(|i| !omits.contains(i)).collect();
+    let text: Vec<&str> = kept.iter().map(|&i| PINNED_SENTENCES[i]).collect();
+    let cites: Vec<String> = kept.iter().map(|&i| handle(input, memories[i])).collect();
+    written(&[(SECTION, text.join(" ").as_str())], &cites)
+}
+
+fn all_but(memories: &[Uuid; 5], omits: &[usize]) -> BTreeSet<Uuid> {
+    (0..5)
+        .filter(|i| !omits.contains(i))
+        .map(|i| memories[i])
+        .collect()
+}
+
+#[test]
+fn a_write_leaving_out_what_the_answer_pinned_is_sent_again_and_the_better_reply_kept() {
+    // Berlin, Maya and the kept tea are pinned. Each case: what the first
+    // reply leaves out, what the second does, and whether the second is
+    // kept. Swapping two pinned memories for a third leaves out fewer but
+    // isn't a part of what the first left out.
+    for (case, first, second, takes_second) in [
+        ("the second restores it", &[0][..], &[][..], true),
+        ("the second leaves it out too", &[0], &[0], false),
+        ("the second leaves out another", &[0, 1], &[2], false),
+    ] {
+        let h = Harness::new();
+        let memories = pinned_profile(&h);
+        let input = h.input(PROFILE_NAME);
+        let llm = FakeLlm::scripted(
+            MODEL,
+            vec![
+                leaving_out(&input, &memories, first),
+                leaving_out(&input, &memories, second),
+            ],
+        );
+        applied(h.refresh(PROFILE_NAME, &llm, true));
+        let sent = calls(&llm, WRITE_TEMPLATE);
+        assert_eq!(sent.len(), 2, "{case}");
+        assert_eq!(sent[1].system, sent[0].system, "{case}");
+        assert_eq!(sent[1].user, sent[0].user, "{case}");
+        let kept = if takes_second { second } else { first };
+        assert_eq!(cites(&h.profile()), all_but(&memories, kept), "{case}");
+    }
+}
+
+#[test]
+fn a_second_write_that_fails_or_is_held_leaves_the_first_reply_standing() {
+    // The refresh applies the first reply and isn't failed or held: the
+    // second write was only ever a better chance.
+    for (case, failure) in [
+        ("transport", json!({"fail": "transport"})),
+        (
+            "rate limited",
+            json!({"fail": "status", "status": 429, "retry_after_secs": 60}),
+        ),
+        (
+            "usage limited",
+            json!({"fail": "usage_limited", "resets_at": "2026-10-02T00:00:00Z"}),
+        ),
+    ] {
+        let h = Harness::new();
+        let memories = pinned_profile(&h);
+        let input = h.input(PROFILE_NAME);
+        let first = leaving_out(&input, &memories, &[0]);
+        let script = json!([{"reply": first}, failure]).to_string();
+        let llm = FakeLlm::from_script(MODEL, &script).unwrap();
+        let outcome = h.refresh(PROFILE_NAME, &llm, true);
+        assert!(
+            matches!(outcome, Outcome::Applied(_)),
+            "{case}: {outcome:?}"
+        );
+        assert_eq!(writes(&llm), 2, "{case}");
+        assert_eq!(cites(&h.profile()), all_but(&memories, &[0]), "{case}");
+        assert_eq!(h.profile().last_error, None, "{case}");
+    }
+}
+
+/// `mental_models.retention_retry = false`, set through the tuning's own
+/// form.
+fn without_retention_retry(tuning: &mut Tuning) {
+    let mut models = serde_json::to_value(&tuning.mental_models).unwrap();
+    models["retention_retry"] = json!(false);
+    tuning.mental_models =
+        serde_json::from_value(models).expect("mental_models.retention_retry is a setting");
+}
+
+/// A case of a refresh of [`pinned_profile`]: its name, the tuning, and
+/// the first reply.
+type OnceCase = (
+    &'static str,
+    fn(&mut Tuning),
+    fn(&RefreshInput, &[Uuid; 5]) -> Value,
+);
+
+#[test]
+fn a_write_is_sent_once_when_nothing_pinned_is_left_out_or_the_retry_is_off() {
+    // Each case is a first reply that would otherwise be sent again, but
+    // for one thing. The second reply cites everything, so taking it would
+    // show.
+    let cases: [OnceCase; 5] = [
+        (
+            "a notable memory left out",
+            |_| {},
+            |input, m| leaving_out(input, m, &[3]),
+        ),
+        (
+            "a major memory not cited before",
+            |_| {},
+            |input, m| leaving_out(input, m, &[4]),
+        ),
+        (
+            "over the token budget",
+            |_| {},
+            |input, m| {
+                let cites: Vec<String> = m[1..].iter().map(|&id| handle(input, id)).collect();
+                written(&[(SECTION, [TEA; 150].join(" ").as_str())], &cites)
+            },
+        ),
+        (
+            "a malformed reply",
+            |_| {},
+            |_, _| written(&[(SECTION, BERLIN)], &["m99".into()]),
+        ),
+        ("the retry off", without_retention_retry, |input, m| {
+            leaving_out(input, m, &[0])
+        }),
+    ];
+    for (case, tune, first) in cases {
+        let h = Harness::with(tune);
+        let memories = pinned_profile(&h);
+        let input = h.input(PROFILE_NAME);
+        let llm = FakeLlm::scripted(
+            MODEL,
+            vec![
+                first(&input, &memories),
+                leaving_out(&input, &memories, &[]),
+            ],
+        );
+        h.refresh(PROFILE_NAME, &llm, true);
+        assert_eq!(writes(&llm), 1, "{case}");
+        assert_ne!(cites(&h.profile()), all_but(&memories, &[]), "{case}");
+    }
+}
+
 // The budget
 
 #[test]

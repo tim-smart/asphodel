@@ -626,6 +626,21 @@ fn the_client_posts_a_structured_chat_completion() {
 }
 
 #[test]
+fn the_client_answers_at_temperature_zero_so_it_skips_sending_a_request_again() {
+    // A refresh sends a write a second time, marked as an attempt, hoping
+    // for a different reply. At temperature 0 the same request gets the
+    // same reply, so the client skips it, and only it.
+    let server = StubServer::start(StubResponse::completion("{}"));
+    let client = OpenAiCompatible::new(server.settings(None));
+    let mut again = serde_json::to_value(request()).unwrap();
+    again["template"]["attempt"] = json!(1);
+    let again: LlmRequest = serde_json::from_value(again).unwrap();
+    assert!(!client.skips_write(&request(), &[]));
+    assert!(client.skips_write(&again, &[]));
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[test]
 fn reply_content_is_json_fenced_or_not_and_anything_else_is_an_error() {
     for content in [
         "{\"a\":1}",

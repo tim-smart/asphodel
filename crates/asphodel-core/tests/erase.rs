@@ -18,7 +18,7 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use asphodel_core::config::PurgePause;
@@ -1251,13 +1251,27 @@ fn a_reworded_section_of_the_same_document_queued_before_a_forget_is_redacted() 
     assert!(text.contains("is six now."), "{text}");
 }
 
-/// A refresh LLM that forgets `memory` while its call is in flight, and
-/// with `erase` runs the erase too, then answers `reply`.
+/// A refresh LLM that answers `replies` in turn, and while the call the
+/// last one answers is in flight forgets `memory`, and with `erase` runs
+/// the erase too.
 struct ForgetsDuringCall<'a> {
     service: &'a Service,
     memory: Uuid,
     erase: bool,
-    reply: Value,
+    replies: Vec<Value>,
+    calls: AtomicUsize,
+}
+
+impl<'a> ForgetsDuringCall<'a> {
+    fn new(service: &'a Service, memory: Uuid, erase: bool, replies: Vec<Value>) -> Self {
+        Self {
+            service,
+            memory,
+            erase,
+            replies,
+            calls: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl LlmClient for ForgetsDuringCall<'_> {
@@ -1266,13 +1280,17 @@ impl LlmClient for ForgetsDuringCall<'_> {
     }
 
     fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let service = self.service;
-        service.forget(BANK, &[self.memory.to_string()]).unwrap();
-        if self.erase {
-            assert!(service.erase_next(BANK).unwrap().is_some());
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        let reply = self.replies.get(call).ok_or(LlmError::NoContent)?;
+        if call + 1 == self.replies.len() {
+            let service = self.service;
+            service.forget(BANK, &[self.memory.to_string()]).unwrap();
+            if self.erase {
+                assert!(service.erase_next(BANK).unwrap().is_some());
+            }
         }
         Ok(LlmResponse {
-            json: self.reply.clone(),
+            json: reply.clone(),
             usage: None,
             latency: Duration::ZERO,
         })
@@ -1286,21 +1304,49 @@ fn a_refresh_in_flight_stores_no_answer_citing_a_memory_hidden_or_erased_meanwhi
     for erase in [false, true] {
         let (h, maya, tea) = maya_and_tea();
         let input = h.service.refresh_input(BANK, PROFILE_NAME).unwrap();
-        let llm = ForgetsDuringCall {
-            service: &h.service,
-            memory: maya,
-            erase,
-            reply: written(
-                "Tim has a daughter called Maya. Tim likes green tea.",
-                &[handle(&input, maya), handle(&input, tea)],
-            ),
-        };
+        let reply = written(
+            "Tim has a daughter called Maya. Tim likes green tea.",
+            &[handle(&input, maya), handle(&input, tea)],
+        );
+        let llm = ForgetsDuringCall::new(&h.service, maya, erase, vec![reply]);
         let outcome = h.service.refresh_model(BANK, PROFILE_NAME, &llm, true);
         assert!(outcome.is_ok(), "{outcome:?}");
         let profile = h.profile();
         assert_eq!(profile.answer, None, "erase: {erase}");
         assert!(profile.cites.is_empty(), "erase: {erase}");
     }
+}
+
+#[test]
+fn a_second_write_citing_a_memory_forgotten_while_it_was_made_stores_nothing() {
+    // The first reply leaves out Maya, major and cited, so the write is
+    // sent again. The second cites her and is the one kept, but she was
+    // forgotten while it was made: nothing is stored, as for any write.
+    let h = Harness::new();
+    let mut major = notable(MAYA);
+    major["significance"] = json!("major");
+    let maya = h.said(EARLIER, major);
+    let tea = h.said(EARLIER, notable(TEA));
+    h.profile_citing(
+        "Tim has a daughter called Maya. Tim likes green tea.",
+        &[maya, tea],
+    );
+    let input = h.service.refresh_input(BANK, PROFILE_NAME).unwrap();
+    let (maya_handle, tea_handle) = (handle(&input, maya), handle(&input, tea));
+    let replies = vec![
+        written("Tim enjoys green tea.", std::slice::from_ref(&tea_handle)),
+        written(
+            "Tim's daughter is Maya, and he enjoys green tea.",
+            &[maya_handle, tea_handle],
+        ),
+    ];
+    let llm = ForgetsDuringCall::new(&h.service, maya, false, replies);
+    let outcome = h.service.refresh_model(BANK, PROFILE_NAME, &llm, true);
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(llm.calls.load(Ordering::Relaxed), 2);
+    let profile = h.profile();
+    assert_eq!(profile.answer, None);
+    assert!(profile.cites.is_empty());
 }
 
 #[test]

@@ -18,8 +18,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use asphodel::replay::cassette::key_of;
 use asphodel_core::config::Secret;
-use asphodel_core::models::{ChatgptTokens, TokenStore};
+use asphodel_core::models::{ChatgptTokens, LlmRequest, TokenStore};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::hermes::{self, StateDb, epoch, start};
@@ -27,8 +28,8 @@ use support::{
     HOME_MEMORY, PASSING_PROBES, Run, TestDir, asphodel, assert_ok, assert_refused,
     assert_refused_without, cassette_bytes, cassette_path, cassette_records, claim, home_claim,
     import_history, imported_small_history, imported_with_a_model, live_script, overrides, probe,
-    probe_in, record, replay_history, said, script_answering_everything, script_steps, simulation,
-    stderr, universal_script, write_cassette, write_reply,
+    probe_in, record, replay_history, reply_to_everything, said, script_answering_everything,
+    script_steps, simulation, stderr, universal_script, write_cassette, write_reply,
 };
 
 fn sha(bytes: &[u8]) -> String {
@@ -1566,4 +1567,241 @@ fn a_refresh_recorded_under_another_model_is_never_substituted() {
     kept.extend(refreshes.iter().map(|r| refresh_copy(r, 200, &[], "far")));
     write_cassette(&dir, &kept);
     recorded_refreshes(&dir, &corpus, &home_lacks_home(), &[]);
+}
+
+// The retention retry. A write that leaves out a memory its stored answer
+// cites, still in its input and major, critical or kept, is sent once
+// more, and the reply that leaves out less is kept. The history here says
+// the home fact (major), then tea, then, two days on, the cat: the
+// profile writes after each, and the third write, the first shown the
+// cat, leaves the home fact out.
+
+const TEA_QUOTE: &str = "I like green tea";
+const CAT_QUOTE: &str = "My cat is called Miso";
+
+/// The profile cites, or doesn't cite, the home fact at noon on 7
+/// January, after the third write.
+fn profile_home(kind: &str) -> String {
+    let fields = format!("model = \"User profile\"\n{HOME_MEMORY}");
+    probe_on("p001", 7, kind, &fields)
+}
+
+fn retention_corpus(dir: &TestDir) -> PathBuf {
+    import_history(dir, |path| {
+        let db = hermes::one_session(path);
+        let t = start();
+        db.home_turn("s1", t);
+        db.turn("s1", t + 3600.0, &format!("{TEA_QUOTE}."), "Noted.");
+        db.turn(
+            "s1",
+            t + 2.0 * hermes::DAY,
+            &format!("{CAT_QUOTE}."),
+            "Noted.",
+        );
+        db
+    })
+}
+
+/// Call 1 claims every fact, and each survives only in the turn quoting it.
+fn retention_claims() -> Vec<Value> {
+    let mut home = home_claim();
+    home["significance"] = json!("major");
+    vec![
+        home,
+        claim("Tim likes green tea.", TEA_QUOTE, "fact"),
+        claim("Tim's cat is called Miso.", CAT_QUOTE, "fact"),
+    ]
+}
+
+/// Whether a record is a write sent a second time.
+fn is_retry(record: &Value) -> bool {
+    is_refresh(record) && !record["template"]["attempt"].is_null()
+}
+
+/// The calls a `live` run of the retention history makes, in order, and
+/// the ids of the home fact and the cat. They come from a first recording
+/// whose every reply is the same; its retries are left out, and its
+/// cassette is removed, so the run under test records afresh.
+fn retention_calls(dir: &TestDir, corpus: &Path) -> (Vec<Value>, [Value; 2]) {
+    let script = script_answering_everything(
+        dir,
+        "retention-calls",
+        retention_claims(),
+        vec![said("Tim lives in Auckland.", &["m1"])],
+    );
+    let probes = probe_on("home", 5, "exists", HOME_MEMORY)
+        + &probe_on("cat", 7, "exists", "memory = \"cat is called Miso\"");
+    let report = replay_history(dir, corpus, "live", &probes, Some(&script), &[]).report();
+    let ids = ["home", "cat"].map(|probe| observed_id(&report, probe));
+    assert!(ids.iter().all(Value::is_string), "{report}");
+    let calls: Vec<Value> = cassette_records(dir)
+        .into_iter()
+        .filter(|record| !is_retry(record))
+        .collect();
+    let writes = calls.iter().filter(|record| is_refresh(record)).count();
+    assert_eq!(writes, 3, "fixture: the profile writes after each fact");
+    fs::remove_file(cassette_path(dir)).unwrap();
+    (calls, ids)
+}
+
+/// A script answering `calls` step by step, in their order: each write
+/// cites everything it's shown, but the one shown the cat leaves the home
+/// fact out; with `retry`, the step after that one is the second reply,
+/// citing everything.
+fn retention_script(
+    dir: &TestDir,
+    calls: &[Value],
+    [home, cat]: &[Value; 2],
+    retry: bool,
+) -> PathBuf {
+    let other = json!({ "reply": reply_to_everything(retention_claims(), vec![]) });
+    let write =
+        |cites: Vec<&str>| json!({ "reply": write_reply(&[said("Tim is known here.", &cites)]) });
+    let mut steps = Vec::new();
+    for record in calls {
+        if !is_refresh(record) {
+            steps.push(other.clone());
+            continue;
+        }
+        let shown = identities(record);
+        let all: Vec<&str> = shown.iter().map(|(handle, _)| handle.as_str()).collect();
+        if !shown.iter().any(|(_, id)| id == cat) {
+            steps.push(write(all));
+            continue;
+        }
+        let without_home = shown
+            .iter()
+            .filter(|(_, id)| id != home)
+            .map(|(handle, _)| handle.as_str())
+            .collect();
+        steps.push(write(without_home));
+        if retry {
+            steps.push(write(all));
+        }
+    }
+    let name = if retry {
+        "retention-retry"
+    } else {
+        "retention"
+    };
+    script_steps(dir, name, &steps)
+}
+
+/// The run's calls by template, in order, retries left out.
+fn call_order(records: &[Value]) -> Vec<Value> {
+    records
+        .iter()
+        .filter(|record| !is_retry(record))
+        .map(|record| record["template"]["name"].clone())
+        .collect()
+}
+
+/// The write is sent again, and the second reply, which cites the home
+/// fact, is the one kept. It's recorded under a key of its own, so
+/// `replay` serves it from the cassette with no LLM, and it's no refresh
+/// of its own. With the retry off, or once the cassette has lost the
+/// second reply, as one recorded before retries has, `replay` keeps the
+/// first reply, with no miss.
+#[test]
+fn a_retried_write_is_recorded_apart_and_replays_with_or_without_it() {
+    let dir = TestDir::new();
+    let corpus = retention_corpus(&dir);
+    let (calls, ids) = retention_calls(&dir, &corpus);
+    let script = retention_script(&dir, &calls, &ids, true);
+    let has_home = profile_home("profile_has");
+    let lacks_home = profile_home("profile_lacks");
+
+    let live = replay_history(&dir, &corpus, "live", &has_home, Some(&script), &[]).report();
+    let records = cassette_records(&dir);
+    assert_eq!(
+        call_order(&records),
+        call_order(&calls),
+        "fixture: the calls came in order"
+    );
+    let retries: Vec<&Value> = records.iter().filter(|record| is_retry(record)).collect();
+    assert_eq!(retries.len(), 1, "{:?}", call_order(&records));
+    let first = records
+        .iter()
+        .find(|record| is_refresh(record) && !is_retry(record) && record["at"] == retries[0]["at"])
+        .expect("the first reply was recorded");
+    assert_ne!(first["key"], retries[0]["key"]);
+    assert_eq!(first["request"]["system"], retries[0]["request"]["system"]);
+    assert_eq!(first["request"]["user"], retries[0]["request"]["user"]);
+    assert_eq!(probe_in(&live, "p001")["passed"], true, "{live}");
+
+    let replay = replay_history(&dir, &corpus, "replay", &has_home, None, &[]).ok();
+    assert_eq!(replay["llm"]["live"], 0, "{replay}");
+    assert_eq!(replay["llm"]["misses"], 0, "{replay}");
+    assert_eq!(simulation(&live), simulation(&replay));
+
+    let off = overrides(&dir, "[mental_models]\nretention_retry = false\n");
+    let flags = ["--overrides", off.as_str()];
+    let without = replay_history(&dir, &corpus, "replay", &lacks_home, None, &flags).ok();
+    assert_eq!(without["llm"]["misses"], 0, "{without}");
+    assert_eq!(
+        without["refresh_calls_per_day"],
+        live["refresh_calls_per_day"]
+    );
+
+    let before_retries: Vec<Value> = records.into_iter().filter(|r| !is_retry(r)).collect();
+    write_cassette(&dir, &before_retries);
+    let old = replay_history(&dir, &corpus, "replay", &lacks_home, None, &[]).ok();
+    assert_eq!(old["llm"]["misses"], 0, "{old}");
+    assert_eq!(old["refresh_calls_per_day"], live["refresh_calls_per_day"]);
+}
+
+/// `fast` sends no retry when it substitutes recorded writes or skips
+/// them, and never substitutes a recorded retry for a first write, even
+/// one listed first at the very time of the write: the first reply stands.
+#[test]
+fn fast_with_recorded_or_no_writes_sends_no_retry() {
+    let dir = TestDir::new();
+    let corpus = retention_corpus(&dir);
+    let (calls, ids) = retention_calls(&dir, &corpus);
+    let script = retention_script(&dir, &calls, &ids, true);
+    let has_home = profile_home("profile_has");
+    replay_history(&dir, &corpus, "live", &has_home, Some(&script), &[]).report();
+    let (mut reordered, firsts): (Vec<Value>, Vec<Value>) =
+        cassette_records(&dir).into_iter().partition(is_retry);
+    assert_eq!(
+        reordered.len(),
+        1,
+        "fixture: the recording sent a write again"
+    );
+    reordered.extend(firsts);
+    write_cassette(&dir, &reordered);
+
+    let lacks_home = profile_home("profile_lacks");
+    for refresh in ["recorded", "off"] {
+        let flags = ["--refresh", refresh];
+        let report = replay_history(&dir, &corpus, "fast", &lacks_home, None, &flags).ok();
+        assert_eq!(report["llm"]["live"], 0, "{refresh}: {report}");
+        assert_eq!(report["llm"]["misses"], 0, "{refresh}: {report}");
+    }
+}
+
+/// A cassette keys each call by a hash of its request. A write keeps the
+/// key it had before retries were recorded, pinned here, so cassettes
+/// recorded then still answer; the same write sent again has a key of its
+/// own.
+#[test]
+fn a_write_keeps_its_cassette_key_and_a_second_try_has_another() {
+    let request = |template: Value| -> LlmRequest {
+        serde_json::from_value(json!({
+            "template": template,
+            "system": "You write a mental model.",
+            "user": "Question: Where does the user live?\n",
+            "schema_name": "mental_model_answer",
+            "schema": {"type": "object"},
+            "max_tokens": null,
+        }))
+        .unwrap()
+    };
+    let first = request(json!({"name": "write_model", "version": 7}));
+    let again = request(json!({"name": "write_model", "version": 7, "attempt": 1}));
+    assert_eq!(
+        key_of("fake-llm", &first),
+        "fe2415dcbac22de2f91eeb4e8a78a43e4b047d41dc411d6066eae7e129c129eb"
+    );
+    assert_ne!(key_of("fake-llm", &again), key_of("fake-llm", &first));
 }
