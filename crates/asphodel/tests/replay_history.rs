@@ -334,27 +334,54 @@ fn recall_finds_any_match_ignores_grounding_and_checks_returned_sentences() {
         db.turn(
             "s1",
             start(),
-            "I live in Auckland, near the harbour.",
+            "I live in Auckland, near the harbour. Quartz oscillators fascinate me. Auckland district notes.",
             "Noted.",
         );
         db
     });
     let harbour = claim("Tim lives near the harbour.", "near the harbour", "fact");
-    let script =
-        script_answering_everything(&dir, "any-match", vec![home_claim(), harbour], vec![]);
+    let unrelated = claim(
+        "Quartz oscillators fascinate me.",
+        "Quartz oscillators fascinate me.",
+        "fact",
+    );
+    // Recall has no relevance floor, so a three-memory store returns even
+    // the unrelated sentence. Enough relevant results must crowd it out;
+    // the grounding probes below verify that public behavior.
+    let mut claims = vec![home_claim(), harbour, unrelated];
+    for district in 1..=12 {
+        claims.push(claim(
+            &format!("Auckland district {district} has notes."),
+            "Auckland district notes.",
+            "fact",
+        ));
+    }
+    let script = script_answering_everything(&dir, "any-match", claims, vec![]);
     let flags = ["--refresh", "off", "--latency", "0s"];
-    let grounding = probe_on("home", 5, "exists", HOME_MEMORY)
+    let query = "query = \"Tim lives in Auckland near the harbour\"";
+    let grounding = probe_on(
+        "home",
+        5,
+        "recall_finds",
+        &format!("{HOME_MEMORY}\n{query}"),
+    ) + &probe_on(
+        "harbour",
+        5,
+        "recall_finds",
+        "memory = \"near the harbour\"\nquery = \"Tim lives in Auckland near the harbour\"",
+    ) + &probe_on("unrelated", 5, "exists", "memory = \"Quartz oscillators\"")
         + &probe_on(
-            "harbour",
+            "unrelated-not-returned",
             5,
-            "recall_finds",
-            "memory = \"near the harbour\"\nquery = \"Tim lives in Auckland near the harbour\"",
+            "recall_lacks",
+            &format!("memory = \"Quartz oscillators\"\n{query}"),
         );
-    let report = replay_history(&dir, &corpus, "fast", &grounding, Some(&script), &flags).ok();
+    let recorded = replay_history(&dir, &corpus, "fast", &grounding, Some(&script), &flags);
+    let report = recorded.report();
+    assert!(recorded.output.status.success(), "grounding: {report}");
     let home = observed_id(&report, "home");
     let harbour = observed_id(&report, "harbour");
     assert_ne!(home, harbour, "the fixture needs two distinct sentences");
-    let query = "query = \"Tim lives in Auckland near the harbour\"";
     let mut probes = String::new();
     for (id, fields) in [
         (
@@ -383,6 +410,10 @@ fn recall_finds_any_match_ignores_grounding_and_checks_returned_sentences() {
             "no-sentence-match",
             format!("memory_id = {home}\nmemory = \"{UNSEEN}\"\n{query}\nany_match = true"),
         ),
+        (
+            "live-but-not-returned",
+            format!("memory = \"Quartz oscillators\"\n{query}\nany_match = true"),
+        ),
     ] {
         probes += &probe_on(id, 5, "recall_finds", &fields);
     }
@@ -396,6 +427,7 @@ fn recall_finds_any_match_ignores_grounding_and_checks_returned_sentences() {
         ("unknown-anchor", true),
         ("no-anchor", true),
         ("no-sentence-match", false),
+        ("live-but-not-returned", false),
     ] {
         let probe = probe_in(&report, id);
         assert_eq!(probe["passed"], passed, "{probe}");
@@ -427,6 +459,62 @@ fn recall_finds_any_match_does_not_match_a_purged_creation_sentence() {
     let report = run.report();
     assert_eq!(probe_in(&report, "purged")["passed"], true);
     assert_eq!(probe_in(&report, "not-returned")["passed"], false);
+}
+
+#[test]
+fn not_created_refuses_a_window_start_after_the_probe_time_without_a_report() {
+    let dir = TestDir::new();
+    let (corpus, _) = record_not_created_fixture(&dir, "notable");
+    let probes = probe(
+        "backwards-window",
+        "2026-01-05T09:00:30Z",
+        "not_created",
+        &format!("{HOME_MEMORY}\nsince = \"2026-01-05T09:00:31Z\"\ncount = 0"),
+    );
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &probes,
+        None,
+        &["--refresh", "off", "--latency", "0s"],
+    );
+    assert!(
+        !run.output.status.success(),
+        "the invalid window must be refused"
+    );
+    assert!(
+        !run.report_path.exists(),
+        "load refusal must not write a report"
+    );
+}
+
+#[test]
+fn history_probes_refuse_unknown_fields_without_a_report() {
+    let dir = TestDir::new();
+    let (corpus, _) = record_not_created_fixture(&dir, "notable");
+    let probes = probe_on(
+        "misspelled-mode",
+        5,
+        "recall_finds",
+        &format!("{HOME_MEMORY}\nquery = \"Tim lives in Auckland\"\nanymatch = true"),
+    );
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &probes,
+        None,
+        &["--refresh", "off", "--latency", "0s"],
+    );
+    assert!(
+        !run.output.status.success(),
+        "a typo must not silently change scoring"
+    );
+    assert!(
+        !run.report_path.exists(),
+        "load refusal must not write a report"
+    );
 }
 
 #[test]
@@ -499,6 +587,14 @@ fn not_created_window_counts_exactly_with_inclusive_boundaries() {
     );
     assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
     let report = run.report();
+    assert_eq!(
+        probe_in(&report, "upper-inclusive")["observed"]["created"],
+        json!([home]),
+    );
+    assert_eq!(
+        probe_in(&report, "outside-window")["observed"]["created"],
+        json!([]),
+    );
     for id in [
         "before",
         "upper-inclusive",
