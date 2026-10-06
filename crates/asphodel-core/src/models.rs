@@ -44,8 +44,8 @@ pub use fake::{FakeEmbedder, FakeEmbedderV2, FakeReranker};
 pub use fetch::{FetchError, FetchFailure, FetchReport, Fetcher, HttpFetcher, fetch_models};
 pub use gate::LlmGate;
 pub use llm::{
-    FakeLlm, LlmClient, LlmError, LlmRequest, LlmResponse, LlmSettings, LlmUsage, OpenAiCompatible,
-    Retry, ScriptError, ScriptStep, ScriptedFailure, Template,
+    Admission, FakeLlm, LlmClient, LlmError, LlmRequest, LlmResponse, LlmSettings, LlmUsage,
+    OpenAiCompatible, Retry, ScriptError, ScriptStep, ScriptedFailure, Template,
 };
 pub use manifest::{
     EMBEDDING_MODEL_ID, MODEL_FILES, ModelFile, ModelSpec, RERANKER_MODEL_ID, manifest,

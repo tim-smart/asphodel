@@ -21,7 +21,9 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, LlmSettings, LlmUsage, unfence};
+use super::llm::{
+    Admission, LlmClient, LlmError, LlmRequest, LlmResponse, LlmSettings, LlmUsage, unfence,
+};
 use crate::clock::Clock;
 use crate::config::{LlmAuth, Secret};
 
@@ -555,6 +557,7 @@ pub struct CodexResponses {
     issuer: String,
     agent: ureq::Agent,
     refreshes: AtomicUsize,
+    admission: Option<Arc<dyn Admission>>,
 }
 
 /// What a single post came back with, before the refresh-and-retry logic.
@@ -584,7 +587,16 @@ impl CodexResponses {
             issuer: AUTH_ISSUER.to_string(),
             agent: config.into(),
             refreshes: AtomicUsize::new(0),
+            admission: None,
         }
+    }
+
+    /// Asks `admission` before every post to the model, the one after a
+    /// 401's refresh included. The refresh itself goes to the issuer and
+    /// isn't asked about.
+    pub fn with_admission(mut self, admission: Arc<dyn Admission>) -> Self {
+        self.admission = Some(admission);
+        self
     }
 
     /// The issuer for refresh. Defaults to [`AUTH_ISSUER`]; tests point it
@@ -631,6 +643,18 @@ impl CodexResponses {
             body["reasoning"] = json!({ "effort": effort });
         }
         body
+    }
+
+    /// [`Self::post`], once the admission, if any, lets it go out.
+    fn admitted_post(
+        &self,
+        tokens: &ChatgptTokens,
+        request: &LlmRequest,
+    ) -> Result<LlmResponse, Post> {
+        if let Some(admission) = &self.admission {
+            admission.admit(request)?;
+        }
+        self.post(tokens, request)
     }
 
     /// One streamed request with `tokens`.
@@ -763,19 +787,19 @@ impl LlmClient for CodexResponses {
     }
 
     /// Load the token file; refresh first if the access token is due; post;
-    /// on 401 refresh once and retry once. A second 401, or a refresh the
+    /// on 401 refresh once and retry once. Each post is admitted first. A second 401, or a refresh the
     /// issuer rejects, is [`LlmError::LoginRequired`].
     fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let mut tokens = self.store.load()?.ok_or(LlmError::LoginRequired)?;
         if tokens.due_for_refresh(self.clock.now()) {
             tokens = self.refresh(&tokens)?;
         }
-        match self.post(&tokens, request) {
+        match self.admitted_post(&tokens, request) {
             Ok(response) => Ok(response),
             Err(Post::Failed(error)) => Err(error),
             Err(Post::Unauthorized) => {
                 let tokens = self.refresh(&tokens)?;
-                match self.post(&tokens, request) {
+                match self.admitted_post(&tokens, request) {
                     Ok(response) => Ok(response),
                     Err(Post::Failed(error)) => Err(error),
                     Err(Post::Unauthorized) => Err(LlmError::LoginRequired),

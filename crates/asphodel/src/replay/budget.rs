@@ -6,9 +6,10 @@
 //! `init` creates it and its lock file `<ledger>.lock` from a frozen
 //! allocations file, and is the only way a ledger comes into being.
 //!
-//! Every backend attempt a budgeted run makes is admitted first, retries
-//! and priming workers included, since [`Budgeted`] sits beneath the retry
-//! layer. Admission takes an exclusive lock on `<ledger>.lock`, reads the
+//! Every post to the model a budgeted run makes is admitted first, retries,
+//! priming workers and the ChatGPT client's post after a 401 included,
+//! since admission sits beneath the retry layer: in [`Budgeted`], or in
+//! the ChatGPT client itself, which can post twice in one call. Admission takes an exclusive lock on `<ledger>.lock`, reads the
 //! ledger and checks it, takes one slot from the run and its stage, writes
 //! the whole ledger to `<ledger>.tmp`, syncs it, renames it over the ledger
 //! and syncs the directory. Only then does the call go out. A crash before
@@ -30,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, anyhow, bail};
-use asphodel_core::models::{LlmClient, LlmError, LlmRequest, LlmResponse};
+use asphodel_core::models::{Admission, LlmClient, LlmError, LlmRequest, LlmResponse};
 use asphodel_core::{Clock as _, SystemClock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -415,7 +416,7 @@ impl Budget {
 
     /// Takes one slot for an attempt at `template`, committed before this
     /// returns. Once anything has gone wrong, refuses every attempt.
-    fn admit(&self, template: &str) -> Result<(), String> {
+    fn take_slot(&self, template: &str) -> Result<(), String> {
         if let Some(reason) = self.stopped() {
             return Err(reason.to_owned());
         }
@@ -536,9 +537,23 @@ pub fn executable_sha() -> anyhow::Result<String> {
     ))
 }
 
-/// The backend client, admitting each attempt against a [`Budget`] before
-/// it goes out. It wraps the raw client, beneath the retry layer, so a
-/// retry is an attempt like any other.
+impl Admission for Budget {
+    /// A refused attempt fails with a code no retry policy knows, so it's
+    /// never retried; the run reports the budget's own reason.
+    fn admit(&self, request: &LlmRequest) -> Result<(), LlmError> {
+        self.take_slot(&request.template.name)
+            .map_err(|_| LlmError::Backend {
+                code: REFUSED_CODE.into(),
+            })
+    }
+}
+
+/// A backend client that sends one request per call, admitting it against
+/// a [`Budget`] first. It wraps the raw client, beneath the retry layer, so
+/// a retry is an attempt like any other. [`CodexResponses`], which can post
+/// twice in a call, is given the budget as its admission instead.
+///
+/// [`CodexResponses`]: asphodel_core::models::CodexResponses
 pub struct Budgeted {
     inner: Arc<dyn LlmClient>,
     budget: Arc<Budget>,
@@ -550,11 +565,7 @@ impl Budgeted {
     }
 
     fn admit(&self, request: &LlmRequest) -> Result<(), LlmError> {
-        self.budget
-            .admit(&request.template.name)
-            .map_err(|_| LlmError::Backend {
-                code: REFUSED_CODE.into(),
-            })
+        self.budget.admit(request)
     }
 }
 

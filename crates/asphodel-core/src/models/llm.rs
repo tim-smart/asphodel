@@ -249,6 +249,14 @@ impl LlmError {
     }
 }
 
+/// Asked before each request a client sends to the model, so the caller
+/// can refuse it: replay's attempt budget. A client that sends more than
+/// one request in a call, as [`super::CodexResponses`] does after a 401,
+/// asks before each.
+pub trait Admission: Send + Sync {
+    fn admit(&self, request: &LlmRequest) -> Result<(), LlmError>;
+}
+
 /// The boundary extraction, reconciliation and refresh call through, and
 /// that replay's recording and cassette modes wrap.
 pub trait LlmClient: Send + Sync {

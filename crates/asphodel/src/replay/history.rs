@@ -18,7 +18,7 @@ use anyhow::{Context as _, anyhow, bail};
 use asphodel_core::config::{Deployment, LLM_API_KEY_ENV, LlmAuth, Secret};
 use asphodel_core::extraction::guidance_hash;
 use asphodel_core::models::{
-    CodexResponses, FakeLlm, LlmClient, LlmSettings, OpenAiCompatible, TokenStore,
+    Admission, CodexResponses, FakeLlm, LlmClient, LlmSettings, OpenAiCompatible, TokenStore,
 };
 use asphodel_core::store::bank::{BankIdentity, PROFILE_FACETS};
 use asphodel_core::{Clock, Models, Service, SimulatedClock, SystemClock, Tuning, VERSION};
@@ -212,14 +212,10 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
     // `replay` never calls the LLM, whatever is configured. A live call
     // retries a transient failure as the daemon's does; its budget runs on
     // the system clock, since the simulated one stands still while it waits.
-    // A budgeted run admits each attempt beneath the retries.
+    // A budgeted run admits each post beneath the retries.
     let live = match mode {
         ReplayMode::Replay => None,
-        ReplayMode::Live | ReplayMode::Fast => live_client(&tuning, args, &dir)?
-            .map(|llm| match &budget {
-                Some(budget) => Arc::new(Budgeted::new(llm, Arc::clone(budget))),
-                None => llm,
-            })
+        ReplayMode::Live | ReplayMode::Fast => live_client(&tuning, args, &dir, budget.as_ref())?
             .map(|llm| crate::serve::retrying(llm, Arc::new(SystemClock)))
             .transpose()?,
     };
@@ -401,12 +397,21 @@ fn mode_name(mode: ReplayMode) -> &'static str {
 /// The LLM `live` and `fast` call on a miss, built as `serve` builds its
 /// own: the scripted fake from `ASPHODEL_LLM_SCRIPT` for tests, else `[llm]`
 /// with the API key from the environment or the ChatGPT login under
-/// `--token-dir`. `None` when nothing is configured.
+/// `--token-dir`. `None` when nothing is configured. With a `budget`, every
+/// post it sends is admitted first, exactly once.
 fn live_client(
     tuning: &Tuning,
     args: &ReplayArgs,
     dir: &Path,
+    budget: Option<&Arc<Budget>>,
 ) -> anyhow::Result<Option<Arc<dyn LlmClient>>> {
+    // One post per call, so admitting each call admits each post.
+    let budgeted = |llm: Arc<dyn LlmClient>| -> Arc<dyn LlmClient> {
+        match budget {
+            Some(budget) => Arc::new(Budgeted::new(llm, Arc::clone(budget))),
+            None => llm,
+        }
+    };
     if let Some(path) = std::env::var_os(crate::serve::LLM_SCRIPT_ENV) {
         let script = std::fs::read_to_string(&path).with_context(|| {
             format!(
@@ -424,7 +429,9 @@ fn live_client(
             "{} is set: live calls go to a scripted fake LLM, not a real one",
             crate::serve::LLM_SCRIPT_ENV
         );
-        return Ok(Some(Arc::new(FakeLlm::from_script(model, &script)?)));
+        return Ok(Some(budgeted(Arc::new(FakeLlm::from_script(
+            model, &script,
+        )?))));
     }
     let deployment = Deployment {
         listen: String::new(),
@@ -439,7 +446,7 @@ fn live_client(
         return Ok(None);
     };
     let client: Arc<dyn LlmClient> = match settings.auth {
-        LlmAuth::ApiKey => Arc::new(OpenAiCompatible::new(settings)),
+        LlmAuth::ApiKey => budgeted(Arc::new(OpenAiCompatible::new(settings))),
         LlmAuth::Chatgpt => {
             let token_dir: PathBuf = args.token_dir.clone().unwrap_or_else(|| dir.to_owned());
             // The login's expiry is in world time, so the live client reads
@@ -451,6 +458,11 @@ fn live_client(
             );
             if let Ok(issuer) = std::env::var(crate::cli::LLM_ISSUER_ENV) {
                 client = client.with_issuer(&issuer);
+            }
+            // It posts again after a 401's refresh, so it admits each post
+            // itself rather than being wrapped.
+            if let Some(budget) = budget {
+                client = client.with_admission(Arc::clone(budget) as Arc<dyn Admission>);
             }
             Arc::new(client)
         }

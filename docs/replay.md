@@ -719,9 +719,9 @@ asphodel replay ... --attempt-budget <file> --budget-run <id>
   run cap above its stage's, per-run caps that add up to more than their
   stage's, and an id given twice. The ledger records the allocations
   file's SHA-256.
-- **Admission.** Every attempt a budgeted run sends takes a slot first:
-  each call, each retry (the budget sits beneath the retry layer), and
-  each priming worker's call. Under an exclusive lock on `<ledger>.lock`,
+- **Admission.** Every post a budgeted run sends to the model takes a
+  slot first: each call, each retry (the budget sits beneath the retry
+  layer), each priming worker's call, and the post after a 401. Under an exclusive lock on `<ledger>.lock`,
   the ledger is read and checked, one slot is taken from the run and from
   its stage, the whole ledger is written to `<ledger>.tmp`, synced and
   renamed over the ledger, and the directory is synced. Only then does the
@@ -760,9 +760,11 @@ asphodel replay ... --attempt-budget <file> --budget-run <id>
   private dir. The lock is an advisory `flock`, which a network
   filesystem may not honour. Runs in different private dirs may share one
   ledger, and their admissions are serialized by the lock.
-- **What counts.** A slot is one call to the model backend. With
-  `auth = "chatgpt"` a call that gets a 401 refreshes the login and posts
-  once more within the same slot, and the OAuth refresh isn't counted.
+- **What counts.** A slot is one post to the model, taken exactly once.
+  With `auth = "chatgpt"`, a call that gets a 401 refreshes the login and
+  posts once more, and that post takes a slot of its own: the client admits
+  each post itself, beneath the retry layer, rather than being wrapped. The
+  login refresh goes to the issuer, not the model, and isn't counted.
 
 ### The report and the aggregate
 
