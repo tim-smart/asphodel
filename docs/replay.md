@@ -244,11 +244,11 @@ mention. The report counts promotions as `call2_rate.promoted`.
 Every route to `refines`, call 2's label or either promotion, then meets a
 kind check (`reconcile.kind_guard`, on by default). A claim can refine a
 memory of its own kind, and a `task` or `recurring` claim can refine a
-task; any other pair of kinds can't be versions of each other, so the
-`refines` is rejected, from a newer claim or an older one. The label is
-dropped, not turned into a mention: the memory gets no access, raise,
-passage or edit. The claim's other labels still decide its fate, and with
-none left it's a new memory. The open-task guard and `ends`, `retracts`
+task. The containment policy treats any other pair of kinds as
+incompatible, so the `refines` is rejected, from a newer claim or an older
+one. The label is dropped, not turned into a mention: the memory gets no
+access, raise, passage or edit. The claim's other labels still decide its
+fate, and it's a new memory only if no other accepted label decides it. The open-task guard and `ends`, `retracts`
 and `denies` are unchanged. The check contains merges; it doesn't prove two
 memories say different things. A preference refined by another preference
 still merges, and a rejected repeat can leave two heads whose sentences
@@ -257,6 +257,17 @@ recall can return both. `call2_rate.refines_rejected` counts the rejections
 as `explicit`, `date_promoted` and `weight_promoted`;
 `call2_rate.refines_across_kinds` counts the same pairs whether or not the
 guard was on, and the report's `kind_mismatches` lists each one.
+
+These count the decisions the guard itself decides, not every cross-kind
+label call 2 gives. A refinement already dropped another way isn't counted:
+a newer one on an open task (the open-task guard), one on a neighbour
+already ended, one on a neighbour an earlier claim in the same chunk
+retracted or refined, and one on a neighbour that vanished before the
+commit. An older one on an open task is counted, since the open-task guard
+only stops newer claims. Repeats that stay repeats, `ends`, `retracts` and
+`denies` are outside the count. Each run lists only what it met, so after
+the arms' heads drift apart, an on/off comparison needs the union of both
+lists.
 
 Call 2 version 3 shows these fields beside both claims and memories, using
 UTC timestamps and `none` for absent dates. Its prompt treats an added
