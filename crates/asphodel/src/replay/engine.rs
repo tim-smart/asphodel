@@ -68,9 +68,8 @@ use super::cassette::{Chained, ChunkContext, ChunkKey, Recorder};
 use super::labelling::{Collector, Material};
 use super::report::{
     Call2Rate, DayCount, InjectedTokens, InjectionUsage, KindMismatchRow, Lag, LlmCounts,
-    MemoryOutcome, Percentiles, ProbeResult, RefineCauses, SessionTokens, WeekBands, WeekCount,
-    Call2Rate, DayCount, InjectedTokens, InjectionUsage, Lag, LlmCounts, MemoryOutcome,
-    Percentiles, ProbeResult, Restatements, SessionTokens, WeekBands, WeekCount,
+    MemoryOutcome, Percentiles, ProbeResult, RefineCauses, Restatements, SessionTokens, WeekBands,
+    WeekCount,
 };
 use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX};
 use super::shadow::{Created, ShadowRow};

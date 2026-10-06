@@ -10,8 +10,8 @@ use super::claims::{Checked, Kind as ClaimKind, Link, NewMemory, Precision, Stam
 use super::input::{Unit, survivor};
 use super::reconcile::{Edit, Fate, Neighbour, Plan, Restated, end_at};
 use super::{
-    CALL2_VERSION, Call1Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT, EDIT_REFINED,
-    EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted, KindMismatch,
+    CALL2_VERSION, Call1Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT,
+    EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted, KindMismatch,
 };
 use crate::constants::{
     Significance, Volatility, WEIGHT_CONFIRMED, WEIGHT_CREATED, WEIGHT_MENTIONED_AGAIN, WEIGHT_USED,
@@ -683,8 +683,10 @@ fn record_restatement(
     Ok(true)
 }
 
-/// A checked claim as JSON, as [`insert_memory`] would have written it. A
-/// known entity is named by its id, a proposed one by its name and kind.
+/// A checked claim as JSON, as [`insert_memory`] would have written it,
+/// with its resolved window: an undated event's start is the day it was
+/// said, flagged `valid_from_defaulted`. A known entity is named by its id,
+/// a proposed one by its name and kind.
 fn claim_json(
     tx: &Transaction<'_>,
     memory: &NewMemory,
@@ -726,7 +728,8 @@ fn claim_json(
         "sentence": memory.content,
         "kind": memory.kind.as_str(),
         "significance": level(memory.significance),
-        "valid_from": stamp(memory.supplied_valid_from()),
+        "valid_from": stamp(memory.valid_from),
+        "valid_from_defaulted": memory.valid_from_defaulted,
         "valid_until": stamp(memory.valid_until),
         "due_at": stamp(memory.due_at),
         "until_event": memory.until_event,
