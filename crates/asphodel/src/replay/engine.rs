@@ -69,6 +69,8 @@ use super::labelling::{Collector, Material};
 use super::report::{
     Call2Rate, DayCount, InjectedTokens, InjectionUsage, KindMismatchRow, Lag, LlmCounts,
     MemoryOutcome, Percentiles, ProbeResult, RefineCauses, SessionTokens, WeekBands, WeekCount,
+    Call2Rate, DayCount, InjectedTokens, InjectionUsage, Lag, LlmCounts, MemoryOutcome,
+    Percentiles, ProbeResult, Restatements, SessionTokens, WeekBands, WeekCount,
 };
 use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX};
 use super::shadow::{Created, ShadowRow};
@@ -143,6 +145,7 @@ pub struct Outcome {
     pub injection_usage: InjectionUsage,
     pub profile_tokens: Percentiles,
     pub call2_rate: Call2Rate,
+    pub restatements: Restatements,
     pub agenda_lines_per_day: Vec<DayCount>,
     pub significance_histogram: BTreeMap<String, u64>,
     pub kind_histogram: BTreeMap<String, u64>,
@@ -333,6 +336,8 @@ pub struct Engine<'a> {
     refines_rejected: RefineCauses,
     refines_across_kinds: RefineCauses,
     kind_mismatches: Vec<KindMismatchRow>,
+    /// Restatements written.
+    restatements: u64,
     agenda_lines: BTreeMap<String, u64>,
     significance_histogram: BTreeMap<String, u64>,
     kind_histogram: BTreeMap<String, u64>,
@@ -419,6 +424,7 @@ impl<'a> Engine<'a> {
             refines_rejected: RefineCauses::default(),
             refines_across_kinds: RefineCauses::default(),
             kind_mismatches: Vec::new(),
+            restatements: 0,
             agenda_lines: BTreeMap::new(),
             significance_histogram: BTreeMap::new(),
             kind_histogram: BTreeMap::new(),
@@ -903,6 +909,7 @@ impl<'a> Engine<'a> {
                     let row = KindMismatchRow::of(extracted.chunk, mismatch);
                     self.kind_mismatches.push(row);
                 }
+                self.restatements += extracted.restatements as u64;
                 extracted
             }
             Committed::Stale(stale) => {
@@ -1417,6 +1424,26 @@ impl<'a> Engine<'a> {
                 Some(view) => (false, json!({ "id": view.id, "present": true })),
                 None => (true, json!({ "id": memory, "present": false })),
             },
+            Check::Restated {
+                sentence, label, ..
+            } => match self.view(memory)? {
+                Some(view) => {
+                    let passed = view.restatements.iter().any(|restatement| {
+                        restatement.sentence == *sentence
+                            && label.is_none_or(|label| restatement.label == label.as_str())
+                    });
+                    let labels: Vec<&str> = view
+                        .restatements
+                        .iter()
+                        .map(|restatement| restatement.label.as_str())
+                        .collect();
+                    (
+                        passed,
+                        json!({ "id": view.id, "present": true, "labels": labels }),
+                    )
+                }
+                None => (false, json!({ "present": false })),
+            },
             Check::AgendaHas { .. } | Check::AgendaLacks { .. } => {
                 let listed = self.service.agenda(bank)?.listed();
                 let has = memory.is_some_and(|id| listed.contains(&id));
@@ -1629,6 +1656,9 @@ impl<'a> Engine<'a> {
                         self.redos as f64 / self.chunks as f64
                     }
                 }),
+            },
+            restatements: Restatements {
+                written: self.restatements,
             },
             agenda_lines_per_day: self
                 .agenda_lines

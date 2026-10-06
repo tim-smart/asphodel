@@ -656,6 +656,22 @@ pub(super) struct Plan {
     /// Refinements between incompatible kinds, in label order, whether or
     /// not the guard rejected them.
     pub mismatches: Vec<Mismatch>,
+    /// Each absorbed newer claim and neighbour its repeat was credited to,
+    /// in claim order: the claims kept as restatements. A same-document
+    /// repeat, an older claim and a claim that's a memory have none.
+    pub restatements: Vec<Restated>,
+}
+
+/// An absorbed claim kept as a restatement on a neighbour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Restated {
+    /// The checked claim's index.
+    pub claim: usize,
+    pub neighbour: i64,
+    /// Call 2's label.
+    pub label: Label,
+    /// The label after the date and significance guards.
+    pub outcome: Label,
 }
 
 impl Plan {
@@ -737,7 +753,11 @@ pub(super) fn plan(
         let mut older_nothing = false;
         let mut older_end: Option<usize> = None;
         let mut mentions: Vec<(usize, Label)> = Vec::new();
+        // The newer claim's repeats, with call 2's label and the label after
+        // the guards.
+        let mut repeats: Vec<(usize, Label, Label)> = Vec::new();
         for &(n, label) in by_claim.get(claim.handle.as_str()).into_iter().flatten() {
+            let called = label;
             if retracted[n] {
                 continue;
             }
@@ -811,6 +831,9 @@ pub(super) fn plan(
                         continue;
                     }
                     mentions.push((n, label));
+                    if newer {
+                        repeats.push((n, called, label));
+                    }
                 }
                 Label::Ends | Label::Retracts | Label::Denies | Label::Refines if ended[n] => {}
                 Label::Ends if newer => {
@@ -846,14 +869,15 @@ pub(super) fn plan(
             }
         }
 
+        let same_document =
+            |n: usize| document_id.is_some() && search.neighbours[n].document_id == document_id;
         for &(n, label) in &mentions {
             let neighbour = &search.neighbours[n];
             // A later version of the same document repeating itself
             // isn't an independent mention.
             // Its passage is recorded either way: it restated the memory.
             plan.add_passage(neighbour.id, (memory.start, memory.end));
-            let same_document = document_id.is_some() && neighbour.document_id == document_id;
-            if same_document {
+            if same_document(n) {
                 continue;
             }
             let kind = plan.accesses.entry(neighbour.id).or_insert(label);
@@ -895,6 +919,19 @@ pub(super) fn plan(
         if fate == Fate::Absorbed && memory.kept {
             plan.keeps
                 .extend(mentions.iter().map(|&(n, _)| search.neighbours[n].id));
+        }
+        // What an absorbed newer claim said is kept on each neighbour it's
+        // credited to, so it isn't lost with call 1's reply.
+        if fate == Fate::Absorbed {
+            plan.restatements
+                .extend(repeats.iter().filter(|&&(n, _, _)| !same_document(n)).map(
+                    |&(n, label, outcome)| Restated {
+                        claim: index,
+                        neighbour: search.neighbours[n].id,
+                        label,
+                        outcome,
+                    },
+                ));
         }
         plan.fates.push(fate);
     }

@@ -37,6 +37,7 @@ const SECTIONS: &[(&str, &str)] = &[
     ("profile_tokens", "Profile tokens"),
     ("extraction_lag", "Extraction lag"),
     ("call2_rate", "Call 2 rate"),
+    ("restatements", "Restatements"),
     ("refresh_calls_per_day", "Refresh calls per day"),
     ("agenda_lines_per_day", "Agenda lines per day"),
     ("bands_per_week", "Memories per band per week"),

@@ -678,6 +678,18 @@ async function memory(ctx) {
                 h("ul", { class: "inline-list" }, view.entities.map((e) => h("li", {}, e.name))),
               )
             : null,
+          view.restatements?.length
+            ? h(
+                "section",
+                { class: "panel", "aria-labelledby": "restated-title" },
+                h("h2", { id: "restated-title" }, "Said again"),
+                h(
+                  "ul",
+                  { class: "history" },
+                  view.restatements.map((r) => h("li", {}, r.sentence, " · ", h("span", {}, r.label.replaceAll("_", " ")), " ", time(r.observed_at, { withTime: true }))),
+                ),
+              )
+            : null,
           h(
             "details",
             { class: "panel" },

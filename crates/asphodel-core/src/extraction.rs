@@ -359,6 +359,9 @@ pub struct Extracted {
     /// neighbour, made chain heads instead because they matter at least
     /// `reconcile.promotion_gap` significance levels more than it.
     pub promoted: Vec<Uuid>,
+    /// Restatements written: one per absorbed newer claim and memory it was
+    /// credited to.
+    pub restatements: usize,
     /// Refinements between kinds that can't be versions of each other, in
     /// label order, and whether `reconcile.kind_guard` rejected each.
     pub kind_mismatches: Vec<KindMismatch>,
@@ -612,6 +615,8 @@ pub struct Prepared {
     search: Option<reconcile::Search>,
     labels: Vec<call2::ClaimLabels>,
     plan: reconcile::Plan,
+    /// The model that answered call 2, when it ran.
+    call2_model: Option<String>,
 }
 
 impl Prepared {
@@ -799,6 +804,7 @@ pub(crate) fn prepare(
             search: None,
             labels: Vec::new(),
             plan: reconcile::Plan::all_new(claims),
+            call2_model: None,
         },
     )
 }
@@ -878,8 +884,12 @@ fn reconcile_claims(
             });
         }
     };
-    let (labels, plan) = match &search {
-        None => (Vec::new(), reconcile::Plan::all_new(checked.memories.len())),
+    let (labels, plan, call2_model) = match &search {
+        None => (
+            Vec::new(),
+            reconcile::Plan::all_new(checked.memories.len()),
+            None,
+        ),
         Some(search) => {
             if !saved {
                 save(store, &lease, &reply, &unit)?;
@@ -903,7 +913,7 @@ fn reconcile_claims(
                 }
             };
             let plan = reconcile::plan(search, &input, &unit, &checked, &labels, rules);
-            (labels, plan)
+            (labels, plan, Some(llm.model().to_string()))
         }
     };
     Ok(Prepared {
@@ -921,6 +931,7 @@ fn reconcile_claims(
         search,
         labels,
         plan,
+        call2_model,
     })
 }
 
@@ -997,6 +1008,7 @@ pub(crate) fn commit_prepared(
                 &plan,
                 neighbours.unwrap_or_default(),
                 prepared.corroborate_used,
+                prepared.call2_model.as_deref(),
             )?;
             tx.commit()?;
             leases.committed(bank_id);
