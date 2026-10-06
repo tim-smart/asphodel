@@ -1658,3 +1658,312 @@ fn fused_candidates_past_the_rerank_pool_are_listed_and_never_reranked() {
     assert_eq!(injection.injection.unwrap().injected, prefetch.injected);
     assert_eq!(*reranker.0.lock().unwrap(), vec![pool; 4]);
 }
+
+// Restatements in recall
+//
+// A restatement is what a repeat said when call 2 absorbed it into a
+// memory. Recall searches each restatement's sentence in the vector and
+// BM25 arms, keyed to its memory, and reranks a memory on the best of its
+// head and its newest five restatements. A returned memory reads as its
+// head and then those restatements, oldest first, whichever sentence
+// matched; explain says which one did. Reconciliation never sees them.
+//
+// Each restatement here shares at least half its words with its memory, so
+// the fake embedder puts the memory above the reconcile floor and call 2
+// runs to absorb it.
+
+const CAT: &str = "Tim's cat is called Miso.";
+const TABBY: &str = "Tim's cat is called Miso and she is a ginger tabby.";
+const PORIRUA: &str = "Tim's cat is called Miso and she came from Porirua.";
+const BIKE: &str = "Tim's bike is a Brompton.";
+
+impl Harness {
+    /// The owner says `sentence` at `said` and call 2 labels it
+    /// `mentioned_again` on `memory`, so the memory keeps it as a
+    /// restatement and no memory is made of it.
+    fn restate(&self, memory: Uuid, said: Timestamp, sentence: &str) {
+        static SESSIONS: AtomicU64 = AtomicU64::new(0);
+        let session = format!("restate-{}", SESSIONS.fetch_add(1, Ordering::Relaxed));
+        let restated = |h: &Harness| {
+            let view = h.service.show_memory(BANK, &memory.to_string()).unwrap();
+            view.restatements.len()
+        };
+        let before = restated(self);
+        let turn = turn(&session, said, sentence, None);
+        self.service.ingest_turn(BANK, &turn).unwrap();
+        let call1 = json!({"claims": [fact(sentence)], "used_injected_ids": []});
+        let call2 = {
+            let lease = self.service.claim_chunk(BANK).unwrap().expect("queued");
+            let input = self.service.call2_input(&lease, &call1, &[]).unwrap();
+            let input = input.expect("call 2 runs");
+            let neighbour = input.neighbours.iter().find(|n| n.memory == memory);
+            let neighbour = neighbour.expect("the memory is a neighbour");
+            json!({"claims": [{
+                "claim": input.claims[0].handle,
+                "labels": [{"neighbour": neighbour.handle, "label": "mentioned_again"}],
+            }]})
+        };
+        let llm = FakeLlm::scripted("fake-llm", vec![call1, call2]);
+        let extracted = self.service.extract_next(BANK, &llm).unwrap();
+        let extracted = extracted.expect("the turn was queued");
+        assert!(extracted.memories.is_empty(), "{sentence:?} was absorbed");
+        assert_eq!(restated(self), before + 1, "{sentence:?} is restated");
+    }
+
+    /// Call 2's input for a turn saying `claims` now, or `None` when call 2
+    /// wouldn't run. The turn stays queued.
+    fn call2_for(&self, claims: Vec<Value>) -> Option<asphodel_core::extraction::Call2Input> {
+        let quotes: Vec<&str> = claims
+            .iter()
+            .map(|c| c["quote"].as_str().unwrap())
+            .collect();
+        let said = self.service.now() - SignedDuration::from_mins(1);
+        let turn = turn("call-2", said, &quotes.join(" "), None);
+        self.service.ingest_turn(BANK, &turn).unwrap();
+        let call1 = json!({"claims": claims, "used_injected_ids": []});
+        let lease = self.service.claim_chunk(BANK).unwrap().expect("queued");
+        self.service.call2_input(&lease, &call1, &[]).unwrap()
+    }
+}
+
+/// Restating a memory gives it accesses, which make it stronger than the
+/// memories it's ranked against. Relevance at four times the logit lets the
+/// words a question shares decide the order instead.
+fn by_relevance() -> Harness {
+    Harness::with(|t| set_scale(t, 0.25))
+}
+
+/// `days` days after [`EARLIER`], when restatements are said in order.
+fn days_later(days: i64) -> Timestamp {
+    at(EARLIER) + SignedDuration::from_hours(24 * days)
+}
+
+/// `memory`'s result in `recall`.
+fn result(recall: &Recall, memory: Uuid) -> &asphodel_core::retrieval::Recalled {
+    let found = recall.results.iter().find(|r| r.id == memory);
+    found.unwrap_or_else(|| panic!("{memory} wasn't recalled: {recall:#?}"))
+}
+
+/// `memory`'s candidate in `explain` as the explain endpoint serves it.
+fn explained_json(explain: &Explain, memory: Uuid) -> Value {
+    let candidate = explained(explain, memory);
+    serde_json::to_value(candidate).unwrap()
+}
+
+/// The 1-based place `arm` gave `candidate`, or `None` when it didn't find
+/// it.
+fn arm_rank(candidate: &Explained, arm: Arm) -> Option<usize> {
+    let found = candidate.arms.iter().find(|a| a.arm == arm);
+    found.and_then(|a| a.rank)
+}
+
+#[test]
+fn a_query_matching_only_a_restatement_recalls_its_memory() {
+    // The question shares no word with the cat's own sentence: only what
+    // was said again about her names a ginger tabby from Porirua. Sam's cat
+    // shares one word with it and would otherwise come first.
+    let h = by_relevance();
+    let cat = h.seed(fact(CAT));
+    h.restate(cat, days_later(1), TABBY);
+    h.restate(cat, days_later(2), PORIRUA);
+    let sam = h.seed(fact("Sam's ginger cat sleeps all day on the sofa."));
+    let question = "ginger tabby Porirua";
+
+    let first = h.recall(RecallRequest {
+        limit: Some(1),
+        ..query(question)
+    });
+    assert_eq!(ids(&first), vec![cat], "{first:#?}");
+    let recall = h.recall(query(question));
+    assert_eq!(ids(&recall), vec![cat, sam], "{recall:#?}");
+
+    let explain = h.explain(explain_recall(&query(question)));
+    let shown = explained(&explain, cat);
+    assert_eq!(arm_rank(shown, Arm::Vector), Some(1), "{shown:#?}");
+    assert_eq!(arm_rank(shown, Arm::Bm25), Some(1), "{shown:#?}");
+    // The best single sentence's logit, the ginger tabby's two words, not
+    // the three every sentence of the memory holds between them.
+    assert_eq!(shown.logit, Some(1.5), "{shown:#?}");
+}
+
+#[test]
+fn a_recalled_memory_reads_as_its_head_then_its_newest_five_restatements_oldest_first() {
+    let h = Harness::new();
+    let cat = h.seed(fact(CAT));
+    let likes = [
+        "sardines", "boxes", "sunbeams", "string", "naps", "cushions", "rain",
+    ];
+    let restated: Vec<String> = likes
+        .iter()
+        .map(|thing| format!("Tim's cat is called Miso and she likes {thing}."))
+        .collect();
+    for (day, sentence) in (1..).zip(&restated) {
+        h.restate(cat, days_later(day), sentence);
+    }
+    let (left_out, shown) = restated.split_at(2);
+
+    // The same text whichever sentence the question matches: the head's,
+    // the newest restatement's, or the oldest's, which is searched but not
+    // shown.
+    let mut texts = BTreeSet::new();
+    for question in ["Miso", "rain", "sardines"] {
+        let recall = h.recall(query(question));
+        let text = result(&recall, cat).sentence.clone();
+        assert!(text.starts_with(CAT), "{question}: {text}");
+        assert_eq!(text.matches(CAT).count(), 1, "{question}: {text}");
+        let places: Vec<usize> = shown
+            .iter()
+            .map(|sentence| {
+                let place = text.find(sentence.as_str());
+                place.unwrap_or_else(|| panic!("{question}: {sentence:?} isn't in {text:?}"))
+            })
+            .collect();
+        assert!(places.is_sorted(), "{question}: {text}");
+        for sentence in left_out {
+            assert!(!text.contains(sentence.as_str()), "{question}: {text}");
+        }
+        assert!(recall.text.contains(&text), "{question}: {}", recall.text);
+        texts.insert(text);
+    }
+    assert_eq!(texts.len(), 1, "{texts:#?}");
+
+    // The reranker sees the head and the newest five: the newest
+    // restatement's word scores, and the oldest's finds the memory through
+    // BM25 but scores as if nothing matched.
+    for (question, logit) in [("rain", 0.5), ("sardines", -0.5)] {
+        let explain = h.explain(explain_recall(&query(question)));
+        let shown = explained(&explain, cat);
+        assert!(
+            arm_rank(shown, Arm::Bm25).is_some(),
+            "{question}: {shown:#?}"
+        );
+        assert_eq!(shown.logit, Some(logit), "{question}: {shown:#?}");
+    }
+}
+
+#[test]
+fn a_sentence_said_again_is_shown_once() {
+    // Rua's sentence is restated word for word, and so is one restatement.
+    let dog = "Tim's dog is called Rua.";
+    let park = "Tim's dog is called Rua and loves the park.";
+    let h = Harness::new();
+    let rua = h.seed(fact(dog));
+    h.restate(rua, days_later(1), dog);
+    h.restate(rua, days_later(2), park);
+    h.restate(rua, days_later(3), park);
+
+    let recall = h.recall(query("Rua park"));
+    let text = &result(&recall, rua).sentence;
+    assert!(text.starts_with(dog), "{text}");
+    assert_eq!(text.matches(dog).count(), 1, "{text}");
+    assert_eq!(text.matches(park).count(), 1, "{text}");
+}
+
+#[test]
+fn a_memory_restated_many_times_takes_one_candidate_slot() {
+    // Every restatement of the cat matches the question better than Sam's
+    // cat does, and the cat still holds one place in each arm and one in
+    // the results.
+    let h = by_relevance();
+    let cat = h.seed(fact(CAT));
+    let likes = [
+        "sardines", "boxes", "sunbeams", "string", "naps", "cushions",
+    ];
+    for (day, thing) in (1..).zip(likes) {
+        let sentence = format!("Tim's cat is called Miso, a ginger tabby who likes {thing}.");
+        h.restate(cat, days_later(day), &sentence);
+    }
+    let [sam, ..] = h.seed_many([
+        fact("Sam has a ginger cat too, and it is called Rangi and it sleeps a lot."),
+        fact(BIKE),
+        fact("Tim lives in Wellington."),
+    ]);
+    let request = query("ginger tabby");
+
+    let recall = h.recall(request.clone());
+    let returned = ids(&recall);
+    assert_eq!(returned.iter().filter(|id| **id == cat).count(), 1);
+    assert_eq!(returned[..2], [cat, sam], "{recall:#?}");
+
+    let explain = h.explain(explain_recall(&request));
+    let listed = explain.candidates.iter().filter(|c| c.id == cat).count();
+    assert_eq!(listed, 1, "{explain:#?}");
+    let second = explained(&explain, sam);
+    assert_eq!(arm_rank(second, Arm::Vector), Some(2), "{second:#?}");
+    assert_eq!(arm_rank(second, Arm::Bm25), Some(2), "{second:#?}");
+    assert_eq!(second.rrf_rank, Some(2), "{second:#?}");
+}
+
+#[test]
+fn a_restatement_never_makes_call_2_run_or_joins_its_neighbours() {
+    // The claim is close to what was said again about the cat and to
+    // nothing the cat's own sentence says.
+    let rescued = "Tim's cat is called Miso, a ginger tabby rescued from Porirua.";
+    let claim = || vec![fact("A ginger tabby rescued from Porirua.")];
+
+    // Alone, it runs no call 2.
+    let h = Harness::new();
+    let cat = h.seed(fact(CAT));
+    h.restate(cat, days_later(1), rescued);
+    assert!(h.call2_for(claim()).is_none());
+
+    // With a memory near it, call 2 runs, and the cat isn't shown.
+    let h = Harness::new();
+    let cat = h.seed(fact(CAT));
+    h.restate(cat, days_later(1), rescued);
+    let winter = h.seed(fact("A ginger tabby was rescued in Porirua last winter."));
+    let input = h.call2_for(claim()).expect("call 2 runs");
+    let shown: Vec<Uuid> = input.neighbours.iter().map(|n| n.memory).collect();
+    assert_eq!(shown, vec![winter], "{input:#?}");
+}
+
+#[test]
+fn a_memory_without_restatements_scores_and_reads_as_before() {
+    // Restating the cat with Tim's bike in it leaves the bike's own score
+    // and text alone.
+    let h = Harness::new();
+    let cat = h.seed(fact(CAT));
+    let bike = h.seed(fact(BIKE));
+    let question = "Tim bike Brompton";
+    let scored = |h: &Harness| {
+        let explain = h.explain(explain_recall(&query(question)));
+        let shown = explained(&explain, bike);
+        (shown.logit, shown.score.map(|parts| parts.relevance))
+    };
+    let before = scored(&h);
+    assert_eq!(before, (Some(2.5), Some(2.5)));
+
+    let sleeps = "Tim's cat is called Miso and she sleeps by the bike.";
+    h.restate(cat, days_later(1), sleeps);
+    assert_eq!(scored(&h), before);
+    let recall = h.recall(query(question));
+    assert_eq!(result(&recall, bike).sentence, BIKE);
+    assert!(result(&recall, cat).sentence.contains(sleeps));
+}
+
+#[test]
+fn explain_names_the_sentence_that_matched() {
+    // Each arm, and the reranker, says which of a memory's sentences it
+    // matched: a restatement, or the head of a memory with none.
+    let h = Harness::new();
+    let cat = h.seed(fact(CAT));
+    h.restate(cat, days_later(1), TABBY);
+    h.restate(cat, days_later(2), PORIRUA);
+    let bike = h.seed(fact(BIKE));
+
+    for (question, memory, sentence) in [
+        ("ginger tabby", cat, TABBY),
+        ("Porirua", cat, PORIRUA),
+        ("bike Brompton", bike, BIKE),
+    ] {
+        let explain = h.explain(explain_recall(&query(question)));
+        let shown = explained_json(&explain, memory);
+        assert_eq!(shown["matched"], sentence, "{question}: {shown:#}");
+        for arm in ["vector", "bm25"] {
+            let arms = shown["arms"].as_array().unwrap();
+            let found = arms.iter().find(|a| a["arm"] == arm);
+            let found = found.unwrap_or_else(|| panic!("{question}: no {arm} arm in {shown:#}"));
+            assert_eq!(found["sentence"], sentence, "{question}, {arm}: {shown:#}");
+        }
+    }
+}

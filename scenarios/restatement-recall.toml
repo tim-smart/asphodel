@@ -1,0 +1,121 @@
+# Tim says his cat is called Miso, then says it again with what she is and
+# where she came from. Call 2 labels the repeat mentioned_again, so it's
+# absorbed into the memory as a restatement. Ten friends coming home share
+# two words each with the question; the cat's own sentence shares none,
+# and only the restatement names a ginger tabby from Porirua. Recall that
+# searches restatements finds the cat ahead of the ten; recall over the
+# memory's own sentence alone ranks it eleventh, past the default limit.
+
+name = "restatement-recall"
+group = "ci"
+description = "A question only a restatement answers recalls the memory it was absorbed into."
+
+[bank]
+timezone = "UTC"
+
+[[turn]]
+at = "2026-01-05T09:00:00Z"
+session = "s1"
+user = "My cat is called Miso."
+assistant = "Lovely name."
+
+[[turn.claim]]
+label = "cat"
+content = "Tim's cat is called Miso."
+quote = "My cat is called Miso"
+kind = "fact"
+significance = "minor"
+
+[[turn]]
+at = "2026-01-12T09:00:00Z"
+session = "s2"
+user = "My cat is called Miso, a ginger tabby from Porirua."
+assistant = "Noted."
+
+[[turn.claim]]
+content = "Tim's cat is called Miso, a ginger tabby from Porirua."
+quote = "My cat is called Miso, a ginger tabby from Porirua"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "cat", outcome = "mentioned_again" }]
+
+[[turn]]
+at = "2026-01-19T09:00:00Z"
+session = "s3"
+user = "Ana came home from Napier. Ben came home from Nelson. Cara came home from Taupo. Dev came home from Picton. Ella came home from Timaru. Finn came home from Whanganui. Gia came home from Gisborne. Hemi came home from Masterton. Iris came home from Oamaru. Jack came home from Kaikoura."
+assistant = "Welcome back to all of them."
+
+[[turn.claim]]
+content = "Ana came home from Napier."
+quote = "Ana came home from Napier"
+kind = "event"
+significance = "minor"
+
+[[turn.claim]]
+content = "Ben came home from Nelson."
+quote = "Ben came home from Nelson"
+kind = "event"
+significance = "minor"
+
+[[turn.claim]]
+content = "Cara came home from Taupo."
+quote = "Cara came home from Taupo"
+kind = "event"
+significance = "minor"
+
+[[turn.claim]]
+content = "Dev came home from Picton."
+quote = "Dev came home from Picton"
+kind = "event"
+significance = "minor"
+
+[[turn.claim]]
+content = "Ella came home from Timaru."
+quote = "Ella came home from Timaru"
+kind = "event"
+significance = "minor"
+
+[[turn.claim]]
+content = "Finn came home from Whanganui."
+quote = "Finn came home from Whanganui"
+kind = "event"
+significance = "minor"
+
+[[turn.claim]]
+content = "Gia came home from Gisborne."
+quote = "Gia came home from Gisborne"
+kind = "event"
+significance = "minor"
+
+[[turn.claim]]
+content = "Hemi came home from Masterton."
+quote = "Hemi came home from Masterton"
+kind = "event"
+significance = "minor"
+
+[[turn.claim]]
+content = "Iris came home from Oamaru."
+quote = "Iris came home from Oamaru"
+kind = "event"
+significance = "minor"
+
+[[turn.claim]]
+content = "Jack came home from Kaikoura."
+quote = "Jack came home from Kaikoura"
+kind = "event"
+significance = "minor"
+
+[[probe]]
+id = "the-repeat-is-restated"
+at = "2026-01-20T09:00:00Z"
+kind = "restated"
+memory = "cat"
+sentence = "Tim's cat is called Miso, a ginger tabby from Porirua."
+label = "mentioned_again"
+
+[[probe]]
+id = "recall-finds-the-cat-by-her-restatement"
+at = "2026-01-20T09:00:00Z"
+kind = "recall_finds"
+memory = "cat"
+query = "Which ginger tabby came from Porirua?"
