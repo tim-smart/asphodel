@@ -2185,7 +2185,7 @@ fn a_restored_store_keeps_its_fingerprint_and_pauses_purge_under_another() {
 /// SQL that undoes the latest registered migration, `SCHEMA_VERSION`'s, by
 /// dropping the tables, indexes and added columns it creates. It only
 /// handles SQL that creates or drops tables and indexes or adds columns,
-/// plus the runner changes below, and fails loudly on any other. Extend
+/// plus the runner conversions below, and fails loudly on any other. Extend
 /// this test when such a migration lands rather than downgrading to a
 /// schema no older binary wrote.
 fn undo_latest_migration() -> String {
@@ -2209,6 +2209,18 @@ fn undo_latest_migration() -> String {
         "the newest migration file, {}, is the latest registered one",
         path.display()
     );
+    if *version == 18 {
+        // Version 18 changes rows, not tables. Put the seeded question back
+        // so restoring the older backup exercises the conversion again.
+        const EARLIER_PROFILE_QUESTION: &str = "Who is the user: their preferences, important people, \
+             work and home, the platforms they use, and how they like to be helped. Not upcoming events, \
+             tasks or routines.";
+        return format!(
+            "UPDATE mental_models SET question = '{}' WHERE question = '{}';",
+            EARLIER_PROFILE_QUESTION.replace('\'', "''"),
+            asphodel_core::store::bank::PROFILE_QUESTION.replace('\'', "''")
+        );
+    }
     let statements = |path: &Path| -> Vec<String> {
         fs::read_to_string(path)
             .unwrap()
@@ -2325,7 +2337,7 @@ fn an_older_backup_restores_into_a_new_data_dir_and_migrates_with_a_copy() {
 
     // The copy put back one schema version, as the binary before the latest
     // registered migration would have left a fresh store: without what that
-    // migration creates, and with one migration row from 0 to the version
+    // migration creates or converts, and with one migration row from 0 to the version
     // before it.
     let older = SCHEMA_VERSION - 1;
     let older_file = dir.path("older.db");

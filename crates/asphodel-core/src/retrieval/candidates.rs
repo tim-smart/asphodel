@@ -48,6 +48,9 @@ pub(crate) struct Candidate {
     /// A state's volatility; `None` for anything else, or a state with none.
     pub volatility: Option<Volatility>,
     pub kept: bool,
+    /// The level strength uses: the owner's setting over the extracted
+    /// one, `trivial` to `critical`, or `kept`.
+    pub significance: String,
 }
 
 /// Turns hits into candidates for one recall, caching each head.
@@ -177,7 +180,8 @@ fn load(
                 m.valid_from, m.valid_from_precision, m.valid_until, m.valid_until_precision,
                 m.due_at, m.due_at_precision, m.window_confidence, m.until_event,
                 m.recurrence_text, m.volatility, m.owner_significance,
-                m.invalidated_at IS NOT NULL OR m.hidden_at IS NOT NULL, s.timezone, m.recurrence_rrule
+                m.invalidated_at IS NOT NULL OR m.hidden_at IS NOT NULL, s.timezone, m.recurrence_rrule,
+                m.significance
          FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
          WHERE m.id = ?1",
         [id],
@@ -200,6 +204,7 @@ fn load(
                 dropped: row.get(15)?,
                 timezone: row.get(16)?,
                 rrule: row.get(17)?,
+                significance: row.get(18)?,
             })
         },
     )?;
@@ -260,6 +265,7 @@ fn load(
         last_observed,
         volatility,
         kept: row.owner_significance.as_deref() == Some("kept"),
+        significance: row.owner_significance.unwrap_or(row.significance),
     }))
 }
 
@@ -279,6 +285,7 @@ struct Row {
     rrule: Option<String>,
     volatility: Option<String>,
     owner_significance: Option<String>,
+    significance: String,
     dropped: bool,
     timezone: String,
 }

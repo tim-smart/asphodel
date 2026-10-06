@@ -1,0 +1,10 @@
+-- Asphodel schema, version 18: the seeded profile question stops leaving
+-- out personal dates.
+--
+-- The earlier question ended "Not upcoming events, tasks or routines.",
+-- which the write read as leaving out birthdays and anniversaries too. The
+-- reworded one asks for them and leaves out one-off events instead. No
+-- table changes: the migration runner rewords every model still asking the
+-- earlier question, so a seeded profile keeps the built-in plan, and leaves
+-- a question the owner changed alone. No refresh is forced; the changed
+-- question changes the fingerprint, so the next refresh writes again.

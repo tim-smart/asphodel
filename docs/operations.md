@@ -580,9 +580,27 @@ lost beneath results for the others:
    refresh goes on. Each facet writes one `refresh` row to the recall log,
    its query in both `query` and `raw_query`, and no access.
 3. **Write.** One `write_model` call gets the question, the facets, the
-   memories under the facet that found each, and the stored answer as the
-   previous one. It returns the whole answer as connected prose, a heading
-   and a paragraph per facet, and one list of the memories it rests on.
+   memories under the facet that found each, each with its significance
+   (the owner's setting over the extracted level, or `kept`), and the
+   stored answer as the previous one. The write is asked to keep the more
+   significant memories when the budget is tight. For the seeded profile
+   it's also asked to keep only what will still be true in months. A
+   message the user sent, received, quoted or forwarded, an order, a
+   booking or a one-off purchase or trip isn't profile material, whatever
+   its significance: its wording and the one-off matter stay out of the
+   prose, and the matter isn't recast as a habit or trait. A lasting fact
+   it states outright, such as a name, relationship, birthday or stated
+   preference, is kept, written from another memory that states it when
+   there is one and otherwise cited to the message's memory. Nothing else
+   is cited to it: not a relationship it doesn't name, nor anything read
+   into who it's to or from, its tone or its subject. A memory holding
+   nothing lasting isn't cited and is dropped from the previous answer,
+   and so is a previous sentence only such a reading would support. Personal dates
+   such as birthdays go with the person they're about, and each person is
+   named with their relationship to the user when a memory gives it. This rule comes
+   last in the prompt, after the previous answer's instructions. It
+   returns the whole answer as connected prose, a heading and a paragraph
+   per facet, and one list of the memories it rests on.
    Code joins the sections into the stored text and refuses a reply with
    no text, no citations or a citation outside the input: that refresh
    changes nothing and fails as malformed, to be tried again in 30
@@ -595,7 +613,7 @@ lost beneath results for the others:
    the end. With nothing selected the answer is cleared, with no call.
 
 A refresh is skipped, unless forced, when its inputs haven't changed: the
-selection, which states may be stale, the question, the plan, the filters
+selection and each memory's significance, which states may be stale, the question, the plan, the filters
 and the size. A changed question always writes again, even when it plans
 the same facets. A state whose confidence falls below 0.9 is supplied to
 the write with its absolute observed date in the memory's timezone and a

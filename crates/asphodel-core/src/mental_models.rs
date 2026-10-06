@@ -54,7 +54,7 @@ pub(crate) use schedule::Schedule;
 pub const PLAN_TEMPLATE: &str = "plan_model";
 pub const PLAN_VERSION: u32 = 1;
 pub const WRITE_TEMPLATE: &str = "write_model";
-pub const WRITE_VERSION: u32 = 3;
+pub const WRITE_VERSION: u32 = 7;
 
 /// The least time between two refreshes of one model, and the wait before
 /// a failed refresh is tried again. Fixed
@@ -167,8 +167,8 @@ pub struct RefreshInput {
     /// The stored answer, which the write is shown to keep the wording
     /// steady.
     pub previous: Option<String>,
-    /// The hash of the selection, stale-state ids, question, plan, filters and
-    /// `max_tokens`.
+    /// The hash of the selection with each memory's significance, stale-state
+    /// ids, question, plan, filters and `max_tokens`.
     pub fingerprint: String,
 }
 
@@ -180,6 +180,9 @@ pub struct InputMemory {
     pub sentence: String,
     /// The heading of the first facet that found it.
     pub facet: String,
+    /// The memory's significance as strength uses it: the owner's setting
+    /// over the extracted level, `trivial` to `critical`, or `kept`.
+    pub significance: String,
 }
 
 /// A refresh's selection as it was scored: every facet's whole pool before
