@@ -230,7 +230,7 @@ memories. Ended and retracted neighbours still reject newer edits.
 
 Code also promotes a newer claim's `mentioned_again` or `confirmed` to
 `refines` when the claim's significance is at least
-`reconcile.promotion_gap` levels (default 1) above the neighbour's. Call 2
+`reconcile.promotion_gap` levels (default 2) above the neighbour's. Call 2
 can call a claim that adds a relationship or a reason a repeat of a memory
 that only names the same person; absorbing it would lose the fact and
 leave it at the trivial memory's significance. The claim becomes the chain

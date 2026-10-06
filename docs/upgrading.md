@@ -28,7 +28,7 @@ get approval before using it on private data.
 A newer claim that call 2 labels `mentioned_again` or `confirmed` now
 becomes a new chain head refining the memory, rather than an access on it,
 when it's at least `reconcile.promotion_gap` significance levels (default
-1) above the memory. Below that gap, a mention still raises the memory's
+2) above the memory. Below that gap, a mention still raises the memory's
 significance. Call 2's prompt (`reconcile_claims` v4) adds that a claim
 saying more than the memory is never mentioned again.
 

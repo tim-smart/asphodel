@@ -271,7 +271,7 @@ impl Default for ReconcileTuning {
     fn default() -> Self {
         Self {
             embedding_floors: BTreeMap::new(),
-            promotion_gap: 1,
+            promotion_gap: 2,
         }
     }
 }
