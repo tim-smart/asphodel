@@ -34,6 +34,11 @@
 //!   query, keeping the sample's `query` and every candidate with what the
 //!   refresh recorded of it. Without it the refresh samples stay as they
 //!   were.
+//! - `asphodel replay ... --refresh-queries Q`, the same table, has every
+//!   refresh facet with a heading in it retrieve and rerank with that
+//!   query instead of its own, recording it as the sample's `rerank_query`
+//!   and keeping its `query` as the label key. The report holds the file's
+//!   SHA-256 as `refresh_queries_hash`, null without it.
 //!
 //! Everything these read or write is derived from history, so all of it
 //! stays under the private dir and errors never quote it.
@@ -46,11 +51,12 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use support::hermes::{self, StateDb, start};
 use support::{
     HOME_QUESTION, PASSING_PROBES, TestDir, asphodel, assert_ok, assert_refused,
     assert_refused_without, claim, home_claim, import_history, import_with, imported_small_history,
-    model_manifest, overrides, read_json, record, replay_history, replay_history_to,
+    model_manifest, overrides, probe_in, read_json, record, replay_history, replay_history_to,
     script_answering_everything, simulation, stderr, stdout,
 };
 
@@ -842,6 +848,291 @@ fn refresh_queries_rescore_the_fixed_pools_keeping_label_keys_and_selection() {
         assert_eq!(after["refresh"][key], before["refresh"][key], "{key}");
     }
     assert_eq!(before["refresh"]["unlabelled"], 0, "{before}");
+}
+
+// Refresh queries in a replay.
+
+/// More memories than a retrieval arm returns (100), every one sharing
+/// several words with one profile facet's query, so they fill that facet's
+/// pool and [`TARGET`], which shares none, is left out of it.
+const FILLERS: usize = 110;
+
+/// The memory a mapped query pulls into the pool: Tim's quote and its
+/// sentence.
+const TARGET: (&str, &str) = ("I own a blue kayak", "Tim owns a blue kayak.");
+
+/// The query the facet is mapped to, sharing words with [`TARGET`] and
+/// none with a filler.
+const MAPPED_QUERY: &str = "blue kayak";
+
+/// Filler `n`: Tim's quote and its sentence.
+fn filler(n: usize) -> (String, String) {
+    (
+        format!("family friends and colleagues include Zed{n:03}"),
+        format!("Tim's family friends and colleagues include Zed{n:03}."),
+    )
+}
+
+/// Ten fillers a turn, one session each, an hour apart, and then the
+/// target's turn.
+fn pool_history(dir: &TestDir) -> PathBuf {
+    import_history(dir, |path| {
+        let db = StateDb::create(path);
+        let fillers: Vec<(String, String)> = (0..FILLERS).map(filler).collect();
+        let mut turns: Vec<String> = fillers
+            .chunks(10)
+            .map(|chunk| {
+                let quotes: Vec<&str> = chunk.iter().map(|(quote, _)| quote.as_str()).collect();
+                format!("By the way, {}.", quotes.join(", and "))
+            })
+            .collect();
+        turns.push(format!("By the way, {}.", TARGET.0));
+        for (turn, user) in turns.iter().enumerate() {
+            let session = format!("s{turn:02}");
+            let at = start() + 3600.0 * turn as f64;
+            db.owner_session(&session, at);
+            db.turn(&session, at, user, "Noted.");
+        }
+        db
+    })
+}
+
+/// Every call 1 claims every filler and the target, each kept only in the
+/// turn that quotes it, and call 2 labels nothing.
+fn pool_script(dir: &TestDir) -> PathBuf {
+    let mut facts: Vec<(String, String)> = (0..FILLERS).map(filler).collect();
+    facts.push((TARGET.0.to_string(), TARGET.1.to_string()));
+    let claims = facts
+        .iter()
+        .map(|(quote, sentence)| {
+            let mut claim = claim(sentence, quote, "fact");
+            claim["claim"] = json!("c1");
+            claim["labels"] = json!([]);
+            claim
+        })
+        .collect();
+    script_answering_everything(dir, "pool-script", claims, vec![])
+}
+
+/// A probe the target passes, which names it.
+const POOL_PROBES: &str = r#"
+[[probe]]
+id = "p001"
+at = "2026-01-06T12:00:00Z"
+kind = "exists"
+memory = "blue kayak"
+"#;
+
+/// A `fast` run with every refresh write skipped, so it calls no LLM,
+/// writing its material to `labelling/<name>.json` and its report to
+/// `reports/<name>.json`, with `extra` flags.
+fn pool_run(dir: &TestDir, corpus: &Path, name: &str, extra: &[&str]) -> support::Run {
+    let material = dir.private_path(&format!("labelling/{name}.json"));
+    let mut flags = vec![
+        "--refresh",
+        "off",
+        "--labelling",
+        material.to_str().unwrap(),
+    ];
+    flags.extend(extra);
+    replay_history_to(dir, corpus, "fast", POOL_PROBES, name, None, &flags)
+}
+
+/// A refresh sample's candidates as retrieval and reranking found them,
+/// leaving out what the selection across facets made of them: what took
+/// each, its handle and its citation can change when another facet's pool
+/// does.
+fn retrieved(sample: &Value) -> Vec<Value> {
+    candidates(sample)
+        .iter()
+        .map(|candidate| {
+            let keys = ["memory", "sentence", "logit", "strength", "score", "rank"];
+            keys.iter()
+                .map(|key| (key.to_string(), candidate[key].clone()))
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        })
+        .collect()
+}
+
+/// `material`'s refresh samples by refresh and facet.
+fn by_facet(material: &Value) -> BTreeMap<(String, String, u64), &Value> {
+    material["refresh"]
+        .as_array()
+        .expect("a refresh list")
+        .iter()
+        .map(|sample| {
+            let key = (
+                sample["at"].as_str().unwrap().to_string(),
+                sample["model"].as_str().unwrap().to_string(),
+                sample["facet_index"].as_u64().unwrap(),
+            );
+            (key, sample)
+        })
+        .collect()
+}
+
+/// Whether `memory` is in `sample`'s pool.
+fn pools(sample: &Value, memory: &str) -> bool {
+    candidates(sample).iter().any(|c| c["memory"] == memory)
+}
+
+/// `replay --refresh-queries` retrieves with the mapped query, not only
+/// reranks with it: the facet whose own query leaves the target out of its
+/// pool (the fillers fill it) finds the target under a query that names it.
+/// Its samples record that query as `rerank_query`, scored with it, and
+/// keep their `query`, so a facet label keyed by it reaches the target in
+/// this run's material and finds nothing in the run without the option.
+/// The other facets retrieve and rerank as they did. The report holds the
+/// file's SHA-256; a run without the option holds none and writes the same
+/// material as before.
+#[test]
+fn refresh_queries_in_a_replay_change_the_retrieved_pool_keeping_label_keys() {
+    let dir = TestDir::new();
+    let corpus = pool_history(&dir);
+    let script = pool_script(&dir);
+    replay_history(&dir, &corpus, "live", POOL_PROBES, Some(&script), &[]).ok();
+
+    let base_run = pool_run(&dir, &corpus, "base", &[]);
+    let base_report = base_run.ok();
+    assert_eq!(base_report["refresh_queries_hash"], Value::Null);
+    let base_path = dir.private_path("labelling/base.json");
+    let base = read_json(&base_path);
+    pool_run(&dir, &corpus, "again", &[]).ok();
+    assert_eq!(
+        fs::read(dir.private_path("labelling/again.json")).unwrap(),
+        fs::read(&base_path).unwrap(),
+        "without the option the material is the same"
+    );
+
+    let target = probe_in(&base_report, "p001")["observed"]["id"]
+        .as_str()
+        .expect("the probe finds the target")
+        .to_string();
+    let base_samples = by_facet(&base);
+    let heading = base_samples
+        .values()
+        .map(|sample| sample["facet"].as_str().unwrap())
+        .find(|heading| {
+            base_samples
+                .values()
+                .filter(|sample| sample["facet"] == *heading)
+                .all(|sample| !pools(sample, &target))
+        })
+        .expect("a facet whose own query leaves the target out of its pool")
+        .to_string();
+
+    let text = toml::to_string(&json!({ heading.as_str(): MAPPED_QUERY })).unwrap();
+    let queries = dir.private_file("refresh-queries.toml", &text);
+    let flags = ["--refresh-queries", queries.to_str().unwrap()];
+    let mapped_report = pool_run(&dir, &corpus, "mapped", &flags).ok();
+    let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+    assert_eq!(mapped_report["refresh_queries_hash"], hash.as_str());
+    let mapped = read_json(&dir.private_path("labelling/mapped.json"));
+    let mapped_samples = by_facet(&mapped);
+    assert_eq!(
+        mapped_samples.keys().collect::<Vec<_>>(),
+        base_samples.keys().collect::<Vec<_>>(),
+        "the same refreshes and facets are sampled"
+    );
+
+    let mut found = 0;
+    for (key, after) in &mapped_samples {
+        let before = base_samples[key];
+        for field in ["facet", "query", "reranked"] {
+            assert_eq!(after[field], before[field], "{field} is kept: {after}");
+        }
+        if after["facet"] != heading.as_str() {
+            assert_eq!(after["rerank_query"], before["rerank_query"], "{after}");
+            assert_eq!(retrieved(after), retrieved(before), "{after}");
+            continue;
+        }
+        assert_eq!(after["rerank_query"], MAPPED_QUERY, "{after}");
+        for candidate in candidates(after) {
+            let sentence = candidate["sentence"].as_str().unwrap();
+            let logit = candidate["logit"].as_f64().expect("a logit");
+            assert_eq!(logit, fake_logit(MAPPED_QUERY, sentence), "{candidate}");
+        }
+        found += usize::from(pools(after, &target));
+    }
+    assert!(
+        found > 0,
+        "the mapped query brings the target into the pool"
+    );
+
+    // A facet label keyed by the facet's own query reaches the target only
+    // where the mapped query retrieved it.
+    let query = mapped_samples
+        .values()
+        .find(|sample| sample["facet"] == heading.as_str())
+        .unwrap()["query"]
+        .clone();
+    let label = json!({ "query": query, "memory": target, "relevant": true });
+    let labels = dir.private_file(
+        "labelling/facets.toml",
+        &toml::to_string(&json!({ "facet": [label] })).unwrap(),
+    );
+    let mapped_path = dir.private_path("labelling/mapped.json");
+    assert_eq!(curve(&dir, &labels, &mapped_path)["refresh"]["matched"], 1);
+    assert_eq!(curve(&dir, &labels, &base_path)["refresh"]["unmatched"], 1);
+}
+
+/// The refresh queries file is history: one outside the private dir is
+/// refused, and so is one naming a heading no refresh facet has or giving
+/// a blank query, each before the run, naming the file and quoting
+/// nothing of it, with no report or material written.
+#[test]
+fn refresh_queries_in_a_replay_are_refused_before_the_run() {
+    let dir = TestDir::new();
+    let corpus = refresh_history(&dir);
+    let script = refresh_script(&dir);
+    replay_history(&dir, &corpus, "live", REFRESH_PROBES, Some(&script), &[]).ok();
+    let (_, material) = refresh_replay(&dir, &corpus, Some("material"), &[]);
+    let heading = read_json(&material)["refresh"][0]["facet"]
+        .as_str()
+        .expect("a refresh is sampled")
+        .to_string();
+
+    let sentinel = "SENTINEL-REFRESH-QUERY-6d0e";
+    let cases = [
+        (
+            "unknown",
+            format!("\"{sentinel} heading\" = \"{sentinel}\"\n"),
+        ),
+        (
+            "blank",
+            toml::to_string(&json!({ heading.as_str(): "   " })).unwrap(),
+        ),
+    ];
+    for (name, text) in cases {
+        let file = format!("refresh-queries-{name}.toml");
+        let queries = dir.private_file(&file, &text);
+        let path = dir.private_path(&format!("labelling/{name}.json"));
+        let flags = [
+            "--refresh-queries",
+            queries.to_str().unwrap(),
+            "--labelling",
+            path.to_str().unwrap(),
+        ];
+        let run = replay_history_to(&dir, &corpus, "fast", REFRESH_PROBES, name, None, &flags);
+        assert_refused_without(&run.output, sentinel, &[&file]);
+        assert!(!run.report_path.exists(), "{name}: no report");
+        assert!(!path.exists(), "{name}: no material");
+    }
+
+    let outside = dir.file("refresh-queries.toml", "\"People\" = \"Who?\"\n");
+    let flags = ["--refresh-queries", outside.to_str().unwrap()];
+    let run = replay_history_to(
+        &dir,
+        &corpus,
+        "fast",
+        REFRESH_PROBES,
+        "outside",
+        None,
+        &flags,
+    );
+    assert_refused(&run.output, "private");
+    assert!(!run.report_path.exists());
 }
 
 // Refresh curves, worked by hand.
