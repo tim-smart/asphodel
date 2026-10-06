@@ -1380,6 +1380,13 @@ fn an_unchanged_selection_skips_the_llm_and_force_doesnt() {
     assert_eq!(refresh(false), (Outcome::Unchanged, 0));
     assert!(matches!(refresh(true), (Outcome::Applied(_), 1)));
 
+    // The same memories at a new significance are a new input, once.
+    h.service
+        .set_significance(BANK, &tea.to_string(), Some("major"))
+        .unwrap();
+    assert!(matches!(refresh(false), (Outcome::Applied(_), 1)));
+    assert_eq!(refresh(false), (Outcome::Unchanged, 0));
+
     h.says(fact(CAT));
     assert!(matches!(refresh(false), (Outcome::Applied(_), 1)));
 }
