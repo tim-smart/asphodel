@@ -873,8 +873,8 @@ fn filler(n: usize) -> (String, String) {
     )
 }
 
-/// Ten fillers a turn, one session each, an hour apart, and then the
-/// target's turn.
+/// Ten fillers a turn, one session each, an hour apart. Insert the target
+/// before the last filler turn so it exists during a sampled refresh.
 fn pool_history(dir: &TestDir) -> PathBuf {
     import_history(dir, |path| {
         let db = StateDb::create(path);
@@ -886,7 +886,7 @@ fn pool_history(dir: &TestDir) -> PathBuf {
                 format!("By the way, {}.", quotes.join(", and "))
             })
             .collect();
-        turns.push(format!("By the way, {}.", TARGET.0));
+        turns.insert(turns.len() - 1, format!("By the way, {}.", TARGET.0));
         for (turn, user) in turns.iter().enumerate() {
             let session = format!("s{turn:02}");
             let at = start() + 3600.0 * turn as f64;
@@ -1053,7 +1053,13 @@ fn refresh_queries_in_a_replay_change_the_retrieved_pool_keeping_label_keys() {
             let logit = candidate["logit"].as_f64().expect("a logit");
             assert_eq!(logit, fake_logit(MAPPED_QUERY, sentence), "{candidate}");
         }
-        found += usize::from(pools(after, &target));
+        if pools(after, &target) {
+            assert!(
+                !pools(before, &target),
+                "the base pool excludes the target at the same sampled refresh: {key:?}"
+            );
+            found += 1;
+        }
     }
     assert!(
         found > 0,
