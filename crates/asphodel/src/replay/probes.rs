@@ -60,6 +60,13 @@ pub fn load(path: &Path, group: Group) -> anyhow::Result<Vec<Probe>> {
                 ));
             }
         }
+        if let super::scenario::Check::NotCreated {
+            since: Some(since), ..
+        } = &probe.check
+            && *since > probe.at
+        {
+            errors.push(format!("probe {id} has its creation window backwards"));
+        }
     }
     if !errors.is_empty() {
         bail!("{}:\n{}", path.display(), errors.join("\n"));

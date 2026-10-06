@@ -1345,12 +1345,19 @@ impl<'a> Engine<'a> {
         let id = probe.id(index);
         let bank = &self.settings.bank;
         let not_created = matches!(probe.check, Check::NotCreated { .. });
-        let (memory, resolution) = if not_created {
+        let any_match = matches!(
+            probe.check,
+            Check::RecallFinds {
+                any_match: true,
+                ..
+            }
+        ) && self.regexes[index].is_some();
+        let (memory, resolution) = if not_created || any_match {
             (self.labels.get(probe.check.memory()).copied(), json!({}))
         } else {
             self.probe_memory(index)?
         };
-        if !not_created && memory.is_none() && self.regexes[index].is_some() {
+        if !not_created && !any_match && memory.is_none() && self.regexes[index].is_some() {
             self.probes.push(ProbeResult {
                 id,
                 at: probe.at,
@@ -1428,12 +1435,13 @@ impl<'a> Engine<'a> {
                 Some(view) => (false, json!({ "id": view.id, "present": true })),
                 None => (true, json!({ "id": memory, "present": false })),
             },
-            Check::NotCreated { .. } => {
+            Check::NotCreated { since, count, .. } => {
                 let matches: Vec<Uuid> = self
                     .created
                     .iter()
                     .filter(|created| {
                         created.created_at <= probe.at
+                            && since.is_none_or(|since| created.created_at >= since)
                             && match &self.regexes[index] {
                                 Some(regex) => regex.is_match(&created.content),
                                 None => memory == Some(created.memory),
@@ -1441,7 +1449,7 @@ impl<'a> Engine<'a> {
                     })
                     .map(|created| created.memory)
                     .collect();
-                (matches.is_empty(), json!({ "created": matches }))
+                (matches.len() == *count, json!({ "created": matches }))
             }
             Check::Restated {
                 sentence, label, ..
@@ -1478,7 +1486,15 @@ impl<'a> Engine<'a> {
                     },
                 )?;
                 let results: Vec<Uuid> = recall.results.iter().map(|r| r.id).collect();
-                let has = memory.is_some_and(|id| results.contains(&id));
+                let has = if any_match {
+                    let regex = self.regexes[index].as_ref().expect("history regex");
+                    recall
+                        .results
+                        .iter()
+                        .any(|result| regex.is_match(&result.sentence))
+                } else {
+                    memory.is_some_and(|id| results.contains(&id))
+                };
                 let wants = matches!(probe.check, Check::RecallFinds { .. });
                 (has == wants, json!({ "id": memory, "results": results }))
             }

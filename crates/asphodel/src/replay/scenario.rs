@@ -266,16 +266,71 @@ pub struct Outcome {
 
 /// A time and an expectation. Never changes the run.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "ProbeFields")]
 pub struct Probe {
     /// `p<n>` in file order when absent.
-    #[serde(default)]
     pub id: Option<String>,
     /// Preferred grounding id for real-history probes; `memory` is the fallback regex.
-    #[serde(default)]
     pub memory_id: Option<uuid::Uuid>,
     pub at: Timestamp,
-    #[serde(flatten)]
     pub check: Check,
+}
+
+// `deny_unknown_fields` cannot be combined with the flattened check.
+// Parse its table separately and check remaining keys against the selected
+// kind, so typos cannot silently change scoring.
+#[derive(Deserialize)]
+struct ProbeFields {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    memory_id: Option<uuid::Uuid>,
+    at: Timestamp,
+    #[serde(flatten)]
+    remaining: toml::Table,
+}
+
+impl TryFrom<ProbeFields> for Probe {
+    type Error = String;
+
+    fn try_from(mut fields: ProbeFields) -> Result<Self, Self::Error> {
+        let check: Check = toml::Value::Table(fields.remaining.clone())
+            .try_into()
+            .map_err(|error: toml::de::Error| error.to_string())?;
+        let allowed: &[&str] = match &check {
+            Check::Band { .. } => &["band"],
+            Check::FadedAt { .. } => &["between"],
+            Check::Exists { .. } => &["memory_kind", "ended", "retracted", "head", "phase"],
+            Check::NotCreated { .. } => &["since", "count"],
+            Check::Restated { .. } => &["sentence", "label"],
+            Check::RecallFinds { .. } => &["query", "any_match"],
+            Check::RecallLacks { .. } | Check::Injects { .. } | Check::NotInjects { .. } => {
+                &["query"]
+            }
+            Check::ProfileHas { .. } | Check::ProfileLacks { .. } => &["model"],
+            Check::Absent { .. } | Check::AgendaHas { .. } | Check::AgendaLacks { .. } => &[],
+        };
+        fields
+            .remaining
+            .retain(|key, _| key != "kind" && key != "memory" && !allowed.contains(&key));
+        if !fields.remaining.is_empty() {
+            return Err(format!(
+                "unknown probe fields: {}",
+                fields
+                    .remaining
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        Ok(Self {
+            id: fields.id,
+            memory_id: fields.memory_id,
+            at: fields.at,
+            check,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -307,10 +362,15 @@ pub enum Check {
     Absent {
         memory: String,
     },
-    /// No matching memory was created through `at`, including purged ones.
+    /// Exactly `count` matching memories were created in `[since, at]`,
+    /// including purged ones. Without `since`, count through `at`.
     /// In real history, `memory` is a regex; `memory_id` is ignored.
     NotCreated {
         memory: String,
+        #[serde(default)]
+        since: Option<Timestamp>,
+        #[serde(default)]
+        count: usize,
     },
     /// The memory keeps an absorbed claim with this sentence as a
     /// restatement, with this label when one is given.
@@ -329,6 +389,8 @@ pub enum Check {
     RecallFinds {
         memory: String,
         query: String,
+        #[serde(default)]
+        any_match: bool,
     },
     RecallLacks {
         memory: String,
@@ -360,7 +422,7 @@ impl Check {
             | Check::FadedAt { memory, .. }
             | Check::Exists { memory, .. }
             | Check::Absent { memory }
-            | Check::NotCreated { memory }
+            | Check::NotCreated { memory, .. }
             | Check::Restated { memory, .. }
             | Check::AgendaHas { memory }
             | Check::AgendaLacks { memory }
@@ -604,6 +666,13 @@ pub fn check(scenario: &Scenario) -> Vec<String> {
             errors.push(format!(
                 "probe {id} needs the real models but the group is ci"
             ));
+        }
+        if let Check::NotCreated {
+            since: Some(since), ..
+        } = &probe.check
+            && *since > probe.at
+        {
+            errors.push(format!("probe {id} has its creation window backwards"));
         }
     }
     errors
