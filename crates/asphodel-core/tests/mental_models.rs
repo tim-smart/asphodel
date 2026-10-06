@@ -1388,8 +1388,19 @@ fn an_unchanged_selection_skips_the_llm_and_force_doesnt() {
     assert!(matches!(refresh(false), (Outcome::Applied(_), 1)));
     assert_eq!(refresh(false), (Outcome::Unchanged, 0));
 
-    h.says(fact(CAT));
-    assert!(matches!(refresh(false), (Outcome::Applied(_), 1)));
+    let cat = h.says(fact(CAT));
+    // Keep the pinned tea memory so this remains a selection test, not a retry.
+    let llm = FakeLlm::scripted(
+        MODEL,
+        vec![written(
+            &[(SECTION, &format!("{TEA} {CAT}"))],
+            &handles(&h.input(PROFILE_NAME), &[tea, cat]),
+        )],
+    );
+    assert!(matches!(
+        (h.refresh(PROFILE_NAME, &llm, false), writes(&llm)),
+        (Outcome::Applied(_), 1)
+    ));
 }
 
 #[test]
