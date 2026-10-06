@@ -45,6 +45,341 @@ fn observed_id(report: &Value, id: &str) -> Value {
     probe_in(report, id)["observed"]["id"].clone()
 }
 
+/// Opt-in fact matching inspects every returned current sentence, not
+/// just the memory selected by a grounding id. The default stays id-based.
+#[test]
+fn recall_finds_current_sentence_matches_across_returned_memories() {
+    let dir = TestDir::new();
+    let corpus = import_history(&dir, |path| {
+        let db = hermes::one_session(path);
+        db.turn(
+            "s1",
+            start(),
+            "I live in Auckland. Tim plays chess.",
+            "Noted.",
+        );
+        db
+    });
+    let script = script_answering_everything(
+        &dir,
+        "sentence-recall",
+        vec![
+            home_claim(),
+            claim("Tim plays chess.", "Tim plays chess", "fact"),
+        ],
+        vec![],
+    );
+    let at = "2026-01-05T12:00:00Z";
+    let flags = ["--refresh", "off", "--latency", "0s"];
+    let grounding = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &(probe("home", at, "exists", HOME_MEMORY)
+            + &probe("chess", at, "exists", "memory = \"plays chess\"")),
+        Some(&script),
+        &flags,
+    )
+    .ok();
+    let home = observed_id(&grounding, "home");
+    let chess = observed_id(&grounding, "chess");
+    assert_ne!(home, chess);
+    let query = "query = \"Auckland\"";
+    let anchored = format!("memory_id = {chess}\n{HOME_MEMORY}\n{query}");
+    let mut probes = probe("default", at, "recall_finds", &anchored);
+    for (id, fields) in [
+        ("known", anchored),
+        (
+            "unknown",
+            format!("memory_id = \"00000000-0000-0000-0000-000000000000\"\n{HOME_MEMORY}\n{query}"),
+        ),
+        ("regex", format!("{HOME_MEMORY}\n{query}")),
+        (
+            "no-match",
+            format!("memory_id = {home}\nmemory = \"{UNSEEN}\"\n{query}"),
+        ),
+    ] {
+        probes += &probe(
+            id,
+            at,
+            "recall_finds",
+            &format!("{fields}\nmatch = \"current_sentence\""),
+        );
+    }
+    let run = replay_history(&dir, &corpus, "fast", &probes, None, &flags);
+    let report = run.report();
+    // Both are returned; only home states the fact. An arbitrary returned
+    // anchor cannot satisfy a sentence regex that matches neither result.
+    let results = probe_in(&report, "default")["observed"]["results"]
+        .as_array()
+        .unwrap();
+    assert!(results.contains(&home), "{report}");
+    assert!(results.contains(&chess), "{report}");
+    for (id, passed) in [
+        ("default", true),
+        ("known", true),
+        ("unknown", true),
+        ("regex", true),
+        ("no-match", false),
+    ] {
+        let result = probe_in(&report, id);
+        assert_eq!(result["passed"], passed, "{result}");
+    }
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+}
+
+/// A historical regex match that has been purged must not hide a later
+/// returned match, or satisfy a probe when no current sentence matches.
+#[test]
+fn recall_finds_current_sentence_does_not_resolve_to_a_purged_creation() {
+    let dir = TestDir::new();
+    let corpus = import_history(&dir, |path| {
+        let db = hermes::one_session(path);
+        db.turn("s1", start(), "I play chess in Auckland.", "Noted.");
+        db.home_turn("s1", start() + 120.0);
+        db
+    });
+    let mut old = claim(
+        "Tim plays chess in Auckland.",
+        "I play chess in Auckland",
+        "fact",
+    );
+    old["significance"] = json!("trivial");
+    let mut home = home_claim();
+    home["significance"] = json!("major");
+    let script = script_answering_everything(&dir, "purged-recall", vec![old, home], vec![]);
+    // These are independent facts; keep this fixture out of call 2.
+    let quiet = overrides(
+        &dir,
+        "[clock]\nquiet_rate = 1.0\n[reconcile.embedding_floors]\n\"fake-embedder:v1\" = 1.0\n",
+    );
+    let flags = ["--refresh", "off", "--latency", "0s", "--overrides", &quiet];
+    let grounding = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &(probe_on("old", 5, "exists", "memory = \"plays chess\"")
+            + &probe_on("home", 5, "exists", HOME_MEMORY)),
+        Some(&script),
+        &flags,
+    )
+    .ok();
+    let home = observed_id(&grounding, "home");
+    let at = "2026-11-05T12:00:00Z";
+    let query = "query = \"Auckland\"";
+    replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &(probe("purged", at, "absent", "memory = \"plays chess\"")
+            + &probe(
+                "returned",
+                at,
+                "recall_finds",
+                &format!("memory_id = {home}\n{HOME_MEMORY}\n{query}"),
+            )),
+        None,
+        &flags,
+    )
+    .ok();
+    let fields = format!("memory = \"Auckland\"\n{query}");
+    let probes = probe("legacy", at, "recall_finds", &fields)
+        + &probe(
+            "current",
+            at,
+            "recall_finds",
+            &format!("{fields}\nmatch = \"current_sentence\""),
+        )
+        + &probe(
+            "historical-only",
+            at,
+            "recall_finds",
+            &format!("memory = \"plays chess\"\n{query}\nmatch = \"current_sentence\""),
+        );
+    let run = replay_history(&dir, &corpus, "fast", &probes, None, &flags);
+    let report = run.report();
+    for (id, passed) in [
+        ("legacy", false),
+        ("current", true),
+        ("historical-only", false),
+    ] {
+        let result = probe_in(&report, id);
+        assert_eq!(result["passed"], passed, "{result}");
+    }
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+}
+
+/// A zero-width window includes its boundary. A disjoint window excludes
+/// the creation, even though the memory still exists when the probe runs.
+#[test]
+fn created_count_uses_an_inclusive_creation_window_and_exact_count() {
+    let dir = TestDir::new();
+    let (corpus, _) = record_not_created_fixture(&dir, "notable");
+    let at = "2026-01-05T12:00:00Z";
+    let mut probes = String::new();
+    for (id, from, to, count) in [
+        ("before", "09:00:00", "09:00:29", 0),
+        ("lower-bound", "09:00:30", "09:00:31", 1),
+        ("upper-bound", "09:00:29", "09:00:30", 1),
+        ("point", "09:00:30", "09:00:30", 1),
+        ("after", "09:00:31", "10:00:00", 0),
+        ("wrong-zero", "09:00:30", "09:00:30", 0),
+        ("wrong-two", "09:00:30", "09:00:30", 2),
+    ] {
+        probes += &probe(
+            id,
+            at,
+            "created_count",
+            &format!(
+                "{HOME_MEMORY}\nbetween = [\"2026-01-05T{from}Z\", \"2026-01-05T{to}Z\"]\ncount = {count}"
+            ),
+        );
+    }
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &probes,
+        None,
+        &["--refresh", "off", "--latency", "0s"],
+    );
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+    let report = run.report();
+    for (id, passed) in [
+        ("before", true),
+        ("lower-bound", true),
+        ("upper-bound", true),
+        ("point", true),
+        ("after", true),
+        ("wrong-zero", false),
+        ("wrong-two", false),
+    ] {
+        let result = probe_in(&report, id);
+        assert_eq!(result["passed"], passed, "{result}");
+    }
+}
+
+/// A purged creation remains in the count; an unrelated grounding id
+/// cannot turn a nonmatching fact into a matching creation.
+#[test]
+fn created_count_retains_purged_creations_and_ignores_grounding_ids() {
+    let dir = TestDir::new();
+    let (corpus, grounding) = record_not_created_fixture(&dir, "trivial");
+    let home = observed_id(&grounding, "home");
+    let quiet = overrides(&dir, "[clock]\nquiet_rate = 1.0\n");
+    let flags = ["--refresh", "off", "--latency", "0s", "--overrides", &quiet];
+    let at = "2026-11-05T12:00:00Z";
+    replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &probe("purged", at, "absent", HOME_MEMORY),
+        None,
+        &flags,
+    )
+    .ok();
+    let window = "between = [\"2026-01-05T09:00:30Z\", \"2026-01-05T09:00:30Z\"]";
+    let probes = probe(
+        "one",
+        at,
+        "created_count",
+        &format!("{HOME_MEMORY}\n{window}\ncount = 1"),
+    ) + &probe(
+        "zero",
+        at,
+        "created_count",
+        &format!("{HOME_MEMORY}\n{window}\ncount = 0"),
+    ) + &probe(
+        "unmatched",
+        at,
+        "created_count",
+        &format!("memory_id = {home}\nmemory = \"{UNSEEN}\"\n{window}\ncount = 0"),
+    ) + &probe(
+        "unknown",
+        at,
+        "created_count",
+        &format!(
+            "memory_id = \"00000000-0000-0000-0000-000000000000\"\n{HOME_MEMORY}\n{window}\ncount = 1"
+        ),
+    );
+    let run = replay_history(&dir, &corpus, "fast", &probes, None, &flags);
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+    let report = run.report();
+    for (id, passed) in [
+        ("one", true),
+        ("zero", false),
+        ("unmatched", true),
+        ("unknown", true),
+    ] {
+        let result = probe_in(&report, id);
+        assert_eq!(result["passed"], passed, "{result}");
+    }
+}
+
+/// Two differently worded creations of the same fact count twice. The
+/// count is neither an exact-sentence check nor a count of every memory.
+#[test]
+fn created_count_matches_fact_paraphrases_without_counting_unrelated_creations() {
+    let dir = TestDir::new();
+    let corpus = import_history(&dir, |path| {
+        let db = hermes::one_session(path);
+        db.turn(
+            "s1",
+            start(),
+            "I live in Auckland, near the harbour. Tim plays chess.",
+            "Noted.",
+        );
+        db
+    });
+    let script = script_answering_everything(
+        &dir,
+        "fact-creations",
+        vec![
+            home_claim(),
+            claim(
+                "Tim's home is near the harbour.",
+                "near the harbour",
+                "fact",
+            ),
+            claim("Tim plays chess.", "Tim plays chess", "fact"),
+        ],
+        vec![],
+    );
+    let at = "2026-01-05T12:00:00Z";
+    let flags = ["--refresh", "off", "--latency", "0s"];
+    let grounding = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &(probe("home", at, "exists", HOME_MEMORY)
+            + &probe("harbour", at, "exists", "memory = \"near the harbour\"")
+            + &probe("chess", at, "exists", "memory = \"plays chess\"")),
+        Some(&script),
+        &flags,
+    )
+    .ok();
+    let ids: BTreeSet<String> = ["home", "harbour", "chess"]
+        .map(|id| observed_id(&grounding, id).as_str().unwrap().to_owned())
+        .into();
+    assert_eq!(ids.len(), 3, "the fixture needs three separate creations");
+    let fields = "memory = \"Auckland|harbour\"\nbetween = [\"2026-01-05T09:00:30Z\", \"2026-01-05T09:00:30Z\"]";
+    let probes = probe("two", at, "created_count", &format!("{fields}\ncount = 2"))
+        + &probe("one", at, "created_count", &format!("{fields}\ncount = 1"))
+        + &probe(
+            "three",
+            at,
+            "created_count",
+            &format!("{fields}\ncount = 3"),
+        );
+    let run = replay_history(&dir, &corpus, "fast", &probes, None, &flags);
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+    let report = run.report();
+    for (id, passed) in [("two", true), ("one", false), ("three", false)] {
+        let result = probe_in(&report, id);
+        assert_eq!(result["passed"], passed, "{result}");
+    }
+}
+
 fn is_call1(record: &Value) -> bool {
     record["template"]["name"] == "extract_claims"
 }
