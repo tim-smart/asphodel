@@ -29,6 +29,8 @@ Extract:
 - The speaker's short answers and references to earlier context, written out in full. "Yes" after "Are you still at Acme?" becomes "Alex still works at Acme.", quoting "Yes". A "remember that" referring to an earlier statement works the same way.
 - From the assistant's reply, only decisions, commitments, durable content and storage locations stated while carrying out the speaker's request. Extract an assistant task only if the speaker requested it and it has a due date or an until-event beyond this turn.
 
+Apply the skips below to each proposition, not to the whole passage: a request, message or temporary situation can still contain an explicitly stated lasting fact worth extracting.
+
 Skip:
 - The fact that someone asked a question or made a request.
 - The assistant's suggestions, general knowledge and tool findings.
@@ -49,11 +51,11 @@ Keep a claim recording a message's wording, sending, receipt or one-off occasion
 
 Also extract each lasting fact stated in so many words as its own claim, without recording the message, its wording or its occasion. Preserve the stated subject, meaning and temporal scope: a relationship, preference or annual date must survive separately. Use the usual kind rules for that fact. For example, "Send Jo a card saying: Mia is my daughter and her birthday is every year on 3 March; enjoy the picnic on 8 October 2026" supports separate claims that Mia is the speaker's daughter and Mia's birthday is every year on 3 March. The card and the one-time picnic are not lasting facts. The `quote` must still copy the supporting text exactly.
 
-Put evidence of the message in `quote`, not in the separate lasting claim's `content`: do not append "as stated in an email", "as told by text" or other sending, receipt or wording clauses. This is not permission to strengthen the claim. Preserve uncertainty, negation and substantive source qualifications ("the clinic's records list ..." is not an unqualified diagnosis); if the text supports only a report or belief, do not turn it into an established fact.
+For each separate lasting claim, distinguish the proposition from its communication frame. Put the message wording in `quote`; do not describe where the proposition was written or that it was sent, received or quoted in `content`. A statement of a relationship does not need a clause saying the relationship was stated in a message. Retain a source qualification when it is part of the proposition itself, such as whose belief, assessment or records it describes ("the clinic's records list ..." is not an unqualified diagnosis). Preserve uncertainty and negation. Do not add an attribution merely because the supporting words occur in a message, or remove one that would strengthen the proposition.
 
 For ordinary reported speech, likewise omit a communication frame that only says who told whom and when; keep the supported proposition and any qualification needed to preserve its meaning. A stated diagnosis or attributed assessment must remain a diagnosis or attributed assessment, not become more certain. This does not make spoken reports written messages or change their usual kind rules.
 
-Do not infer a relationship, preference or recurring date from a salutation, affectionate wording or a message's occasion. A one-time calendar date in a note is not an annual date. A separate lasting fact must not carry the message wording or occasion, and emitting it does not justify an extra unsupported claim. Facts the user states in their own words alongside an assistant draft are extracted as usual; the draft does not turn invented content into facts.
+Do not infer a relationship, preference or recurring date from a salutation, affectionate wording or a message's occasion. A one-time calendar date in a note is not an annual date. Emitting a separate lasting fact does not justify an extra unsupported claim. Facts the user states in their own words alongside an assistant draft are extracted as usual; the draft does not turn invented content into facts.
 
 # Kinds
 
@@ -64,7 +66,7 @@ Choose `kind` in this order:
 - `state`: something ongoing that is expected to change without an announcement, such as mood, location, current work or progress. Keep an explicit end condition as `until_event` ("until the release ships").
 - `fact`: everything else except claims recording written messages, assistant-drafted wording or an intent to send a message, including preferences, things whose change would be announced (a job, home or relationship), and things not expected to change (a chronic condition).
 
-Classify each proposition separately. A durable relationship is a `fact`, even when stated alongside a visit, illness or other temporary state. "Alex's grandson Ben is staying this week" supports a separate fact that Ben is Alex's grandson and a temporary claim about the stay; do not fold the relationship into a short-lived state. Extract only relationships actually stated, not inferred from the situation.
+Select and classify each proposition separately, including facts stated within possessive or descriptive phrases. A durable relationship is a `fact`, even when stated alongside a visit, illness or other temporary state. "Alex's grandson Ben is staying this week" supports a separate fact that Ben is Alex's grandson and a temporary claim about the stay; do not fold the relationship into a short-lived state or discard it when skipping the temporary claim. Extract only relationships actually stated, not inferred from the situation.
 
 Use `volatility` only for states, to describe how quickly they go stale: `hours` (mood, today's location), `days` (an illness, trip or bug being chased), `weeks` (a sprint or visitor), `months` (a project or job hunting), `years` (a degree). Use null when unsure and for all other kinds.
 
