@@ -200,9 +200,24 @@ fn every_checked_in_scenario_passes_its_probes() {
                     assert_eq!(shadow["purged"], 5, "{shadow}");
                     assert_eq!(shadow["re_mentioned"], 1, "{shadow}");
                 }
+                // Refinements rejected across kinds are counted by what made
+                // them refinements; `promoted` counts only those that landed.
+                let rejected = |explicit: u64, date_promoted: u64, weight_promoted: u64| {
+                    json!({
+                        "explicit": explicit,
+                        "date_promoted": date_promoted,
+                        "weight_promoted": weight_promoted,
+                    })
+                };
+                let call2 = &report["call2_rate"];
                 if stem == "relationship-outweighs-repeat" {
-                    // The weightier repeat is the one new chain head.
-                    assert_eq!(report["call2_rate"]["promoted"], 1, "{stem}");
+                    assert_eq!(call2["promoted"], 0, "{stem}");
+                    assert_eq!(call2["refines_rejected"], rejected(0, 0, 1), "{stem}");
+                }
+                if stem == "preference-survives-mislabels" {
+                    // The weightier repeat of the refinement.
+                    assert_eq!(call2["promoted"], 1, "{stem}");
+                    assert_eq!(call2["refines_rejected"], rejected(2, 1, 0), "{stem}");
                 }
             });
         }

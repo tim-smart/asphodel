@@ -1,13 +1,16 @@
-# A trivial memory names Sam without saying who Sam is. Days later the owner
-# says Sam is his wife, and call 2 labels that major claim mentioned_again on
-# the trivial memory, as the model did in the evaluation store. The claim
-# says more than the memory and matters more, so code doesn't absorb it: it
-# becomes the chain head, the trivial memory is superseded, and recall for
-# the relationship finds the new memory.
+# A trivial event names Sam without saying who Sam is. Days later the owner
+# says Sam is his wife, and call 2 labels that major fact mentioned_again on
+# the trivial event, as the model did in the evaluation store. The claim
+# says more than the event and matters more, so code doesn't absorb it. It
+# isn't the event's next version either: a fact doesn't refine an event, so
+# the fact becomes a head of its own and the event stays a head beside it.
+# The two overlap, since the fact repeats the flowers. Recall for the
+# relationship finds the fact, recall for the flowers may return both, and
+# ending the relationship leaves the historical event as it was.
 
 name = "relationship-outweighs-repeat"
 group = "ci"
-description = "A major claim labelled mentioned_again on a trivial memory naming the same person becomes the head instead of being absorbed."
+description = "A major fact labelled mentioned_again on a trivial event naming the same person is kept as its own head beside the event instead of being absorbed."
 
 [bank]
 timezone = "UTC"
@@ -40,7 +43,7 @@ significance = "major"
 reconcile = [{ memory = "flowers", outcome = "mentioned_again" }]
 
 [[probe]]
-id = "the-relationship-is-the-head"
+id = "the-relationship-is-a-head"
 at = "2026-03-05T10:00:00Z"
 kind = "exists"
 memory = "wife"
@@ -49,11 +52,12 @@ head = true
 retracted = false
 
 [[probe]]
-id = "the-trivial-memory-is-superseded"
+id = "the-trivial-event-is-still-a-head"
 at = "2026-03-05T10:00:00Z"
 kind = "exists"
 memory = "flowers"
-head = false
+memory_kind = "event"
+head = true
 retracted = false
 
 [[probe]]
@@ -62,3 +66,53 @@ at = "2026-03-05T10:00:00Z"
 kind = "recall_finds"
 memory = "wife"
 query = "Who is Tim's wife?"
+
+# Both heads are eligible, so a question about the flowers can return both.
+# Nothing here says how long the duplicate lasts.
+[[probe]]
+id = "recall-for-the-flowers-finds-the-event"
+at = "2026-03-05T10:00:00Z"
+kind = "recall_finds"
+memory = "flowers"
+query = "Who did Tim send flowers to?"
+
+[[probe]]
+id = "recall-for-the-flowers-finds-the-relationship"
+at = "2026-03-05T10:00:00Z"
+kind = "recall_finds"
+memory = "wife"
+query = "Who did Tim send flowers to?"
+
+[[turn]]
+at = "2026-03-20T09:00:00Z"
+session = "s1"
+user = "Sam and I have separated, she is no longer my wife."
+assistant = "I'm sorry to hear that."
+
+[[turn.claim]]
+label = "separated"
+content = "Sam is no longer Tim's wife; they have separated."
+quote = "Sam and I have separated, she is no longer my wife"
+kind = "event"
+significance = "major"
+changes_something = true
+reconcile = [{ memory = "wife", outcome = "ends" }]
+
+# The end is the day the separation was said, so the probes look the day
+# after. An event is past by its own window either way, so the event's
+# probe checks only that it is still its own head and not retracted.
+[[probe]]
+id = "the-relationship-is-ended"
+at = "2026-03-21T10:00:00Z"
+kind = "exists"
+memory = "wife"
+ended = true
+head = true
+
+[[probe]]
+id = "the-historical-event-is-untouched"
+at = "2026-03-21T10:00:00Z"
+kind = "exists"
+memory = "flowers"
+head = true
+retracted = false

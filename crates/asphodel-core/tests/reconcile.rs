@@ -99,6 +99,11 @@ const PASSPORT: &str = "Tim needs to renew his passport.";
 const BOOKING: &str = "Tim has a hotel booking.";
 const FLOWERS: &str = "Tim sent flowers to Sam.";
 const FLOWERS_WIFE: &str = "Tim sent flowers to Sam, his wife.";
+const SEATS: &str = "Tim prefers window seats on flights.";
+const SEATS_FLEW: &str = "Tim flew in window seats on flights.";
+const SEATS_BOOK: &str = "Tim needs to book window seats on flights.";
+const SEATS_HUNT: &str = "Tim is hunting for window seats on flights.";
+const SEATS_LEFT: &str = "Tim prefers window seats on the left on flights.";
 
 fn at(text: &str) -> Timestamp {
     text.parse().unwrap()
@@ -150,11 +155,16 @@ impl Drop for TestDir {
 /// A floor for each fake model, the embedder's at `floor`, and bank time
 /// at full speed with or without turns.
 fn tuning(floor: f64) -> Tuning {
+    tuning_with(floor, "")
+}
+
+/// As [`tuning`], with `extra` TOML after it.
+fn tuning_with(floor: f64, extra: &str) -> Tuning {
     Tuning::from_toml(&format!(
         "[clock]\nquiet_rate = 1.0\n\
          [injection.reranker_floors]\n\"{}\" = 0.0\n\
          [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
-         [reconcile.embedding_floors]\n\"{}\" = {floor:?}\n",
+         [reconcile.embedding_floors]\n\"{}\" = {floor:?}\n{extra}",
         FakeReranker::MODEL_ID,
         FakeEmbedder::MODEL_ID,
     ))
@@ -923,16 +933,16 @@ fn a_mention_that_matters_no_more_than_the_memory_is_absorbed_and_keeps_only_on_
 fn a_repeat_that_matters_more_than_the_memory_becomes_its_head() {
     // Call 2 can label a claim that says more than a memory, such as a
     // relationship the memory only names a person in, a repeat. A newer
-    // claim well above the memory's significance isn't absorbed: it becomes
-    // the chain head with its own sentence and significance, the memory is
-    // superseded but not wrong, and the head inherits its accesses, as on
-    // refines.
+    // claim of the same kind well above the memory's significance isn't
+    // absorbed: it becomes the chain head with its own sentence and
+    // significance, the memory is superseded but not wrong, and the head
+    // inherits its accesses, as on refines.
     for label in ["mentioned_again", "confirmed"] {
         let h = Harness::new();
         let old = h.fixture(said(FLOWERS, "event").significance("trivial"));
         let before = h.accesses(old);
         h.says("I sent flowers to Sam, my wife.");
-        let wife = claim(FLOWERS_WIFE, "fact", "I sent flowers to Sam, my wife");
+        let wife = claim(FLOWERS_WIFE, "event", "I sent flowers to Sam, my wife");
         let wife = reply(vec![wife.significance("major")]);
         let extracted = one_label(&h, wife, old, label);
 
@@ -1023,7 +1033,7 @@ fn a_repeat_is_weighed_against_the_owners_setting_and_the_promotion_gap() {
         } else {
             h.says(&format!("{quote}."));
         }
-        let wife = claim(FLOWERS_WIFE, "fact", quote).significance(c.claim);
+        let wife = claim(FLOWERS_WIFE, "event", quote).significance(c.claim);
         let extracted = one_label(&h, reply(vec![wife]), old, "mentioned_again");
 
         let owner = c.owner.map(String::from);
@@ -1252,6 +1262,153 @@ fn a_related_claim_of_another_kind_never_replaces_an_open_task() {
             "{label}: the renewal is still outstanding"
         );
     }
+
+    // A corrected task, or the same task on a schedule, is still a version
+    // of it and refines it.
+    for kind in ["task", "recurring"] {
+        let h = Harness::new();
+        let task = h.fixture(said(PASSPORT, "task"));
+        let every = "renew my passport every ten years";
+        h.says(&format!("I need to {every}."));
+        let again = claim(PASSPORT, kind, every).with("recurrence_text", json!("every ten years"));
+        let new = one_label(&h, reply(vec![again]), task, "refines").memories[0];
+        assert_eq!(h.change(task).superseded_by, Some(new), "{kind}");
+        assert_eq!(h.edits(task), [EDIT_REFINED], "{kind}");
+    }
+}
+
+#[test]
+fn a_refinement_across_kinds_leaves_both_memories_standing() {
+    // Call 2 can label an event, a request or a state about something Tim
+    // prefers a refinement of the preference, or the other way round. Code
+    // treats a memory of another kind as no version of the claim, whether
+    // the refinement is call 2's or a repeat promoted for a new date or for
+    // mattering more, and whichever was said first. The memory stays the
+    // head with nothing written on it, not even the mention, and the claim
+    // is a memory of its own. This contains merges; it doesn't prove the
+    // two say different things.
+    struct Case {
+        memory: Value,
+        claim: Value,
+        label: &'static str,
+        older: bool,
+    }
+    let case = |memory, claim, label, older| Case {
+        memory,
+        claim,
+        label,
+        older,
+    };
+    let seats = || said(SEATS, "fact");
+    let mut cases = Vec::new();
+    for older in [false, true] {
+        for (memory, claim) in [
+            (seats(), said(SEATS_FLEW, "event")),
+            (seats(), said(SEATS_BOOK, "task")),
+            (seats(), said(SEATS_HUNT, "state")),
+            (said(SEATS_FLEW, "event"), said(SEATS, "fact")),
+            (said(SEATS_HUNT, "state"), said(SEATS, "fact")),
+        ] {
+            cases.push(case(memory, claim, "refines", older));
+        }
+    }
+    for label in ["mentioned_again", "confirmed"] {
+        // A new date on a repeat of another kind.
+        let flight = said(SEATS_FLEW, "event").at("valid_from", "2026-10-20", "day");
+        cases.push(case(seats(), flight, label, false));
+        // A repeat of another kind that matters more.
+        let flowers = said(FLOWERS, "event").significance("trivial");
+        let wife = said(FLOWERS_WIFE, "fact").significance("major");
+        cases.push(case(flowers, wife, label, false));
+    }
+
+    for c in cases {
+        let name = format!(
+            "{} labelled {} on {}, older {}",
+            c.claim["kind"], c.label, c.memory["kind"], c.older
+        );
+        let h = Harness::new();
+        let old = h.fixture(c.memory);
+        let state = |h: &Harness| {
+            let view = h.show(old);
+            let accesses = h.accesses(old);
+            (
+                view.chain.head,
+                view.window,
+                h.change(old),
+                accesses,
+                view.significance,
+                view.edits,
+            )
+        };
+        let before = state(&h);
+        let text = c.claim["quote"].as_str().unwrap();
+        if c.older {
+            h.doc("old-notes", text, date(2026, 8, 1));
+        } else {
+            h.says(text);
+        }
+        let extracted = one_label(&h, reply(vec![c.claim]), old, c.label);
+
+        assert_eq!(extracted.memories.len(), 1, "{name}: the claim is new");
+        let new = h.show(extracted.memories[0]);
+        assert_eq!(new.chain.head, new.id, "{name}");
+        assert!(
+            new.accesses.iter().all(|a| a.inherited_from.is_none()),
+            "{name}: the claim inherits nothing"
+        );
+        assert_eq!(state(&h), before, "{name}");
+    }
+
+    // The evaluation's control arm turns the check off: the same label
+    // refines as it did before.
+    let h = Harness::open(tuning_with(FLOOR, "[reconcile]\nkind_guard = false\n"));
+    let old = h.fact(SEATS);
+    h.says(SEATS_FLEW);
+    let flew = reply(vec![said(SEATS_FLEW, "event")]);
+    let new = one_label(&h, flew, old, "refines").memories[0];
+    assert_eq!(h.change(old).superseded_by, Some(new), "guard off");
+}
+
+#[test]
+fn a_rejected_refinement_drops_that_label_not_the_claim() {
+    // The claim's other labels still decide its fate. Beside a refinement
+    // of its own kind, the claim refines that memory alone and inherits
+    // nothing from the other. Beside a mention, it's absorbed as one.
+    let h = Harness::new();
+    let seats = h.fact(SEATS);
+    let flew = h.fixture(said(SEATS_FLEW, "event"));
+    let untouched = |h: &Harness| (h.change(flew), h.accesses(flew), h.edits(flew));
+    let before = untouched(&h);
+    let both = |h: &Harness, text: &str, label: &str| {
+        h.says(text);
+        let call1 = reply(vec![said(text, "fact")]);
+        let input = call2(h, &call1).expect("call 2 runs");
+        let labels = [
+            (neighbour_handle(&input, flew), "refines"),
+            (neighbour_handle(&input, seats), label),
+        ];
+        let call2 = call2_reply(vec![labelled(&input.claims[0].handle, &labels)]);
+        reconcile(h, call1, call2, &[])
+    };
+
+    let extracted = both(&h, SEATS, "mentioned_again");
+    assert!(extracted.memories.is_empty(), "absorbed by the mention");
+    assert_eq!(h.access_kinds(seats), ["created", "mentioned_again"]);
+    assert_eq!(untouched(&h), before);
+
+    h.advance(1);
+    let new = both(&h, SEATS_LEFT, "refines").memories[0];
+    assert_eq!(h.change(seats).superseded_by, Some(new));
+    assert_eq!(h.edits(seats), [EDIT_REFINED]);
+    assert_eq!(untouched(&h), before);
+    let inherited: BTreeSet<Uuid> = h
+        .show(new)
+        .accesses
+        .iter()
+        .filter_map(|access| access.inherited_from)
+        .collect();
+    assert_eq!(inherited, BTreeSet::from([seats]));
 }
 
 #[test]

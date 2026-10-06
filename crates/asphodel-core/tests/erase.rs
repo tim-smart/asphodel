@@ -802,6 +802,45 @@ fn forget_erases_the_whole_chain_and_clears_what_points_into_it() {
     assert_eq!(content, 0);
 }
 
+#[test]
+fn forget_takes_one_of_two_overlapping_heads_and_leaves_the_other() {
+    // A weightier fact call 2 labelled a repeat of a trivial event isn't
+    // the event's next version, so the two stand as separate chains that
+    // share words. Forgetting the relationship takes its own chain and
+    // passage and leaves the event, which never said it. Forgetting the
+    // event leaves the relationship head, whose sentence still says the
+    // flowers were sent: forget follows chains, not overlapping content.
+    const FLOWERS: &str = "Tim sent flowers to Sam.";
+    const WIFE: &str = "Tim sent flowers to Sam, his wife.";
+    let wife_claim = || with(notable(WIFE), "significance", json!("major"));
+    for forget_wife in [true, false] {
+        let h = Harness::new();
+        let flowers = h.said(EARLIER, with(trivial(FLOWERS), "kind", json!("event")));
+        let (wife, said) = h.says_changing(wife_claim(), flowers, "mentioned_again");
+        assert_eq!(h.superseded_by(flowers), None, "two heads");
+
+        let (gone, kept) = if forget_wife {
+            (wife, flowers)
+        } else {
+            (flowers, wife)
+        };
+        h.forget(&[gone]);
+        let erased = h.erase_next().expect("nothing was queued first");
+        assert_eq!(erased.memories, BTreeSet::from([gone]), "{forget_wife}");
+        assert_eq!(h.exist(&[gone, kept]), [false, true], "{forget_wife}");
+        assert!(h.memory(kept).hidden_at.is_none(), "{forget_wife}");
+        if forget_wife {
+            assert!(
+                !h.text(said).contains("wife"),
+                "the relationship is redacted"
+            );
+        } else {
+            assert_eq!(h.memory(wife).sentence, WIFE, "the overlap survives");
+            assert!(h.text(said).contains("flowers"));
+        }
+    }
+}
+
 // Purge in the nightly sweep
 
 #[test]

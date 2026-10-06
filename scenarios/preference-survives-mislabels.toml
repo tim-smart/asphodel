@@ -1,0 +1,151 @@
+# Tim states a preference. Call 2 then labels an event, a request and a
+# dated repeat of another kind as versions of it: the merges the evaluation
+# store showed, which left a preference with no head. None of them is the
+# preference's next version, so each becomes a memory of its own and the
+# preference stays the head, found by recall for its question. A
+# refinement that is a preference does replace it, and a weightier repeat
+# of that refinement is promoted to the head in turn.
+
+name = "preference-survives-mislabels"
+group = "ci"
+description = "A preference stays its chain's head through refinements of other kinds, then a refinement of its own kind and a weightier repeat replace it."
+
+[bank]
+timezone = "UTC"
+
+[[turn]]
+at = "2026-03-02T09:00:00Z"
+session = "s1"
+user = "I prefer window seats on flights."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "seats"
+content = "Tim prefers window seats on flights."
+quote = "I prefer window seats on flights"
+kind = "fact"
+significance = "minor"
+
+[[turn]]
+at = "2026-03-04T09:00:00Z"
+session = "s1"
+user = "I flew in window seats on both flights to Sydney."
+assistant = "Nice views."
+
+[[turn.claim]]
+label = "flew"
+content = "Tim flew in window seats on flights to Sydney."
+quote = "I flew in window seats on both flights to Sydney"
+kind = "event"
+significance = "minor"
+reconcile = [{ memory = "seats", outcome = "refines" }]
+
+[[turn]]
+at = "2026-03-05T09:00:00Z"
+session = "s1"
+user = "Please book window seats on my flights to Perth."
+assistant = "I'll book them."
+
+[[turn.claim]]
+label = "book"
+content = "Tim needs window seats booked on his flights to Perth."
+quote = "Please book window seats on my flights to Perth"
+kind = "task"
+significance = "minor"
+reconcile = [{ memory = "seats", outcome = "refines" }]
+
+[[turn]]
+at = "2026-03-06T09:00:00Z"
+session = "s1"
+user = "I got window seats on my flights on 20 March."
+assistant = "Good."
+
+[[turn.claim]]
+label = "march"
+content = "Tim has window seats on his flights on 20 March 2026."
+quote = "I got window seats on my flights on 20 March"
+kind = "event"
+significance = "minor"
+valid_from = { at = "2026-03-20", precision = "day" }
+reconcile = [{ memory = "seats", outcome = "mentioned_again" }]
+
+[[probe]]
+id = "the-preference-is-still-the-head"
+at = "2026-03-06T10:00:00Z"
+kind = "exists"
+memory = "seats"
+memory_kind = "fact"
+head = true
+retracted = false
+
+[[probe]]
+id = "the-request-is-its-own-head"
+at = "2026-03-06T10:00:00Z"
+kind = "exists"
+memory = "book"
+memory_kind = "task"
+head = true
+
+[[probe]]
+id = "recall-finds-the-preference"
+at = "2026-03-06T10:00:00Z"
+kind = "recall_finds"
+memory = "seats"
+query = "What seats does Tim prefer on flights?"
+
+[[turn]]
+at = "2026-03-09T09:00:00Z"
+session = "s1"
+user = "I prefer window seats on the left on flights."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "left"
+content = "Tim prefers window seats on the left on flights."
+quote = "I prefer window seats on the left on flights"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "seats", outcome = "refines" }]
+
+[[probe]]
+id = "the-refinement-replaces-the-preference"
+at = "2026-03-09T10:00:00Z"
+kind = "exists"
+memory = "seats"
+head = false
+retracted = false
+
+[[probe]]
+id = "recall-finds-the-refinement"
+at = "2026-03-09T10:00:00Z"
+kind = "recall_finds"
+memory = "left"
+query = "What seats does Tim prefer on flights?"
+
+[[turn]]
+at = "2026-03-12T09:00:00Z"
+session = "s1"
+user = "Window seats on the left matter a lot to me on flights, I prefer them."
+assistant = "Understood."
+
+[[turn.claim]]
+label = "matters"
+content = "Tim strongly prefers window seats on the left on flights."
+quote = "Window seats on the left matter a lot to me on flights, I prefer them"
+kind = "fact"
+significance = "major"
+reconcile = [{ memory = "left", outcome = "mentioned_again" }]
+
+[[probe]]
+id = "the-weightier-repeat-is-the-head"
+at = "2026-03-12T10:00:00Z"
+kind = "exists"
+memory = "matters"
+head = true
+
+[[probe]]
+id = "recall-finds-the-head"
+at = "2026-03-12T10:00:00Z"
+kind = "recall_finds"
+memory = "matters"
+query = "What seats does Tim prefer on flights?"
