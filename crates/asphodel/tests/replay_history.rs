@@ -1567,3 +1567,302 @@ fn a_refresh_recorded_under_another_model_is_never_substituted() {
     write_cassette(&dir, &kept);
     recorded_refreshes(&dir, &corpus, &home_lacks_home(), &[]);
 }
+
+// Attempt budgets.
+
+/// An allocations file: `stages` as `(id, cap)` and `runs` as
+/// `(id, stage, cap)`, a run with no cap of its own taking from its
+/// stage's alone.
+fn allocations(stages: &[(&str, u64)], runs: &[(&str, &str, Option<u64>)]) -> String {
+    let mut toml = String::new();
+    for (id, cap) in stages {
+        toml += &format!("[[stage]]\nid = \"{id}\"\ncap = {cap}\n\n");
+    }
+    for (id, stage, cap) in runs {
+        toml += &format!("[[run]]\nid = \"{id}\"\nstage = \"{stage}\"\n");
+        if let Some(cap) = cap {
+            toml += &format!("cap = {cap}\n");
+        }
+        toml += "\n";
+    }
+    toml
+}
+
+/// `asphodel replay-budget init` of `allocations` into the ledger `name`
+/// under the private dir: the ledger's path and the command's output.
+fn budget_init(dir: &TestDir, name: &str, allocations: &str) -> (PathBuf, std::process::Output) {
+    let file = dir.private_file(&format!("{name}.allocations.toml"), allocations);
+    let ledger = dir.private_path(name);
+    let output = asphodel(dir)
+        .args(["replay-budget", "init", "--allocations"])
+        .arg(&file)
+        .arg("--ledger")
+        .arg(&ledger)
+        .output()
+        .unwrap();
+    (ledger, output)
+}
+
+/// `asphodel replay-budget show` of `ledger`: its stdout as text, which
+/// must parse as JSON.
+fn budget_show(dir: &TestDir, ledger: &Path) -> (String, Value) {
+    let output = asphodel(dir)
+        .args(["replay-budget", "show", "--ledger"])
+        .arg(ledger)
+        .output()
+        .unwrap();
+    assert_ok(&output);
+    let text = support::stdout(&output);
+    let shown = serde_json::from_str(&text).unwrap_or_else(|error| panic!("{error}: {text}"));
+    (text, shown)
+}
+
+/// The path beside `ledger` with `suffix` added to its name.
+fn beside(ledger: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{suffix}", ledger.display()))
+}
+
+/// A run of `mode` on `corpus` under `ledger` as `run`, whose LLM is a
+/// Codex stub failing its first `failures` requests as overloaded, with
+/// the reranker gate shut, `tuning` added to the overrides and `extra`
+/// flags: the command, to run or spawn, and the stub's request count,
+/// which is every backend attempt the run makes.
+fn budgeted(
+    dir: &TestDir,
+    corpus: &Path,
+    mode: &str,
+    (ledger, run): (&Path, &str),
+    failures: usize,
+    tuning: &str,
+    extra: &[&str],
+) -> (std::process::Command, Arc<AtomicUsize>) {
+    let reply = support::reply_to_everything(vec![home_claim()], vec![]);
+    let (url, requests) = codex_failing("server_is_overloaded", failures, &reply);
+    let token_dir = dir.private_path("tokens");
+    logged_in(&token_dir);
+    let llm = format!("[llm]\nauth = \"chatgpt\"\nendpoint = \"{url}\"\nmodel = \"gpt-test\"\n");
+    let probes = dir.private_file("probes.toml", PASSING_PROBES);
+    let mut command = asphodel(dir);
+    command
+        .arg("replay")
+        .arg("--corpus")
+        .arg(corpus)
+        .args(["--mode", mode])
+        .arg("--cassette")
+        .arg(cassette_path(dir))
+        .arg("--probes")
+        .arg(&probes)
+        .args([
+            "--overrides",
+            &overrides(dir, &format!("{llm}{SHUT_GATE}{tuning}")),
+        ])
+        .arg("--token-dir")
+        .arg(&token_dir)
+        .arg("--attempt-budget")
+        .arg(ledger)
+        .args(["--budget-run", run])
+        .args(extra)
+        .env("ASPHODEL_LLM_RETRY_WAIT_MS", "0");
+    (command, requests)
+}
+
+/// Priming 4 chunks at a time, with no refreshes, in `fast`.
+const PRIMED: [&str; 4] = ["--refresh", "off", "--prime-concurrency", "4"];
+
+/// Every backend attempt a budgeted run makes takes a slot from the
+/// ledger first, retries and priming workers included. A run capped at 3
+/// that wants more makes exactly 3 requests, though 4 calls go out at once
+/// and the first fails and is retried. Running out stops the run with
+/// exit 2 and keeps the 2 replies that succeeded. `show` counts all 3
+/// attempts against the run, its stage and call 1's template, and names
+/// no path, since the ledger binds a run to its cassette's.
+#[test]
+fn a_budgeted_run_makes_exactly_its_cap_in_attempts_across_priming_and_retries() {
+    assert!(
+        serial_call1_chunks().len() > 3,
+        "the run must want more than its cap"
+    );
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let budget = allocations(&[("s1", 3)], &[("r1", "s1", Some(3))]);
+    let (ledger, init) = budget_init(&dir, "ledger.json", &budget);
+    assert_ok(&init);
+
+    let (mut run, requests) = budgeted(&dir, &corpus, "fast", (&ledger, "r1"), 1, "", &PRIMED);
+    let output = run.output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    assert_eq!(call1_chunks(&dir).len(), 2, "the successful replies stay");
+
+    let (text, shown) = budget_show(&dir, &ledger);
+    assert_eq!(shown["runs"]["r1"]["consumed"], 3, "{shown}");
+    assert_eq!(
+        shown["runs"]["r1"]["by_template"]["extract_claims"], 3,
+        "{shown}"
+    );
+    assert_eq!(shown["stages"]["s1"]["consumed"], 3, "{shown}");
+    let root = dir.private().parent().unwrap().to_str().unwrap().to_owned();
+    assert!(!text.contains(&root), "show names a path: {text}");
+}
+
+/// A budget belongs to the ledger, not to an invocation. Run again, an
+/// exhausted run makes no request; a second `init` can't replace the
+/// ledger; and two runs started together in one stage make, between them,
+/// exactly the stage's cap however they interleave.
+#[test]
+fn a_resumed_or_concurrent_run_cannot_spend_past_its_ledger() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let budget = allocations(
+        &[("s1", 2), ("s2", 3)],
+        &[("r1", "s1", Some(2)), ("a", "s2", None), ("b", "s2", None)],
+    );
+    let (ledger, init) = budget_init(&dir, "ledger.json", &budget);
+    assert_ok(&init);
+
+    for spent in [2, 0] {
+        let (mut run, requests) = budgeted(&dir, &corpus, "fast", (&ledger, "r1"), 0, "", &PRIMED);
+        let output = run.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+        assert_eq!(requests.load(Ordering::SeqCst), spent);
+    }
+
+    let (_, again) = budget_init(&dir, "ledger.json", &budget);
+    assert_eq!(again.status.code(), Some(2), "{}", stderr(&again));
+    let (_, shown) = budget_show(&dir, &ledger);
+    assert_eq!(shown["runs"]["r1"]["consumed"], 2, "{shown}");
+
+    // Each in a directory of its own, wanting every chunk, so each wants
+    // more than the whole stage holds and both run out.
+    let (a_dir, b_dir) = (TestDir::new(), TestDir::new());
+    let (a_corpus, b_corpus) = (
+        imported_small_history(&a_dir),
+        imported_small_history(&b_dir),
+    );
+    let (mut a, a_requests) = budgeted(&a_dir, &a_corpus, "fast", (&ledger, "a"), 0, "", &PRIMED);
+    let (mut b, b_requests) = budgeted(&b_dir, &b_corpus, "fast", (&ledger, "b"), 0, "", &PRIMED);
+    let (a, b) = (a.spawn().unwrap(), b.spawn().unwrap());
+    for output in [a.wait_with_output().unwrap(), b.wait_with_output().unwrap()] {
+        assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    }
+    let total = a_requests.load(Ordering::SeqCst) + b_requests.load(Ordering::SeqCst);
+    assert_eq!(total, 3);
+    let (_, shown) = budget_show(&dir, &ledger);
+    assert_eq!(shown["stages"]["s2"]["consumed"], 3, "{shown}");
+}
+
+/// A run is bound to what it first ran with: run again with other
+/// overrides, it is refused before calling anything, though its budget
+/// has room. A call the cassette answers never takes a slot, so a `live`
+/// run of a fully recorded history completes under a cap of 0.
+#[test]
+fn a_budgeted_run_is_bound_to_its_first_configuration_and_cache_hits_are_free() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let budget = allocations(
+        &[("s1", 1000)],
+        &[("recorder", "s1", Some(1000)), ("cached", "s1", Some(0))],
+    );
+    let (ledger, init) = budget_init(&dir, "ledger.json", &budget);
+    assert_ok(&init);
+
+    let (mut run, requests) = budgeted(&dir, &corpus, "live", (&ledger, "recorder"), 0, "", &[]);
+    assert_ok(&run.output().unwrap());
+    let recorded = requests.load(Ordering::SeqCst);
+    assert!(recorded > 0);
+
+    let (mut run, requests) = budgeted(&dir, &corpus, "live", (&ledger, "cached"), 0, "", &[]);
+    assert_ok(&run.output().unwrap());
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+    // Without its cassette the run would have to call again.
+    fs::remove_file(cassette_path(&dir)).unwrap();
+    let other = "[clock]\nquiet_rate = 0.2\n";
+    let (mut run, requests) = budgeted(&dir, &corpus, "live", (&ledger, "recorder"), 0, other, &[]);
+    let output = run.output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    let (_, shown) = budget_show(&dir, &ledger);
+    assert_eq!(shown["runs"]["recorder"]["consumed"], recorded, "{shown}");
+}
+
+/// A ledger that can't be trusted stops a run before any request: one
+/// that's missing, one without its lock file, one that doesn't parse, one
+/// whose stage count disagrees with its runs', and one in a directory a
+/// commit can't be written to. Nothing falls back to calling unbudgeted.
+#[test]
+fn a_ledger_that_cannot_be_trusted_dispatches_nothing() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let budget = allocations(&[("s1", 100)], &[("r1", "s1", None)]);
+    let fresh = |name: &str| {
+        let (ledger, init) = budget_init(&dir, name, &budget);
+        assert_ok(&init);
+        ledger
+    };
+
+    let missing = dir.private_path("missing.json");
+    let unlocked = fresh("unlocked.json");
+    fs::remove_file(beside(&unlocked, ".lock")).unwrap();
+    let malformed = fresh("malformed.json");
+    fs::write(&malformed, "{").unwrap();
+    let disagreeing = fresh("disagreeing.json");
+    let mut counts: Value = serde_json::from_slice(&fs::read(&disagreeing).unwrap()).unwrap();
+    counts["stages"]["s1"]["consumed"] = json!(1);
+    fs::write(&disagreeing, counts.to_string()).unwrap();
+    let mut ledgers = vec![missing, unlocked, malformed, disagreeing];
+
+    let read_only = fresh("read-only/ledger.json");
+    let parent = read_only.parent().unwrap().to_owned();
+    set_mode(&parent, 0o555);
+    // Root writes anyway, so the case means nothing there.
+    let writable = fs::write(parent.join("probe"), "").is_ok();
+    if !writable {
+        ledgers.push(read_only);
+    }
+
+    for ledger in &ledgers {
+        let (mut run, requests) = budgeted(&dir, &corpus, "live", (ledger, "r1"), 0, "", &[]);
+        let output = run.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}: {}",
+            ledger.display(),
+            stderr(&output)
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0, "{}", ledger.display());
+    }
+    set_mode(&parent, 0o755);
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// The ledger only changes by a complete commit replacing it, and a call
+/// goes out only after its commit lands. So a commit interrupted before it
+/// landed leaves the last one standing: a stale `.tmp` beside the ledger,
+/// here claiming the whole cap spent, changes nothing, and the run spends
+/// its cap from the ledger's own count.
+#[test]
+fn an_interrupted_commit_leaves_the_last_ledger_standing() {
+    let dir = TestDir::new();
+    let corpus = imported_small_history(&dir);
+    let budget = allocations(&[("s1", 2)], &[("r1", "s1", Some(2))]);
+    let (ledger, init) = budget_init(&dir, "ledger.json", &budget);
+    assert_ok(&init);
+    let mut stale: Value = serde_json::from_slice(&fs::read(&ledger).unwrap()).unwrap();
+    stale["runs"]["r1"]["consumed"] = json!(2);
+    stale["runs"]["r1"]["by_template"] = json!({"extract_claims": 2});
+    stale["stages"]["s1"]["consumed"] = json!(2);
+    fs::write(beside(&ledger, ".tmp"), stale.to_string()).unwrap();
+
+    let (mut run, requests) = budgeted(&dir, &corpus, "fast", (&ledger, "r1"), 0, "", &PRIMED);
+    let output = run.output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    let (_, shown) = budget_show(&dir, &ledger);
+    assert_eq!(shown["runs"]["r1"]["consumed"], 2, "{shown}");
+}
