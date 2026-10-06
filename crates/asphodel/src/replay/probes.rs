@@ -49,7 +49,9 @@ pub fn load(path: &Path, group: Group) -> anyhow::Result<Vec<Probe>> {
                 "probe {id} needs the real models, which this run doesn't have"
             ));
         }
-        if let super::scenario::Check::FadedAt { between, .. } = &probe.check {
+        if let super::scenario::Check::FadedAt { between, .. }
+        | super::scenario::Check::CreatedCount { between, .. } = &probe.check
+        {
             if between[0] > between[1] {
                 errors.push(format!("probe {id} has its range backwards"));
             }

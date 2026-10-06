@@ -71,7 +71,7 @@ use super::report::{
     MemoryOutcome, Percentiles, ProbeResult, RefineCauses, Restatements, SessionTokens, WeekBands,
     WeekCount,
 };
-use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX};
+use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX, RecallMatch};
 use super::shadow::{Created, ShadowRow};
 use super::timeline::{Matching, SessionClass, Timeline};
 use crate::cli::ReplayMode;
@@ -1344,13 +1344,21 @@ impl<'a> Engine<'a> {
         let probe = &self.timeline.probes[index];
         let id = probe.id(index);
         let bank = &self.settings.bank;
-        let not_created = matches!(probe.check, Check::NotCreated { .. });
-        let (memory, resolution) = if not_created {
+        let fact_matching = matches!(
+            probe.check,
+            Check::NotCreated { .. }
+                | Check::CreatedCount { .. }
+                | Check::RecallFinds {
+                    matching: RecallMatch::CurrentSentence,
+                    ..
+                }
+        );
+        let (memory, resolution) = if fact_matching {
             (self.labels.get(probe.check.memory()).copied(), json!({}))
         } else {
             self.probe_memory(index)?
         };
-        if !not_created && memory.is_none() && self.regexes[index].is_some() {
+        if !fact_matching && memory.is_none() && self.regexes[index].is_some() {
             self.probes.push(ProbeResult {
                 id,
                 at: probe.at,
@@ -1428,12 +1436,19 @@ impl<'a> Engine<'a> {
                 Some(view) => (false, json!({ "id": view.id, "present": true })),
                 None => (true, json!({ "id": memory, "present": false })),
             },
-            Check::NotCreated { .. } => {
+            Check::NotCreated { .. } | Check::CreatedCount { .. } => {
                 let matches: Vec<Uuid> = self
                     .created
                     .iter()
                     .filter(|created| {
                         created.created_at <= probe.at
+                            && match &probe.check {
+                                Check::CreatedCount { between, .. } => {
+                                    created.created_at >= between[0]
+                                        && created.created_at <= between[1]
+                                }
+                                _ => true,
+                            }
                             && match &self.regexes[index] {
                                 Some(regex) => regex.is_match(&created.content),
                                 None => memory == Some(created.memory),
@@ -1441,7 +1456,13 @@ impl<'a> Engine<'a> {
                     })
                     .map(|created| created.memory)
                     .collect();
-                (matches.is_empty(), json!({ "created": matches }))
+                match &probe.check {
+                    Check::CreatedCount { count, .. } => (
+                        matches.len() == *count,
+                        json!({ "created": matches, "count": matches.len() }),
+                    ),
+                    _ => (matches.is_empty(), json!({ "created": matches })),
+                }
             }
             Check::Restated {
                 sentence, label, ..
@@ -1478,7 +1499,29 @@ impl<'a> Engine<'a> {
                     },
                 )?;
                 let results: Vec<Uuid> = recall.results.iter().map(|r| r.id).collect();
-                let has = memory.is_some_and(|id| results.contains(&id));
+                let has = if matches!(
+                    probe.check,
+                    Check::RecallFinds {
+                        matching: RecallMatch::CurrentSentence,
+                        ..
+                    }
+                ) {
+                    match &self.regexes[index] {
+                        Some(regex) => recall
+                            .results
+                            .iter()
+                            .any(|result| regex.is_match(&result.sentence)),
+                        None => match self.view(memory)? {
+                            Some(view) => recall
+                                .results
+                                .iter()
+                                .any(|result| result.sentence == view.sentence),
+                            None => false,
+                        },
+                    }
+                } else {
+                    memory.is_some_and(|id| results.contains(&id))
+                };
                 let wants = matches!(probe.check, Check::RecallFinds { .. });
                 (has == wants, json!({ "id": memory, "results": results }))
             }

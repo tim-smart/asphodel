@@ -278,6 +278,15 @@ pub struct Probe {
     pub check: Check,
 }
 
+/// How a recall probe identifies the fact it expects.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallMatch {
+    #[default]
+    MemoryId,
+    CurrentSentence,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Check {
@@ -312,6 +321,13 @@ pub enum Check {
     NotCreated {
         memory: String,
     },
+    /// Exact number of matching creations in an inclusive window, purged
+    /// ones included. History probes ignore grounding ids.
+    CreatedCount {
+        memory: String,
+        between: [Timestamp; 2],
+        count: usize,
+    },
     /// The memory keeps an absorbed claim with this sentence as a
     /// restatement, with this label when one is given.
     Restated {
@@ -329,6 +345,8 @@ pub enum Check {
     RecallFinds {
         memory: String,
         query: String,
+        #[serde(default, rename = "match")]
+        matching: RecallMatch,
     },
     RecallLacks {
         memory: String,
@@ -361,6 +379,7 @@ impl Check {
             | Check::Exists { memory, .. }
             | Check::Absent { memory }
             | Check::NotCreated { memory }
+            | Check::CreatedCount { memory, .. }
             | Check::Restated { memory, .. }
             | Check::AgendaHas { memory }
             | Check::AgendaLacks { memory }
@@ -381,6 +400,7 @@ impl Check {
             Check::Exists { .. } => "exists",
             Check::Absent { .. } => "absent",
             Check::NotCreated { .. } => "not_created",
+            Check::CreatedCount { .. } => "created_count",
             Check::Restated { .. } => "restated",
             Check::AgendaHas { .. } => "agenda_has",
             Check::AgendaLacks { .. } => "agenda_lacks",
@@ -581,7 +601,11 @@ pub fn check(scenario: &Scenario) -> Vec<String> {
                 "probe {id} names {memory:?}, which no claim labels"
             )),
             Some((_, created)) => {
-                if !matches!(probe.check, Check::Absent { .. }) && probe.at < *created {
+                if !matches!(
+                    probe.check,
+                    Check::Absent { .. } | Check::CreatedCount { .. }
+                ) && probe.at < *created
+                {
                     errors.push(format!(
                         "probe {id} at {} is before {memory:?} is created at {created}",
                         probe.at
@@ -589,7 +613,7 @@ pub fn check(scenario: &Scenario) -> Vec<String> {
                 }
             }
         }
-        if let Check::FadedAt { between, .. } = &probe.check {
+        if let Check::FadedAt { between, .. } | Check::CreatedCount { between, .. } = &probe.check {
             if between[0] > between[1] {
                 errors.push(format!("probe {id} has its range backwards"));
             }
