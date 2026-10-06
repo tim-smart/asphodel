@@ -26,6 +26,7 @@
 //! written; 2 when the arguments or the scenario were refused, or the run
 //! itself failed, with no report.
 
+pub mod budget;
 pub mod cassette;
 pub mod claims_agreement;
 pub mod corpus;
@@ -207,6 +208,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             latency_from_cassette: false,
             until: args.until,
             labelling: None,
+            budget: None,
         };
         let engine = Engine::new(
             &service,

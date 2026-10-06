@@ -129,6 +129,9 @@ pub struct Settings {
     /// Collect the labelling material, sampling turns whose queries these
     /// labels judge first.
     pub labelling: Option<BTreeSet<String>>,
+    /// The run's attempt budget. A refresh that runs out of it fails
+    /// quietly, as any refresh does, so the run checks after refreshing.
+    pub budget: Option<Arc<super::budget::Budget>>,
 }
 
 /// What a run produced for the report.
@@ -768,6 +771,9 @@ impl<'a> Engine<'a> {
             }
             Llm::Recorded(recorder, _) => {
                 let refreshes = refreshes_due(self.service, recorder, &mut self.labelling)?;
+                if let Some(reason) = self.settings.budget.as_ref().and_then(|b| b.stopped()) {
+                    return Err(internal(reason));
+                }
                 (refreshes.next_due, recorder.take_refresh_times())
             }
         };

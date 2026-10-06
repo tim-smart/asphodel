@@ -140,11 +140,15 @@ enum Command {
     Import(ImportArgs),
 
     /// Replay recorded sessions on a simulated clock.
-    Replay(ReplayArgs),
+    Replay(Box<ReplayArgs>),
 
     /// Compare, render and calibrate from replay reports.
     #[command(subcommand)]
     Report(ReportCommand),
+
+    /// Create and show the ledger that caps a replay's live calls.
+    #[command(subcommand)]
+    ReplayBudget(ReplayBudgetCommand),
 
     /// Run concurrent prefetches against a daemon on a copy of a store.
     Bench(BenchArgs),
@@ -949,6 +953,17 @@ pub struct ReplayArgs {
     /// `llm.auth = "chatgpt"`; the private dir by default.
     #[arg(long)]
     pub token_dir: Option<PathBuf>,
+
+    /// The ledger `asphodel replay-budget init` created: every backend
+    /// attempt, retries included, takes a slot from `--budget-run`'s
+    /// budget first, and the run stops with exit 2 once it can't
+    /// (`live` and `fast` only).
+    #[arg(long, requires = "budget_run", conflicts_with = "scenario")]
+    pub attempt_budget: Option<PathBuf>,
+
+    /// The run in `--attempt-budget`'s ledger this invocation spends from.
+    #[arg(long, requires = "attempt_budget", conflicts_with = "scenario")]
+    pub budget_run: Option<String>,
 }
 
 /// Where a real-history replay's LLM replies come from.
@@ -995,6 +1010,35 @@ pub struct ImportArgs {
     /// Check the history and print the counts, writing nothing.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReplayBudgetCommand {
+    /// Create a ledger and its lock file from a frozen allocations file.
+    /// Never replaces one.
+    Init(ReplayBudgetInitArgs),
+
+    /// A ledger's caps and counts: ids and numbers only.
+    Show(ReplayBudgetShowArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ReplayBudgetInitArgs {
+    /// The allocations: `[[stage]]` tables of `id` and `cap`, and `[[run]]`
+    /// tables of `id`, `stage` and an optional `cap`.
+    #[arg(long)]
+    pub allocations: PathBuf,
+
+    /// The ledger to create, on a local filesystem under the private dir.
+    #[arg(long)]
+    pub ledger: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct ReplayBudgetShowArgs {
+    /// The ledger to show.
+    #[arg(long)]
+    pub ledger: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1212,7 +1256,7 @@ impl Cli {
             Command::Models(ModelsCommand::Fetch { model_dir }) => models_fetch(model_dir),
             Command::Llm(LlmCommand::Login { data_dir }) => llm_login(&data_dir),
             Command::Import(args) => crate::replay::import::run(args),
-            Command::Replay(args) => crate::replay::run(args),
+            Command::Replay(args) => crate::replay::run(*args),
             Command::Report(ReportCommand::ClaimsAgreement(args)) => {
                 crate::replay::claims_agreement::run(args)
             }
@@ -1220,6 +1264,7 @@ impl Cli {
             Command::Report(ReportCommand::Html(args)) => crate::replay::html::run(args),
             Command::Report(ReportCommand::Precision(args)) => crate::replay::labelling::run(args),
             Command::Report(ReportCommand::Rescore(args)) => crate::replay::rescore::run(args),
+            Command::ReplayBudget(command) => crate::replay::budget::run(command),
             Command::Bench(args) => crate::bench::run(args),
         }
     }

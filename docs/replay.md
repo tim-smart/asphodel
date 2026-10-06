@@ -585,7 +585,8 @@ asphodel replay --corpus <file> --mode live|replay|fast \
     [--no-cache] [--refresh live|recorded|off] [--self-test] \
     [--prime-concurrency [N]] \
     [--config FILE] [--overrides FILE] [--latency DURATION] [--until TIMESTAMP] \
-    [--onnx-threads N] [--token-dir DIR]
+    [--onnx-threads N] [--token-dir DIR] \
+    [--attempt-budget <ledger> --budget-run <id>]
 ```
 
 - **Modes**. Every LLM call is keyed by SHA-256 of
@@ -689,6 +690,79 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   latency and records as it goes.
 - The report goes to `--report` or `<replay dir>/reports/<stem>-<mode>.json`,
   inside the private dir only.
+
+### Attempt budgets
+
+A ledger caps how many backend attempts a set of `live` and `fast` runs may
+make, retries included. Write the allocations, then create the ledger once:
+
+```toml
+[[stage]]
+id = "s1"
+cap = 950
+
+[[run]]
+id = "recording"
+stage = "s1"
+cap = 950        # optional; without it the run draws on its stage's alone
+```
+
+```
+asphodel replay-budget init --allocations <toml> --ledger <file>
+asphodel replay-budget show --ledger <file>
+asphodel replay ... --attempt-budget <file> --budget-run <id>
+```
+
+- **`init`** creates the ledger and its lock file `<ledger>.lock`, both
+  exclusively, and is the only way a ledger comes into being. It refuses an
+  existing ledger or lock file, a run on a stage that isn't allocated, a
+  run cap above its stage's, per-run caps that add up to more than their
+  stage's, and an id given twice. The ledger records the allocations
+  file's SHA-256.
+- **Admission.** Every attempt a budgeted run sends takes a slot first:
+  each call, each retry (the budget sits beneath the retry layer), and
+  each priming worker's call. Under an exclusive lock on `<ledger>.lock`,
+  the ledger is read and checked, one slot is taken from the run and from
+  its stage, the whole ledger is written to `<ledger>.tmp`, synced and
+  renamed over the ledger, and the directory is synced. Only then does the
+  call go out. A crash before the rename leaves the last ledger standing
+  with nothing sent, and a stale `<ledger>.tmp` is ignored; after it, the
+  slot stays taken whether or not the call went out. Nothing is refunded:
+  not a failure, a cancelled run or an attempt whose fate is unknown. A
+  call the cassette answers, and a claim or verdict `fast` reuses, never
+  takes a slot.
+- **Binding.** A run's first invocation binds it to the executable's
+  SHA-256, the `--config` and `--overrides` files' hashes, the corpus hash,
+  the cassette's path, the mode, `--refresh`, `--prime-concurrency` and
+  `--until`. A later invocation, such as a resume, must match all of them
+  and spends what's left of the same budget. A new invocation is never a
+  new budget.
+- **Failing closed.** The ledger is checked when the run opens, before
+  anything else, and again at every admission: its format, that each
+  stage's count is the sum of its runs', that each run's counts by
+  template add up, that nothing is over its cap, and the binding. A
+  missing ledger or lock file, one that doesn't parse, counts that don't
+  add up, a binding that doesn't match, or a failed lock, write or sync
+  stops the run's calls for good, with none sent. Nothing resets a count or
+  falls back to calling unbudgeted. `--attempt-budget` is refused in
+  `replay` mode, which calls nothing.
+- **Stopping.** Once the budget runs out or can't be trusted, the run ends
+  with exit 2 and the reason, and writes no report, whichever call hit
+  it: call 1, call 2, a top-up, or a refresh, which otherwise fails
+  without failing the run. A prime still appends the replies that already
+  succeeded, so stopping loses no paid call.
+- **`show`** prints the ledger's id, the allocations hash, a commit
+  counter, and each stage's and run's cap and count, with each run's
+  counts by template and whether it's bound: ids and numbers only. The
+  ledger itself names the cassette each run is bound to, so it stays in
+  the private dir; only `show`'s output may be reported.
+- **Where it lives.** Keep the ledger on a local filesystem under the
+  private dir. The lock is an advisory `flock`, which a network
+  filesystem may not honour. Runs in different private dirs may share one
+  ledger, and their admissions are serialized by the lock.
+- **What counts.** A slot is one call to the model backend. With
+  `auth = "chatgpt"` a call that gets a 401 refreshes the login and posts
+  once more within the same slot, and the OAuth refresh isn't counted.
 
 ### The report and the aggregate
 

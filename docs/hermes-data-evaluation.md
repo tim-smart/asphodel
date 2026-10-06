@@ -550,6 +550,14 @@ nobody has judged. These top-ups are covered by the standing authorization
 only within the same private-data and backend boundary. Overrides take the
 shape of `Tuning`, for example `clock.quiet_rate = 0.2` or `injection.cap = 6`.
 
+Run every live comparison with a call cap under an attempt budget
+(`docs/replay.md`, "Attempt budgets"): freeze the allocations file before
+independent Fable review of the plan, create the ledger once with
+`asphodel replay-budget init`, and pass `--attempt-budget` and
+`--budget-run` to every run, resumes included. Keep the ledger in the
+private dir, since it names each run's cassette; report only
+`asphodel replay-budget show`'s output.
+
 ```sh
 asphodel replay --corpus "$ASPHODEL_REPLAY_DIR/corpus/state.jsonl" --mode fast \
     --config "$ASPHODEL_REPLAY_DIR/replay.toml" --overrides "$ASPHODEL_REPLAY_DIR/try-1.toml" \

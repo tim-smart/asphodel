@@ -24,6 +24,7 @@ use asphodel_core::store::bank::{BankIdentity, PROFILE_FACETS};
 use asphodel_core::{Clock, Models, Service, SimulatedClock, SystemClock, Tuning, VERSION};
 use jiff::tz::TimeZone;
 
+use super::budget::{Binding, Budget, Budgeted};
 use super::cassette::Recorder;
 use super::engine::{Engine, Llm, Settings};
 use super::report::{Call1, Flags, Report};
@@ -170,12 +171,55 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         .as_deref()
         .map(|text| super::scenario::duration(text).map_err(|error| anyhow!("--latency: {error}")))
         .transpose()?;
+    let kind = mode_name(mode);
+    let refresh_name = match mode {
+        ReplayMode::Fast => match refresh {
+            RefreshMode::Live => "live",
+            RefreshMode::Recorded => "recorded",
+            RefreshMode::Off => "off",
+        },
+        _ => "request",
+    };
+
+    // Opened before anything is called, so a ledger that can't be trusted
+    // stops the run before it starts.
+    let budget = match (&args.attempt_budget, &args.budget_run) {
+        (Some(_), _) if mode == ReplayMode::Replay => {
+            bail!("--attempt-budget caps live calls, and replay mode makes none")
+        }
+        (Some(ledger), Some(run)) => {
+            let binding = Binding {
+                executable_sha256: super::budget::executable_sha()?,
+                config_sha256: super::budget::file_sha(args.config.as_deref())?,
+                overrides_sha256: super::budget::file_sha(args.overrides.as_deref())?,
+                corpus_hash: corpus.hash.clone(),
+                cassette: cassette_path.display().to_string(),
+                mode: kind.to_owned(),
+                refresh: refresh_name.to_owned(),
+                prime_concurrency: args.prime_concurrency.map(NonZeroUsize::get),
+                until: args.until.map(|until| until.to_string()),
+            };
+            Some(Budget::open(ledger, run, binding)?)
+        }
+        _ => None,
+    };
+    // Why the run failed: the budget's reason, when it stopped the calls,
+    // since the call that hit it fails with only a code.
+    let stopped = |error: anyhow::Error| match budget.as_ref().and_then(|budget| budget.stopped()) {
+        Some(reason) => anyhow!("{reason}"),
+        None => error,
+    };
     // `replay` never calls the LLM, whatever is configured. A live call
     // retries a transient failure as the daemon's does; its budget runs on
     // the system clock, since the simulated one stands still while it waits.
+    // A budgeted run admits each attempt beneath the retries.
     let live = match mode {
         ReplayMode::Replay => None,
         ReplayMode::Live | ReplayMode::Fast => live_client(&tuning, args, &dir)?
+            .map(|llm| match &budget {
+                Some(budget) => Arc::new(Budgeted::new(llm, Arc::clone(budget))),
+                None => llm,
+            })
             .map(|llm| crate::serve::retrying(llm, Arc::new(SystemClock)))
             .transpose()?,
     };
@@ -199,16 +243,6 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         assistant_name: header.assistant.clone(),
         timezone: Some(header.timezone.clone()),
     };
-    let kind = mode_name(mode);
-    let refresh_name = match mode {
-        ReplayMode::Fast => match refresh {
-            RefreshMode::Live => "live",
-            RefreshMode::Recorded => "recorded",
-            RefreshMode::Off => "off",
-        },
-        _ => "request",
-    };
-
     // Primed once, before the simulation, so a self-test's two runs read
     // the same cassette.
     let primed = match args.prime_concurrency {
@@ -236,7 +270,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
                 &recorder,
             )?;
             let started = std::time::Instant::now();
-            let primed = recorder.prime(&chunks, concurrency)?;
+            let primed = recorder.prime(&chunks, concurrency).map_err(stopped)?;
             tracing::info!(
                 primed,
                 seconds = started.elapsed().as_secs(),
@@ -284,6 +318,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             latency_from_cassette: latency.is_none(),
             until: args.until,
             labelling: labelling_path.as_ref().map(|_| labelled.clone()),
+            budget: budget.clone(),
         };
         let engine = Engine::new(
             &service,
@@ -294,7 +329,12 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             Llm::Recorded(&recorder, mode),
         )
         .map_err(failure)?;
-        let mut outcome = engine.run().map_err(failure)?;
+        let mut outcome = engine.run().map_err(failure).map_err(stopped)?;
+        // A refresh can be refused without failing the run, so a run that
+        // ran out writes no report either.
+        if let Some(reason) = budget.as_ref().and_then(|budget| budget.stopped()) {
+            bail!("{reason}");
+        }
         outcome.llm.primed = primed;
         material = outcome.material.take();
         let purged_then_re_mentioned =
