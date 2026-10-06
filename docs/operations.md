@@ -564,13 +564,16 @@ lost beneath results for the others:
    message the user sent, received, quoted or forwarded, an order, a
    booking or a one-off purchase or trip isn't profile material, whatever
    its significance: its wording and the one-off matter stay out of the
-   prose. A lasting fact it states outright, such as a name, relationship,
-   birthday or stated preference, is kept, written from another memory
-   that states it when there is one and otherwise cited to the message's
-   memory. A memory holding nothing lasting isn't cited and is dropped from
-   the previous answer. Personal dates such as birthdays go
-   with the person they're about, and each person is named with their
-   relationship to the user when the memories give it. This rule comes
+   prose, and the matter isn't recast as a habit or trait. A lasting fact
+   it states outright, such as a name, relationship, birthday or stated
+   preference, is kept, written from another memory that states it when
+   there is one and otherwise cited to the message's memory. Nothing else
+   is cited to it: not a relationship it doesn't name, nor anything read
+   into who it's to or from, its tone or its subject. A memory holding
+   nothing lasting isn't cited and is dropped from the previous answer,
+   and so is a previous sentence only such a reading would support. Personal dates
+   such as birthdays go with the person they're about, and each person is
+   named with their relationship to the user when a memory gives it. This rule comes
    last in the prompt, after the previous answer's instructions. It
    returns the whole answer as connected prose, a heading and a paragraph
    per facet, and one list of the memories it rests on.
