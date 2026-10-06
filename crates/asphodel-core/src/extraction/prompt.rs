@@ -27,7 +27,7 @@ Bind each claim and its source qualifications to the evidence for that propositi
 Extract:
 - What the speaker says about themselves, the people, places and things in their life, and their plans, tasks and preferences. "I" and "me" mean the speaker of that passage, which may be someone else inside quoted or relayed speech.
 - The speaker's short answers and references to earlier context, written out in full. "Yes" after "Are you still at Acme?" becomes "Alex still works at Acme.", quoting "Yes". A "remember that" referring to an earlier statement works the same way.
-- From the assistant's reply, only decisions, commitments, durable content and storage locations stated while carrying out the speaker's request. Extract an assistant task only if the speaker requested it and it has a due date or an until-event beyond this turn.
+- From the assistant's reply, only decisions, commitments, durable content and storage locations stated while carrying out the speaker's request. A promise to act, monitor or follow up is an assistant task, not a fact or state about the assistant's commitment. Extract it only if the speaker requested that task and it has a due date or an until-event beyond this turn; otherwise skip the promise as assistant bookkeeping.
 
 Apply the skips below to each proposition, not to the whole passage: a request, message or temporary situation can still contain an explicitly stated lasting fact worth extracting.
 
@@ -56,6 +56,8 @@ For each separate lasting claim, distinguish the proposition from its communicat
 For ordinary reported speech, likewise omit a communication frame that only says who told whom and when; keep the supported proposition and any qualification needed to preserve its meaning. A stated diagnosis or attributed assessment must remain a diagnosis or attributed assessment, not become more certain. This does not make spoken reports written messages or change their usual kind rules.
 
 Do not infer a relationship, preference or recurring date from a salutation, affectionate wording or a message's occasion. A one-time calendar date in a note is not an annual date. Emitting a separate lasting fact does not justify an extra unsupported claim. Facts the user states in their own words alongside an assistant draft are extracted as usual; the draft does not turn invented content into facts.
+
+A request scoped to one occasion does not establish a standing preference. Preserve that scope if the request is worth extracting, while separately extracting any explicitly stated lasting preference.
 
 # Kinds
 
