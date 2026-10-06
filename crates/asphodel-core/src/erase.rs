@@ -20,13 +20,15 @@
 //! request turn is linked to when it's ingested ([`crate::ingest`]).
 //!
 //! **The erase** takes a chain and a reason. In common it deletes the
-//! memory rows (their vectors, FTS rows, entity links, accesses, recall
-//! results and citations go with them, and `ended_by` and `superseded_by`
-//! pointing in are cleared), blanks the answer of every model citing the
-//! chain for a refresh, deletes orphan entities, and writes one edit row of ids, never
-//! content. Forget also redacts every passage the chain rests on or was
-//! mentioned in, deletes the chain's recall rows and scrubs it from stored
-//! in-context sets again, for what joined it after the forget. Purge also
+//! memory rows (their vectors, FTS rows, entity links, accesses,
+//! restatements, recall results and citations go with them, and `ended_by`
+//! and `superseded_by` pointing in are cleared), blanks the answer of every
+//! model citing the chain for a refresh, deletes orphan entities, and writes
+//! one edit row of ids, never content. Forget also redacts every passage the
+//! chain rests on or was mentioned in, deletes every restatement, on any
+//! memory, whose passage that masks, deletes the chain's recall rows and
+//! scrubs it from stored in-context sets again, for what joined it after the
+//! forget. Purge also
 //! records each memory's chunk and span in its edit row, and never redacts.
 //!
 //! **The tombstone.** A redacted passage is masked character for
@@ -308,6 +310,12 @@ pub(crate) fn remove_document(
     let (forgotten, members, aftermath) = hide(&tx, store, bank_id, &named, None)?;
 
     for (source, _) in &sources {
+        // What a memory resting elsewhere restated here goes with the text.
+        tx.execute(
+            "DELETE FROM restatements
+             WHERE chunk_id IN (SELECT id FROM chunks WHERE source_id = ?1)",
+            [source],
+        )?;
         tx.execute(
             "UPDATE chunks SET text = NULL, call1_output = NULL, failed_at = NULL,
                     tombstoned_at = COALESCE(tombstoned_at, ?2)
@@ -1045,8 +1053,9 @@ fn redact(
     Ok(())
 }
 
-/// Masks `spans` in a chunk's text, drops call 1's saved reply, and records
-/// the spans.
+/// Masks `spans` in a chunk's text, drops call 1's saved reply, deletes
+/// every restatement taken from text it masks, whichever memory it's on,
+/// and records the spans.
 fn mask_chunk(
     conn: &Connection,
     chunk_id: i64,
@@ -1057,6 +1066,15 @@ fn mask_chunk(
         "UPDATE chunks SET text = ?2, call1_output = NULL WHERE id = ?1",
         (chunk_id, text.map(|text| mask(text, spans))),
     )?;
+    {
+        let mut overlapping = conn.prepare_cached(
+            "DELETE FROM restatements
+             WHERE chunk_id = ?1 AND start_offset < ?3 AND end_offset > ?2",
+        )?;
+        for &(start, end) in spans {
+            overlapping.execute((chunk_id, start as i64, end as i64))?;
+        }
+    }
     let stored: Option<String> = conn
         .query_row(
             "SELECT spans FROM chunk_redactions WHERE chunk_id = ?1",
@@ -1286,6 +1304,8 @@ pub(crate) fn delete_bank(
         "DELETE FROM accesses WHERE bank_id = ?1",
         "DELETE FROM pending_credits WHERE bank_id = ?1",
         "DELETE FROM mention_passages
+         WHERE chunk_id IN (SELECT id FROM chunks WHERE bank_id = ?1)",
+        "DELETE FROM restatements
          WHERE chunk_id IN (SELECT id FROM chunks WHERE bank_id = ?1)",
         "DELETE FROM chunks WHERE bank_id = ?1",
         "DELETE FROM sources WHERE bank_id = ?1",

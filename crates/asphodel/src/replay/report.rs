@@ -53,6 +53,7 @@ pub struct Report {
     /// The tokens the mental models' answers hold, sampled daily.
     pub profile_tokens: Percentiles,
     pub call2_rate: Call2Rate,
+    pub restatements: Restatements,
     pub agenda_lines_per_day: Vec<DayCount>,
     /// Memories created, by the significance extraction gave them.
     pub significance_histogram: BTreeMap<String, u64>,
@@ -291,6 +292,14 @@ impl KindMismatchRow {
     }
 }
 
+/// The claims a repeat absorbed that were kept on the memory they restate.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct Restatements {
+    /// Rows written: one per absorbed newer claim and memory it was
+    /// credited to.
+    pub written: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MemoryOutcome {
     pub id: Uuid,
@@ -368,6 +377,7 @@ pub struct Aggregate {
     pub injection_usage: InjectionUsage,
     pub profile_tokens: Percentiles,
     pub call2_rate: Call2Rate,
+    pub restatements: Restatements,
     pub agenda_lines_per_day: Vec<EpochDayCount>,
     pub significance_histogram: BTreeMap<String, u64>,
     pub kind_histogram: BTreeMap<String, u64>,
@@ -526,6 +536,7 @@ impl Aggregate {
                 redos: report.call2_rate.redos,
                 redo_rate: report.call2_rate.redo_rate,
             },
+            restatements: report.restatements.clone(),
             agenda_lines_per_day: report.agenda_lines_per_day.iter().map(day).collect(),
             significance_histogram: report.significance_histogram.clone(),
             kind_histogram: report.kind_histogram.clone(),

@@ -8,10 +8,10 @@ use uuid::Uuid;
 
 use super::claims::{Checked, Kind as ClaimKind, Link, NewMemory, Precision, Stamp, is_pronoun};
 use super::input::{Unit, survivor};
-use super::reconcile::{Edit, Fate, Neighbour, Plan, end_at};
+use super::reconcile::{Edit, Fate, Neighbour, Plan, Restated, end_at};
 use super::{
-    Call1Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT, EDIT_REFINED,
-    EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted, KindMismatch,
+    CALL2_VERSION, Call1Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT,
+    EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted, KindMismatch,
 };
 use crate::constants::{
     Significance, Volatility, WEIGHT_CONFIRMED, WEIGHT_CREATED, WEIGHT_MENTIONED_AGAIN, WEIGHT_USED,
@@ -52,6 +52,7 @@ pub(super) fn commit(
     plan: &Plan,
     neighbours: &[Neighbour],
     corroborate_used: bool,
+    call2_model: Option<&str>,
 ) -> Result<Extracted, StoreError> {
     let now = store.now();
     let (proposed, entities_created) = resolve_proposals(tx, store, lease, unit, checked, plan)?;
@@ -234,6 +235,13 @@ pub(super) fn commit(
     for (&neighbour, spans) in &plan.mention_spans {
         record_passages(tx, unit, neighbour, spans)?;
     }
+    let mut restatements = 0;
+    for restated in &plan.restatements {
+        let memory = &checked.memories[restated.claim];
+        if record_restatement(tx, unit, input, memory, restated, call2_model)? {
+            restatements += 1;
+        }
+    }
     for (&neighbour, &significance) in &plan.raises {
         let raised = tx.execute(
             "UPDATE memories SET significance = ?2, updated_at = ?3
@@ -309,6 +317,7 @@ pub(super) fn commit(
                 }
             })
             .collect(),
+        restatements,
     })
 }
 
@@ -634,6 +643,103 @@ fn record_passages(
         statement.execute((memory_id, unit.chunk_id, start as i64, end as i64))?;
     }
     Ok(())
+}
+
+/// Keeps what an absorbed claim said on the memory it restated (schema
+/// version 19): call 1's checked claim, call 2's label and the label after
+/// the guards, and the passage it was taken from, so a forget masking that
+/// passage can delete it. Returns whether a row was written: a memory
+/// erased since the chunk's input was read takes none, as it takes no
+/// access.
+fn record_restatement(
+    tx: &Transaction<'_>,
+    unit: &Unit,
+    input: &Call1Input,
+    memory: &NewMemory,
+    restated: &Restated,
+    call2_model: Option<&str>,
+) -> Result<bool, rusqlite::Error> {
+    if !exists(tx, restated.neighbour)? {
+        return Ok(false);
+    }
+    let claim = claim_json(tx, memory)?;
+    tx.execute(
+        "INSERT INTO restatements (memory_id, chunk_id, start_offset, end_offset, claim, label,
+                                   outcome, observed_at, call2_version, model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            restated.neighbour,
+            unit.chunk_id,
+            memory.start as i64,
+            memory.end as i64,
+            claim.to_string(),
+            restated.label.as_str(),
+            restated.outcome.as_str(),
+            micros(input.observed_at),
+            CALL2_VERSION,
+            call2_model.unwrap_or_default(),
+        ],
+    )?;
+    Ok(true)
+}
+
+/// A checked claim as JSON, as [`insert_memory`] would have written it,
+/// with its resolved window: an undated event's start is the day it was
+/// said, flagged `valid_from_defaulted`. A known entity is named by its id,
+/// a proposed one by its name and kind.
+fn claim_json(
+    tx: &Transaction<'_>,
+    memory: &NewMemory,
+) -> Result<serde_json::Value, rusqlite::Error> {
+    let stamp = |stamp: Option<Stamp>| {
+        stamp.map(|stamp| {
+            serde_json::json!({
+                "at": stamp.at.to_string(),
+                "precision": stamp.precision.as_str(),
+            })
+        })
+    };
+    let mut links = Vec::with_capacity(memory.links.len());
+    for link in &memory.links {
+        links.push(match link {
+            Link::Known {
+                entity,
+                surface_form,
+            } => {
+                let uuid: Option<String> = tx
+                    .query_row("SELECT uuid FROM entities WHERE id = ?1", [entity], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                serde_json::json!({"entity": uuid, "surface_form": surface_form})
+            }
+            Link::Proposed {
+                name,
+                kind,
+                surface_form,
+            } => serde_json::json!({
+                "new_name": name,
+                "new_kind": kind.as_str(),
+                "surface_form": surface_form,
+            }),
+        });
+    }
+    Ok(serde_json::json!({
+        "sentence": memory.content,
+        "kind": memory.kind.as_str(),
+        "significance": level(memory.significance),
+        "valid_from": stamp(memory.valid_from),
+        "valid_from_defaulted": memory.valid_from_defaulted,
+        "valid_until": stamp(memory.valid_until),
+        "due_at": stamp(memory.due_at),
+        "until_event": memory.until_event,
+        "window_confidence": if memory.low_confidence { "low" } else { "high" },
+        "volatility": memory.volatility.map(volatility),
+        "recurrence_text": memory.recurrence_text,
+        "recurrence_rrule": memory.recurrence_rrule,
+        "recurrence_start": stamp(memory.recurrence_start),
+        "entities": links,
+    }))
 }
 
 fn exists(tx: &Transaction<'_>, memory_id: i64) -> Result<bool, rusqlite::Error> {

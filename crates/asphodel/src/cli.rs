@@ -2768,6 +2768,18 @@ fn print_memory(view: &Value) {
             text(entity, "id")
         );
     }
+    let restatements = list(view, "restatements");
+    if !restatements.is_empty() {
+        println!("  restated ({}):", restatements.len());
+        for restatement in restatements {
+            println!(
+                "    {} {}  {}",
+                text(restatement, "observed_at"),
+                text(restatement, "label"),
+                text(restatement, "sentence"),
+            );
+        }
+    }
     let accesses = list(view, "accesses");
     println!("  accesses ({}):", accesses.len());
     for access in accesses {

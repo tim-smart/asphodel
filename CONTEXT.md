@@ -136,6 +136,10 @@ _Avoid_: Duplicate, repeat, re-extraction
 The kind of access where the user says a memory is still right.
 _Avoid_: Verified, acknowledged
 
+**Restatement**:
+What a newer statement said when it was absorbed into a memory as mentioned again or confirmed, kept on that memory with when it was said and the label it took. It counts for nothing: it isn't recalled, injected or reconciled against. It goes when its memory goes, or when the passage it came from is forgotten or removed.
+_Avoid_: Mention, duplicate, absorbed claim (outside the code)
+
 **Recent use**:
 The part of strength that comes from recent accesses and fades with disuse. It starts over when a memory's validity window closes.
 _Avoid_: Retrieval strength, base level (outside the formula)

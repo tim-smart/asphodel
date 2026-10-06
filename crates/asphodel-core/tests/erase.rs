@@ -81,6 +81,7 @@ const PASSPORT: &str = "Tim needs to renew his passport.";
 const TAX: &str = "Tim needs to file the tax return.";
 const BIKE: &str = "Tim needs to fix the bike.";
 const GARDEN: &str = "Tim's garden needs water.";
+const LISBON_WITH_MAYA: &str = "Tim moved to Lisbon with his daughter Maya.";
 
 /// An extraction failure no retry fixes.
 const TRANSPORT: ChunkError = ChunkError {
@@ -503,6 +504,12 @@ impl Harness {
         assert!(extracted.memories.is_empty(), "the repeat is no new memory");
     }
 
+    /// How many restatements the store holds, read past the API to prove
+    /// they're gone.
+    fn restatement_rows(&self) -> i64 {
+        self.count("SELECT count(*) FROM restatements")
+    }
+
     /// Every mention span gone, as on a store from before version 7.
     fn make_legacy(&self) {
         self.sql("UPDATE accesses SET spans = NULL; DELETE FROM mention_passages;");
@@ -839,6 +846,77 @@ fn forget_takes_one_of_two_overlapping_heads_and_leaves_the_other() {
             assert!(h.text(said).contains("flowers"));
         }
     }
+}
+
+// Restatements: the sentence of a claim absorbed into a memory as a
+// repeat. Its text is the owner's, so it goes wherever the memory or the
+// passage it was taken from goes.
+
+#[test]
+fn a_restatement_goes_with_its_memory_by_forget_or_bank_deletion() {
+    for delete_bank in [false, true] {
+        let h = Harness::new();
+        let maya = h.said(EARLIER, notable(MAYA));
+        h.ingest("chat", "As I said, my daughter is called Maya.");
+        h.extract_mention(quoting(notable(MAYA), "my daughter is called Maya"), maya);
+        assert_eq!(h.memory(maya).restatements.len(), 1, "{delete_bank}");
+
+        if delete_bank {
+            h.service.delete_bank(BANK, BANK).unwrap();
+        } else {
+            h.forget(&[maya]);
+            assert!(h.erase_next().is_some());
+        }
+        assert_eq!(h.restatement_rows(), 0, "delete_bank: {delete_bank}");
+    }
+}
+
+#[test]
+fn forgetting_a_memory_takes_restatements_on_others_that_overlap_its_passage() {
+    // One turn restates Maya and Tea and says something new whose passage
+    // overlaps Maya's restatement. Forgetting the new memory masks its
+    // passage, so the restatement taken from that text goes, even though
+    // it's on a memory that stays. Tea's, elsewhere in the turn, stays.
+    let (h, maya, tea) = maya_and_tea();
+    h.ingest(
+        "chat",
+        "My daughter Maya and I moved to Lisbon. I still like green tea.",
+    );
+    let extracted = h.extract_with(
+        vec![
+            quoting(notable(MAYA), "My daughter Maya"),
+            quoting(notable(LISBON_WITH_MAYA), "Maya and I moved to Lisbon"),
+            quoting(notable(TEA), "I still like green tea"),
+        ],
+        &[(0, maya, "mentioned_again"), (2, tea, "mentioned_again")],
+    );
+    let [lisbon] = extracted.memories[..] else {
+        panic!("one new memory: {:?}", extracted.memories);
+    };
+    assert_eq!(h.memory(maya).restatements.len(), 1);
+    assert_eq!(h.memory(tea).restatements.len(), 1);
+
+    h.forget(&[lisbon]);
+    assert!(h.erase_next().is_some());
+    assert!(h.memory(maya).restatements.is_empty());
+    assert_eq!(h.memory(tea).restatements.len(), 1);
+    assert_eq!(h.restatement_rows(), 1, "only Tea's is left");
+}
+
+#[test]
+fn removing_a_document_takes_its_restatements_but_not_the_memory() {
+    // The memory came from a turn and the document only said it again, so
+    // removing the document leaves the memory but not the sentence taken
+    // from the document.
+    let h = Harness::new();
+    let tea = h.said(EARLIER, notable(TEA));
+    h.doc("notes.md", "# Drinks\n\nI like green tea.\n");
+    h.extract_mention(quoting(notable(TEA), "I like green tea"), tea);
+    assert_eq!(h.memory(tea).restatements.len(), 1);
+
+    h.service.remove_document(BANK, "notes.md").unwrap();
+    assert!(h.memory(tea).restatements.is_empty());
+    assert_eq!(h.restatement_rows(), 0);
 }
 
 // Purge in the nightly sweep

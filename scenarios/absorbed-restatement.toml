@@ -1,0 +1,90 @@
+# Tim says where he lives, then says it again twice in one turn of another
+# session, then confirms it. Call 2 labels both claims in the second turn
+# mentioned_again and the third turn's confirmed. None matters more than the
+# memory or adds a date, so all three are absorbed: no new memory, and the
+# memory keeps each sentence call 1 wrote as a restatement with the label it
+# took. The two in one turn are one access but two restatements.
+
+name = "absorbed-restatement"
+group = "ci"
+description = "A claim absorbed as a repeat is kept as a restatement on the memory it repeats."
+
+[bank]
+timezone = "UTC"
+
+[[turn]]
+at = "2026-01-05T09:00:00Z"
+session = "s1"
+user = "I live in Auckland."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "home"
+content = "Tim lives in Auckland."
+quote = "I live in Auckland"
+kind = "fact"
+significance = "minor"
+
+[[turn]]
+at = "2026-02-10T09:00:00Z"
+session = "s2"
+user = "I still live in Auckland, by the way. I've been here for years."
+assistant = "Good to know."
+
+[[turn.claim]]
+content = "Tim still lives in Auckland."
+quote = "I still live in Auckland"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "home", outcome = "mentioned_again" }]
+
+[[turn.claim]]
+content = "Tim has lived in Auckland for years."
+quote = "I've been here for years"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "home", outcome = "mentioned_again" }]
+
+[[turn]]
+at = "2026-03-01T09:00:00Z"
+session = "s3"
+user = "Yes, that's right, I live in Auckland."
+assistant = "Thanks for confirming."
+
+[[turn.claim]]
+content = "Tim lives in Auckland."
+quote = "I live in Auckland"
+kind = "fact"
+significance = "minor"
+reconcile = [{ memory = "home", outcome = "confirmed" }]
+
+[[probe]]
+id = "the-memory-is-still-the-head"
+at = "2026-03-01T10:00:00Z"
+kind = "exists"
+memory = "home"
+head = true
+
+[[probe]]
+id = "the-mention-is-restated"
+at = "2026-03-01T10:00:00Z"
+kind = "restated"
+memory = "home"
+sentence = "Tim still lives in Auckland."
+label = "mentioned_again"
+
+[[probe]]
+id = "the-second-mention-in-the-turn-is-restated"
+at = "2026-03-01T10:00:00Z"
+kind = "restated"
+memory = "home"
+sentence = "Tim has lived in Auckland for years."
+label = "mentioned_again"
+
+[[probe]]
+id = "the-confirmation-is-restated"
+at = "2026-03-01T10:00:00Z"
+kind = "restated"
+memory = "home"
+sentence = "Tim lives in Auckland."
+label = "confirmed"

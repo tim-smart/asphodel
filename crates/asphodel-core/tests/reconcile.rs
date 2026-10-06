@@ -68,6 +68,7 @@ const FLOOR: f64 = 0.5;
 const TEA: &str = "Tim likes green tea.";
 const TEA_AGAIN: &str = "Tim really likes green tea.";
 const TEA_A_LOT: &str = "Tim likes green tea a lot.";
+const TEA_DAILY: &str = "Tim drinks green tea every day.";
 const ACME: &str = "Tim works at Acme.";
 const ACME_STILL: &str = "Tim still works at Acme.";
 const ACME_LEFT: &str = "Tim no longer works at Acme, having left in August 2026.";
@@ -303,6 +304,15 @@ impl Harness {
     fn edits(&self, memory: Uuid) -> Vec<String> {
         let edits = self.show(memory).edits.into_iter();
         edits.map(|edit| edit.kind).collect()
+    }
+
+    /// The claims absorbed into a memory, newest first: each sentence,
+    /// when it was said and the label it took.
+    fn restated(&self, memory: Uuid) -> Vec<(String, Timestamp, String)> {
+        let restatements = self.show(memory).restatements.into_iter();
+        restatements
+            .map(|r| (r.sentence, r.observed_at, r.label))
+            .collect()
     }
 
     fn change(&self, memory: Uuid) -> Change {
@@ -930,6 +940,37 @@ fn a_mention_that_matters_no_more_than_the_memory_is_absorbed_and_keeps_only_on_
 }
 
 #[test]
+fn an_absorbed_claim_is_kept_as_a_restatement_newest_first() {
+    // A repeat leaves no memory of its own, so the sentence call 1 wrote
+    // would be lost at commit. The memory keeps it, with when it was said
+    // and the label it took, for a later pass to look at again. Two repeats
+    // in one turn are one access but two restatements.
+    let h = Harness::new();
+    let tea = h.fact(TEA);
+    assert!(h.restated(tea).is_empty(), "a new memory restates nothing");
+    h.says_at(T1, "I really like green tea. I drink it every day.");
+    let again = claim(TEA_AGAIN, "fact", "I really like green tea");
+    let daily = claim(TEA_DAILY, "fact", "I drink it every day");
+    let mention = (tea, "mentioned_again");
+    label_each(&h, reply(vec![again, daily]), &[mention, mention]);
+    h.says_at(T2, "Yes, I like green tea a lot.");
+    let confirmed = claim(TEA_A_LOT, "fact", "I like green tea a lot");
+    one_label(&h, reply(vec![confirmed]), tea, "confirmed");
+
+    assert_eq!(h.memories(), 1);
+    assert_eq!(h.accesses(tea).len(), 3, "created and one access per turn");
+    let restated = h.restated(tea);
+    assert_eq!(restated.len(), 3, "{restated:?}");
+    assert_eq!(restated[0], (TEA_A_LOT.into(), at(T2), "confirmed".into()));
+    let same_turn: BTreeSet<_> = restated[1..].iter().cloned().collect();
+    let said = |sentence: &str| (sentence.into(), at(T1), "mentioned_again".into());
+    assert_eq!(
+        same_turn,
+        BTreeSet::from([said(TEA_AGAIN), said(TEA_DAILY)])
+    );
+}
+
+#[test]
 fn a_repeat_that_matters_more_than_the_memory_becomes_its_head() {
     // Call 2 can label a claim that says more than a memory, such as a
     // relationship the memory only names a person in, a repeat. A newer
@@ -969,6 +1010,8 @@ fn a_repeat_that_matters_more_than_the_memory_becomes_its_head() {
             .collect();
         assert_eq!(inherited, before, "{label}");
         assert_eq!(h.access_kinds(new), ["created"], "{label}");
+        assert!(h.restated(old).is_empty(), "{label}: the claim is a memory");
+        assert!(h.restated(new).is_empty(), "{label}: the claim is a memory");
     }
 }
 
@@ -1110,6 +1153,11 @@ fn repeat_labels_preserve_added_or_changed_windows_as_a_dated_head() {
                 assert_eq!(window[field]["precision"], "minute");
                 assert_eq!(extracted.memories, vec![head.id]);
                 assert_ne!(head.id, old.id);
+                let restated = (&old.restatements, &head.restatements);
+                assert!(
+                    restated.0.is_empty() && restated.1.is_empty(),
+                    "{label}, {field}: the claim is a memory"
+                );
                 assert!(old.retracted_at.is_none(), "adding detail is a refinement");
             }
         }
@@ -1431,8 +1479,11 @@ fn a_document_mention_is_an_access_unless_an_earlier_version_said_it() {
     assert_eq!(accesses.len(), 2, "{accesses:?}");
     assert_eq!(accesses[1].kind, "mentioned_again");
     assert_eq!(accesses[1].source, Some(diary.source));
+    let restated = h.restated(bike);
+    assert_eq!(restated.len(), 1, "{restated:?}");
 
-    // A later version of the same document doesn't reinforce itself.
+    // A later version of the same document doesn't reinforce itself, and
+    // isn't a restatement either.
     h.advance(1);
     let text = "My bike is a Brompton. I ride it to work.";
     let edited = h.doc("notes", text, date(2026, 9, 27));
@@ -1441,6 +1492,7 @@ fn a_document_mention_is_an_access_unless_an_earlier_version_said_it() {
     let extracted = one_label(&h, restated, bike, "mentioned_again");
     assert!(extracted.memories.is_empty());
     assert_eq!(h.accesses(bike), accesses);
+    assert_eq!(h.restated(bike).len(), 1);
 }
 
 #[test]
@@ -1644,7 +1696,8 @@ fn an_older_claim_labelled_ends_is_created_already_ended() {
 fn an_older_claim_corrects_nothing_but_its_mention_still_counts() {
     // An old note retracting, refining or denying a newer memory creates
     // nothing and changes nothing, not even the task the denied filing
-    // ended. Only its mention lands, even on an ended neighbour.
+    // ended. Only its mention or confirmation lands, even on an ended
+    // neighbour, and none of it is a restatement: only a newer claim is.
     const LATER: &str = "2026-09-20T00:00:00Z";
     const LATEST: &str = "2026-09-25T00:00:00Z";
     let h = Harness::new();
@@ -1655,15 +1708,17 @@ fn an_older_claim_corrects_nothing_but_its_mention_still_counts() {
     let filed = h.seed(LATEST, filed, &[(task, "ends")]);
     let acme = h.seed(LATER, said(ACME, "fact"), &[]);
     h.left_acme(LATEST, acme);
-    let state = |h: &Harness, m: Uuid| (h.change(m), h.accesses(m), h.edits(m));
+    let bike = h.seed(LATER, said(BIKE, "fact"), &[]);
+    let state = |h: &Harness, m: Uuid| (h.change(m), h.accesses(m), h.edits(m), h.restated(m));
     let corrected = [dentist, tokyo, task, filed];
     let before = corrected.map(|m| state(&h, m));
     let acme_before = state(&h, acme);
+    let bike_before = state(&h, bike);
 
     let doc = h.doc(
         "old-notes",
         "Dentist on 8 October. Going to Japan in 2027. \
-         I haven't filed the tax return. I work at Acme.",
+         I haven't filed the tax return. I work at Acme. My bike is a Brompton.",
         date(2026, 9, 10),
     );
     let extracted = label_each(
@@ -1673,23 +1728,34 @@ fn an_older_claim_corrects_nothing_but_its_mention_still_counts() {
             claim(JAPAN, "event", "Going to Japan in 2027"),
             claim(TAX_NOT_FILED, "fact", "I haven't filed the tax return"),
             claim(ACME, "fact", "I work at Acme"),
+            claim(BIKE, "fact", "My bike is a Brompton"),
         ]),
         &[
             (dentist, "retracts"),
             (tokyo, "refines"),
             (filed, "denies"),
             (acme, "mentioned_again"),
+            (bike, "confirmed"),
         ],
     );
 
     assert!(extracted.memories.is_empty());
     assert_eq!(corrected.map(|m| state(&h, m)), before);
-    let (change, mut accesses, edits) = state(&h, acme);
-    assert_eq!((&change, &edits), (&acme_before.0, &acme_before.2));
-    let mention = accesses.pop().unwrap();
-    assert_eq!(accesses, acme_before.1);
-    assert_eq!(mention.kind, "mentioned_again");
-    assert_eq!(mention.source, Some(doc.source));
+    for (memory, before, kind) in [
+        (acme, acme_before, "mentioned_again"),
+        (bike, bike_before, "confirmed"),
+    ] {
+        let (change, mut accesses, edits, restated) = state(&h, memory);
+        assert_eq!((&change, &edits), (&before.0, &before.2), "{kind}");
+        assert_eq!(
+            restated, before.3,
+            "{kind}: an older claim restates nothing"
+        );
+        let mention = accesses.pop().unwrap();
+        assert_eq!(accesses, before.1, "{kind}");
+        assert_eq!(mention.kind, kind);
+        assert_eq!(mention.source, Some(doc.source), "{kind}");
+    }
 }
 
 // Reopening.

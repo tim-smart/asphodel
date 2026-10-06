@@ -21,7 +21,7 @@ use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
 
 /// The schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// How long a pre-migration copy is kept after its migration completes.
 pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
@@ -68,6 +68,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
         18,
         include_str!("../../migrations/0018_profile_question.sql"),
     ),
+    (19, include_str!("../../migrations/0019_restatements.sql")),
 ];
 
 /// The columns a migration adds, by version. Every migration is safe to run

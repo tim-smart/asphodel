@@ -104,6 +104,9 @@ pub struct MemoryView {
     /// Its own accesses and those it inherits, oldest first.
     pub accesses: Vec<AccessEntry>,
     pub edits: Vec<EditEntry>,
+    /// The claims absorbed into it as repeats, newest first. Its own, not
+    /// its predecessors'.
+    pub restatements: Vec<RestatementEntry>,
     pub chain: ChainView,
     pub entities: Vec<LinkedEntity>,
     pub strength: StrengthView,
@@ -178,6 +181,15 @@ pub struct AccessEntry {
     pub source: Option<Uuid>,
     /// The predecessor it's inherited from, along `superseded_by`.
     pub inherited_from: Option<Uuid>,
+}
+
+/// A claim a repeat absorbed into the memory: the sentence call 1 wrote,
+/// when it was said, and its label.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RestatementEntry {
+    pub sentence: String,
+    pub observed_at: Timestamp,
+    pub label: String,
 }
 
 /// The supersession chain the memory is in.
@@ -478,6 +490,22 @@ pub(crate) fn memory(
             .collect::<Result<_, _>>()?
     };
 
+    let restatements: Vec<RestatementEntry> = {
+        let mut statement = conn.prepare_cached(
+            "SELECT json_extract(claim, '$.sentence'), observed_at, label FROM restatements
+             WHERE memory_id = ?1 ORDER BY observed_at DESC, id DESC",
+        )?;
+        statement
+            .query_map([memory_id], |row| {
+                Ok(RestatementEntry {
+                    sentence: row.get(0)?,
+                    observed_at: timestamp(row.get(1)?),
+                    label: row.get(2)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?
+    };
+
     let (passage, gone) = passage(&row);
     Ok(MemoryView {
         id: uuid,
@@ -525,6 +553,7 @@ pub(crate) fn memory(
         },
         accesses,
         edits: edits(&conn, "e.memory_id = ?1", memory_id)?,
+        restatements,
         chain: ChainView {
             head: parse(&conn.query_row(
                 "SELECT uuid FROM memories WHERE id = ?1",

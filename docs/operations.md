@@ -479,7 +479,8 @@ whatever it says.
   `critical` or `kept`, or clears it. It's the field keep and unkeep write.
 - `asphodel memory show --bank B <id>` answers "why do you think X?": the
   sentence, kind, window and phase, both significance fields, the source
-  passage or why it's gone, the access and edit logs, the supersession
+  passage or why it's gone, the claims absorbed into it as repeats
+  ("Restatements" below), the access and edit logs, the supersession
   chain, the secret-scan kinds, strength in its parts, any guard holding
   back a purge, and projected fade and purge dates. The dates are bank-time
   durations plus the earliest world date at full speed.
@@ -953,6 +954,10 @@ What forget can't reach:
   recorded span for the mention, so forget masks more of that turn or
   document than the mention itself (`docs/upgrading.md`, version 8).
 
+The erase also deletes the forgotten memories' restatements, and every
+restatement on any other memory whose passage the redaction masks, so
+masked text doesn't survive in a row on a memory that stays.
+
 ## Retracting a memory
 
 `asphodel memory retract --bank B <id>` is the owner saying a memory never
@@ -980,6 +985,8 @@ every version ever ingested under it. It's irreversible.
   nothing it found is written.
 - Each version's text is cleared at once. The versions keep their keys, so
   sending any of them again is a duplicate and queues nothing.
+- Every restatement taken from any version is deleted at once, whichever
+  memory it's on.
 
 Memories the document only mentioned again, which rest on other turns or
 documents, stay. Everything listed under "What forget can't reach" applies
@@ -989,6 +996,33 @@ input. Over HTTP it's `POST /v1/banks/{bank}/documents/remove` with
 the path, where a client would turn `folder/../notes` into `notes`. The
 dashboard asks for confirmation before it calls the route; the CLI and the
 route don't.
+
+## Restatements
+
+A claim call 2 labels `mentioned_again` or `confirmed` on an older memory,
+and that code doesn't make a memory of its own (it adds no date and doesn't
+matter more than the memory), is absorbed: it counts as an access on the
+memory. Its sentence is kept as a restatement on that memory, with when it
+was said and the label, so a later pass can look at it again. One row is
+kept per absorbed claim and memory it was credited to. A later version of
+the same document repeating itself, an older claim, and a claim that became
+a memory keep none. `asphodel memory show` lists a memory's restatements
+newest first, as does the dashboard's memory page under "Said again".
+Nothing reads them for recall, reconciliation or injection.
+
+A restatement is the owner's content, and goes as memory content does:
+
+- **Forget** deletes the forgotten memories' restatements, and those on
+  any other memory whose passage the redaction masks.
+- **Removing a document** deletes the restatements taken from it at once,
+  even on a memory that came from elsewhere.
+- **The source sweep.** Past `purge.source_horizon_days` (90 days) a source
+  loses its text, but a restatement outlives it, as a memory's sentence
+  does.
+- **Purge** deletes a memory's restatements with it. That's a known
+  limitation: a restatement can't yet outlive the memory it's on.
+- **Bank deletion** deletes them with everything else.
+- **Re-embedding** doesn't touch them. They have no vectors.
 
 ## Explaining recall and injection
 
@@ -1063,6 +1097,9 @@ for the token and sends it on every `/v1` call it makes, which need it like
 any other client. Browsing never goes through recall, so looking at a
 memory doesn't strengthen it or log a recall. The Recall page doesn't
 either; see below.
+
+A memory's page lists the claims absorbed into it as repeats under "Said
+again", newest first ("Restatements" above).
 
 It also shows each bank's counts, the `attention` lines from `status` as a
 banner, failed chunks with retry, the purge pause with its

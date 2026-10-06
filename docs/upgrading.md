@@ -395,6 +395,26 @@ well. `fast --refresh recorded` finds nothing to substitute until
 refreshes are recorded again under v7. Re-recording private history follows the
 evaluation policy.
 
+## Schema version 19: restatements
+
+A newer claim that call 2 labels `mentioned_again` or `confirmed`, and that
+the date and significance guards leave a repeat, is absorbed: it becomes an
+access on the memory, and until now the sentence call 1 wrote for it was
+lost when the chunk committed. The migration adds an empty `restatements`
+table, and from now on each absorbed claim is kept there on the memory it
+was credited to: the checked claim as JSON, call 2's label and the label
+after the guards, when it was said, the call 2 template version and the
+model. `asphodel memory show` and the dashboard's memory page list them.
+
+There's no backfill. What was absorbed before the upgrade is already gone.
+
+Nothing reads the table for recall, reconciliation, injection or strength,
+so no label, guard, prompt or recall result changes, and the deletion
+fingerprint is unchanged, so purge doesn't pause. Retention follows memory
+content: see "Restatements" in `docs/operations.md`. The replay report and
+aggregate gain `restatements.written`, so the first replay after upgrading
+differs from an earlier report by that key alone. No action is needed.
+
 ## Write template version 3: dates for possibly stale states
 
 Schema version 15 introduced `write_model` v2 and the one-answer reply

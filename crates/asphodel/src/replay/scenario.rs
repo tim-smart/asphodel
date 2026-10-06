@@ -307,6 +307,14 @@ pub enum Check {
     Absent {
         memory: String,
     },
+    /// The memory keeps an absorbed claim with this sentence as a
+    /// restatement, with this label when one is given.
+    Restated {
+        memory: String,
+        sentence: String,
+        #[serde(default)]
+        label: Option<Label>,
+    },
     AgendaHas {
         memory: String,
     },
@@ -347,6 +355,7 @@ impl Check {
             | Check::FadedAt { memory, .. }
             | Check::Exists { memory, .. }
             | Check::Absent { memory }
+            | Check::Restated { memory, .. }
             | Check::AgendaHas { memory }
             | Check::AgendaLacks { memory }
             | Check::RecallFinds { memory, .. }
@@ -365,6 +374,7 @@ impl Check {
             Check::FadedAt { .. } => "faded_at",
             Check::Exists { .. } => "exists",
             Check::Absent { .. } => "absent",
+            Check::Restated { .. } => "restated",
             Check::AgendaHas { .. } => "agenda_has",
             Check::AgendaLacks { .. } => "agenda_lacks",
             Check::RecallFinds { .. } => "recall_finds",

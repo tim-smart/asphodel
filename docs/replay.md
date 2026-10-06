@@ -319,6 +319,7 @@ probes run on sessions named
 | `faded_at` | `memory`, `between = [from, to]` | The first instant strength fell below τ is within the range, inclusive. It's computed at `at` from the access log and bank time, to the minute, as `memory show`'s projection does. Not yet faded by `at` fails. |
 | `exists` | `memory`, and any of `memory_kind`, `ended`, `retracted`, `head`, `phase` | The memory is in the store and every given field matches. `head` is whether it's the head of its supersession chain; `phase` is `upcoming`, `current`, `overdue`, `recently_past` or `long_past`. |
 | `absent` | `memory`, optional `memory_id` in real history | The memory isn't in the store. In real history it must resolve to a created memory, then purged or forgotten; scenario labels may also be checked before extraction. |
+| `restated` | `memory`, `sentence`, optional `label` | The memory keeps an absorbed claim whose sentence is exactly `sentence` as a restatement, with `label` (`mentioned_again` or `confirmed`) when it's given. |
 | `agenda_has`, `agenda_lacks` | `memory` | The bank's agenda at `at` lists, or doesn't list, the memory. |
 | `recall_finds`, `recall_lacks` | `memory`, `query` | Explicit recall for `query`, with no session, returns, or doesn't return, the memory. |
 | `injects`, `not_injects` | `memory`, `query` | A prefetch for `query` on a session no turn uses injects, or doesn't inject, the memory. Group `models` only. |
@@ -467,7 +468,8 @@ One JSON object per run. The fields the scripted scenarios pin:
 history. `observed` holds what the probe saw, in a shape per probe kind:
 `faded_at` gives the instant or null; `band` the band and strength;
 `exists` and `absent` the memory's id and the fields `exists` can check;
-the agenda probes the ids listed; the recall and inject probes the ids
+`restated` the memory's id and its restatements' labels, never their
+sentences; the agenda probes the ids listed; the recall and inject probes the ids
 returned. The other report fields (injected and profile tokens,
 refresh calls per day, the call-2 rate, agenda lines per day, the
 histograms, probe results) sit beside these and aren't pinned by the
@@ -706,6 +708,11 @@ the neighbour, both kinds, the cause, whether the claim was older and
 whether `reconcile.kind_guard` rejected it), and `llm` with `cache`, `top_up`, `live`,
 `primed`, `misses`, `used_verdicts` by source and `latency_ms`. A `live` run and the `replay`
 of its cassette differ only in `kind`, `flags`, `llm` and `cassette_hash`.
+
+Reports and aggregates also carry `restatements.written`: the
+restatements the run wrote, one per absorbed newer claim and memory it was
+credited to (CONTEXT.md, "Restatement"). It sits beside `call2_rate`, and
+`report diff` compares it. A run before schema version 19 has no such key.
 
 Reports and aggregates also carry `injection_usage`: per-memory counts
 `used`, `not_used`, `unjudged` (verdict source `none`), and

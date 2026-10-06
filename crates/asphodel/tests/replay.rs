@@ -373,6 +373,26 @@ memory = "home"
     }
 }
 
+/// Every restatement a run writes is counted, in the report and the
+/// aggregate export alike; a run that absorbs nothing writes none.
+#[test]
+fn restatements_written_are_counted_in_report_and_aggregate() {
+    let dir = TestDir::new();
+    for (path, written) in [
+        // Two of the three are in one turn, on one memory.
+        (scenario("absorbed-restatement"), 3),
+        (inline(&dir, "nothing-absorbed", HOME_TURN), 0),
+    ] {
+        let aggregate = dir.path("aggregate.json");
+        let run = replay(&dir, &path, &["--aggregate", aggregate.to_str().unwrap()]);
+        run.assert_passed();
+        let export: Value = serde_json::from_slice(&fs::read(aggregate).unwrap()).unwrap();
+        let path = path.display();
+        assert_eq!(run.report()["restatements"]["written"], written, "{path}");
+        assert_eq!(export["restatements"]["written"], written, "{path}");
+    }
+}
+
 /// Each loader error, as a sentence naming the label at fault.
 const LOADER_ERRORS: &str = r#"
 [[turn]]

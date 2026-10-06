@@ -333,6 +333,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             injection_usage: outcome.injection_usage,
             profile_tokens: outcome.profile_tokens,
             call2_rate: outcome.call2_rate,
+            restatements: outcome.restatements,
             agenda_lines_per_day: outcome.agenda_lines_per_day,
             significance_histogram: outcome.significance_histogram,
             kind_histogram: outcome.kind_histogram,
