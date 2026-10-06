@@ -608,6 +608,10 @@ so rather than improvise.
 
 ### Latency and throughput
 
+- Shipped: `refresh_retries` in the report and aggregate, the mental
+  model writes sent again because a reply left out a pinned memory, by
+  outcome (accepted, rejected, failed, skipped). They're extra write
+  calls, not counted in `refresh_calls_per_day`.
 - Shipped: bench `p50_ms`, `p95_ms`, `p99_ms`, `max_ms` per concurrency
   level and the fraction the reranker answered within its deadline; replay
   `extraction_lag` p50/p95 in simulated time; `llm.latency_ms` percentiles

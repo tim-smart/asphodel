@@ -50,7 +50,7 @@ use std::time::Duration;
 use asphodel_core::extraction::{Call1Input, Committed, DropReason, Extracted, Prepared};
 use asphodel_core::ingest::{Document, Outcome as IngestOutcome, Turn, TurnAuthor};
 use asphodel_core::inspect::InspectError;
-use asphodel_core::mental_models::{PLAN_TEMPLATE, Refreshes};
+use asphodel_core::mental_models::{Outcome as RefreshOutcome, PLAN_TEMPLATE, Refreshes, Retried};
 use asphodel_core::models::{FakeLlm, LlmClient, LlmError, LlmRequest, LlmResponse};
 use asphodel_core::retrieval::{Band, PrefetchRequest, RecallRequest, band, estimate_tokens};
 use asphodel_core::service::Claimed;
@@ -68,7 +68,8 @@ use super::cassette::{Chained, ChunkContext, ChunkKey, Recorder};
 use super::labelling::{Collector, Material};
 use super::report::{
     Call2Rate, DayCount, InjectedTokens, InjectionUsage, KindMismatchRow, Lag, LlmCounts,
-    MemoryOutcome, Percentiles, ProbeResult, RefineCauses, SessionTokens, WeekBands, WeekCount,
+    MemoryOutcome, Percentiles, ProbeResult, RefineCauses, RefreshRetries, SessionTokens,
+    WeekBands, WeekCount,
 };
 use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX};
 use super::shadow::{Created, ShadowRow};
@@ -139,6 +140,7 @@ pub struct Outcome {
     pub bands_per_week: Vec<WeekBands>,
     pub extraction_lag: Lag,
     pub refresh_calls_per_day: Vec<DayCount>,
+    pub refresh_retries: RefreshRetries,
     pub injected_tokens: InjectedTokens,
     pub injection_usage: InjectionUsage,
     pub profile_tokens: Percentiles,
@@ -318,6 +320,7 @@ pub struct Engine<'a> {
     lags_ms: Vec<u64>,
     llm_calls: u64,
     refresh_calls: BTreeMap<String, u64>,
+    refresh_retries: RefreshRetries,
     snapshots: Vec<Snapshot>,
     previous_strengths: BTreeMap<Uuid, f64>,
     sessions: BTreeMap<String, SessionCount>,
@@ -405,6 +408,7 @@ impl<'a> Engine<'a> {
             lags_ms: Vec::new(),
             llm_calls: 0,
             refresh_calls: BTreeMap::new(),
+            refresh_retries: RefreshRetries::default(),
             snapshots: Vec::new(),
             previous_strengths: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -745,7 +749,7 @@ impl<'a> Engine<'a> {
     /// their calls by bank-local day, collecting their scored selections
     /// for the labelling material. Returns when the next is due.
     fn run_refreshes(&mut self) -> Result<Option<Timestamp>, Failure> {
-        let (next_due, calls) = match self.llm {
+        let (refreshes, calls) = match self.llm {
             Llm::Scripted => {
                 let refreshes =
                     refreshes_due(self.service, &self.refresh_llm, &mut self.labelling)?;
@@ -764,13 +768,26 @@ impl<'a> Engine<'a> {
                         .unwrap_or_else(|poisoned| poisoned.into_inner()),
                 );
                 self.llm_calls += calls.len() as u64 + plans;
-                (refreshes.next_due, calls)
+                (refreshes, calls)
             }
             Llm::Recorded(recorder, _) => {
                 let refreshes = refreshes_due(self.service, recorder, &mut self.labelling)?;
-                (refreshes.next_due, recorder.take_refresh_times())
+                (refreshes, recorder.take_refresh_times())
             }
         };
+        for run in &refreshes.ran {
+            let RefreshOutcome::Applied(applied) = &run.outcome else {
+                continue;
+            };
+            let retries = &mut self.refresh_retries;
+            match applied.retried {
+                Some(Retried::Accepted) => retries.accepted += 1,
+                Some(Retried::Rejected) => retries.rejected += 1,
+                Some(Retried::Failed) => retries.failed += 1,
+                Some(Retried::Skipped) => retries.skipped += 1,
+                None => {}
+            }
+        }
         for at in calls {
             let day = at
                 .to_zoned(self.settings.timezone.clone())
@@ -778,7 +795,7 @@ impl<'a> Engine<'a> {
                 .to_string();
             *self.refresh_calls.entry(day).or_default() += 1;
         }
-        Ok(next_due)
+        Ok(refreshes.next_due)
     }
 
     /// Prepares one claimed chunk: its call 1 and call 2 run now, with the
@@ -1583,6 +1600,7 @@ impl<'a> Engine<'a> {
                 p50_ms: percentile(0.5),
                 p95_ms: percentile(0.95),
             },
+            refresh_retries: self.refresh_retries,
             refresh_calls_per_day: self
                 .refresh_calls
                 .into_iter()

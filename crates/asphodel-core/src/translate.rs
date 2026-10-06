@@ -344,6 +344,7 @@ fn request(content: &str, language: &str) -> LlmRequest {
             name: TRANSLATE_TEMPLATE.into(),
             version: TRANSLATE_VERSION,
             guidance: None,
+            attempt: None,
         },
         system: SYSTEM.replace("{language}", language),
         user: content.to_owned(),

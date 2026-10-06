@@ -1,5 +1,31 @@
 # Upgrading
 
+## A write that drops a pinned memory is sent again
+
+A mental model refresh whose reply leaves out a memory the stored answer
+cites, that's still in its input and is major, critical or kept, now sends
+the same write again, once, when the reply fits `max_tokens`. The second
+reply is kept only when what it leaves out of those memories is a strict
+part of what the first left out; otherwise the first stands. The prompt is
+unchanged (`write_model` v7). Expect one more write call on the refreshes
+that drop such a memory, on the ChatGPT backend. An OpenAI-compatible
+endpoint answers at temperature 0, where the same request gets the same
+reply, so it never retries. Set
+`retention_retry = false` under `[mental_models]` to keep the old
+behaviour.
+
+No schema migration, nothing is re-extracted and purge doesn't pause. A
+write sent again carries `attempt` in its template, which replay keys and
+records apart; a first write's key is unchanged, so older cassettes still
+answer. `replay` of a cassette with no recording of a retry, as every one
+recorded before this has none, keeps the first reply and counts no miss.
+`live` with the retry on makes the retry calls an older recording never
+made; to reproduce an older recording exactly, use `replay`, or turn the
+retry off. `fast` with `--refresh recorded` or `off` never retries, and a
+recorded retry never stands in for a first write. Reports and the
+aggregate export count retries under `refresh_retries`; they aren't refresh
+calls of their own.
+
 ## Shorter trivial and minor lifetimes
 
 The significance mapping changes from 0.1 to 0.0 for trivial memories and

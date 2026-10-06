@@ -95,6 +95,12 @@ and the date doesn't go stale in meaning. Cost 5 was accepted.
 - Each refresh rewrites the answer, so there is no stable sentence
   identity to diff two refreshes by, and recorded `write_model` replies
   from before the change can't stand in for new ones.
+- The retry for a dropped pinned memory sends the same request again and
+  names nothing, so it undoes only a drop the writer doesn't repeat; a
+  memory it leaves out every time stays out, which is how a correctly
+  dropped one stays out too. It costs a second write call on refreshes
+  that drop one, and nothing on a backend at temperature 0, which skips
+  it.
 - The "as of" date for a stale state updates at the next refresh, not
   daily. A state crossing the confidence threshold changes the fingerprint
   so it does get one.
@@ -110,6 +116,7 @@ and the date doesn't go stale in meaning. Cost 5 was accepted.
 | `###` name, `Prompt:`, `Output:`, `####` facet headings | TIM-185 |
 | Operator docs, upgrade notes, replay notes | TIM-186 |
 | Significance in the write input and fingerprint, profile durability rule, reworded profile question | `write_model` v7, schema 18, TIM-193 |
+| A write leaving out a pinned memory is sent again once; the reply leaving out a strict part of that is kept | `mental_models.retention_retry`, TIM-201 |
 
 Still open after TIM-186: no `write_model` v2 or v3 cassettes were
 recorded for the scenarios under `scenarios/`, which run against the

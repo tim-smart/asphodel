@@ -329,6 +329,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             bands_per_week: outcome.bands_per_week,
             extraction_lag: outcome.extraction_lag,
             refresh_calls_per_day: outcome.refresh_calls_per_day,
+            refresh_retries: outcome.refresh_retries,
             injected_tokens: outcome.injected_tokens,
             injection_usage: outcome.injection_usage,
             profile_tokens: outcome.profile_tokens,

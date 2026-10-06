@@ -43,9 +43,21 @@
 //!    with no text is left out. A reply with no text, no citations or a
 //!    citation outside the selection changes nothing and is recorded like
 //!    one that doesn't parse. Code can check the citations, not the prose.
-//! 6. **Trim.** Over `max_tokens`, measured on the stored text with its
+//! 6. **Retry.** The answer pins the memories it cites that are still in
+//!    the selection and major, critical or kept. When the reply leaves one
+//!    out though Trim would remove nothing from it, so the budget isn't
+//!    why, the same request goes again, once, marked as a second attempt
+//!    ([`Template::attempt`]). Its reply is taken only when what it leaves
+//!    out of the pinned memories is a strict part of what the first left
+//!    out; otherwise, or when the call fails, is held or is malformed, the
+//!    first stands, and the refresh goes on. Nothing in the prompt names a
+//!    memory: a memory the writer drops every time stays dropped, and only
+//!    a drop it doesn't repeat is undone. A client whose reply wouldn't
+//!    differ skips it ([`LlmClient::skips_write`]), and
+//!    `mental_models.retention_retry` turns it off.
+//! 7. **Trim.** Over `max_tokens`, measured on the stored text with its
 //!    headings, sentences go from the end ([`Answer::trim_to`]).
-//! 7. **Store.** The answer and its citations replace the old ones whole,
+//! 8. **Store.** The answer and its citations replace the old ones whole,
 //!    unless a memory it cites was forgotten while it was written, or a
 //!    forget blanked the answer meanwhile: then nothing is stored, and the
 //!    refresh the forget requested writes it again.
@@ -54,7 +66,7 @@
 //! to scrub there. Each facet's retrieval writes one `refresh` row to the
 //! recall log, with its query, and nothing writes an access.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use rusqlite::OptionalExtension;
@@ -66,8 +78,8 @@ use uuid::Uuid;
 use super::schedule::Schedule;
 use super::{
     Answer, Applied, Facet, FailureKind, InputMemory, ModelError, ModelRow, Outcome, PLAN_TEMPLATE,
-    PLAN_VERSION, RefreshInput, RejectReason, Rejected, ScoredFacet, StoredPlan, WRITE_TEMPLATE,
-    WRITE_VERSION, load_cites, volatility_str,
+    PLAN_VERSION, RefreshInput, RejectReason, Rejected, Retried, ScoredFacet, StoredPlan,
+    WRITE_TEMPLATE, WRITE_VERSION, load_cites, volatility_str,
 };
 use crate::constants::{STATE_AGE_SHOWN_BELOW, TAU};
 use crate::models::{LlmClient, LlmError, LlmRequest, Template};
@@ -82,6 +94,9 @@ use crate::strength::{Kind, Phase};
 struct Selection {
     /// Memory rowid to handle.
     handles: BTreeMap<i64, String>,
+    /// The memories the stored answer cites, by rowid, whether selected or
+    /// not.
+    cited: Vec<i64>,
     input: RefreshInput,
     /// Each facet's whole scored pool, when they were asked for.
     scored: Option<Vec<ScoredFacet>>,
@@ -225,6 +240,7 @@ fn select(
     });
     Ok(Selection {
         handles,
+        cited,
         input,
         scored,
     })
@@ -474,7 +490,7 @@ pub(crate) fn refresh(
         Ok(response) => response.json,
         Err(error) => return llm_failed(cx, schedule, model, &error),
     };
-    let Some((mut written, applied)) = serde_json::from_value::<Written>(reply)
+    let Some(first) = serde_json::from_value::<Written>(reply)
         .ok()
         .and_then(|reply| apply(&selection, reply))
     else {
@@ -482,9 +498,14 @@ pub(crate) fn refresh(
         return failed(cx, model, FailureKind::Malformed);
     };
     let max_tokens = model.max_tokens as usize;
-    let trimmed = written
-        .answer
-        .trim_to(|answer| estimate_tokens(&answer.text()) <= max_tokens);
+    let fits = |answer: &Answer| estimate_tokens(&answer.text()) <= max_tokens;
+    let (mut written, applied) = if cx.tuning.mental_models.retention_retry && fits(&first.0.answer)
+    {
+        retry_if_dropped(model, llm, &request, &identities, &selection, first)
+    } else {
+        first
+    };
+    let trimmed = written.answer.trim_to(fits);
     let stored = store(cx, model, &selection, Some(&written), started)?;
     Ok(Outcome::Applied(Applied {
         written: stored,
@@ -607,6 +628,7 @@ fn plan_request(question: &str, language: Option<&str>) -> LlmRequest {
             name: PLAN_TEMPLATE.into(),
             version: PLAN_VERSION,
             guidance: None,
+            attempt: None,
         },
         system: plan_system(language),
         user: format!("Question: {question}\n"),
@@ -797,6 +819,7 @@ fn write_request(input: &RefreshInput, profile: bool) -> LlmRequest {
             name: WRITE_TEMPLATE.into(),
             version: WRITE_VERSION,
             guidance: None,
+            attempt: None,
         },
         system: write_system(input.language.as_deref(), profile),
         user,
@@ -888,6 +911,98 @@ fn apply(selection: &Selection, reply: Written) -> Option<(Accepted, Applied)> {
         return None;
     }
     Some((Accepted { answer, cites }, applied))
+}
+
+/// The memories the stored answer pins: those it cites that are still in
+/// `selection` and major, critical or kept, by rowid.
+fn pinned(selection: &Selection) -> BTreeSet<i64> {
+    let significance: BTreeMap<&str, &str> = selection
+        .input
+        .memories
+        .iter()
+        .map(|memory| (memory.handle.as_str(), memory.significance.as_str()))
+        .collect();
+    selection
+        .handles
+        .iter()
+        .filter(|(memory, handle)| {
+            selection.cited.contains(memory)
+                && matches!(
+                    significance.get(handle.as_str()),
+                    Some(&("major" | "critical" | "kept"))
+                )
+        })
+        .map(|(memory, _)| *memory)
+        .collect()
+}
+
+/// Step 6, the retry: `first` if it leaves out nothing the answer pins;
+/// otherwise the same `request` sent again, once, as a second attempt, and
+/// its reply if what it leaves out of the pinned memories is a strict part
+/// of what `first` left out. In every other case `first` stands, with
+/// [`Applied::retried`] saying why.
+fn retry_if_dropped(
+    model: &ModelRow,
+    llm: &dyn LlmClient,
+    request: &LlmRequest,
+    identities: &[(String, Uuid)],
+    selection: &Selection,
+    first: (Accepted, Applied),
+) -> (Accepted, Applied) {
+    let pinned = pinned(selection);
+    let left_out = |cites: &[i64]| -> BTreeSet<i64> {
+        pinned
+            .iter()
+            .filter(|memory| !cites.contains(memory))
+            .copied()
+            .collect()
+    };
+    let first_out = left_out(&first.0.cites);
+    if first_out.is_empty() {
+        return first;
+    }
+    let (accepted, applied) = first;
+    let standing = move |retried: Retried| {
+        let applied = Applied {
+            retried: Some(retried),
+            ..applied
+        };
+        (accepted, applied)
+    };
+    let again = LlmRequest {
+        template: Template {
+            attempt: Some(1),
+            ..request.template.clone()
+        },
+        ..request.clone()
+    };
+    if llm.skips_write(&again, identities) {
+        return standing(Retried::Skipped);
+    }
+    let reply = match llm.complete_identified(&again, identities) {
+        Ok(response) => response.json,
+        Err(error) => {
+            tracing::info!(model = %model.uuid, %error, "a mental model write sent again failed; the first reply stands");
+            return standing(Retried::Failed);
+        }
+    };
+    let Some((second, second_applied)) = serde_json::from_value::<Written>(reply)
+        .ok()
+        .and_then(|reply| apply(selection, reply))
+    else {
+        tracing::info!(model = %model.uuid, "a mental model write sent again got a malformed answer; the first reply stands");
+        return standing(Retried::Failed);
+    };
+    let second_out = left_out(&second.cites);
+    if second_out.len() < first_out.len() && second_out.is_subset(&first_out) {
+        let applied = Applied {
+            retried: Some(Retried::Accepted),
+            ..second_applied
+        };
+        (second, applied)
+    } else {
+        standing(Retried::Rejected)
+    }
 }
 
 /// Whether a reply made from `selection` can still be stored: no memory it

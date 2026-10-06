@@ -113,6 +113,7 @@ pub fn call1_request(input: &Call1Input) -> LlmRequest {
             name: CALL1_TEMPLATE.into(),
             version: CALL1_VERSION,
             guidance: guidance_hash(input.guidance.as_deref()),
+            attempt: None,
         },
         system: system(input.language.as_deref(), input.guidance.as_deref()),
         user: render(input),

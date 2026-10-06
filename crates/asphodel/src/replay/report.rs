@@ -48,6 +48,8 @@ pub struct Report {
     pub bands_per_week: Vec<WeekBands>,
     pub extraction_lag: Lag,
     pub refresh_calls_per_day: Vec<DayCount>,
+    /// The writes sent again, by what became of them.
+    pub refresh_retries: RefreshRetries,
     pub injected_tokens: InjectedTokens,
     pub injection_usage: InjectionUsage,
     /// The tokens the mental models' answers hold, sampled daily.
@@ -215,6 +217,25 @@ pub struct CronTokens {
     pub tokens: u64,
 }
 
+/// The mental model writes sent again because the first reply left out a
+/// memory the answer pinned, by what became of them
+/// ([`Retried`](asphodel_core::mental_models::Retried)). They aren't
+/// refresh calls of their own.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RefreshRetries {
+    /// The second reply was applied.
+    pub accepted: u64,
+    /// The second reply left out as much, or something else: the first
+    /// stood.
+    pub rejected: u64,
+    /// The second call failed, was held or was malformed.
+    pub failed: u64,
+    /// Not sent: `fast` with `--refresh recorded` or `off`, a cassette with
+    /// no recording of it and no live client, or a client whose reply
+    /// wouldn't differ.
+    pub skipped: u64,
+}
+
 /// How often a chunk's claims landed near something stored and call 2 ran.
 #[derive(Debug, Default, Serialize)]
 pub struct Call2Rate {
@@ -364,6 +385,7 @@ pub struct Aggregate {
     pub bands_per_week: Vec<WeekNumberBands>,
     pub extraction_lag: Lag,
     pub refresh_calls_per_day: Vec<EpochDayCount>,
+    pub refresh_retries: RefreshRetries,
     pub injected_tokens: AggregateTokens,
     pub injection_usage: InjectionUsage,
     pub profile_tokens: Percentiles,
@@ -505,6 +527,7 @@ impl Aggregate {
                 .collect(),
             extraction_lag: report.extraction_lag.clone(),
             refresh_calls_per_day: report.refresh_calls_per_day.iter().map(day).collect(),
+            refresh_retries: report.refresh_retries.clone(),
             injected_tokens: AggregateTokens {
                 sessions: report.injected_tokens.sessions.len() as u64,
                 per_session: Percentiles::of(&mut per_session),

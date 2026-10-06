@@ -469,7 +469,8 @@ history. `observed` holds what the probe saw, in a shape per probe kind:
 `exists` and `absent` the memory's id and the fields `exists` can check;
 the agenda probes the ids listed; the recall and inject probes the ids
 returned. The other report fields (injected and profile tokens,
-refresh calls per day, the call-2 rate, agenda lines per day, the
+refresh calls per day, writes sent again (`refresh_retries`), the call-2
+rate, agenda lines per day, the
 histograms, probe results) sit beside these and aren't pinned by the
 scripted tests. The report is a plain serde value with keys in struct
 order, so two runs compare byte for byte.
@@ -620,7 +621,18 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   never saw here. Citations are checked by identity rather than by name.
   A write recorded before identities were kept carries nothing over. A
   `write_model` v1 record, sentence by sentence, never stands in for a v2
-  write. The current write template is v7, which lists each memory's
+  write. A write sent again because its reply left out a memory the
+  answer pins carries `attempt` in its template, so it's keyed and
+  recorded apart from the first, and its record never stands in for a
+  first write. `fast` with `--refresh recorded` or `off` never sends one.
+  `live`, `replay` and `fast --refresh live` answer it by its own key;
+  without a recording, `replay`, and `live` or `fast` with no LLM
+  configured, skip it with no miss and the first reply stands, while
+  `live` and `fast --refresh live` with an LLM send it. So `live` with
+  `mental_models.retention_retry` on makes retry calls a recording from
+  before retries never made; `replay`, or the retry off, reproduces it.
+  Retries aren't counted in `refresh_calls_per_day`; `refresh_retries`
+  counts them by what became of them. The current write template is v7, which lists each memory's
   significance and gives the seeded profile a durability rule; v2 to v6
   records do not substitute for v7 either.
   A `refresh_model` record from before schema version 13

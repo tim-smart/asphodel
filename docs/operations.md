@@ -611,6 +611,20 @@ lost beneath results for the others:
    trimmed from the end, and a section left empty loses its heading. A
    sentence ends at `.`, `!`, `?`, `。`, `！` or `？` before whitespace or
    the end. With nothing selected the answer is cleared, with no call.
+4. **Retry.** The answer pins the memories it cites that are still in the
+   input and major, critical or kept. A reply that leaves one of them out,
+   while fitting `max_tokens`, so the budget isn't why, is sent again once
+   as the same request. The second reply is kept only when what it leaves
+   out of the pinned memories is a strict part of what the first left
+   out; otherwise, and when the second call fails, is held or is
+   malformed, the first stands and the refresh goes on. Nothing in the
+   prompt names a memory, so a memory the writer leaves out every time
+   stays out: only a drop it doesn't repeat is undone. The cost is one
+   more write call on the refreshes that drop something, and a retried
+   refresh takes about two write round trips. An OpenAI-compatible
+   endpoint is asked at temperature 0, where the same request gets the
+   same reply, so it never retries. Set `retention_retry = false` under
+   `[mental_models]` to turn it off.
 
 A refresh is skipped, unless forced, when its inputs haven't changed: the
 selection and each memory's significance, which states may be stale, the question, the plan, the filters

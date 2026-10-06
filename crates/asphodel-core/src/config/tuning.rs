@@ -390,6 +390,11 @@ pub struct MentalModelsTuning {
 
     /// The input cap once the memories the model cites now are added.
     pub input_budget_with_cited: u32,
+
+    /// Send a write again, once, when its reply leaves out a memory the
+    /// answer cites that's still in the input and major, critical or kept,
+    /// and keep the second reply if it leaves out less of them.
+    pub retention_retry: bool,
 }
 
 impl Default for MentalModelsTuning {
@@ -405,6 +410,7 @@ impl Default for MentalModelsTuning {
             facet_budget: 20,
             input_budget: 90,
             input_budget_with_cited: 100,
+            retention_retry: true,
         }
     }
 }

@@ -235,6 +235,28 @@ pub struct Applied {
     pub rejected: Vec<Rejected>,
     /// The sentences trimmed from the end to fit `max_tokens`.
     pub trimmed: usize,
+    /// What became of the write sent again because the first reply left
+    /// out a memory the answer pinned; `None` when there was no reason to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retried: Option<Retried>,
+}
+
+/// A write sent again ([`Applied::retried`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Retried {
+    /// The second reply left out a strict part of what the first did, and
+    /// is the one applied.
+    Accepted,
+    /// The second reply left out as much or something else, so the first
+    /// stands.
+    Rejected,
+    /// The second call failed, was held or got a malformed reply: the first
+    /// reply stands.
+    Failed,
+    /// The client skipped it ([`LlmClient::skips_write`](crate::models::LlmClient::skips_write)):
+    /// the first reply stands.
+    Skipped,
 }
 
 /// A section of the reply left out, by its index in the reply.

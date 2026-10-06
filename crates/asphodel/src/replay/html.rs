@@ -38,6 +38,7 @@ const SECTIONS: &[(&str, &str)] = &[
     ("extraction_lag", "Extraction lag"),
     ("call2_rate", "Call 2 rate"),
     ("refresh_calls_per_day", "Refresh calls per day"),
+    ("refresh_retries", "Refresh writes sent again"),
     ("agenda_lines_per_day", "Agenda lines per day"),
     ("bands_per_week", "Memories per band per week"),
     ("fade_outs_per_week", "Fade-outs per week"),

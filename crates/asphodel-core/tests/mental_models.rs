@@ -172,6 +172,7 @@ impl Harness {
             facet_budget: 20,
             input_budget: 60,
             input_budget_with_cited: 70,
+            retention_retry: true,
         };
         tuning.agenda = AgendaTuning {
             horizon_days: 7,

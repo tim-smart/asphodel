@@ -106,6 +106,14 @@ pub struct Template {
     /// other template, so their keys and older records stay as they were.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guidance: Option<String>,
+    /// Which try of the same request this is: `None` for the first, and
+    /// `Some(1)` for a mental model write sent again because its first
+    /// reply left out a memory the answer pinned. The backend sees the same
+    /// request either way; replay keys and records the two apart. Absent
+    /// when `None`, so first tries keep their keys and older records stay
+    /// as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
 }
 
 /// One structured-output call: a system and a user message, and the JSON
@@ -278,9 +286,13 @@ pub trait LlmClient: Send + Sync {
     }
 
     /// Whether a mental model refresh skips its write `request`, whose
-    /// handles stand for `identities`, instead of sending it: the write
-    /// counts as made and changes nothing. Replay's `--refresh off` skips
-    /// every write. Every other client sends it.
+    /// handles stand for `identities`, instead of sending it. For a first
+    /// write the write counts as made and changes nothing: replay's
+    /// `--refresh off` skips every one. For a write sent again
+    /// ([`Template::attempt`]) the first reply stands: a client whose reply
+    /// to the same request wouldn't differ skips it, and so does replay
+    /// when it has no recording to answer it with. Every other client sends
+    /// it.
     fn skips_write(&self, request: &LlmRequest, identities: &[(String, uuid::Uuid)]) -> bool {
         let _ = (request, identities);
         false
@@ -383,6 +395,12 @@ impl LlmClient for OpenAiCompatible {
             usage: parse_usage(&reply),
             latency,
         })
+    }
+
+    /// Requests go at temperature 0, so the same request sent again gets
+    /// the same reply: a write sent again is skipped.
+    fn skips_write(&self, request: &LlmRequest, _identities: &[(String, uuid::Uuid)]) -> bool {
+        request.template.attempt.is_some()
     }
 }
 

@@ -251,7 +251,9 @@ pub struct Counts {
     pub latencies_ms: Vec<u64>,
     /// Call 2 requests seen, however answered.
     pub call2: u64,
-    /// Simulated times of refresh requests, however answered.
+    /// Simulated times of refresh writes, however answered. A write sent
+    /// again ([`Template::attempt`]) isn't a refresh of its own and isn't
+    /// counted.
     pub refresh_times: Vec<Timestamp>,
 }
 
@@ -580,6 +582,7 @@ impl Recorder {
                 name: JUDGE_TEMPLATE.into(),
                 version: JUDGE_VERSION,
                 guidance: None,
+                attempt: None,
             },
             system: JUDGE_SYSTEM.to_owned(),
             user,
@@ -758,10 +761,11 @@ impl Recorder {
     /// mental model, by the question line the request starts with, nearest
     /// in simulated time, among those made with this run's LLM model,
     /// language, and the request's template version, so a first-version
-    /// write, sentence by sentence, never stands in for this one. `None`
-    /// when there's none; `Some(None)` when its answer can't be carried over
-    /// ([`carry_over`]). A plan isn't substituted: it holds only the
-    /// question and the language, so it replays by key.
+    /// write, sentence by sentence, never stands in for this one. A write
+    /// sent again ([`Template::attempt`]) never stands in for a first one.
+    /// `None` when there's none; `Some(None)` when its answer can't be
+    /// carried over ([`carry_over`]). A plan isn't substituted: it holds
+    /// only the question and the language, so it replays by key.
     fn nearest_refresh(
         &self,
         request: &LlmRequest,
@@ -778,6 +782,7 @@ impl Recorder {
                 record.model == self.model
                     && record.language == self.language
                     && record.template.version == request.template.version
+                    && record.template.attempt.is_none()
                     && record.request.user.lines().next().unwrap_or("") == question
             })
             .min_by_key(|record| {
@@ -837,12 +842,15 @@ impl LlmClient for Recorder {
         self.complete_identified(request, &[])
     }
 
+    /// A write sent again is answered by its own key, or live, never
+    /// substituted and never counted as a refresh: [`Recorder::skips_write`]
+    /// has already skipped it when neither can answer.
     fn complete_identified(
         &self,
         request: &LlmRequest,
         identities: &[(String, Uuid)],
     ) -> Result<LlmResponse, LlmError> {
-        if request.template.name == WRITE_TEMPLATE {
+        if request.template.name == WRITE_TEMPLATE && request.template.attempt.is_none() {
             lock(&self.counts).refresh_times.push(self.clock.now());
             if self.mode == ReplayMode::Fast
                 && self.refresh == RefreshMode::Recorded
@@ -861,7 +869,28 @@ impl LlmClient for Recorder {
     /// `fast` skips a write with `--refresh off`, and with `--refresh
     /// recorded` when the nearest recorded write can't be carried over: the
     /// write is counted, and nothing is written.
+    ///
+    /// A write sent again ([`Template::attempt`]), so the first reply
+    /// stands, is skipped by `fast` with `--refresh recorded` or `off`,
+    /// which don't send writes; otherwise it's answered by its own key when
+    /// the cassette has it, and else skipped unless a live client is there
+    /// to send it and doesn't skip it itself. A skip counts no miss.
     fn skips_write(&self, request: &LlmRequest, identities: &[(String, Uuid)]) -> bool {
+        if request.template.name == WRITE_TEMPLATE && request.template.attempt.is_some() {
+            if self.mode == ReplayMode::Fast && self.refresh != RefreshMode::Live {
+                return true;
+            }
+            let key = key_of(&self.model, request);
+            if !self.no_cache && lock(&self.index).by_key.contains_key(&key) {
+                return false;
+            }
+            return match (&self.live, self.mode) {
+                (Some(live), ReplayMode::Live | ReplayMode::Fast) => {
+                    live.skips_write(request, identities)
+                }
+                _ => true,
+            };
+        }
         if self.mode != ReplayMode::Fast || request.template.name != WRITE_TEMPLATE {
             return false;
         }
