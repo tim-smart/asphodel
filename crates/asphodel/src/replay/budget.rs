@@ -415,7 +415,8 @@ impl Budget {
     }
 
     /// Takes one slot for an attempt at `template`, committed before this
-    /// returns. Once anything has gone wrong, refuses every attempt.
+    /// returns. Once anything has gone wrong, refuses every attempt: here
+    /// without waiting for the mutex, and again under it.
     fn take_slot(&self, template: &str) -> Result<(), String> {
         if let Some(reason) = self.stopped() {
             return Err(reason.to_owned());
@@ -452,6 +453,12 @@ impl Budget {
             .gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Checked again under the mutex the latch is set under, so an
+        // attempt that queued here before another one stopped the calls
+        // doesn't go on to find a ledger that has since recovered.
+        if let Some(reason) = self.stopped() {
+            bail!("{reason}");
+        }
         let result = (|| {
             let _lock = lock(&self.ledger)?;
             let mut ledger = load(&self.ledger)?;
