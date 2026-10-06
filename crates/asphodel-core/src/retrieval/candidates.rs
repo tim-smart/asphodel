@@ -101,6 +101,28 @@ impl<'a> Cleanup<'a> {
         Ok(ranked)
     }
 
+    /// [`Cleanup::list`] for hits carrying `T` along: each head listed once,
+    /// with what its best hit carried.
+    pub(crate) fn list_with<T: Copy>(
+        &mut self,
+        hits: &[(i64, T)],
+    ) -> Result<Vec<(i64, T)>, rusqlite::Error> {
+        let mut ranked: Vec<(i64, T)> = Vec::new();
+        for &(hit, carried) in hits {
+            if let Some(head) = self.shown(hit)?
+                && !ranked.iter().any(|(listed, _)| *listed == head)
+            {
+                ranked.push((head, carried));
+            }
+        }
+        Ok(ranked)
+    }
+
+    /// `head` and every memory in its chain before it.
+    pub(crate) fn members(&self, head: i64) -> std::collections::BTreeSet<i64> {
+        crate::strength::inherits_from(self.strength.links(), head)
+    }
+
     /// The candidates for `ids`, in that order. Every id must have come out
     /// of [`Cleanup::list`].
     pub(crate) fn take(&mut self, ids: &[i64]) -> Vec<Candidate> {

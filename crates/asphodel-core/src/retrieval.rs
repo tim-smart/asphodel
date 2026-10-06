@@ -4,7 +4,11 @@
 //!
 //! 1. **Retrievers.** Vector search and BM25 over memory content, and an
 //!    entity arm over the memories linked to entities named in the query,
-//!    [`CANDIDATES_PER_ARM`] hits each ([`arms`]).
+//!    [`CANDIDATES_PER_ARM`] hits each ([`arms`]). Explicit recall's vector
+//!    and BM25 arms also search restatement sentences, keyed to the memory
+//!    each was absorbed into, and collapse them to one hit per memory
+//!    (TIM-206 measurement branch; [`restated`]). Injection, refresh
+//!    selection and reconciliation never see restatements.
 //! 2. **Clean-up.** Retracted and hidden hits drop out, the rest become the
 //!    heads of their supersession chains, and strength is computed for each
 //!    ([`candidates`]). Injection drops heads below τ and those already in
@@ -12,7 +16,9 @@
 //!    recall applies its filters.
 //! 3. **Fusion.** Unweighted RRF ([`fuse`]); an empty arm contributes
 //!    nothing.
-//! 4. **Reranking.** The top [`RERANKED`] go to the reranker, under
+//! 4. **Reranking.** The top [`RERANKED`] go to the reranker, explicit
+//!    recall's each as its head and the restatements it's shown with,
+//!    scoring the best of them, under
 //!    [`RERANKER_DEADLINE`](crate::constants::RERANKER_DEADLINE) measured
 //!    from the start of the request. Past it, explicit recall keeps RRF
 //!    order and prefetch injects nothing: without the logit there's no
@@ -45,6 +51,7 @@ mod explain;
 pub(crate) mod format;
 mod log;
 mod rerank;
+pub(crate) mod restated;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, MutexGuard};
@@ -811,7 +818,10 @@ pub(crate) fn recall(
     } else {
         ranked
             .iter()
-            .map(|item| format::recall_line(&item.candidate, now, strong_cutoff))
+            .map(|item| {
+                let text = recalled_text(&run.gathered, &item.candidate);
+                format::recall_line(&item.candidate, &text, now, strong_cutoff)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -826,10 +836,11 @@ pub(crate) fn recall(
     let results: Vec<Recalled> = ranked
         .into_iter()
         .map(|item| {
+            let sentence = recalled_text(&run.gathered, &item.candidate);
             let c = item.candidate;
             Recalled {
                 id: c.uuid,
-                sentence: c.content,
+                sentence,
                 kind: c.window.kind,
                 window: RecalledWindow {
                     valid_from: c.window.valid_from,
@@ -881,6 +892,15 @@ pub(crate) fn recall(
     })
 }
 
+/// A recalled memory's text: its head's sentence, then the restatements
+/// it's shown with ([`restated`]).
+fn recalled_text(gathered: &Gathered, candidate: &Candidate) -> String {
+    match gathered.restated.get(&candidate.id) {
+        Some(restated) => restated::compose(&candidate.content, restated),
+        None => candidate.content.clone(),
+    }
+}
+
 /// Explain: [`recall`] or [`scored_prefetch`]'s pipeline with its working
 /// shown and none of their side effects ([`explain`](self::explain)). An
 /// injection runs as for a session with nothing in context.
@@ -912,7 +932,7 @@ pub(crate) fn explain(
                 .enumerate()
                 .map(|(index, item)| {
                     let reason = (index >= run.limit).then_some(Cut::OverLimit);
-                    explained_ranked(item, &run.gathered.arms, strong_cutoff, reason)
+                    explained_ranked(item, &run.gathered, strong_cutoff, reason)
                 })
                 .chain(explained_overflow(&run.gathered, strong_cutoff))
                 .collect();
@@ -947,13 +967,15 @@ pub(crate) fn explain(
                 .ranked
                 .iter()
                 .zip(&run.cuts)
-                .map(|(item, cut)| explained_ranked(item, &gathered.arms, strong_cutoff, *cut))
+                .map(|(item, cut)| explained_ranked(item, gathered, strong_cutoff, *cut))
                 .chain(explained_overflow(gathered, strong_cutoff))
                 .collect();
             candidates.extend(gathered.refused_candidates.iter().map(|candidate| {
+                let arms = arm_ranks(candidate, &gathered.refused, None, false);
                 explained(
                     candidate,
-                    arm_ranks(candidate.id, &gathered.refused, false),
+                    arms,
+                    None,
                     None,
                     None,
                     None,
@@ -1031,7 +1053,16 @@ fn inject(
 
     let keep =
         |candidate: &Candidate| candidate.strength >= TAU && !in_context.contains(&candidate.uuid);
-    let mut gathered = gather(cx, bank_id, &query, now, &keep, None, aside)?;
+    let mut gathered = gather(
+        cx,
+        bank_id,
+        &query,
+        now,
+        &keep,
+        None,
+        Restatements::Ignored,
+        aside,
+    )?;
     let found = std::mem::take(&mut gathered.candidates);
     let documents = found.iter().map(|c| c.content.clone()).collect();
     let reranking = Instant::now();
@@ -1159,13 +1190,41 @@ fn recall_run(
             && request.phase.admits(candidate.phase)
             && in_range(candidate, request)
     };
-    let mut gathered = gather(cx, bank_id, &query, now, &keep, linked.as_ref(), aside)?;
+    let mut gathered = gather(
+        cx,
+        bank_id,
+        &query,
+        now,
+        &keep,
+        linked.as_ref(),
+        Restatements::Searched,
+        aside,
+    )?;
     let found = std::mem::take(&mut gathered.candidates);
-    let documents = found.iter().map(|c| c.content.clone()).collect();
+    // Each candidate's head and the restatements it's shown with, in that
+    // order, all reranked in one call; a candidate scores its best.
+    let sentences: Vec<Vec<String>> = found
+        .iter()
+        .map(|c| {
+            let restated = gathered.restated.get(&c.id).into_iter().flatten();
+            std::iter::once(&c.content)
+                .chain(restated)
+                .cloned()
+                .collect()
+        })
+        .collect();
+    let documents = sentences.iter().flatten().cloned().collect();
     let reranking = Instant::now();
     let logits = rerank::logits(&cx.models.reranker, cx.permit, &query, documents, deadline);
     let rerank = reranking.elapsed();
     let reranked = logits.is_some();
+    let (logits, matched) = match logits {
+        Some(logits) => {
+            let (logits, matched) = best_sentences(&sentences, &logits);
+            (Some(logits), matched)
+        }
+        None => (None, vec![None; found.len()]),
+    };
     let ranking = &cx.tuning.ranking;
     let with_phase = request.phase != PhaseFilter::Any;
     let ranked = rank(found, logits, |candidate, logit| {
@@ -1188,6 +1247,13 @@ fn recall_run(
             phase,
         )
     });
+    let ranked = ranked
+        .into_iter()
+        .map(|item| Ranked {
+            matched: matched[item.rrf_rank - 1].clone(),
+            ..item
+        })
+        .collect();
     Ok(RecallRun {
         bank_id,
         query,
@@ -1197,6 +1263,27 @@ fn recall_run(
         reranked,
         rerank,
     })
+}
+
+/// Each candidate's best logit over its `sentences`, and the sentence that
+/// scored it: the first best, so the head wins a tie, then the older
+/// restatement. `logits` is every candidate's sentences' logits in order.
+fn best_sentences(sentences: &[Vec<String>], logits: &[f32]) -> (Vec<f32>, Vec<Option<String>>) {
+    let mut logits = logits.iter().copied();
+    sentences
+        .iter()
+        .map(|sentences| {
+            let mut best: Option<(f32, &String)> = None;
+            for sentence in sentences {
+                let logit = logits.next().unwrap_or(f32::NEG_INFINITY);
+                if best.is_none_or(|(top, _)| logit > top) {
+                    best = Some((logit, sentence));
+                }
+            }
+            let (logit, sentence) = best.expect("a candidate has its head");
+            (logit, Some(sentence.clone()))
+        })
+        .unzip()
 }
 
 /// [`score`] and the terms it sums.
@@ -1220,16 +1307,18 @@ fn score_parts(
 /// A ranked candidate as explain shows it.
 fn explained_ranked(
     item: &Ranked,
-    arms: &[Vec<i64>; 3],
+    gathered: &Gathered,
     strong_cutoff: f64,
     reason: Option<Cut>,
 ) -> Explained {
+    let arms = &gathered.arms;
     explained(
         &item.candidate,
-        arm_ranks(item.candidate.id, arms, true),
+        arm_ranks(&item.candidate, arms, Some(&gathered.matched), true),
         Some(item.rrf_rank),
         item.logit,
         item.parts,
+        item.matched.clone(),
         strong_cutoff,
         reason,
     )
@@ -1248,8 +1337,9 @@ fn explained_overflow(
         .map(move |(index, candidate)| {
             explained(
                 candidate,
-                arm_ranks(candidate.id, &gathered.arms, true),
+                arm_ranks(candidate, &gathered.arms, Some(&gathered.matched), true),
                 Some(RERANKED + index + 1),
+                None,
                 None,
                 None,
                 strong_cutoff,
@@ -1258,12 +1348,14 @@ fn explained_overflow(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn explained(
     candidate: &Candidate,
     arms: Vec<ArmRank>,
     rrf_rank: Option<usize>,
     logit: Option<f64>,
     score: Option<ScoreParts>,
+    matched: Option<String>,
     strong_cutoff: f64,
     reason: Option<Cut>,
 ) -> Explained {
@@ -1276,6 +1368,7 @@ fn explained(
         rrf_rank,
         logit,
         score,
+        matched,
         strength: band(candidate.strength, strong_cutoff),
         kept: candidate.kept,
         included: reason.is_none(),
@@ -1283,17 +1376,28 @@ fn explained(
     }
 }
 
-/// The arms whose list holds `id`, with its 1-based place in each when
-/// `ranked`.
-fn arm_ranks(id: i64, lists: &[Vec<i64>; 3], ranked: bool) -> Vec<ArmRank> {
+/// The arms whose list holds `candidate`, with its 1-based place in each
+/// when `ranked`, and the sentence each matched, from `matched` when it's
+/// known there and the head's otherwise.
+fn arm_ranks(
+    candidate: &Candidate,
+    lists: &[Vec<i64>; 3],
+    matched: Option<&[BTreeMap<i64, String>; 3]>,
+    ranked: bool,
+) -> Vec<ArmRank> {
     [Arm::Vector, Arm::Bm25, Arm::Entity]
         .into_iter()
+        .enumerate()
         .zip(lists)
-        .filter_map(|(arm, list)| {
-            let place = list.iter().position(|listed| *listed == id)?;
+        .filter_map(|((index, arm), list)| {
+            let place = list.iter().position(|listed| *listed == candidate.id)?;
+            let sentence = matched
+                .and_then(|matched| matched[index].get(&candidate.id))
+                .unwrap_or(&candidate.content);
             Some(ArmRank {
                 arm,
                 rank: ranked.then_some(place + 1),
+                sentence: sentence.clone(),
             })
         })
         .collect()
@@ -1613,6 +1717,9 @@ struct Ranked {
     logit: Option<f64>,
     /// `None` when the reranker was skipped.
     parts: Option<ScoreParts>,
+    /// The sentence the logit is for: the head's, or in explicit recall
+    /// the restatement that scored best. `None` with no logit.
+    matched: Option<String>,
 }
 
 impl Ranked {
@@ -1637,6 +1744,7 @@ fn rank(
                 rrf_rank: index + 1,
                 logit: None,
                 parts: None,
+                matched: None,
             })
             .collect();
     };
@@ -1647,11 +1755,13 @@ fn rank(
         .map(|(index, (candidate, logit))| {
             let logit = f64::from(logit);
             let parts = score(&candidate, logit);
+            let matched = Some(candidate.content.clone());
             Ranked {
                 candidate,
                 rrf_rank: index + 1,
                 logit: Some(logit),
                 parts: Some(parts),
+                matched,
             }
         })
         .collect();
@@ -1663,6 +1773,14 @@ fn rank(
             .then(left.rrf_rank.cmp(&right.rrf_rank))
     });
     ranked
+}
+
+/// Whether [`gather`]'s vector and BM25 arms search restatements beside
+/// memory sentences. Only explicit recall does (TIM-206 measurement branch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restatements {
+    Searched,
+    Ignored,
 }
 
 /// What [`gather`] keeps aside for explain besides the candidates it
@@ -1686,6 +1804,12 @@ struct Gathered {
     overflow: Vec<Candidate>,
     /// Each arm's list as fusion took it: vector, BM25, entity.
     arms: [Vec<i64>; 3],
+    /// The sentence each arm matched for each head it listed, when explain
+    /// asked for the overflow.
+    matched: [BTreeMap<i64, String>; 3],
+    /// The restatements each of `candidates` is reranked and shown with,
+    /// when the arms searched them; a candidate with none isn't listed.
+    restated: BTreeMap<i64, Vec<String>>,
     /// The heads each arm found that the filter refused, when asked for.
     refused: [Vec<i64>; 3],
     /// Their candidates, in RRF order over `refused`.
@@ -1710,6 +1834,7 @@ impl Gathered {
 /// [`RERANKED`] in RRF order. `linked`, when given, also seeds the entity
 /// arm with the memories of the recall tool's `entity`. `aside` says what
 /// else to keep for explain.
+#[allow(clippy::too_many_arguments)]
 fn gather(
     cx: &Context<'_>,
     bank_id: i64,
@@ -1717,6 +1842,7 @@ fn gather(
     now: Timestamp,
     keep: &dyn Fn(&Candidate) -> bool,
     linked: Option<&BTreeSet<i64>>,
+    restatements: Restatements,
     aside: Aside,
 ) -> Result<Gathered, RecallError> {
     if query.is_empty() {
@@ -1728,20 +1854,36 @@ fn gather(
     let (vector, conn) = cx.embed_query(bank_id, query)?;
     let embed = started.elapsed();
     let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning, now, keep)?;
-    let vector_hits = arms::vector(&conn, bank_id, &vector, CANDIDATES_PER_ARM)?;
-    let bm25_hits = arms::bm25(&conn, bank_id, query, CANDIDATES_PER_ARM)?;
-    let entity_hits = match linked {
+    let (vector_hits, bm25_hits) = match restatements {
+        Restatements::Searched => (
+            arms::vector_restated(&conn, bank_id, &vector, CANDIDATES_PER_ARM)?,
+            arms::bm25_restated(&conn, bank_id, query, CANDIDATES_PER_ARM)?,
+        ),
+        Restatements::Ignored => (
+            arms::own(arms::vector(&conn, bank_id, &vector, CANDIDATES_PER_ARM)?),
+            arms::own(arms::bm25(&conn, bank_id, query, CANDIDATES_PER_ARM)?),
+        ),
+    };
+    // The entity arm never searches restatements.
+    let entity_hits = arms::own(match linked {
         // The filter already names the entities; their memories by cosine
         // are the entity arm.
         Some(ids) => entity_arm_over(&conn, ids, &vector)?,
         None => arms::entity(&conn, bank_id, query, &vector, CANDIDATES_PER_ARM)?,
+    });
+    let carried = |hits: &[arms::Hit]| -> Vec<(i64, arms::Hit)> {
+        hits.iter().map(|hit| (hit.memory, *hit)).collect()
     };
-    let hits = [vector_hits, bm25_hits, entity_hits];
-    let lists = [
-        cleanup.list(&hits[0])?,
-        cleanup.list(&hits[1])?,
-        cleanup.list(&hits[2])?,
+    let listed = [
+        cleanup.list_with(&carried(&vector_hits))?,
+        cleanup.list_with(&carried(&bm25_hits))?,
+        cleanup.list_with(&carried(&entity_hits))?,
     ];
+    let hits = [vector_hits, bm25_hits, entity_hits]
+        .map(|hits| hits.iter().map(|hit| hit.memory).collect::<Vec<i64>>());
+    let lists = listed
+        .each_ref()
+        .map(|listed| listed.iter().map(|(head, _)| *head).collect::<Vec<i64>>());
     let mut fused = fuse(&[
         lists[0].as_slice(),
         lists[1].as_slice(),
@@ -1755,6 +1897,28 @@ fn gather(
     };
     fused.truncate(RERANKED);
     let candidates = cleanup.take(&fused);
+    let mut restated = BTreeMap::new();
+    if restatements == Restatements::Searched {
+        for candidate in &candidates {
+            let members = cleanup.members(candidate.id);
+            let chosen = restated::select(&conn, &members, &candidate.content)?;
+            if !chosen.is_empty() {
+                restated.insert(candidate.id, chosen);
+            }
+        }
+    }
+    let matched = match aside {
+        Aside::Nothing => Default::default(),
+        Aside::Overflow | Aside::OverflowAndRefused => {
+            let mut matched: [BTreeMap<i64, String>; 3] = Default::default();
+            for (sentences, listed) in matched.iter_mut().zip(&listed) {
+                for (head, hit) in listed {
+                    sentences.insert(*head, matched_sentence(&conn, hit)?);
+                }
+            }
+            matched
+        }
+    };
     let (refused, refused_candidates) = if aside == Aside::OverflowAndRefused {
         let refused = hits.map(|hits| cleanup.refused(&hits));
         let order = fuse(&[
@@ -1771,11 +1935,31 @@ fn gather(
         candidates,
         overflow,
         arms: lists,
+        matched,
+        restated,
         refused,
         refused_candidates,
         embed,
         retrieve: started.elapsed().saturating_sub(embed),
     })
+}
+
+/// The sentence `hit` matched: its memory's own, which may be an earlier
+/// version than the head it's shown as, or a restatement's.
+fn matched_sentence(conn: &Connection, hit: &arms::Hit) -> Result<String, rusqlite::Error> {
+    match hit.sentence {
+        arms::Sentence::Memory => conn.query_row(
+            "SELECT content FROM memories WHERE id = ?1",
+            [hit.memory],
+            |row| row.get(0),
+        ),
+        arms::Sentence::Restatement(id) => conn.query_row(
+            "SELECT COALESCE(json_extract(claim, '$.sentence'), '') FROM restatements
+             WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        ),
+    }
 }
 
 /// The entity arm when the caller already resolved the entities: the

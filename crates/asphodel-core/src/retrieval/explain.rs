@@ -120,6 +120,10 @@ pub struct Explained {
     pub logit: Option<f64>,
     /// `None` wherever `logit` is.
     pub score: Option<ScoreParts>,
+    /// The sentence the logit is for: `sentence`, or in recall mode the
+    /// restatement that scored best, the head winning a tie. `None`
+    /// wherever `logit` is.
+    pub matched: Option<String>,
     pub strength: Band,
     pub kept: bool,
     /// Returned by recall, or injected.
@@ -129,13 +133,17 @@ pub struct Explained {
 }
 
 /// An arm that found a candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArmRank {
     pub arm: Arm,
     /// Its 1-based place in the arm's list as fusion took it, after
     /// clean-up and the mode's filter; `None` below τ, where it never
     /// reached fusion.
     pub rank: Option<usize>,
+    /// The sentence the arm matched: in recall mode a restatement's, for
+    /// the vector and BM25 arms, or an earlier version's; otherwise the
+    /// candidate's own.
+    pub sentence: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

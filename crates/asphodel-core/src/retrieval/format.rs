@@ -73,7 +73,14 @@ pub(crate) fn line_parts(candidate: &Candidate, now: Timestamp) -> Line {
 
 /// A recall-tool line starts with the unchanged id for the owner tools.
 /// It shares injection annotations but also exposes kind and weak strength.
-pub(crate) fn recall_line(candidate: &Candidate, now: Timestamp, strong_cutoff: f64) -> String {
+/// `text` is the memory as recall shows it, its head's sentence and any
+/// restatements.
+pub(crate) fn recall_line(
+    candidate: &Candidate,
+    text: &str,
+    now: Timestamp,
+    strong_cutoff: f64,
+) -> String {
     let kind = match candidate.window.kind {
         Kind::Fact => "fact",
         Kind::State => "state",
@@ -91,12 +98,7 @@ pub(crate) fn recall_line(candidate: &Candidate, now: Timestamp, strong_cutoff: 
         labels.push("kept".to_owned());
     }
     labels.extend(annotations(candidate, now));
-    format!(
-        "{} {} [{}]",
-        candidate.uuid,
-        candidate.content,
-        labels.join("; ")
-    )
+    format!("{} {} [{}]", candidate.uuid, text, labels.join("; "))
 }
 
 /// The block: the header, then one line per memory, in score order.

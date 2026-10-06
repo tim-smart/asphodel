@@ -87,6 +87,69 @@ impl SqliteVec {
     }
 }
 
+/// One hit from [`SqliteVec::nearest_restatements`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestatementNeighbour {
+    pub restatement_id: i64,
+    /// The memory it was absorbed into.
+    pub memory_id: i64,
+    /// Cosine distance, as [`Neighbour::distance`].
+    pub distance: f32,
+}
+
+/// The `restatement_vectors` table (schema version 20, the TIM-206
+/// measurement branch), which only explicit recall searches: a plain table
+/// scanned exactly with sqlite-vec's cosine distance.
+impl SqliteVec {
+    /// Stores `vector` for the restatement with rowid `restatement_id`.
+    pub fn insert_restatement(
+        &self,
+        conn: &Connection,
+        bank_id: i64,
+        restatement_id: i64,
+        vector: &[f32],
+    ) -> Result<(), VectorError> {
+        let bytes = self.check(vector)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO restatement_vectors (restatement_id, bank_id, embedding)
+             VALUES (?1, ?2, ?3)",
+            (restatement_id, bank_id, bytes),
+        )?;
+        Ok(())
+    }
+
+    /// The `k` nearest restatements to `query` within `bank_id`, nearest
+    /// first, the lower rowid first on a tie.
+    pub fn nearest_restatements(
+        &self,
+        conn: &Connection,
+        bank_id: i64,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<RestatementNeighbour>, VectorError> {
+        let bytes = self.check(query)?;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let k = i64::try_from(k).unwrap_or(i64::MAX);
+        let mut statement = conn.prepare_cached(
+            "SELECT v.restatement_id, r.memory_id, vec_distance_cosine(v.embedding, ?2) AS distance
+             FROM restatement_vectors v JOIN restatements r ON r.id = v.restatement_id
+             WHERE v.bank_id = ?1
+             ORDER BY distance, v.restatement_id
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map((bank_id, bytes, k), |row| {
+            Ok(RestatementNeighbour {
+                restatement_id: row.get(0)?,
+                memory_id: row.get(1)?,
+                distance: row.get::<_, f64>(2)? as f32,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
 impl VectorIndex for SqliteVec {
     fn dimensions(&self) -> usize {
         EMBEDDING_DIMENSIONS

@@ -179,6 +179,16 @@ pub const CANDIDATES_PER_ARM: usize = 100;
 /// The fused candidates the reranker scores.
 pub const RERANKED: usize = 40;
 
+/// How many times [`CANDIDATES_PER_ARM`] sentences explicit recall's
+/// vector and BM25 arms fetch before collapsing them to one per memory, so
+/// a memory restated many times can't fill an arm (TIM-206 measurement
+/// branch).
+pub const RESTATED_FETCH: usize = 4;
+
+/// The most restatements a recalled memory is reranked with and shown with:
+/// its newest distinct sentences (TIM-206 measurement branch).
+pub const RESTATED_SHOWN: usize = 5;
+
 /// A message with fewer words than this, split on whitespace, is a short
 /// follow-up ("yes, book it"): its query borrows the previous prefetch query
 /// of the session.

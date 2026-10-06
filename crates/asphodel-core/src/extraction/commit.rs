@@ -238,7 +238,8 @@ pub(super) fn commit(
     let mut restatements = 0;
     for restated in &plan.restatements {
         let memory = &checked.memories[restated.claim];
-        if record_restatement(tx, unit, input, memory, restated, call2_model)? {
+        let vector = &vectors[restated.claim];
+        if record_restatement(tx, unit, input, memory, vector, restated, call2_model)? {
             restatements += 1;
         }
     }
@@ -650,15 +651,17 @@ fn record_passages(
 /// the guards, and the passage it was taken from, so a forget masking that
 /// passage can delete it. Returns whether a row was written: a memory
 /// erased since the chunk's input was read takes none, as it takes no
-/// access.
+/// access. The claim's vector goes with it (schema version 20), for
+/// explicit recall to search.
 fn record_restatement(
     tx: &Transaction<'_>,
     unit: &Unit,
     input: &Call1Input,
     memory: &NewMemory,
+    vector: &[f32],
     restated: &Restated,
     call2_model: Option<&str>,
-) -> Result<bool, rusqlite::Error> {
+) -> Result<bool, StoreError> {
     if !exists(tx, restated.neighbour)? {
         return Ok(false);
     }
@@ -680,6 +683,13 @@ fn record_restatement(
             call2_model.unwrap_or_default(),
         ],
     )?;
+    // The caller checked every vector's width, so only SQLite can fail.
+    crate::store::SqliteVec
+        .insert_restatement(tx, unit.bank_id, tx.last_insert_rowid(), vector)
+        .map_err(|error| match error {
+            VectorError::Sqlite(error) => StoreError::Sqlite(error),
+            other => StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(other))),
+        })?;
     Ok(true)
 }
 
