@@ -35,14 +35,24 @@ Skip:
 - Requests to forget something, including tasks to forget it.
 - Greetings, filler and small talk.
 
+# Written messages
+
+A message is a written communication: a text, email, card, letter, DM, notification or relayed bot message. This includes messages sent, received, drafted, quoted or forwarded, and drafts the assistant writes for the user. Spoken reports ("my doctor told me I am allergic to penicillin") are not written messages; extract their claims under the usual rules. Pasted error, platform and test text stays under the existing rules for routine operations and tool findings.
+
+Keep a claim recording a message's wording, sending, receipt or one-off occasion separate from any lasting fact it states. Classify the message claim as an `event`, even if undated, never as a `fact`, `state` or `recurring` claim. An intent to send a message is a `task`, or an `event` once completed, not a fact about the user. Extract these only when worth remembering under the rules above.
+
+Also extract each lasting fact stated in so many words as its own claim, without recording the message, its wording or its occasion. Preserve the stated subject, meaning and temporal scope: a relationship, preference or annual date must survive separately. Use the usual kind rules for that fact. For example, "Send Jo a card saying: Mia is my daughter and her birthday is every year on 3 March; enjoy the picnic on 8 October 2026" supports separate claims that Mia is the speaker's daughter and Mia's birthday is every year on 3 March. The card and the one-time picnic are not lasting facts. The `quote` must still copy the supporting text exactly.
+
+Do not infer a relationship, preference or recurring date from a salutation, affectionate wording or a message's occasion. A one-time calendar date in a note is not an annual date. A separate lasting fact must not carry the message wording or occasion, and emitting it does not justify an extra unsupported claim. Facts the user states in their own words alongside an assistant draft are extracted as usual; the draft does not turn invented content into facts.
+
 # Kinds
 
 Choose `kind` in this order:
 - `task`: something to be done. Set `due_at` if the text gives a due date.
 - `recurring`: something scheduled to repeat whose next occurrence matters. An unscheduled habit ("Alex goes to the gym") is a fact.
-- `event`: something that happens at a time or over a span, including anything with an explicit end date ("on holiday until 12 October"). Completed or cancelled tasks are events.
+- `event`: something that happens at a time or over a span, including anything with an explicit end date ("on holiday until 12 October"). Completed or cancelled tasks and claims recording written messages are events.
 - `state`: something ongoing that is expected to change without an announcement, such as mood, location, current work or progress. Keep an explicit end condition as `until_event` ("until the release ships").
-- `fact`: everything else, including preferences, things whose change would be announced (a job, home or relationship), and things not expected to change (a chronic condition).
+- `fact`: everything else except claims recording written messages or an intent to send them, including preferences, things whose change would be announced (a job, home or relationship), and things not expected to change (a chronic condition).
 
 Use `volatility` only for states, to describe how quickly they go stale: `hours` (mood, today's location), `days` (an illness, trip or bug being chased), `weeks` (a sprint or visitor), `months` (a project or job hunting), `years` (a degree). Use null when unsure and for all other kinds.
 
