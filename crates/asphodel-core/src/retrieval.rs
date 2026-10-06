@@ -497,6 +497,9 @@ pub(crate) struct Context<'a> {
     /// [`RERANKER_DEADLINE`](crate::constants::RERANKER_DEADLINE) unless a
     /// test or bench set another.
     pub deadline: Duration,
+    /// Replay only: refresh facet heading to the query its retrieval runs
+    /// instead of the plan's.
+    pub refresh_queries: &'a BTreeMap<String, String>,
 }
 
 /// The gate floor and relevance scale for the loaded reranker, looked up

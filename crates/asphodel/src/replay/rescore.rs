@@ -30,7 +30,6 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::path::Path;
 
 use anyhow::{Context as _, anyhow, bail};
 use asphodel_core::config::RerankQuery;
@@ -72,7 +71,11 @@ fn execute(args: &RescoreArgs) -> anyhow::Result<()> {
     }
     let mut material = load_material(&material_path)?;
     let refresh_queries = match &queries_path {
-        Some(path) => load_refresh_queries(path, &material)?,
+        Some(path) => {
+            let known = |heading: &str| material.refresh.iter().any(|s| s.facet == heading);
+            super::load_refresh_queries(path, known, "no refresh sample of the material has")?
+                .queries
+        }
         None => BTreeMap::new(),
     };
     let corpus = super::corpus::load(&corpus_path)?;
@@ -110,37 +113,6 @@ fn execute(args: &RescoreArgs) -> anyhow::Result<()> {
     json.push(b'\n');
     super::write_file(&out_path, &json)
         .with_context(|| format!("writing the rescored material to {}", out_path.display()))
-}
-
-/// The refresh queries file: facet heading to query, every heading one
-/// a refresh sample of `material` has and every query nonblank. Errors
-/// name the file and never quote it.
-fn load_refresh_queries(
-    path: &Path,
-    material: &Material,
-) -> anyhow::Result<BTreeMap<String, String>> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let queries: BTreeMap<String, String> =
-        toml::from_str(&text).map_err(|error| super::toml_error(path, &text, &error))?;
-    let unknown = queries
-        .keys()
-        .filter(|heading| !material.refresh.iter().any(|s| &s.facet == *heading))
-        .count();
-    if unknown > 0 {
-        bail!(
-            "{} names {unknown} facet heading(s) no refresh sample of the material has",
-            path.display()
-        );
-    }
-    let blank = queries.values().filter(|q| q.trim().is_empty()).count();
-    if blank > 0 {
-        bail!("{} gives {blank} facet(s) a blank query", path.display());
-    }
-    Ok(queries
-        .into_iter()
-        .map(|(heading, query)| (heading, query.trim().to_owned()))
-        .collect())
 }
 
 /// Scores each refresh sample whose heading `queries` names against that

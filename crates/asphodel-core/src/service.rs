@@ -83,6 +83,10 @@ pub struct Service {
     /// The reranker deadline: [`RERANKER_DEADLINE`], fixed in code, unless
     /// [`Service::with_reranker_deadline`] set another.
     reranker_deadline: Duration,
+    /// Replay only: refresh facet heading to the query its retrieval runs
+    /// instead of the plan's ([`Service::with_refresh_queries`]). Empty
+    /// everywhere else.
+    refresh_queries: BTreeMap<String, String>,
     /// Each bank's last refresh trigger and last daily sweep. In memory;
     /// the requests themselves are in the store.
     schedule: Schedule,
@@ -150,6 +154,7 @@ impl Service {
             sessions,
             reranker_permit: Arc::default(),
             reranker_deadline: RERANKER_DEADLINE,
+            refresh_queries: BTreeMap::new(),
             schedule,
             blocks: Blocks::default(),
             refreshing: Mutex::new(()),
@@ -191,6 +196,7 @@ impl Service {
             sessions,
             reranker_permit: Arc::default(),
             reranker_deadline: RERANKER_DEADLINE,
+            refresh_queries: BTreeMap::new(),
             schedule,
             blocks: Blocks::default(),
             refreshing: Mutex::new(()),
@@ -269,6 +275,16 @@ impl Service {
     /// per slow call.
     pub fn with_reranker_deadline(mut self, deadline: Duration) -> Self {
         self.reranker_deadline = deadline;
+        self
+    }
+
+    /// The same service with every refresh facet whose heading `queries`
+    /// names retrieving and reranking with that query instead of its
+    /// plan's. The plan, and the query its scored pools are keyed by, stay
+    /// the plan's. For replay's query experiments only; `serve` never sets
+    /// it.
+    pub fn with_refresh_queries(mut self, queries: BTreeMap<String, String>) -> Self {
+        self.refresh_queries = queries;
         self
     }
 
@@ -571,6 +587,7 @@ impl Service {
             sessions: &self.sessions,
             permit: &self.reranker_permit,
             deadline: self.reranker_deadline,
+            refresh_queries: &self.refresh_queries,
         })
     }
 

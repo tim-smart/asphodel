@@ -130,8 +130,17 @@ fn select(
     };
     let tuning = &cx.tuning.mental_models;
     let facet_budget = tuning.facet_budget as usize;
-    // Each facet's best, and past them the cited memories it scored.
-    let queries: Vec<&str> = facets.iter().map(|facet| facet.query.as_str()).collect();
+    // Each facet's best, and past them the cited memories it scored. A
+    // replay may retrieve a facet by another query; the plan keeps its own.
+    let queries: Vec<&str> = facets
+        .iter()
+        .map(|facet| {
+            cx.refresh_queries
+                .get(&facet.heading)
+                .unwrap_or(&facet.query)
+                .as_str()
+        })
+        .collect();
     let found = crate::retrieval::select(
         cx,
         model.bank_id,

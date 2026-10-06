@@ -20,7 +20,7 @@ use asphodel_core::extraction::guidance_hash;
 use asphodel_core::models::{
     CodexResponses, FakeLlm, LlmClient, LlmSettings, OpenAiCompatible, TokenStore,
 };
-use asphodel_core::store::bank::BankIdentity;
+use asphodel_core::store::bank::{BankIdentity, PROFILE_FACETS};
 use asphodel_core::{Clock, Models, Service, SimulatedClock, SystemClock, Tuning, VERSION};
 use jiff::tz::TimeZone;
 
@@ -103,6 +103,20 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         .as_deref()
         .map(|path| super::inside_private(&dir, path, "the probes file"))
         .transpose()?;
+    let refresh_queries_path = args
+        .refresh_queries
+        .as_deref()
+        .map(|path| super::inside_private(&dir, path, "the refresh queries"))
+        .transpose()?;
+    if let Some(path) = &refresh_queries_path {
+        let outputs = [Some(&report_path), aggregate_path.as_ref()];
+        if outputs.into_iter().flatten().any(|output| path == output) {
+            bail!(
+                "--refresh-queries {} is also an output of this run",
+                path.display()
+            );
+        }
+    }
     if let Some(path) = &labelling_path {
         let occupied = [
             Some(&corpus_path),
@@ -111,6 +125,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             Some(&report_path),
             aggregate_path.as_ref(),
             labels_path.as_ref(),
+            refresh_queries_path.as_ref(),
         ];
         if occupied.into_iter().flatten().any(|other| path == other) {
             bail!(
@@ -123,6 +138,16 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
         Some(path) => super::labelling::labelled_queries(path)?,
         None => BTreeSet::new(),
     };
+    // Checked before the run, so only the seeded profile's built-in
+    // headings are known: a planned model's facets come from its plan
+    // call, mid-run.
+    let refresh_queries = refresh_queries_path
+        .as_deref()
+        .map(|path| {
+            let known = |heading: &str| PROFILE_FACETS.iter().any(|(built, _)| *built == heading);
+            super::load_refresh_queries(path, known, "the seeded profile's plan doesn't have")
+        })
+        .transpose()?;
     let shadow_path = dir.join(SHADOW_FILE);
     super::refuse_symlink(&shadow_path)?;
 
@@ -233,7 +258,13 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             tuning.clone(),
             super::clone_models(&models),
         )?
-        .with_reranker_deadline(NO_DEADLINE);
+        .with_reranker_deadline(NO_DEADLINE)
+        .with_refresh_queries(
+            refresh_queries
+                .as_ref()
+                .map(|file| file.queries.clone())
+                .unwrap_or_default(),
+        );
         service.ensure_bank_with_models(&header.bank, &identity)?;
         super::create_models(&service, &header.bank, &header.models)?;
         let recorder = Recorder::open(
@@ -276,6 +307,7 @@ pub(super) fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             git_sha: option_env!("ASPHODEL_GIT_SHA"),
             corpus_hash: Some(corpus.hash.clone()),
             cassette_hash: Some(recorder.completed_hash()?),
+            refresh_queries_hash: refresh_queries.as_ref().map(|file| file.hash.clone()),
             tuning: tuning.clone(),
             call1: Call1::of(&tuning),
             flags: Flags {

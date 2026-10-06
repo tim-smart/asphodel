@@ -533,7 +533,8 @@ writes nothing; the counts hold no text, so they can be shared.
 ```
 asphodel replay --corpus <file> --mode live|replay|fast \
     [--cassette <file>] [--probes <file>] [--report <file>] [--aggregate <file>] \
-    [--labelling <file>] [--no-cache] [--refresh live|recorded|off] [--self-test] \
+    [--labelling <file>] [--refresh-queries <file>] \
+    [--no-cache] [--refresh live|recorded|off] [--self-test] \
     [--prime-concurrency [N]] \
     [--config FILE] [--overrides FILE] [--latency DURATION] [--until TIMESTAMP] \
     [--onnx-threads N] [--token-dir DIR]
@@ -1048,6 +1049,43 @@ To compare refresh facet queries the same way, rescore with
 `--refresh-queries` and read the `refresh` section against the same facet
 labels. The curves and input sizes move with the new logits; `budget` and
 `taken` still show what the run's own queries took.
+
+### Refresh queries in a replay
+
+```
+asphodel replay --corpus <file> ... --refresh-queries <file>
+```
+
+runs the replay with other queries for the seeded profile's facets. The
+file has the format `report rescore` takes, a TOML table of facet heading
+to query. Every refresh facet with a heading in it, of any model,
+retrieves and reranks with that query instead of its own: the vector,
+BM25 and entity arms search it and the reranker scores against it, so the
+pool itself changes, not only its logits. Nothing else does. The model's
+stored plan keeps its queries, the write request names facets by heading
+as before, and in the labelling material each refresh sample keeps the
+plan's `query`, so facet labels keep matching, with the query it ran
+recorded as `rerank_query`. The report holds the file's SHA-256 as
+`refresh_queries_hash`, null without one, and `report diff` and the HTML
+page show it beside the corpus and cassette hashes. `serve` has no such
+option and production queries are unchanged.
+
+The file is checked before the run, so only headings known then are
+accepted: the seeded profile's built-in plan, `Preferences`, `People`,
+`Work and home`, `Platforms` and `How to help`. A planned model's
+headings come from its plan call during the run and can't be named; one
+that happens to share a profile heading follows the mapping too. A
+heading the profile doesn't have and a blank query are refused, naming
+the file and quoting neither, before anything runs or is written. The
+file must be inside the private dir and may not be the report, the
+aggregate or the labelling material.
+
+A different query changes what the refresh selects, so with `--refresh
+recorded` a recorded write stands in only while every memory it cites is
+still in the input, and is skipped otherwise: the answers and probes
+then show the recorded queries' writes, not these. To see what the
+queries give, run with `--refresh live`. Selection, the material and its curves need no LLM and
+run with `--refresh off`.
 
 ### Bench
 

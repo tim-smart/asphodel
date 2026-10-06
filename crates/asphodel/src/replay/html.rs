@@ -60,6 +60,7 @@ const IDENTITY: &[&str] = &[
     "git_sha",
     "corpus_hash",
     "cassette_hash",
+    "refresh_queries_hash",
 ];
 
 /// Runs the command: writes the page and exits 0, or exits 2 when it's

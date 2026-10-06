@@ -77,6 +77,7 @@ fn diff(a: &Map<String, Value>, b: &Map<String, Value>) -> Value {
             "git_sha": report.get("git_sha"),
             "corpus_hash": report.get("corpus_hash"),
             "cassette_hash": report.get("cassette_hash"),
+            "refresh_queries_hash": report.get("refresh_queries_hash"),
         })
     };
 
