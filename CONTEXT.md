@@ -129,7 +129,7 @@ The kind of access where a reply actually relied on a recalled memory, whether i
 _Avoid_: Retrieved, returned, injected
 
 **Mentioned again**:
-The kind of access where the user or a document independently states something already remembered. A later version of the same document repeating itself doesn't count. A newer statement that matters more than the memory isn't one: it refines the memory.
+The kind of access where the user or a document independently states something already remembered. A later version of the same document repeating itself doesn't count. A newer statement that matters much more than the memory isn't one: it refines the memory.
 _Avoid_: Duplicate, repeat, re-extraction
 
 **Confirmed**:

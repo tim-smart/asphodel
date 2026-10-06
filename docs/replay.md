@@ -244,10 +244,7 @@ mention. The report counts promotions as `call2_rate.promoted`.
 Call 2 version 3 shows these fields beside both claims and memories, using
 UTC timestamps and `none` for absent dates. Its prompt treats an added
 schedule as a refinement: "needs to pack the carrots" refined by "reminder
-to pack the carrots at 8am on the 30th". Version 4 adds that a claim saying
-something the memory doesn't, such as a relationship, a reason or a new
-attribute, is never mentioned again, and that a memory naming a person says
-nothing about who they are.
+to pack the carrots at 8am on the 30th".
 
 A fully undated `retracts` still corrects and invalidates its predecessor.
 The replacement carries over the first retracted neighbour's whole window
