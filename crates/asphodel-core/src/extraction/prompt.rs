@@ -22,10 +22,14 @@ Write each claim as one self-contained sentence. Use names instead of pronouns a
 
 For `quote`, copy the passage supporting the claim character for character from the text. Use context only to understand the text, never as a quote or the sole source of a claim. Claims with quotes absent from the text are discarded.
 
+Bind each claim and its source qualifications to the evidence for that proposition. Preserve a stated report, belief, record or assessment without upgrading it to an established fact or changing who or what supports it. A source named for another claim does not support this one, even if both concern the same person or topic. Do not invent a record, authority or attribution to qualify a claim.
+
 Extract:
-- What the speaker says about themselves, the people, places and things in their life, and their plans, tasks and preferences. "I" and "me" mean the speaker.
+- What the speaker says about themselves, the people, places and things in their life, and their plans, tasks and preferences. "I" and "me" mean the speaker of that passage, which may be someone else inside quoted or relayed speech.
 - The speaker's short answers and references to earlier context, written out in full. "Yes" after "Are you still at Acme?" becomes "Alex still works at Acme.", quoting "Yes". A "remember that" referring to an earlier statement works the same way.
-- From the assistant's reply, only decisions, commitments, durable content and storage locations stated while carrying out the speaker's request. Extract an assistant task only if the speaker requested it and it has a due date or an until-event beyond this turn.
+- From the assistant's reply, only decisions, commitments, durable content and storage locations stated while carrying out the speaker's request. A promise to act, monitor or follow up is an assistant task, not a fact or state about the assistant's commitment. Extract it only if the speaker requested that task and it has a due date or an until-event beyond this turn; otherwise skip the promise as assistant bookkeeping.
+
+Apply the skips below to each proposition, not to the whole passage: a request, message or temporary situation can still contain an explicitly stated lasting fact worth extracting.
 
 Skip:
 - The fact that someone asked a question or made a request.
@@ -35,14 +39,36 @@ Skip:
 - Requests to forget something, including tasks to forget it.
 - Greetings, filler and small talk.
 
+# Written messages and assistant drafts
+
+A written message is content addressed between parties: a text, email, card, letter, DM, notification or relayed bot message. This includes messages sent, received, drafted, quoted or forwarded. A portal page or a transaction outcome merely mentioning an emailed receipt is not itself a message; extract its claims under the usual rules. A claim recording the email itself follows the message rules. Spoken reports ("my doctor told me I am allergic to penicillin") are not written messages; extract their claims under the usual rules. Pasted error, platform and test text stays under the existing rules for routine operations and tool findings.
+
+Resolve pronouns within each quoted, drafted or forwarded passage using that passage's speaker and addressee. "I", "me" and "my" refer to its speaker; "you" and "your" refer to its addressee, not automatically to the conversation user. Keep those roles through nested quotations and resolve third-person references from the wording and relevant context. Carry the resolved subject into each separate claim and its entity links. If the subject remains ambiguous, do not guess a named subject or extract a lasting fact that depends on that guess.
+
+Assistant-drafted wording follows a separate draft-content rule, whether the user will write it or speak it. Skip claims recording the draft unless worth remembering under the rules above; if retained, classify them as `event`, never `fact`, `state` or `recurring`. This does not reclassify ordinary reported speech or independently supported facts the user states alongside the draft.
+
+Keep a claim recording a message's wording, sending, receipt or one-off occasion separate from any lasting fact it states. Classify the message claim as an `event`, even if undated, never as a `fact`, `state` or `recurring` claim. An intent to send a message is a `task`, or an `event` once completed, not a fact about the user. Extract these only when worth remembering under the rules above.
+
+Also extract each lasting fact stated in so many words as its own claim, without recording the message, its wording or its occasion. Preserve the stated subject, meaning and temporal scope: a relationship, preference or annual date must survive separately. Use the usual kind rules for that fact. For example, "Send Jo a card saying: Mia is my daughter and her birthday is every year on 3 March; enjoy the picnic on 8 October 2026" supports separate claims that Mia is the speaker's daughter and Mia's birthday is every year on 3 March. The card and the one-time picnic are not lasting facts. The `quote` must still copy the supporting text exactly.
+
+For each separate lasting claim, distinguish the proposition from its communication frame. Put the message wording in `quote`; do not describe where the proposition was written or that it was sent, received or quoted in `content`. A statement of a relationship does not need a clause saying the relationship was stated in a message. Retain a source qualification when it is part of the proposition itself, such as whose belief, assessment or records it describes ("the clinic's records list ..." is not an unqualified diagnosis). Preserve uncertainty and negation. Do not add an attribution merely because the supporting words occur in a message, or remove one that would strengthen the proposition.
+
+For ordinary reported speech, likewise omit a communication frame that only says who told whom and when; keep the supported proposition and any qualification needed to preserve its meaning. A stated diagnosis or attributed assessment must remain a diagnosis or attributed assessment, not become more certain. This does not make spoken reports written messages or change their usual kind rules.
+
+Do not infer a relationship, preference or recurring date from a salutation, affectionate wording or a message's occasion. A one-time calendar date in a note is not an annual date. Emitting a separate lasting fact does not justify an extra unsupported claim. Facts the user states in their own words alongside an assistant draft are extracted as usual; the draft does not turn invented content into facts.
+
+A request scoped to one occasion does not establish a standing preference. Preserve that scope if the request is worth extracting, while separately extracting any explicitly stated lasting preference.
+
 # Kinds
 
 Choose `kind` in this order:
 - `task`: something to be done. Set `due_at` if the text gives a due date.
 - `recurring`: something scheduled to repeat whose next occurrence matters. An unscheduled habit ("Alex goes to the gym") is a fact.
-- `event`: something that happens at a time or over a span, including anything with an explicit end date ("on holiday until 12 October"). Completed or cancelled tasks are events.
+- `event`: something that happens at a time or over a span, including anything with an explicit end date ("on holiday until 12 October"). Completed or cancelled tasks and claims recording written messages or assistant-drafted wording are events.
 - `state`: something ongoing that is expected to change without an announcement, such as mood, location, current work or progress. Keep an explicit end condition as `until_event` ("until the release ships").
-- `fact`: everything else, including preferences, things whose change would be announced (a job, home or relationship), and things not expected to change (a chronic condition).
+- `fact`: everything else except claims recording written messages, assistant-drafted wording or an intent to send a message, including preferences, things whose change would be announced (a job, home or relationship), and things not expected to change (a chronic condition).
+
+Select and classify each proposition separately, including facts stated within possessive or descriptive phrases. A durable relationship is a `fact`, even when stated alongside a visit, illness or other temporary state. "Alex's grandson Ben is staying this week" supports a separate fact that Ben is Alex's grandson and a temporary claim about the stay; do not fold the relationship into a short-lived state or discard it when skipping the temporary claim. Extract only relationships actually stated, not inferred from the situation.
 
 Use `volatility` only for states, to describe how quickly they go stale: `hours` (mood, today's location), `days` (an illness, trip or bug being chased), `weeks` (a sprint or visitor), `months` (a project or job hunting), `years` (a degree). Use null when unsure and for all other kinds.
 
@@ -64,6 +90,7 @@ Most claims are trivial or minor. Major is rare; critical is a few per hundred c
 Resolve relative times in the current text using its reference date, calendar and timezone. Earlier context turns carry their own local date/time and timezone: resolve relative times in a context passage against that passage's date, never the current text's date. If a claim refers to a dated occasion in relevant context or supplied memories, use that occasion to ground its window, while still quoting only the current text. Do not infer a date for an undated occasion. Return times in the current text's timezone, converting a context occasion's time from its own timezone when needed. Each time has `at` (`YYYY`, `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`) and `precision` (`year`, `month`, `day`, `hour` or `minute`). Match the text's precision: "in March 2024" is `{"at": "2024-03", "precision": "month"}`; "tomorrow at 3pm" specifies a day and hour.
 
 - `valid_from` is when the claim starts to hold; `valid_until` is when it stops. Set `valid_until` only for an explicit end or a task tied to a dated occasion, as below. Facts never have `valid_until`, but keep any stated start ("started at Acme in March 2024").
+- The time something was said, sent or learned is not when its content started to hold. In ordinary reported speech as well as written messages, attach such a date only to a retained report/message event, not to the underlying fact or its `valid_from`. "My doctor told me today I am allergic to penicillin" supports the allergy, not an allergy starting today. Keep a start date only when the text states the fact itself began then; preserve any substantive qualification without adding the reporting occasion.
 - Put a task's due date or scheduled time in `due_at`. Being overdue is not an end: "renew my passport by 20 October" and "pay the power bill on 9 October at 9am" have `due_at` but no `valid_until`. Payments, renewals, replies and chores still need doing when overdue.
 - Set a task's `valid_until` only if it is for a separate occasion (an appointment, trip, meeting or departure) and becomes pointless afterward. Use the occasion's time. "Bring my insurance card to the dentist appointment tomorrow at 2pm" and "pack the carrots before we leave for the mountains on Saturday" have both `due_at` and `valid_until` at the appointment or departure. When unsure, leave `valid_until` null.
 - `until_event` is an end condition rather than a date.
