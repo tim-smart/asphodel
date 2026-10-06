@@ -320,6 +320,282 @@ fn not_created_uses_the_regex_without_requiring_a_resolved_memory() {
     assert_eq!(probe_in(&run.report(), "unknown-matching")["passed"], false);
 }
 
+// Proposed TIM-203 harness contract, tests only. `any_match = true` opts
+// recall_finds into current-sentence regex matching across returned memories.
+// not_created gains optional `since` (inclusive) and `count` (default zero):
+// exactly that many matching creations in [since, at], including purged ones.
+// Omitted fields keep the existing identity/through-at behavior.
+
+#[test]
+fn recall_finds_any_match_ignores_grounding_and_checks_returned_sentences() {
+    let dir = TestDir::new();
+    let corpus = import_history(&dir, |path| {
+        let db = hermes::one_session(path);
+        db.turn(
+            "s1",
+            start(),
+            "I live in Auckland, near the harbour.",
+            "Noted.",
+        );
+        db
+    });
+    let harbour = claim("Tim lives near the harbour.", "near the harbour", "fact");
+    let script =
+        script_answering_everything(&dir, "any-match", vec![home_claim(), harbour], vec![]);
+    let flags = ["--refresh", "off", "--latency", "0s"];
+    let grounding = probe_on("home", 5, "exists", HOME_MEMORY)
+        + &probe_on(
+            "harbour",
+            5,
+            "recall_finds",
+            "memory = \"near the harbour\"\nquery = \"Tim lives in Auckland near the harbour\"",
+        );
+    let report = replay_history(&dir, &corpus, "fast", &grounding, Some(&script), &flags).ok();
+    let home = observed_id(&report, "home");
+    let harbour = observed_id(&report, "harbour");
+    assert_ne!(home, harbour, "the fixture needs two distinct sentences");
+    let query = "query = \"Tim lives in Auckland near the harbour\"";
+    let mut probes = String::new();
+    for (id, fields) in [
+        (
+            "legacy",
+            format!("memory_id = {home}\nmemory = \"{UNSEEN}\"\n{query}"),
+        ),
+        (
+            "legacy-explicit",
+            format!("memory_id = {home}\nmemory = \"{UNSEEN}\"\n{query}\nany_match = false"),
+        ),
+        (
+            "other-returned",
+            format!("memory_id = {home}\nmemory = \"near the harbour\"\n{query}\nany_match = true"),
+        ),
+        (
+            "unknown-anchor",
+            format!(
+                "memory_id = \"00000000-0000-0000-0000-000000000000\"\nmemory = \"near the harbour\"\n{query}\nany_match = true"
+            ),
+        ),
+        (
+            "no-anchor",
+            format!("memory = \"near the harbour\"\n{query}\nany_match = true"),
+        ),
+        (
+            "no-sentence-match",
+            format!("memory_id = {home}\nmemory = \"{UNSEEN}\"\n{query}\nany_match = true"),
+        ),
+    ] {
+        probes += &probe_on(id, 5, "recall_finds", &fields);
+    }
+    let run = replay_history(&dir, &corpus, "fast", &probes, None, &flags);
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+    let report = run.report();
+    for (id, passed) in [
+        ("legacy", true),
+        ("legacy-explicit", true),
+        ("other-returned", true),
+        ("unknown-anchor", true),
+        ("no-anchor", true),
+        ("no-sentence-match", false),
+    ] {
+        let probe = probe_in(&report, id);
+        assert_eq!(probe["passed"], passed, "{probe}");
+    }
+}
+
+#[test]
+fn recall_finds_any_match_does_not_match_a_purged_creation_sentence() {
+    let dir = TestDir::new();
+    let (corpus, _) = record_not_created_fixture(&dir, "trivial");
+    let quiet = overrides(&dir, "[clock]\nquiet_rate = 1.0\n");
+    let at = "2026-11-05T12:00:00Z";
+    let probes = probe("purged", at, "absent", HOME_MEMORY)
+        + &probe(
+            "not-returned",
+            at,
+            "recall_finds",
+            &format!("{HOME_MEMORY}\nquery = \"Tim lives in Auckland\"\nany_match = true"),
+        );
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &probes,
+        None,
+        &["--refresh", "off", "--latency", "0s", "--overrides", &quiet],
+    );
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+    let report = run.report();
+    assert_eq!(probe_in(&report, "purged")["passed"], true);
+    assert_eq!(probe_in(&report, "not-returned")["passed"], false);
+}
+
+#[test]
+fn not_created_window_counts_exactly_with_inclusive_boundaries() {
+    let dir = TestDir::new();
+    let (corpus, grounding) = record_not_created_fixture(&dir, "notable");
+    let home = observed_id(&grounding, "home");
+    let mut probes = String::new();
+    for (id, at, since, count) in [
+        ("before", "2026-01-05T09:00:29Z", "2026-01-05T09:00:00Z", 0),
+        (
+            "upper-inclusive",
+            "2026-01-05T09:00:30Z",
+            "2026-01-05T09:00:29Z",
+            1,
+        ),
+        (
+            "both-inclusive",
+            "2026-01-05T09:00:30Z",
+            "2026-01-05T09:00:30Z",
+            1,
+        ),
+        (
+            "outside-window",
+            "2026-01-05T09:00:31Z",
+            "2026-01-05T09:00:31Z",
+            0,
+        ),
+        (
+            "wrong-count",
+            "2026-01-05T09:00:31Z",
+            "2026-01-05T09:00:29Z",
+            2,
+        ),
+    ] {
+        probes += &probe(
+            id,
+            at,
+            "not_created",
+            &format!("{HOME_MEMORY}\nsince = \"{since}\"\ncount = {count}"),
+        );
+    }
+    probes += &probe_on(
+        "regex-not-anchor",
+        5,
+        "not_created",
+        &format!(
+            "memory_id = {home}\nmemory = \"{UNSEEN}\"\nsince = \"2026-01-05T09:00:00Z\"\ncount = 0"
+        ),
+    );
+    probes += &probe_on(
+        "count-without-window",
+        5,
+        "not_created",
+        &format!("{HOME_MEMORY}\ncount = 1"),
+    );
+    probes += &probe_on(
+        "default-zero",
+        5,
+        "not_created",
+        &format!("{HOME_MEMORY}\nsince = \"2026-01-05T09:00:31Z\""),
+    );
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &probes,
+        None,
+        &["--refresh", "off", "--latency", "0s"],
+    );
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+    let report = run.report();
+    for id in [
+        "before",
+        "upper-inclusive",
+        "both-inclusive",
+        "outside-window",
+        "regex-not-anchor",
+        "count-without-window",
+        "default-zero",
+    ] {
+        assert_eq!(probe_in(&report, id)["passed"], true, "{id}: {report}");
+    }
+    assert_eq!(probe_in(&report, "wrong-count")["passed"], false);
+}
+
+#[test]
+fn not_created_window_counts_paraphrased_creations_not_only_the_grounded_head() {
+    let dir = TestDir::new();
+    let corpus = import_history(&dir, |path| {
+        let db = hermes::one_session(path);
+        db.home_turn("s1", start());
+        db
+    });
+    let paraphrase = claim("Tim resides in Auckland.", hermes::HOME_QUOTE, "fact");
+    let script = script_answering_everything(
+        &dir,
+        "two-creations",
+        vec![home_claim(), paraphrase],
+        vec![],
+    );
+    let flags = ["--refresh", "off", "--latency", "0s"];
+    let grounding = probe_on("home", 5, "exists", HOME_MEMORY)
+        + &probe_on(
+            "paraphrase",
+            5,
+            "exists",
+            "memory = \"resides in Auckland\"",
+        );
+    let report = replay_history(&dir, &corpus, "fast", &grounding, Some(&script), &flags).ok();
+    let home = observed_id(&report, "home");
+    assert_ne!(home, observed_id(&report, "paraphrase"));
+    let fields = format!(
+        "memory_id = {home}\nmemory = \"(lives|resides) in Auckland\"\nsince = \"2026-01-05T09:00:30Z\""
+    );
+    let at = "2026-01-05T09:00:30Z";
+    let probes = probe(
+        "two-creations",
+        at,
+        "not_created",
+        &format!("{fields}\ncount = 2"),
+    ) + &probe(
+        "not-single",
+        at,
+        "not_created",
+        &format!("{fields}\ncount = 1"),
+    );
+    let run = replay_history(&dir, &corpus, "fast", &probes, None, &flags);
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+    let report = run.report();
+    assert_eq!(probe_in(&report, "two-creations")["passed"], true);
+    assert_eq!(probe_in(&report, "not-single")["passed"], false);
+}
+
+#[test]
+fn not_created_window_keeps_purged_creations_in_the_count() {
+    let dir = TestDir::new();
+    let (corpus, _) = record_not_created_fixture(&dir, "trivial");
+    let quiet = overrides(&dir, "[clock]\nquiet_rate = 1.0\n");
+    let at = "2026-11-05T12:00:00Z";
+    let fields = format!("{HOME_MEMORY}\nsince = \"2026-01-05T09:00:30Z\"");
+    let probes = probe("purged", at, "absent", HOME_MEMORY)
+        + &probe(
+            "one-creation",
+            at,
+            "not_created",
+            &format!("{fields}\ncount = 1"),
+        )
+        + &probe(
+            "not-zero",
+            at,
+            "not_created",
+            &format!("{fields}\ncount = 0"),
+        );
+    let run = replay_history(
+        &dir,
+        &corpus,
+        "fast",
+        &probes,
+        None,
+        &["--refresh", "off", "--latency", "0s", "--overrides", &quiet],
+    );
+    assert_eq!(run.output.status.code(), Some(1), "{}", stderr(&run.output));
+    let report = run.report();
+    assert_eq!(probe_in(&report, "purged")["passed"], true);
+    assert_eq!(probe_in(&report, "one-creation")["passed"], true);
+    assert_eq!(probe_in(&report, "not-zero")["passed"], false);
+}
+
 // Recording modes.
 
 /// `live` calls the LLM, records, and reports the hash of the completed
