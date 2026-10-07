@@ -2209,6 +2209,15 @@ fn undo_latest_migration() -> String {
         "the newest migration file, {}, is the latest registered one",
         path.display()
     );
+    if *version == 20 {
+        // Its triggers have bodies this splitter can't read.
+        return "DROP TRIGGER IF EXISTS sources_fts_insert;
+             DROP TRIGGER IF EXISTS sources_fts_delete;
+             DROP TRIGGER IF EXISTS sources_fts_update;
+             DROP TABLE IF EXISTS sources_fts;
+             INSERT INTO memories_fts (memories_fts, rank) VALUES ('secure-delete', 0);"
+            .into();
+    }
     if *version == 18 {
         // Version 18 changes rows, not tables. Put the seeded question back
         // so restoring the older backup exercises the conversion again.
@@ -2542,6 +2551,17 @@ fn retract_and_document_removal_answer_over_http() {
     assert_eq!(retracted[0]["id"], id.as_str());
     assert!(daemon.memories("main", "status=live").is_empty());
 
+    let listed = |daemon: &Daemon, query: &str| -> Vec<Value> {
+        let page = daemon.get_ok(&format!("/v1/banks/main/sources?{query}"));
+        page["sources"].as_array().unwrap().clone()
+    };
+    // Search matches words of the id or the text, any case, as prefixes.
+    assert_eq!(listed(&daemon, "q=NOTES.MD").len(), 1);
+    assert_eq!(listed(&daemon, "q=drink%20te").len(), 1);
+    assert!(listed(&daemon, "q=drink%20coffee").is_empty());
+    assert_eq!(listed(&daemon, "gone=false").len(), 1);
+    assert!(listed(&daemon, "gone=true").is_empty());
+
     let removed = daemon.ok(daemon.remove_document("main", "notes.md"));
     assert_eq!(removed["document_id"], "notes.md", "{removed}");
     assert_eq!(removed["sources"], json!([source]), "{removed}");
@@ -2560,6 +2580,12 @@ fn retract_and_document_removal_answer_over_http() {
     let shown = daemon.get_ok(&format!("/v1/banks/main/sources/{source}"));
     assert_eq!(shown["text"], Value::Null, "{shown}");
     assert_eq!(shown["gone"]["reason"], "removed", "{shown}");
+    assert_eq!(listed(&daemon, "gone=true").len(), 1);
+    assert!(listed(&daemon, "gone=false").is_empty());
+    assert!(
+        listed(&daemon, "q=drink%20tea").is_empty(),
+        "removed text isn't searched"
+    );
     let again = daemon.ingest_notes();
     assert_eq!(again["outcome"], "duplicate");
     assert_eq!(daemon.chunks("main")["queued"], json!([]));

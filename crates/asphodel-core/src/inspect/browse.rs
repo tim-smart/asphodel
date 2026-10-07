@@ -185,6 +185,11 @@ pub struct SourceQuery {
     pub kind: Option<SourceKind>,
     pub document_id: Option<String>,
     pub session_id: Option<String>,
+    /// Words the document id, session id, stored text or reply must all
+    /// contain, each as a prefix. Text that's gone isn't searched.
+    pub q: Option<String>,
+    /// Only sources whose text is gone, or only those whose text is kept.
+    pub gone: Option<bool>,
     pub cursor: Option<String>,
     pub limit: Option<usize>,
 }
@@ -777,6 +782,30 @@ pub(crate) fn sources(
     if let Some(session) = &query.session_id {
         filters.push("s.session_id = ?".into());
         params.push(Sql::Text(session.clone()));
+    }
+    if let Some(text) = query.q.as_deref() {
+        match match_all(text) {
+            Some(search) => {
+                filters.push(
+                    "s.id IN (SELECT rowid FROM sources_fts WHERE sources_fts MATCH ?)".into(),
+                );
+                params.push(Sql::Text(search));
+            }
+            None if !text.trim().is_empty() => {
+                return Err(InspectError::InvalidQuery {
+                    reason: "the search has no words in it",
+                });
+            }
+            None => {}
+        }
+    }
+    if let Some(gone) = query.gone {
+        let test = "(s.text IS NULL OR s.removed_at IS NOT NULL)";
+        filters.push(if gone {
+            test.into()
+        } else {
+            format!("NOT {test}")
+        });
     }
     let filter = filters.join(" AND ");
     let total: i64 = conn.query_row(

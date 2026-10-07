@@ -965,7 +965,8 @@ details.panel > summary {
 
 .source {
   display: grid;
-  gap: 0.3rem;
+  grid-template-columns: 1fr auto;
+  gap: 0.3rem 1rem;
   padding: 0.85rem 0.25rem;
   border-bottom: 1px solid var(--rule);
 }
@@ -973,6 +974,16 @@ details.panel > summary {
 .source-name {
   font: 500 1rem var(--mono);
   word-break: break-all;
+}
+
+.source > :not(.source-remove) {
+  grid-column: 1;
+}
+
+.source-remove {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
 }
 
 .source[data-gone] .source-name {

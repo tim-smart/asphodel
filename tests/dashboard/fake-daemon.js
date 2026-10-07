@@ -757,8 +757,13 @@ export class FakeDaemon {
   sources(query) {
     const kind = query.get("kind");
     const documentId = query.get("document_id");
+    const q = query.get("q")?.toLowerCase();
+    const gone = query.get("gone");
+    const matches = (s) =>
+      [s.document_id, s.session_id, s.text, s.reply].some((field) => field?.toLowerCase().includes(q));
     const listed = this.state.sources
       .filter((s) => (!kind || s.kind === kind) && (!documentId || s.document_id === documentId))
+      .filter((s) => (!q || matches(s)) && (!gone || String(Boolean(s.gone)) === gone))
       .map(({ id, kind, document_id, session_id, message_at, observed_at, ingested_at, gone, secret_kinds, chunks }) => ({
         id,
         kind,

@@ -63,11 +63,11 @@ const bankHash = (bank, ...rest) => `#/banks/${[bank, ...rest].map(encodeURIComp
 const memoryHash = (bank, id) => bankHash(bank, "memories", id);
 const sourceHash = (bank, id) => bankHash(bank, "sources", id);
 
-function listHash(bank, params) {
+function listHash(bank, params, section = "memories") {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) if (value) search.set(key, value);
   const text = search.toString();
-  return `${bankHash(bank, "memories")}${text ? `?${text}` : ""}`;
+  return `${bankHash(bank, section)}${text ? `?${text}` : ""}`;
 }
 
 function memoryCount(count) {
@@ -753,12 +753,39 @@ function groupVersions(sources) {
   return [...groups.values()];
 }
 
+/// Asks, then removes every version of a document and forgets the memories
+/// resting on it.
+async function removeDocument(ctx, documentId) {
+  const { h } = ctx.ui;
+  const confirmed = await ctx.confirm({
+    title: "Remove this document?",
+    body: [
+      h("p", { class: "quoted" }, documentId),
+      h(
+        "p",
+        {},
+        "This removes every version of it and forgets the memories resting on it, with all their versions. Its text is deleted now, and sending the same text again is ignored as a duplicate.",
+      ),
+      h("p", {}, "It can't be undone here. A backup, or a later edited copy of the document, can bring the content back."),
+    ],
+    action: "Remove document",
+  });
+  if (!confirmed) return;
+  ctx.act(async () => {
+    const done = await ctx.api.removeDocument(ctx.bank, documentId);
+    const dequeued = done.dequeued ? ` and took ${plural(done.dequeued, "chunk")} off the queue` : "";
+    return `Removed ${done.document_id}: ${plural(done.sources.length, "version")}. Forgot ${memoryCount(done.forgotten.length)}${dequeued}.`;
+  });
+}
+
 // The bank's turns and documents, newest first: one entry per turn, and one
 // per document id with its newest version.
 async function sources(ctx) {
-  const { api, ui, bank } = ctx;
+  const { api, ui, bank, params } = ctx;
   const { h, time, pill } = ui;
-  const first = await api.sources(bank, { limit: 200 });
+  const filters = { q: params.q ?? "", kind: params.kind ?? "", gone: params.gone ?? "" };
+  const go = (change) => ctx.navigate(listHash(bank, { ...filters, ...change }, "sources"));
+  const first = await api.sources(bank, { ...filters, limit: 200 });
   const loaded = [...first.sources];
   let cursor = first.next_cursor;
   const list = h("ul", { class: "sources" });
@@ -793,6 +820,16 @@ async function sources(ctx) {
                 : h("span", {}, "ingested ", time(newest.ingested_at)),
             ]),
           ),
+          isTurn || newest.gone?.reason === "removed"
+            ? null
+            : [
+                " ",
+                h(
+                  "button",
+                  { type: "button", class: "danger-outline source-remove", "aria-label": `Remove ${id}`, onclick: () => removeDocument(ctx, id) },
+                  "Remove…",
+                ),
+              ],
         );
       }),
     );
@@ -805,7 +842,7 @@ async function sources(ctx) {
       class: "quiet more",
       onclick: async () => {
         more.disabled = true;
-        const next = await api.sources(bank, { limit: 200, cursor });
+        const next = await api.sources(bank, { ...filters, limit: 200, cursor });
         loaded.push(...next.sources);
         cursor = next.next_cursor;
         draw();
@@ -816,11 +853,62 @@ async function sources(ctx) {
     "Load more sources",
   );
 
+  const search = h("input", { id: "search", type: "search", name: "q", value: filters.q, autocomplete: "off" });
+  const toolbar = h(
+    "div",
+    { class: "toolbar" },
+    h(
+      "form",
+      {
+        role: "search",
+        class: "search",
+        onsubmit: (event) => {
+          event.preventDefault();
+          go({ q: search.value.trim() });
+        },
+      },
+      h("label", { for: "search" }, "Search sources"),
+      h("div", { class: "search-row" }, search, h("button", { type: "submit" }, "Search")),
+    ),
+    select(h, {
+      id: "kind",
+      label: "Kind",
+      value: filters.kind,
+      options: [
+        ["", "Any kind"],
+        ["turn", "Turns"],
+        ["document", "Documents"],
+      ],
+      onchange: (kind) => go({ kind }),
+    }),
+    select(h, {
+      id: "gone",
+      label: "Text",
+      value: filters.gone,
+      options: [
+        ["", "Kept or gone"],
+        ["false", "Kept"],
+        ["true", "Gone"],
+      ],
+      onchange: (gone) => go({ gone }),
+    }),
+  );
+  const filtered = Object.values(filters).some(Boolean);
+
   return {
     title: `Sources · ${bank}`,
     content: [
       heading(h, "Sources"),
-      loaded.length ? list : h("p", { class: "empty" }, "Nothing ingested yet. Turns and documents show up here."),
+      toolbar,
+      loaded.length
+        ? list
+        : h(
+            "p",
+            { class: "empty" },
+            filtered
+              ? ["No sources match these filters. ", h("a", { href: bankHash(bank, "sources") }, "Clear the filters")]
+              : "Nothing ingested yet. Turns and documents show up here.",
+          ),
       cursor ? more : null,
     ],
   };
@@ -844,32 +932,7 @@ async function source(ctx) {
           h("p", {}, "Removes every version and forgets the memories resting on it. Memories that only mention it stay."),
           h(
             "button",
-            {
-              type: "button",
-              class: "danger-outline",
-              onclick: async () => {
-                const versions = s.versions.filter((v) => v.gone?.reason !== "removed").length || 1;
-                const confirmed = await ctx.confirm({
-                  title: "Remove this document?",
-                  body: [
-                    h("p", { class: "quoted" }, s.document_id),
-                    h(
-                      "p",
-                      {},
-                      `This removes every version of it (${plural(versions, "version")}) and forgets the memories resting on it, with all their versions. Its text is deleted now, and sending the same text again is ignored as a duplicate.`,
-                    ),
-                    h("p", {}, "It can't be undone here. A backup, or a later edited copy of the document, can bring the content back."),
-                  ],
-                  action: "Remove document",
-                });
-                if (!confirmed) return;
-                ctx.act(async () => {
-                  const done = await api.removeDocument(bank, s.document_id);
-                  const dequeued = done.dequeued ? ` and took ${plural(done.dequeued, "chunk")} off the queue` : "";
-                  return `Removed ${done.document_id}: ${plural(done.sources.length, "version")}. Forgot ${memoryCount(done.forgotten.length)}${dequeued}.`;
-                });
-              },
-            },
+            { type: "button", class: "danger-outline", onclick: () => removeDocument(ctx, s.document_id) },
             "Remove document…",
           ),
         )

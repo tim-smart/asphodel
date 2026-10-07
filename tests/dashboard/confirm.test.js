@@ -17,6 +17,7 @@ import {
   findDialog,
   findText,
   open,
+  queryButton,
   queryDialog,
   queryText,
   stays,
@@ -141,6 +142,19 @@ test("a confirmed removal sends the document's id in the body and says what went
   assert.deepEqual(sent.body, { document_id: DOCUMENT });
   await waitFor(() => !queryDialog(page.document), "the confirmation to close");
   await findText(page.root, /\b6 memories\b/i);
+});
+
+test("a document is removed from the sources list, and stays listed as removed", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: "#/banks/main/sources", token: TOKEN });
+
+  click(await findButton(page.root, `Remove ${DOCUMENT}`));
+  await confirm(page, /remove/i);
+
+  const sent = await waitFor(() => daemon.calls("POST", REMOVE)[0], "POST documents/remove");
+  assert.deepEqual(sent.body, { document_id: DOCUMENT });
+  await findText(page.root, /\b6 memories\b/i);
+  await waitFor(() => !queryButton(page.root, `Remove ${DOCUMENT}`), "no remove for a removed document");
 });
 
 test("removing a document whose id has dot segments removes that document and no other", async (t) => {

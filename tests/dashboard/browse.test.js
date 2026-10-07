@@ -125,6 +125,30 @@ test("the sources page lists each document once and each turn, and says which we
   await findText(page.root, "My daughter Ada starts school next week.");
 });
 
+test("the sources page searches and filters through the daemon", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: "#/banks/main/sources", token: TOKEN });
+  await findLink(page.root, DOCUMENT);
+
+  const search = await findField(page.root, /search/i);
+  type(search, "ada");
+  submit(search);
+  await queried(daemon, "/v1/banks/main/sources", "q", "ada");
+  await findLink(page.root, /session-1/);
+  await waitFor(() => !queryLink(page.root, DOCUMENT), "the list to narrow");
+
+  choose(await findField(page.root, /kind/i), "document");
+  await queried(daemon, "/v1/banks/main/sources", "kind", "document");
+  await findText(page.root, /no sources match/i);
+
+  page.window.location.hash = "#/banks/main/sources";
+  await findLink(page.root, DOCUMENT);
+  choose(await findField(page.root, /text/i), "true");
+  await queried(daemon, "/v1/banks/main/sources", "gone", "true");
+  await findRow(page.root, "recipes.md");
+  await waitFor(() => !queryLink(page.root, DOCUMENT), "only gone sources");
+});
+
 test("a document's page shows its text, its versions and each chunk's state", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon, { hash: "#/banks/main/sources", token: TOKEN });

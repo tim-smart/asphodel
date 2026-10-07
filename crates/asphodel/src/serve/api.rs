@@ -1065,8 +1065,8 @@ async fn banks(State(app): State<Shared>) -> Result<Json<Banks>, ApiError> {
     Ok(Json(Banks { banks }))
 }
 
-/// `GET /v1/banks/{bank}/sources?kind=&document_id=&session_id=`: turns
-/// and document versions, newest ingest first.
+/// `GET /v1/banks/{bank}/sources?kind=&document_id=&session_id=&q=&gone=`:
+/// turns and document versions, newest ingest first.
 async fn sources(
     State(app): State<Shared>,
     Path(bank): Path<String>,

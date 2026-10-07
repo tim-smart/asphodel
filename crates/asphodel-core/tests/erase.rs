@@ -774,6 +774,9 @@ fn forget_erases_the_whole_chain_and_clears_what_points_into_it() {
         into: "Berlin".into(),
     };
     h.service.merge_entities(BANK, &merge).unwrap();
+    let indexed = "SELECT count(*) FROM memories_fts_data
+                   WHERE instr(block, CAST('lisbon' AS BLOB)) > 0";
+    assert!(h.count(indexed) > 0);
 
     let forgotten = h.forget(&[moved_out]);
     let chain = BTreeSet::from([moved_out, moved]);
@@ -784,6 +787,7 @@ fn forget_erases_the_whole_chain_and_clears_what_points_into_it() {
     assert_eq!(erased.memories, chain);
 
     assert_eq!(h.exist(&[moved_out, moved, berlin]), [false, false, true]);
+    assert_eq!(h.count(indexed), 0, "erased words leave the search index");
     let kept = h.memory(berlin);
     assert_eq!(kept.chain.ended_by, None);
     assert_eq!(kept.window.valid_until, until);
@@ -910,13 +914,19 @@ fn removing_a_document_takes_its_restatements_but_not_the_memory() {
     // from the document.
     let h = Harness::new();
     let tea = h.said(EARLIER, notable(TEA));
-    h.doc("notes.md", "# Drinks\n\nI like green tea.\n");
+    h.doc("notes.md", "# Drinks\n\nI like green tea from a kyusu.\n");
     h.extract_mention(quoting(notable(TEA), "I like green tea"), tea);
     assert_eq!(h.memory(tea).restatements.len(), 1);
+
+    // The search index holds the document's words until it's removed.
+    let indexed = "SELECT count(*) FROM sources_fts_data
+                   WHERE instr(block, CAST('kyusu' AS BLOB)) > 0";
+    assert!(h.count(indexed) > 0);
 
     h.service.remove_document(BANK, "notes.md").unwrap();
     assert!(h.memory(tea).restatements.is_empty());
     assert_eq!(h.restatement_rows(), 0);
+    assert_eq!(h.count(indexed), 0, "removed words leave the search index");
 }
 
 // Purge in the nightly sweep
