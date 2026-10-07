@@ -24,7 +24,7 @@ use crate::entities::{
 };
 use crate::erase::{
     Aftermath, BankDeleteError, BankDeleted, DocumentRemoved, Erased, ForgetError, ForgetRequest,
-    Forgotten, RemoveDocumentError,
+    Forgotten, RemoveDocumentError, RemoveTurnError, TurnRemoved,
 };
 use crate::extraction::{Call1Input, Call2Input, Committed, ExtractError, Extracted};
 use crate::ingest::{Document, IngestError, Ingested, Outcome, Turn};
@@ -1312,6 +1312,23 @@ impl Service {
         };
         let (bank_id, removed, aftermath) =
             crate::erase::remove_document(&self.store, &out, bank, document_id)?;
+        self.settle(bank_id, aftermath)?;
+        Ok(removed)
+    }
+
+    /// `POST .../turns/{source}/remove`: removes one turn as
+    /// [`Service::remove_document`] removes a document
+    /// ([`crate::erase::remove_turn`]).
+    pub fn remove_turn(&self, bank: &str, source: &str) -> Result<TurnRemoved, RemoveTurnError> {
+        let out = {
+            let conn = self.store.connection();
+            match crate::ingest::find_bank(&conn, bank)? {
+                Some((bank_id, _)) => self.leases.out(bank_id),
+                None => return Err(RemoveTurnError::UnknownBank),
+            }
+        };
+        let (bank_id, removed, aftermath) =
+            crate::erase::remove_turn(&self.store, &out, bank, source)?;
         self.settle(bank_id, aftermath)?;
         Ok(removed)
     }

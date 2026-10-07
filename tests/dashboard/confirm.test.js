@@ -1,4 +1,4 @@
-// Forget, retract and document removal can't be undone, so each asks first
+// Forget, retract and removing a document or turn can't be undone, so each asks first
 // and says what will go. Nothing is sent until the owner confirms; cancelling
 // sends nothing. Afterwards the page says what the daemon did, even when what
 // it acted on is already gone.
@@ -144,7 +144,7 @@ test("a confirmed removal sends the document's id in the body and says what went
   await findText(page.root, /\b6 memories\b/i);
 });
 
-test("a document is removed from the sources list, and stays listed as removed", async (t) => {
+test("a document and a turn are removed from the sources list, and stay listed as removed", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon, { hash: "#/banks/main/sources", token: TOKEN });
 
@@ -155,6 +155,12 @@ test("a document is removed from the sources list, and stays listed as removed",
   assert.deepEqual(sent.body, { document_id: DOCUMENT });
   await findText(page.root, /\b6 memories\b/i);
   await waitFor(() => !queryButton(page.root, `Remove ${DOCUMENT}`), "no remove for a removed document");
+
+  click(await findButton(page.root, `Remove turn ${ids.turn}`));
+  await confirm(page, /remove/i);
+  await waitFor(() => daemon.calls("POST", `/v1/banks/main/turns/${ids.turn}/remove`)[0], "POST turns/{id}/remove");
+  await findText(page.root, /\b1 memory\b/i);
+  await waitFor(() => !queryButton(page.root, `Remove turn ${ids.turn}`), "no remove for a removed turn");
 });
 
 test("removing a document whose id has dot segments removes that document and no other", async (t) => {

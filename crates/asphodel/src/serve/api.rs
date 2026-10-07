@@ -18,7 +18,7 @@ use asphodel_core::entities::{
 };
 use asphodel_core::erase::{
     BankDeleteError, BankDeleted, DocumentRemoved, ForgetError, ForgetRequest, Forgotten,
-    RemoveDocumentError, RemoveDocumentRequest,
+    RemoveDocumentError, RemoveDocumentRequest, RemoveTurnError, TurnRemoved,
 };
 use asphodel_core::ingest::{Document, IngestError, Ingested, Outcome, Turn};
 use asphodel_core::inspect::{
@@ -72,6 +72,7 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/v1/banks/{bank}/turns", post(turns))
         .route("/v1/banks/{bank}/documents", post(documents))
         .route("/v1/banks/{bank}/documents/remove", post(remove_document))
+        .route("/v1/banks/{bank}/turns/{source}/remove", post(remove_turn))
         .route("/v1/banks/{bank}/sources", get(sources))
         .route("/v1/banks/{bank}/sources/{source}", get(show_source))
         .route("/v1/banks/{bank}/prefetch", post(prefetch))
@@ -396,6 +397,17 @@ impl From<RemoveDocumentError> for ApiError {
                 Self::new(StatusCode::BAD_REQUEST, error.to_string())
             }
             RemoveDocumentError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<RemoveTurnError> for ApiError {
+    fn from(error: RemoveTurnError) -> Self {
+        match error {
+            RemoveTurnError::UnknownBank | RemoveTurnError::UnknownTurn => {
+                Self::new(StatusCode::NOT_FOUND, error.to_string())
+            }
+            RemoveTurnError::Store(error) => error.into(),
         }
     }
 }
@@ -1107,6 +1119,26 @@ async fn remove_document(
     let removed = app
         .call(move |service| {
             let removed = service.remove_document(&name, &document)?;
+            if !removed.forgotten.is_empty() {
+                service.erase_next(&name)?;
+            }
+            Ok::<_, ApiError>(removed)
+        })
+        .await?;
+    app.wake(&bank);
+    Ok(Json(removed))
+}
+
+/// `POST /v1/banks/{bank}/turns/{source}/remove`: one turn, by its source
+/// id. The dashboard asks the owner to confirm first; the route doesn't.
+async fn remove_turn(
+    State(app): State<Shared>,
+    Path((bank, source)): Path<(String, String)>,
+) -> Result<Json<TurnRemoved>, ApiError> {
+    let name = bank.clone();
+    let removed = app
+        .call(move |service| {
+            let removed = service.remove_turn(&name, &source)?;
             if !removed.forgotten.is_empty() {
                 service.erase_next(&name)?;
             }

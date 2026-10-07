@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asphodel_core::config::Layer;
-use asphodel_core::erase::{DocumentRemoved, RemoveDocumentError};
+use asphodel_core::erase::{DocumentRemoved, RemoveDocumentError, RemoveTurnError};
 use asphodel_core::extraction::Committed;
 use asphodel_core::ingest::{Document, Ingested, Outcome, Turn};
 use asphodel_core::inspect::{
@@ -651,6 +651,65 @@ fn a_chunk_in_flight_when_its_document_is_removed_leaves_no_memory_behind() {
     assert_eq!(shown.text, None);
     assert!(shown.chunks.iter().all(|chunk| chunk.memories.is_empty()));
     assert_eq!(h.service.queue_depth(BANK).unwrap(), 0);
+}
+
+// Removing a turn
+
+#[test]
+fn removing_a_turn_forgets_what_rests_on_it_and_keeps_its_key() {
+    let h = Harness::new();
+    let maya = h.fact(MAYA);
+    let said = turn(at(EARLIER) + days(1), TEA);
+    let ingested = h.service.ingest_turn(BANK, &said).unwrap();
+    let tea = h
+        .service
+        .extract_next(BANK, &states(TEA))
+        .unwrap()
+        .unwrap()
+        .memories[0];
+    let waiting = h
+        .service
+        .ingest_turn(BANK, &turn(at(EARLIER) + days(2), BIKE))
+        .unwrap();
+
+    let removed = h
+        .service
+        .remove_turn(BANK, &ingested.source.to_string())
+        .unwrap();
+    assert_eq!(removed.source, ingested.source);
+    assert_eq!(removed.forgotten, [tea]);
+    assert_eq!(removed.dequeued, 0);
+    let removed = h
+        .service
+        .remove_turn(BANK, &waiting.source.to_string())
+        .unwrap();
+    assert_eq!((removed.forgotten.len(), removed.dequeued), (0, 1));
+    assert_eq!(h.service.queue_depth(BANK).unwrap(), 0);
+
+    assert!(!h.recalled(TEA).contains(&tea));
+    let shown = h
+        .service
+        .show_source(BANK, &ingested.source.to_string())
+        .unwrap();
+    assert_eq!((shown.text, shown.gone), (None, Some(Gone::Removed)));
+    h.erase();
+    assert_eq!(h.rows(&[tea]), 0);
+    assert!(h.recalled(MAYA).contains(&maya), "other turns stay");
+
+    let again = h.service.ingest_turn(BANK, &said).unwrap();
+    assert_eq!(again.outcome, Outcome::Duplicate);
+    assert!(matches!(
+        h.service.remove_turn(BANK, &ingested.source.to_string()),
+        Err(RemoveTurnError::UnknownTurn)
+    ));
+    let (document, _) = h.doc_stating(NOTES, NOTES_V1, TEA);
+    assert!(
+        matches!(
+            h.service.remove_turn(BANK, &document.to_string()),
+            Err(RemoveTurnError::UnknownTurn)
+        ),
+        "a document isn't removed as a turn"
+    );
 }
 
 #[test]

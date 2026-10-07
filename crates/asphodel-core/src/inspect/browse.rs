@@ -265,7 +265,7 @@ pub enum ChunkState {
     Extracted,
     /// It reached the retry cap; `chunks/retry` puts it back.
     Failed,
-    /// It left the queue unextracted: its document was removed.
+    /// It left the queue unextracted: its source was removed.
     Dropped,
 }
 

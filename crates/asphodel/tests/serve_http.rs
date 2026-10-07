@@ -2517,7 +2517,7 @@ fn the_dashboard_routes_browse_without_writing_anything() {
 }
 
 #[test]
-fn retract_and_document_removal_answer_over_http() {
+fn retract_and_source_removal_answer_over_http() {
     let dir = TestDir::new();
     let mut daemon = Serve::new(&dir).script(&[auckland()]).ready();
     daemon.create_bank("main");
@@ -2589,6 +2589,38 @@ fn retract_and_document_removal_answer_over_http() {
     let again = daemon.ingest_notes();
     assert_eq!(again["outcome"], "duplicate");
     assert_eq!(daemon.chunks("main")["queued"], json!([]));
+
+    // A turn is removed by its source id, once.
+    let turn = json!({
+        "session_id": "s1",
+        "message_at": "2026-10-01T10:00:00Z",
+        "user_text": "I drink tea.",
+        "assistant_text": "Noted.",
+        "platform": "cli",
+    });
+    let turn = daemon.post_ok("/v1/banks/main/turns", &turn)["source"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let remove_turn = |bank: &str, source: &str| {
+        daemon.post(
+            &format!("/v1/banks/{bank}/turns/{source}/remove"),
+            &json!({}),
+        )
+    };
+    let removed = daemon.ok(remove_turn("main", &turn));
+    assert_eq!(removed["source"], turn.as_str(), "{removed}");
+    let shown = daemon.get_ok(&format!("/v1/banks/main/sources/{turn}"));
+    assert_eq!(shown["text"], Value::Null, "{shown}");
+    assert_eq!(shown["gone"]["reason"], "removed", "{shown}");
+    for (bank, source) in [
+        ("main", turn.as_str()),
+        ("main", source.as_str()),
+        ("nobody", turn.as_str()),
+    ] {
+        let reply = remove_turn(bank, source);
+        assert_eq!(reply.status, 404, "{bank} {source}: {}", reply.body);
+    }
 }
 
 /// GETs `path` without the token, checks it's served as `content_type`,

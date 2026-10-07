@@ -637,6 +637,7 @@ export class FakeDaemon {
       }
       return this.removeDocument(body.document_id);
     }
+    if (collection === "turns" && action === "remove" && method === "POST") return this.removeTurn(id);
     if (collection === "chunks" && id === undefined && method === "GET") {
       const failedOnly = query.get("failed") === "true";
       return json(200, { queued: failedOnly ? [] : state.queued, failed: state.failed });
@@ -795,6 +796,20 @@ export class FakeDaemon {
       this.state.views[id].hidden_at = "2026-10-03T09:05:00Z";
     }
     return json(200, { document_id: documentId, sources: versions.map((s) => s.id), forgotten, dequeued: 0 });
+  }
+
+  removeTurn(id) {
+    const turn = this.state.sources.find((s) => s.id === id && s.kind === "turn" && s.gone?.reason !== "removed");
+    if (!turn) return error(404, "unknown turn");
+    const forgotten = this.state.memories.filter((m) => m.source === id).map((m) => m.id);
+    turn.text = null;
+    turn.reply = null;
+    turn.gone = { reason: "removed" };
+    for (const memory of forgotten) {
+      this.state.memories.find((m) => m.id === memory).status = "forgetting";
+      this.state.views[memory].hidden_at = "2026-10-03T09:05:00Z";
+    }
+    return json(200, { source: id, forgotten, dequeued: 0 });
   }
 
   /// Only `enabled` is edited here. Enabling is refused, changing nothing,

@@ -1000,6 +1000,15 @@ the path, where a client would turn `folder/../notes` into `notes`. The
 dashboard asks for confirmation before it calls the route; the CLI and the
 route don't.
 
+## Removing a turn
+
+`POST /v1/banks/{bank}/turns/{source}/remove` removes one turn by its source
+id, the same way: the memories resting on it are forgotten, its waiting
+chunk leaves the queue, its text and restatements go at once, and it keeps
+its key, so the plugin resending it is a duplicate. The dashboard offers it
+on the Sources page and on the turn's own page, and asks for confirmation
+first; the route doesn't. There's no CLI command.
+
 ## Restatements
 
 A claim call 2 labels `mentioned_again` or `confirmed` on an older memory,

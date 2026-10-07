@@ -138,7 +138,7 @@ export function capitalize(text) {
 export function goneReason(gone) {
   switch (gone?.reason) {
     case "removed":
-      return "Removed by the owner, with every version of the document.";
+      return "Removed by the owner.";
     case "swept":
       return "Swept: the nightly sweep deleted the text at its horizon.";
     case "forget_requested":

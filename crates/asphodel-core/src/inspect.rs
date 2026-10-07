@@ -169,7 +169,7 @@ pub enum Gone {
     Redacted,
     /// The turn asked to forget, so it was never stored.
     ForgetRequested,
-    /// The owner removed the document, every version of it.
+    /// The owner removed the turn, or the document with every version of it.
     Removed,
 }
 

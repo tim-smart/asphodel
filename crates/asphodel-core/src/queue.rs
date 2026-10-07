@@ -443,7 +443,8 @@ pub(crate) fn finish(
     Ok(())
 }
 
-/// Whether the chunk's source was removed ([`crate::erase::remove_document`])
+/// Whether the chunk's source was removed ([`crate::erase::remove_document`],
+/// [`crate::erase::remove_turn`])
 /// after it was queued, so nothing may be extracted from it.
 pub(crate) fn source_removed(
     conn: &rusqlite::Connection,

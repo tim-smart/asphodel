@@ -778,6 +778,25 @@ async function removeDocument(ctx, documentId) {
   });
 }
 
+/// Asks, then removes a turn and forgets the memories resting on it.
+async function removeTurn(ctx, turn) {
+  const { h } = ctx.ui;
+  const confirmed = await ctx.confirm({
+    title: "Remove this turn?",
+    body: [
+      h("p", {}, "This forgets the memories resting on it, with all their versions. Its text is deleted now, and sending the same turn again is ignored as a duplicate."),
+      h("p", {}, "It can't be undone here. A backup can bring the content back."),
+    ],
+    action: "Remove turn",
+  });
+  if (!confirmed) return;
+  ctx.act(async () => {
+    const done = await ctx.api.removeTurn(ctx.bank, turn);
+    const dequeued = done.dequeued ? ` and took ${plural(done.dequeued, "chunk")} off the queue` : "";
+    return `Removed the turn. Forgot ${memoryCount(done.forgotten.length)}${dequeued}.`;
+  });
+}
+
 // The bank's turns and documents, newest first: one entry per turn, and one
 // per document id with its newest version.
 async function sources(ctx) {
@@ -820,13 +839,18 @@ async function sources(ctx) {
                 : h("span", {}, "ingested ", time(newest.ingested_at)),
             ]),
           ),
-          isTurn || newest.gone?.reason === "removed"
+          newest.gone?.reason === "removed"
             ? null
             : [
                 " ",
                 h(
                   "button",
-                  { type: "button", class: "danger-outline source-remove", "aria-label": `Remove ${id}`, onclick: () => removeDocument(ctx, id) },
+                  {
+                    type: "button",
+                    class: "danger-outline source-remove",
+                    "aria-label": `Remove ${isTurn ? `turn ${newest.id}` : id}`,
+                    onclick: () => (isTurn ? removeTurn(ctx, newest.id) : removeDocument(ctx, id)),
+                  },
                   "Remove…",
                 ),
               ],
@@ -923,20 +947,25 @@ async function source(ctx) {
   const removed = s.gone?.reason === "removed";
   const title = isDocument ? s.document_id : `Turn${s.session_id ? ` in session ${s.session_id}` : ""}`;
 
-  const remove =
-    isDocument && !removed
-      ? h(
-          "section",
-          { class: "panel danger-zone", "aria-labelledby": "remove-title" },
-          h("h2", { id: "remove-title" }, "Remove this document"),
-          h("p", {}, "Removes every version and forgets the memories resting on it. Memories that only mention it stay."),
-          h(
-            "button",
-            { type: "button", class: "danger-outline", onclick: () => removeDocument(ctx, s.document_id) },
-            "Remove document…",
-          ),
-        )
-      : null;
+  const remove = removed
+    ? null
+    : h(
+        "section",
+        { class: "panel danger-zone", "aria-labelledby": "remove-title" },
+        h("h2", { id: "remove-title" }, isDocument ? "Remove this document" : "Remove this turn"),
+        h(
+          "p",
+          {},
+          isDocument
+            ? "Removes every version and forgets the memories resting on it. Memories that only mention it stay."
+            : "Forgets the memories resting on it. Memories that only mention it stay.",
+        ),
+        h(
+          "button",
+          { type: "button", class: "danger-outline", onclick: () => (isDocument ? removeDocument(ctx, s.document_id) : removeTurn(ctx, s.id)) },
+          isDocument ? "Remove document…" : "Remove turn…",
+        ),
+      );
 
   const chunks = s.chunks.length
     ? h(

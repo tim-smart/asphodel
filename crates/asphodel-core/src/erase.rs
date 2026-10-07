@@ -156,6 +156,40 @@ impl From<rusqlite::Error> for RemoveDocumentError {
     }
 }
 
+/// The edit kind removing a turn writes, with the same counts as
+/// [`EDIT_DOCUMENT_REMOVED`].
+pub const EDIT_TURN_REMOVED: &str = "turn_removed";
+
+/// What `remove_turn` returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TurnRemoved {
+    pub source: Uuid,
+    /// Every memory forgotten with it: the whole chain of each memory that
+    /// rested on it.
+    pub forgotten: Vec<Uuid>,
+    /// Chunks taken off the queue before extraction. A chunk in flight
+    /// stays, and its commit is refused.
+    pub dequeued: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RemoveTurnError {
+    #[error("unknown bank")]
+    UnknownBank,
+
+    #[error("the bank has no such turn, or it was removed already")]
+    UnknownTurn,
+
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl From<rusqlite::Error> for RemoveTurnError {
+    fn from(error: rusqlite::Error) -> Self {
+        RemoveTurnError::Store(StoreError::Sqlite(error))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EraseReason {
@@ -264,7 +298,6 @@ pub(crate) fn remove_document(
     if document_id.is_empty() {
         return Err(RemoveDocumentError::EmptyDocumentId);
     }
-    let now = micros(store.now());
     let mut conn = store.connection();
     let tx = conn.transaction()?;
     let (bank_id, _) = find_bank(&tx, bank)?.ok_or(RemoveDocumentError::UnknownBank)?;
@@ -282,7 +315,95 @@ pub(crate) fn remove_document(
     if sources.is_empty() {
         return Err(RemoveDocumentError::UnknownDocument);
     }
+    let (removed, aftermath) =
+        remove_sources(&tx, store, out, bank_id, &sources, EDIT_DOCUMENT_REMOVED)?;
+    tx.commit()?;
+    tracing::info!(
+        sources = removed.sources.len(),
+        memories = removed.forgotten.len(),
+        dequeued = removed.dequeued,
+        "removed a document"
+    );
+    Ok((
+        bank_id,
+        DocumentRemoved {
+            document_id: document_id.to_string(),
+            sources: removed.sources,
+            forgotten: removed.forgotten,
+            dequeued: removed.dequeued,
+        },
+        aftermath,
+    ))
+}
 
+/// Removes one turn as [`remove_document`] removes a document: forgets the
+/// memories resting on it, dequeues its waiting chunk and clears its text
+/// now, keeping its key.
+pub(crate) fn remove_turn(
+    store: &Store,
+    out: &BTreeSet<i64>,
+    bank: &str,
+    source: &str,
+) -> Result<(i64, TurnRemoved, Aftermath), RemoveTurnError> {
+    let mut conn = store.connection();
+    let tx = conn.transaction()?;
+    let (bank_id, _) = find_bank(&tx, bank)?.ok_or(RemoveTurnError::UnknownBank)?;
+    let source: Uuid = source.parse().map_err(|_| RemoveTurnError::UnknownTurn)?;
+    let row: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM sources
+             WHERE bank_id = ?1 AND kind = 'turn' AND uuid = ?2 AND removed_at IS NULL",
+            (bank_id, source.to_string()),
+            |row| row.get(0),
+        )
+        .optional()?;
+    let row = row.ok_or(RemoveTurnError::UnknownTurn)?;
+    let (removed, aftermath) = remove_sources(
+        &tx,
+        store,
+        out,
+        bank_id,
+        &[(row, source.to_string())],
+        EDIT_TURN_REMOVED,
+    )?;
+    tx.execute("DELETE FROM turn_in_context WHERE source_id = ?1", [row])?;
+    tx.commit()?;
+    tracing::info!(
+        memories = removed.forgotten.len(),
+        dequeued = removed.dequeued,
+        "removed a turn"
+    );
+    Ok((
+        bank_id,
+        TurnRemoved {
+            source,
+            forgotten: removed.forgotten,
+            dequeued: removed.dequeued,
+        },
+        aftermath,
+    ))
+}
+
+/// What removing a set of sources took with it.
+struct Removal {
+    sources: Vec<Uuid>,
+    forgotten: Vec<Uuid>,
+    dequeued: usize,
+}
+
+/// Removes `sources` (rowid and uuid) inside the caller's transaction:
+/// dequeues their waiting chunks unless a worker holds them, forgets the
+/// memories resting on them, clears their text and marks them removed, and
+/// writes one `edit` row of counts.
+fn remove_sources(
+    tx: &Transaction<'_>,
+    store: &Store,
+    out: &BTreeSet<i64>,
+    bank_id: i64,
+    sources: &[(i64, String)],
+    edit: &str,
+) -> Result<(Removal, Aftermath), rusqlite::Error> {
+    let now = micros(store.now());
     let mut dequeued = 0;
     let mut named = Vec::new();
     {
@@ -294,7 +415,7 @@ pub(crate) fn remove_document(
             "SELECT m.id FROM memories m JOIN chunks c ON c.id = m.chunk_id
              WHERE c.source_id = ?1 AND m.hidden_at IS NULL ORDER BY m.id",
         )?;
-        for (source, _) in &sources {
+        for (source, _) in sources {
             let jobs: Vec<i64> = queued
                 .query_map([source], |row| row.get(0))?
                 .collect::<Result<_, _>>()?;
@@ -307,9 +428,9 @@ pub(crate) fn remove_document(
             }
         }
     }
-    let (forgotten, members, aftermath) = hide(&tx, store, bank_id, &named, None)?;
+    let (forgotten, members, aftermath) = hide(tx, store, bank_id, &named, None)?;
 
-    for (source, _) in &sources {
+    for (source, _) in sources {
         // What a memory resting elsewhere restated here goes with the text.
         tx.execute(
             "DELETE FROM restatements
@@ -334,10 +455,10 @@ pub(crate) fn remove_document(
         .map(|(_, uuid)| uuid.parse().expect("a stored uuid parses"))
         .collect();
     log_edit(
-        &tx,
+        tx,
         store,
         bank_id,
-        EDIT_DOCUMENT_REMOVED,
+        edit,
         None,
         &serde_json::json!({
             "sources": uuids,
@@ -346,17 +467,8 @@ pub(crate) fn remove_document(
         })
         .to_string(),
     )?;
-    tx.commit()?;
-    tracing::info!(
-        sources = uuids.len(),
-        memories = members.len(),
-        dequeued,
-        "removed a document"
-    );
     Ok((
-        bank_id,
-        DocumentRemoved {
-            document_id: document_id.to_string(),
+        Removal {
             sources: uuids,
             forgotten,
             dequeued,
