@@ -1314,6 +1314,86 @@ fn a_model_is_not_released_while_a_call_is_running_on_it() {
     assert_eq!(embedder_loads.load(Ordering::SeqCst), 2);
 }
 
+/// The fake embedder, but the first one loaded takes a while to free:
+/// its drop marks `freeing`, says so on `dropping` and waits for `go`.
+struct SlowToFree {
+    gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    freeing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Embedder for SlowToFree {
+    fn model_id(&self) -> &str {
+        FakeEmbedder.model_id()
+    }
+
+    fn dimensions(&self) -> usize {
+        FakeEmbedder.dimensions()
+    }
+
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
+        FakeEmbedder.embed(texts)
+    }
+}
+
+impl Drop for SlowToFree {
+    fn drop(&mut self) {
+        if let Some((dropping, go)) = self.gate.get_mut().unwrap().take() {
+            self.freeing.store(true, Ordering::SeqCst);
+            dropping.send(()).unwrap();
+            go.recv().unwrap();
+            self.freeing.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+#[test]
+fn a_released_model_is_freed_before_it_loads_again() {
+    let (dropping, freeing_started) = std::sync::mpsc::channel();
+    let (go, gate) = std::sync::mpsc::channel();
+    let gate = Arc::new(Mutex::new(Some((dropping, gate))));
+    let freeing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loaded_while_freeing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (resident, embedder_loads, _) = resident({
+        let freeing = Arc::clone(&freeing);
+        let loaded_while_freeing = Arc::clone(&loaded_while_freeing);
+        move || {
+            if freeing.load(Ordering::SeqCst) {
+                loaded_while_freeing.store(true, Ordering::SeqCst);
+            }
+            Arc::new(SlowToFree {
+                gate: Mutex::new(gate.lock().unwrap().take()),
+                freeing: Arc::clone(&freeing),
+            }) as Arc<dyn Embedder>
+        }
+    });
+    let models = resident.models();
+    let text = "The cat sat on the mat.";
+    let expected = FakeEmbedder.embed(&[text]).unwrap();
+
+    // The release is still freeing the model when a call arrives.
+    let release = std::thread::spawn(move || resident.release_idle(Duration::ZERO));
+    freeing_started.recv().unwrap();
+    let (answered, answer) = std::sync::mpsc::channel();
+    let call = std::thread::spawn({
+        let embedder = Arc::clone(&models.embedder);
+        move || answered.send(embedder.embed(&[text])).unwrap()
+    });
+    // The call waits for the old copy to be freed rather than loading a
+    // second one beside it. A call that doesn't wait answers well inside
+    // this; one that does is still waiting when it's up.
+    let early = answer.recv_timeout(Duration::from_millis(500)).ok();
+    go.send(()).unwrap();
+    assert!(release.join().unwrap());
+    let result = early.unwrap_or_else(|| answer.recv().unwrap());
+    call.join().unwrap();
+    assert_eq!(result.unwrap(), expected);
+    assert_eq!(embedder_loads.load(Ordering::SeqCst), 2);
+    assert!(
+        !loaded_while_freeing.load(Ordering::SeqCst),
+        "the model loaded again while its old copy was still being freed"
+    );
+}
+
 // The real models. Ignored: they run only when the models are present.
 
 /// The real models on this machine, from the dir the daemon would resolve.
