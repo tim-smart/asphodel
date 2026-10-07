@@ -35,19 +35,14 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      # Only Cargo's downloads are cached. `target` is rebuilt each run: a
-      # restored one brought back every earlier head's artifacts and filled
-      # the disk.
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      # Caches Cargo's downloads and the dependencies' build output. Unlike
+      # a whole restored `target`, which brought back every earlier head's
+      # artifacts and filled the disk, it drops the workspace's own crates
+      # and anything the lockfile no longer names before saving. The
+      # toolchain comes from nix, so flake.lock is part of the key.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
+          key: ${{ hashFiles('flake.lock') }}
 
       - name: cargo fmt --check
         run: nix develop -c cargo fmt --check
@@ -65,17 +60,10 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      # As in check, only Cargo's downloads are cached.
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      # As in check.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
+          key: ${{ hashFiles('flake.lock') }}
 
       # nextest runs the test binaries side by side, where `cargo test` runs
       # them one after another. It doesn't run doc tests, so those follow.
