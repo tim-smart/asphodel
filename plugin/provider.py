@@ -1,7 +1,7 @@
 """The ``MemoryProvider`` hook implementation.
 
 ``prefetch`` is the only hook on the
-reply path and Hermes cuts it off at 8 s, so the plugin's own budget is 3 s.
+reply path and Hermes cuts it off at 8 s, so the plugin's own budget is 5 s.
 ``system_prompt_block`` runs at session start with a 2 s budget and one
 retry. ``sync_turn`` already runs on Hermes' single background worker, so it
 sends synchronously and spools on failure. Nothing here ever raises into
@@ -34,8 +34,6 @@ from .spool import Spool
 log = logging.getLogger(__name__)
 
 PROVIDER_NAME = "asphodel"
-#: Shown on the "🧠 recalled N memories" status line.
-PROVIDER_LABEL = "Asphodel"
 #: The daemon major version this plugin was written for. ``initialize`` warns
 #: when the health response's major differs.
 DAEMON_MAJOR_VERSION = 0
@@ -65,7 +63,7 @@ class Timeouts:
     Tests shorten them; production uses the defaults."""
 
     health: float = 2.0
-    prefetch: float = 3.0
+    prefetch: float = 5.0
     system_prompt: float = 2.0
     #: Attempts beyond the first for ``system_prompt_block``.
     system_prompt_retries: int = 1
@@ -119,7 +117,6 @@ class AsphodelMemoryProvider(MemoryProvider):
         self._reply_eligible: Dict[str, bool] = {}
         self._context_versions: Dict[str, int] = {}
         self._context_lock = threading.Lock()
-        self._last_injected: int = 0
         # A block fetched before the session id was known.
         self._pending_block_id: Optional[str] = None
         # Whether a PUT has set the bank up. Until one does, every bank
@@ -363,11 +360,10 @@ class AsphodelMemoryProvider(MemoryProvider):
         """``POST /v1/banks/{bank}/prefetch`` with the query, the session's
         last prefetch query as ``previous_query``, its bounded assistant reply
         as ``previous_reply`` only when attribution is unambiguous and, once,
-        a pending block id. Stores the ``recall_id`` for ``sync_turn`` and the injected count
-        for ``recall_status``. The query goes as Hermes gave it, for the daemon
+        a pending block id. Stores the ``recall_id`` for ``sync_turn``.
+        The query goes as Hermes gave it, for the daemon
         to clean, but one that cleans to nothing isn't sent. "" then and on
         any failure."""
-        self._last_injected = 0
         if not isinstance(query, str) or not _QUERY_NOISE.sub("", query.lstrip(), count=1).strip():
             log.debug("prefetch: skipped, the query cleans to nothing")
             return ""
@@ -432,16 +428,13 @@ class AsphodelMemoryProvider(MemoryProvider):
             pending.append((query, str(recall_id)))
             del pending[:-PENDING_RECALLS_PER_SESSION]
         injected = result.get("injected")
-        self._last_injected = len(injected) if isinstance(injected, list) else 0
-        log.debug("prefetch: recall %s injected %d", recall_id, self._last_injected)
+        injected_count = len(injected) if isinstance(injected, list) else 0
+        log.debug("prefetch: recall %s injected %d", recall_id, injected_count)
         return result.get("text") or ""
 
     def recall_status(self) -> Optional[RecallStatus]:
-        """The last prefetch's injected count; ``None`` when it injected
-        nothing or failed."""
-        if self._last_injected <= 0:
-            return None
-        return RecallStatus(provider_label=PROVIDER_LABEL, count=self._last_injected)
+        """Keep automatic recall silent in Hermes; memory injection still runs."""
+        return None
 
     # -- ingest --------------------------------------------------------------
 
