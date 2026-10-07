@@ -269,10 +269,13 @@ only stops newer claims. Repeats that stay repeats, `ends`, `retracts` and
 the arms' heads drift apart, an on/off comparison needs the union of both
 lists.
 
-Call 2 version 3 shows these fields beside both claims and memories, using
+Call 2 version 5 shows these fields beside both claims and memories, using
 UTC timestamps and `none` for absent dates. Its prompt treats an added
-schedule as a refinement: "needs to pack the carrots" refined by "reminder
-to pack the carrots at 8am on the 30th".
+schedule to the same statement as a refinement: "needs to pack the carrots"
+refined by "reminder to pack the carrots at 8am on the 30th". A refinement
+must keep the statement the memory makes; a different preference, plan or
+fact about the same person or thing gets no label unless another label
+applies.
 
 A fully undated `retracts` still corrects and invalidates its predecessor.
 The replacement carries over the first retracted neighbour's whole window

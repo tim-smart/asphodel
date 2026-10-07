@@ -80,7 +80,7 @@ pub fn guidance_hash(guidance: Option<&str>) -> Option<String> {
 
 /// Call 2's template name and version, which replay's cassette keys include.
 pub const CALL2_TEMPLATE: &str = "reconcile_claims";
-pub const CALL2_VERSION: u32 = 3;
+pub const CALL2_VERSION: u32 = 5;
 
 /// The top five neighbours per claim after fusing vector search and BM25.
 /// A flagged claim's entity-linked open tasks and current states come on top.

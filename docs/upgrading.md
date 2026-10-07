@@ -1,5 +1,21 @@
 # Upgrading
 
+## Call 2 version 5: a refinement keeps the same statement
+
+Call 2's prompt (`reconcile_claims`) now says a `refines` label needs the
+claim to keep the statement the memory makes, only more precisely. A
+different preference, plan or fact about the same person or thing is no
+refinement and gets no label unless another label applies, so it becomes a
+memory of its own instead of replacing the one it resembles. The
+`mentioned_again` definition and the other labels are unchanged. Version 4
+was a prompt that was evaluated and dropped, so this one is 5.
+
+Stored memories and chains are unchanged and nothing is re-extracted. No
+schema migration is needed and purge doesn't pause. Replay cassettes key
+call 2 by template version, so replies recorded under version 3 don't
+answer version 5 requests: strict `replay` misses them, and `fast` and
+`live` ask the LLM again.
+
 ## Shorter trivial and minor lifetimes
 
 The significance mapping changes from 0.1 to 0.0 for trivial memories and
