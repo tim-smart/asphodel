@@ -12,7 +12,9 @@
 //!
 //! The ONNX models load from a [`ModelDir`] that `asphodel models fetch`
 //! fills from the [`manifest`]. Nothing downloads at runtime, and a missing
-//! or corrupt file fails before ONNX Runtime is touched. The fakes are
+//! or corrupt file fails before ONNX Runtime is touched. The daemon serves
+//! them through [`ResidentModels`], which releases an idle model and loads
+//! it again on its next call. The fakes are
 //! deterministic and live here rather than in tests, because the scripted
 //! replay scenarios
 //! run on them under `cargo test`.
@@ -25,6 +27,7 @@ mod gate;
 mod llm;
 mod manifest;
 mod onnx;
+mod resident;
 mod retry;
 pub(crate) mod write;
 
@@ -51,6 +54,7 @@ pub use manifest::{
     EMBEDDING_MODEL_ID, MODEL_FILES, ModelFile, ModelSpec, RERANKER_MODEL_ID, manifest,
 };
 pub use onnx::{OnnxEmbedder, OnnxReranker};
+pub use resident::ResidentModels;
 pub use retry::{LlmRetry, LlmRetrying, RetryBoard, RetryPolicy};
 
 /// How to run the ONNX models.
@@ -179,4 +183,22 @@ pub(crate) fn normalise(vector: &mut [f32]) {
             *value /= norm;
         }
     }
+}
+
+/// The embedding model alone from `dir`, its files checked first.
+pub(crate) fn load_embedder(
+    dir: &ModelDir,
+    options: &ModelOptions,
+) -> Result<OnnxEmbedder, ModelError> {
+    let spec = &manifest()[0];
+    OnnxEmbedder::new(&spec.id, dir.read_verified(spec)?, options)
+}
+
+/// The reranker alone from `dir`, its files checked first.
+pub(crate) fn load_reranker(
+    dir: &ModelDir,
+    options: &ModelOptions,
+) -> Result<OnnxReranker, ModelError> {
+    let spec = &manifest()[1];
+    OnnxReranker::new(&spec.id, dir.read_verified(spec)?, options)
 }

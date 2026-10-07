@@ -60,6 +60,23 @@ Texts are embedded one at a time. The graph is dynamically quantised, so a
 text's vector would otherwise depend on what it was batched with, and the
 reconcile floor needs the same text to give the same vector.
 
+### Releasing idle models
+
+The daemon releases a model's memory once nothing has used it for
+`--model-idle-minutes` / `ASPHODEL_MODEL_IDLE_MINUTES` (15 by default), and
+loads it again, files checked, on its next call. `0` keeps both models
+loaded. Each model goes on its own, so extraction, which only embeds, never
+keeps the reranker loaded. A model is never released while a call is
+running on it, including a reranker call its request gave up on at the
+deadline.
+
+After a release the daemon calls glibc's `malloc_trim`; without it, freed
+model memory stays in the process. With both models released, the daemon's
+resident memory falls by about half (127 MB to 60 MB on a fresh store). A
+reload takes about 0.2 s, paid by the first call after an idle spell, and a
+reranker reload counts against the reranker deadline. The idle time is
+real time, not bank time, and replay never releases its models.
+
 ### The fakes
 
 `FakeEmbedder` and `FakeReranker` are deterministic stand-ins: a hashed bag

@@ -235,6 +235,8 @@ fn measure(
         allow_network_fs: false,
         model_dir: std::env::var_os("ASPHODEL_MODEL_DIR").map(PathBuf::from),
         onnx_threads: None,
+        // A release mid-run would time a reload, not a recall.
+        model_idle_minutes: 0,
     };
     let daemon_stop = stop_tx.clone();
     let daemon = std::thread::spawn(move || -> anyhow::Result<()> {

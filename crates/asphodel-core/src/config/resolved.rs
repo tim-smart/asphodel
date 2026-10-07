@@ -67,16 +67,25 @@ pub struct ModelsConfig {
     pub fake: bool,
     /// `--onnx-threads`, when set.
     pub onnx_threads: Option<usize>,
+    /// `--model-idle-minutes`: how long a model goes unused before it's
+    /// released. `None` when the models stay loaded.
+    pub idle_minutes: Option<u32>,
 }
 
 impl ModelsConfig {
-    pub fn new(models: &Models, fake: bool, onnx_threads: Option<usize>) -> Self {
+    pub fn new(
+        models: &Models,
+        fake: bool,
+        onnx_threads: Option<usize>,
+        idle_minutes: Option<u32>,
+    ) -> Self {
         let ids = models.ids();
         Self {
             embedding: ids.embedding,
             reranker: ids.reranker,
             fake,
             onnx_threads,
+            idle_minutes,
         }
     }
 }

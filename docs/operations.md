@@ -89,6 +89,7 @@ native sidecar (Kubernetes 1.29 or later) in a single-replica StatefulSet.
 | `ASPHODEL_MODEL_DIR` | `--model-dir` | The models. The image sets it. |
 | `ASPHODEL_ALLOW_NETWORK_FS` | `--allow-network-fs` | Run on a network filesystem. |
 | `ASPHODEL_ONNX_THREADS` | `--onnx-threads` | ONNX Runtime's intra-op threads. |
+| `ASPHODEL_MODEL_IDLE_MINUTES` | `--model-idle-minutes` | Minutes unused before a model's memory is released (`docs/models.md`). Default 15; 0 keeps the models loaded. |
 | `ASPHODEL_URL` | `--url` | Where a client finds the daemon. Default `http://127.0.0.1:7720`. |
 | `ASPHODEL_LOG` | none | The log filter (`docs/logging.md`). Default `info`. |
 
