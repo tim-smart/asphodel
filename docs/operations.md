@@ -15,9 +15,10 @@ the flake. It holds:
   ONNX Runtime;
 - the model dir, at `ASPHODEL_MODEL_DIR`, with every file the manifest in
   `crates/asphodel-core/src/models/manifest.rs` lists;
-- the timezone database, at `TZDIR`.
+- the timezone database, at `TZDIR`;
+- BusyBox, so `kubectl exec -it <pod> -c asphodel -- sh` gives a shell.
 
-There's no shell, no package manager and no `/etc/passwd`. The entrypoint
+There's no package manager and no `/etc/passwd`. The entrypoint
 is `asphodel` and the default command is `serve`, so
 `kubectl exec <pod> -c asphodel -- asphodel status` runs any other
 subcommand. It runs as uid and gid 65532.
@@ -741,8 +742,8 @@ check, and the file only appears under its final name once everything
 passed. `-` writes to stdout.
 
 Asphodel has no destination, schedule or retention of its own.
-`deploy/kubernetes/backup.yaml` is a nightly CronJob. The image has no
-shell, so the job takes the copy in two steps: an init container runs
+`deploy/kubernetes/backup.yaml` is a nightly CronJob. The job takes the
+copy in two steps: an init container runs
 `asphodel backup --out /backup/asphodel.db` against the `asphodel`
 Service, and an rclone container uploads the checked file under a
 timestamped name. Retention is the bucket's lifecycle rule.
@@ -830,7 +831,7 @@ fails at once rather than queueing behind it. In Kubernetes:
      untouched. An error that names a move or the data dir's sync means
      you need to look at the data dir.
 
-   The image has no shell, so look with a throwaway pod that mounts the
+   The daemon isn't running, so look with a throwaway pod that mounts the
    claim:
 
    ```sh

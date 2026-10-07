@@ -1,12 +1,13 @@
-# The OCI image: the binary, both models and the timezone database, with no
-# shell. `asphodel serve` is the default command; every other subcommand
-# runs with `kubectl exec <pod> -c asphodel -- asphodel <subcommand>`.
+# The OCI image: the binary, both models, the timezone database and BusyBox
+# for a shell. `asphodel serve` is the default command; every other
+# subcommand runs with `kubectl exec <pod> -c asphodel -- asphodel <subcommand>`.
 #
 # `ASPHODEL_DATA_DIR` is left unset and the image has no `/data`, so a pod
 # whose volume didn't mount fails at startup instead of serving an empty
 # store from the container's own filesystem.
 {
   dockerTools,
+  busybox,
   tzdata,
   asphodel,
   models,
@@ -15,7 +16,7 @@ dockerTools.buildLayeredImage {
   name = "asphodel";
   tag = asphodel.version;
 
-  contents = [asphodel];
+  contents = [asphodel busybox];
 
   extraCommands = ''
     mkdir -m 1777 tmp

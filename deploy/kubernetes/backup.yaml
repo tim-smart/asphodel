@@ -1,9 +1,9 @@
 # A nightly backup. Asphodel has no destination, schedule or
 # retention of its own, so this job owns all three.
 #
-# The image has no shell, so the copy is taken in two steps: the init
-# container writes a checked file with `asphodel backup --out <file>`, which
-# verifies the length and SHA-256 and runs its own integrity check before
+# The copy is taken in two steps: the init container writes a checked file
+# with `asphodel backup --out <file>`, which verifies the length and SHA-256
+# and runs its own integrity check before
 # the file appears, and rclone uploads it under a timestamped name. Retention
 # is the bucket's lifecycle rule. Without a file in between, the stream would
 # reach the bucket before its hash was checked. From a host with Bash and

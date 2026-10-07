@@ -24,7 +24,7 @@ restarts it.
 ### In Kubernetes
 
 `nix build .#image` builds the OCI image: the binary, ONNX Runtime, both
-models and the timezone database, with no shell. Load it with
+models, the timezone database and BusyBox for a shell. Load it with
 `docker load < result` and push it to your registry.
 
 `deploy/kubernetes/` has the example deployment: Hermes with Asphodel as a
