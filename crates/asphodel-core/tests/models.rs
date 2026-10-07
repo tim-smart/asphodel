@@ -1192,6 +1192,128 @@ fn a_call_retrying_through_an_outage_shows_in_status_until_it_ends() {
     assert_eq!(seen(&service), before);
 }
 
+// Releasing idle models.
+
+/// Resident models on the fakes, counting each model's loads. The embedder
+/// is `embedder()`'s.
+fn resident(
+    embedder: impl Fn() -> Arc<dyn Embedder> + Send + Sync + 'static,
+) -> (ResidentModels, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let embedder_loads = Arc::new(AtomicUsize::new(0));
+    let reranker_loads = Arc::new(AtomicUsize::new(0));
+    let resident = ResidentModels::new(
+        {
+            let loads = Arc::clone(&embedder_loads);
+            move || {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok(embedder())
+            }
+        },
+        {
+            let loads = Arc::clone(&reranker_loads);
+            move || {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(FakeReranker) as Arc<dyn Reranker>)
+            }
+        },
+    )
+    .unwrap();
+    (resident, embedder_loads, reranker_loads)
+}
+
+#[test]
+fn idle_models_are_released_and_load_again_on_their_next_call() {
+    let (resident, embedder_loads, reranker_loads) =
+        resident(|| Arc::new(FakeEmbedder) as Arc<dyn Embedder>);
+    // Startup loads each model once, so a missing file still fails fast.
+    assert_eq!(embedder_loads.load(Ordering::SeqCst), 1);
+    assert_eq!(reranker_loads.load(Ordering::SeqCst), 1);
+    let models = resident.models();
+    let text = "The cat sat on the mat.";
+    let expected = FakeEmbedder.embed(&[text]).unwrap();
+
+    // A model used within the idle time stays loaded.
+    assert_eq!(models.embedder.embed(&[text]).unwrap(), expected);
+    resident.release_idle(Duration::from_secs(60 * 60));
+    assert_eq!(models.embedder.embed(&[text]).unwrap(), expected);
+    assert_eq!(embedder_loads.load(Ordering::SeqCst), 1);
+
+    // Released, the models still name themselves without loading, so a
+    // new bank records them and the floors still apply.
+    resident.release_idle(Duration::ZERO);
+    assert_eq!(models.ids(), Models::fake().ids());
+    assert_eq!(models.embedder.dimensions(), EMBEDDING_DIMENSIONS);
+    assert_eq!(embedder_loads.load(Ordering::SeqCst), 1);
+    assert_eq!(reranker_loads.load(Ordering::SeqCst), 1);
+
+    // The next call loads only the model it needs, and answers as before.
+    assert_eq!(models.embedder.embed(&[text]).unwrap(), expected);
+    assert_eq!(embedder_loads.load(Ordering::SeqCst), 2);
+    assert_eq!(reranker_loads.load(Ordering::SeqCst), 1);
+    let logits = models.reranker.rerank("cat", &["a cat", "a dog"]).unwrap();
+    assert_eq!(logits, vec![0.5, -0.5]);
+    assert_eq!(reranker_loads.load(Ordering::SeqCst), 2);
+}
+
+/// The fake embedder, but each call waits inside the model until `go`
+/// lets it finish, after saying on `entered` that it's running.
+struct Blocking {
+    entered: Mutex<std::sync::mpsc::Sender<()>>,
+    go: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Embedder for Blocking {
+    fn model_id(&self) -> &str {
+        FakeEmbedder.model_id()
+    }
+
+    fn dimensions(&self) -> usize {
+        FakeEmbedder.dimensions()
+    }
+
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.entered.lock().unwrap().send(()).unwrap();
+        self.go.lock().unwrap().recv().unwrap();
+        FakeEmbedder.embed(texts)
+    }
+}
+
+#[test]
+fn a_model_is_not_released_while_a_call_is_running_on_it() {
+    let (entered, running) = std::sync::mpsc::channel();
+    let (go, gate) = std::sync::mpsc::channel();
+    let blocking: Arc<dyn Embedder> = Arc::new(Blocking {
+        entered: Mutex::new(entered),
+        go: Mutex::new(gate),
+    });
+    let (resident, embedder_loads, _) = resident(move || Arc::clone(&blocking));
+    let models = resident.models();
+    let text = "The cat sat on the mat.";
+    let expected = FakeEmbedder.embed(&[text]).unwrap();
+
+    // A call is inside the model, as a reranker call cut off by its
+    // deadline still is, when the idle check comes round.
+    let call = std::thread::spawn({
+        let embedder = Arc::clone(&models.embedder);
+        move || embedder.embed(&[text])
+    });
+    running.recv().unwrap();
+    resident.release_idle(Duration::ZERO);
+    go.send(()).unwrap();
+    assert_eq!(call.join().unwrap().unwrap(), expected);
+
+    // The running call kept the model, so the next call finds it loaded.
+    go.send(()).unwrap();
+    assert_eq!(models.embedder.embed(&[text]).unwrap(), expected);
+    assert_eq!(embedder_loads.load(Ordering::SeqCst), 1);
+
+    // Idle again, it's released, and comes back on the call after.
+    resident.release_idle(Duration::ZERO);
+    go.send(()).unwrap();
+    assert_eq!(models.embedder.embed(&[text]).unwrap(), expected);
+    assert_eq!(embedder_loads.load(Ordering::SeqCst), 2);
+}
+
 // The real models. Ignored: they run only when the models are present.
 
 /// The real models on this machine, from the dir the daemon would resolve.
