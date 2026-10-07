@@ -30,11 +30,11 @@ def test_previous_query_is_the_last_prefetch_query_for_the_session(make_provider
     assert bodies[2].get("previous_query") is None
 
 
-def test_recall_status_reports_the_last_injected_count(make_provider, daemon):
+def test_successful_recall_injects_memories_without_a_status(make_provider, daemon):
     provider = make_provider()
-    provider.prefetch("tea?", session_id=SESSION)
-    status = provider.recall_status()
-    assert status is not None and status.count == 2
+    assert provider.recall_status() is None
+    assert provider.prefetch("tea?", session_id=SESSION) == INJECTION
+    assert provider.recall_status() is None
 
 
 def test_returns_empty_and_no_status_when_the_daemon_is_down(make_provider, daemon):
