@@ -156,7 +156,7 @@ class AsphodelMemoryProvider(MemoryProvider):
             self._hermes_home = str(kwargs.get("hermes_home") or self._resolve_home())
             self._session_id = session_id or ""
             self._platform = kwargs.get("platform") or None
-            self._agent_context = kwargs.get("agent_context") or PRIMARY_CONTEXT
+            self._agent_context = _agent_context(kwargs.get("agent_context"), self._platform)
             self._profile = kwargs.get("agent_identity") or "default"
             self.config = plugin_config.load_config(self._hermes_home)
             self.client = DaemonClient(self.config.url, token=self.config.token, breaker=self.breaker)
@@ -448,10 +448,11 @@ class AsphodelMemoryProvider(MemoryProvider):
         turn_author: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Keeps the bounded reply prefix only for an unambiguous latest query.
-        Ingests the turn when ``agent_context`` is ``primary`` and
-        ``ingest`` is on. Builds the ``Turn`` body with :func:`build_turn`,
-        ``POST``s it, and spools it on a connection failure or 5xx. After a
-        2xx it replays the spool."""
+        Ingests the turn when ``agent_context`` is ``primary``, a human
+        wrote the user row (not an async delegation result or other
+        notification Hermes injects) and ``ingest`` is on. Builds the
+        ``Turn`` body with :func:`build_turn`, ``POST``s it, and spools it on
+        a connection failure or 5xx. After a 2xx it replays the spool."""
         try:
             session = session_id or self._session_id
             # Never attach a late reply to a newer query. Text alone cannot
@@ -465,7 +466,7 @@ class AsphodelMemoryProvider(MemoryProvider):
                     self._last_reply[session] = (assistant_content or "")[:RERANK_CONTEXT_CHARS]
             if self.client is None or self.config is None or not self.bank:
                 return
-            if self._agent_context != PRIMARY_CONTEXT or not self.config.ingest:
+            if self._agent_context != PRIMARY_CONTEXT or not self.config.ingest or not turns.human_turn(messages):
                 return
             turn = self.build_turn(
                 user_content,
@@ -759,3 +760,18 @@ def _author(turn_author: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "name": str(name) if name else None,
         "is_bot": bool(turn_author.get("is_bot", False)),
     }
+
+
+def _agent_context(context: Optional[str], platform: Optional[str]) -> str:
+    """Hermes' ``agent_context``, or the session source when Hermes calls a
+    non-human run, such as a kanban worker, ``primary``."""
+    context = context or PRIMARY_CONTEXT
+    if context != PRIMARY_CONTEXT:
+        return context
+    try:
+        from agent.session_source import session_source_for
+
+        source = session_source_for(platform)
+    except Exception:
+        return context
+    return source if source in turns.NON_HUMAN_SOURCES else context

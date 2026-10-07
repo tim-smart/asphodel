@@ -14,8 +14,10 @@
 //! Carried-tail clones keep their original timestamps under later ids, so
 //! timestamp order replays them when they were said. Hermes' summary row
 //! (`_compressed_summary=1`) is skipped, and a clear is emitted at its time.
-//! Cron sessions get prefetch only, and subagent sessions (`parent_session_id`
-//! set) are skipped.
+//! Cron sessions get prefetch only. Subagent sessions (`parent_session_id`
+//! set) and the sessions of other non-human runs (kanban workers, tool
+//! integrations, one-shot runs) are skipped. A turn whose user row Hermes
+//! made itself, such as an async delegation result, gets prefetch only.
 
 use std::path::Path;
 
@@ -59,6 +61,7 @@ const REQUIRED_COLUMNS: [(&str, &[(&str, &str)]); 3] = [
             ("compacted", "INTEGER"),
             ("_compressed_summary", "INTEGER"),
             ("tool_calls", "TEXT"),
+            ("display_kind", "TEXT"),
         ],
     ),
     ("schema_version", &[("version", "INTEGER")]),
@@ -74,6 +77,13 @@ const MULTIMODAL_PREFIX: &str = "\u{0}json:";
 
 /// The session `source` Hermes gives cron runs.
 const CRON_SOURCE: &str = "cron";
+
+/// Session sources Hermes gives runs that aren't a human conversation.
+const NON_HUMAN_SOURCES: [&str; 4] = ["kanban", "subagent", "tool", "oneshot"];
+
+/// The one user-row `display_kind` a human wrote: a typed `/steer`. Every
+/// other kind marks a row Hermes made itself.
+const STEER_DISPLAY_KIND: &str = "steer";
 
 /// Runs the command: exit 0 with the counts on stdout, 2 when refused.
 pub fn run(args: ImportArgs) -> anyhow::Result<()> {
@@ -218,6 +228,7 @@ struct MessageRow {
     at: f64,
     summary: bool,
     tool_calls: Option<String>,
+    display_kind: Option<String>,
 }
 
 /// A turn being assembled: the user row and the final assistant reply so
@@ -261,13 +272,17 @@ fn import(
         "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND active = 0 AND compacted = 0",
     )?;
     let mut statement = conn.prepare(
-        "SELECT role, content, timestamp, _compressed_summary, tool_calls
+        "SELECT role, content, timestamp, _compressed_summary, tool_calls, display_kind
          FROM messages WHERE session_id = ?1 AND (active = 1 OR compacted = 1)
          ORDER BY timestamp, id",
     )?;
     for session in &sessions {
         if session.parent.is_some() {
             counts.subagent_sessions_skipped += 1;
+            continue;
+        }
+        if NON_HUMAN_SOURCES.contains(&session.source.as_str()) {
+            counts.non_human_sessions_skipped += 1;
             continue;
         }
         let class = if session.source == CRON_SOURCE {
@@ -287,6 +302,7 @@ fn import(
                     at: row.get(2)?,
                     summary: row.get::<_, i64>(3)? != 0,
                     tool_calls: row.get(4)?,
+                    display_kind: row.get(5)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -325,8 +341,16 @@ fn import(
                 },
             });
             *previous_query = Some(user_text.clone());
+            let synthetic = turn
+                .user
+                .display_kind
+                .as_deref()
+                .is_some_and(|kind| kind != STEER_DISPLAY_KIND);
+            if synthetic {
+                counts.synthetic_turns += 1;
+            }
             match (&turn.assistant, class) {
-                (Some(assistant), SessionClass::Primary) => {
+                (Some(assistant), SessionClass::Primary) if !synthetic => {
                     let (assistant_text, _) =
                         plain_text(assistant.content.as_deref().unwrap_or(""), &block, counts)?;
                     let reply_at = epoch(assistant.at)?.max(at);

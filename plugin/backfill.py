@@ -12,8 +12,10 @@ live writer is never read mid-transaction:
 - a ``_compressed_summary`` row is skipped and counted, and posts nothing:
   a session clear changes only live injection state, which historical turns
   never made, so a backfilled one could only wipe a live session's;
-- cron sessions and subagent sessions (``parent_session_id`` set) post
-  nothing;
+- cron sessions, subagent sessions (``parent_session_id`` set) and the
+  sessions of other non-human runs (kanban workers, tool integrations,
+  one-shot runs) post nothing, and neither does a turn whose user row
+  Hermes made itself, such as an async delegation result;
 - the injected memory block is cut from the text, multimodal content is
   reduced to its text, backfilled channel history is stripped, and a
   ``[Name] `` prefix naming a ``--speaker`` makes that speaker the author.
@@ -84,6 +86,7 @@ REQUIRED_COLUMNS = (
             ("compacted", "INTEGER"),
             ("_compressed_summary", "INTEGER"),
             ("tool_calls", "TEXT"),
+            ("display_kind", "TEXT"),
         ),
     ),
     ("schema_version", (("version", "INTEGER"),)),
@@ -104,6 +107,7 @@ COUNT_KEYS = (
     "primary_sessions",
     "cron_sessions",
     "subagent_sessions_skipped",
+    "non_human_sessions_skipped",
     "turns",
     "prefetch_only_turns",
     "compactions",
@@ -115,6 +119,7 @@ COUNT_KEYS = (
     "image_parts_dropped",
     "backfills_stripped",
     "non_owner_turns",
+    "synthetic_turns",
 )
 
 EXIT_STOPPED = 1
@@ -318,13 +323,16 @@ def _walk(conn: sqlite3.Connection, *, speakers: Dict[str, str], timezone_name: 
         if parent is not None:
             counts["subagent_sessions_skipped"] += 1
             continue
+        if source in turns.NON_HUMAN_SOURCES:
+            counts["non_human_sessions_skipped"] += 1
+            continue
         cron = source == CRON_SOURCE
         counts["cron_sessions" if cron else "primary_sessions"] += 1
         counts["inactive_rows_skipped"] += conn.execute(
             "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 0 AND compacted = 0", (session,)
         ).fetchone()[0]
         rows = conn.execute(
-            "SELECT role, content, timestamp, _compressed_summary, tool_calls FROM messages "
+            "SELECT role, content, timestamp, _compressed_summary, tool_calls, display_kind FROM messages "
             "WHERE session_id = ? AND (active = 1 OR compacted = 1) ORDER BY timestamp, id",
             (session,),
         ).fetchall()
@@ -335,7 +343,10 @@ def _walk(conn: sqlite3.Connection, *, speakers: Dict[str, str], timezone_name: 
                 return
             user, assistant = open_turn
             user_text, author = _user_text(user[1] or "", speakers, counts)
-            if assistant is None or cron:
+            synthetic = not turns.human_display_kind(user[5])
+            if synthetic:
+                counts["synthetic_turns"] += 1
+            if assistant is None or cron or synthetic:
                 counts["prefetch_only_turns"] += 1
                 return
             assistant_text = _plain_text(assistant[1] or "", counts)
@@ -366,7 +377,7 @@ def _walk(conn: sqlite3.Connection, *, speakers: Dict[str, str], timezone_name: 
 
         open_turn = None
         for row in rows:
-            role, _, _, summary, tool_calls = row
+            role, _, _, summary, tool_calls, _ = row
             if summary:
                 # Hermes replaced the turns before here with this summary. The
                 # importer replays a clear here; the backfill only counts it.

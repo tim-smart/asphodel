@@ -144,6 +144,7 @@ pub struct Message<'a> {
     pub compacted: bool,
     pub summary: bool,
     pub api_content: Option<&'a str>,
+    pub display_kind: Option<&'a str>,
 }
 
 impl Default for Message<'_> {
@@ -158,6 +159,7 @@ impl Default for Message<'_> {
             compacted: false,
             summary: false,
             api_content: None,
+            display_kind: None,
         }
     }
 }
@@ -219,8 +221,8 @@ impl StateDb {
         self.conn
             .execute(
                 "INSERT INTO messages (session_id, role, content, timestamp, tool_calls,
-                     active, compacted, _compressed_summary, api_content)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     active, compacted, _compressed_summary, api_content, display_kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     message.session,
                     message.role,
@@ -231,6 +233,7 @@ impl StateDb {
                     message.compacted,
                     message.summary,
                     message.api_content,
+                    message.display_kind,
                 ],
             )
             .unwrap();
@@ -245,6 +248,26 @@ impl StateDb {
             content: user,
             at,
             api_content: Some(API_CONTENT_SENTINEL),
+            ..Message::default()
+        });
+        self.message(Message {
+            session,
+            role: "assistant",
+            content: assistant,
+            at: at + 30.0,
+            ..Message::default()
+        });
+    }
+
+    /// A turn whose user row Hermes injected itself, typed with
+    /// `display_kind`, such as an async delegation result.
+    pub fn injected_turn(&self, session: &str, at: f64, kind: &str, user: &str, assistant: &str) {
+        self.message(Message {
+            session,
+            role: "user",
+            content: user,
+            at,
+            display_kind: Some(kind),
             ..Message::default()
         });
         self.message(Message {
@@ -374,7 +397,8 @@ pub const HOME_QUOTE: &str = "I live in Auckland";
 pub const HOME_SENTENCE: &str = "Tim lives in Auckland.";
 
 /// A small history over a week: a primary session with the home turn and a
-/// few more, a cron session and a subagent session.
+/// few more, a cron session, a subagent session, a kanban worker's session
+/// and an async delegation result Hermes injected into a primary session.
 pub fn small_history(path: &Path) -> StateDb {
     let db = StateDb::create(path);
     let start = start();
@@ -410,12 +434,28 @@ pub fn small_history(path: &Path) -> StateDb {
         "Done.",
     );
 
+    let kanban = start + 4.5 * DAY;
+    db.session("s-kanban", "kanban", None, None, kanban);
+    db.turn(
+        "s-kanban",
+        kanban,
+        "work kanban task t_1",
+        "Kanban task done.",
+    );
+
     db.owner_session("s-later", start + 5.0 * DAY);
     db.turn(
         "s-later",
         start + 5.0 * DAY,
         "Any plans for the weekend?",
         "A walk, maybe.",
+    );
+    db.injected_turn(
+        "s-later",
+        start + 5.0 * DAY + 600.0,
+        "internal_notification",
+        "[ASYNC DELEGATION COMPLETE — deleg_1] Delegated result.",
+        "The delegated work is done.",
     );
     db
 }

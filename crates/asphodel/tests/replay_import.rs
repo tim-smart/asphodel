@@ -254,10 +254,11 @@ fn speakers_come_from_the_prefix_and_backfill_is_stripped() {
     assert!(!text(&corpus).contains("BACKFILLED-CHANNEL-HISTORY"));
 }
 
-/// Cron sessions get prefetch only, and subagent
-/// sessions (those with a `parent_session_id`) are skipped.
+/// Cron sessions get prefetch only. Subagent sessions (those with a
+/// `parent_session_id`) and kanban worker sessions are skipped. A turn
+/// Hermes injected into a primary session gets prefetch only.
 #[test]
-fn cron_sessions_get_prefetch_only_and_subagent_sessions_nothing() {
+fn only_human_turns_sync() {
     let dir = TestDir::new();
     let corpus = import_history(&dir, hermes::small_history);
 
@@ -269,6 +270,12 @@ fn cron_sessions_get_prefetch_only_and_subagent_sessions_nothing() {
     );
     assert!(session_events(&corpus, "s-sub").is_empty());
     assert!(!text(&corpus).contains("Subagent task"));
+    assert!(session_events(&corpus, "s-kanban").is_empty());
+    assert!(!text(&corpus).contains("work kanban task"));
+    assert_eq!(
+        kinds(&session_events(&corpus, "s-later")),
+        ["prefetch", "sync", "prefetch"]
+    );
 
     // The primary sessions are there, a prefetch and a sync per turn.
     assert_eq!(

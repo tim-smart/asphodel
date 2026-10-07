@@ -6,11 +6,13 @@
   "inactive_rows_skipped": 2,
   "memory_blocks_stripped": 1,
   "multimodal_rows": 1,
+  "non_human_sessions_skipped": 1,
   "non_owner_turns": 2,
-  "prefetch_only_turns": 1,
+  "prefetch_only_turns": 2,
   "primary_sessions": 4,
   "subagent_sessions_skipped": 1,
   "summary_rows_skipped": 1,
+  "synthetic_turns": 1,
   "tool_rows_skipped": 2,
   "turns": 13
 }

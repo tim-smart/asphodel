@@ -343,7 +343,9 @@ HERMES_HOME=~/.hermes python3 backfill.py --all-history --speaker Sam=discord:12
 
 It reads an online-backup copy of `state.db`, never the live file, using
 the rules of `asphodel import`. Only turns Hermes still keeps for search are
-read. Tool rows, cron sessions and subagent sessions are skipped. The
+read. Tool rows, cron sessions, subagent and kanban worker sessions, and
+turns Hermes injected itself (such as async delegation results) are
+skipped. The
 injected memory block (Hindsight's `<memory-context>`) is cut from the
 user's text, so Hindsight's memories aren't extracted as the user's own
 words. A schema version other than 30 or 31 is refused.

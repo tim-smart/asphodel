@@ -53,6 +53,7 @@ pub struct Counts {
     pub primary_sessions: u64,
     pub cron_sessions: u64,
     pub subagent_sessions_skipped: u64,
+    pub non_human_sessions_skipped: u64,
     pub turns: u64,
     pub prefetch_only_turns: u64,
     pub compactions: u64,
@@ -64,6 +65,7 @@ pub struct Counts {
     pub image_parts_dropped: u64,
     pub backfills_stripped: u64,
     pub non_owner_turns: u64,
+    pub synthetic_turns: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

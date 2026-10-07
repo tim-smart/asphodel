@@ -10,6 +10,13 @@ from typing import Any, Dict, List, Optional
 #: the user text on backfill. Everything before it is other people's words.
 NEW_MESSAGE_MARKER = "[New message]"
 FORGET_TOOL = "memory_forget"
+#: Hermes session sources that aren't a human conversation: kanban workers,
+#: delegated subagents, tool integrations and one-shot runs.
+NON_HUMAN_SOURCES = frozenset({"kanban", "subagent", "tool", "oneshot"})
+#: The one user-row ``display_kind`` a human wrote: a typed ``/steer``. Every
+#: other kind marks a row Hermes made itself, such as an async delegation
+#: result or a process completion.
+STEER_DISPLAY_KIND = "steer"
 
 
 def strip_backfill(user_text: str) -> str:
@@ -32,6 +39,17 @@ def current_turn_rows(messages: Optional[List[Dict[str, Any]]]) -> List[Dict[str
         if isinstance(row, dict) and row.get("role") == "user":
             return list(messages[index:])
     return []
+
+
+def human_display_kind(kind: Optional[str]) -> bool:
+    return not kind or kind == STEER_DISPLAY_KIND
+
+
+def human_turn(messages: Optional[List[Dict[str, Any]]]) -> bool:
+    """False when the current turn's user row is one Hermes made itself.
+    A turn without a transcript is taken as human."""
+    rows = current_turn_rows(messages)
+    return not rows or human_display_kind(rows[0].get("display_kind"))
 
 
 def forget_requested(messages: Optional[List[Dict[str, Any]]]) -> bool:

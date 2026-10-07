@@ -122,15 +122,36 @@ def test_recall_id_is_per_session(make_provider, daemon):
 
 
 @pytest.mark.parametrize(
-    "setup",
-    [dict(init={"agent_context": "cron"}), dict(ingest=False)],
-    ids=["not-a-primary-agent", "ingest-off"],
+    "setup, source",
+    [
+        (dict(init={"agent_context": "cron"}), None),
+        (dict(init={"platform": "cli"}), "kanban"),
+        (dict(ingest=False), None),
+    ],
+    ids=["not-a-primary-agent", "kanban-worker", "ingest-off"],
 )
-def test_nothing_is_ingested_but_recall_still_works(make_provider, daemon, setup):
+def test_nothing_is_ingested_but_recall_still_works(make_provider, daemon, monkeypatch, setup, source):
+    if source:
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", source)
     provider = make_provider(**setup)
     sync(provider)
     assert daemon.requests_for("turns") == []
     assert provider.prefetch("tea?", session_id=SESSION) != ""
+
+
+def test_only_turns_a_human_wrote_are_ingested(make_provider, daemon):
+    """Hermes injects async delegation results and other notifications as
+    user rows in the owner's session, typed with a ``display_kind``. Only a
+    typed ``/steer`` is the owner's own words."""
+    provider = make_provider()
+    owner = {"id": "111", "name": "Tim", "is_bot": False}
+    for kind, user in [
+        ("internal_notification", "[ASYNC DELEGATION BATCH COMPLETE — deleg_1]"),
+        ("async_delegation_complete", "[ASYNC DELEGATION COMPLETE — deleg_2]"),
+        ("steer", "Use the cheaper flights."),
+    ]:
+        sync(provider, user=user, messages=transcript(user, "Noted.", epoch=EPOCH, display_kind=kind), turn_author=owner)
+    assert [r.body["user_text"] for r in daemon.requests_for("turns")] == ["Use the cheaper flights."]
 
 
 # -- recall ids across overlapping turns -----------------------------------------

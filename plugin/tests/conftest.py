@@ -70,6 +70,8 @@ def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.delenv("ASPHODEL_URL", raising=False)
     monkeypatch.delenv("ASPHODEL_TOKEN", raising=False)
+    for name in ("HERMES_SESSION_SOURCE", "HERMES_SESSION_SOURCE_EXPLICIT", "HERMES_SINGLE_QUERY_SESSION"):
+        monkeypatch.delenv(name, raising=False)
     hermes_stubs.HermesState.reset()
     return home
 
@@ -132,13 +134,18 @@ def make_provider(hermes_home, daemon, clock, warnings):
     return make
 
 
-def transcript(user_text: str, assistant_text: str, *, epoch: float = 1759371557.622, tool_calls=None, earlier=()):
+def transcript(
+    user_text: str, assistant_text: str, *, epoch: float = 1759371557.622, tool_calls=None, earlier=(), display_kind=None
+):
     """An OpenAI-style transcript as Hermes passes it to ``sync_turn``: any
-    ``earlier`` rows, then this turn's user row stamped with ``epoch``, the
+    ``earlier`` rows, then this turn's user row stamped with ``epoch`` and
+    typed with any ``display_kind``, the
     assistant's tool calls (each ``(name, args)`` becomes an assistant row
     with ``tool_calls`` and a tool row) and the final assistant row."""
     rows = list(earlier)
     rows.append({"role": "user", "content": user_text, "timestamp": epoch})
+    if display_kind:
+        rows[-1]["display_kind"] = display_kind
     for index, (name, args) in enumerate(tool_calls or ()):
         call_id = f"call_{index}"
         rows.append(

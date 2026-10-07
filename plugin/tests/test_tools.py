@@ -49,8 +49,9 @@ def test_the_owner_may_forget_keep_and_unkeep(make_provider, daemon, author):
         ({"platform": "telegram"}, dict(author_id="111", author_name="Tim", author_is_bot=False)),
         ({"agent_context": "cron"}, {}),
         ({"agent_context": "cron"}, dict(author_id="111", author_name="Tim", author_is_bot=False)),
+        ({"agent_context": "subagent"}, {}),
     ],
-    ids=["another-speaker", "bot-with-owner-id", "owner-id-on-another-platform", "cron", "cron-with-owner-id"],
+    ids=["another-speaker", "bot-with-owner-id", "owner-id-on-another-platform", "cron", "cron-with-owner-id", "subagent"],
 )
 def test_a_non_owner_is_refused_without_a_request(make_provider, daemon, init, author):
     provider = make_provider(init=init)

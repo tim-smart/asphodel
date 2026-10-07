@@ -95,9 +95,9 @@ def is_owner(
 ) -> bool:
     """A turn with no author (CLI, TUI, Hermes UI) is the owner's. With an
     author, the owner is matched by speaker id ``<platform>:<author_id>``
-    against the configured owner ids. Bots and cron runs are never the
-    owner."""
-    if agent_context == "cron" or author_is_bot:
+    against the configured owner ids. Bots and non-primary runs (cron,
+    kanban workers, subagents) are never the owner."""
+    if agent_context not in (None, "primary") or author_is_bot:
         return False
     if not author_id:
         return True

@@ -580,7 +580,10 @@ Hermes uses for search, in `timestamp` order, not row id. Then, per primary sess
   is stripped, and the `[Name] ` prefix stays and picks the speaker: a
   manifest `[[speaker]]` by name, else the owner;
 - cron sessions (`source = "cron"`) get prefetch only, as class `cron`;
-  subagent sessions (`parent_session_id` set) produce nothing.
+  subagent sessions (`parent_session_id` set) and kanban, tool and
+  one-shot sessions produce nothing;
+- a turn whose user row has a `display_kind` other than `steer` (one
+  Hermes injected, such as an async delegation result) gets prefetch only.
 
 The manifest is TOML: `timezone`, `bank` (default `main`), `assistant`,
 `[owner] name, platform_ids`, `[[speaker]] name, id`, an optional

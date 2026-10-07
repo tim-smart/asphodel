@@ -1,7 +1,7 @@
 """Stand-ins for the Hermes modules the plugin imports, so the tests run
 without a Hermes checkout. The shapes follow hermes-agent at ``be5e9f7``:
 ``agent/memory_provider.py`` (the base class, abstract members and
-``spawn_context_thread``), ``tools/registry.py`` (``tool_error``),
+``spawn_context_thread``), ``agent/session_source.py``, ``tools/registry.py`` (``tool_error``),
 ``hermes_time``, ``hermes_constants``, ``hermes_cli.config`` and
 ``plugins/memory/config_schema.py``."""
 
@@ -198,6 +198,19 @@ class ProviderConfigSchema:
     fields: tuple = dataclass_field(default_factory=tuple)
 
 
+# -- agent.session_source ---------------------------------------------------------
+
+def session_source_for(platform: Optional[str]) -> str:
+    source = os.environ.get("HERMES_SESSION_SOURCE", "").strip()
+    single_query = os.environ.get("HERMES_SINGLE_QUERY_SESSION") == "1"
+    explicit = os.environ.get("HERMES_SESSION_SOURCE_EXPLICIT") == "1"
+    if single_query and not explicit and source in ("tui", "desktop"):
+        source = ""
+    if single_query and not source and (platform or "cli") == "cli":
+        return "oneshot"
+    return source or platform or "cli"
+
+
 def install() -> None:
     """Puts the stubs in ``sys.modules``. Idempotent."""
     if "agent.memory_provider" in sys.modules and getattr(sys.modules["agent.memory_provider"], "_asphodel_stub", False):
@@ -210,6 +223,9 @@ def install() -> None:
     memory_provider.spawn_context_thread = spawn_context_thread
     memory_provider.ctx_bound = ctx_bound
     agent.memory_provider = memory_provider
+    session_source = _module("agent.session_source")
+    session_source.session_source_for = session_source_for
+    agent.session_source = session_source
 
     tools = _module("tools")
     registry = _module("tools.registry")
