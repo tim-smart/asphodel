@@ -14,7 +14,7 @@ use crate::queue::SourceKind;
 
 const SCHEMA_NAME: &str = "call1_claims";
 
-const SYSTEM: &str = r#"Extract claims worth remembering from a conversation turn or document section for a personal assistant's long-term memory. Also identify which memories in the assistant's context its reply relied on.
+const SYSTEM: &str = r#"Extract claims worth remembering from a conversation turn or document section for a assistant's long-term memory. Also identify which memories in the assistant's context its reply relied on.
 
 # Claims
 
@@ -28,11 +28,13 @@ Extract:
 - What the speaker says about themselves, the people, places and things in their life, and their plans, tasks and preferences. "I" and "me" mean the speaker of that passage, which may be someone else inside quoted or relayed speech.
 - The speaker's short answers and references to earlier context, written out in full. "Yes" after "Are you still at Acme?" becomes "Alex still works at Acme.", quoting "Yes". A "remember that" referring to an earlier statement works the same way.
 - From the assistant's reply, only decisions, commitments, durable content and storage locations stated while carrying out the speaker's request. A promise to act, monitor or follow up is an assistant task, not a fact or state about the assistant's commitment. Extract it only if the speaker requested that task and it has a due date or an until-event beyond this turn; otherwise skip the promise as assistant bookkeeping.
+- What the speaker wanted, when a request concerns their life (people, places, purchases, plans, interests). Extract an `event` recording the intent, not the asking: "Alex wanted to try the Corner Cafe's online ordering on 7 October 2026, without buying." Do not record whether the assistant acted or the outcome unless the text states it. Usually `trivial`.
 
 Apply the skips below to each proposition, not to the whole passage: a request, message or temporary situation can still contain an explicitly stated lasting fact worth extracting.
 
 Skip:
-- The fact that someone asked a question or made a request.
+- Questions or requests without concerns about the users life.
+- Requests whose only content is the assistant operating its own tools, notes or system.
 - The assistant's suggestions, general knowledge and tool findings.
 - Routine operations: commands, checks, restarts, result reports, and adding, updating, saving, removing, restoring, moving or verifying notes or files. Extract the durable content, decision or commitment, not an event about the operation. A date or path alone does not make an operation worth remembering.
 - Storage locations already stated in the supplied context. Extract where something durable is kept only as a fact about the thing ("the trip notes are in 07_Trips/Anniversary"), not an edit event.
