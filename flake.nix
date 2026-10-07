@@ -3,11 +3,13 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs = {
     self,
     nixpkgs,
+    crane,
     ...
   }: let
     inherit (nixpkgs) lib;
@@ -17,6 +19,7 @@
   in {
     packages = forAllSystems (pkgs: let
       asphodel = pkgs.callPackage ./nix/package.nix {
+        craneLib = crane.mkLib pkgs;
         gitSha = self.rev or (self.dirtyRev or null);
       };
       models = pkgs.callPackage ./nix/models.nix {inherit asphodel;};
