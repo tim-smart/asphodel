@@ -42,10 +42,12 @@ export function route(hash) {
       ? id
         ? "memory"
         : "memories"
-      : section === "documents" && !id
-        ? "documents"
-        : section === "sources" && id
+      : section === "sources"
+        ? id
           ? "source"
+          : "sources"
+        : section === "documents" && !id
+          ? "sources"
           : section === "chunks" && !id
             ? "chunks"
             : section === "recall" && !id
@@ -199,13 +201,13 @@ async function banks(ctx) {
         ]),
         counts(h, "Sources", [
           [
-            h("a", { href: bankHash(bank.name, "documents") }, "Documents"),
+            h("a", { href: bankHash(bank.name, "sources") }, "Documents"),
             String(bank.sources.documents),
             bank.sources.document_versions !== bank.sources.documents
               ? h("span", { class: "quiet-text" }, `(${plural(bank.sources.document_versions, "version")})`)
               : null,
           ],
-          ["Turns", String(bank.sources.turns)],
+          [h("a", { href: bankHash(bank.name, "sources") }, "Turns"), String(bank.sources.turns)],
           bank.sources.removed ? ["Removed", String(bank.sources.removed)] : null,
         ]),
         counts(h, "Ingestion", [
@@ -740,7 +742,7 @@ function headingPath(path) {
   }
 }
 
-function groupDocuments(sources) {
+function groupVersions(sources) {
   const groups = new Map();
   for (const source of sources) {
     const key = source.document_id ?? source.id;
@@ -751,36 +753,44 @@ function groupDocuments(sources) {
   return [...groups.values()];
 }
 
-// The bank's documents, one entry per document id, newest version first.
-async function documents(ctx) {
+// The bank's turns and documents, newest first: one entry per turn, and one
+// per document id with its newest version.
+async function sources(ctx) {
   const { api, ui, bank } = ctx;
   const { h, time, pill } = ui;
-  const first = await api.sources(bank, { kind: "document", limit: 200 });
+  const first = await api.sources(bank, { limit: 200 });
   const loaded = [...first.sources];
   let cursor = first.next_cursor;
-  const list = h("ul", { class: "documents" });
+  const list = h("ul", { class: "sources" });
 
   const draw = () =>
     list.replaceChildren(
-      ...groupDocuments(loaded).map(({ id, newest, versions }) => {
+      ...groupVersions(loaded).map(({ id, newest, versions }) => {
+        const isTurn = newest.kind === "turn";
         const chunks = versions.reduce((sum, v) => sum + v.chunks, 0);
         const failed = versions.reduce((sum, v) => sum + v.failed, 0);
         const remembered = versions.reduce((sum, v) => sum + v.memories, 0);
         return h(
           "li",
-          { class: "document", "data-gone": newest.gone?.reason ?? null },
-          h("a", { class: "document-name", href: sourceHash(bank, newest.id) }, id),
+          { class: "source", "data-gone": newest.gone?.reason ?? null },
+          h(
+            "a",
+            { class: "source-name", href: sourceHash(bank, newest.id) },
+            isTurn ? `Turn${newest.session_id ? ` in session ${newest.session_id}` : ""}` : id,
+          ),
           " ",
           h(
             "div",
             { class: "meta" },
             spaced([
               newest.gone ? pill(newest.gone.reason.replaceAll("_", " "), "gone") : null,
-              h("span", {}, plural(versions.length, "version")),
+              isTurn ? null : h("span", {}, plural(versions.length, "version")),
               h("span", {}, plural(chunks, "chunk")),
               h("span", {}, memoryCount(remembered)),
               failed ? pill(`${failed} failed`, "failed") : null,
-              h("span", {}, "ingested ", time(newest.ingested_at)),
+              isTurn
+                ? h("span", {}, "said ", time(newest.message_at ?? newest.observed_at, { withTime: true }))
+                : h("span", {}, "ingested ", time(newest.ingested_at)),
             ]),
           ),
         );
@@ -795,7 +805,7 @@ async function documents(ctx) {
       class: "quiet more",
       onclick: async () => {
         more.disabled = true;
-        const next = await api.sources(bank, { kind: "document", limit: 200, cursor });
+        const next = await api.sources(bank, { limit: 200, cursor });
         loaded.push(...next.sources);
         cursor = next.next_cursor;
         draw();
@@ -803,14 +813,14 @@ async function documents(ctx) {
         if (!cursor) more.remove();
       },
     },
-    "Load more documents",
+    "Load more sources",
   );
 
   return {
-    title: `Documents · ${bank}`,
+    title: `Sources · ${bank}`,
     content: [
-      heading(h, "Documents"),
-      loaded.length ? list : h("p", { class: "empty" }, "No documents yet. Documents the agent ingests show up here."),
+      heading(h, "Sources"),
+      loaded.length ? list : h("p", { class: "empty" }, "Nothing ingested yet. Turns and documents show up here."),
       cursor ? more : null,
     ],
   };
@@ -936,7 +946,7 @@ async function source(ctx) {
   return {
     title,
     content: [
-      h("p", { class: "back" }, h("a", { href: isDocument ? bankHash(bank, "documents") : bankHash(bank, "memories") }, isDocument ? "← Documents" : "← Memories")),
+      h("p", { class: "back" }, h("a", { href: bankHash(bank, "sources") }, "← Sources")),
       heading(
         h,
         title,
@@ -1685,4 +1695,4 @@ async function missing(ctx) {
   };
 }
 
-export const pages = { banks, memories, memory, documents, source, chunks, recall, models, missing };
+export const pages = { banks, memories, memory, sources, source, chunks, recall, models, missing };

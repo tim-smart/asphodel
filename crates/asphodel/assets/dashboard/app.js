@@ -43,7 +43,7 @@ export function mount(root, { fetch }) {
           { class: "tabs", "aria-label": `Bank ${bank}` },
           [
             ["memories", "Memories"],
-            ["documents", "Documents"],
+            ["sources", "Sources"],
             ["chunks", "Ingestion"],
             ["recall", "Recall"],
             ["models", "Models"],

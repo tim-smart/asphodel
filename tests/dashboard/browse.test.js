@@ -1,4 +1,4 @@
-// Browsing a bank's memories and documents. The list routes do the
+// Browsing a bank's memories and sources. The list routes do the
 // filtering; the dashboard sends what the owner picks and shows what comes
 // back. Browsing only ever reads: it never goes through recall, which would
 // log the query and could credit use.
@@ -111,21 +111,23 @@ test("a memory opens from the list with its passage and a link to its source", a
   await findText(page.root, "Sam started at Effectful.");
 });
 
-test("the documents page lists each document once, and says which were removed", async (t) => {
+test("the sources page lists each document once and each turn, and says which were removed", async (t) => {
   const daemon = new FakeDaemon();
-  const page = await open(t, daemon, { hash: "#/banks/main/documents", token: TOKEN });
+  const page = await open(t, daemon, { hash: "#/banks/main/sources", token: TOKEN });
 
-  await queried(daemon, "/v1/banks/main/sources", "kind", "document");
   await findLink(page.root, DOCUMENT);
   const links = [...page.root.querySelectorAll("a[href]")].filter((a) => textOf(a).includes(DOCUMENT));
   assert.equal(links.length, 1, "two versions, one entry");
   const recipes = await findRow(page.root, "recipes.md");
   assert.match(textOf(recipes), /removed/i);
+
+  click(await findLink(page.root, /session-1/));
+  await findText(page.root, "My daughter Ada starts school next week.");
 });
 
 test("a document's page shows its text, its versions and each chunk's state", async (t) => {
   const daemon = new FakeDaemon();
-  const page = await open(t, daemon, { hash: "#/banks/main/documents", token: TOKEN });
+  const page = await open(t, daemon, { hash: "#/banks/main/sources", token: TOKEN });
 
   click(await findLink(page.root, DOCUMENT));
 
@@ -143,14 +145,14 @@ test("a removed document's page says it was removed in place of its text", async
   await findText(page.root, /removed/i);
 });
 
-test("browsing banks, memories, documents and sources only reads", async (t) => {
+test("browsing banks, memories and sources only reads", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon, { token: TOKEN });
 
   click(await findLink(page.root, /\bmain\b/));
   click(await findLink(page.root, sentences.auckland));
   await findText(page.root, "Sam lives in Auckland (passage)");
-  page.window.location.hash = "#/banks/main/documents";
+  page.window.location.hash = "#/banks/main/sources";
   click(await findLink(page.root, DOCUMENT));
   await findText(page.root, "Sam started at Effectful.");
 

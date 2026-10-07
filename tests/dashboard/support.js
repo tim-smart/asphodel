@@ -11,7 +11,7 @@
 //   `confirm`-style dialogs) comes from `root.ownerDocument.defaultView`.
 // - Routes are hash routes under `/dashboard`, so a deep link works:
 //   `#/` the banks, `#/banks/{bank}/memories`, `#/banks/{bank}/memories/{id}`,
-//   `#/banks/{bank}/documents`, `#/banks/{bank}/sources/{id}`,
+//   `#/banks/{bank}/sources`, `#/banks/{bank}/sources/{id}`,
 //   `#/banks/{bank}/chunks`, `#/banks/{bank}/recall` and
 //   `#/banks/{bank}/models`.
 // - A confirmation is an element in the page with `role="dialog"` or
