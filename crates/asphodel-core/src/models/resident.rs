@@ -129,8 +129,8 @@ struct Slot<T: ?Sized> {
     model_id: String,
     load: Load<T>,
     state: Mutex<State<T>>,
-    /// Held while a call finds or loads the model, so callers that find it
-    /// released wait for one load rather than each starting their own.
+    /// Held while a call finds or loads the model and while an idle model
+    /// is freed, so teardown and reload cannot overlap and loads are single-flight.
     loading: Mutex<()>,
 }
 
@@ -197,6 +197,10 @@ impl<T: ?Sized> Slot<T> {
     /// Drops the model if nothing is running on it and it's been idle for
     /// `idle`. Whether it did.
     fn release_idle(&self, idle: Duration) -> bool {
+        let _loading = self
+            .loading
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let model = {
             let mut state = self.state();
             if state.model.is_none() || state.running > 0 || state.used.elapsed() < idle {
@@ -204,8 +208,8 @@ impl<T: ?Sized> Slot<T> {
             }
             state.model.take()
         };
-        // Dropped outside the lock: freeing a session takes a moment, and a
-        // call arriving meanwhile only waits to load it again.
+        // Drop outside the state lock, but hold loading until teardown ends
+        // so a new call cannot load a replacement while this model is freed.
         drop(model);
         tracing::info!(model = %self.model_id, "released an idle model");
         true
