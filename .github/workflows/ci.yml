@@ -126,10 +126,6 @@ jobs:
           path: ~/nix-cache
           key: crane-deps-${{ hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml') }}
 
-      # Made by the runner's user before nix starts, so the daemon doesn't
-      # create it as root on a miss.
-      - run: mkdir -p ~/nix-cache
-
       - uses: cachix/install-nix-action@v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
@@ -143,7 +139,11 @@ jobs:
 
       - name: Save the dependency build
         if: steps.deps-cache.outputs.cache-hit != 'true'
-        run: nix copy --to "file://$HOME/nix-cache?compression=zstd" .#asphodel.cargoArtifacts
+        # The daemon, as root, lays the cache out when the build first asks
+        # it for paths.
+        run: |
+          sudo chown -R "$USER" ~/nix-cache
+          nix copy --to "file://$HOME/nix-cache?compression=zstd" .#asphodel.cargoArtifacts
 
       # Runs the image as a pod would, on the real models, until /v1/health
       # answers 200. The floors and scale are placeholders: the daemon only
