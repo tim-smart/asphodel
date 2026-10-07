@@ -142,6 +142,7 @@ jobs:
         # The daemon, as root, lays the cache out when the build first asks
         # it for paths.
         run: |
+          mkdir -p ~/nix-cache
           sudo chown -R "$USER" ~/nix-cache
           nix copy --to "file://$HOME/nix-cache?compression=zstd" .#asphodel.cargoArtifacts
 
