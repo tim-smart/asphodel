@@ -14,7 +14,7 @@ use crate::queue::SourceKind;
 
 const SCHEMA_NAME: &str = "call1_claims";
 
-const SYSTEM: &str = r#"Extract claims worth remembering from a conversation turn or document section for a personal assistant's long-term memory. Also identify which memories in the assistant's context its reply relied on.
+const SYSTEM: &str = r#"Extract claims worth remembering from a conversation turn or document section for a assistant's long-term memory. Also identify which memories in the assistant's context its reply relied on.
 
 # Claims
 
@@ -33,7 +33,7 @@ Extract:
 Apply the skips below to each proposition, not to the whole passage: a request, message or temporary situation can still contain an explicitly stated lasting fact worth extracting.
 
 Skip:
-- The act of asking a question or making a request. For a request, record only what the speaker wanted, as above.
+- Questions or requests without concerns about the users life.
 - Requests whose only content is the assistant operating its own tools, notes or system.
 - The assistant's suggestions, general knowledge and tool findings.
 - Routine operations: commands, checks, restarts, result reports, and adding, updating, saving, removing, restoring, moving or verifying notes or files. Extract the durable content, decision or commitment, not an event about the operation. A date or path alone does not make an operation worth remembering.
