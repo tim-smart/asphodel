@@ -271,7 +271,7 @@ impl Service {
 
     /// The same service with the reranker deadline set to
     /// `deadline`. The deadline is fixed in code; this is for
-    /// tests of the fallback and for the bench, which shouldn't wait 1.5 s
+    /// tests of the fallback and for the bench, which shouldn't wait 3 s
     /// per slow call.
     pub fn with_reranker_deadline(mut self, deadline: Duration) -> Self {
         self.reranker_deadline = deadline;

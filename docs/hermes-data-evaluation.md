@@ -417,7 +417,7 @@ asphodel bench --config "$ASPHODEL_REPLAY_DIR/replay.toml" --corpus "$ASPHODEL_R
 ```
 
 It copies the replayed store under `bench/` and starts a daemon on loopback
-with the production 1.5 s reranker deadline on. It never touches another
+with the production 3 s reranker deadline on. It never touches another
 store. Stop the browse daemon first if it is on the same port.
 
 ## 8. Labels: drafted by you, independently reviewed by Fable

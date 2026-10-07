@@ -1,7 +1,7 @@
 """The ``MemoryProvider`` hook implementation.
 
 ``prefetch`` is the only hook on the
-reply path and Hermes cuts it off at 8 s, so the plugin's own budget is 3 s.
+reply path and Hermes cuts it off at 8 s, so the plugin's own budget is 5 s.
 ``system_prompt_block`` runs at session start with a 2 s budget and one
 retry. ``sync_turn`` already runs on Hermes' single background worker, so it
 sends synchronously and spools on failure. Nothing here ever raises into
@@ -65,7 +65,7 @@ class Timeouts:
     Tests shorten them; production uses the defaults."""
 
     health: float = 2.0
-    prefetch: float = 3.0
+    prefetch: float = 5.0
     system_prompt: float = 2.0
     #: Attempts beyond the first for ``system_prompt_block``.
     system_prompt_retries: int = 1

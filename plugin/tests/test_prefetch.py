@@ -1,5 +1,5 @@
 """``prefetch`` and ``recall_status``: the body, the previous query, the
-pending ``recall_id``, the 3 s budget, "" on every failure and no call for a
+pending ``recall_id``, the prefetch budget, "" on every failure and no call for a
 query that cleans to nothing."""
 
 import pytest

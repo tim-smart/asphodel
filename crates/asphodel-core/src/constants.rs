@@ -161,10 +161,9 @@ impl Volatility {
 
 /// The reranker deadline in prefetch and recall. Past it, the reranker is
 /// skipped: explicit recall uses RRF order and prefetch injects nothing.
-/// It's the first link in a
-/// chain of timeouts: 1.5 s in the daemon, 3 s in the plugin and 8 s in
-/// Hermes.
-pub const RERANKER_DEADLINE: Duration = Duration::from_millis(1500);
+/// It's the first link in a chain of timeouts: 3 s in the daemon, 5 s in
+/// the plugin's prefetch hook and 8 s in Hermes.
+pub const RERANKER_DEADLINE: Duration = Duration::from_secs(3);
 
 // Retrieval:
 

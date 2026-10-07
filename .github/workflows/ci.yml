@@ -41,10 +41,11 @@ jobs:
       # and anything the lockfile no longer names before saving. The
       # toolchain comes from nix, so flake.lock is part of the key. Its own
       # hash of the runner's rustc and environment is off: it differed
-      # between runners, so no run found the last one's cache.
+      # between runners, so no run found the last one's cache. Turning it
+      # off drops the lockfiles from its key too, so they're in ours.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ hashFiles('flake.lock') }}
+          key: ${{ hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml') }}
           add-rust-environment-hash-key: false
 
       - name: cargo fmt --check
@@ -66,7 +67,7 @@ jobs:
       # As in check.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ hashFiles('flake.lock') }}
+          key: ${{ hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml') }}
           add-rust-environment-hash-key: false
 
       # nextest runs the test binaries side by side, where `cargo test` runs
