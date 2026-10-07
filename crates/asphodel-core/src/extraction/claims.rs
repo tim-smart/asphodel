@@ -10,6 +10,7 @@
 //! - fields that don't belong to the claim's kind are dropped;
 //! - a weekday named in the quote that matches none of the claim's dates
 //!   lowers window confidence;
+//! - an annual date in plain English gets an RRULE when call 1 gave none;
 //! - an RRULE is kept only when it parses and recurs within a year;
 //! - remember-this keeps a memory only from the owner's own message.
 
@@ -328,6 +329,9 @@ fn check_claim(
     if claim.kind == Kind::Recurring {
         // Do not repair an explicit but invalid start or guess an interval
         // phase. Only a fully specified annual calendar date can start itself.
+        if recurrence_rrule.is_none() && !has_recurrence_start {
+            recurrence_rrule = recurrence_text.as_deref().and_then(annual_rule);
+        }
         if !has_recurrence_start {
             recurrence_start = recurrence_rrule
                 .as_deref()
@@ -563,6 +567,60 @@ fn weekday_mismatch(quote: &str, dates: &[Option<Stamp>], tz: &TimeZone) -> bool
 fn strip_rrule_prefix(rule: &str) -> &str {
     let rule = rule.trim();
     rule.strip_prefix("RRULE:").unwrap_or(rule)
+}
+
+const MONTHS: [&str; 12] = [
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+];
+
+/// The RRULE for an annual date in plain English, such as "Every year on
+/// November 12" or "annually on 3 Mar", when call 1 stated the schedule but
+/// gave no rule. Anything looser is left without one.
+fn annual_rule(text: &str) -> Option<String> {
+    let text = text.trim().trim_end_matches('.').to_lowercase();
+    let date = [
+        "every year on ",
+        "each year on ",
+        "annually on ",
+        "yearly on ",
+    ]
+    .iter()
+    .find_map(|prefix| text.strip_prefix(prefix))?;
+    let month = |word: &str| {
+        MONTHS
+            .iter()
+            .position(|name| *name == word || (word.len() == 3 && name.starts_with(word)))
+            .map(|index| index + 1)
+    };
+    let day = |word: &str| {
+        ["st", "nd", "rd", "th"]
+            .iter()
+            .find_map(|suffix| word.strip_suffix(suffix))
+            .unwrap_or(word)
+            .parse::<u8>()
+            .ok()
+            .filter(|day| (1..=31).contains(day))
+    };
+    let (month, day) = match date.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [first, second] => match (month(first), month(second)) {
+            (Some(month), None) => (month, day(second)?),
+            (None, Some(month)) => (month, day(first)?),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(format!("FREQ=YEARLY;BYMONTH={month};BYMONTHDAY={day}"))
 }
 
 /// A deliberately narrow inference: one month and one positive month day,

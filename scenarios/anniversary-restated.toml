@@ -1,0 +1,66 @@
+# An anniversary restated without a rule. Call 1 gives the restatement's
+# schedule only in words, and the refinement that replaces the original still
+# recurs on its date: the agenda leaves it out until it's within the seven-day
+# horizon, then lists it. Without a rule it would be an undated routine,
+# listed every day.
+#
+# Times are given in UTC; the bank is in Auckland (UTC+13 in November), so
+# 2026-11-08T20:00Z is 09:00 on 9 November bank-local.
+
+name = "anniversary-restated"
+group = "ci"
+description = "A recurring date restated with only its schedule in words keeps recurring after it refines the original."
+
+[bank]
+timezone = "Pacific/Auckland"
+
+[[turn]]
+at = "2026-09-20T20:00:00Z"
+session = "s1"
+user = "Our wedding anniversary is 12 November."
+assistant = "Noted."
+
+[[turn.claim]]
+label = "anniversary"
+content = "Tim and Sam's wedding anniversary is every year on 12 November."
+quote = "Our wedding anniversary is 12 November"
+kind = "recurring"
+significance = "critical"
+recurrence_text = "Every year on 12 November"
+recurrence_rrule = "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12"
+
+[[turn]]
+at = "2026-09-27T20:00:00Z"
+session = "s1"
+user = "Remember our anniversary is November 12, and it's our 10th this year."
+assistant = "Got it."
+
+[[turn.claim]]
+label = "anniversary-restated"
+content = "Tim and Sam's wedding anniversary is November 12, and their 10th is in 2026."
+quote = "our anniversary is November 12, and it's our 10th this year"
+kind = "recurring"
+significance = "critical"
+recurrence_text = "Every year on November 12"
+reconcile = [{ memory = "anniversary", outcome = "refines" }]
+
+[[probe]]
+id = "restatement-is-the-head"
+at = "2026-09-27T21:00:00Z"
+kind = "exists"
+memory = "anniversary-restated"
+memory_kind = "recurring"
+head = true
+
+# 29 September bank-local: 12 November is weeks away.
+[[probe]]
+id = "agenda-leaves-it-out-until-near"
+at = "2026-09-28T20:00:00Z"
+kind = "agenda_lacks"
+memory = "anniversary-restated"
+
+[[probe]]
+id = "agenda-lists-the-restated-anniversary"
+at = "2026-11-08T20:00:00Z"
+kind = "agenda_has"
+memory = "anniversary-restated"
