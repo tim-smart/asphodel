@@ -39,10 +39,13 @@ jobs:
       # a whole restored `target`, which brought back every earlier head's
       # artifacts and filled the disk, it drops the workspace's own crates
       # and anything the lockfile no longer names before saving. The
-      # toolchain comes from nix, so flake.lock is part of the key.
+      # toolchain comes from nix, so flake.lock is part of the key. Its own
+      # hash of the runner's rustc and environment is off: it differed
+      # between runners, so no run found the last one's cache.
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ hashFiles('flake.lock') }}
+          add-rust-environment-hash-key: false
 
       - name: cargo fmt --check
         run: nix develop -c cargo fmt --check
@@ -64,6 +67,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ hashFiles('flake.lock') }}
+          add-rust-environment-hash-key: false
 
       # nextest runs the test binaries side by side, where `cargo test` runs
       # them one after another. It doesn't run doc tests, so those follow.
