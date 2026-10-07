@@ -198,6 +198,11 @@ pub struct ServeArgs {
     /// Intra-op threads for ONNX Runtime. Unset leaves it to the runtime.
     #[arg(long, env = "ASPHODEL_ONNX_THREADS")]
     pub onnx_threads: Option<NonZeroUsize>,
+
+    /// Minutes a model goes unused before its memory is released. It loads
+    /// again on its next use. 0 keeps the models loaded.
+    #[arg(long, env = "ASPHODEL_MODEL_IDLE_MINUTES", default_value_t = 15)]
+    pub model_idle_minutes: u32,
 }
 
 #[derive(Debug, Args)]

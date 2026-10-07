@@ -21,9 +21,9 @@ use asphodel_core::config::{
     Deployment, LLM_API_KEY_ENV, LlmAuth, ModelsConfig, Secret, TOKEN_ENV,
 };
 use asphodel_core::models::{
-    CodexResponses, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient, LlmGate,
-    LlmRetry, LlmSettings, LlmStatus, ModelOptions, Models, OpenAiCompatible, RetryBoard,
-    RetryPolicy, TokenStore,
+    CodexResponses, Embedder, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient,
+    LlmGate, LlmRetry, LlmSettings, LlmStatus, ModelOptions, OpenAiCompatible, Reranker,
+    ResidentModels, RetryBoard, RetryPolicy, TokenStore,
 };
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::{Clock, ResolvedConfig, Service, SystemClock, Tuning};
@@ -50,6 +50,9 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// the next refresh earlier than the timer knew, so it looks again at
 /// least this often; the debounce is minutes, so a minute late is fine.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The longest the idle release waits between looks at the models.
+const RELEASE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The shortest wait between passes. The timer is monotonic and the
 /// deadline is on the service's clock, so a wake can land just short of it;
@@ -103,6 +106,8 @@ struct Started {
     /// Every bank in the store, each of which gets a worker at once, since
     /// the queue may hold chunks from before a restart.
     banks: Vec<String>,
+    /// The models the service runs on, for the idle release.
+    models: Arc<ResidentModels>,
 }
 
 /// The bound listener, before axum takes it.
@@ -148,6 +153,7 @@ pub(crate) async fn run_with(
     let script = llm_script()?;
     let retry_wait = retry_wait()?;
     let gate = startup_gate();
+    let model_idle_minutes = args.model_idle_minutes;
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let app: Shared = Arc::new(App {
@@ -214,6 +220,10 @@ pub(crate) async fn run_with(
 
     let service = Arc::new(started.service);
     tokio::spawn(housekeeping(Arc::downgrade(&service)));
+    if model_idle_minutes > 0 {
+        let idle = Duration::from_secs(u64::from(model_idle_minutes) * 60);
+        tokio::spawn(release_idle_models(started.models, idle, stop.clone()));
+    }
     let retries = Arc::new(Retries {
         clock: Arc::clone(&clock),
         sleeper: Arc::new(StopSleeper::default()),
@@ -364,52 +374,52 @@ fn start(
         .with_context(|| format!("opening the store in {}", args.data_dir.display()))?;
     config.purge = store.check_fingerprint(&config.deletion_fingerprint)?;
     config.llm = llm_status(&config, &args.data_dir)?;
-    let service = match models {
+    // The models always sit behind their idle release; with
+    // `--model-idle-minutes 0` nothing ever releases them.
+    let carries_v1 = matches!(models, ModelsSwitch::FakeV2);
+    let (resident, fake) = match models {
         ModelsSwitch::Fake => {
             warn!(
                 "{MODELS_ENV}=fake: serving with the deterministic fake models, not the ONNX ones"
             );
-            let models = Models::fake();
-            config.models = Some(ModelsConfig::new(
-                &models,
-                true,
-                args.onnx_threads.map(std::num::NonZeroUsize::get),
-            ));
-            Service::with_models(Arc::clone(&clock), store, config.tuning.clone(), models)?
+            let resident = ResidentModels::new(
+                || Ok(Arc::new(FakeEmbedder) as Arc<dyn Embedder>),
+                || Ok(Arc::new(FakeReranker) as Arc<dyn Reranker>),
+            )?;
+            (resident, true)
         }
         ModelsSwitch::FakeV2 => {
             warn!(
                 "{MODELS_ENV}=fake-v2: serving with the second fake embedder, carrying the first for banks recorded under it"
             );
-            let models = Models {
-                embedder: Arc::new(FakeEmbedderV2),
-                reranker: Arc::new(FakeReranker),
-            };
-            config.models = Some(ModelsConfig::new(
-                &models,
-                true,
-                args.onnx_threads.map(std::num::NonZeroUsize::get),
-            ));
-            Service::with_models(Arc::clone(&clock), store, config.tuning.clone(), models)?
-                .with_previous_embedder(Arc::new(FakeEmbedder))?
+            let resident = ResidentModels::new(
+                || Ok(Arc::new(FakeEmbedderV2) as Arc<dyn Embedder>),
+                || Ok(Arc::new(FakeReranker) as Arc<dyn Reranker>),
+            )?;
+            (resident, true)
         }
         ModelsSwitch::None => {
             let dir = crate::cli::resolve_model_dir(args.model_dir.as_deref())?;
-            let models = Models::load(
-                &dir,
-                &ModelOptions {
-                    threads: args.onnx_threads,
-                },
-            )
-            .with_context(|| format!("loading the models in {}", dir.path().display()))?;
-            config.models = Some(ModelsConfig::new(
-                &models,
-                false,
-                args.onnx_threads.map(std::num::NonZeroUsize::get),
-            ));
-            Service::with_models(Arc::clone(&clock), store, config.tuning.clone(), models)?
+            let options = ModelOptions {
+                threads: args.onnx_threads,
+            };
+            let resident = ResidentModels::load(&dir, &options)
+                .with_context(|| format!("loading the models in {}", dir.path().display()))?;
+            (resident, false)
         }
     };
+    let models = resident.models();
+    config.models = Some(ModelsConfig::new(
+        &models,
+        fake,
+        args.onnx_threads.map(std::num::NonZeroUsize::get),
+        (args.model_idle_minutes > 0).then_some(args.model_idle_minutes),
+    ));
+    let mut service =
+        Service::with_models(Arc::clone(&clock), store, config.tuning.clone(), models)?;
+    if carries_v1 {
+        service = service.with_previous_embedder(Arc::new(FakeEmbedder))?;
+    }
     // Purge and the sweep run, or wait for an ack, as the store's deletion
     // fingerprint says. Forget never waits.
     let service = service.with_purge_pause(config.purge.clone());
@@ -437,6 +447,7 @@ fn start(
         config,
         llm: llm.map(|(llm, _)| llm),
         banks,
+        models: Arc::new(resident),
     }))
 }
 
@@ -778,6 +789,27 @@ async fn housekeeping(service: Weak<Service>) {
             }
         };
         tokio::time::sleep(wait).await;
+    }
+}
+
+/// Releases each model that's gone `idle` unused, looking a quarter of
+/// `idle` apart and at least once a minute, until the daemon stops. A model
+/// released this way loads again on its next call.
+async fn release_idle_models(
+    models: Arc<ResidentModels>,
+    idle: Duration,
+    stop: watch::Receiver<bool>,
+) {
+    let every = (idle / 4).min(RELEASE_INTERVAL);
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(every) => {}
+            () = stopped(stop.clone()) => return,
+        }
+        let models = Arc::clone(&models);
+        if let Err(error) = tokio::task::spawn_blocking(move || models.release_idle(idle)).await {
+            warn!(%error, "releasing idle models panicked");
+        }
     }
 }
 
