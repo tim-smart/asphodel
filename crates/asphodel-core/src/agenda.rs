@@ -1,16 +1,17 @@
 //! The agenda.
 //!
-//! Three groups, built by query with no LLM, and judged by bank-local date
-//! so the clock alone changes them only at midnight:
+//! Three groups, built by query with no LLM, and judged by bank-local date,
+//! except that a dated item leaves once its time has passed:
 //!
 //! - **Dated lines**, chosen by world time alone: events starting and
 //!   tasks due from today to `agenda.horizon_days` ahead, tasks overdue
 //!   since up to `agenda.overdue_days` ago, and recurring memories with a
 //!   period longer than a week whose next occurrence falls in the horizon.
-//!   Both ends are inclusive. An event that had begun when it was said is
-//!   a record, not a plan, and isn't listed. They're never gated on τ, so
-//!   a minor appointment can't fade out on the day it matters. In date order, at
-//!   most `agenda.dated_lines`; over the cap, faded items fold into a count
+//!   Both ends are inclusive. An event leaves at the end of its start's
+//!   unit, so a meeting at 11:00 is gone by 11:01. An event that had begun
+//!   when it was said is a record, not a plan, and isn't listed. They're
+//!   never gated on τ, so a minor appointment can't fade out on the day it
+//!   matters. In date order, at most `agenda.dated_lines`; over the cap, faded items fold into a count
 //!   first, then the least significant, then the furthest from today.
 //! - **Routines**: recurring memories with a period of a week or less, or
 //!   with no usable RRULE, at or above τ, strongest first and then by
@@ -95,7 +96,7 @@ struct Row {
     uuid: Uuid,
     kind: Kind,
     level: f64,
-    valid_from: Option<Timestamp>,
+    valid_from: Option<WorldTime>,
     valid_until: Option<WorldTime>,
     due_at: Option<Timestamp>,
     rrule: Option<String>,
@@ -149,13 +150,14 @@ pub(crate) fn build(
         match row.kind {
             Kind::Event => {
                 if let Some(from) = row.valid_from
-                    && row.observed_at < from
+                    && row.observed_at < from.at
+                    && now < unit_end(from, &source_tz)
                 {
-                    let date = local(from);
-                    if today <= date && date <= horizon {
+                    let date = local(from.at);
+                    if date <= horizon {
                         dated.push(Dated {
                             row: index,
-                            at: from,
+                            at: from.at,
                             date,
                         });
                     }
@@ -306,7 +308,7 @@ fn rows(
     let mut statement = conn.prepare_cached(
         "SELECT m.id, m.uuid, m.kind, COALESCE(m.owner_significance, m.significance),
                 m.valid_from, m.valid_until, m.due_at, m.recurrence_rrule, m.recurrence_start,
-                s.timezone, m.valid_until_precision, m.observed_at
+                s.timezone, m.valid_until_precision, m.observed_at, m.valid_from_precision
          FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
          WHERE m.bank_id = ?1 AND m.kind IN ('event', 'task', 'recurring')
            AND m.invalidated_at IS NULL AND m.hidden_at IS NULL
@@ -323,7 +325,7 @@ fn rows(
                 uuid: uuid.parse().unwrap_or_default(),
                 kind: memory_kind(&kind).unwrap_or(Kind::Fact),
                 level: significance_value(&level, significance),
-                valid_from: row.get::<_, Option<i64>>(4)?.map(timestamp),
+                valid_from: world_time(row.get(4)?, row.get(12)?),
                 valid_until: world_time(row.get(5)?, row.get(10)?),
                 due_at: row.get::<_, Option<i64>>(6)?.map(timestamp),
                 rrule: row.get(7)?,
