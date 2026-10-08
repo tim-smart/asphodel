@@ -35,6 +35,7 @@ code, pre { font-family: ui-monospace, monospace; font-size: 0.95em; }
 const SECTIONS: &[(&str, &str)] = &[
     ("injected_tokens", "Injected tokens"),
     ("profile_tokens", "Profile tokens"),
+    ("call1_input", "Call 1 input sizes"),
     ("extraction_lag", "Extraction lag"),
     ("call2_rate", "Call 2 rate"),
     ("restatements", "Restatements"),

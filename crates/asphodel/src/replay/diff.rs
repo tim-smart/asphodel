@@ -114,6 +114,7 @@ fn diff(a: &Map<String, Value>, b: &Map<String, Value>) -> Value {
         "injected_tokens",
         "injection_usage",
         "profile_tokens",
+        "call1_input",
         "call2_rate",
         "restatements",
         "significance_histogram",

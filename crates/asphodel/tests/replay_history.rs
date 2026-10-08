@@ -793,6 +793,122 @@ fn not_created_window_keeps_purged_creations_in_the_count() {
 
 // Recording modes.
 
+/// A one-token injection budget keeps the future occasion out of in-context memories:
+/// call 1 sees zero upcoming lines twice, then one.
+fn check_call1_input_sizes(recording_mode: &str) {
+    const OCCASION: &str = "Zoë’s wedding is on 30 January 2026.";
+    let dir = TestDir::new();
+    let corpus = import_history(&dir, |path| {
+        let db = StateDb::create(path);
+        db.owner_session("s-idle", start());
+        db.turn("s-idle", start(), "Hello.", "Hi.");
+        db.owner_session("s-date", start() + 600.0);
+        db.turn("s-date", start() + 600.0, OCCASION, "Noted.");
+        db.owner_session("s-gift", start() + 1200.0);
+        db.turn(
+            "s-gift",
+            start() + 1200.0,
+            "I need a gift for the wedding. 🎁",
+            "We can plan that.",
+        );
+        db
+    });
+    let mut event = claim(OCCASION, OCCASION, "event");
+    event["valid_from"] = json!({
+        "at": "2026-01-30", "precision": "day"
+    });
+    let script = script_answering_everything(&dir, "occasion-size", vec![event], vec![]);
+    let probes = probe_on("occasion", 6, "exists", r#"memory = "wedding""#);
+    let export = dir.path("sizes.json");
+    // Separate sessions alone do not prevent relevance injection. The dated
+    // sentence cannot fit this budget, so the gift turn sees it only through
+    // the bank-wide upcoming block. It is beyond the agenda horizon too.
+    let settings = overrides(&dir, "[injection]\ntoken_budget = 1\n");
+    let flags = [
+        "--aggregate",
+        export.to_str().unwrap(),
+        "--latency",
+        "0s",
+        "--overrides",
+        &settings,
+    ];
+    let mut recording_flags = flags.to_vec();
+    if recording_mode == "fast" {
+        recording_flags.extend(["--refresh", "live"]);
+    }
+    let recorded = replay_history(
+        &dir,
+        &corpus,
+        recording_mode,
+        &probes,
+        Some(&script),
+        &recording_flags,
+    )
+    .ok();
+    let recorded_export: Value = serde_json::from_slice(&fs::read(&export).unwrap()).unwrap();
+
+    // The cassette is the public record of requests actually sent. This
+    // oracle follows prompt edits without pinning their wording.
+    let records = cassette_records(&dir);
+    let requests: Vec<&str> = records
+        .iter()
+        .filter(|r| is_call1(r))
+        .map(|r| r["request"]["user"].as_str().unwrap())
+        .collect();
+    assert_eq!(requests.len(), 3, "one extraction per synced turn");
+    assert!(
+        requests
+            .iter()
+            .any(|text| text.len() > text.chars().count()),
+        "the fixture distinguishes characters from UTF-8 bytes"
+    );
+    let mut characters: Vec<usize> = requests.iter().map(|text| text.chars().count()).collect();
+    characters.sort_unstable();
+    // Three observations give the middle and maximum at p50 and p95.
+    // Upcoming-line observations are [0, 0, 1], including the empty blocks.
+    let expected = json!({
+        "characters": { "samples": 3, "p50": characters[1], "p95": characters[2] },
+        "upcoming_lines": { "samples": 3, "p50": 0, "p95": 1 }
+    });
+
+    // Exercise fast's composed replies as well as exact replay. Neither
+    // should lose observations just because no network call is made.
+    let mut results = vec![(recorded, recorded_export)];
+    let cassette = cassette_bytes(&dir);
+    for mode in ["replay", "fast"] {
+        let report = replay_history(&dir, &corpus, mode, &probes, None, &flags).ok();
+        assert_eq!(report["llm"]["live"], 0, "{mode} uses no live client");
+        assert_eq!(
+            cassette_bytes(&dir),
+            cassette,
+            "{mode} records no new calls"
+        );
+        let aggregate = serde_json::from_slice(&fs::read(&export).unwrap()).unwrap();
+        results.push((report, aggregate));
+    }
+    for (report, aggregate) in results {
+        assert_eq!(
+            aggregate["call1_input"], expected,
+            "aggregate call-1 sizes in {}",
+            report["kind"]
+        );
+        assert_eq!(
+            report["call1_input"], expected,
+            "the private report and aggregate describe the same input sizes"
+        );
+    }
+}
+
+#[test]
+fn call1_input_sizes_survive_live_recording_replay_and_fast_reuse() {
+    check_call1_input_sizes("live");
+}
+
+#[test]
+fn call1_input_sizes_survive_fast_top_up_and_reuse() {
+    check_call1_input_sizes("fast");
+}
+
 /// `live` calls the LLM, records, and reports the hash of the completed
 /// cassette. `replay` of that cassette needs no LLM, simulates the same
 /// run, and writes a byte-identical report each time.

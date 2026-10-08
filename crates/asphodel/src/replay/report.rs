@@ -52,6 +52,7 @@ pub struct Report {
     pub injection_usage: InjectionUsage,
     /// The tokens the mental models' answers hold, sampled daily.
     pub profile_tokens: Percentiles,
+    pub call1_input: Call1InputSizes,
     pub call2_rate: Call2Rate,
     pub restatements: Restatements,
     pub agenda_lines_per_day: Vec<DayCount>,
@@ -180,6 +181,16 @@ impl Percentiles {
             p95: percentile(values, 0.95),
         }
     }
+}
+
+/// Input sizes sampled once per simulated call 1, including cached replies.
+/// Priming calls and call-2-only retries are not simulation observations.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Call1InputSizes {
+    /// Unicode characters in the user prompt, excluding the system prompt.
+    pub characters: Percentiles,
+    /// Upcoming event entries, with zero for an empty block.
+    pub upcoming_lines: Percentiles,
 }
 
 /// The value at the nearest rank of `p` in sorted `values`, or 0 when
@@ -376,6 +387,7 @@ pub struct Aggregate {
     pub injected_tokens: AggregateTokens,
     pub injection_usage: InjectionUsage,
     pub profile_tokens: Percentiles,
+    pub call1_input: Call1InputSizes,
     pub call2_rate: Call2Rate,
     pub restatements: Restatements,
     pub agenda_lines_per_day: Vec<EpochDayCount>,
@@ -525,6 +537,7 @@ impl Aggregate {
                 },
             },
             profile_tokens: report.profile_tokens.clone(),
+            call1_input: report.call1_input.clone(),
             injection_usage: report.injection_usage.clone(),
             call2_rate: Call2Rate {
                 chunks: report.call2_rate.chunks,
