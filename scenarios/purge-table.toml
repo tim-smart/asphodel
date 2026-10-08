@@ -1,7 +1,7 @@
 # The purge table through the store, with δ set to 1.0 here rather than
 # read from the default, and bank time at world speed. One mention is purged at the first 04:00 sweep after
 # strength falls below τ − δ: e^((S·σ − τ + δ) / a) days after the mention,
-# which is 128.7 days for trivial, 536.8 for minor and 4576 for notable.
+# which is 128.7 days for trivial, 536.8 for minor and 1178 for notable.
 # The exists probes sit 5% before the crossing and the absent probes 5%
 # plus a sweep after it. Separate occasions (at least three world days
 # apart) lift the lasting floor: trivial on 6 occasions, minor on 3 and
@@ -16,7 +16,7 @@
 
 name = "purge-table"
 group = "ci"
-description = "One mention is purged at 4 months, 1.5 years or 12.5 years; enough separate occasions, or major significance, is never purged."
+description = "One mention is purged at 4 months, 1.5 years or 3.2 years; enough separate occasions, or major significance, is never purged."
 
 [bank]
 timezone = "UTC"
@@ -251,13 +251,13 @@ memory = "trivial-thrice"
 
 [[probe]]
 id = "notable-still-there"
-at = "2037-11-30T09:00:00Z"
+at = "2029-01-27T09:00:00Z"
 kind = "exists"
 memory = "notable"
 
 [[probe]]
 id = "notable-purged"
-at = "2039-03-04T09:00:00Z"
+at = "2029-05-27T09:00:00Z"
 kind = "absent"
 memory = "notable"
 

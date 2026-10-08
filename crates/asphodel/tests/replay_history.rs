@@ -74,7 +74,7 @@ fn backfilled_turn_strength_matches_the_imported_history() {
     let dir = TestDir::new();
     let user = "Tim likes green tea.";
     let message_at: Timestamp = "2026-01-05T09:00:00Z".parse().unwrap();
-    let received = message_at + SignedDuration::from_hours(180 * 24);
+    let received = message_at + SignedDuration::from_hours(30 * 24);
     let settings = format!(
         "[clock]\nquiet_rate = 1.0\n[purge]\ndelta = 0.0\n\
          [injection.reranker_floors]\n\"{}\" = 0.0\n\

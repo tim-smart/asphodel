@@ -501,8 +501,8 @@ order, so two runs compare byte for byte.
 
 | Scenario | What it checks |
 |---|---|
-| `lifetimes` | The lifetimes table: one mention at each level fades at 7.4 days, 1 month, 9 months, 3 years and 12 years of bank time, within 5%. |
-| `purge-table` | One trivial, minor or notable mention is purged at 4.2 months, 1.5 years and 12.5 years; trivial mentioned on 6 occasions, minor on 3, notable on 2 and anything major never is; a claim stated again after its memory was purged comes back as a new memory and the shadow table counts it. |
+| `lifetimes` | The lifetimes table: one mention at each level fades at 7.4 days, 1 month, 2 months, 3 years and 12 years of bank time, within 5%. |
+| `purge-table` | One trivial, minor or notable mention is purged at 4.2 months, 1.5 years and 3.2 years; trivial mentioned on 6 occasions, minor on 3, notable on 2 and anything major never is; a claim stated again after its memory was purged comes back as a new memory and the shadow table counts it. |
 | `maya-to-mia` | Correcting Maya to Mia retracts Maya, makes Mia the head, hides Maya from recall, and Mia inherits Maya's accesses: she's still in recall 100 days on, where a fresh minor memory would have faded, and fades at the day the inherited log gives. |
 | `rescheduled-appointment` | A reschedule retracts the old slot, the agenda lists the new one and not the old, and the appointment is recently past once it has happened. |
 | `three-week-holiday` | A trivial memory mentioned once is still in recall after a three-week gap, where world time would have faded it, and fades at the bank day the quiet rate gives. |

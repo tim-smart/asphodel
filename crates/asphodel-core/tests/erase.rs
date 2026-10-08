@@ -11,8 +11,9 @@
 //! Thursday 1 October 2026 in Auckland (UTC+13) unless a test moves it. The
 //! next 04:00 there, when the nightly sweep runs, is 15:00 UTC the same day.
 //! The tuning sets `clock.quiet_rate = 1.0`, so bank time is world time,
-//! and `purge.delta = 1.0`: a trivial memory said once is purged about 129
-//! days later, a notable one after more than twelve years.
+//! and `purge.delta = 1.0` with notable significance at 0.5: a trivial memory
+//! said once is purged about 129 days later, a notable one after more than
+//! twelve years.
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -181,6 +182,7 @@ impl Harness {
         };
         let tuning = Tuning::from_toml(&format!(
             "[clock]\nquiet_rate = 1.0\n{purge}\
+             [strength.significance]\nnotable = 0.5\n\
              [injection.reranker_floors]\n\"{}\" = 1.0\n\
              [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
              [reconcile.embedding_floors]\n\"{}\" = 0.5\n{extra}",

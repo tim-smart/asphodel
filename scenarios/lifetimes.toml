@@ -2,11 +2,11 @@
 # and how long it stays in recall. Bank time runs at world speed here, so the
 # table's bank days read as days. The ranges are 5% either side of the
 # closed-form crossing, e^((S·σ − τ) / a) days after the mention: 7.39, 30.83,
-# 262.8, 1096.6 and 4576 days.
+# 67.65, 1096.6 and 4576 days.
 
 name = "lifetimes"
 group = "ci"
-description = "One mention fades at 1 week, 1 month, 9 months, 3 years and 12 years of bank time."
+description = "One mention fades at 1 week, 1 month, 2 months, 3 years and 12 years of bank time."
 
 [bank]
 timezone = "UTC"
@@ -71,10 +71,10 @@ between = ["2026-02-03T15:58:56Z", "2026-02-06T17:58:50Z"]
 
 [[probe]]
 id = "notable-fades"
-at = "2026-10-09T09:00:00Z"
+at = "2026-03-18T09:00:00Z"
 kind = "faded_at"
 memory = "notable"
-between = ["2026-09-12T01:03:08Z", "2026-10-08T07:47:40Z"]
+between = ["2026-03-10T15:19:29Z", "2026-03-17T09:40:29Z"]
 
 [[probe]]
 id = "major-fades"

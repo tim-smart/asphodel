@@ -1,5 +1,18 @@
 # Upgrading
 
+## Notable memories last about 100 days
+
+The default `strength.significance.notable` drops from 0.5 to 0.31. With
+one mention, a notable memory fades after about 68 bank days and becomes
+eligible for purge after about 104, instead of about 263 and 403. A
+notable memory mentioned on two separate occasions is still never purged.
+
+Significance values are deletion inputs, so the daemon pauses purge and
+the source sweep on start. Run `asphodel purge plan` to see what would be
+deleted, then `asphodel purge ack --hash <h>`. To keep the old behaviour,
+set `notable = 0.5` under `[strength.significance]`. No schema migration
+is needed.
+
 ## Purge sooner after fading
 
 The default `purge.delta` drops from 1.0 to 0.15. A faded memory now waits

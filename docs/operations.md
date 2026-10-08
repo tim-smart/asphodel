@@ -188,7 +188,7 @@ at 2.5:
 [strength.significance]
 trivial = 0.0
 minor = 0.2
-notable = 0.5
+notable = 0.31
 major = 0.7
 critical = 0.9
 ```
