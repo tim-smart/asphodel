@@ -1588,7 +1588,11 @@ fn the_system_prompt_preview_is_the_block_a_new_session_gets() {
     daemon.create_bank("main");
     let preview = || daemon.get_ok("/v1/banks/main/system-prompt/preview");
 
-    assert!(preview()["text"].as_str().is_some_and(|text| !text.is_empty()));
+    assert!(
+        preview()["text"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    );
     let block = daemon.get_ok("/v1/banks/main/system-prompt");
     assert_eq!(
         preview(),
