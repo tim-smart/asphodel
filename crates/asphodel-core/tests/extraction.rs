@@ -23,7 +23,8 @@ use asphodel_core::config::Tuning;
 use asphodel_core::entities::MergeRequest;
 use asphodel_core::extraction::{
     CANDIDATE_MEMORIES, CONTEXT_CHARS, CONTEXT_TURNS, Call1Input, DropReason, Dropped,
-    ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, Extracted, UPCOMING_EVENTS,
+    ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, Extracted, IgnoredOccasion,
+    OccasionDisposition, OccasionFilled, OccasionRef, UPCOMING_EVENTS,
 };
 use asphodel_core::ingest::{Document, Ingested, TURN_SEPARATOR, Turn, TurnAuthor};
 use asphodel_core::inspect::{
@@ -459,6 +460,28 @@ fn handle(input: &Call1Input, entity: Uuid) -> String {
 fn memory_handle(input: &Call1Input, memory: Uuid) -> String {
     let shown = input.in_context.iter().find(|m| m.memory == memory);
     shown.expect("in context").handle.clone()
+}
+
+/// The commit's account of an `occasion` reference on claim `claim`:
+/// the occasion it resolved to, the memory written, and whether code
+/// filled `(valid_until, due_at)`.
+fn occasion_ref(
+    claim: usize,
+    occasion: Option<Uuid>,
+    memory: Option<Uuid>,
+    (valid_until, due_at): (bool, bool),
+    disposition: OccasionDisposition,
+) -> OccasionRef {
+    OccasionRef {
+        claim,
+        occasion,
+        memory,
+        filled: OccasionFilled {
+            valid_until,
+            due_at,
+        },
+        disposition,
+    }
 }
 
 /// The candidates' entities, without `user` and `assistant`.
@@ -1052,8 +1075,12 @@ fn an_upcoming_occasion_beyond_the_horizon_reaches_call_1_across_sessions() {
     );
     assert!(same_session.in_context.is_empty());
     assert_eq!(same_session.upcoming.len(), 1);
+    assert_eq!(same_session.upcoming[0].handle, "o1");
     assert_eq!(same_session.upcoming[0].memory, occasion);
     assert_eq!(same_session.upcoming[0].content, wedding);
+    let wedding_day = time("2026-10-22T00:00", Day);
+    assert_eq!(Some(same_session.upcoming[0].at), wedding_day);
+    assert!(!same_session.upcoming[0].low_confidence);
 
     let later = h.ingest(&turn(
         "s2",
@@ -1071,6 +1098,42 @@ fn an_upcoming_occasion_beyond_the_horizon_reaches_call_1_across_sessions() {
         h.memory(occasion).accesses,
         before,
         "grounding is not a use"
+    );
+
+    // A task naming the occasion by handle gets its start, instant and
+    // precision as stored, as both end and due date, though it's said in
+    // another timezone. The task keeps its own.
+    let london = h.ingest(&Turn {
+        timezone: Some("Europe/London".into()),
+        ..turn(
+            "s3",
+            "2026-10-01T06:55:00Z",
+            "Buy a gift for the wedding.",
+            "OK.",
+        )
+    });
+    let leased = head(&h, london.source, 0);
+    let input = h.service.call1_input(&leased, &[]).unwrap();
+    assert!(input.context.is_empty());
+    assert_eq!(input.upcoming[0].handle, "o1");
+    let gift = said("task", "Buy a gift for the wedding").with("occasion", json!("o1"));
+    let llm = unlabelled(reply(vec![gift], &[]));
+    let extracted = h.service.extract_chunk(leased, &llm, &[]).unwrap();
+    let task = extracted.memories[0];
+    let window = h.memory(task).window;
+    assert_eq!(window.valid_until, wedding_day);
+    assert_eq!(window.due_at, wedding_day);
+    assert_eq!(window.timezone, "Europe/London");
+    assert_eq!(window.window_confidence, "high");
+    assert_eq!(
+        extracted.occasions,
+        vec![occasion_ref(
+            0,
+            Some(occasion),
+            Some(task),
+            (true, true),
+            OccasionDisposition::Grounded
+        )]
     );
 }
 
@@ -1170,6 +1233,12 @@ fn upcoming_grounding_is_capped_at_the_nearest_occasions() {
             .collect::<Vec<_>>(),
         expected
     );
+    let handles: Vec<&str> = input.upcoming.iter().map(|e| e.handle.as_str()).collect();
+    assert_eq!(handles, ["o1", "o2", "o3", "o4", "o5"][..UPCOMING_EVENTS]);
+    for (n, event) in input.upcoming.iter().enumerate() {
+        let start = format!("2026-10-{}T00:00", 15 + n);
+        assert_eq!(Some(event.at), time(&start, Day));
+    }
 }
 
 #[test]
@@ -1200,10 +1269,9 @@ fn only_the_banks_visible_in_context_memories_are_given() {
     assert_eq!(input.in_context.len(), 1);
     assert_eq!(input.in_context[0].memory, occasion);
     memory_handle(&input, occasion);
-    assert!(
-        input.upcoming.is_empty(),
-        "in-context occasions are not repeated"
-    );
+    assert_eq!(input.upcoming.len(), 1, "in context and still an occasion");
+    assert_eq!(input.upcoming[0].memory, occasion);
+    assert_eq!(input.upcoming[0].handle, "o1");
 }
 
 #[test]
@@ -1244,7 +1312,256 @@ fn the_request_carries_the_input() {
     assert_eq!(input.upcoming.len(), 1);
     assert_eq!(input.upcoming[0].memory, occasion);
     for event in &input.upcoming {
+        assert!(prompt.contains(&event.handle));
         assert!(prompt.contains(&event.content));
+    }
+}
+
+#[test]
+fn an_occasion_fills_only_the_dates_a_task_leaves_out() {
+    let h = Harness::new();
+    let wedding = "The wedding is on 22 October 2026.";
+    let wedding = told(&h, "main", wedding, |_| {
+        vec![said("event", wedding).at("valid_from", "2026-10-22", "day")]
+    })
+    .memories[0];
+    let concert = "The concert is on 25 October 2026";
+    let concert = told(&h, "main", &format!("{concert}, maybe."), |_| {
+        let event = said("event", concert).at("valid_from", "2026-10-25", "day");
+        vec![event.with("window_confidence", json!("low"))]
+    })
+    .memories[0];
+    let before = h.memory(wedding).accesses;
+
+    let naming =
+        |handle: &str, kind: &str, quote: &str| said(kind, quote).with("occasion", json!(handle));
+    let claims = vec![
+        // 0: its own end stays, the due date is filled.
+        naming("o1", "task", "Buy flowers for the wedding").at("valid_until", "2026-10-20", "day"),
+        // 1: its own due date stays, the end is filled.
+        naming("o1", "task", "Book a taxi for the wedding").at(
+            "due_at",
+            "2026-10-21T09:00",
+            "minute",
+        ),
+        // 2: both its own.
+        naming("o1", "task", "Iron a shirt for the wedding")
+            .at("valid_until", "2026-10-20", "day")
+            .at("due_at", "2026-10-19", "day"),
+        // 3: an end given but unreadable is still given.
+        naming("o1", "task", "Polish my shoes for the wedding").at("valid_until", "someday", "day"),
+        // 4: a handle call 1 wasn't given.
+        naming("o9", "task", "Pack a bag for the trip"),
+        // 5 to 7: only a task is dated by an occasion.
+        naming("o1", "fact", "The wedding is outdoors"),
+        naming("o1", "event", "The rehearsal dinner happened"),
+        naming("o1", "state", "I am nervous about the wedding"),
+        // 8: a low-confidence occasion's dates are low confidence.
+        naming("o2", "task", "Buy a card for the concert"),
+        // 9: but only when they're copied.
+        naming("o2", "task", "Print the concert tickets")
+            .at("valid_until", "2026-10-25", "day")
+            .at("due_at", "2026-10-24", "day"),
+    ];
+    let current = h.say(T1, &saying(&claims), "Noted.");
+    let mut claims = claims;
+    // 10: dropped by the checks.
+    claims.push(
+        claim("Tim needs a suit.", "task", "a suit for the wedding").with("occasion", json!("o1")),
+    );
+
+    let leased = head(&h, current.source, 0);
+    let input = h.service.call1_input(&leased, &[]).unwrap();
+    let listed: Vec<(&str, Uuid, bool)> = input
+        .upcoming
+        .iter()
+        .map(|e| (e.handle.as_str(), e.memory, e.low_confidence))
+        .collect();
+    assert_eq!(listed, [("o1", wedding, false), ("o2", concert, true)]);
+    let llm = unlabelled(reply(claims, &["o1", "o2"]));
+    let extracted = h.service.extract_chunk(leased, &llm, &[]).unwrap();
+    assert_eq!(extracted.memories.len(), 10);
+    let memory = |claim: usize| extracted.memories[claim];
+    let window = |claim: usize| h.memory(memory(claim)).window;
+
+    // An occasion handle is never a `used` verdict.
+    assert!(extracted.used.is_empty());
+    assert_eq!(h.memory(wedding).accesses, before);
+
+    let wedding_day = time("2026-10-22T00:00", Day);
+    let concert_day = time("2026-10-25T00:00", Day);
+    let dates = |claim: usize| {
+        let window = window(claim);
+        (window.valid_until, window.due_at, window.window_confidence)
+    };
+    let high = || "high".to_owned();
+    let low = || "low".to_owned();
+    assert_eq!(
+        dates(0),
+        (time("2026-10-20T00:00", Day), wedding_day, high())
+    );
+    assert_eq!(
+        dates(1),
+        (wedding_day, time("2026-10-21T09:00", Minute), high())
+    );
+    assert_eq!(
+        dates(2),
+        (
+            time("2026-10-20T00:00", Day),
+            time("2026-10-19T00:00", Day),
+            high()
+        )
+    );
+    assert_eq!(dates(3), (None, wedding_day, low()));
+    assert_eq!(dates(4), (None, None, high()));
+    for claim in 5..=7 {
+        let window = window(claim);
+        assert_eq!((window.valid_until, window.due_at), (None, None), "{claim}");
+    }
+    assert_eq!(dates(8), (concert_day, concert_day, low()));
+    assert_eq!(
+        dates(9),
+        (concert_day, time("2026-10-24T00:00", Day), high())
+    );
+
+    use OccasionDisposition::{DueOnly, Explicit, Grounded, Ignored};
+    let not_a_task = |claim| {
+        let disposition = Ignored(IgnoredOccasion::NotATask);
+        occasion_ref(
+            claim,
+            Some(wedding),
+            Some(memory(claim)),
+            (false, false),
+            disposition,
+        )
+    };
+    assert_eq!(
+        extracted.occasions,
+        vec![
+            occasion_ref(0, Some(wedding), Some(memory(0)), (false, true), DueOnly),
+            occasion_ref(1, Some(wedding), Some(memory(1)), (true, false), Grounded),
+            occasion_ref(2, Some(wedding), Some(memory(2)), (false, false), Explicit),
+            occasion_ref(3, Some(wedding), Some(memory(3)), (false, true), DueOnly),
+            occasion_ref(
+                4,
+                None,
+                Some(memory(4)),
+                (false, false),
+                Ignored(IgnoredOccasion::UnknownHandle)
+            ),
+            not_a_task(5),
+            not_a_task(6),
+            not_a_task(7),
+            occasion_ref(8, Some(concert), Some(memory(8)), (true, true), Grounded),
+            occasion_ref(9, Some(concert), Some(memory(9)), (false, false), Explicit),
+            occasion_ref(
+                10,
+                Some(wedding),
+                None,
+                (false, false),
+                Ignored(IgnoredOccasion::Dropped)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn an_occasion_reference_is_accounted_for_by_what_reconciliation_writes() {
+    const GIFT: &str = "Tim needs a gift for the wedding.";
+    const WEDDING: &str = "The wedding is on 22 October 2026.";
+    let wedding_day = time("2026-10-22T00:00", Day);
+    let occasion = |h: &Harness| {
+        told(h, "main", WEDDING, |_| {
+            vec![said("event", WEDDING).at("valid_from", "2026-10-22", "day")]
+        })
+        .memories[0]
+    };
+    let for_wedding = |quote: &str| claim(GIFT, "task", quote).with("occasion", json!("o1"));
+
+    // A repeat that dates an undated task refines it.
+    let h = Harness::new();
+    let wedding = occasion(&h);
+    let gift = "I need a gift for the wedding";
+    let undated = golden(&h, gift, "OK.", vec![claim(GIFT, "task", gift)])[0];
+    let again = "I still need a gift for the wedding";
+    h.say("2026-10-01T06:40:00Z", again, "OK.");
+    let leased = lease(&h, "main");
+    let call1 = reply(vec![for_wedding(again)], &[]);
+    let llm = labelled(&h, &leased, call1, undated, "mentioned_again", &[]);
+    let extracted = h.service.extract_chunk(leased, &llm, &[]).unwrap();
+    let dated = h.memory(undated).chain.head;
+    assert_ne!(dated, undated);
+    assert_eq!(extracted.memories, vec![dated]);
+    assert_eq!(h.memory(dated).window.valid_until, wedding_day);
+    assert_eq!(
+        extracted.occasions,
+        vec![occasion_ref(
+            0,
+            Some(wedding),
+            Some(dated),
+            (true, true),
+            OccasionDisposition::Grounded
+        )]
+    );
+
+    // Saying it again adds nothing to the dated head: no memory is written.
+    let window = h.memory(dated).window;
+    let reminder = "Remember, a gift for the wedding";
+    h.say("2026-10-01T06:50:00Z", reminder, "OK.");
+    let leased = lease(&h, "main");
+    let call1 = reply(vec![for_wedding("a gift for the wedding")], &[]);
+    let llm = labelled(&h, &leased, call1, dated, "mentioned_again", &[]);
+    let extracted = h.service.extract_chunk(leased, &llm, &[]).unwrap();
+    assert!(extracted.memories.is_empty());
+    assert_eq!(h.memory(dated).chain.head, dated);
+    assert_eq!(h.memory(dated).window, window);
+    assert_eq!(
+        extracted.occasions,
+        vec![occasion_ref(
+            0,
+            Some(wedding),
+            None,
+            (true, true),
+            OccasionDisposition::Absorbed
+        )]
+    );
+
+    // An older claim a newer memory ends is created ended where that memory
+    // starts. The end the occasion supplied is overridden, unless the two
+    // are the same instant and precision.
+    for (start, disposition) in [
+        ("2026-10-05", OccasionDisposition::Overridden),
+        ("2026-10-22", OccasionDisposition::Grounded),
+    ] {
+        let h = Harness::new();
+        let wedding = occasion(&h);
+        let has = "I have the gift for the wedding";
+        let has = claim("Tim has the gift for the wedding.", "fact", has);
+        let has = golden(
+            &h,
+            has["quote"].as_str().unwrap(),
+            "Nice.",
+            vec![has.at("valid_from", start, "day")],
+        )[0];
+        h.say("2026-10-01T06:20:00Z", gift, "OK.");
+        let leased = lease(&h, "main");
+        let call1 = reply(vec![for_wedding(gift)], &[]);
+        let llm = labelled(&h, &leased, call1, has, "ends", &[]);
+        let extracted = h.service.extract_chunk(leased, &llm, &[]).unwrap();
+        let task = extracted.memories[0];
+        let end = time(&format!("{start}T00:00"), Day);
+        assert_eq!(h.memory(task).window.valid_until, end, "{start}");
+        assert_eq!(
+            extracted.occasions,
+            vec![occasion_ref(
+                0,
+                Some(wedding),
+                Some(task),
+                (true, true),
+                disposition
+            )],
+            "{start}"
+        );
     }
 }
 

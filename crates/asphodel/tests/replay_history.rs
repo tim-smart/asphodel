@@ -794,7 +794,10 @@ fn not_created_window_keeps_purged_creations_in_the_count() {
 // Recording modes.
 
 /// A one-token injection budget keeps the future occasion out of in-context memories:
-/// call 1 sees zero upcoming lines twice, then one.
+/// call 1 sees zero upcoming lines twice, then one. Every call 1 replies
+/// with the occasion and a gift task naming it as `o1`; each survives only
+/// in the turn that says it, so the gift turn's reference is grounded and
+/// the two dropped ones are ignored.
 fn check_call1_input_sizes(recording_mode: &str) {
     const OCCASION: &str = "Zoë’s wedding is on 30 January 2026.";
     let dir = TestDir::new();
@@ -817,8 +820,11 @@ fn check_call1_input_sizes(recording_mode: &str) {
     event["valid_from"] = json!({
         "at": "2026-01-30", "precision": "day"
     });
-    let script = script_answering_everything(&dir, "occasion-size", vec![event], vec![]);
-    let probes = probe_on("occasion", 6, "exists", r#"memory = "wedding""#);
+    let mut gift = claim("Tim needs a gift.", "I need a gift for the wedding", "task");
+    gift["occasion"] = json!("o1");
+    let script = script_answering_everything(&dir, "occasion-size", vec![event, gift], vec![]);
+    let probes = probe_on("occasion", 6, "exists", r#"memory = "wedding""#)
+        + &probe_on("gift", 6, "exists", r#"memory = "gift""#);
     let export = dir.path("sizes.json");
     // Separate sessions alone do not prevent relevance injection. The dated
     // sentence cannot fit this budget, so the gift turn sees it only through
@@ -887,15 +893,43 @@ fn check_call1_input_sizes(recording_mode: &str) {
         results.push((report, aggregate));
     }
     for (report, aggregate) in results {
+        let kind = &report["kind"];
         assert_eq!(
             aggregate["call1_input"], expected,
-            "aggregate call-1 sizes in {}",
-            report["kind"]
+            "aggregate call-1 sizes in {kind}"
         );
         assert_eq!(
             report["call1_input"], expected,
             "the private report and aggregate describe the same input sizes"
         );
+
+        let refs = &aggregate["occasion_refs"];
+        assert_eq!(
+            (&refs["given"], &refs["grounded"], &refs["ignored"]),
+            (&json!(3), &json!(1), &json!(2)),
+            "occasion references in {kind}"
+        );
+        assert_eq!(
+            report["occasion_refs"], *refs,
+            "the private report and aggregate count the same references"
+        );
+        // The rows name ids only: the grounded one links the gift task to
+        // the occasion, and a dropped claim wrote nothing.
+        let rows = report["occasion_ref_rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{kind}");
+        let grounded: Vec<&Value> = rows
+            .iter()
+            .filter(|row| row["disposition"] == "grounded")
+            .collect();
+        assert_eq!(grounded.len(), 1, "{kind}");
+        let row = grounded[0];
+        assert_eq!(row["claim"], 1);
+        assert_eq!(row["occasion"], observed_id(&report, "occasion"));
+        assert_eq!(row["memory"], observed_id(&report, "gift"));
+        assert_eq!(row["filled"], json!({"valid_until": true, "due_at": true}));
+        for row in rows.iter().filter(|row| row["disposition"] != "grounded") {
+            assert!(row["memory"].is_null(), "{kind}: {row}");
+        }
     }
 }
 
