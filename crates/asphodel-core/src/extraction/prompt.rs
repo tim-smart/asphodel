@@ -217,6 +217,13 @@ fn render(input: &Call1Input) -> String {
         let _ = writeln!(out, "- {}: {}", memory.handle, memory.content);
     }
 
+    if !input.upcoming.is_empty() {
+        out.push_str("\nUpcoming occasions already remembered, for grounding dates only. Never quote from them:\n");
+        for event in &input.upcoming {
+            let _ = writeln!(out, "- {}", event.content);
+        }
+    }
+
     if !input.context.is_empty() {
         out.push_str("\nContext, for understanding the text only. Never quote from it:\n");
         for (index, passage) in input.context.iter().enumerate() {
