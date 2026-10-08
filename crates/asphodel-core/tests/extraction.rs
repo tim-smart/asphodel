@@ -961,7 +961,9 @@ fn a_candidates_examples_are_its_strongest_visible_memories() {
         h.service.retract("main", &doctor.to_string()).unwrap();
 
         let use_in_reply = |memory: Uuid| {
-            let used = h.ingest(&turn("chat", "2026-10-01T05:00:00Z", "And?", "Yes!"));
+            // This case tests a fresh use lifting a trivial memory, not
+            // the decay of a historical use received just now.
+            let used = h.ingest(&turn("chat", START, "And?", "Yes!"));
             let lease = head(&h, used.source, 0);
             let shown = memory_handle(&h.service.call1_input(&lease, &[memory]).unwrap(), memory);
             let llm = FakeLlm::scripted(MODEL, vec![reply(vec![], &[&shown])]);
@@ -1677,7 +1679,7 @@ fn used_verdicts_write_one_access_per_memory_per_turn() {
     let cake = remember(&h, "main", "Tim likes cake.");
     let reply_text = "Tea and cake, as you like them.";
     let current = h.say(T1, "Tea and cake? I like cake.", reply_text);
-    let ingested_at = h.clock.now();
+    let message_at = at(T1);
     let turn_number = h.bank().turns;
     h.advance(1);
 
@@ -1698,7 +1700,7 @@ fn used_verdicts_write_one_access_per_memory_per_turn() {
     let tea = h.memory(tea);
     assert_eq!(
         accesses(&tea)[1..],
-        [("used", ingested_at, turn_number, Some(current.source))]
+        [("used", message_at, turn_number, Some(current.source))]
     );
     let cake = h.memory(cake);
     let in_turn: Vec<&str> = accesses(&cake)

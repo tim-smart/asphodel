@@ -863,7 +863,7 @@ fn a_chain_past_the_knn_limit_neither_aborts_extraction_nor_crowds_out_a_neighbo
 #[test]
 fn a_repeat_is_one_access_on_the_memory_and_outranks_used() {
     // The reply relied on the memory and the user restated it in the same
-    // turn: one access, the heavier mention, at the source's ingested_at and
+    // turn: one access, the heavier mention, at the source's message_at and
     // the bank's turn, like every access extraction writes.
     let h = Harness::new();
     let tea = h.fact(TEA);
@@ -885,7 +885,7 @@ fn a_repeat_is_one_access_on_the_memory_and_outranks_used() {
     let mut accesses = before.1;
     accesses.push(AccessEntry {
         kind: "mentioned_again".into(),
-        at: h.now(),
+        at: at(T1),
         turn: h.bank().turns,
         source: Some(source),
         inherited_from: None,
