@@ -699,25 +699,26 @@ question rules out, with the specifics that make a fact usable. Don't generalise
 and merge memories that say the same thing.
 
 Write a section for each facet listed, in that order and under the facet's heading, with what \
-matters most first, and leave out a facet the memories say nothing about. Write a section as one \
-paragraph of connected prose when its facts bear on each other, or as a list, one fact per line \
-starting with \"- \", when they stand alone. Don't mix the two in a section, and don't split one \
-fact over lines. Say nothing the memories you cite don't support, and use names, not \
-pronouns, for the people in it. When a memory is marked with an observed date and may be stale, \
-write its fact with that absolute date (for example, 'as of 1 Sep'), not as an unqualified \
-current fact or a relative age. {language_rule}
+matters most first, and leave out a facet the memories say nothing about. Write a section as a \
+list, one fact per line starting with \"- \", unless its facts depend on each other closely enough \
+to read as one paragraph of connected prose. Don't mix the two in a section, and don't split one \
+fact over lines. Say nothing the memories you cite don't support, and use names, not pronouns, \
+for the people in it. When a memory is marked with an observed date and may be stale, write its \
+fact with that absolute date (for example, 'as of 1 Sep'), not as an unqualified current fact or \
+a relative age. {language_rule}
 
 Each memory is listed with its significance: trivial, minor, notable, major or critical, or kept \
 when the user asked for it to be remembered. When the budget is tight, keep the more significant \
 memories and leave out the less significant ones.
 
-The previous answer keeps the wording steady; it is not a limit. Restate what the memories listed \
-still support, reword what they change, add what they support that it left out, and leave out \
-what they no longer support or what no longer answers the question: anything you leave out is \
-gone. Cite by handle every memory the answer rests on, in the cites list for the whole answer \
-and never in the text, and only the handles listed (m1, m2, ...). Use the token budget, headings included, at about four \
-characters to a token, for what the memories support: leaving out a supported fact that answers \
-the question is worse than a longer answer, but don't pad and don't go over.\
+The previous answer keeps the wording steady, not its form or length: write a paragraph of \
+separate facts in it as a list. Restate what the memories listed still support, reword what they \
+change, add what they support that it left out, and leave out what they no longer support or what \
+no longer answers the question: anything you leave out is gone. Cite by handle every memory the \
+answer rests on, in the cites list for the whole answer and never in the text, and only the \
+handles listed (m1, m2, ...). Use the token budget, headings included, at about four characters \
+to a token, for what the memories support: leaving out a supported fact that answers the \
+question is worse than a longer answer, but don't pad and don't go over.\
 {profile_rule}";
 
 /// The seeded profile's durability rule. Other models keep whatever time
