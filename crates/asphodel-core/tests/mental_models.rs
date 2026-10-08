@@ -1779,8 +1779,9 @@ fn a_changed_question_rewrites_the_answer_even_with_the_same_facets() {
 
 #[test]
 fn a_write_stores_its_sections_as_one_text_citing_what_the_whole_reply_cites() {
-    // Each section is its heading's line and then its paragraph, with a
-    // blank line between sections. A section with no text is left out,
+    // Each section is its heading's line and then its paragraph or list,
+    // with a blank line between sections. A list keeps its lines, but not
+    // blank ones or a heading's marks. A section with no text is left out,
     // heading and all. The next write replaces the text and the citations
     // whole.
     let h = Harness::new();
@@ -1794,17 +1795,21 @@ fn a_write_stores_its_sections_as_one_text_citing_what_the_whole_reply_cites() {
             ("Preferences", "Tim likes green tea. Tim walks to work."),
             ("Hobbies", "  "),
             ("People", MAYA),
+            (
+                "Pets",
+                "- Miso is a  cat\n\n  - Miso is grey\n-\n##\n### Miso sleeps a lot\n#cats",
+            ),
         ];
-        written(&sections, &handles(input, &[tea, walk, maya]))
+        written(&sections, &handles(input, &[tea, walk, maya, cat]))
     });
     assert!(first.written);
     assert_eq!(first.trimmed, 0);
     let profile = h.profile();
     assert_eq!(
         answer(&profile),
-        "### Preferences\nTim likes green tea. Tim walks to work.\n\n### People\nTim's daughter is called Maya."
+        "### Preferences\nTim likes green tea. Tim walks to work.\n\n### People\nTim's daughter is called Maya.\n\n### Pets\n- Miso is a cat\n- Miso is grey\nMiso sleeps a lot\n#cats"
     );
-    assert_eq!(cites(&profile), BTreeSet::from([tea, walk, maya]));
+    assert_eq!(cites(&profile), BTreeSet::from([tea, walk, maya, cat]));
 
     h.rewrite(PROFILE_NAME, &[("Pets", &[(CAT_ENTRY, &[cat])])]);
     let profile = h.profile();
@@ -1946,10 +1951,10 @@ fn mornings(h: &Harness, max_tokens: u32) -> &'static str {
 
 #[test]
 fn an_answer_past_max_tokens_loses_sentences_from_the_end_headings_included() {
-    // Measured on the stored text, headings and all. The last sentence of
-    // the last section goes first, and a section left empty takes its
-    // heading with it. A sentence ends at `.`, `!` or `?` before a space or
-    // the end, so "2.5" doesn't end one.
+    // Measured on the stored text, headings and all. The last sentence or
+    // line of the last section goes first, and a section left empty takes
+    // its heading with it. A sentence ends at `.`, `!` or `?` before a space
+    // or the end, so "2.5" doesn't end one.
     let h = Harness::new();
     mornings(&h, 27);
     let tea = h.seed(fact("Tim drinks tea in the morning."));
@@ -1958,12 +1963,15 @@ fn an_answer_past_max_tokens_loses_sentences_from_the_end_headings_included() {
     let applied = h.refresh_with("Mornings", |input| {
         let sections = [
             ("Drinks", drinks.as_str()),
-            ("Later", "Tim has juice at lunch."),
+            (
+                "Later",
+                "- Tim has juice at lunch\n- Tim has water at dinner",
+            ),
         ];
         written(&sections, &handles(input, &[tea]))
     });
     assert!(applied.written);
-    assert_eq!(applied.trimmed, 2);
+    assert_eq!(applied.trimmed, 3);
     let mornings = h.model("Mornings");
     assert_eq!(answer(&mornings), format!("### Drinks\n{kept}"));
     assert!(estimate_tokens(answer(&mornings)) <= 27);
@@ -2116,30 +2124,32 @@ fn the_block_opens_with_guidance_then_holds_the_agenda_and_each_enabled_model() 
     let single_facet_block = block.text;
 
     // Multiple facets sit below the model heading, with the stored answer
-    // unchanged. An enabled model without an answer has no prompt section.
+    // unchanged, a list keeping its lines. An enabled model without an
+    // answer has no prompt section.
     h.edit("Plans", json!({"enabled": true})).unwrap();
     let empty = h.block(None);
     assert!(!empty.text.contains("### Plans"), "{}", empty.text);
     assert!(!empty.text.contains("Where is Tim going and when?"));
     let cat = h.seed(fact(CAT));
+    let pets = format!("- {CAT_ENTRY}\n- Miso is grey.");
     h.rewrite(
         PROFILE_NAME,
         &[
             ("Drinks", &[(TEA, &[tea])]),
-            ("Pets", &[(CAT_ENTRY, &[cat])]),
+            ("Pets", &[(pets.as_str(), &[cat])]),
         ],
     );
     let block = h.block(None);
     assert!(
         block.text.ends_with(&format!(
-            "### {PROFILE_NAME}\n\nPrompt:\n{question}\n\nOutput:\n#### Drinks\n{TEA}\n\n#### Pets\n{CAT_ENTRY}"
+            "### {PROFILE_NAME}\n\nPrompt:\n{question}\n\nOutput:\n#### Drinks\n{TEA}\n\n#### Pets\n{pets}"
         )),
         "{}",
         block.text
     );
     assert_eq!(
         answer(&h.profile()),
-        format!("### Drinks\n{TEA}\n\n### Pets\n{CAT_ENTRY}")
+        format!("### Drinks\n{TEA}\n\n### Pets\n{pets}")
     );
     assert!(
         single_facet_block.ends_with(&format!(
@@ -3455,7 +3465,7 @@ fn the_whole_block_stays_within_the_budget_and_records_only_what_it_renders() {
     // caps and is laid out first, so today's appointment can't be pushed
     // out by a model; the models get what's left. What the block lists or
     // cites, and so puts in a session's context, is only what it rendered.
-    // A model too long for what's left is cut at a sentence end, and one
+    // A model too long for what's left is cut at a sentence or line end, and one
     // with no sentence that fits is left out. `model show` says which.
     let h = Harness::new();
     let today = "Tim has a dentist appointment this evening at the clinic on Queen Street.";
@@ -3493,7 +3503,7 @@ fn the_whole_block_stays_within_the_budget_and_records_only_what_it_renders() {
     assert!(block.agenda.contains(&today), "today's appointment");
     assert!(block.text.contains("dentist appointment this evening"));
 
-    // The answer is cut at a sentence end, and the block cites the model's
+    // The answer is cut at a sentence or line end, and the block cites the model's
     // whole citation set, which goes in context, since some of it renders.
     let rendered = texts
         .iter()

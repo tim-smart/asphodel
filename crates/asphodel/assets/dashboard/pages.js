@@ -1565,17 +1565,32 @@ function explainResults(ctx, explained, sent, timeZone) {
   return [summary, injected, madeIt, leftOut].filter(Boolean);
 }
 
-/// A model's stored answer, each `### heading` and its paragraph, or that it
-/// has none yet.
+/// A model's stored answer, each `### heading` and its paragraph or list,
+/// or that it has none yet.
 function modelAnswer(h, answer) {
   if (!answer) return h("p", { class: "answer quiet-text" }, "No answer yet.");
   const sections = answer.split("\n\n").map((block) => {
     const [first, ...rest] = block.split("\n");
     return first.startsWith("### ")
-      ? [h("h3", {}, first.slice(4)), h("p", {}, rest.join(" "))]
-      : h("p", {}, block);
+      ? [h("h3", {}, first.slice(4)), answerLines(h, rest)]
+      : answerLines(h, [first, ...rest]);
   });
   return h("div", { class: "answer" }, sections);
+}
+
+/// A section's lines: a run of `- ` lines as a list, any other line a
+/// paragraph.
+function answerLines(h, lines) {
+  const blocks = [];
+  for (const line of lines) {
+    const last = blocks.at(-1);
+    if (!line.startsWith("- ")) blocks.push(line);
+    else if (Array.isArray(last)) last.push(line.slice(2));
+    else blocks.push([line.slice(2)]);
+  }
+  return blocks.map((block) =>
+    Array.isArray(block) ? h("ul", {}, block.map((item) => h("li", {}, item))) : h("p", {}, block),
+  );
 }
 
 function candidateRow(ctx, c, reason) {

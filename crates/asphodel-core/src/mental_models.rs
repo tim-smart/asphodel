@@ -1,7 +1,7 @@
 //! Mental models.
 //!
 //! A model answers a standing question, such as "who is the user?", with
-//! one prose answer, a heading and a paragraph per facet, and one set of
+//! one answer, a heading and a paragraph or list per facet, and one set of
 //! citations: the memories the answer rests on. Only the owner defines
 //! models, through the CLI or API, and there are no hand edits. A refresh
 //! ([`refresh`]) asks one narrow question per facet of the model's question
@@ -24,7 +24,7 @@
 //!
 //! Possibly stale states are supplied to the write with absolute observed
 //! dates for the prose to carry. Rendering adds no age annotations and
-//! cuts an answer only at a sentence end to fit the shared block budget
+//! cuts an answer only at a sentence or line end to fit the shared block budget
 //! ([`crate::system_prompt`]); even a cut answer cites its whole set.
 
 mod answer;
@@ -54,7 +54,7 @@ pub(crate) use schedule::Schedule;
 pub const PLAN_TEMPLATE: &str = "plan_model";
 pub const PLAN_VERSION: u32 = 1;
 pub const WRITE_TEMPLATE: &str = "write_model";
-pub const WRITE_VERSION: u32 = 8;
+pub const WRITE_VERSION: u32 = 9;
 
 /// The least time between two refreshes of one model, and the wait before
 /// a failed refresh is tried again. Fixed

@@ -476,7 +476,7 @@ pub enum ModelCommand {
     Refresh(ModelRefreshArgs),
 
     /// Show a model's answer as the block reads it, each section a heading
-    /// and a paragraph, then the memories it cites with their status and
+    /// and a paragraph or list, then the memories it cites with their status and
     /// whether the block shows the model.
     Show(ModelShowArgs),
 }
@@ -1719,7 +1719,7 @@ fn model(command: ModelCommand) -> anyhow::Result<()> {
 }
 
 /// A model's view: its settings, its answer as the block reads it, each
-/// section a heading and one paragraph, then the memories it cites with
+/// section a heading and a paragraph or list, then the memories it cites with
 /// their status, and whether the block shows the model.
 fn print_model_view(view: &Value) {
     let enabled = if view.get("enabled").and_then(Value::as_bool) == Some(false) {

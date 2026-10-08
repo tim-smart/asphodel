@@ -554,7 +554,7 @@ Only the owner defines mental models, through these commands or the API.
 - `asphodel model refresh --bank B <name> [--force]` refreshes now. It's
   skipped when the inputs haven't changed, unless `--force`.
 - `asphodel model show --bank B <name>` prints the stored answer, each
-  section a heading and one paragraph, then the memories it cites with
+  section a heading and a paragraph or list, then the memories it cites with
   their status (current, ended, retracted or
   forgotten), and whether the prompt block shows the model: whole, cut
   short to fit what the agenda and older models leave of the budget, or
@@ -604,16 +604,16 @@ lost beneath results for the others:
    such as birthdays go with the person they're about, and each person is
    named with their relationship to the user when a memory gives it. This rule comes
    last in the prompt, after the previous answer's instructions. It
-   returns the whole answer as connected prose, a heading and a paragraph
-   per facet, and one list of the memories it rests on.
+   returns the whole answer, a heading and a paragraph or list per facet,
+   and one list of the memories it rests on.
    Code joins the sections into the stored text and refuses a reply with
    no text, no citations or a citation outside the input: that refresh
    changes nothing and fails as malformed, to be tried again in 30
    minutes. Code can check the citations, not the prose. A memory that left
    the input isn't listed, so the answer can't cite it, and the prompt
    says that what the listed memories no longer support goes. Over
-   `max_tokens`, measured on the text with its headings, sentences are
-   trimmed from the end, and a section left empty loses its heading. A
+   `max_tokens`, measured on the text with its headings, sentences and
+   lines are trimmed from the end, and a section left empty loses its heading. A
    sentence ends at `.`, `!`, `?`, `。`, `！` or `？` before whitespace or
    the end. With nothing selected the answer is cleared, with no call.
 
@@ -655,7 +655,7 @@ in the answer written at refresh time. The seeded profile defaults to a
 2560-token prompt block
 (`mental_models.budget`) shared with the agenda and every enabled model.
 Headings count toward these caps. An answer that doesn't fit what's left
-of the block is cut at a sentence end, by the same trim as the refresh's.
+of the block is cut at a sentence or line end, by the same trim as the refresh's.
 A section left empty loses its heading, and a model with no sentence left
 is omitted. The profile is not guaranteed its full cap when the agenda or
 other models use the budget.

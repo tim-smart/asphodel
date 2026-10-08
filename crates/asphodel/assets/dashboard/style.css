@@ -1425,9 +1425,14 @@ legend {
   font: 650 0.95rem var(--sans);
 }
 
-.model .answer p {
+.model .answer p,
+.model .answer ul {
   margin: 0;
   font: 400 1rem/1.45 var(--serif);
+}
+
+.model .answer ul {
+  padding-left: 1.2rem;
 }
 
 .model[data-enabled="false"] {

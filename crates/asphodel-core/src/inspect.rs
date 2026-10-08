@@ -958,7 +958,7 @@ pub struct ModelView {
     /// current, and at least its first sentence fits what the agenda and
     /// the older models leave of the budget.
     pub renders: bool,
-    /// The answer as the block shows it: whole, or cut at a sentence end.
+    /// The answer as the block shows it: whole, or cut at a sentence or line end.
     /// `None` when the block leaves the model out.
     pub shown_answer: Option<String>,
 }

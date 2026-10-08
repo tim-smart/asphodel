@@ -34,17 +34,17 @@
 //!    for the seeded profile, to keep only what will still hold in months.
 //!    Possibly stale states carry their absolute observed date in the
 //!    memory's timezone; the write is asked to include it in the prose. It
-//!    replies with the whole answer, a heading and a paragraph per section, and the handles of every
-//!    memory it rests on. A memory that left the selection isn't listed, so
-//!    the reply can't cite it, and the prompt says that what the listed
-//!    memories no longer support goes. With nothing selected there's
+//!    replies with the whole answer, a heading and a paragraph or list per
+//!    section, and the handles of every memory it rests on. A memory that
+//!    left the selection isn't listed, so the reply can't cite it, and the
+//!    prompt says that what the listed memories no longer support goes. With nothing selected there's
 //!    nothing to ask: the answer is cleared, with no call.
 //! 5. **Apply.** Code joins the sections into the stored text. A section
 //!    with no text is left out. A reply with no text, no citations or a
 //!    citation outside the selection changes nothing and is recorded like
 //!    one that doesn't parse. Code can check the citations, not the prose.
 //! 6. **Trim.** Over `max_tokens`, measured on the stored text with its
-//!    headings, sentences go from the end ([`Answer::trim_to`]).
+//!    headings, sentences or lines go from the end ([`Answer::trim_to`]).
 //! 7. **Store.** The answer and its citations replace the old ones whole,
 //!    unless a memory it cites was forgotten while it was written, or a
 //!    forget blanked the answer meanwhile: then nothing is stored, and the
@@ -698,12 +698,14 @@ well. Give the assistant everything the memories say that answers the question, 
 question rules out, with the specifics that make a fact usable. Don't generalise a specific away, \
 and merge memories that say the same thing.
 
-Write it as connected prose, a section for each facet listed, in that order and under the facet's \
-heading, and leave out a facet the memories say nothing about. Write each section as one \
-paragraph that reads as a whole, with what matters most first. Say nothing the memories you cite \
-don't support, and use names, not pronouns, for the people in it. When a memory is marked with an \
-observed date and may be stale, write its fact with that absolute date (for example, 'as of 1 \
-Sep'), not as an unqualified current fact or a relative age. {language_rule}
+Write a section for each facet listed, in that order and under the facet's heading, with what \
+matters most first, and leave out a facet the memories say nothing about. Write a section as one \
+paragraph of connected prose when its facts bear on each other, or as a list, one fact per line \
+starting with \"- \", when they stand alone. Don't mix the two in a section, and don't split one \
+fact over lines. Say nothing the memories you cite don't support, and use names, not \
+pronouns, for the people in it. When a memory is marked with an observed date and may be stale, \
+write its fact with that absolute date (for example, 'as of 1 Sep'), not as an unqualified \
+current fact or a relative age. {language_rule}
 
 Each memory is listed with its significance: trivial, minor, notable, major or critical, or kept \
 when the user asked for it to be remembered. When the budget is tight, keep the more significant \

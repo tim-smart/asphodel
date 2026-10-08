@@ -10,7 +10,7 @@
 //!   only when it and the guidance alone are over: undated tasks, then
 //!   routines, least-ranked first, then dated lines in the agenda's fold
 //!   order. The models fill what's left, oldest first, each whole under its
-//!   heading and question when it fits, cut at a sentence end when it
+//!   heading and question when it fits, cut at a sentence or line end when it
 //!   doesn't ([`Answer::trim_to`]), the same helper rendering and
 //!   measuring it. A model with no sentence left renders nothing. The
 //!   answer's section headings sit a level under the model's. What the
@@ -194,7 +194,7 @@ pub(crate) struct Layout {
     /// The memories the rendered models cite, each once.
     pub cited: Vec<Uuid>,
     /// Each model the block shows, by rowid, with its answer as shown:
-    /// whole, or cut at a sentence end. A model left out isn't here.
+    /// whole, or cut at a sentence or line end. A model left out isn't here.
     pub models: HashMap<i64, String>,
 }
 
@@ -290,7 +290,7 @@ pub(crate) fn lay_out(
     let mut sections: Vec<String> = agenda_section.into_iter().collect();
 
     // Then each enabled model, oldest first, in what's left: its answer
-    // whole, or cut at a sentence end to fit. A model renders only while
+    // whole, or cut at a sentence or line end to fit. A model renders only while
     // every memory its answer cites is current, and then cites them all,
     // which puts them in a session's context.
     let mut cited: Vec<Uuid> = Vec::new();

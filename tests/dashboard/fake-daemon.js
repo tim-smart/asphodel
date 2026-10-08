@@ -219,7 +219,7 @@ export function fixtures() {
     models: [
       model("profile", "User profile", {
         max_tokens: 500,
-        answer: `### About Sam\n${sentences.auckland}`,
+        answer: `### About Sam\n${sentences.auckland}\n\n### How to help\n- Sam likes short replies.\n- Sam reads on a phone.`,
         cites: [ids.auckland],
         last_refreshed_at: "2026-10-03T08:30:00Z",
       }),

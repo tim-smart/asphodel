@@ -1,15 +1,16 @@
-//! A model's answer: sections, each an optional heading and one paragraph.
+//! A model's answer: sections, each an optional heading and its text, a
+//! paragraph or a list.
 //!
 //! Stored as Markdown, each section a `### heading` line followed by its
-//! paragraph, sections separated by a blank line. A section without a
+//! text, sections separated by a blank line. A section without a
 //! heading is a paragraph alone; only answers converted from entries
 //! written before sections have one, and it comes first.
 //!
 //! The refresh trims an answer over `max_tokens`, and the block cuts one
 //! that doesn't fit what's left of its budget, the same way: the last
-//! sentence of the last section goes, and a section left empty takes its
-//! heading with it, until it fits. A sentence ends at `.`, `!`, `?`, `。`,
-//! `！` or `？` followed by whitespace or the end of the text.
+//! sentence or line of the last section goes, and a section left empty takes
+//! its heading with it, until it fits. A sentence ends at `.`, `!`, `?`,
+//! `。`, `！` or `？` followed by whitespace or the end of the text.
 
 use rusqlite::Connection;
 
@@ -24,10 +25,29 @@ struct Section {
     text: String,
 }
 
-/// Runs of whitespace, newlines included, as one space, so a paragraph is
-/// one line and a heading can't break the layout.
+/// Runs of whitespace, newlines included, as one space, so a heading is
+/// one line.
 fn collapse(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Each line collapsed and blank ones dropped, so a list keeps its items
+/// but a section can't hold the blank line that ends it. A line loses the
+/// marks that would make it a heading, and an empty list item goes.
+fn lines(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let line = collapse(line);
+            let unmarked = line.trim_start_matches('#');
+            if unmarked.len() < line.len() && (unmarked.is_empty() || unmarked.starts_with(' ')) {
+                unmarked.trim_start().to_owned()
+            } else {
+                line
+            }
+        })
+        .filter(|line| !line.is_empty() && line != "-")
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl Answer {
@@ -39,7 +59,7 @@ impl Answer {
             .into_iter()
             .map(|(heading, text)| Section {
                 heading: heading.map(|h| collapse(&h)).filter(|h| !h.is_empty()),
-                text: collapse(&text),
+                text: lines(&text),
             })
             .filter(|section| !section.text.is_empty())
             .collect();
@@ -91,8 +111,8 @@ impl Answer {
             .join("\n\n")
     }
 
-    /// Takes the last sentence off the end until `fits` holds or nothing is
-    /// left. Returns how many sentences went.
+    /// Takes the last sentence or line off the end until `fits` holds or
+    /// nothing is left. Returns how many went.
     pub(crate) fn trim_to(&mut self, fits: impl Fn(&Answer) -> bool) -> usize {
         let mut trimmed = 0;
         while !self.is_empty() && !fits(self) {
@@ -102,8 +122,8 @@ impl Answer {
         trimmed
     }
 
-    /// Takes the last sentence of the last section off; a section left
-    /// empty goes with its heading.
+    /// Takes the last sentence or line of the last section off; a section
+    /// left empty goes with its heading.
     fn pop_sentence(&mut self) {
         let Some(last) = self.sections.last_mut() else {
             return;
@@ -117,12 +137,16 @@ impl Answer {
     }
 }
 
-/// Where the text before the last sentence ends, or `None` when the text is
-/// one sentence.
+/// Where the text before the last sentence or line ends, or `None` when the
+/// text is one sentence on one line.
 fn last_sentence_start(text: &str) -> Option<usize> {
     let mut end = None;
     let mut chars = text.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
+        if c == '\n' {
+            end = Some(at);
+            continue;
+        }
         if !matches!(c, '.' | '!' | '?' | '。' | '！' | '？') {
             continue;
         }

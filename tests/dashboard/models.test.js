@@ -93,6 +93,8 @@ test("each model shows its question, answer, token limit, whether it's in the pr
   const profile = await findModel(page, "User profile");
   assert.ok(textOf(profile).includes(questions.profile), textOf(profile));
   assert.ok(textOf(profile).includes(sentences.auckland), textOf(profile));
+  const items = [...profile.querySelectorAll(".answer li")].map(textOf);
+  assert.deepEqual(items, ["Sam likes short replies.", "Sam reads on a phone."]);
   assert.match(textOf(profile), /(^|\D)500(\D|$)/);
   assert.ok(profile.querySelector('time[datetime="2026-10-03T08:30:00Z"]'), profile.innerHTML);
   assert.ok(isOn(toggleIn(profile)), "the profile is in the prompt");
