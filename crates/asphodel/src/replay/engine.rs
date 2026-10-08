@@ -47,7 +47,9 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asphodel_core::extraction::{Call1Input, Committed, DropReason, Extracted, Prepared};
+use asphodel_core::extraction::{
+    Call1Input, Committed, DropReason, Extracted, Prepared, call1_request,
+};
 use asphodel_core::ingest::{Document, Outcome as IngestOutcome, Turn, TurnAuthor};
 use asphodel_core::inspect::InspectError;
 use asphodel_core::mental_models::{PLAN_TEMPLATE, Refreshes};
@@ -67,9 +69,9 @@ use uuid::Uuid;
 use super::cassette::{Chained, ChunkContext, ChunkKey, Recorder};
 use super::labelling::{Collector, Material};
 use super::report::{
-    Call2Rate, DayCount, InjectedTokens, InjectionUsage, KindMismatchRow, Lag, LlmCounts,
-    MemoryOutcome, Percentiles, ProbeResult, RefineCauses, Restatements, SessionTokens, WeekBands,
-    WeekCount,
+    Call1InputSizes, Call2Rate, DayCount, InjectedTokens, InjectionUsage, KindMismatchRow, Lag,
+    LlmCounts, MemoryOutcome, Percentiles, ProbeResult, RefineCauses, Restatements, SessionTokens,
+    WeekBands, WeekCount,
 };
 use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX};
 use super::shadow::{Created, ShadowRow};
@@ -143,6 +145,7 @@ pub struct Outcome {
     pub injected_tokens: InjectedTokens,
     pub injection_usage: InjectionUsage,
     pub profile_tokens: Percentiles,
+    pub call1_input: Call1InputSizes,
     pub call2_rate: Call2Rate,
     pub restatements: Restatements,
     pub agenda_lines_per_day: Vec<DayCount>,
@@ -328,6 +331,8 @@ pub struct Engine<'a> {
     cron_prefetches: u64,
     cron_tokens: u64,
     profile_tokens: Vec<u64>,
+    call1_characters: Vec<u64>,
+    upcoming_lines: Vec<u64>,
     chunks: u64,
     call2_chunks: u64,
     /// Claims a repeat label would have absorbed that became chain heads.
@@ -417,6 +422,8 @@ impl<'a> Engine<'a> {
             cron_prefetches: 0,
             cron_tokens: 0,
             profile_tokens: Vec::new(),
+            call1_characters: Vec::new(),
+            upcoming_lines: Vec::new(),
             chunks: 0,
             call2_chunks: 0,
             promoted: 0,
@@ -795,6 +802,11 @@ impl<'a> Engine<'a> {
         let source = lease.source;
         let position = lease.position;
         let input = self.service.call1_input(&lease, &in_context)?;
+        // Sample the simulation input before choosing how to answer it. Fast
+        // composition bypasses Recorder, and priming runs outside the engine.
+        self.call1_characters
+            .push(call1_request(&input).user.chars().count() as u64);
+        self.upcoming_lines.push(input.upcoming.len() as u64);
         let (mine, used, name) = {
             let pending = self.pending.get_mut(&source).ok_or_else(|| {
                 internal(format!(
@@ -1604,6 +1616,8 @@ impl<'a> Engine<'a> {
 
         let mut turn_tokens = self.turn_tokens;
         let mut profile_tokens = self.profile_tokens;
+        let mut call1_characters = self.call1_characters;
+        let mut upcoming_lines = self.upcoming_lines;
         let llm = match self.llm {
             Llm::Scripted => LlmCounts {
                 scripted: self.llm_calls,
@@ -1672,6 +1686,10 @@ impl<'a> Engine<'a> {
                 },
             },
             profile_tokens: Percentiles::of(&mut profile_tokens),
+            call1_input: Call1InputSizes {
+                characters: Percentiles::of(&mut call1_characters),
+                upcoming_lines: Percentiles::of(&mut upcoming_lines),
+            },
             call2_rate: Call2Rate {
                 chunks: self.chunks,
                 call2: self.call2_chunks,
