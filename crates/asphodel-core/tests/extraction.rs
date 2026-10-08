@@ -2029,10 +2029,16 @@ fn a_claim_is_kept_only_with_a_quote_from_the_chunk_located_in_characters() {
 #[test]
 fn an_assistant_task_needs_a_due_date_or_an_until_event() {
     let h = Harness::new();
+    let wedding = "The wedding is on 22 October 2026.";
+    let wedding = told(&h, "main", wedding, |_| {
+        vec![said("event", wedding).at("valid_from", "2026-10-22", "day")]
+    })
+    .memories[0];
     h.say(
         T1,
         "Can you send me the report by Friday? And look into the backup sometime.",
-        "I'll send you the report by Friday. I'll look into the backup.",
+        "I'll send you the report by Friday. I'll look into the backup. \
+         I'll look into a gift for the wedding.",
     );
     let task = |content: &str, quote: &str| claim(content, "task", quote);
     let extracted = extract(
@@ -2057,14 +2063,32 @@ fn an_assistant_task_needs_a_due_date_or_an_until_event() {
                 "Tim wants the backup looked into.",
                 "look into the backup sometime",
             ),
+            // Naming an occasion doesn't make an undated assistant task
+            // eligible: only the reply's own dates count for that.
+            task(
+                "Hermes will look into a gift for the wedding.",
+                "I'll look into a gift for the wedding",
+            )
+            .with("occasion", json!("o1")),
         ],
     );
     assert_eq!(extracted.memories.len(), 3);
-    let undated = Dropped {
-        claim: 1,
+    let undated = |claim| Dropped {
+        claim,
         reason: DropReason::AssistantTaskUndated,
     };
-    assert_eq!(extracted.dropped, vec![undated]);
+    assert_eq!(extracted.dropped, vec![undated(1), undated(4)]);
+    let dropped = OccasionDisposition::Ignored(IgnoredOccasion::Dropped);
+    assert_eq!(
+        extracted.occasions,
+        vec![occasion_ref(
+            4,
+            Some(wedding),
+            None,
+            (false, false),
+            dropped
+        )]
+    );
 }
 
 // Entities.
