@@ -374,6 +374,12 @@ fn check_claim(
         Kind::Task | Kind::Event | Kind::State | Kind::Recurring => {}
     }
 
+    // Judge assistant tasks on the reply's own dates, before an occasion
+    // can supply a deadline.
+    if claim.kind == Kind::Task && from_reply && due_at.is_none() && until_event.is_none() {
+        return Err(DropReason::AssistantTaskUndated);
+    }
+
     // A task for a listed occasion gets the occasion's start, its instant
     // and precision as stored, for each of its end and due date it left
     // out. The task keeps its own timezone, so a coarse unit can end at a
@@ -396,10 +402,6 @@ fn check_claim(
         if (filled.valid_until || filled.due_at) && occasion.low_confidence {
             low = true;
         }
-    }
-
-    if claim.kind == Kind::Task && from_reply && due_at.is_none() && until_event.is_none() {
-        return Err(DropReason::AssistantTaskUndated);
     }
 
     if claim.kind == Kind::Recurring {
