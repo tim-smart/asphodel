@@ -28,6 +28,9 @@ pub(super) struct Unit {
     pub source_id: i64,
     pub tz: TimeZone,
     pub ingested_at: Timestamp,
+    /// Strength accesses use the turn's message time, capped at arrival.
+    /// Documents use arrival time instead. Ordering still uses ingested_at.
+    pub access_at: Timestamp,
     /// The document's id, for a document chunk: a neighbour from an earlier
     /// version of the same document isn't mentioned again.
     pub document_id: Option<String>,
@@ -224,6 +227,15 @@ pub(super) fn assemble(
         source_id: source.source_id,
         tz,
         ingested_at: source.ingested_at,
+        access_at: if is_turn {
+            source
+                .message_at
+                .map(timestamp)
+                .unwrap_or(source.ingested_at)
+                .min(source.ingested_at)
+        } else {
+            source.ingested_at
+        },
         document_id: source.document_id.clone(),
         turn,
         entity_boundary,

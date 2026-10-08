@@ -144,7 +144,7 @@ pub(super) fn commit(
                 }
             })?;
         link_entities(tx, store, unit, memory_id, &memory.links, &proposed)?;
-        // The created access carries the source's ingested_at, never
+        // The created access carries the source's access time, never
         // the time extraction ran.
         insert_access(tx, unit, memory_id, "created")?;
         memories.push(uuid);
@@ -527,7 +527,7 @@ fn has_alias(tx: &Transaction<'_>, entity_id: i64, alias: &str) -> Result<bool, 
         .is_some())
 }
 
-/// An access at the source's ingested_at and turn number, keeping the
+/// An access at the source's access time and turn number, keeping the
 /// strongest kind: an access already there stays unless this one weighs
 /// more. A memory has at most one access per turn, and one per
 /// document: a document carries the number of the turn before it, and its
@@ -567,7 +567,7 @@ fn insert_access(
                     unit.bank_id,
                     memory_id,
                     kind,
-                    micros(unit.ingested_at),
+                    micros(unit.access_at),
                     unit.turn,
                     unit.source_id,
                 ),
@@ -576,7 +576,7 @@ fn insert_access(
         Some((id, old)) if weight(kind) > weight(&old) => {
             tx.execute(
                 "UPDATE accesses SET kind = ?2, at = ?3 WHERE id = ?1",
-                (id, kind, micros(unit.ingested_at)),
+                (id, kind, micros(unit.access_at)),
             )?;
         }
         Some(_) => {}
@@ -617,7 +617,7 @@ fn hold_credit(tx: &Transaction<'_>, unit: &Unit, memory_id: i64) -> Result<(), 
     tx.execute(
         "INSERT OR IGNORE INTO pending_credits (bank_id, memory_id, turn, at)
          VALUES (?1, ?2, ?3, ?4)",
-        (unit.bank_id, memory_id, unit.turn, micros(unit.ingested_at)),
+        (unit.bank_id, memory_id, unit.turn, micros(unit.access_at)),
     )?;
     Ok(())
 }
