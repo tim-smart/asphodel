@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asphodel_core::config::{Layer, Tuning};
-use asphodel_core::ingest::Turn;
+use asphodel_core::ingest::{Document, Turn};
 use asphodel_core::inspect::{Guard, MemoryView, StrengthView};
 use asphodel_core::models::{FakeEmbedder, FakeLlm, FakeReranker, Models};
 use asphodel_core::retrieval::RecallRequest;
@@ -112,6 +112,23 @@ impl Harness {
         self.clock.set(to);
     }
 
+    fn restart(self) -> Self {
+        let Self {
+            service,
+            clock,
+            _dir,
+        } = self;
+        let tuning = service.tuning().clone();
+        drop(service);
+        let store = Store::open(&_dir.0, OpenOptions::default(), clock.clone()).unwrap();
+        let service = Service::with_models(clock.clone(), store, tuning, Models::fake()).unwrap();
+        Self {
+            service,
+            clock,
+            _dir,
+        }
+    }
+
     /// The owner says each claim's quote at `when` in `tz`, and the turn is
     /// extracted with call 1 finding `claims` and judging `used` used, and
     /// call 2 giving the first claim `labels` against their memories.
@@ -124,7 +141,21 @@ impl Harness {
         used: &[Uuid],
         labels: &[(Uuid, &str)],
     ) -> Vec<Uuid> {
-        self.set(when);
+        self.turn_received(when, when, tz, claims, used, labels)
+    }
+
+    /// Ingest at a different time from the original message, as backfill
+    /// and spool replay do. Extraction runs at receipt time too.
+    fn turn_received(
+        &self,
+        when: Timestamp,
+        received: Timestamp,
+        tz: &str,
+        claims: Vec<Value>,
+        used: &[Uuid],
+        labels: &[(Uuid, &str)],
+    ) -> Vec<Uuid> {
+        self.set(received);
         let quotes: Vec<&str> = claims
             .iter()
             .map(|c| c["quote"].as_str().unwrap())
@@ -240,6 +271,129 @@ fn local(at: &str, precision: &str) -> Value {
 
 fn day(date: &str) -> Value {
     local(&format!("{date}T00:00"), "day")
+}
+
+#[test]
+fn backfilled_turn_strength_matches_imports_simulated_message_clock() {
+    let backfill = Harness::new("");
+    let imported = Harness::new("");
+    let fact = || minor("fact", "Tim likes green tea.");
+    let old = backfill.turn_received(at(0.0), at(180.0), "UTC", vec![fact()], &[], &[])[0];
+    // Import replays on a simulated clock at the original turn time.
+    let replayed = imported.says(at(0.0), fact());
+    imported.set(at(180.0));
+
+    let actual = backfill.show(old);
+    assert_eq!(actual.accesses.len(), 1);
+    assert_eq!(actual.accesses[0].kind, "created");
+    assert_eq!(actual.accesses[0].at, at(0.0));
+    assert_eq!(actual.strength, imported.strength(replayed));
+}
+
+#[test]
+fn backfilled_mentions_ten_days_apart_count_as_three_occasions() {
+    let h = Harness::new("");
+    let fact = || claim("fact", "notable", "Tim studied physics at Otago.");
+    let memory = h.turn_received(at(0.0), at(180.0), "UTC", vec![fact()], &[], &[])[0];
+    for (day, seconds) in [(10.0, 20), (20.0, 40)] {
+        let received = at(180.0) + SignedDuration::from_secs(seconds);
+        assert!(
+            h.turn_received(
+                at(day),
+                received,
+                "UTC",
+                vec![fact()],
+                &[],
+                &[(memory, "mentioned_again")],
+            )
+            .is_empty()
+        );
+    }
+    assert_eq!(h.strength(memory).occasions, 3);
+    let accesses = h.show(memory).accesses;
+    let mut times: Vec<_> = accesses.iter().map(|a| a.at).collect();
+    times.sort();
+    assert_eq!(times, [at(0.0), at(10.0), at(20.0)]);
+}
+
+#[test]
+fn future_turn_accesses_are_capped_at_receipt_time() {
+    let h = Harness::new("");
+    let fact = || minor("fact", "Tim likes green tea.");
+    let memory = h.turn_received(at(10.0), at(0.0), "UTC", vec![fact()], &[], &[])[0];
+    for (day, label) in [(11.0, "mentioned_again"), (12.0, "confirmed")] {
+        assert!(
+            h.turn_received(
+                at(day),
+                at(0.0),
+                "UTC",
+                vec![fact()],
+                &[],
+                &[(memory, label)],
+            )
+            .is_empty()
+        );
+    }
+    h.turn_received(at(13.0), at(0.0), "UTC", vec![], &[memory], &[]);
+    let accesses = h.show(memory).accesses;
+    assert_eq!(accesses.len(), 4);
+    for kind in ["created", "mentioned_again", "confirmed", "used"] {
+        let access = accesses.iter().find(|a| a.kind == kind).expect(kind);
+        assert_eq!(access.at, at(0.0), "{kind}");
+    }
+}
+
+#[test]
+fn upgrade_redates_legacy_turn_accesses_but_preserves_document_accesses() {
+    let h = Harness::new("");
+    let memory = h.turn_received(
+        at(0.0),
+        at(180.0),
+        "UTC",
+        vec![minor("fact", "Tim likes green tea.")],
+        &[],
+        &[],
+    )[0];
+    let document = Document {
+        document_id: "notes".into(),
+        text: "Tim's locker is number 12.".into(),
+        reference_date: "2026-01-05".parse().unwrap(),
+        reference_date_exact: true,
+        timezone: Some("UTC".into()),
+    };
+    h.service.ingest_document(BANK, &document).unwrap();
+    let llm = FakeLlm::scripted(
+        "fake-llm",
+        vec![
+            json!({"claims": [minor("fact", &document.text)], "used_injected_ids": []}),
+            json!({"claims": []}),
+        ],
+    );
+    let doc_memory = h
+        .service
+        .extract_next(BANK, &llm)
+        .unwrap()
+        .unwrap()
+        .memories[0];
+    let doc_before = h.show(doc_memory);
+    assert_eq!(doc_before.accesses[0].at, at(180.0));
+
+    // Fixture of version 20, before turn access dating was fixed. SQL is
+    // only setup; all migration results are read through Service.
+    h.service
+        .store()
+        .unwrap()
+        .connection()
+        .execute_batch(&format!(
+            "UPDATE accesses SET at = {};
+         DELETE FROM migrations WHERE to_version > 20; PRAGMA user_version = 20;",
+            at(180.0).as_microsecond(),
+        ))
+        .unwrap();
+    let h = h.restart();
+    assert_eq!(h.show(memory).accesses[0].at, at(0.0));
+    assert_eq!(h.show(doc_memory).accesses, doc_before.accesses);
+    assert_eq!(h.strength(doc_memory), doc_before.strength);
 }
 
 /// `before` until the minute before `at`, and `after` from `at`.
