@@ -1107,7 +1107,7 @@ async function chunks(ctx) {
             { class: "table-wrap" },
             h(
               "table",
-              {},
+              { class: "stack-table" },
               h("thead", {}, h("tr", {}, ["Error", "Attempts", "Failed", "Source", ""].map((c) => h("th", { scope: "col" }, c)))),
               h(
                 "tbody",
@@ -1116,10 +1116,10 @@ async function chunks(ctx) {
                   h(
                     "tr",
                     {},
-                    h("td", {}, h("code", {}, f.error_kind), f.status ? h("span", { class: "quiet-text" }, ` HTTP ${f.status}`) : null),
-                    h("td", { class: "num" }, String(f.error_count)),
-                    h("td", {}, time(f.failed_at, { withTime: true })),
-                    h("td", {}, h("a", { href: sourceHash(bank, f.source) }, `source ${shortId(f.source)}`)),
+                    h("td", { "data-label": "Error" }, h("code", {}, f.error_kind), f.status ? h("span", { class: "quiet-text" }, ` HTTP ${f.status}`) : null),
+                    h("td", { class: "num", "data-label": "Attempts" }, String(f.error_count)),
+                    h("td", { "data-label": "Failed" }, time(f.failed_at, { withTime: true })),
+                    h("td", { "data-label": "Source" }, h("a", { href: sourceHash(bank, f.source) }, `source ${shortId(f.source)}`)),
                     h("td", {}, h("button", { type: "button", class: "quiet", "aria-label": `Retry chunk ${shortId(f.chunk)}`, onclick: () => retry([f.chunk]) }, "Retry")),
                   ),
                 ),
@@ -1140,7 +1140,7 @@ async function chunks(ctx) {
           { class: "table-wrap" },
           h(
             "table",
-            {},
+            { class: "stack-table" },
             h("thead", {}, h("tr", {}, ["Order", "Source", "Chunk", "Attempts", "State"].map((c) => h("th", { scope: "col" }, c)))),
             h(
               "tbody",
@@ -1149,11 +1149,11 @@ async function chunks(ctx) {
                 h(
                   "tr",
                   {},
-                  h("td", { class: "num" }, String(i + 1)),
-                  h("td", {}, h("a", { href: sourceHash(bank, q.source) }, `${q.source_kind} ${shortId(q.source)}`)),
-                  h("td", { class: "num" }, String(q.position + 1)),
-                  h("td", { class: "num" }, String(q.error_count)),
-                  h("td", {}, q.in_flight ? pill("in flight", "in_flight") : pill("waiting", "queued")),
+                  h("td", { class: "num", "data-label": "Order" }, String(i + 1)),
+                  h("td", { "data-label": "Source" }, h("a", { href: sourceHash(bank, q.source) }, `${q.source_kind} ${shortId(q.source)}`)),
+                  h("td", { class: "num", "data-label": "Chunk" }, String(q.position + 1)),
+                  h("td", { class: "num", "data-label": "Attempts" }, String(q.error_count)),
+                  h("td", { "data-label": "State" }, q.in_flight ? pill("in flight", "in_flight") : pill("waiting", "queued")),
                 ),
               ),
             ),

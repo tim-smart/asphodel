@@ -178,6 +178,12 @@ td code {
   overflow-wrap: anywhere;
 }
 
+/* In a table the column scrolls instead; an error kind stays whole. */
+td code {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
 time,
 .num {
   font-variant-numeric: tabular-nums;
@@ -1873,13 +1879,15 @@ dialog.confirm h2 {
     font-size: 0.85rem;
   }
 
-  /* Each candidate as a stacked card, so the reason it was left out
-     doesn't scroll out of sight. */
-  .explain-table thead {
+  /* Each row as a stacked card, so nothing (a candidate's reason, a failed
+     chunk's source) scrolls out of sight. */
+  .explain-table thead,
+  .stack-table thead {
     display: none;
   }
 
-  .explain-table tr {
+  .explain-table tr,
+  .stack-table tr {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 0.4rem 0.75rem;
@@ -1887,13 +1895,15 @@ dialog.confirm h2 {
     border-bottom: 1px solid var(--rule);
   }
 
-  .explain-table td {
+  .explain-table td,
+  .stack-table td {
     padding: 0;
     border: 0;
     min-width: 0;
   }
 
-  .explain-table td::before {
+  .explain-table td::before,
+  .stack-table td[data-label]::before {
     content: attr(data-label);
     display: block;
     font: 650 0.68rem/1.4 var(--sans);
@@ -1910,6 +1920,24 @@ dialog.confirm h2 {
 
   .explain-table .explain-memory::before {
     content: none;
+  }
+
+  .stack-table tr:last-child {
+    border-bottom: 0;
+  }
+
+  .stack-table tr {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .stack-table time {
+    white-space: normal;
+  }
+
+  .stack-table td:not([data-label]) {
+    grid-column: 1 / -1;
+    width: auto;
+    text-align: left;
   }
 }
 
