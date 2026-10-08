@@ -123,16 +123,16 @@ async function banks(ctx) {
         h(
           "p",
           {},
-          "The deletion settings changed since purge last ran, so the nightly sweep deletes nothing until you acknowledge the new ones.",
+          "The deletion settings changed since purge last ran. Until you acknowledge them, the nightly sweep deletes nothing.",
         ),
         plan.changed.length
           ? h("p", {}, "Changed: ", plan.changed.map((key, i) => [i ? ", " : "", h("code", {}, key)]))
           : null,
-        h("p", {}, "Under the new settings the next sweep deletes:"),
+        h("p", {}, "Under the new settings, the next sweep deletes:"),
         h(
           "ul",
           { class: "purge-counts" },
-          h("li", {}, h("strong", {}, String(plan.memories)), " ", plan.memories === 1 ? "memory" : "memories", " (every version counted)"),
+          h("li", {}, h("strong", {}, String(plan.memories)), " ", h("span", {}, plan.memories === 1 ? "memory" : "memories", h("span", { class: "quiet-text" }, ", counting every version"))),
           h("li", {}, h("strong", {}, String(plan.sources)), " ", plan.sources === 1 ? "source" : "sources"),
           h("li", {}, h("strong", {}, String(plan.failed_chunks)), " ", plan.failed_chunks === 1 ? "failed chunk" : "failed chunks"),
           h("li", {}, h("strong", {}, String(plan.recalls)), " ", plan.recalls === 1 ? "recall" : "recalls"),
@@ -158,7 +158,7 @@ async function banks(ctx) {
               if (!confirmed) return;
               ctx.act(async () => {
                 await api.purgeAck(plan.current);
-                return "Purge resumed. The next sweep runs under the new settings.";
+                return "Purge resumed. The next sweep uses the new settings.";
               });
             },
           },
@@ -246,10 +246,9 @@ async function banks(ctx) {
     content: [
       heading(h, "Banks"),
       purge,
-      list.length
-        ? h("div", { class: "bank-grid" }, cards)
-        : h("p", { class: "empty" }, "No banks yet. A bank appears when the Hermes plugin first connects to this daemon."),
-      daemon,
+      list.length || daemon
+        ? h("div", { class: "bank-grid" }, list.length ? cards : h("p", { class: "empty" }, "No banks yet. One appears when the Hermes plugin first connects to this daemon."), daemon)
+        : h("p", { class: "empty" }, "No banks yet. One appears when the Hermes plugin first connects to this daemon."),
     ],
   };
 }
@@ -411,7 +410,7 @@ async function memories(ctx) {
   return {
     title: `Memories · ${bank}`,
     content: [
-      heading(h, "Memories", h("p", { class: "quiet-text" }, `${memoryCount(page.total)} listed, as of `, ui.time(page.as_of, { withTime: true }))),
+      heading(h, "Memories", h("p", { class: "quiet-text" }, `${capitalize(memoryCount(page.total))} as of `, ui.time(page.as_of, { withTime: true }))),
       toolbar,
       chips,
       page.memories.length
@@ -419,7 +418,7 @@ async function memories(ctx) {
         : h(
             "p",
             { class: "empty" },
-            filtered ? ["No memories match these filters. ", h("a", { href: bankHash(bank, "memories") }, "Clear the filters")] : "This bank has no memories yet.",
+            filtered ? ["No memories match these filters. ", h("a", { href: bankHash(bank, "memories") }, "Clear filters")] : "No memories yet. They appear once the first turn or document is extracted.",
           ),
       cursor ? more : null,
       h("p", { class: "footnote" }, FADE_BASIS),
@@ -428,16 +427,16 @@ async function memories(ctx) {
 }
 
 const GUARDS = {
-  purge_disabled: "Purge is turned off (no δ is set).",
-  purge_paused: "Purge is paused until the new deletion settings are acknowledged.",
-  forgotten: "It's being forgotten; the erase removes it instead.",
+  purge_disabled: "Purge is off because no δ is set.",
+  purge_paused: "Purge is paused until someone acknowledges the new deletion settings.",
+  forgotten: "It's being forgotten, so the erase removes it instead.",
   strength: "Its strength is above the purge line.",
-  lasting: "It's been mentioned on enough occasions, or matters enough, never to be purged.",
+  lasting: "It has come up often enough, or matters enough, that it's never purged.",
 };
 
 /// What the fade and purge dates mean, wherever they're shown.
 const FADE_BASIS =
-  "Fade dates assume a memory isn't used again. Bank time only moves while the bank is in use, so each date is the soonest it can come.";
+  "Dates assume the memory goes unused from now on. Bank time only moves while the bank is in use, so each date is the earliest it could happen.";
 
 /// A strength figure, with a real minus sign.
 function figure(value) {
@@ -453,7 +452,7 @@ function day(value) {
 }
 
 function guardText(ui, guard) {
-  if (guard.guard === "date_ahead") return ["Its start or end date hasn't passed yet (", ui.time(guard.until), ")."];
+  if (guard.guard === "date_ahead") return ["Its start or end date is still ahead, on ", ui.time(guard.until), "."];
   if (guard.guard === "overdue_task") return ["It's an overdue task, held until ", ui.time(guard.until), "."];
   return GUARDS[guard.guard] ?? guard.guard;
 }
@@ -462,7 +461,7 @@ function guardText(ui, guard) {
 // owner's actions on it.
 async function memory(ctx) {
   const { api, ui, bank, at } = ctx;
-  const { h, time, fadeLabel, outOfUseLabel, purgeLabel, pill, gauge } = ui;
+  const { h, time, fadeLabel, outOfUseLabel, purgeLabel, pill, outlook } = ui;
   const view = await api.memory(bank, at.id);
   const status = memoryStatus(view);
   const kept = view.significance.owner === "kept";
@@ -470,7 +469,7 @@ async function memory(ctx) {
   const link = (id, text) => h("a", { href: memoryHash(bank, id) }, text ?? `memory ${shortId(id)}`);
 
   const source = view.source;
-  const sourceName = source.document_id ?? (source.session_id ? `Turn in session ${source.session_id}` : "Its source");
+  const sourceName = source.document_id ?? (source.session_id ? `Turn in ${source.session_id}` : "Its source");
 
   const actions = [];
   if (status !== "forgetting") {
@@ -487,15 +486,15 @@ async function memory(ctx) {
                 ctx.act(async () => {
                   if (kept) {
                     await api.unkeep(bank, [view.id]);
-                    return "No longer kept. It fades like any other memory again.";
+                    return "No longer kept. It can fade again like any other memory.";
                   }
                   await api.keep(bank, [view.id]);
-                  return "Kept. It won't fade while it's kept.";
+                  return "Kept. It won't fade until you stop keeping it.";
                 }),
             },
             kept ? "Stop keeping" : "Keep",
           ),
-          h("p", {}, kept ? "Let it fade again when it goes unused." : "Hold it at full strength so it never fades."),
+          h("p", {}, kept ? "Let it fade again if it goes unused." : "Hold it at full strength so it never fades."),
         ),
       );
     }
@@ -518,7 +517,7 @@ async function memory(ctx) {
                     h(
                       "p",
                       {},
-                      "Retracting says it never held. Recall, the agenda and the system prompt stop using it at once, and it fades out on its own.",
+                      "Retracting marks it as never true. Recall, the agenda and the system prompt stop using it at once, and it fades out on its own.",
                     ),
                     ends ? h("p", {}, `It also reopens ${memoryCount(ends)} it ended.`) : null,
                     h("p", {}, "There's no undo."),
@@ -536,7 +535,7 @@ async function memory(ctx) {
             },
             "Retract…",
           ),
-          h("p", {}, "It's wrong: take it out of use and reopen what it ended."),
+          h("p", {}, "For a memory that's wrong. Takes it out of use and reopens anything it ended."),
         ),
       );
     }
@@ -558,8 +557,8 @@ async function memory(ctx) {
                     "p",
                     {},
                     versions > 1
-                      ? `Forget erases it and every version of it in its chain (${plural(versions, "version")}), and masks the passages they came from.`
-                      : "Forget erases it and every version of it, and masks the passage it came from.",
+                      ? `This erases all ${plural(versions, "version")} of it and masks the passages they came from.`
+                      : "This erases it and masks the passage it came from.",
                   ),
                   h("p", {}, "It can't be undone."),
                 ],
@@ -572,8 +571,8 @@ async function memory(ctx) {
                 async () => {
                   const done = await api.forget(bank, [view.id]);
                   return done.forgotten.length
-                    ? `Forgot ${memoryCount(done.forgotten.length)}: “${view.sentence}” and every version in its chain.`
-                    : "Nothing to forget: it was already gone.";
+                    ? [`Forgot ${memoryCount(done.forgotten.length)}, every version of `, h("q", {}, view.sentence), "."]
+                    : "Nothing to forget. It was already gone.";
                 },
                 { then: bankHash(bank, "memories") },
               );
@@ -581,7 +580,7 @@ async function memory(ctx) {
           },
           "Forget…",
         ),
-        h("p", {}, "Erase it and every version, as if it was never said."),
+        h("p", {}, "Erases it and every version, as if it was never said."),
       ),
     );
   }
@@ -603,7 +602,7 @@ async function memory(ctx) {
                     member.id === view.id ? h("span", { "aria-current": "page" }, `This memory (${shortId(member.id)})`) : link(member.id),
                     member.retracted ? " · retracted" : null,
                     member.hidden ? " · being forgotten" : null,
-                    member.superseded_by ? " · refined by the next" : " · newest",
+                    member.superseded_by ? " · replaced by the next" : " · current",
                   ),
                 ),
               )
@@ -641,7 +640,7 @@ async function memory(ctx) {
             status === "forgetting"
               ? outOfUseLabel(status, null)
               : status === "retracted"
-                ? h("span", { class: "fade", "data-fade": "out" }, gauge("out"), h("span", {}, "Out of use: recall, the agenda and the system prompt skip it"))
+                ? outlook("out", "Out of use", "Recall, the agenda and the system prompt skip it")
                 : fadeLabel(view.projection.fade),
           ),
           h("div", { class: "outlook-purge" }, purgeLabel(view.projection.purge)),
@@ -670,7 +669,7 @@ async function memory(ctx) {
               h("a", { href: sourceHash(bank, source.source) }, sourceName),
               source.message_at ? [" · ", time(source.message_at, { withTime: true })] : null,
             ),
-            source.secret_kinds.length ? h("p", { class: "quiet-text" }, `Secrets were redacted before storage: ${source.secret_kinds.join(", ")}.`) : null,
+            source.secret_kinds.length ? h("p", { class: "quiet-text" }, `Redacted before storage: ${source.secret_kinds.join(", ")}.`) : null,
           ),
           chain,
           view.entities.length
@@ -696,7 +695,7 @@ async function memory(ctx) {
           h(
             "details",
             { class: "panel" },
-            h("summary", {}, `History: ${plural(view.accesses.length, "access", "accesses")}, ${plural(view.edits.length, "edit")}`),
+            h("summary", {}, "History ", h("span", { class: "quiet-text" }, `${plural(view.accesses.length, "access", "accesses")}, ${plural(view.edits.length, "edit")}`)),
             h(
               "ul",
               { class: "history" },
@@ -732,6 +731,20 @@ async function memory(ctx) {
   };
 }
 
+/// A narrow screen restyles a stacked table's rows as cards, and some
+/// browsers then stop treating it as a table. Explicit roles keep each cell
+/// tied to its column header for assistive technology. Returns `el`.
+function tableRoles(el) {
+  for (const table of el.querySelectorAll("table")) {
+    table.setAttribute("role", "table");
+    for (const group of table.querySelectorAll("thead, tbody")) group.setAttribute("role", "rowgroup");
+    for (const row of table.querySelectorAll("tr")) row.setAttribute("role", "row");
+    for (const head of table.querySelectorAll("th")) head.setAttribute("role", "columnheader");
+    for (const cell of table.querySelectorAll("td")) cell.setAttribute("role", "cell");
+  }
+  return el;
+}
+
 /// A chunk's headings, stored as a JSON array, as "Home › Garden".
 function headingPath(path) {
   if (!path) return null;
@@ -765,9 +778,9 @@ async function removeDocument(ctx, documentId) {
       h(
         "p",
         {},
-        "This removes every version of it and forgets the memories resting on it, with all their versions. Its text is deleted now, and sending the same text again is ignored as a duplicate.",
+        "This removes every version and forgets the memories drawn from it, with all their versions. The text is deleted now. Sending the same text again is ignored as a duplicate.",
       ),
-      h("p", {}, "It can't be undone here. A backup, or a later edited copy of the document, can bring the content back."),
+      h("p", {}, "There's no undo here. A backup or a later edited copy of the document can bring it back."),
     ],
     action: "Remove document",
   });
@@ -785,8 +798,8 @@ async function removeTurn(ctx, turn) {
   const confirmed = await ctx.confirm({
     title: "Remove this turn?",
     body: [
-      h("p", {}, "This forgets the memories resting on it, with all their versions. Its text is deleted now, and sending the same turn again is ignored as a duplicate."),
-      h("p", {}, "It can't be undone here. A backup can bring the content back."),
+      h("p", {}, "This forgets the memories drawn from it, with all their versions. The text is deleted now. Sending the same turn again is ignored as a duplicate."),
+      h("p", {}, "There's no undo here. Only a backup can bring it back."),
     ],
     action: "Remove turn",
   });
@@ -823,7 +836,7 @@ async function sources(ctx) {
           h(
             "a",
             { class: "source-name", href: sourceHash(bank, newest.id) },
-            isTurn ? `Turn${newest.session_id ? ` in session ${newest.session_id}` : ""}` : id,
+            isTurn ? `Turn${newest.session_id ? ` in ${newest.session_id}` : ""}` : id,
           ),
           " ",
           h(
@@ -911,8 +924,8 @@ async function sources(ctx) {
       label: "Text",
       value: filters.gone,
       options: [
-        ["", "Kept or gone"],
-        ["false", "Kept"],
+        ["", "Stored or gone"],
+        ["false", "Still stored"],
         ["true", "Gone"],
       ],
       onchange: (gone) => go({ gone }),
@@ -931,8 +944,8 @@ async function sources(ctx) {
             "p",
             { class: "empty" },
             filtered
-              ? ["No sources match these filters. ", h("a", { href: bankHash(bank, "sources") }, "Clear the filters")]
-              : "Nothing ingested yet. Turns and documents show up here.",
+              ? ["No sources match these filters. ", h("a", { href: bankHash(bank, "sources") }, "Clear filters")]
+              : "Nothing ingested yet. Turns and documents will appear here as Hermes sends them.",
           ),
       cursor ? more : null,
     ],
@@ -946,7 +959,7 @@ async function source(ctx) {
   const s = await api.source(bank, at.id);
   const isDocument = s.kind === "document";
   const removed = s.gone?.reason === "removed";
-  const title = isDocument ? s.document_id : `Turn${s.session_id ? ` in session ${s.session_id}` : ""}`;
+  const title = isDocument ? s.document_id : `Turn${s.session_id ? ` in ${s.session_id}` : ""}`;
 
   const remove = removed
     ? null
@@ -958,8 +971,8 @@ async function source(ctx) {
           "p",
           {},
           isDocument
-            ? "Removes every version and forgets the memories resting on it. Memories that only mention it stay."
-            : "Forgets the memories resting on it. Memories that only mention it stay.",
+            ? "Removes every version and forgets the memories drawn from it. Memories that only mention it are left alone."
+            : "Forgets the memories drawn from it. Memories that only mention it are left alone.",
         ),
         h(
           "button",
@@ -1008,7 +1021,7 @@ async function source(ctx) {
           ),
         ),
         s.chunks.some((c) => c.state === "failed")
-          ? h("p", {}, h("a", { href: bankHash(bank, "chunks") }, "Retry failed chunks on the ingestion page"))
+          ? h("p", {}, h("a", { href: bankHash(bank, "chunks") }, "Retry failed chunks on the Ingestion page"))
           : null,
       )
     : null;
@@ -1063,7 +1076,13 @@ async function source(ctx) {
           "div",
           {},
           s.text !== null
-            ? h("section", { class: "panel", "aria-label": "Text" }, h("pre", { class: "source-text" }, s.text), s.reply ? [h("h2", {}, "Reply"), h("pre", { class: "source-text" }, s.reply)] : null)
+            ? h(
+                "section",
+                { class: "panel", "aria-label": "Text" },
+                s.reply ? h("h2", {}, "Message") : null,
+                h("pre", { class: "source-text" }, s.text),
+                s.reply ? [h("h2", { class: "reply-title" }, "Reply"), h("pre", { class: "source-text" }, s.reply)] : null,
+              )
             : h("p", { class: "notice", "data-tone": "gone" }, goneReason(s.gone) ?? "The text is gone."),
           chunks,
         ),
@@ -1091,19 +1110,19 @@ async function chunks(ctx) {
     h(
       "div",
       { class: "section-head" },
-      h("h2", { id: "failed-title" }, `Failed chunks (${list.failed.length})`),
-      list.failed.length ? h("button", { type: "button", onclick: () => retry() }, "Retry all") : null,
+      h("h2", { id: "failed-title" }, "Failed chunks ", h("span", { class: "title-count" }, String(list.failed.length))),
+      list.failed.length ? h("button", { type: "button", class: "small", onclick: () => retry() }, "Retry all") : null,
     ),
     list.failed.length
       ? [
-          h("p", { class: "quiet-text" }, "These chunks hit the retry cap. Retrying puts them back on the queue in their place."),
+          h("p", { class: "quiet-text" }, "Extraction gave up on these after too many attempts. Retrying puts them back in the queue where they were."),
           h(
             "div",
             { class: "table-wrap" },
             h(
               "table",
-              {},
-              h("thead", {}, h("tr", {}, ["Error", "Attempts", "Failed", "Source", ""].map((c) => h("th", { scope: "col" }, c)))),
+              { class: "stack-table" },
+              h("thead", {}, h("tr", {}, ["Error", "Attempts", "Failed", "Source"].map((c) => h("th", { scope: "col" }, c)), h("th", { scope: "col" }, h("span", { class: "visually-hidden" }, "Action")))),
               h(
                 "tbody",
                 {},
@@ -1111,10 +1130,10 @@ async function chunks(ctx) {
                   h(
                     "tr",
                     {},
-                    h("td", {}, h("code", {}, f.error_kind), f.status ? h("span", { class: "quiet-text" }, ` HTTP ${f.status}`) : null),
-                    h("td", { class: "num" }, String(f.error_count)),
-                    h("td", {}, time(f.failed_at, { withTime: true })),
-                    h("td", {}, h("a", { href: sourceHash(bank, f.source) }, `source ${shortId(f.source)}`)),
+                    h("td", { "data-label": "Error" }, h("code", {}, f.error_kind), f.status ? h("span", { class: "quiet-text" }, ` HTTP ${f.status}`) : null),
+                    h("td", { class: "num", "data-label": "Attempts" }, String(f.error_count)),
+                    h("td", { "data-label": "Failed" }, time(f.failed_at, { withTime: true })),
+                    h("td", { "data-label": "Source" }, h("a", { href: sourceHash(bank, f.source) }, `source ${shortId(f.source)}`)),
                     h("td", {}, h("button", { type: "button", class: "quiet", "aria-label": `Retry chunk ${shortId(f.chunk)}`, onclick: () => retry([f.chunk]) }, "Retry")),
                   ),
                 ),
@@ -1128,14 +1147,14 @@ async function chunks(ctx) {
   const queued = h(
     "section",
     { class: "panel", "aria-labelledby": "queue-title" },
-    h("h2", { id: "queue-title" }, `Queue (${list.queued.length})`),
+    h("h2", { id: "queue-title" }, "Queue ", h("span", { class: "title-count" }, String(list.queued.length))),
     list.queued.length
       ? h(
           "div",
           { class: "table-wrap" },
           h(
             "table",
-            {},
+            { class: "stack-table" },
             h("thead", {}, h("tr", {}, ["Order", "Source", "Chunk", "Attempts", "State"].map((c) => h("th", { scope: "col" }, c)))),
             h(
               "tbody",
@@ -1144,11 +1163,11 @@ async function chunks(ctx) {
                 h(
                   "tr",
                   {},
-                  h("td", { class: "num" }, String(i + 1)),
-                  h("td", {}, h("a", { href: sourceHash(bank, q.source) }, `${q.source_kind} ${shortId(q.source)}`)),
-                  h("td", { class: "num" }, String(q.position + 1)),
-                  h("td", { class: "num" }, String(q.error_count)),
-                  h("td", {}, q.in_flight ? pill("in flight", "in_flight") : pill("waiting", "queued")),
+                  h("td", { class: "num", "data-label": "Order" }, String(i + 1)),
+                  h("td", { "data-label": "Source" }, h("a", { href: sourceHash(bank, q.source) }, `${q.source_kind} ${shortId(q.source)}`)),
+                  h("td", { class: "num", "data-label": "Chunk" }, String(q.position + 1)),
+                  h("td", { class: "num", "data-label": "Attempts" }, String(q.error_count)),
+                  h("td", { "data-label": "State" }, q.in_flight ? pill("in flight", "in_flight") : pill("waiting", "queued")),
                 ),
               ),
             ),
@@ -1157,7 +1176,7 @@ async function chunks(ctx) {
       : h("p", { class: "empty" }, "Nothing waiting. New turns and documents are extracted as they arrive."),
   );
 
-  return { title: `Ingestion · ${bank}`, content: [heading(h, "Ingestion"), failed, queued] };
+  return { title: `Ingestion · ${bank}`, content: [heading(h, "Ingestion"), tableRoles(failed), tableRoles(queued)] };
 }
 
 // The Recall page: one query through recall or injection, with the working
@@ -1181,19 +1200,19 @@ const ON = [
 function cutReason(reason, { injection, limit }) {
   switch (reason) {
     case "below_tau":
-      return "Strength below τ, so it never reached fusion.";
+      return "Too weak (below τ) to reach fusion.";
     case "not_reranked":
-      return "The reranker missed its deadline, so nothing passes the gate.";
+      return "Not reranked. The reranker missed its deadline, so nothing passes the gate.";
     case "under_floor":
-      return `Logit under the reranker's floor of ${figure(injection?.floor)}.`;
+      return `Logit below the reranker's floor of ${figure(injection?.floor)}.`;
     case "over_cap":
-      return `Over the cap of ${memoryCount(injection?.cap ?? 0)}: higher-scoring ones took every place.`;
+      return `Over the cap of ${memoryCount(injection?.cap ?? 0)}. Higher scores took every place.`;
     case "over_budget":
-      return `Over the budget: its line would take the block past ${injection?.token_budget ?? "the"} tokens.`;
+      return `Over budget. Its line would take the block past ${injection?.token_budget ?? "the"} tokens.`;
     case "over_limit":
       return `Ranked past the limit of ${limit}.`;
     case "outside_rerank_pool":
-      return "Fused too far down for the reranker to see it.";
+      return "Fused too far down for the reranker to see.";
     default:
       return reason;
   }
@@ -1291,10 +1310,10 @@ async function recall(ctx) {
   const modes = h(
     "fieldset",
     { class: "segmented" },
-    h("legend", {}, "Run it through"),
+    h("legend", {}, "Run as"),
     [
-      ["recall", "Recall", "What the memory_recall tool returns"],
-      ["injection", "Injection", "What prefetch puts in the prompt"],
+      ["recall", "Recall", "What memory_recall would return"],
+      ["injection", "Injection", "What prefetch would put in the prompt"],
     ].map(([value, label, detail]) =>
       h(
         "label",
@@ -1329,7 +1348,7 @@ async function recall(ctx) {
     field("explain-from", "From", from),
     field("explain-to", "To", to),
     field("explain-on", "Dates match", on),
-    h("p", { class: "hint range-hint" }, `Whole days in the bank's timezone, ${timeZone}. Leave either end open.`),
+    h("p", { class: "hint range-hint" }, `Whole days in the bank's timezone (${timeZone}). Either end can be left open.`),
     field("explain-phase", "Phase", phase),
     field("explain-entity", "Entity", entity),
     field("explain-limit", "Limit", limit),
@@ -1338,7 +1357,7 @@ async function recall(ctx) {
       { class: "kinds" },
       h("legend", {}, "Kinds"),
       kinds.map((box) => h("label", { class: "check" }, box, capitalize(box.value))),
-      h("p", { class: "hint" }, "None ticked means every kind."),
+      h("p", { class: "hint" }, "Leave all unticked to search every kind."),
     ),
   );
 
@@ -1347,12 +1366,12 @@ async function recall(ctx) {
   const injectionFields = h(
     "fieldset",
     { class: "explain-filters", "aria-label": "Conversation", hidden: true },
-    field("explain-previous-query", "Previous message", previousQuery, "The user's message before this one, if any."),
-    field("explain-previous-reply", "Previous reply", previousReply, "The agent's reply to it. A short follow-up borrows from both."),
+    field("explain-previous-query", "Previous message", previousQuery, "The user's message before this one. Optional."),
+    field("explain-previous-reply", "Previous reply", previousReply, "The agent's answer to it. A short follow-up borrows context from both."),
     h(
       "p",
       { class: "notice", "data-tone": "info" },
-      "There's no session here, so nothing counts as already in context, and nothing is held for a later turn.",
+      "This runs outside any session. Nothing counts as already in context, and nothing is held back for a later turn.",
     ),
   );
 
@@ -1422,13 +1441,13 @@ async function recall(ctx) {
     h("div", { class: "field explain-query" }, queryLabel, query),
     recallFilters,
     injectionFields,
-    h("div", { class: "explain-run" }, run, h("p", { class: "hint" }, "Logs no recall, credits no use and touches no session.")),
+    h("div", { class: "explain-run" }, run, h("p", { class: "hint" }, "A dry run. Nothing is logged, no memory is credited with a use, and no session is touched.")),
   );
 
   return {
     title: `Recall · ${bank}`,
     content: [
-      heading(h, "Recall", h("p", { class: "quiet-text" }, "See what a query brings back, and why a memory didn't.")),
+      heading(h, "Recall", h("p", { class: "quiet-text" }, "Try a query and see what comes back, and why the rest didn't.")),
       form,
       results,
     ],
@@ -1455,8 +1474,8 @@ function explainResults(ctx, explained, sent, timeZone) {
           "p",
           { class: "notice", "data-tone": "error" },
           isInjection
-            ? "The reranker missed its deadline, so nothing passes the gate and nothing would be injected."
-            : "The reranker missed its deadline, so these are in fusion order, as recall returns them.",
+            ? "The reranker missed its deadline. Nothing passes the gate, so nothing would be injected."
+            : "The reranker missed its deadline. These are in fusion order, which is how recall returns them.",
         ),
     h(
       "dl",
@@ -1474,7 +1493,7 @@ function explainResults(ctx, explained, sent, timeZone) {
               sent.from ? ["from ", h("code", {}, sent.from)] : null,
               sent.from && sent.to ? " " : null,
               sent.to ? ["up to ", h("code", {}, sent.to)] : null,
-              h("span", { class: "quiet-text" }, ` (whole days in ${timeZone})`),
+              h("span", { class: "quiet-text" }, ` (whole days, ${timeZone})`),
             ),
           )
         : null,
@@ -1510,13 +1529,13 @@ function explainResults(ctx, explained, sent, timeZone) {
               ]),
             )
           : null,
-        h("p", { class: "hint" }, "Exactly as the agent gets it."),
+        h("p", { class: "hint" }, "Shown exactly as the agent receives it."),
       )
     : null;
 
   const reasons = { injection, limit };
   const table = (rows, { left }) =>
-    h(
+    tableRoles(h(
       "div",
       { class: "table-wrap" },
       h(
@@ -1535,7 +1554,7 @@ function explainResults(ctx, explained, sent, timeZone) {
         ),
         h("tbody", {}, rows.map((c) => candidateRow(ctx, c, left ? cutReason(c.reason, reasons) : null))),
       ),
-    );
+    ));
 
   // With nothing injected, the injected text already says so.
   const madeIt =
@@ -1544,21 +1563,21 @@ function explainResults(ctx, explained, sent, timeZone) {
       : h(
           "section",
           { class: "panel", "aria-labelledby": "made-title" },
-          h("h2", { id: "made-title" }, `${isInjection ? "Injected" : "Returned"} (${kept.length})`),
-          kept.length ? table(kept, { left: false }) : h("p", { class: "empty" }, "Recall returns nothing for this."),
+          h("h2", { id: "made-title" }, isInjection ? "Injected " : "Returned ", h("span", { class: "title-count" }, String(kept.length))),
+          kept.length ? table(kept, { left: false }) : h("p", { class: "empty" }, "Recall returns nothing for this query."),
         );
 
   const leftOut = h(
     "section",
     { class: "panel", "aria-labelledby": "left-title" },
-    h("h2", { id: "left-title" }, `Left out (${cut.length})`),
+    h("h2", { id: "left-title" }, "Left out ", h("span", { class: "title-count" }, String(cut.length))),
     cut.length ? table(cut, { left: true }) : null,
     h(
       "p",
       { class: "hint" },
       isInjection
         ? "A memory missing from both lists wasn't in any search arm's top hits."
-        : "A memory missing from both lists wasn't in any search arm's top hits, or the filters dropped it.",
+        : "A memory missing from both lists wasn't in any search arm's top hits, or a filter dropped it.",
     ),
   );
 
@@ -1663,13 +1682,13 @@ async function models(ctx) {
         await api.editModel(bank, model.name, { enabled: on });
       } catch (error) {
         if (on && error instanceof ApiError && error.status === 422) {
-          error.message = `That model stays out of the prompt: ${error.message}. Take another model out first.`;
+          error.message = `That model stays out of the prompt because ${error.message}. Take another model out first.`;
         }
         throw error;
       }
       return on
-        ? "Back in the prompt for new Hermes sessions. A refresh is on its way."
-        : "Out of the prompt for new Hermes sessions, and its refreshes are paused.";
+        ? "Back in the prompt for new Hermes sessions. A refresh has started."
+        : "Out of the prompt for new Hermes sessions. Its refreshes are paused."
     });
 
   const usage = h(
@@ -1695,15 +1714,14 @@ async function models(ctx) {
       left >= 0
         ? `${plural(enabled.length, "enabled model")}, ${left} tokens to spare. `
         : `${plural(enabled.length, "enabled model")}, ${-left} tokens over. `,
-      "The agenda comes out of the same budget first, so a model can get less than its limit.",
+      "The agenda is paid for first, so a model can get less than its limit.",
     ),
-  );
-
-  const notes = h(
-    "ul",
-    { class: "model-notes" },
-    h("li", {}, "Changes reach new Hermes sessions only. A running session keeps the system prompt it started with."),
-    h("li", {}, "Taking a model out also pauses its refreshes. Putting it back in starts one."),
+    h(
+      "ul",
+      { class: "model-notes" },
+      h("li", {}, "Changes reach new Hermes sessions only. A running session keeps the system prompt it started with."),
+      h("li", {}, "Taking a model out pauses its refreshes. Putting it back starts one."),
+    ),
   );
 
   const prompt = h(
@@ -1715,7 +1733,7 @@ async function models(ctx) {
       h("h2", { id: "preview-title" }, "System prompt"),
       h("p", { class: "quiet-text" }, "Built ", time(preview.built_at, { withTime: true })),
     ),
-    h("p", { class: "quiet-text" }, "What a new Hermes session gets now, exactly as it gets it."),
+    h("p", { class: "quiet-text" }, "What a new Hermes session would get right now, character for character."),
     h("pre", { class: "injection-text", tabindex: "0", "aria-label": "The system prompt" }, preview.text),
   );
 
@@ -1751,6 +1769,15 @@ async function models(ctx) {
       ),
       h("p", { class: "question" }, m.question),
       modelAnswer(h, m.answer),
+      m.last_error
+        ? h(
+            "p",
+            { class: "model-error" },
+            pill("refresh failed", "failed"),
+            " ",
+            h("span", {}, REFRESH_FAILURES[m.last_error] ?? m.last_error, m.last_error_at ? [", ", time(m.last_error_at, { withTime: true })] : null),
+          )
+        : null,
       h(
         "ul",
         { class: "meta inline-list" },
@@ -1760,28 +1787,17 @@ async function models(ctx) {
         h("li", {}, m.last_refreshed_at ? ["Refreshed ", time(m.last_refreshed_at, { withTime: true })] : "Never refreshed"),
         m.enabled ? null : h("li", {}, "Refreshes paused"),
       ),
-      m.last_error
-        ? h(
-            "p",
-            { class: "model-error" },
-            pill("refresh failed", "failed"),
-            " ",
-            REFRESH_FAILURES[m.last_error] ?? m.last_error,
-            m.last_error_at ? [" ", time(m.last_error_at, { withTime: true })] : null,
-          )
-        : null,
     );
   });
 
   return {
     title: `Mental models · ${bank}`,
     content: [
-      heading(h, "Mental models", h("p", { class: "quiet-text" }, "Each enabled model's answer goes into Hermes's system prompt, after the agenda.")),
+      heading(h, "Mental models", h("p", { class: "quiet-text" }, "Answers to standing questions, written from this bank's memories. Each enabled model goes into Hermes's system prompt after the agenda.")),
       usage,
-      notes,
       list.length
         ? h("div", { class: "model-grid" }, cards)
-        : h("p", { class: "empty" }, "No mental models yet. Create one with asphodel model create."),
+        : h("p", { class: "empty" }, "No mental models yet. Create one with ", h("code", {}, "asphodel model create"), "."),
       prompt,
     ],
   };
@@ -1791,7 +1807,7 @@ async function missing(ctx) {
   const { h } = ctx.ui;
   return {
     title: "Not found",
-    content: [heading(h, "There's no page here"), h("p", {}, h("a", { href: "#/" }, "Go to the banks"))],
+    content: [heading(h, "Nothing here"), h("p", {}, "That address doesn't match any page. ", h("a", { href: "#/" }, "Go to the banks"))],
   };
 }
 
