@@ -87,6 +87,13 @@ pub enum Phase {
     LongPast,
 }
 
+/// A dated task said at or after its due time is a record, not an open plan.
+/// Eligibility uses the stored instant; precision only controls when an
+/// eligible task becomes overdue.
+pub(crate) fn task_due_is_eligible(observed_at: Timestamp, due_at: Timestamp) -> bool {
+    observed_at < due_at
+}
+
 impl Window {
     /// When the window closes: the end of `valid_until`'s unit. An event with
     /// no `valid_until` is a point event, whose window is `valid_from`'s
@@ -101,10 +108,12 @@ impl Window {
     }
 
     /// When an open task becomes overdue: the end of its due date's unit.
-    /// `None` for anything but a task with a due date.
+    /// `None` unless it is a dated task said before its due time.
     pub fn overdue_from(&self, tz: &TimeZone) -> Option<Timestamp> {
         match (self.kind, self.due_at) {
-            (Kind::Task, Some(due)) => Some(unit_end(due, tz)),
+            (Kind::Task, Some(due)) if task_due_is_eligible(self.observed_at, due.at) => {
+                Some(unit_end(due, tz))
+            }
             _ => None,
         }
     }

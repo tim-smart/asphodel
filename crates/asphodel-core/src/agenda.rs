@@ -9,7 +9,8 @@
 //!   period longer than a week whose next occurrence falls in the horizon.
 //!   Both ends are inclusive. An event leaves at the end of its start's
 //!   unit, so a meeting at 11:00 is gone by 11:01. An event that had begun
-//!   when it was said is a record, not a plan, and isn't listed. They're
+//!   when it was said is a record, not a plan, and isn't listed. The same
+//!   applies to a task said at or after its due time. They're
 //!   never gated on τ, so a minor appointment can't fade out on the day it
 //!   matters. In date order, at most `agenda.dated_lines`; over the cap, faded items fold into a count
 //!   first, then the least significant, then the furthest from today.
@@ -43,7 +44,7 @@ use crate::retrieval::candidates::Cleanup;
 use crate::retrieval::format::{self, Line};
 use crate::store::strength::{StrengthLoader, memory_kind, significance_value, world_time};
 use crate::store::timestamp;
-use crate::strength::{AccessKind, Kind, WorldTime, unit_end};
+use crate::strength::{AccessKind, Kind, WorldTime, task_due_is_eligible, unit_end};
 
 /// The bank's agenda now.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -166,7 +167,10 @@ pub(crate) fn build(
             Kind::Task => match row.due_at {
                 Some(due) => {
                     let date = local(due);
-                    if overdue_from <= date && date <= horizon {
+                    if task_due_is_eligible(row.observed_at, due)
+                        && overdue_from <= date
+                        && date <= horizon
+                    {
                         dated.push(Dated {
                             row: index,
                             at: due,
