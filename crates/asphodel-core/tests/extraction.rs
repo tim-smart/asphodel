@@ -1582,14 +1582,9 @@ fn an_occasion_reference_is_accounted_for_by_what_reconciliation_writes() {
     ] {
         let h = Harness::new();
         let wedding = occasion(&h);
-        let has = "I have the gift for the wedding";
-        let has = claim("Tim has the gift for the wedding.", "fact", has);
-        let has = golden(
-            &h,
-            has["quote"].as_str().unwrap(),
-            "Nice.",
-            vec![has.at("valid_from", start, "day")],
-        )[0];
+        let quote = "I have the gift for the wedding";
+        let has = claim("Tim has the gift for the wedding.", "fact", quote);
+        let has = golden(&h, quote, "Nice.", vec![has.at("valid_from", start, "day")])[0];
         h.say("2026-10-01T06:20:00Z", gift, "OK.");
         let leased = lease(&h, "main");
         let call1 = reply(vec![for_wedding(gift)], &[]);
