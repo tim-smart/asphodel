@@ -561,7 +561,7 @@ fn retract_refuses_a_superseded_memory_naming_its_head_and_a_repeat() {
 #[test]
 fn a_retracted_memory_still_shows_until_the_sweep_purges_it() {
     let h = Harness::new();
-    let tea = h.says(trivial(TEA), &[]);
+    let tea = h.says_at(h.now(), trivial(TEA), &[]);
     h.retract(tea).unwrap();
     assert_eq!(h.listed(MemoryStatus::Retracted), set(&[tea]));
     let purge = h.show(tea).projection.purge;
