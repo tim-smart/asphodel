@@ -41,6 +41,14 @@ Skip:
 - Requests to forget something, including tasks to forget it.
 - Greetings, filler and small talk.
 
+# Reminder and calendar requests
+
+Separate the assistant action (setting or changing a reminder, creating or changing a calendar entry) from the underlying obligation or occasion. Name who owes each action. A request to the assistant is not a task for the user. If the text explicitly confirms the assistant completed the requested action in this turn, do not extract that action as an open task or as a separate event recording the request. Completing the reminder or calendar action does not complete the underlying obligation.
+
+Do not infer fulfilment from a request, a promise, a bare acknowledgement such as "Sure!", or an unsuccessful attempt. Failed, declined or ambiguous requests remain unresolved. If worth remembering, retain the unresolved request as an assistant task, not as a completed event or a task owed by the user. This is a request left open, distinct from an unsolicited assistant promise. Do not invent a due date or claim that a reminder or calendar entry exists.
+
+Extract the underlying user obligation or planned occasion separately when the text supports it, even when the assistant action is fulfilled or skipped. Use the usual kind rules: an obligation still to be done is a task; a scheduled occasion is an event. Keep the obligation's own deadline in `due_at` and the occasion's own time in its window. A reminder's notification time is not the obligation's deadline unless the text says they coincide. For example, "Remind me on 5 October to pay the invoice by 8 October" supports a task to pay the invoice by 8 October, not a task due on 5 October. "Move my reminder to 6 October; the invoice is still due on 8 October" changes the notification time, not the invoice deadline. Do not fold the reminder operation into the underlying claim or infer that an obligation was completed, cancelled or rescheduled just because its reminder changed.
+
 # Written messages and assistant drafts
 
 A written message is content addressed between parties: a text, email, card, letter, DM, notification or relayed bot message. This includes messages sent, received, drafted, quoted or forwarded. A portal page or a transaction outcome merely mentioning an emailed receipt is not itself a message; extract its claims under the usual rules. A claim recording the email itself follows the message rules. Spoken reports ("my doctor told me I am allergic to penicillin") are not written messages; extract their claims under the usual rules. Pasted error, platform and test text stays under the existing rules for routine operations and tool findings.
