@@ -28,6 +28,10 @@ pub(super) struct Unit {
     pub source_id: i64,
     pub tz: TimeZone,
     pub ingested_at: Timestamp,
+    /// When accesses and pending credits are dated: a turn's message_at,
+    /// capped at ingested_at, or a document's ingested_at. Ordering still
+    /// uses ingested_at.
+    pub access_at: Timestamp,
     /// The document's id, for a document chunk: a neighbour from an earlier
     /// version of the same document isn't mentioned again.
     pub document_id: Option<String>,
@@ -224,6 +228,9 @@ pub(super) fn assemble(
         source_id: source.source_id,
         tz,
         ingested_at: source.ingested_at,
+        access_at: source.message_at.map_or(source.ingested_at, |at| {
+            timestamp(at).min(source.ingested_at)
+        }),
         document_id: source.document_id.clone(),
         turn,
         entity_boundary,

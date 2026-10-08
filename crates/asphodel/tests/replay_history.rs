@@ -18,8 +18,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use asphodel_core::config::Secret;
-use asphodel_core::models::{ChatgptTokens, TokenStore};
+use asphodel_core::config::{Secret, Tuning};
+use asphodel_core::ingest::Turn;
+use asphodel_core::models::{
+    ChatgptTokens, FakeEmbedder, FakeLlm, FakeReranker, Models, TokenStore,
+};
+use asphodel_core::retrieval::band;
+use asphodel_core::store::bank::BankIdentity;
+use asphodel_core::store::{OpenOptions, Store};
+use asphodel_core::{Service, SimulatedClock};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::hermes::{self, StateDb, epoch, start};
@@ -57,6 +65,97 @@ fn is_call2(record: &Value) -> bool {
 /// `plan_model`, and replays by its key like any other call.
 fn is_refresh(record: &Value) -> bool {
     record["template"]["name"] == "write_model"
+}
+
+/// A turn backfilled 180 days after it was said ages like the same turn
+/// imported and replayed.
+#[test]
+fn backfilled_turn_strength_matches_the_imported_history() {
+    let dir = TestDir::new();
+    let user = "Tim likes green tea.";
+    let message_at: Timestamp = "2026-01-05T09:00:00Z".parse().unwrap();
+    let received = message_at + SignedDuration::from_hours(180 * 24);
+    let settings = format!(
+        "[clock]\nquiet_rate = 1.0\n[purge]\ndelta = 0.0\n\
+         [injection.reranker_floors]\n\"{}\" = 0.0\n\
+         [ranking.relevance_scales]\n\"{0}\" = 1.0\n\
+         [reconcile.embedding_floors]\n\"{}\" = 0.5\n",
+        FakeReranker::MODEL_ID,
+        FakeEmbedder::MODEL_ID,
+    );
+    let tuning = Tuning::from_toml(&settings).unwrap();
+    let cutoff = tuning.recall.strong_cutoff;
+    let clock = Arc::new(SimulatedClock::new(received));
+    let store = Store::open(&dir.path("backfill"), OpenOptions::default(), clock.clone()).unwrap();
+    let service = Service::with_models(clock, store, tuning, Models::fake()).unwrap();
+    let timezone = Some("Pacific/Auckland".to_owned());
+    service
+        .ensure_bank_with_models(
+            "main",
+            &BankIdentity {
+                timezone: timezone.clone(),
+                ..BankIdentity::default()
+            },
+        )
+        .unwrap();
+    service
+        .ingest_turn(
+            "main",
+            &Turn {
+                session_id: "s1".into(),
+                message_at,
+                timezone,
+                user_text: user.into(),
+                assistant_text: "Noted.".into(),
+                author: None,
+                platform: None,
+                recall_id: None,
+                forget_requested: false,
+            },
+        )
+        .unwrap();
+    let fact = claim(user, user, "fact");
+    let llm = FakeLlm::scripted(
+        "fake-llm",
+        vec![json!({ "claims": [fact.clone()], "used_injected_ids": [] })],
+    );
+    let lease = service.claim_chunk("main").unwrap().unwrap();
+    let extracted = service.extract_chunk(lease, &llm, &[]).unwrap();
+    let view = service
+        .show_memory("main", &extracted.memories[0].to_string())
+        .unwrap();
+    assert_eq!(view.accesses.len(), 1);
+    assert_eq!(view.accesses[0].kind, "created");
+    assert_eq!(view.accesses[0].at, message_at);
+
+    let corpus = import_history(&dir, |path| {
+        let db = hermes::one_session(path);
+        db.turn("s1", start(), user, "Noted.");
+        db
+    });
+    let script = script_answering_everything(&dir, "backfill-import", vec![fact], vec![]);
+    let aged = serde_json::to_value(band(view.strength.value, cutoff)).unwrap();
+    let probes = probe(
+        "aged",
+        &received.to_string(),
+        "band",
+        &format!("memory = \"likes green tea\"\nband = {aged}"),
+    );
+    let flags = [
+        "--refresh",
+        "off",
+        "--overrides",
+        &overrides(&dir, &settings),
+    ];
+    let report = replay_history(&dir, &corpus, "fast", &probes, Some(&script), &flags).ok();
+    let imported = probe_in(&report, "aged")["observed"]["strength"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (view.strength.value - imported).abs() < 1e-9,
+        "backfill strength {} differs from imported strength {imported}",
+        view.strength.value
+    );
 }
 
 // Probe identity and unresolved-memory regressions, through the CLI report.

@@ -17,10 +17,8 @@ use crate::constants::FULL_SPEED_WINDOW;
 ///
 /// The turns are the bank's `sources` of kind `turn`, at `message_at`, and
 /// include tombstoned ones: a swept or forgotten turn still happened. Ingested
-/// documents don't count. A turn replayed from the plugin's spool after an
-/// outage is placed by `message_at`, while its memories' `created` accesses
-/// carry the ingest time, so they may start ageing at the quiet rate. That's
-/// at most a day of bank time and isn't corrected for.
+/// documents don't count. Turns replayed from the plugin's spool after an
+/// outage keep their original message times, as do their memories' accesses.
 #[derive(Debug, Clone)]
 pub struct BankTime {
     /// Disjoint full-speed windows in microseconds, sorted.

@@ -330,9 +330,9 @@ HERMES_HOME=~/.hermes python3 backfill.py --all-history --speaker Sam=discord:12
 
 - **A cutoff is required.** Give either `--since YYYY-MM-DD` (the start of
   that day in the configured timezone, or UTC) or `--all-history`. Each
-  turn keeps its original time, so its memories arrive already aged. A
-  memory from six months ago that was never reinforced lands near the floor,
-  and the first purge will take many of those.
+  turn keeps its original time, so its memories arrive already aged.
+  Repeated mentions across history count as separate occasions when they
+  are at least three world days apart, building the memory's lasting floor.
 - **`--dry-run`** prints the counts and posts nothing. They're the counts
   `asphodel import --dry-run` prints for the same database, plus, with
   `--since`, `turns_before_since`, the turns the cutoff leaves out.

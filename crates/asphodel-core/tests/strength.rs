@@ -124,7 +124,21 @@ impl Harness {
         used: &[Uuid],
         labels: &[(Uuid, &str)],
     ) -> Vec<Uuid> {
-        self.set(when);
+        self.turn_received(when, when, tz, claims, used, labels)
+    }
+
+    /// Ingest at a different time from the original message, as backfill
+    /// and spool replay do. Extraction runs at receipt time too.
+    fn turn_received(
+        &self,
+        when: Timestamp,
+        received: Timestamp,
+        tz: &str,
+        claims: Vec<Value>,
+        used: &[Uuid],
+        labels: &[(Uuid, &str)],
+    ) -> Vec<Uuid> {
+        self.set(received);
         let quotes: Vec<&str> = claims
             .iter()
             .map(|c| c["quote"].as_str().unwrap())
@@ -240,6 +254,59 @@ fn local(at: &str, precision: &str) -> Value {
 
 fn day(date: &str) -> Value {
     local(&format!("{date}T00:00"), "day")
+}
+
+#[test]
+fn backfilled_mentions_ten_days_apart_count_as_three_occasions() {
+    let h = Harness::new("");
+    let fact = || claim("fact", "notable", "Tim studied physics at Otago.");
+    let memory = h.turn_received(at(0.0), at(180.0), "UTC", vec![fact()], &[], &[])[0];
+    for (day, seconds) in [(10.0, 20), (20.0, 40)] {
+        let received = at(180.0) + SignedDuration::from_secs(seconds);
+        assert!(
+            h.turn_received(
+                at(day),
+                received,
+                "UTC",
+                vec![fact()],
+                &[],
+                &[(memory, "mentioned_again")],
+            )
+            .is_empty()
+        );
+    }
+    assert_eq!(h.strength(memory).occasions, 3);
+    let accesses = h.show(memory).accesses;
+    let mut times: Vec<_> = accesses.iter().map(|a| a.at).collect();
+    times.sort();
+    assert_eq!(times, [at(0.0), at(10.0), at(20.0)]);
+}
+
+#[test]
+fn future_turn_accesses_are_capped_at_receipt_time() {
+    let h = Harness::new("");
+    let fact = || minor("fact", "Tim likes green tea.");
+    let memory = h.turn_received(at(10.0), at(0.0), "UTC", vec![fact()], &[], &[])[0];
+    for (day, label) in [(11.0, "mentioned_again"), (12.0, "confirmed")] {
+        assert!(
+            h.turn_received(
+                at(day),
+                at(0.0),
+                "UTC",
+                vec![fact()],
+                &[],
+                &[(memory, label)],
+            )
+            .is_empty()
+        );
+    }
+    h.turn_received(at(13.0), at(0.0), "UTC", vec![], &[memory], &[]);
+    let accesses = h.show(memory).accesses;
+    assert_eq!(accesses.len(), 4);
+    for kind in ["created", "mentioned_again", "confirmed", "used"] {
+        let access = accesses.iter().find(|a| a.kind == kind).expect(kind);
+        assert_eq!(access.at, at(0.0), "{kind}");
+    }
 }
 
 /// `before` until the minute before `at`, and `after` from `at`.
