@@ -2719,6 +2719,38 @@ fn overdue_tasks_are_listed_for_overdue_days() {
     assert_eq!(agenda.dated, vec![recent]);
     assert!(!agenda.dated.contains(&old));
     assert!(!agenda.undated_tasks.contains(&done));
+
+    // A dated task must have been said before its due instant to become
+    // an overdue obligation. Equality is excluded, just as for events.
+    let h = Harness::new();
+    let due = local("2026-09-25T09:00");
+    let dated_task = |content| {
+        task(content).level("minor").with(
+            "due_at",
+            json!({"at": "2026-09-25T09:00", "precision": "minute"}),
+        )
+    };
+    let before = h.seed_at(due - secs(1), dated_task("Tim needs to call the plumber."));
+    let equal = h.seed_at(due, dated_task("Tim needs to collect the parcel."));
+    let after = h.seed_at(
+        due + secs(1),
+        dated_task("Tim needs to return the library book."),
+    );
+    let retrospective = h.seed_at(
+        at("2026-09-25T13:06:00Z"),
+        dated_task("Tim needs to take the bins out."),
+    );
+
+    let agenda = h.agenda();
+    assert!(
+        agenda.dated.contains(&before),
+        "a genuine overdue obligation stays listed"
+    );
+    assert_eq!(
+        agenda.listed(),
+        vec![before],
+        "tasks said at or after their due time are records, not plans: {equal}, {after}, {retrospective}"
+    );
 }
 
 #[test]

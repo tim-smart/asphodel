@@ -36,7 +36,7 @@ use asphodel_core::retrieval::{
 };
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::{OpenOptions, Store};
-use asphodel_core::strength::Kind;
+use asphodel_core::strength::{Kind, Phase};
 use asphodel_core::{Service, SimulatedClock, Tuning};
 use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
@@ -1203,6 +1203,15 @@ fn recall_filters_by_phase() {
     // the only one that reaches it short of `any`.
     let weed = claim("Tim needs to weed the garden.", "task");
     let overdue = h.seed(weed.with("due_at", day("2026-09-30")));
+    let due = local("2026-09-30T00:00");
+    let retrospective = [
+        (due, "Tim needs to mow the garden."),
+        (
+            due + SignedDuration::from_secs(1),
+            "Tim needs to water the garden.",
+        ),
+    ]
+    .map(|(said, text)| h.seed_at(said, claim(text, "task").with("due_at", day("2026-09-30"))));
 
     let only = |phase| {
         let request = RecallRequest {
@@ -1215,8 +1224,27 @@ fn recall_filters_by_phase() {
     assert_eq!(only(PhaseFilter::Past), vec![past]);
     let now = only(PhaseFilter::Current);
     assert!(now.contains(&current) && now.contains(&overdue));
+    assert!(retrospective.iter().all(|id| now.contains(id)));
     assert!(!now.contains(&upcoming) && !now.contains(&past));
-    assert_eq!(only(PhaseFilter::Any).len(), 4);
+    assert_eq!(only(PhaseFilter::Any).len(), 6);
+
+    // The current filter includes overdue tasks, but only a task said
+    // before its due instant gets the overdue phase and ranking bonus.
+    let request = RecallRequest {
+        phase: PhaseFilter::Current,
+        ..query("garden")
+    };
+    let explain = h.explain(explain_recall(&request));
+    let eligible = explained(&explain, overdue);
+    assert_eq!(eligible.phase, Phase::Overdue);
+    assert!(eligible.score.unwrap().phase_term > 0.0);
+    for memory in retrospective {
+        let shown = explained(&explain, memory);
+        assert_eq!(
+            (shown.phase, shown.score.unwrap().phase_term),
+            (Phase::Current, 0.0)
+        );
+    }
 }
 
 #[test]

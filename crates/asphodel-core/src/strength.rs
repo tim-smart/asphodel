@@ -33,6 +33,7 @@ pub use bank_time::{BankTime, FULL_SPEED_HORIZON_DAYS};
 pub use chain::{Chains, Link, chain, chain_head, inherits_from};
 pub use confidence::state_confidence;
 pub use purge::{PurgeRule, never_purged, purge_eligible};
+pub(crate) use window::task_due_is_eligible;
 pub use window::{Kind, Phase, TimePrecision, Window, WorldTime, unit_end};
 
 const MICROS_PER_DAY: f64 = 86_400_000_000.0;
