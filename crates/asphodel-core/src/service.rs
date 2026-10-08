@@ -51,7 +51,7 @@ use crate::sessions::Sessions;
 use crate::store::bank::{Bank, BankError, BankIdentity, ModelIds};
 use crate::store::{Store, StoreError};
 use crate::sweep::{PurgeError, PurgePlan, SweepSchedule, Sweeps};
-use crate::system_prompt::{Block, Blocks};
+use crate::system_prompt::{Block, Blocks, Preview};
 use crate::translate::{Found, TranslateError, Translation};
 
 /// How long an LLM call may go on retrying before `status` says it needs
@@ -1761,14 +1761,24 @@ impl Service {
         Ok(block)
     }
 
-    /// The block `system_prompt` would serve now without building one, or
-    /// `None` when nothing is cached for the bank's local day. It writes
-    /// nothing: no block row, no session mapping, no access. The cache
-    /// lives in memory, so it's empty after a restart until the next fetch.
-    pub fn cached_system_prompt(&self, bank: &str) -> Result<Option<Block>, ModelError> {
+    /// What a new Hermes session would get now, for the dashboard: the
+    /// cached block, or one laid out at `now` and not kept. It writes
+    /// nothing: no block row, no cache entry, no session mapping, no access.
+    pub fn preview_system_prompt(&self, bank: &str) -> Result<Preview, ModelError> {
         let (bank_id, tz) = self.model_bank(bank)?;
-        let today = self.now().to_zoned(tz).date();
-        Ok(self.blocks.get(bank_id, today).ok())
+        let now = self.now();
+        if let Ok(block) = self.blocks.get(bank_id, now.to_zoned(tz.clone()).date()) {
+            return Ok(Preview {
+                built_at: block.built_at,
+                text: block.text,
+            });
+        }
+        let conn = self.store.connection();
+        let layout = crate::system_prompt::lay_out(&conn, &self.tuning, bank_id, &tz, now)?;
+        Ok(Preview {
+            built_at: now,
+            text: layout.text,
+        })
     }
 
     fn mapping_expiry(&self) -> SignedDuration {

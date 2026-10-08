@@ -43,7 +43,7 @@ use asphodel_core::retrieval::{
 use asphodel_core::store::StoreError;
 use asphodel_core::store::bank::{Bank, BankError, BankIdentity};
 use asphodel_core::sweep::{PurgeAck, PurgeError, PurgePlan};
-use asphodel_core::system_prompt::Block;
+use asphodel_core::system_prompt::{Block, Preview};
 use asphodel_core::translate::{TranslateError, Translation};
 use asphodel_core::{Health, ResolvedConfig, Service};
 use axum::body::{Body, Bytes};
@@ -89,8 +89,8 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/v1/banks/{bank}/chunks/retry", post(retry_chunks))
         .route("/v1/banks/{bank}/system-prompt", get(system_prompt))
         .route(
-            "/v1/banks/{bank}/system-prompt/cached",
-            get(cached_system_prompt),
+            "/v1/banks/{bank}/system-prompt/preview",
+            get(preview_system_prompt),
         )
         .route("/v1/banks/{bank}/agenda", get(agenda))
         .route(
@@ -917,22 +917,17 @@ async fn system_prompt(
     Ok(Json(block))
 }
 
-#[derive(Serialize)]
-struct CachedBlock {
-    block: Option<Block>,
-}
-
-/// `GET /v1/banks/{bank}/system-prompt/cached`: the block the daemon has
-/// cached, or `null`, for the dashboard. Unlike `/system-prompt` it never
-/// builds one, so looking writes nothing.
-async fn cached_system_prompt(
+/// `GET /v1/banks/{bank}/system-prompt/preview`: the block's text as a new
+/// session would get it now, for the dashboard. Unlike `/system-prompt` it
+/// keeps nothing, so looking writes nothing.
+async fn preview_system_prompt(
     State(app): State<Shared>,
     Path(bank): Path<String>,
-) -> Result<Json<CachedBlock>, ApiError> {
-    let block = app
-        .call(move |service| service.cached_system_prompt(&bank))
+) -> Result<Json<Preview>, ApiError> {
+    let preview = app
+        .call(move |service| service.preview_system_prompt(&bank))
         .await?;
-    Ok(Json(CachedBlock { block }))
+    Ok(Json(preview))
 }
 
 /// `GET /v1/banks/{bank}/agenda`: the agenda as the block would list it.

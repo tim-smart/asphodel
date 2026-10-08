@@ -1622,8 +1622,8 @@ function candidateRow(ctx, c, reason) {
 
 // The bank's mental models, and which of them go into Hermes's system
 // prompt. A model is in the prompt while it's enabled; the daemon refuses an
-// enable past the budget, and the page shows its reason. The block the
-// daemon has cached is read without building one, so looking writes nothing.
+// enable past the budget, and the page shows its reason. The prompt preview
+// is what a new session would get now, and looking writes nothing.
 
 const REFRESH_FAILURES = {
   llm: "The LLM call failed",
@@ -1634,9 +1634,9 @@ const REFRESH_FAILURES = {
 async function models(ctx) {
   const { api, ui, bank } = ctx;
   const { h, time, pill } = ui;
-  const [{ models: list, budget }, { block: cached }] = await Promise.all([
+  const [{ models: list, budget }, preview] = await Promise.all([
     api.models(bank),
-    api.cachedSystemPrompt(bank),
+    api.previewSystemPrompt(bank),
   ]);
   const enabled = list.filter((m) => m.enabled);
   const used = enabled.reduce((sum, m) => sum + m.max_tokens, 0);
@@ -1693,23 +1693,15 @@ async function models(ctx) {
 
   const prompt = h(
     "section",
-    { class: "panel cached-prompt", "aria-labelledby": "cached-title" },
+    { class: "panel prompt-preview", "aria-labelledby": "preview-title" },
     h(
       "div",
       { class: "section-head" },
-      h("h2", { id: "cached-title" }, "Cached system prompt"),
-      cached ? h("p", { class: "quiet-text" }, "Built ", time(cached.built_at, { withTime: true })) : null,
+      h("h2", { id: "preview-title" }, "System prompt"),
+      h("p", { class: "quiet-text" }, "Built ", time(preview.built_at, { withTime: true })),
     ),
-    cached
-      ? [
-          h("p", { class: "quiet-text" }, "What a new Hermes session gets now, exactly as it gets it."),
-          h("pre", { class: "injection-text", tabindex: "0", "aria-label": "The cached system prompt" }, cached.text),
-        ]
-      : h(
-          "p",
-          { class: "empty" },
-          "Nothing is cached right now. The next Hermes session to start builds the block, from the agenda and the enabled models as they are then.",
-        ),
+    h("p", { class: "quiet-text" }, "What a new Hermes session gets now, exactly as it gets it."),
+    h("pre", { class: "injection-text", tabindex: "0", "aria-label": "The system prompt" }, preview.text),
   );
 
   const cards = list.map((m, i) => {

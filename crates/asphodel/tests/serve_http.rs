@@ -1579,21 +1579,23 @@ fn the_model_list_carries_the_budget_and_enabling_past_it_changes_nothing() {
     assert_eq!(enabled(&daemon.get_ok("/v1/banks/main/models")), before);
 }
 
-/// The dashboard shows the block the daemon has cached without building
-/// one, so looking writes nothing.
+/// The dashboard previews what a new session gets: the cached block, or
+/// one laid out now when nothing is cached.
 #[test]
-fn the_cached_system_prompt_is_null_until_a_fetch_builds_it() {
+fn the_system_prompt_preview_is_the_block_a_new_session_gets() {
     let dir = TestDir::new();
     let daemon = Serve::new(&dir).ready();
     daemon.create_bank("main");
-    let cached = || daemon.get_ok("/v1/banks/main/system-prompt/cached");
+    let preview = || daemon.get_ok("/v1/banks/main/system-prompt/preview");
 
-    assert_eq!(cached(), json!({"block": null}));
-    assert_eq!(cached(), json!({"block": null}), "looking built a block");
+    assert!(preview()["text"].as_str().is_some_and(|text| !text.is_empty()));
     let block = daemon.get_ok("/v1/banks/main/system-prompt");
-    assert_eq!(cached(), json!({ "block": block }));
     assert_eq!(
-        daemon.get("/v1/banks/nope/system-prompt/cached").status,
+        preview(),
+        json!({ "built_at": block["built_at"], "text": block["text"] })
+    );
+    assert_eq!(
+        daemon.get("/v1/banks/nope/system-prompt/preview").status,
         404
     );
 }

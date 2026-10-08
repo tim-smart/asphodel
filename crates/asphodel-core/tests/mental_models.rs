@@ -47,7 +47,7 @@ use asphodel_core::retrieval::{Prefetch, PrefetchRequest, Taken, estimate_tokens
 use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME};
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::strength::{Kind, TimePrecision, WorldTime};
-use asphodel_core::system_prompt::Block;
+use asphodel_core::system_prompt::{Block, Preview};
 use asphodel_core::{Service, SimulatedClock, Tuning};
 use jiff::civil::{DateTime, Time};
 use jiff::tz::TimeZone;
@@ -2327,23 +2327,32 @@ fn taking_a_model_out_of_the_prompt_and_back_shows_in_the_next_block_and_survive
 }
 
 #[test]
-fn the_cached_block_is_read_without_building_one() {
+fn the_preview_is_what_a_new_session_gets_and_keeps_nothing() {
     let h = Harness::new();
     let tea = h.seed(fact(TEA));
     h.profile_adding(&[("Tim likes green tea.", &[tea])]);
     let accesses = h.accesses(tea, "injection");
+    let preview = || h.service.preview_system_prompt(BANK).unwrap();
 
-    // Nothing has fetched the block, so nothing is cached, and looking
-    // doesn't build one.
-    assert_eq!(h.service.cached_system_prompt(BANK).unwrap(), None);
-
+    // Nothing has fetched the block, so the preview lays it out now and
+    // keeps it nowhere: a fetch a minute later builds its own.
+    let laid_out = preview();
+    assert!(laid_out.text.contains("Tim likes green tea."));
+    h.advance(minutes(1));
     let served = h.block(None);
+    assert_ne!(served.built_at, laid_out.built_at);
+
+    // Once a block is cached, the preview is that block.
+    h.advance(minutes(1));
     assert_eq!(
-        h.service.cached_system_prompt(BANK).unwrap(),
-        Some(served.clone())
+        preview(),
+        Preview {
+            built_at: served.built_at,
+            text: served.text.clone(),
+        }
     );
 
-    // Whatever clears the cache empties it: an edit, and local midnight.
+    // A change the cache drops shows at once.
     h.service
         .edit_model(
             BANK,
@@ -2354,14 +2363,11 @@ fn the_cached_block_is_read_without_building_one() {
             },
         )
         .unwrap();
-    assert_eq!(h.service.cached_system_prompt(BANK).unwrap(), None);
-    h.block(None);
-    h.set(at("2026-10-01T11:00:00Z"));
-    assert_eq!(h.service.cached_system_prompt(BANK).unwrap(), None);
+    assert!(!preview().text.contains("Tim likes green tea."));
     assert_eq!(
         h.accesses(tea, "injection"),
         accesses,
-        "reading the cache never counts"
+        "previewing never counts"
     );
 }
 

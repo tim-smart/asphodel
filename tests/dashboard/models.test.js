@@ -7,10 +7,10 @@
 // A model's toggle is the checkbox, `role="switch"` or `aria-pressed` button
 // in its row.
 //
-// The page also shows the system prompt block the daemon has cached, read
-// from `GET .../system-prompt/cached`. Reading it never builds a block, as
-// `GET .../system-prompt` does when nothing is cached, and never refreshes a
-// model. The block's text is shown verbatim in a `<pre>`.
+// The page also shows what a new Hermes session would get now, read from
+// `GET .../system-prompt/preview`. Reading it never builds a block, as
+// `GET .../system-prompt` does, and never refreshes a model. The text is
+// shown verbatim in a `<pre>`.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -30,9 +30,6 @@ import {
 
 const MODELS = "#/banks/main/models";
 
-/// What the page says when nothing is cached.
-const NOTHING_CACHED = /\b(nothing|not|no|isn't)\b[^.]*\bcached\b/i;
-
 function toggleIn(row) {
   return row.querySelector('input[type="checkbox"], [role="switch"], button[aria-pressed]');
 }
@@ -44,7 +41,7 @@ function isOn(toggle) {
 
 /// The row of the model named `name`: the innermost row with a prompt
 /// toggle whose text has the name. Other text with the name, such as the
-/// cached block, isn't a row.
+/// prompt preview, isn't a row.
 function queryModel(page, name) {
   const rows = [...page.root.querySelectorAll('tr, li, article, [role="row"], [role="listitem"]')].filter(
     (row) => toggleIn(row) && textOf(row).includes(name),
@@ -133,10 +130,10 @@ test("a model taken out of the prompt and put back is edited through enabled alo
   assert.deepEqual(out.body, { enabled: false });
   await waitFor(() => queryToggle(page, "Plans") && !isOn(queryToggle(page, "Plans")), "Plans out of the prompt");
   await findUse(page, 500, 800);
-  // The edit cleared the daemon's cache, and the page reads it again
-  // rather than keep the block it loaded with.
+  // The edit cleared the daemon's cache, and the page shows the block as
+  // it'd be built now rather than keep the one it loaded with.
   await waitFor(() => !queryBlock(page, cached), "the stale cached block to go");
-  await findText(page.root, NOTHING_CACHED);
+  await waitFor(() => queryBlock(page, daemon.layOut()), "the block without Plans");
 
   click(await findToggle(page, "Plans"));
   const back = await waitFor(() => patches(daemon, "Plans")[1], "a second PATCH Plans");
@@ -160,7 +157,7 @@ test("enabling past the budget shows the daemon's error and leaves the model out
   await stays(() => !isOn(queryToggle(page, "Travel")), "Travel left out");
   assert.ok(queryText(page.root, /(^|\D)700\D{1,16}800(\D|$)/), "the budget use is unchanged");
   assert.equal(daemon.state.models.find((m) => m.name === "Travel").enabled, false);
-  // A refusal changes nothing, so the cache and the block shown stay.
+  // A refusal changes nothing, so the block shown stays.
   assert.ok(queryBlock(page, cached), "a refused enable dropped the cached block");
 });
 
@@ -184,7 +181,7 @@ function builtNothing(daemon) {
   return daemon.calls(null, "/v1/banks/main/system-prompt").length === 0 && daemon.calls(null, /\/refresh$/).length === 0;
 }
 
-test("the cached system prompt shows exactly as Hermes gets it, with when it was built", async (t) => {
+test("the system prompt shows exactly as Hermes gets it, with when it was built", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon, { hash: MODELS, token: TOKEN });
 
@@ -194,12 +191,11 @@ test("the cached system prompt shows exactly as Hermes gets it, with when it was
   await stays(() => builtNothing(daemon), "no block built and no model refreshed");
 });
 
-test("with nothing cached the page says so and builds nothing", async (t) => {
+test("with nothing cached the page shows the block as it'd be built now, and builds nothing", async (t) => {
   const daemon = new FakeDaemon();
   daemon.state.cachedBlock = null;
   const page = await open(t, daemon, { hash: MODELS, token: TOKEN });
 
-  await findText(page.root, NOTHING_CACHED);
-  assert.equal(page.root.querySelector("pre"), null, page.root.innerHTML);
+  await waitFor(() => queryBlock(page, daemon.layOut()), "the block as it'd be built now");
   await stays(() => builtNothing(daemon) && daemon.state.cachedBlock === null, "no block built");
 });

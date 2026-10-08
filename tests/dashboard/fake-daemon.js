@@ -614,7 +614,7 @@ export class FakeDaemon {
     if (top !== "banks") return error(404, "no such route");
     if (bank === undefined && method === "GET") return json(200, { banks: state.banks });
     if (!state.banks.some((b) => b.name === bank)) return error(404, "unknown bank");
-    if (bank !== "main") return this.emptyBank(collection, method);
+    if (bank !== "main") return this.emptyBank(collection, id, method);
 
     if (collection === "recall" && id === "explain" && method === "POST") return this.explain(body);
     if (collection === "memories" && id === undefined && method === "GET") return this.memories(query);
@@ -647,16 +647,17 @@ export class FakeDaemon {
       return json(200, { models: state.models, budget: state.budget });
     }
     if (collection === "models" && action === undefined && method === "PATCH") return this.editModel(id, body);
-    // Reading the cache never builds a block; fetching the block does, when
-    // nothing is cached.
-    if (collection === "system-prompt" && id === "cached" && method === "GET") {
-      return json(200, { block: state.cachedBlock });
+    // The preview is the cached block, or one laid out now and not kept.
+    // Fetching the block builds and caches one when nothing is cached.
+    if (collection === "system-prompt" && id === "preview" && method === "GET") {
+      if (state.cachedBlock) return json(200, { built_at: state.cachedBlock.built_at, text: state.cachedBlock.text });
+      return json(200, { built_at: NOW, text: this.layOut() });
     }
     if (collection === "system-prompt" && id === undefined && method === "GET") {
       state.cachedBlock ??= {
         id: "01a10400-0000-7000-8000-0000000000f2",
         built_at: NOW,
-        text: "Built Sat 3 Oct 22:00; memories win: use memory_recall for history and detail.",
+        text: this.layOut(),
         agenda: [],
         cited: [],
       };
@@ -665,7 +666,7 @@ export class FakeDaemon {
     return error(404, "no such route");
   }
 
-  emptyBank(collection, method) {
+  emptyBank(collection, id, method) {
     if (collection === "memories" && method === "GET") {
       return json(200, {
         memories: [],
@@ -678,7 +679,9 @@ export class FakeDaemon {
     if (collection === "sources" && method === "GET") return json(200, { sources: [], total: 0, next_cursor: null });
     if (collection === "chunks" && method === "GET") return json(200, { queued: [], failed: [] });
     if (collection === "models" && method === "GET") return json(200, { models: [], budget: 800 });
-    if (collection === "system-prompt" && method === "GET") return json(200, { block: null });
+    if (collection === "system-prompt" && id === "preview" && method === "GET") {
+      return json(200, { built_at: NOW, text: "Built Sat 3 Oct 22:00; memories win: use memory_recall for history and detail." });
+    }
     return error(404, "no such route");
   }
 
@@ -829,6 +832,12 @@ export class FakeDaemon {
     // An edit clears the bank's cached block, as the daemon's does.
     this.state.cachedBlock = null;
     return json(200, found);
+  }
+
+  /// The block's text as it'd be built now: a heading per enabled model.
+  layOut() {
+    const models = this.state.models.filter((m) => m.enabled).map((m) => m.name);
+    return ["Built Sat 3 Oct 22:00; memories win: use memory_recall for history and detail.", ...models].join("\n\n");
   }
 
   retry(chunks) {

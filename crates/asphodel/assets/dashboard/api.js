@@ -94,7 +94,7 @@ export function client(fetch, storage) {
     chunks: (name) => call("GET", `${bank(name)}/chunks`),
     models: (name) => call("GET", `${bank(name)}/models`),
     // Never builds a block, unlike `/system-prompt`.
-    cachedSystemPrompt: (name) => call("GET", `${bank(name)}/system-prompt/cached`),
+    previewSystemPrompt: (name) => call("GET", `${bank(name)}/system-prompt/preview`),
     editModel: (name, model, edit) => call("PATCH", `${bank(name)}/models/${path(model)}`, edit),
     retryChunks: (name, chunks) => call("POST", `${bank(name)}/chunks/retry`, chunks ? { chunks } : {}),
   };

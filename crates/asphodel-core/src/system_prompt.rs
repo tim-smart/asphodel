@@ -97,6 +97,13 @@ impl Block {
     }
 }
 
+/// The block's text as a new session would get it now, without keeping it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Preview {
+    pub built_at: Timestamp,
+    pub text: String,
+}
+
 /// Each bank's block, with the local date it was built for. Each clear
 /// bumps the bank's generation, so a build that raced a clear isn't cached.
 #[derive(Debug, Default)]
