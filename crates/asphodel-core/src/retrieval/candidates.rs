@@ -218,6 +218,7 @@ fn load(
         valid_from,
         valid_until,
         due_at,
+        observed_at: row.observed_at,
     };
     let tz = TimeZone::get(&row.timezone).unwrap_or(TimeZone::UTC);
     let inputs = loader.inputs(conn, id)?;

@@ -145,6 +145,7 @@ impl StrengthLoader {
                     valid_from: memory.valid_from,
                     valid_until: memory.valid_until,
                     due_at: memory.due_at,
+                    observed_at: memory.observed_at,
                 };
                 let tz = TimeZone::get(&memory.timezone).unwrap_or(TimeZone::UTC);
                 match window.closes_at(&tz) {
@@ -292,9 +293,10 @@ pub(crate) fn window(
     conn: &Connection,
     memory_id: i64,
 ) -> Result<Option<(Window, TimeZone)>, rusqlite::Error> {
-    let (kind, valid_from, valid_until, due_at, timezone) = conn.query_row(
+    let (kind, valid_from, valid_until, due_at, timezone, observed_at) = conn.query_row(
         "SELECT m.kind, m.valid_from, m.valid_from_precision, m.valid_until,
-                m.valid_until_precision, m.due_at, m.due_at_precision, s.timezone
+                m.valid_until_precision, m.due_at, m.due_at_precision, s.timezone,
+                m.observed_at
          FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
          WHERE m.id = ?1",
         [memory_id],
@@ -305,6 +307,7 @@ pub(crate) fn window(
                 world_time(row.get(3)?, row.get(4)?),
                 world_time(row.get(5)?, row.get(6)?),
                 row.get::<_, String>(7)?,
+                timestamp(row.get(8)?),
             ))
         },
     )?;
@@ -315,6 +318,7 @@ pub(crate) fn window(
                 valid_from,
                 valid_until,
                 due_at,
+                observed_at,
             },
             TimeZone::get(&timezone).unwrap_or(TimeZone::UTC),
         )

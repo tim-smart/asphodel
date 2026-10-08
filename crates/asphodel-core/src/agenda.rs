@@ -7,8 +7,9 @@
 //!   tasks due from today to `agenda.horizon_days` ahead, tasks overdue
 //!   since up to `agenda.overdue_days` ago, and recurring memories with a
 //!   period longer than a week whose next occurrence falls in the horizon.
-//!   Both ends are inclusive. They're never gated on τ, so a minor
-//!   appointment can't fade out on the day it matters. In date order, at
+//!   Both ends are inclusive. An event that had begun when it was said is
+//!   a record, not a plan, and isn't listed. They're never gated on τ, so
+//!   a minor appointment can't fade out on the day it matters. In date order, at
 //!   most `agenda.dated_lines`; over the cap, faded items fold into a count
 //!   first, then the least significant, then the furthest from today.
 //! - **Routines**: recurring memories with a period of a week or less, or
@@ -147,7 +148,9 @@ pub(crate) fn build(
         }
         match row.kind {
             Kind::Event => {
-                if let Some(from) = row.valid_from {
+                if let Some(from) = row.valid_from
+                    && row.observed_at < from
+                {
                     let date = local(from);
                     if today <= date && date <= horizon {
                         dated.push(Dated {

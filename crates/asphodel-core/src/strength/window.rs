@@ -66,13 +66,16 @@ pub struct Window {
     pub valid_from: Option<WorldTime>,
     pub valid_until: Option<WorldTime>,
     pub due_at: Option<WorldTime>,
+    /// When it was said. Something that had already started then is never
+    /// upcoming, however its start was dated.
+    pub observed_at: Timestamp,
 }
 
 /// Where a memory sits relative to now. Computed, never stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    /// Before the end of `valid_from`'s unit.
+    /// Before the end of `valid_from`'s unit, and said before it began.
     Upcoming,
     /// An open window, an open task that isn't overdue, or no window.
     Current,
@@ -120,14 +123,18 @@ impl Window {
         })
     }
 
-    /// Upcoming before the end of `valid_from`'s unit, past from
+    /// Upcoming before the end of `valid_from`'s unit when said before it
+    /// began, past from
     /// [`Window::closes_at`], then overdue for a task past
     /// [`Window::overdue_from`], and current otherwise.
     ///
     /// Recently past and long past are labels for rendering and filters.
     /// Ranking works from the days since the close, not from this.
     pub fn phase(&self, tz: &TimeZone, now: Timestamp) -> Phase {
-        if self.valid_from.is_some_and(|from| now < unit_end(from, tz)) {
+        if self
+            .valid_from
+            .is_some_and(|from| self.observed_at < from.at && now < unit_end(from, tz))
+        {
             return Phase::Upcoming;
         }
         if let Some(closes_at) = self.closes_at(tz)

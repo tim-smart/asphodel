@@ -8,6 +8,10 @@ Use `cargo nextest run` to run all tests, not `cargo test`.
 TMPDIR=/dev/shm nix develop -c cargo nextest run
 ```
 
+macOS has no `/dev/shm`. Use a short directory such as `/tmp/ash`: the
+daemon tests listen on Unix sockets, whose paths have a length limit, so a
+long `TMPDIR` makes them time out.
+
 ## Writing tests
 
 Test behavior through public seams only:

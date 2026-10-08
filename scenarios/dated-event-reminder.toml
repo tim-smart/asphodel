@@ -1,6 +1,6 @@
 name = "dated-event-reminder"
 group = "ci"
-description = "A reminder expires when its dated event passes; ordinary overdue and undated tasks stay on the agenda."
+description = "A reminder expires when its dated event passes; ordinary overdue and undated tasks stay on the agenda; an event already under way when said is a record, not an agenda item."
 
 [bank]
 timezone = "UTC"
@@ -35,6 +35,28 @@ kind = "task"
 significance = "minor"
 due_at = { at = "2026-02-10T12:00", precision = "minute" }
 # Omitting valid_until scripts a null end: an ordinary deadline is not an expiry.
+
+[[turn]]
+at = "2026-02-09T10:00:00Z"
+session = "reminders"
+user = "The clinic replied to me. I have a check-up on 11 February."
+assistant = "Noted."
+
+# No stated time, so it's dated to the day it was said.
+[[turn.claim]]
+label = "clinic-replied"
+content = "The clinic replied to Tim."
+quote = "The clinic replied to me"
+kind = "event"
+significance = "minor"
+
+[[turn.claim]]
+label = "check-up"
+content = "Tim has a check-up on 2026-02-11."
+quote = "I have a check-up on 11 February"
+kind = "event"
+significance = "minor"
+valid_from = { at = "2026-02-11", precision = "day" }
 
 [[probe]]
 id = "dated-reminder-before-event"
@@ -71,3 +93,22 @@ id = "ordinary-overdue-task-after-event"
 at = "2026-02-10T14:01:00Z"
 kind = "agenda_has"
 memory = "passport-deadline"
+
+[[probe]]
+id = "same-day-record-not-on-agenda"
+at = "2026-02-09T12:00:00Z"
+kind = "agenda_lacks"
+memory = "clinic-replied"
+
+[[probe]]
+id = "same-day-record-is-current"
+at = "2026-02-09T12:00:00Z"
+kind = "exists"
+memory = "clinic-replied"
+phase = "current"
+
+[[probe]]
+id = "event-said-ahead-on-agenda"
+at = "2026-02-09T12:00:00Z"
+kind = "agenda_has"
+memory = "check-up"
