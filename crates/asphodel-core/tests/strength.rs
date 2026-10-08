@@ -741,6 +741,60 @@ fn only_a_mention_or_a_confirmation_renews_a_stale_states_rank() {
 }
 
 #[test]
+fn retrospective_tasks_lose_the_overdue_guard_but_keep_strength_based_retention() {
+    // Keep the overdue window open long enough for all three trivial
+    // tasks to fade below the purge line. Only the pre-due task is guarded.
+    let h = Harness::new("[agenda]\noverdue_days = 300\n");
+    let task =
+        |text: &str| trivial("task", text).with("due_at", local("2026-01-05T09:01", "minute"));
+    let eligible = h.says(
+        t0() + SignedDuration::from_secs(59),
+        task("Tim needs to renew his passport."),
+    );
+    let equal = h.says(
+        t0() + SignedDuration::from_secs(60),
+        task("Tim needs to file the tax return."),
+    );
+    let late = h.says(
+        t0() + SignedDuration::from_secs(61),
+        task("Tim needs to fix the bike."),
+    );
+
+    h.set(at(1.0));
+    for memory in [equal, late] {
+        assert_eq!(h.show(memory).purge.guards, [Guard::Strength]);
+        assert_eq!(h.service.purge_chain(BANK, memory).unwrap(), None);
+    }
+    assert!(h.service.purge_candidates().unwrap().is_empty());
+
+    h.set(at(180.0));
+    assert_eq!(
+        h.show(eligible).purge.guards,
+        [Guard::OverdueTask {
+            until: ts("2026-11-01T09:02:00Z")
+        }]
+    );
+    assert_eq!(h.service.purge_chain(BANK, eligible).unwrap(), None);
+    let candidates: BTreeSet<Uuid> = h
+        .service
+        .purge_candidates()
+        .unwrap()
+        .into_iter()
+        .map(|(_, head)| head)
+        .collect();
+    assert_eq!(candidates, BTreeSet::from([equal, late]));
+    for memory in [equal, late] {
+        assert!(h.show(memory).purge.eligible_now);
+        let erased = h
+            .service
+            .purge_chain(BANK, memory)
+            .unwrap()
+            .expect("faded retrospective task is purgeable");
+        assert_eq!(erased.memories, BTreeSet::from([memory]));
+    }
+}
+
+#[test]
 fn purge_waits_below_its_line_for_dates_still_ahead_and_overdue_tasks() {
     // Every memory here is trivial and said once in January, so by July
     // each head is far below τ − δ and only its dates can hold it back.
