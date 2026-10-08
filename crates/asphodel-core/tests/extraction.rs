@@ -39,7 +39,7 @@ use asphodel_core::queue::{Failure, Lease, SourceKind};
 use asphodel_core::store::bank::BankIdentity;
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::strength::TimePrecision::{self, Day, Hour, Minute, Month, Year};
-use asphodel_core::strength::WorldTime;
+use asphodel_core::strength::{Phase, WorldTime};
 use jiff::civil::{Date, DateTime, date};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
@@ -150,11 +150,26 @@ impl Harness {
         Self::build(Some(Models::fake()), false, extra)
     }
 
+    /// [`Harness::new`] with the clock stopped at `start` rather than
+    /// [`START`], for a date the clock can't move back to.
+    fn starting_at(start: &str) -> Self {
+        Self::build_at(at(start), Some(Models::fake()), false, "")
+    }
+
     /// `None` is a service built without models, as `Service::open` gives.
     /// `deterministic_ids` is replay's store option.
     fn build(models: Option<Models>, deterministic_ids: bool, extra: &str) -> Self {
+        Self::build_at(at(START), models, deterministic_ids, extra)
+    }
+
+    fn build_at(
+        start: Timestamp,
+        models: Option<Models>,
+        deterministic_ids: bool,
+        extra: &str,
+    ) -> Self {
         let dir = TestDir::new();
-        let clock = Arc::new(SimulatedClock::new(at(START)));
+        let clock = Arc::new(SimulatedClock::new(start));
         let options = OpenOptions {
             deterministic_ids,
             ..OpenOptions::default()
@@ -1134,6 +1149,38 @@ fn an_upcoming_occasion_beyond_the_horizon_reaches_call_1_across_sessions() {
             (true, true),
             OccasionDisposition::Grounded
         )]
+    );
+
+    // A coarse start stays upcoming until its unit ends, and a calendar
+    // year can outlast 366 days: San Luis began 2008 on UTC-2 and ended it
+    // on UTC-3, so its 2008 runs until 03:00 UTC on 1 January 2009.
+    let h = Harness::starting_at("2007-12-01T13:00:00Z");
+    let in_san_luis = |session: &str, message_at: &str, user: &str| Turn {
+        timezone: Some("America/Argentina/San_Luis".into()),
+        ..turn(session, message_at, user, "Noted.")
+    };
+    let reunion = "There's a family reunion in 2008.";
+    h.ingest(&in_san_luis("s1", "2007-12-01T12:00:00Z", reunion));
+    let reunion = extract(
+        &h,
+        vec![said("event", reunion).at("valid_from", "2008", "year")],
+    )
+    .memories[0];
+    h.clock.set(at("2009-01-01T02:30:00Z"));
+    assert_eq!(h.memory(reunion).phase, Some(Phase::Upcoming));
+    let current = h.ingest(&in_san_luis(
+        "s2",
+        "2009-01-01T02:29:00Z",
+        "I need a gift for the reunion.",
+    ));
+    let input = input_for(&h, current.source, &[]);
+    assert_eq!(
+        input
+            .upcoming
+            .iter()
+            .map(|event| event.memory)
+            .collect::<Vec<_>>(),
+        vec![reunion]
     );
 }
 

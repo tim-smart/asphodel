@@ -608,9 +608,11 @@ fn strongest_memories(
         .collect())
 }
 
-/// The longest unit a time can have. An event whose start is further back
-/// than this has begun, whatever its precision.
-const LONGEST_UNIT: SignedDuration = SignedDuration::from_hours(24 * 366);
+/// Conservative SQL lookback for the longest precision unit (a calendar year).
+/// A leap year spans 366 local days, but an offset rollback can make it longer
+/// in UTC. Two extra days cover timezone changes, including historical
+/// date-line shifts. The exact phase check below remains authoritative.
+const LONGEST_UNIT: SignedDuration = SignedDuration::from_hours(24 * 368);
 
 /// Up to [`UPCOMING_EVENTS`] of the bank's current events that are
 /// upcoming now ([`Phase::Upcoming`], as the agenda has them) and haven't
