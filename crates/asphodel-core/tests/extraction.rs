@@ -23,7 +23,7 @@ use asphodel_core::config::Tuning;
 use asphodel_core::entities::MergeRequest;
 use asphodel_core::extraction::{
     CANDIDATE_MEMORIES, CONTEXT_CHARS, CONTEXT_TURNS, Call1Input, DropReason, Dropped,
-    ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, Extracted,
+    ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, Extracted, UPCOMING_EVENTS,
 };
 use asphodel_core::ingest::{Document, Ingested, TURN_SEPARATOR, Turn, TurnAuthor};
 use asphodel_core::inspect::{
@@ -1019,6 +1019,160 @@ fn a_candidates_examples_are_its_strongest_visible_memories() {
 }
 
 #[test]
+fn an_upcoming_occasion_beyond_the_horizon_reaches_call_1_across_sessions() {
+    let h = Harness::new();
+    let wedding = "Sam's wedding is on 22 October 2026.";
+    let occasion = golden(
+        &h,
+        wedding,
+        "Noted.",
+        vec![said("event", wedding).at("valid_from", "2026-10-22", "day")],
+    )[0];
+    let before = h.memory(occasion).accesses;
+
+    for n in 0..CONTEXT_TURNS + 1 {
+        h.say(
+            &format!("2026-10-01T06:{:02}:00Z", 31 + n),
+            &format!("Unrelated turn {n}."),
+            "OK.",
+        );
+    }
+    let current = h.say(
+        "2026-10-01T06:45:00Z",
+        "I need a gift for the wedding.",
+        "OK.",
+    );
+    let same_session = input_for(&h, current.source, &[]);
+    assert_eq!(same_session.context.len(), CONTEXT_TURNS);
+    assert!(
+        same_session
+            .context
+            .iter()
+            .all(|text| !text.contains(wedding))
+    );
+    assert!(same_session.in_context.is_empty());
+    assert_eq!(same_session.upcoming.len(), 1);
+    assert_eq!(same_session.upcoming[0].memory, occasion);
+    assert_eq!(same_session.upcoming[0].content, wedding);
+
+    let later = h.ingest(&turn(
+        "s2",
+        "2026-10-01T06:50:00Z",
+        "I still need a gift for the wedding.",
+        "OK.",
+    ));
+    let other_session = input_for(&h, later.source, &[]);
+    assert!(other_session.context.is_empty());
+    assert!(other_session.in_context.is_empty());
+    assert_eq!(other_session.upcoming.len(), 1);
+    assert_eq!(other_session.upcoming[0].memory, occasion);
+    assert_eq!(other_session.upcoming[0].content, wedding);
+    assert_eq!(
+        h.memory(occasion).accesses,
+        before,
+        "grounding is not a use"
+    );
+}
+
+#[test]
+fn upcoming_grounding_excludes_ended_hidden_and_non_event_memories() {
+    let h = Harness::new();
+    let rows = vec![
+        said("event", "The wedding is on 22 October 2026.").at("valid_from", "2026-10-22", "day"),
+        said("event", "The concert was on 20 September 2026.").at(
+            "valid_from",
+            "2026-09-20",
+            "day",
+        ),
+        said(
+            "event",
+            "The trip started on 30 September and ends on 30 October 2026.",
+        )
+        .at("valid_from", "2026-09-30", "day")
+        .at("valid_until", "2026-10-30", "day"),
+        said("event", "The exhibition ran from 20 to 25 September 2026.")
+            .at("valid_from", "2026-09-20", "day")
+            .at("valid_until", "2026-09-25", "day"),
+        said("event", "The forgotten appointment is on 10 October 2026.").at(
+            "valid_from",
+            "2026-10-10",
+            "day",
+        ),
+        said("event", "The retracted appointment is on 11 October 2026.").at(
+            "valid_from",
+            "2026-10-11",
+            "day",
+        ),
+        said("task", "I need a gift for an undated occasion."),
+        said("event", "There is an undated party."),
+        said("task", "Renew my passport by 12 October 2026.").at("due_at", "2026-10-12", "day"),
+        said("fact", "My new job starts on 13 October 2026.").at("valid_from", "2026-10-13", "day"),
+    ];
+    let memories = golden(&h, &saying(&rows), "Noted.", rows);
+    forget(&h, memories[4]);
+    h.service.retract("main", &memories[5].to_string()).unwrap();
+    told(
+        &h,
+        "other",
+        "The other bank's wedding is on 9 October 2026.",
+        |_| {
+            vec![
+                said("event", "The other bank's wedding is on 9 October 2026.").at(
+                    "valid_from",
+                    "2026-10-09",
+                    "day",
+                ),
+            ]
+        },
+    );
+    let current = h.say("2026-10-01T06:45:00Z", "I need a gift.", "OK.");
+    let input = input_for(&h, current.source, &[]);
+    assert_eq!(input.upcoming.len(), 1);
+    assert_eq!(input.upcoming[0].memory, memories[0]);
+    assert_eq!(
+        input.upcoming[0].content,
+        "The wedding is on 22 October 2026."
+    );
+    assert_eq!(h.memory(memories[6]).window.valid_until, None);
+}
+
+#[test]
+fn upcoming_grounding_is_capped_at_the_nearest_occasions() {
+    let h = Harness::new();
+    // Store furthest first so insertion order cannot satisfy nearest-first.
+    let rows: Vec<Value> = (0..=UPCOMING_EVENTS)
+        .rev()
+        .map(|n| {
+            let date = date(2026, 10, 15)
+                .checked_add(jiff::Span::new().days(n as i64))
+                .unwrap();
+            said("event", &format!("Occasion {n} is on {date}.")).at(
+                "valid_from",
+                &date.to_string(),
+                "day",
+            )
+        })
+        .collect();
+    let memories = golden(&h, &saying(&rows), "Noted.", rows);
+    let current = h.say("2026-10-01T06:45:00Z", "I need a gift.", "OK.");
+    let input = input_for(&h, current.source, &[]);
+    let expected: Vec<Uuid> = memories
+        .iter()
+        .rev()
+        .take(UPCOMING_EVENTS)
+        .copied()
+        .collect();
+    assert_eq!(
+        input
+            .upcoming
+            .iter()
+            .map(|event| event.memory)
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
 fn only_the_banks_visible_in_context_memories_are_given() {
     let h = Harness::new();
     let tea = remember(&h, "main", "Tim likes tea.");
@@ -1026,12 +1180,30 @@ fn only_the_banks_visible_in_context_memories_are_given() {
     forget(&h, address);
     let elsewhere = remember(&h, "other", "Tim likes coffee.");
     let unknown = Uuid::from_u128(1);
+    let occasion = told(&h, "main", "The wedding is on 22 October 2026.", |_| {
+        vec![said("event", "The wedding is on 22 October 2026.").at(
+            "valid_from",
+            "2026-10-22",
+            "day",
+        )]
+    })
+    .memories[0];
     let current = h.say(T1, "Tea?", "You like tea, so yes.");
 
     let input = input_for(&h, current.source, &[tea, address, elsewhere, unknown]);
     assert_eq!(input.in_context.len(), 1);
     assert_eq!(input.in_context[0].memory, tea);
     assert_eq!(input.in_context[0].content, "Tim likes tea.");
+
+    let current = h.say("2026-10-01T06:45:00Z", "A wedding gift?", "OK.");
+    let input = input_for(&h, current.source, &[occasion]);
+    assert_eq!(input.in_context.len(), 1);
+    assert_eq!(input.in_context[0].memory, occasion);
+    memory_handle(&input, occasion);
+    assert!(
+        input.upcoming.is_empty(),
+        "in-context occasions are not repeated"
+    );
 }
 
 #[test]
@@ -1039,6 +1211,14 @@ fn the_request_carries_the_input() {
     let h = Harness::new();
     let ana = entities(&h, "main", &["Ana"])[0];
     let tea = remember(&h, "main", "Tim likes tea.");
+    let occasion = told(&h, "main", "The wedding is on 22 October 2026.", |_| {
+        vec![said("event", "The wedding is on 22 October 2026.").at(
+            "valid_from",
+            "2026-10-22",
+            "day",
+        )]
+    })
+    .memories[0];
     h.say("2026-10-01T06:00:00Z", "Morning.", "Morning, Tim.");
     let current = h.say(T1, "Ana wants tea.", "I'll put the kettle on.");
 
@@ -1061,6 +1241,11 @@ fn the_request_carries_the_input() {
     }
     assert!(prompt.contains(&memory_handle(&input, tea)));
     assert!(prompt.contains("Tim likes tea."));
+    assert_eq!(input.upcoming.len(), 1);
+    assert_eq!(input.upcoming[0].memory, occasion);
+    for event in &input.upcoming {
+        assert!(prompt.contains(&event.content));
+    }
 }
 
 /// `[extraction] guidance` as it might be written, padded, and the text
