@@ -731,6 +731,20 @@ async function memory(ctx) {
   };
 }
 
+/// A narrow screen restyles a stacked table's rows as cards, and some
+/// browsers then stop treating it as a table. Explicit roles keep each cell
+/// tied to its column header for assistive technology. Returns `el`.
+function tableRoles(el) {
+  for (const table of el.querySelectorAll("table")) {
+    table.setAttribute("role", "table");
+    for (const group of table.querySelectorAll("thead, tbody")) group.setAttribute("role", "rowgroup");
+    for (const row of table.querySelectorAll("tr")) row.setAttribute("role", "row");
+    for (const head of table.querySelectorAll("th")) head.setAttribute("role", "columnheader");
+    for (const cell of table.querySelectorAll("td")) cell.setAttribute("role", "cell");
+  }
+  return el;
+}
+
 /// A chunk's headings, stored as a JSON array, as "Home › Garden".
 function headingPath(path) {
   if (!path) return null;
@@ -1108,7 +1122,7 @@ async function chunks(ctx) {
             h(
               "table",
               { class: "stack-table" },
-              h("thead", {}, h("tr", {}, ["Error", "Attempts", "Failed", "Source", ""].map((c) => h("th", { scope: "col" }, c)))),
+              h("thead", {}, h("tr", {}, ["Error", "Attempts", "Failed", "Source"].map((c) => h("th", { scope: "col" }, c)), h("th", { scope: "col" }, h("span", { class: "visually-hidden" }, "Action")))),
               h(
                 "tbody",
                 {},
@@ -1127,7 +1141,7 @@ async function chunks(ctx) {
             ),
           ),
         ]
-      : h("p", { class: "empty" }, "No failed chunks. Everything extracted cleanly."),
+      : h("p", { class: "empty" }, "No failed chunks."),
   );
 
   const queued = h(
@@ -1162,7 +1176,7 @@ async function chunks(ctx) {
       : h("p", { class: "empty" }, "Nothing waiting. New turns and documents are extracted as they arrive."),
   );
 
-  return { title: `Ingestion · ${bank}`, content: [heading(h, "Ingestion"), failed, queued] };
+  return { title: `Ingestion · ${bank}`, content: [heading(h, "Ingestion"), tableRoles(failed), tableRoles(queued)] };
 }
 
 // The Recall page: one query through recall or injection, with the working
@@ -1521,7 +1535,7 @@ function explainResults(ctx, explained, sent, timeZone) {
 
   const reasons = { injection, limit };
   const table = (rows, { left }) =>
-    h(
+    tableRoles(h(
       "div",
       { class: "table-wrap" },
       h(
@@ -1540,7 +1554,7 @@ function explainResults(ctx, explained, sent, timeZone) {
         ),
         h("tbody", {}, rows.map((c) => candidateRow(ctx, c, left ? cutReason(c.reason, reasons) : null))),
       ),
-    );
+    ));
 
   // With nothing injected, the injected text already says so.
   const madeIt =

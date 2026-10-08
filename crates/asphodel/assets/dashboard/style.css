@@ -277,6 +277,16 @@ label {
   color: var(--ink-3);
 }
 
+/* Read by assistive technology, not shown. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 .noscript {
   max-width: 40rem;
   margin: 4rem auto;
@@ -1880,10 +1890,22 @@ dialog.confirm h2 {
   }
 
   /* Each row as a stacked card, so nothing (a candidate's reason, a failed
-     chunk's source) scrolls out of sight. */
+     chunk's source) scrolls out of sight. The header row is hidden from
+     view only: screen readers still announce each cell's column, and the
+     data-label above each cell says the same on screen. */
+  .explain-table,
+  .stack-table {
+    position: relative;
+  }
+
   .explain-table thead,
   .stack-table thead {
-    display: none;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 
   .explain-table tr,
@@ -1905,6 +1927,9 @@ dialog.confirm h2 {
   .explain-table td::before,
   .stack-table td[data-label]::before {
     content: attr(data-label);
+    /* Empty alt text: the column header already names the cell. Browsers
+       without the syntax keep the line above. */
+    content: attr(data-label) / "";
     display: block;
     font: 650 0.68rem/1.4 var(--sans);
     letter-spacing: 0.05em;
