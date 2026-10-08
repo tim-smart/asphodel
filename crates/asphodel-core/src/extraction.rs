@@ -8,9 +8,11 @@
 //!    text before a document chunk), the reference date and a calendar strip
 //!    in the source's timezone, the speaker, the entity candidates found
 //!    through the alias FTS, the in-context memories, and for a turn the
-//!    bank's nearest upcoming events. Memories cited by the session's
-//!    prompt block are shown under their own handles, never as a copy of
-//!    the block's prose; `used` credits the memory the reply relied on.
+//!    bank's nearest upcoming events as occasions. Memories cited by the
+//!    session's prompt block are shown under their own handles, never as a
+//!    copy of the block's prose; `used` credits the memory the reply relied
+//!    on. A task names the occasion it's for by handle, and code copies the
+//!    occasion's start into whichever of its end and due date it left out.
 //! 2. **Call 1.** One structured-output call ([`call1_request`]) returns the
 //!    claims and the `used` verdicts.
 //! 3. **Checks in code.** A claim whose quote isn't in the chunk is dropped.
@@ -63,6 +65,7 @@ use crate::config::Tuning;
 use crate::models::{Embedder, LlmClient, LlmError, ModelError};
 use crate::queue::{self, ChunkError, Failure, Lease, Leases, QueueError, SourceKind};
 use crate::store::{Store, StoreError, VectorIndex};
+use crate::strength::WorldTime;
 
 pub use call2::call2_request;
 pub(crate) use input::{entities_named, phrase, survivor};
@@ -70,7 +73,7 @@ pub use prompt::call1_request;
 
 /// Call 1's template name and version, which replay's cassette keys include.
 pub const CALL1_TEMPLATE: &str = "extract_claims";
-pub const CALL1_VERSION: u32 = 15;
+pub const CALL1_VERSION: u32 = 16;
 
 /// The hash call 1's template carries for `[extraction] guidance`:
 /// lower-case hex SHA-256 of the text as the prompt inserts it, trimmed.
@@ -178,10 +181,11 @@ pub struct Call1Input {
     /// for a document, which has no reply to have used anything.
     pub in_context: Vec<InContextMemory>,
     /// Up to [`UPCOMING_EVENTS`] of the bank's events that are still
-    /// upcoming, from any session, nearest first, leaving out any already
-    /// in context. They ground a task's window on a dated occasion the
-    /// current text only names. They have no handles, so the reply can't
-    /// credit them `used`. Always empty for a document.
+    /// upcoming, from any session, nearest first, with handles `o1`, `o2`,
+    /// …. One in context is listed here too. A task claim names the one it's
+    /// for in `occasion`, and code dates the task from it. The handles are
+    /// only for that, so the reply can't credit an occasion `used`. Always
+    /// empty for a document.
     pub upcoming: Vec<UpcomingEvent>,
     /// `[llm] language`: the language every claim is written in. `None`
     /// writes each in the language of the passage it quotes.
@@ -263,8 +267,69 @@ pub struct InContextMemory {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpcomingEvent {
+    pub handle: String,
     pub memory: Uuid,
     pub content: String,
+    /// The event's start, as stored: the instant at the start of its unit
+    /// in its own source's timezone, and its precision.
+    pub at: WorldTime,
+    /// The event's window confidence is low.
+    pub low_confidence: bool,
+}
+
+/// A claim whose reply named an occasion, and what came of it. One per
+/// non-null `occasion` in the reply that committed, dropped claims
+/// included. Ids only, never content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OccasionRef {
+    /// The claim's index in call 1's reply.
+    pub claim: usize,
+    /// The occasion the handle names. `None` for a handle call 1 wasn't
+    /// given.
+    pub occasion: Option<Uuid>,
+    /// The memory the claim wrote. `None` when it was dropped or absorbed.
+    pub memory: Option<Uuid>,
+    /// Which fields the checks copied from the occasion, even when
+    /// insertion later replaced the end.
+    pub filled: OccasionFilled,
+    pub disposition: OccasionDisposition,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct OccasionFilled {
+    pub valid_until: bool,
+    pub due_at: bool,
+}
+
+/// What a reference came to, at commit. Exclusive, decided in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OccasionDisposition {
+    /// The reference wasn't used.
+    Ignored(IgnoredOccasion),
+    /// An accepted reference whose claim wrote no memory.
+    Absorbed,
+    /// Code copied the end, but the written memory's end isn't that
+    /// instant and precision: a newer memory ended the older claim.
+    Overridden,
+    /// Code copied the end and the written memory keeps it.
+    Grounded,
+    /// Code copied only the due date.
+    DueOnly,
+    /// The claim gave both fields itself, valid or not.
+    Explicit,
+}
+
+/// Why a reference wasn't used, the first that applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IgnoredOccasion {
+    /// The claim failed the checks.
+    Dropped,
+    /// Only a task is dated from an occasion.
+    NotATask,
+    /// A handle call 1 wasn't given.
+    UnknownHandle,
 }
 
 /// What a claim does to a neighbour (CONTEXT.md "Reconciliation").
@@ -380,6 +445,8 @@ pub struct Extracted {
     /// Refinements between kinds that can't be versions of each other, in
     /// label order, and whether `reconcile.kind_guard` rejected each.
     pub kind_mismatches: Vec<KindMismatch>,
+    /// The reply's occasion references, in claim order.
+    pub occasions: Vec<OccasionRef>,
 }
 
 /// What made reconciliation treat a claim as a refinement of a neighbour.

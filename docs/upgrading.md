@@ -1,5 +1,24 @@
 # Upgrading
 
+## Call 1 version 16: tasks name the occasion they're for
+
+Call 1 is now shown the bank's nearest upcoming events, from any session,
+with handles `o1`, `o2`, …, including any already in context. A task that
+is clearly for one of them and pointless once it has passed names it in
+a new `occasion` field, and code copies the event's start into whichever
+of the task's end and due date call 1 left out. A date call 1 gave wins,
+even one that doesn't parse. No schema migration is needed, and nothing
+stored changes until new turns are extracted.
+
+The start is copied as stored, the same instant and precision, and the
+task keeps its own timezone. For a task said in another timezone than its
+occasion, a day, month or year is counted in each memory's own zone, so a
+coarse task can end days earlier or later than its occasion.
+
+Replay: the version bump means `fast` re-extracts every call 1 and
+`replay` misses on cassettes recorded before it. Reports and aggregates
+gain `occasion_refs`, and reports `occasion_ref_rows` (`docs/replay.md`).
+
 ## Notable memories last about 100 days
 
 The default `strength.significance.notable` drops from 0.5 to 0.31. With

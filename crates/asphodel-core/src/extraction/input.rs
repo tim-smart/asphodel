@@ -10,6 +10,7 @@ use rusqlite::{Connection, OptionalExtension};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+use super::claims::{Precision, Stamp};
 use super::{
     CALENDAR_DAYS, CANDIDATE_MEMORIES, CONTEXT_CHARS, CONTEXT_TURNS, Call1Input, Candidate,
     ContextTurnTime, ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, InContextMemory,
@@ -51,6 +52,18 @@ pub(super) struct Unit {
     pub candidates: BTreeMap<String, i64>,
     /// In-context handle to memory rowid and public id.
     pub in_context: BTreeMap<String, (i64, Uuid)>,
+    /// Occasion handle to the occasion a task can be dated from.
+    pub occasions: BTreeMap<String, Occasion>,
+}
+
+/// An upcoming event a task can name by handle.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Occasion {
+    pub memory: Uuid,
+    /// Its start, copied verbatim into a task: the same instant and
+    /// precision, never converted to the task's timezone.
+    pub at: Stamp,
+    pub low_confidence: bool,
 }
 
 impl Unit {
@@ -220,11 +233,22 @@ pub(super) fn assemble(
     }
 
     let upcoming = if is_turn {
-        let shown: BTreeSet<Uuid> = in_context_memories.iter().map(|m| m.memory).collect();
-        upcoming_events(conn, bank_id, now, &shown)?
+        upcoming_events(conn, bank_id, now)?
     } else {
         Vec::new()
     };
+    let occasions = upcoming
+        .iter()
+        .map(|(event, at)| {
+            let occasion = Occasion {
+                memory: event.memory,
+                at: *at,
+                low_confidence: event.low_confidence,
+            };
+            (event.handle.clone(), occasion)
+        })
+        .collect();
+    let upcoming = upcoming.into_iter().map(|(event, _)| event).collect();
 
     let turn = turn_number(conn, bank_id, source.source_id, is_turn)?;
     let entity_boundary: i64 =
@@ -246,6 +270,7 @@ pub(super) fn assemble(
         owner_speaking: speaker_ref.as_ref().is_some_and(|speaker| speaker.owner),
         candidates: handles,
         in_context: in_context_handles,
+        occasions,
     };
     let input = Call1Input {
         chunk: source.chunk,
@@ -616,19 +641,19 @@ const LONGEST_UNIT: SignedDuration = SignedDuration::from_hours(24 * 368);
 
 /// Up to [`UPCOMING_EVENTS`] of the bank's current events that are
 /// upcoming now ([`Phase::Upcoming`], as the agenda has them) and haven't
-/// ended, nearest first, leaving out `shown`. Bank-wide, so an occasion
-/// dated in another session grounds a task in this one. No τ gate, as on
-/// the agenda, and reads only: grounding isn't a use.
+/// ended, nearest first, with handles `o1`, `o2`, … and their starts.
+/// Bank-wide, so an occasion dated in another session grounds a task in
+/// this one, and in context or not, since a task can name it either way.
+/// No τ gate, as on the agenda, and reads only: grounding isn't a use.
 fn upcoming_events(
     conn: &Connection,
     bank_id: i64,
     now: Timestamp,
-    shown: &BTreeSet<Uuid>,
-) -> Result<Vec<UpcomingEvent>, rusqlite::Error> {
+) -> Result<Vec<(UpcomingEvent, Stamp)>, rusqlite::Error> {
     let since = now.checked_sub(LONGEST_UNIT).unwrap_or(Timestamp::MIN);
     let mut statement = conn.prepare_cached(
         "SELECT m.uuid, m.content, m.valid_from, m.valid_from_precision, m.valid_until,
-                m.valid_until_precision, m.observed_at, s.timezone
+                m.valid_until_precision, m.observed_at, s.timezone, m.window_confidence
          FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
          WHERE m.bank_id = ?1 AND m.kind = 'event' AND m.valid_from >= ?2
            AND m.invalidated_at IS NULL AND m.hidden_at IS NULL
@@ -640,23 +665,34 @@ fn upcoming_events(
     while upcoming.len() < UPCOMING_EVENTS
         && let Some(row) = rows.next()?
     {
-        let memory = parse_uuid(&row.get::<_, String>(0)?);
-        if shown.contains(&memory) {
-            continue;
-        }
+        let from_precision: Option<String> = row.get(3)?;
         let window = Window {
             kind: Kind::Event,
-            valid_from: world_time(row.get(2)?, row.get(3)?),
+            valid_from: world_time(row.get(2)?, from_precision.clone()),
             valid_until: world_time(row.get(4)?, row.get(5)?),
             due_at: None,
             observed_at: timestamp(row.get(6)?),
         };
         let tz = TimeZone::get(&row.get::<_, String>(7)?).unwrap_or(TimeZone::UTC);
+        let (Some(from), Some(precision)) = (
+            window.valid_from,
+            from_precision.as_deref().and_then(Precision::parse),
+        ) else {
+            continue;
+        };
         if window.phase(&tz, now) == Phase::Upcoming && !has_ended(window.valid_until, &tz, now) {
-            upcoming.push(UpcomingEvent {
-                memory,
+            let event = UpcomingEvent {
+                handle: format!("o{}", upcoming.len() + 1),
+                memory: parse_uuid(&row.get::<_, String>(0)?),
                 content: row.get(1)?,
-            });
+                at: from,
+                low_confidence: row.get::<_, String>(8)? == "low",
+            };
+            let at = Stamp {
+                at: from.at,
+                precision,
+            };
+            upcoming.push((event, at));
         }
     }
     Ok(upcoming)

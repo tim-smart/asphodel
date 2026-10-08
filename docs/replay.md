@@ -674,8 +674,9 @@ asphodel replay --corpus <file> --mode live|replay|fast \
 
   It's an approximation, the one `fast` already makes by reusing claims
   by chunk. A primed call 1 is shown no in-context memories, upcoming
-  occasions or prompt block text, and its candidates are only the
-  entities ingestion makes, with no memories linked, where a serial run's are what the
+  occasions or prompt block text, so its claims name no occasion, and
+  its candidates are only the entities ingestion makes, with no memories
+  linked, where a serial run's are what the
   store holds at the claim. Its reply has no `used` verdicts to reuse,
   so each pair is judged by a top-up when the simulation first meets
   it. The report marks a primed run with `flags.prime_concurrency`, null
@@ -737,6 +738,21 @@ Reports and aggregates also carry `restatements.written`: the
 restatements the run wrote, one per absorbed newer claim and memory it was
 credited to (CONTEXT.md, "Restatement"). It sits beside `call2_rate`, and
 `report diff` compares it. A run before schema version 19 has no such key.
+
+Reports and aggregates also carry `occasion_refs`: the `occasion`
+references in the call 1 replies that committed, counted once per chunk
+however often it was reconciled again. `given` counts every non-null
+`occasion`, dropped claims included, and the dispositions sum to it:
+`grounded` (code copied the end and the written memory keeps it),
+`due_only` (code copied only the due date), `explicit` (the claim gave both
+fields itself), `overridden` (code copied the end, but a newer memory ended
+the older claim elsewhere), `absorbed` (an accepted reference whose claim
+wrote no memory) and `ignored` (a dropped claim, a claim that isn't a task,
+or a handle call 1 wasn't given). The report also lists each reference in
+`occasion_ref_rows`: the chunk, the claim's index, the occasion and the
+memory written (ids, either null), which of `valid_until` and `due_at` code
+`filled`, and the `disposition`. The rows stay in the report; `report diff`
+compares the counts.
 
 Reports and aggregates also carry `injection_usage`: per-memory counts
 `used`, `not_used`, `unjudged` (verdict source `none`), and

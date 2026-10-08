@@ -89,7 +89,7 @@ Most claims are trivial or minor. Major is rare; critical is a few per hundred c
 
 # Time
 
-Resolve relative times in the current text using its reference date, calendar and timezone. Earlier context turns carry their own local date/time and timezone: resolve relative times in a context passage against that passage's date, never the current text's date. If a claim refers to a dated occasion in relevant context or supplied memories, use that occasion to ground its window, while still quoting only the current text. Do not infer a date for an undated occasion. Return times in the current text's timezone, converting a context occasion's time from its own timezone when needed. Each time has `at` (`YYYY`, `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`) and `precision` (`year`, `month`, `day`, `hour` or `minute`). Match the text's precision: "in March 2024" is `{"at": "2024-03", "precision": "month"}`; "tomorrow at 3pm" specifies a day and hour.
+Resolve relative times in the current text using its reference date, calendar and timezone. Earlier context turns carry their own local date/time and timezone: resolve relative times in a context passage against that passage's date, never the current text's date. Upcoming occasions have handles (`o1`, `o2`, ...). Put a listed occasion's handle in a task's `occasion` only when the task is clearly for that one occasion and becomes pointless once it has passed; its dates are then filled in for you. Anything that still needs doing after the occasion has passed keeps `occasion` null. Leave `occasion` null for every other claim, for a task whose occasion is not listed, and when more than one listed occasion could be the one meant. Being the only occasion listed is not evidence that a task is for it. If a claim refers to a dated occasion in a context passage, use that passage's date to ground its window, while still quoting only the current text. Do not infer a date for an undated occasion. Return times in the current text's timezone, converting a context occasion's time from its own timezone when needed. Each time has `at` (`YYYY`, `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`) and `precision` (`year`, `month`, `day`, `hour` or `minute`). Match the text's precision: "in March 2024" is `{"at": "2024-03", "precision": "month"}`; "tomorrow at 3pm" specifies a day and hour.
 
 - `valid_from` is when the claim starts to hold; `valid_until` is when it stops. Set `valid_until` only for an explicit end or a task tied to a dated occasion, as below. Facts never have `valid_until`, but keep any stated start ("started at Acme in March 2024").
 - The time something was said, sent or learned is not when its content started to hold. In ordinary reported speech as well as written messages, attach such a date only to a retained report/message event, not to the underlying fact or its `valid_from`. "My doctor told me today I am allergic to penicillin" supports the allergy, not an allergy starting today. Keep a start date only when the text states the fact itself began then; preserve any substantive qualification without adding the reporting occasion.
@@ -107,7 +107,7 @@ Link each claim to the entities it is about. Known entities have handles (`e1`, 
 
 # Used
 
-Context memories have handles (`m1`, `m2`, ...). In `used_injected_ids`, return only the handles of memories the assistant's reply actually relied on. Being shown a memory is not using it. Return an empty list for documents, which have no reply."#;
+Context memories have handles (`m1`, `m2`, ...). In `used_injected_ids`, return only the handles of memories the assistant's reply actually relied on. Being shown a memory is not using it. Return an empty list for documents, which have no reply. Occasion handles (`o1`, `o2`, ...) are only for `occasion`; never put them in `used_injected_ids`."#;
 
 /// The language rule without `[llm] language`.
 const INFERRED_LANGUAGE: &str = "Write the claim in the language of the passage it quotes and never translate. Entity names and dates stay as they appear.";
@@ -218,9 +218,11 @@ fn render(input: &Call1Input) -> String {
     }
 
     if !input.upcoming.is_empty() {
-        out.push_str("\nUpcoming occasions already remembered, for grounding dates only. Never quote from them:\n");
+        out.push_str(
+            "\nUpcoming occasions. Use a handle only in a task's `occasion`. Never quote from them:\n",
+        );
         for event in &input.upcoming {
-            let _ = writeln!(out, "- {}", event.content);
+            let _ = writeln!(out, "- {}: {}", event.handle, event.content);
         }
     }
 
@@ -321,11 +323,13 @@ fn schema() -> Value {
             "recurrence_rrule": nullable_string(),
             "recurrence_start": time(),
             "entities": {"type": "array", "items": link},
+            "occasion": nullable_string(),
         },
         "required": [
             "content", "kind", "quote", "significance", "remember_this", "changes_something",
             "valid_from", "valid_until", "window_confidence", "until_event", "due_at",
             "volatility", "recurrence_text", "recurrence_rrule", "recurrence_start", "entities",
+            "occasion",
         ],
         "additionalProperties": false,
     });

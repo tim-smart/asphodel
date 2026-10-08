@@ -36,6 +36,7 @@ const SECTIONS: &[(&str, &str)] = &[
     ("injected_tokens", "Injected tokens"),
     ("profile_tokens", "Profile tokens"),
     ("call1_input", "Call 1 input sizes"),
+    ("occasion_refs", "Occasion references"),
     ("extraction_lag", "Extraction lag"),
     ("call2_rate", "Call 2 rate"),
     ("restatements", "Restatements"),

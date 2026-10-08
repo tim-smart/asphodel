@@ -12,6 +12,7 @@ use super::reconcile::{Edit, Fate, Neighbour, Plan, Restated, end_at};
 use super::{
     CALL2_VERSION, Call1Input, EDIT_END_CLEARED, EDIT_END_REPOINTED, EDIT_ENDED, EDIT_KEPT,
     EDIT_REFINED, EDIT_RETRACTED, EDIT_SIGNIFICANCE_RAISED, EntityKind, Extracted, KindMismatch,
+    OccasionDisposition, OccasionRef,
 };
 use crate::constants::{
     Significance, Volatility, WEIGHT_CONFIRMED, WEIGHT_CREATED, WEIGHT_MENTIONED_AGAIN, WEIGHT_USED,
@@ -27,6 +28,8 @@ struct Written {
     uuid: Uuid,
     end: (Stamp, bool),
     said_at: Stamp,
+    /// The end the row was written with, after any newer neighbour's.
+    valid_until: Option<Stamp>,
 }
 
 impl Written {
@@ -120,6 +123,7 @@ pub(super) fn commit(
             Written {
                 id: memory_id,
                 uuid,
+                valid_until: ended.map_or(memory.valid_until, |(_, until, _)| Some(until)),
                 // Where a neighbour this claim ends, or a memory whose ender
                 // it replaces, ends.
                 end: match memory.valid_from {
@@ -318,7 +322,48 @@ pub(super) fn commit(
             })
             .collect(),
         restatements,
+        occasions: occasion_refs(checked, &written),
     })
+}
+
+/// What each occasion reference came to, from what was written.
+fn occasion_refs(checked: &Checked, written: &BTreeMap<usize, Written>) -> Vec<OccasionRef> {
+    checked
+        .occasions
+        .iter()
+        .map(|reference| {
+            let index = checked
+                .memories
+                .iter()
+                .position(|memory| memory.claim == reference.claim);
+            let memory = index.map(|index| &checked.memories[index]);
+            let row = index.and_then(|index| written.get(&index));
+            let filled = match (reference.ignored, memory) {
+                (None, Some(memory)) => memory.filled,
+                _ => Default::default(),
+            };
+            let disposition = match (reference.ignored, memory, row) {
+                (Some(ignored), _, _) => OccasionDisposition::Ignored(ignored),
+                (None, _, None) => OccasionDisposition::Absorbed,
+                (None, Some(memory), Some(row)) if filled.valid_until => {
+                    if row.valid_until == memory.valid_until {
+                        OccasionDisposition::Grounded
+                    } else {
+                        OccasionDisposition::Overridden
+                    }
+                }
+                _ if filled.due_at => OccasionDisposition::DueOnly,
+                _ => OccasionDisposition::Explicit,
+            };
+            OccasionRef {
+                claim: reference.claim,
+                occasion: reference.occasion,
+                memory: row.map(|row| row.uuid),
+                filled,
+                disposition,
+            }
+        })
+        .collect()
 }
 
 /// The entity each proposed name resolves to, keyed by its lowercase name,

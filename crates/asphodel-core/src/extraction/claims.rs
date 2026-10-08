@@ -7,6 +7,8 @@
 //!
 //! - a quote that isn't in the chunk drops the claim;
 //! - a time that doesn't parse is dropped and lowers window confidence;
+//! - a task naming an occasion by handle gets the occasion's start as its
+//!   end and due date, each only where the claim gave none;
 //! - fields that don't belong to the claim's kind are dropped;
 //! - a weekday named in the quote that matches none of the claim's dates
 //!   lowers window confidence;
@@ -24,7 +26,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::input::Unit;
-use super::{Call1Input, DropReason, Dropped, EntityKind};
+use super::{Call1Input, DropReason, Dropped, EntityKind, IgnoredOccasion, OccasionFilled};
 use crate::constants::{Significance, Volatility};
 use crate::ingest::TURN_SEPARATOR;
 use crate::queue::SourceKind;
@@ -54,6 +56,10 @@ struct RawClaim {
     recurrence_rrule: Option<String>,
     recurrence_start: Option<RawTime>,
     entities: Vec<RawLink>,
+    /// The handle of the upcoming occasion a task is for. Missing reads as
+    /// null.
+    #[serde(default)]
+    occasion: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,6 +203,9 @@ pub(super) struct NewMemory {
     pub recurrence_rrule: Option<String>,
     pub recurrence_start: Option<Stamp>,
     pub links: Vec<Link>,
+    /// Which of `valid_until` and `due_at` were copied from the occasion
+    /// the claim named.
+    pub filled: OccasionFilled,
 }
 
 impl NewMemory {
@@ -217,6 +226,21 @@ pub(super) struct Checked {
     pub dropped: Vec<Dropped>,
     /// In-context memories judged used, by rowid and public id, each once.
     pub used: Vec<(i64, uuid::Uuid)>,
+    /// Every claim with a non-null `occasion`, in claim order.
+    pub occasions: Vec<CheckedOccasion>,
+}
+
+/// A claim's `occasion` reference after the checks. Commit decides what an
+/// accepted one came to.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CheckedOccasion {
+    /// The claim's index in call 1's reply.
+    pub claim: usize,
+    /// The occasion the handle names, whether or not it was used.
+    pub occasion: Option<uuid::Uuid>,
+    /// Why it wasn't used. `None` when it was accepted, and
+    /// [`NewMemory::filled`] says what it supplied.
+    pub ignored: Option<IgnoredOccasion>,
 }
 
 /// Parses and checks call 1's reply. `Err` names why the reply doesn't fit
@@ -230,8 +254,31 @@ pub(super) fn check(
 
     let mut memories = Vec::new();
     let mut dropped = Vec::new();
+    let mut occasions = Vec::new();
     for (index, claim) in reply.claims.into_iter().enumerate() {
-        match check_claim(index, claim, input, unit) {
+        // The reference is resolved whether or not the claim survives.
+        let reference = claim.occasion.as_deref().map(|handle| {
+            let occasion = unit.occasions.get(handle.trim());
+            (occasion.map(|occasion| occasion.memory), claim.kind)
+        });
+        let checked = check_claim(index, claim, input, unit);
+        if let Some((occasion, kind)) = reference {
+            let ignored = if checked.is_err() {
+                Some(IgnoredOccasion::Dropped)
+            } else if kind != Kind::Task {
+                Some(IgnoredOccasion::NotATask)
+            } else if occasion.is_none() {
+                Some(IgnoredOccasion::UnknownHandle)
+            } else {
+                None
+            };
+            occasions.push(CheckedOccasion {
+                claim: index,
+                occasion,
+                ignored,
+            });
+        }
+        match checked {
             Ok(memory) => memories.push(memory),
             Err(reason) => dropped.push(Dropped {
                 claim: index,
@@ -254,6 +301,7 @@ pub(super) fn check(
         memories,
         dropped,
         used,
+        occasions,
     })
 }
 
@@ -290,6 +338,10 @@ fn check_claim(
         }
         stamp
     };
+    // Whether call 1 gave the field at all, before parsing: one it gave
+    // but that doesn't parse is still its own, and isn't filled.
+    let gave_valid_until = claim.valid_until.is_some();
+    let gave_due_at = claim.due_at.is_some();
     let mut valid_from = time(claim.valid_from);
     let mut valid_until = time(claim.valid_until);
     let mut due_at = time(claim.due_at);
@@ -320,6 +372,30 @@ fn check_claim(
         }
         // A task for a dated occasion can end when that occasion passes.
         Kind::Task | Kind::Event | Kind::State | Kind::Recurring => {}
+    }
+
+    // A task for a listed occasion gets the occasion's start, its instant
+    // and precision as stored, for each of its end and due date it left
+    // out. The task keeps its own timezone, so a coarse unit can end at a
+    // different time than the occasion's does in another zone.
+    let mut filled = OccasionFilled::default();
+    if claim.kind == Kind::Task
+        && let Some(occasion) = claim
+            .occasion
+            .as_deref()
+            .and_then(|handle| unit.occasions.get(handle.trim()))
+    {
+        if !gave_valid_until {
+            valid_until = Some(occasion.at);
+            filled.valid_until = true;
+        }
+        if !gave_due_at {
+            due_at = Some(occasion.at);
+            filled.due_at = true;
+        }
+        if (filled.valid_until || filled.due_at) && occasion.low_confidence {
+            low = true;
+        }
     }
 
     if claim.kind == Kind::Task && from_reply && due_at.is_none() && until_event.is_none() {
@@ -405,6 +481,7 @@ fn check_claim(
         recurrence_rrule,
         recurrence_start,
         links,
+        filled,
     })
 }
 

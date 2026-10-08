@@ -9,7 +9,10 @@
 use std::collections::BTreeMap;
 
 use asphodel_core::Tuning;
-use asphodel_core::extraction::{CALL1_VERSION, KindMismatch, RefineCause, guidance_hash};
+use asphodel_core::extraction::{
+    CALL1_VERSION, KindMismatch, OccasionDisposition, OccasionFilled, OccasionRef, RefineCause,
+    guidance_hash,
+};
 use asphodel_core::strength::Kind;
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -53,6 +56,7 @@ pub struct Report {
     /// The tokens the mental models' answers hold, sampled daily.
     pub profile_tokens: Percentiles,
     pub call1_input: Call1InputSizes,
+    pub occasion_refs: OccasionRefs,
     pub call2_rate: Call2Rate,
     pub restatements: Restatements,
     pub agenda_lines_per_day: Vec<DayCount>,
@@ -67,6 +71,9 @@ pub struct Report {
     /// in commit order, whether `reconcile.kind_guard` rejected it or not:
     /// the census an on/off comparison labels.
     pub kind_mismatches: Vec<KindMismatchRow>,
+    /// Every occasion reference in a committing call 1 reply, in commit
+    /// order: ids and what came of it, no content.
+    pub occasion_ref_rows: Vec<OccasionRefRow>,
     /// Where each LLM reply came from, and what the run identifies by:
     /// everything that differs between a `live` run and the `replay` of
     /// its cassette sits here.
@@ -191,6 +198,62 @@ pub struct Call1InputSizes {
     pub characters: Percentiles,
     /// Upcoming event entries, with zero for an empty block.
     pub upcoming_lines: Percentiles,
+}
+
+/// Occasion references counted when their chunk committed, once per chunk
+/// however often it was reconciled again. `given` counts every non-null
+/// `occasion` in the replies that committed; the dispositions sum to it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OccasionRefs {
+    pub given: u64,
+    pub grounded: u64,
+    pub due_only: u64,
+    pub explicit: u64,
+    pub overridden: u64,
+    pub absorbed: u64,
+    pub ignored: u64,
+}
+
+impl OccasionRefs {
+    pub fn of(rows: &[OccasionRefRow]) -> Self {
+        let mut counts = Self::default();
+        for row in rows {
+            counts.given += 1;
+            *match row.disposition {
+                OccasionDisposition::Grounded => &mut counts.grounded,
+                OccasionDisposition::DueOnly => &mut counts.due_only,
+                OccasionDisposition::Explicit => &mut counts.explicit,
+                OccasionDisposition::Overridden => &mut counts.overridden,
+                OccasionDisposition::Absorbed => &mut counts.absorbed,
+                OccasionDisposition::Ignored(_) => &mut counts.ignored,
+            } += 1;
+        }
+        counts
+    }
+}
+
+/// One occasion reference, by id.
+#[derive(Debug, Clone, Serialize)]
+pub struct OccasionRefRow {
+    pub chunk: Uuid,
+    pub claim: usize,
+    pub occasion: Option<Uuid>,
+    pub memory: Option<Uuid>,
+    pub filled: OccasionFilled,
+    pub disposition: OccasionDisposition,
+}
+
+impl OccasionRefRow {
+    pub fn of(chunk: Uuid, reference: &OccasionRef) -> Self {
+        Self {
+            chunk,
+            claim: reference.claim,
+            occasion: reference.occasion,
+            memory: reference.memory,
+            filled: reference.filled,
+            disposition: reference.disposition,
+        }
+    }
 }
 
 /// The value at the nearest rank of `p` in sorted `values`, or 0 when
@@ -388,6 +451,7 @@ pub struct Aggregate {
     pub injection_usage: InjectionUsage,
     pub profile_tokens: Percentiles,
     pub call1_input: Call1InputSizes,
+    pub occasion_refs: OccasionRefs,
     pub call2_rate: Call2Rate,
     pub restatements: Restatements,
     pub agenda_lines_per_day: Vec<EpochDayCount>,
@@ -538,6 +602,7 @@ impl Aggregate {
             },
             profile_tokens: report.profile_tokens.clone(),
             call1_input: report.call1_input.clone(),
+            occasion_refs: report.occasion_refs.clone(),
             injection_usage: report.injection_usage.clone(),
             call2_rate: Call2Rate {
                 chunks: report.call2_rate.chunks,

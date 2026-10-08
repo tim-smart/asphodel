@@ -70,6 +70,10 @@ _Avoid_: Created at, extracted at
 When a task should be done by. It is separate from the task's validity window.
 _Avoid_: Deadline, valid until
 
+**Occasion**:
+An upcoming event a task can be for, shown to extraction with a handle. A task that names one gets the occasion's start as its end and due date, wherever it gave neither itself. The start is copied as stored, the same instant and precision, and the task keeps its own timezone. So across timezones a day-, month- or year-precision task can end days earlier or later than its occasion does: the unit is counted in each memory's own zone.
+_Avoid_: Anchor event, parent event
+
 **World time**:
 Calendar time. Validity windows, phase, due dates and state confidence run on it, because the world doesn't pause when the user stops talking.
 _Avoid_: Real time, wall-clock (outside the code)

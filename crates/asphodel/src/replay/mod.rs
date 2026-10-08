@@ -251,6 +251,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             injection_usage: outcome.injection_usage,
             profile_tokens: outcome.profile_tokens,
             call1_input: outcome.call1_input,
+            occasion_refs: outcome.occasion_refs,
             call2_rate: outcome.call2_rate,
             restatements: outcome.restatements,
             agenda_lines_per_day: outcome.agenda_lines_per_day,
@@ -258,6 +259,7 @@ fn execute(args: &ReplayArgs) -> anyhow::Result<Finished> {
             kind_histogram: outcome.kind_histogram,
             memories: outcome.memories,
             kind_mismatches: outcome.kind_mismatches,
+            occasion_ref_rows: outcome.occasion_ref_rows,
             llm: outcome.llm,
         })
     })

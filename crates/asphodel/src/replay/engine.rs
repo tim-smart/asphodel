@@ -70,8 +70,8 @@ use super::cassette::{Chained, ChunkContext, ChunkKey, Recorder};
 use super::labelling::{Collector, Material};
 use super::report::{
     Call1InputSizes, Call2Rate, DayCount, InjectedTokens, InjectionUsage, KindMismatchRow, Lag,
-    LlmCounts, MemoryOutcome, Percentiles, ProbeResult, RefineCauses, Restatements, SessionTokens,
-    WeekBands, WeekCount,
+    LlmCounts, MemoryOutcome, OccasionRefRow, OccasionRefs, Percentiles, ProbeResult, RefineCauses,
+    Restatements, SessionTokens, WeekBands, WeekCount,
 };
 use super::scenario::{Author, Check, Claim, PROBE_SESSION_PREFIX};
 use super::shadow::{Created, ShadowRow};
@@ -146,6 +146,7 @@ pub struct Outcome {
     pub injection_usage: InjectionUsage,
     pub profile_tokens: Percentiles,
     pub call1_input: Call1InputSizes,
+    pub occasion_refs: OccasionRefs,
     pub call2_rate: Call2Rate,
     pub restatements: Restatements,
     pub agenda_lines_per_day: Vec<DayCount>,
@@ -153,6 +154,7 @@ pub struct Outcome {
     pub kind_histogram: BTreeMap<String, u64>,
     pub memories: Vec<MemoryOutcome>,
     pub kind_mismatches: Vec<KindMismatchRow>,
+    pub occasion_ref_rows: Vec<OccasionRefRow>,
     pub llm: LlmCounts,
     pub created: Vec<Created>,
     pub shadow: Vec<ShadowRow>,
@@ -340,6 +342,8 @@ pub struct Engine<'a> {
     refines_rejected: RefineCauses,
     refines_across_kinds: RefineCauses,
     kind_mismatches: Vec<KindMismatchRow>,
+    /// Occasion references in committing replies, in commit order.
+    occasion_ref_rows: Vec<OccasionRefRow>,
     /// Restatements written.
     restatements: u64,
     agenda_lines: BTreeMap<String, u64>,
@@ -430,6 +434,7 @@ impl<'a> Engine<'a> {
             refines_rejected: RefineCauses::default(),
             refines_across_kinds: RefineCauses::default(),
             kind_mismatches: Vec::new(),
+            occasion_ref_rows: Vec::new(),
             restatements: 0,
             agenda_lines: BTreeMap::new(),
             significance_histogram: BTreeMap::new(),
@@ -919,6 +924,10 @@ impl<'a> Engine<'a> {
                     }
                     let row = KindMismatchRow::of(extracted.chunk, mismatch);
                     self.kind_mismatches.push(row);
+                }
+                for reference in &extracted.occasions {
+                    let row = OccasionRefRow::of(extracted.chunk, reference);
+                    self.occasion_ref_rows.push(row);
                 }
                 self.restatements += extracted.restatements as u64;
                 extracted
@@ -1690,6 +1699,7 @@ impl<'a> Engine<'a> {
                 characters: Percentiles::of(&mut call1_characters),
                 upcoming_lines: Percentiles::of(&mut upcoming_lines),
             },
+            occasion_refs: OccasionRefs::of(&self.occasion_ref_rows),
             call2_rate: Call2Rate {
                 chunks: self.chunks,
                 call2: self.call2_chunks,
@@ -1726,6 +1736,7 @@ impl<'a> Engine<'a> {
             kind_histogram: self.kind_histogram,
             memories,
             kind_mismatches: self.kind_mismatches,
+            occasion_ref_rows: self.occasion_ref_rows,
             llm,
             created: self.created,
             shadow: self.shadow,
