@@ -333,7 +333,6 @@ HERMES_HOME=~/.hermes python3 backfill.py --all-history --speaker Sam=discord:12
   turn keeps its original time, so its memories arrive already aged.
   Repeated mentions across history count as separate occasions when they
   are at least three world days apart, building the memory's lasting floor.
-  Future message times are capped at the time the turn arrived.
 - **`--dry-run`** prints the counts and posts nothing. They're the counts
   `asphodel import --dry-run` prints for the same database, plus, with
   `--since`, `turns_before_since`, the turns the cutoff leaves out.

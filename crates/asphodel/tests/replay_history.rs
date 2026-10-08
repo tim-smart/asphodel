@@ -18,8 +18,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use asphodel_core::config::Secret;
-use asphodel_core::models::{ChatgptTokens, TokenStore};
+use asphodel_core::config::{Secret, Tuning};
+use asphodel_core::ingest::Turn;
+use asphodel_core::models::{
+    ChatgptTokens, FakeEmbedder, FakeLlm, FakeReranker, Models, TokenStore,
+};
+use asphodel_core::retrieval::band;
+use asphodel_core::store::bank::BankIdentity;
+use asphodel_core::store::{OpenOptions, Store};
+use asphodel_core::{Service, SimulatedClock};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::hermes::{self, StateDb, epoch, start};
@@ -59,24 +67,14 @@ fn is_refresh(record: &Value) -> bool {
     record["template"]["name"] == "write_model"
 }
 
-/// Backfill at receipt time and CLI import/replay of the same synthetic
-/// Hermes turn must agree after 180 days, not merely share a test clock.
+/// A turn backfilled 180 days after it was said ages like the same turn
+/// imported and replayed.
 #[test]
 fn backfilled_turn_strength_matches_the_imported_history() {
-    use asphodel_core::config::Tuning;
-    use asphodel_core::ingest::Turn;
-    use asphodel_core::models::{FakeEmbedder, FakeLlm, FakeReranker, Models};
-    use asphodel_core::store::bank::BankIdentity;
-    use asphodel_core::store::{OpenOptions, Store};
-    use asphodel_core::{Service, SimulatedClock};
-    use jiff::{SignedDuration, Timestamp};
-
     let dir = TestDir::new();
     let user = "Tim likes green tea.";
-    let assistant = "Noted.";
-    // Import syncs at the final reply but preserves the user message time.
     let message_at: Timestamp = "2026-01-05T09:00:00Z".parse().unwrap();
-    let received = message_at + SignedDuration::from_secs(180 * 86_400);
+    let received = message_at + SignedDuration::from_hours(180 * 24);
     let settings = format!(
         "[clock]\nquiet_rate = 1.0\n[purge]\ndelta = 0.0\n\
          [injection.reranker_floors]\n\"{}\" = 0.0\n\
@@ -90,11 +88,12 @@ fn backfilled_turn_strength_matches_the_imported_history() {
     let clock = Arc::new(SimulatedClock::new(received));
     let store = Store::open(&dir.path("backfill"), OpenOptions::default(), clock.clone()).unwrap();
     let service = Service::with_models(clock, store, tuning, Models::fake()).unwrap();
+    let timezone = Some("Pacific/Auckland".to_owned());
     service
         .ensure_bank_with_models(
             "main",
             &BankIdentity {
-                timezone: Some("Pacific/Auckland".into()),
+                timezone: timezone.clone(),
                 ..BankIdentity::default()
             },
         )
@@ -105,9 +104,9 @@ fn backfilled_turn_strength_matches_the_imported_history() {
             &Turn {
                 session_id: "s1".into(),
                 message_at,
-                timezone: Some("Pacific/Auckland".into()),
+                timezone,
                 user_text: user.into(),
-                assistant_text: assistant.into(),
+                assistant_text: "Noted.".into(),
                 author: None,
                 platform: None,
                 recall_id: None,
@@ -118,9 +117,7 @@ fn backfilled_turn_strength_matches_the_imported_history() {
     let fact = claim(user, user, "fact");
     let llm = FakeLlm::scripted(
         "fake-llm",
-        vec![json!({
-            "claims": [fact.clone()], "used_injected_ids": []
-        })],
+        vec![json!({ "claims": [fact.clone()], "used_injected_ids": [] })],
     );
     let lease = service.claim_chunk("main").unwrap().unwrap();
     let extracted = service.extract_chunk(lease, &llm, &[]).unwrap();
@@ -133,41 +130,30 @@ fn backfilled_turn_strength_matches_the_imported_history() {
 
     let corpus = import_history(&dir, |path| {
         let db = hermes::one_session(path);
-        db.turn("s1", start(), user, assistant);
+        db.turn("s1", start(), user, "Noted.");
         db
     });
     let script = script_answering_everything(&dir, "backfill-import", vec![fact], vec![]);
-    let settings_path = overrides(&dir, &settings);
-    let band =
-        serde_json::to_value(asphodel_core::retrieval::band(view.strength.value, cutoff)).unwrap();
+    let aged = serde_json::to_value(band(view.strength.value, cutoff)).unwrap();
     let probes = probe(
         "aged",
         &received.to_string(),
         "band",
-        &format!("memory = \"likes green tea\"\nband = {band}"),
+        &format!("memory = \"likes green tea\"\nband = {aged}"),
     );
-    let report = replay_history(
-        &dir,
-        &corpus,
-        "fast",
-        &probes,
-        Some(&script),
-        &[
-            "--refresh",
-            "off",
-            "--latency",
-            "0s",
-            "--overrides",
-            &settings_path,
-        ],
-    )
-    .ok();
-    let imported_strength = probe_in(&report, "aged")["observed"]["strength"]
+    let flags = [
+        "--refresh",
+        "off",
+        "--overrides",
+        &overrides(&dir, &settings),
+    ];
+    let report = replay_history(&dir, &corpus, "fast", &probes, Some(&script), &flags).ok();
+    let imported = probe_in(&report, "aged")["observed"]["strength"]
         .as_f64()
         .unwrap();
     assert!(
-        (view.strength.value - imported_strength).abs() < 1e-9,
-        "backfill strength {} differs from imported strength {imported_strength}",
+        (view.strength.value - imported).abs() < 1e-9,
+        "backfill strength {} differs from imported strength {imported}",
         view.strength.value
     );
 }

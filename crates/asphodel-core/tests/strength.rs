@@ -257,23 +257,6 @@ fn day(date: &str) -> Value {
 }
 
 #[test]
-fn backfilled_turn_strength_matches_imports_simulated_message_clock() {
-    let backfill = Harness::new("");
-    let imported = Harness::new("");
-    let fact = || minor("fact", "Tim likes green tea.");
-    let old = backfill.turn_received(at(0.0), at(180.0), "UTC", vec![fact()], &[], &[])[0];
-    // Import replays on a simulated clock at the original turn time.
-    let replayed = imported.says(at(0.0), fact());
-    imported.set(at(180.0));
-
-    let actual = backfill.show(old);
-    assert_eq!(actual.accesses.len(), 1);
-    assert_eq!(actual.accesses[0].kind, "created");
-    assert_eq!(actual.accesses[0].at, at(0.0));
-    assert_eq!(actual.strength, imported.strength(replayed));
-}
-
-#[test]
 fn backfilled_mentions_ten_days_apart_count_as_three_occasions() {
     let h = Harness::new("");
     let fact = || claim("fact", "notable", "Tim studied physics at Otago.");
