@@ -793,7 +793,7 @@ fn not_created_window_keeps_purged_creations_in_the_count() {
 
 // Recording modes.
 
-/// Separate sessions keep the future occasion out of in-context memories:
+/// A one-token injection budget keeps the future occasion out of in-context memories:
 /// call 1 sees zero upcoming lines twice, then one.
 fn check_call1_input_sizes(recording_mode: &str) {
     const OCCASION: &str = "Zoë’s wedding is on 30 January 2026.";
@@ -815,12 +815,23 @@ fn check_call1_input_sizes(recording_mode: &str) {
     });
     let mut event = claim(OCCASION, OCCASION, "event");
     event["valid_from"] = json!({
-        "at": "2026-01-30T00:00:00Z", "precision": "day"
+        "at": "2026-01-30", "precision": "day"
     });
     let script = script_answering_everything(&dir, "occasion-size", vec![event], vec![]);
     let probes = probe_on("occasion", 6, "exists", r#"memory = "wedding""#);
     let export = dir.path("sizes.json");
-    let flags = ["--aggregate", export.to_str().unwrap(), "--latency", "0s"];
+    // Separate sessions alone do not prevent relevance injection. The dated
+    // sentence cannot fit this budget, so the gift turn sees it only through
+    // the bank-wide upcoming block. It is beyond the agenda horizon too.
+    let settings = overrides(&dir, "[injection]\ntoken_budget = 1\n");
+    let flags = [
+        "--aggregate",
+        export.to_str().unwrap(),
+        "--latency",
+        "0s",
+        "--overrides",
+        &settings,
+    ];
     let mut recording_flags = flags.to_vec();
     if recording_mode == "fast" {
         recording_flags.extend(["--refresh", "live"]);
