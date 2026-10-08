@@ -28,6 +28,10 @@ pub struct DeletionInputs {
     pub n0: f64,
     pub min_access_age_days: f64,
     pub floor_spacing_days: f64,
+    /// Inputs recorded before it existed read as 1.0, the margin purge
+    /// already had then through δ's default.
+    #[serde(default = "default_never_purged_margin")]
+    pub never_purged_margin: f64,
     pub weight_created: f64,
     /// `strength.access_weights.used`, under the name it had when it was a
     /// constant, so its default keeps every stored fingerprint.
@@ -49,6 +53,10 @@ pub struct DeletionInputs {
     pub source_horizon_days: u32,
 }
 
+fn default_never_purged_margin() -> f64 {
+    1.0
+}
+
 impl DeletionInputs {
     /// The fixed strength constants of this build, with the deletion inputs
     /// from `tuning`.
@@ -63,6 +71,7 @@ impl DeletionInputs {
             n0: constants::N0,
             min_access_age_days: constants::MIN_ACCESS_AGE_DAYS,
             floor_spacing_days: constants::FLOOR_SPACING_DAYS,
+            never_purged_margin: constants::NEVER_PURGED_MARGIN,
             weight_created: constants::WEIGHT_CREATED,
             weight_used: tuning.strength.access_weights.used,
             weight_mentioned_again: constants::WEIGHT_MENTIONED_AGAIN,
@@ -173,6 +182,7 @@ pub fn deletion_fingerprint(inputs: &DeletionInputs) -> Fingerprint {
         n0,
         min_access_age_days,
         floor_spacing_days,
+        never_purged_margin,
         weight_created,
         weight_used,
         weight_mentioned_again,
@@ -197,6 +207,7 @@ pub fn deletion_fingerprint(inputs: &DeletionInputs) -> Fingerprint {
     hash.float("n0", *n0);
     hash.float("min_access_age_days", *min_access_age_days);
     hash.float("floor_spacing_days", *floor_spacing_days);
+    hash.float("never_purged_margin", *never_purged_margin);
     hash.float("weight.created", *weight_created);
     hash.float("weight.used", *weight_used);
     hash.float("weight.mentioned_again", *weight_mentioned_again);

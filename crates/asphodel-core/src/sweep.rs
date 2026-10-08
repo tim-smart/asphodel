@@ -6,7 +6,8 @@
 //! memory refreshes once. The last sweep lives in memory: after a restart
 //! the next is the first sweep time after the daemon started.
 //!
-//! **Purge.** A chain whose head is below τ − δ goes through the erase
+//! **Purge.** A chain whose head is below τ − δ, and not held for good by
+//! its lasting strength, goes through the erase
 //! path, one transaction per chain, with strength and the guards read on
 //! the head ([`purge_eligible`]). A chain waiting on a forget's erase is
 //! left to it. δ null never purges.
@@ -368,8 +369,8 @@ fn is_eligible(
     let Some((window, tz)) = window(conn, head)? else {
         return Ok(false);
     };
-    let strength = loader.strength(conn, head)?.value;
-    Ok(purge_eligible(rule, strength, &window, &tz, now))
+    let strength = loader.strength(conn, head)?;
+    Ok(purge_eligible(rule, &strength, &window, &tz, now))
 }
 
 /// Purge's second phase, in one transaction: re-reads the chain `head` is

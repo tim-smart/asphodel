@@ -132,6 +132,7 @@ impl SignificanceTuning {
 #[serde(default, deny_unknown_fields)]
 pub struct PurgeTuning {
     /// δ: a memory is purged once its strength falls this far below τ.
+    /// The wait after fading grows with how long the memory lasted.
     /// `None` means never purge, written `delta = "never"` in TOML.
     #[serde(with = "delta")]
     pub delta: Option<f64>,
@@ -144,7 +145,7 @@ pub struct PurgeTuning {
 impl Default for PurgeTuning {
     fn default() -> Self {
         Self {
-            delta: Some(1.0),
+            delta: Some(0.15),
             source_horizon_days: 90,
         }
     }

@@ -2717,6 +2717,7 @@ fn print_memory(view: &Value) {
             "date_ahead" => println!("    held: a date ahead, until {}", text(guard, "until")),
             "overdue_task" => println!("    held: an overdue task, until {}", text(guard, "until")),
             "strength" => println!("    held: the head is above the purge line"),
+            "lasting" => println!("    held for good: its occasions and significance keep it"),
             other => println!("    held: {other}"),
         }
     }

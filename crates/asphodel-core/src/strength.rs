@@ -32,7 +32,7 @@ pub use crate::constants::RECENTLY_PAST_DAYS;
 pub use bank_time::{BankTime, FULL_SPEED_HORIZON_DAYS};
 pub use chain::{Chains, Link, chain, chain_head, inherits_from};
 pub use confidence::state_confidence;
-pub use purge::{PurgeRule, purge_eligible};
+pub use purge::{PurgeRule, never_purged, purge_eligible};
 pub use window::{Kind, Phase, TimePrecision, Window, WorldTime, unit_end};
 
 const MICROS_PER_DAY: f64 = 86_400_000_000.0;
@@ -96,6 +96,9 @@ pub struct Strength {
     pub value: f64,
     pub recent_use: f64,
     pub lasting_floor: f64,
+    /// `S·significance + lasting_floor`: what strength falls to without
+    /// use, and never below.
+    pub lasting: f64,
     /// n: the accesses counted as separate occasions for the floor.
     pub occasions: u32,
 }
@@ -169,6 +172,7 @@ pub fn strength(
         value: S * significance + recent_use.max(lasting_floor),
         recent_use,
         lasting_floor,
+        lasting: S * significance + lasting_floor,
         occasions,
     }
 }

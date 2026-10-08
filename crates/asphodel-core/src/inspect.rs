@@ -29,7 +29,8 @@ use crate::mental_models::{Model, find_model, model};
 use crate::store::strength::{StrengthLoader, window, world_time};
 use crate::store::{Store, StoreError, timestamp};
 use crate::strength::{
-    Phase, WorldTime, chain, chain_head, projected_below, projected_below_after, unit_end,
+    Phase, WorldTime, chain, chain_head, never_purged, projected_below, projected_below_after,
+    unit_end,
 };
 
 mod browse;
@@ -264,6 +265,9 @@ pub enum Guard {
     OverdueTask { until: Timestamp },
     /// The head is above the purge line.
     Strength,
+    /// The head's lasting strength, from its occasions and significance,
+    /// keeps it from purge for good.
+    Lasting,
 }
 
 /// Fade and purge dates if the memory isn't used again. Each is the bank
@@ -274,8 +278,8 @@ pub struct Projection {
     pub basis: &'static str,
     /// When strength falls below τ and recall stops finding it.
     pub fade: Option<Projected>,
-    /// When the chain can be purged: its head below τ − δ and its guards
-    /// past. `None` when it never can, or purge is off.
+    /// When the chain can be purged: its head below τ − δ, not held by its
+    /// lasting strength, and its guards past. `None` when it never can, or purge is off.
     pub purge: Option<Projected>,
 }
 
@@ -632,7 +636,9 @@ fn outlook(
     let links = loader.links();
     let head = chain_head(links, memory_id);
     let members = chain(links, memory_id);
-    let head_strength = loader.strength(conn, head)?.value;
+    let head_parts = loader.strength(conn, head)?;
+    let head_strength = head_parts.value;
+    let lasting = never_purged(head_parts.lasting);
     let delta = tuning.purge.delta;
     let line = delta.map(|delta| TAU - delta);
     let mut guards = Vec::new();
@@ -677,11 +683,14 @@ fn outlook(
     if line.is_some_and(|line| head_strength >= line) {
         guards.push(Guard::Strength);
     }
+    if lasting {
+        guards.push(Guard::Lasting);
+    }
     // The first time the guards have cleared and the head is below the
     // line together: a window closing as its date guard clears restarts
     // recent use, so the head can be below the line now and above it then.
     let purge = match line {
-        Some(line) if !hidden => {
+        Some(line) if !hidden && !lasting => {
             let head_inputs = loader.inputs(conn, head)?;
             projected_below_after(
                 head_inputs.significance,

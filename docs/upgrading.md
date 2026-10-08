@@ -1,5 +1,25 @@
 # Upgrading
 
+## Purge sooner after fading
+
+The default `purge.delta` drops from 1.0 to 0.15. A faded memory now waits
+about half as long as it lasted before it's eligible for purge, instead of
+about 16 times as long. With one mention, a trivial memory fades after 7.4
+bank days and becomes eligible for purge after about 11 bank days; a minor
+memory fades after about 1 bank month and becomes eligible for purge after
+about 1.5 bank months. Guards and reinforcement still apply.
+
+What's never purged doesn't change. That used to follow from δ: a memory
+whose lasting strength (`S·significance + lasting_floor`, which never
+falls) stays at or above τ − 1 never crossed τ − δ. It's now its own fixed
+line, `NEVER_PURGED_MARGIN = 1.0`, so major, critical and kept memories,
+and memories mentioned on enough separate occasions, fade but stay.
+
+`purge.delta` is a deletion input, so the daemon pauses purge and the
+source sweep on start. Run `asphodel purge plan` to see what would be
+deleted, then `asphodel purge ack --hash <h>`. To keep the old behaviour,
+set `delta = 1.0` under `[purge]`. No schema migration is needed.
+
 ## Call 2 version 5: a refinement keeps the same statement
 
 Call 2's prompt (`reconcile_claims`) now says a `refines` label needs the

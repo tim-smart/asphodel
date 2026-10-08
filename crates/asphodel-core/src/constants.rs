@@ -28,6 +28,12 @@ pub const S: f64 = 2.5;
 /// fading, by definition.
 pub const TAU: f64 = -0.7;
 
+/// How far below τ a memory's lasting strength, `S·significance +
+/// lasting_floor`, must be for purge to take it. Lasting strength never
+/// falls, so a memory at or above `τ − NEVER_PURGED_MARGIN` can fade but is
+/// never purged: enough separate occasions, or enough significance, keep it.
+pub const NEVER_PURGED_MARGIN: f64 = 1.0;
+
 /// a: the base fading rate of each access (Pavlik & Anderson).
 pub const A: f64 = 0.35;
 
@@ -242,6 +248,7 @@ pub struct FixedConstants {
     pub n0: f64,
     pub min_access_age_days: f64,
     pub floor_spacing_days: f64,
+    pub never_purged_margin: f64,
     pub access_weights: AccessWeights,
     pub window_close_weight: f64,
     pub full_speed_window_hours: f64,
@@ -299,6 +306,7 @@ impl FixedConstants {
             n0: N0,
             min_access_age_days: MIN_ACCESS_AGE_DAYS,
             floor_spacing_days: FLOOR_SPACING_DAYS,
+            never_purged_margin: NEVER_PURGED_MARGIN,
             access_weights: AccessWeights {
                 created: WEIGHT_CREATED,
                 used: WEIGHT_USED,

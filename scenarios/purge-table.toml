@@ -1,11 +1,12 @@
-# The purge table through the store, with δ = 1.0 and bank time at world
-# speed. One mention is purged at the first 04:00 sweep after
+# The purge table through the store, with δ set to 1.0 here rather than
+# read from the default, and bank time at world speed. One mention is purged at the first 04:00 sweep after
 # strength falls below τ − δ: e^((S·σ − τ + δ) / a) days after the mention,
 # which is 128.7 days for trivial, 536.8 for minor and 4576 for notable.
 # The exists probes sit 5% before the crossing and the absent probes 5%
 # plus a sweep after it. Separate occasions (at least three world days
 # apart) lift the lasting floor: trivial on 6 occasions, minor on 3 and
-# notable on 2 are never purged, and nothing major is.
+# notable on 2 are never purged, and nothing major is: their lasting
+# strength holds them at or above τ − 1, whatever δ is.
 #
 # The cat is stated again after its memory was purged. Reconciliation has
 # nothing to match, so it comes back as a new memory, and the shadow table
@@ -22,6 +23,7 @@ timezone = "UTC"
 
 [tuning]
 clock.quiet_rate = 1.0
+purge.delta = 1.0
 
 [[turn]]
 at = "2026-01-05T09:00:00Z"

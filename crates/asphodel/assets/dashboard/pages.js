@@ -432,6 +432,7 @@ const GUARDS = {
   purge_paused: "Purge is paused until the new deletion settings are acknowledged.",
   forgotten: "It's being forgotten; the erase removes it instead.",
   strength: "Its strength is above the purge line.",
+  lasting: "It's been mentioned on enough occasions, or matters enough, never to be purged.",
 };
 
 /// What the fade and purge dates mean, wherever they're shown.

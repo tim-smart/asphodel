@@ -57,14 +57,14 @@ significance = "critical"
 
 [[probe]]
 id = "trivial-fades"
-at = "2026-01-22T09:00:00Z"
+at = "2026-01-14T09:00:00Z"
 kind = "faded_at"
 memory = "trivial"
 between = ["2026-01-12T09:28:13Z", "2026-01-13T03:12:15Z"]
 
 [[probe]]
 id = "minor-fades"
-at = "2026-03-14T09:00:00Z"
+at = "2026-02-07T09:00:00Z"
 kind = "faded_at"
 memory = "minor"
 between = ["2026-02-03T15:58:56Z", "2026-02-06T17:58:50Z"]
@@ -89,3 +89,11 @@ at = "2039-03-04T09:00:00Z"
 kind = "faded_at"
 memory = "critical"
 between = ["2037-11-30T12:51:05Z", "2039-03-03T03:09:06Z"]
+
+# Major significance alone holds its lasting strength above τ − 1, so it
+# fades but is never purged, under the default δ.
+[[probe]]
+id = "major-never-purged"
+at = "2039-03-04T09:00:00Z"
+kind = "exists"
+memory = "major"

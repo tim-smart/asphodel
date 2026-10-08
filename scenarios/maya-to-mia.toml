@@ -109,7 +109,7 @@ band = "fading"
 
 [[probe]]
 id = "mia-fades-on-the-inherited-log"
-at = "2027-08-28T09:00:00Z"
+at = "2026-12-03T09:00:00Z"
 kind = "faded_at"
 memory = "mia"
 between = ["2026-11-01T03:37:24Z", "2026-12-02T16:57:08Z"]
