@@ -691,24 +691,31 @@ fn plan(
 
 // The write.
 
-const WRITE_SYSTEM: &str = "You write a mental model: a short answer to a standing question \
-about the user, built only from their memories. Write it as connected prose, a section for each \
-facet listed, in that order and under the facet's heading, and leave out a facet the memories say \
-nothing about. A section is one paragraph that reads as a whole, with what matters most first. Say \
-nothing the memories you cite don't support, and use names, not pronouns, for the people in it. \
-When a memory is marked with an observed date and may be stale, write its fact with that absolute \
-date (for example, 'as of 1 Sep'), not as an unqualified current fact or a relative age. \
-{language_rule}
+const WRITE_SYSTEM: &str = "You write a mental model: a summary of the user's memories that \
+answers a standing question about them. An AI assistant reads it at the start of every \
+conversation, instead of reading the memories themselves, to understand the user and help them \
+well. Give the assistant everything the memories say that answers the question, and nothing the \
+question rules out, with the specifics that make a fact usable. Don't generalise a specific away, \
+and merge memories that say the same thing.
+
+Write it as connected prose, a section for each facet listed, in that order and under the facet's \
+heading, and leave out a facet the memories say nothing about. Write each section as one \
+paragraph that reads as a whole, with what matters most first. Say nothing the memories you cite \
+don't support, and use names, not pronouns, for the people in it. When a memory is marked with an \
+observed date and may be stale, write its fact with that absolute date (for example, 'as of 1 \
+Sep'), not as an unqualified current fact or a relative age. {language_rule}
 
 Each memory is listed with its significance: trivial, minor, notable, major or critical, or kept \
 when the user asked for it to be remembered. When the budget is tight, keep the more significant \
 memories and leave out the less significant ones.
 
-The previous answer is there to keep the wording steady. Restate what the memories listed still \
-support, reword what they change, and leave out what they no longer support or what no longer \
-answers the question: anything you leave out is gone. Cite by handle every memory the answer rests \
-on, as one list for the whole answer, and only the handles listed (m1, m2, ...). Keep the whole \
-answer, headings included, within the token budget, about four characters to a token.\
+The previous answer keeps the wording steady; it is not a limit. Restate what the memories listed \
+still support, reword what they change, add what they support that it left out, and leave out \
+what they no longer support or what no longer answers the question: anything you leave out is \
+gone. Cite by handle every memory the answer rests on, in the cites list for the whole answer \
+and never in the text, and only the handles listed (m1, m2, ...). Use the token budget, headings included, at about four \
+characters to a token, for what the memories support: leaving out a supported fact that answers \
+the question is worse than a longer answer, but don't pad and don't go over.\
 {profile_rule}";
 
 /// The seeded profile's durability rule. Other models keep whatever time
