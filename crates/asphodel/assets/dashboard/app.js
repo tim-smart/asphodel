@@ -274,10 +274,10 @@ export function mount(root, { fetch }) {
       },
       h("a", { class: "mark", href: "#/", tabindex: "-1" }, flower(), h("span", {}, "Asphodel")),
       h("h1", {}, "Sign in to this daemon"),
-      rejected ? h("p", { id: "token-error", class: "notice", "data-tone": "error", role: "alert" }, "The daemon rejected that token. Check ASPHODEL_TOKEN and try again.") : null,
+      rejected ? h("p", { id: "token-error", class: "notice", "data-tone": "error", role: "alert" }, ["The daemon rejected that token. Check ", h("code", {}, "ASPHODEL_TOKEN"), " and try again."]) : null,
       h("label", { for: "token" }, "Token"),
       input,
-      h("p", { id: "token-help", class: "help" }, "The bearer token the daemon was started with (ASPHODEL_TOKEN). It stays in this tab and is gone when you close it."),
+      h("p", { id: "token-help", class: "help" }, "The bearer token the daemon was started with, from ", h("code", {}, "ASPHODEL_TOKEN"), ". It's kept in this tab only and cleared when you close it."),
       h("button", { type: "submit" }, "Sign in"),
     );
     root.replaceChildren(h("main", { class: "token-page" }, form));

@@ -167,6 +167,17 @@ code,
   font-size: 0.88em;
 }
 
+/* Commands and config keys in running text read as code, not as words. */
+p code,
+li code,
+dd code,
+td code {
+  padding: 0.05em 0.35em;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+  overflow-wrap: anywhere;
+}
+
 time,
 .num {
   font-variant-numeric: tabular-nums;
@@ -183,9 +194,16 @@ button {
   background: var(--stem);
   border: 1px solid var(--stem);
   border-radius: var(--radius);
-  padding: 0.5rem 0.9rem;
+  padding: 0 0.9rem;
   cursor: pointer;
   min-height: 2.5rem;
+  line-height: 1.2;
+}
+
+button.small {
+  min-height: 2.1rem;
+  padding-inline: 0.75rem;
+  font-size: 0.88rem;
 }
 
 button:hover {
@@ -231,8 +249,8 @@ select {
   background: var(--surface);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: 0.45rem 0.6rem;
-  min-height: 2.5rem;
+  padding: 0 0.6rem;
+  height: 2.5rem;
   max-width: 100%;
 }
 
@@ -291,14 +309,17 @@ label {
 
 .top-row {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 0.75rem;
   min-height: 3.5rem;
+  padding-top: 1rem;
 }
 
+/* The text sets the baseline the bank name sits on; the flower centres on
+   it. */
 .mark {
   display: inline-flex;
-  align-items: center;
+  align-items: baseline;
   gap: 0.5rem;
   color: var(--ink);
   text-decoration: none;
@@ -308,6 +329,7 @@ label {
 }
 
 .flower {
+  align-self: center;
   width: 1.35rem;
   height: 1.35rem;
   fill: var(--stem);
@@ -331,8 +353,9 @@ label {
 
 .sign-out {
   margin-left: auto;
+  align-self: center;
   min-height: 2.1rem;
-  padding: 0.3rem 0.7rem;
+  padding-inline: 0.7rem;
   font-size: 0.85rem;
 }
 
@@ -340,6 +363,11 @@ label {
   display: flex;
   gap: 0.25rem;
   overflow-x: auto;
+  scrollbar-width: none;
+  margin-top: 0.4rem;
+  /* Pulled out by a tab's own padding, so the first tab's text lines up
+     with the wordmark above it. */
+  padding-inline: calc(var(--gap) - 0.75rem);
 }
 
 .tabs a {
@@ -365,7 +393,7 @@ label {
 }
 
 .tabs .count {
-  font: 600 0.72rem var(--mono);
+  font: 600 0.72rem/1.4 var(--mono);
   color: var(--surface);
   background: var(--vein);
   border-radius: 999px;
@@ -409,6 +437,10 @@ label {
   gap: 0.35rem;
 }
 
+.page-head > p {
+  max-width: 70ch;
+}
+
 .back {
   font-size: 0.9rem;
 }
@@ -440,6 +472,10 @@ label {
   padding: 2rem 0;
 }
 
+.panel .empty {
+  padding: 0.25rem 0;
+}
+
 .footnote {
   font-size: 0.82rem;
   color: var(--ink-3);
@@ -458,8 +494,20 @@ label {
 }
 
 .panel > h2,
-.card > h2 {
+.card > h2,
+.section-head h2 {
   font-size: 0.95rem;
+}
+
+.section-head .quiet-text {
+  font-size: 0.85rem;
+}
+
+/* A count after a section title, quieter than the title. */
+.title-count {
+  margin-left: 0.15rem;
+  font: 500 0.85rem var(--mono);
+  color: var(--ink-3);
 }
 
 .pill {
@@ -499,7 +547,7 @@ label {
 .meta {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: baseline;
   gap: 0.25rem 0.9rem;
   font-size: 0.82rem;
   color: var(--ink-3);
@@ -522,10 +570,16 @@ label {
 
 .facts > div {
   display: flex;
+  align-items: baseline;
   justify-content: space-between;
   gap: 1rem;
   border-bottom: 1px dotted var(--rule);
-  padding-bottom: 0.35rem;
+  padding-bottom: 0.45rem;
+}
+
+.facts > div:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
 }
 
 .facts dt {
@@ -540,12 +594,32 @@ label {
 
 /* The fade label and its stem gauge */
 
+/* What happens, and under it when. The gauge sits on the first line, so a
+   wrapped date never pulls it off centre. */
 .fade {
   display: inline-flex;
-  align-items: center;
-  gap: 0.6rem;
+  align-items: flex-start;
+  gap: 0.75rem;
   font-size: 0.85rem;
+  line-height: 1.4;
   color: var(--ink-2);
+}
+
+.fade .gauge {
+  margin-top: calc((1lh - 0.4rem) / 2);
+}
+
+.fade-words {
+  display: grid;
+}
+
+.fade-main {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.fade-when {
+  color: var(--ink-3);
 }
 
 .gauge {
@@ -586,8 +660,8 @@ label {
   visibility: hidden;
 }
 
-.fade[data-fade="out"] {
-  color: var(--ink-3);
+.fade[data-fade="out"] .fade-main {
+  color: var(--ink-2);
 }
 
 [data-fade="never"] .gauge > span {
@@ -629,7 +703,12 @@ label {
 .bank footer {
   font-size: 0.82rem;
   border-top: 1px solid var(--rule);
-  padding-top: 0.6rem;
+  padding-top: 0.75rem;
+  margin-top: auto;
+}
+
+.bank {
+  grid-template-rows: auto 1fr auto;
 }
 
 .count-groups {
@@ -647,6 +726,7 @@ label {
 .count-group .count {
   display: flex;
   flex-direction: column-reverse;
+  justify-content: flex-end;
 }
 
 .count-group dt {
@@ -662,6 +742,7 @@ label {
 
 .count-group dd .quiet-text {
   font: 400 0.75rem var(--sans);
+  margin-left: 0.15rem;
 }
 
 .purge-card {
@@ -678,6 +759,12 @@ label {
   gap: 0.5rem 1.5rem;
 }
 
+.purge-counts li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+
 .purge-counts strong {
   font: 600 1.2rem var(--mono);
 }
@@ -686,15 +773,12 @@ label {
   justify-self: start;
 }
 
-.daemon {
-  max-width: 26rem;
-}
 
 /* The memory list */
 
 .toolbar {
   display: grid;
-  grid-template-columns: minmax(16rem, 2fr) repeat(4, minmax(9rem, 1fr));
+  grid-template-columns: minmax(16rem, 2fr) repeat(auto-fit, minmax(9rem, 1fr));
   gap: 0.75rem 1rem;
   align-items: end;
 }
@@ -722,6 +806,10 @@ label {
   gap: 0.5rem;
 }
 
+.search-row button {
+  height: 2.5rem;
+}
+
 .search-row input {
   flex: 1;
   min-width: 0;
@@ -739,7 +827,7 @@ label {
   border: 1px solid var(--rule);
   border-radius: 999px;
   min-height: 2.2rem;
-  padding: 0.25rem 0.8rem;
+  padding: 0 0.85rem;
   font-weight: 600;
   font-size: 0.88rem;
 }
@@ -756,8 +844,9 @@ label {
 }
 
 .chip-count {
+  margin-left: 0.15rem;
   font: 500 0.8rem var(--mono);
-  opacity: 0.8;
+  opacity: 0.75;
 }
 
 .memories {
@@ -769,17 +858,18 @@ label {
 
 .memory {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 22rem;
+  grid-template-columns: minmax(0, 1fr) 19rem;
   grid-template-areas:
     "sentence fade"
     "meta fade";
-  gap: 0.3rem 1.5rem;
-  padding: 0.95rem 0.25rem;
+  gap: 0.35rem 2rem;
+  padding: 1rem 0;
   border-bottom: 1px solid var(--rule);
 }
 
 .memory .sentence {
   grid-area: sentence;
+  justify-self: start;
   font: 400 1.14rem/1.4 var(--serif);
   color: var(--ink-far);
   text-decoration: none;
@@ -794,11 +884,13 @@ label {
   grid-area: meta;
 }
 
-/* A fixed, left-aligned column, so the gauges stack in one line. */
+/* A fixed, left-aligned column, so the gauges stack in one line. Its first
+   line sits level with the sentence. */
 .memory .fade {
   grid-area: fade;
-  align-self: center;
+  align-self: start;
   justify-self: start;
+  padding-top: 0.15rem;
 }
 
 /* The ink pales as the memory nears its fade. */
@@ -864,12 +956,21 @@ label {
 
 .outlook-fade .fade {
   font-size: 1rem;
-  color: var(--ink);
 }
 
 .outlook-fade .gauge {
   width: 8rem;
   height: 0.5rem;
+  margin-top: calc((1lh - 0.5rem) / 2);
+}
+
+/* On the memory's page the words read as one line when there's room. */
+.outlook-fade .fade-words {
+  display: block;
+}
+
+.outlook-fade .fade-when::before {
+  content: "· ";
 }
 
 .outlook-purge {
@@ -919,6 +1020,17 @@ label {
 details.panel > summary {
   cursor: pointer;
   font-weight: 650;
+  font-size: 0.95rem;
+}
+
+details.panel > summary .quiet-text {
+  margin-left: 0.35rem;
+  font-weight: 400;
+}
+
+/* Closed, the panel is just its summary. */
+details.panel:not([open]) {
+  gap: 0;
 }
 
 .history {
@@ -934,6 +1046,10 @@ details.panel > summary {
   display: inline-block;
   min-width: 9rem;
   color: var(--ink-2);
+}
+
+.history li span:first-child::first-letter {
+  text-transform: uppercase;
 }
 
 .actions {
@@ -965,15 +1081,16 @@ details.panel > summary {
 
 .source {
   display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 0.3rem 1rem;
-  padding: 0.85rem 0.25rem;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.35rem 1rem;
+  padding: 0.9rem 0;
   border-bottom: 1px solid var(--rule);
 }
 
 .source-name {
-  font: 500 1rem var(--mono);
-  word-break: break-all;
+  justify-self: start;
+  font: 500 0.95rem/1.4 var(--mono);
+  overflow-wrap: anywhere;
 }
 
 .source > :not(.source-remove) {
@@ -984,6 +1101,8 @@ details.panel > summary {
   grid-column: 2;
   grid-row: 1 / span 2;
   align-self: center;
+  min-height: 2.1rem;
+  font-size: 0.88rem;
 }
 
 .source[data-gone] .source-name {
@@ -992,7 +1111,7 @@ details.panel > summary {
 
 .source-text {
   margin: 0;
-  font: 1rem/1.6 var(--sans);
+  font: 1.05rem/1.55 var(--serif);
   white-space: pre-wrap;
   word-break: break-word;
   max-height: 32rem;
@@ -1025,7 +1144,8 @@ details.panel > summary {
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 0.75rem;
+  gap: 0.5rem 0.75rem;
+  min-height: 2.1rem;
 }
 
 .table-wrap {
@@ -1050,9 +1170,30 @@ th {
 }
 
 td {
-  padding: 0.55rem 0.6rem;
+  padding: 0.6rem;
   border-bottom: 1px solid var(--rule);
-  vertical-align: top;
+  vertical-align: baseline;
+}
+
+th:first-child,
+td:first-child {
+  padding-left: 0;
+}
+
+th:last-child,
+td:last-child {
+  padding-right: 0;
+}
+
+td.num {
+  font-size: 0.85rem;
+}
+
+/* A trailing action column hugs its button, right-aligned. */
+td:has(> button:only-child) {
+  text-align: right;
+  width: 1%;
+  white-space: nowrap;
 }
 
 tr:last-child td {
@@ -1061,7 +1202,8 @@ tr:last-child td {
 
 td button {
   min-height: 2rem;
-  padding: 0.2rem 0.7rem;
+  padding-inline: 0.7rem;
+  font-size: 0.88rem;
 }
 
 /* The Recall page */
@@ -1072,7 +1214,8 @@ textarea {
   background: var(--surface);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: 0.45rem 0.6rem;
+  padding: 0.5rem 0.6rem;
+  display: block;
   width: 100%;
   resize: vertical;
 }
@@ -1185,7 +1328,15 @@ legend {
 }
 
 .explain-filters .range-hint {
-  margin-top: -0.4rem;
+  margin-top: -0.35rem;
+}
+
+.field .hint {
+  margin-top: 0.3rem;
+}
+
+.explain-filters .notice {
+  font-size: 0.9rem;
 }
 
 .explain-filters .field:has(textarea) {
@@ -1240,6 +1391,14 @@ legend {
   opacity: 0.55;
 }
 
+/* Label, then value, both left: the query is the point, not a figure to
+   right-align. */
+.explain-summary .facts > div {
+  display: grid;
+  grid-template-columns: 9rem minmax(0, 1fr);
+  justify-content: start;
+}
+
 .explain-summary .facts dd {
   text-align: left;
 }
@@ -1254,6 +1413,7 @@ legend {
 
 .latency > div {
   display: flex;
+  align-items: baseline;
   gap: 0.4rem;
 }
 
@@ -1290,6 +1450,7 @@ legend {
 
 .explain-memory {
   min-width: 16rem;
+  vertical-align: top;
 }
 
 .explain-memory .meta {
@@ -1352,7 +1513,7 @@ legend {
    out of the prompt keeps its card, paled like a faded memory. */
 
 .budget {
-  max-width: 40rem;
+  max-width: 44rem;
 }
 
 .budget-figure {
@@ -1388,10 +1549,10 @@ legend {
 
 .model-notes {
   margin: 0;
-  padding-left: 1.1rem;
-  font-size: 0.88rem;
-  color: var(--ink-2);
-  max-width: 64ch;
+  padding: 0.75rem 0 0 1.1rem;
+  border-top: 1px solid var(--rule);
+  font-size: 0.85rem;
+  color: var(--ink-3);
   display: grid;
   gap: 0.2rem;
 }
@@ -1404,9 +1565,15 @@ legend {
 
 .model-head {
   display: flex;
-  align-items: start;
+  align-items: center;
   justify-content: space-between;
   gap: 1rem;
+}
+
+.model > .meta {
+  margin-top: auto;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--rule);
 }
 
 .model h2 {
@@ -1420,9 +1587,21 @@ legend {
   color: var(--ink);
 }
 
+.model .answer {
+  display: grid;
+  gap: 0.2rem;
+}
+
 .model .answer h3 {
-  margin: 0.6rem 0 0.2rem;
-  font: 650 0.95rem var(--sans);
+  margin: 0.4rem 0 0;
+  font: 650 0.78rem/1.4 var(--sans);
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--ink-2);
+}
+
+.model .answer h3:first-child {
+  margin-top: 0;
 }
 
 .model .answer p,
@@ -1451,6 +1630,10 @@ legend {
 
 .model-error {
   margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.5rem;
   font-size: 0.85rem;
   color: var(--ink-2);
 }
@@ -1536,7 +1719,7 @@ dialog.confirm::backdrop {
 }
 
 dialog.confirm h2 {
-  font: 600 1.3rem var(--serif);
+  font: 600 1.3rem/1.25 var(--serif);
   margin-bottom: 0.75rem;
 }
 
@@ -1626,8 +1809,51 @@ dialog.confirm h2 {
 }
 
 @media (max-width: 40rem) {
+  .tabs {
+    gap: 0;
+    padding-inline: calc(var(--gap) - 0.5rem);
+  }
+
   .tabs a {
     padding-inline: 0.5rem;
+    font-size: 0.88rem;
+  }
+
+  .top-row {
+    min-height: 3rem;
+    padding-top: 0.75rem;
+  }
+
+  .memory .fade {
+    padding-top: 0.2rem;
+  }
+
+  .source {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .source-remove {
+    grid-column: 1;
+    grid-row: auto;
+    justify-self: start;
+    margin-top: 0.25rem;
+  }
+
+  .segmented {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .explain-summary .facts > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.1rem;
+  }
+
+  .outlook-fade .fade-words {
+    display: grid;
+  }
+
+  .outlook-fade .fade-when::before {
+    content: none;
   }
 
   .memory {
@@ -1636,10 +1862,6 @@ dialog.confirm h2 {
       "sentence"
       "meta"
       "fade";
-  }
-
-  .memory .fade {
-    justify-self: start;
   }
 
   /* Stacked, there's no column to keep aligned. */

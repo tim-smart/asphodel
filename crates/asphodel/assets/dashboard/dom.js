@@ -42,49 +42,50 @@ export function elements(document) {
     return h("span", { class: "gauge", "aria-hidden": "true", style: { "--fill": fill.toFixed(3) } }, h("span"));
   }
 
+  /// A fade or purge label's words: what happens, and under it, when.
+  function outlook(stage, main, when, fade) {
+    return h(
+      "span",
+      { class: "fade", "data-fade": stage },
+      gauge(stage, fade),
+      h("span", { class: "fade-words" }, h("span", { class: "fade-main" }, main), when ? [" ", h("span", { class: "fade-when" }, when)] : null),
+    );
+  }
+
+  /// "no sooner than Oct 17, 2026".
+  function noSooner(iso) {
+    return ["no sooner than ", time(iso)];
+  }
+
   /// When a memory fades if it isn't used again.
-  function fadeLabel(fade, { gauged = true } = {}) {
+  function fadeLabel(fade) {
     const stage = fadeStage(fade);
-    const words =
-      stage === "never"
-        ? ["Never fades"]
-        : stage === "faded"
-          ? ["Faded: recall no longer finds it"]
-          : [`Fades in ${bankDays(fade.bank_days)}, no sooner than `, time(fade.earliest_at)];
-    return h("span", { class: "fade", "data-fade": stage }, gauged ? gauge(stage, fade) : null, h("span", {}, words));
+    if (stage === "never") return outlook(stage, "Never fades");
+    if (stage === "faded") return outlook(stage, "Faded", "Recall no longer finds it");
+    return outlook(stage, `Fades in ${bankDays(fade.bank_days)}`, noSooner(fade.earliest_at), fade);
   }
 
   /// What a retracted or forgotten memory's row says in place of a fade:
   /// it's out of use already, so only its purge, or its erase, is ahead.
   function outOfUseLabel(status, purge) {
-    const words =
-      status === "forgetting"
-        ? ["Being forgotten: the erase removes it"]
-        : !purge
-          ? ["Out of use. Never purged while things stay as they are"]
-          : purge.bank_days === 0
-            ? ["Out of use. Can be purged at the next sweep"]
-            : [`Out of use. Purged in ${bankDays(purge.bank_days)}, no sooner than `, time(purge.earliest_at)];
-    return h("span", { class: "fade", "data-fade": "out" }, gauge("out"), h("span", {}, words));
+    if (status === "forgetting") return outlook("out", "Being forgotten", "The erase will remove it");
+    if (!purge) return outlook("out", "Out of use", "Never purged as things stand");
+    if (purge.bank_days === 0) return outlook("out", "Out of use", "Can be purged at the next sweep");
+    return outlook("out", `Purged in ${bankDays(purge.bank_days)}`, noSooner(purge.earliest_at));
   }
 
   /// When a memory's chain can be purged.
   function purgeLabel(purge) {
-    if (!purge) return h("span", { class: "purge" }, "Never purged while things stay as they are");
+    if (!purge) return h("span", { class: "purge" }, "Never purged as things stand");
     if (purge.bank_days === 0) return h("span", { class: "purge" }, "Can be purged at the next sweep");
-    return h(
-      "span",
-      { class: "purge" },
-      `Purged in ${bankDays(purge.bank_days)}, no sooner than `,
-      time(purge.earliest_at),
-    );
+    return h("span", { class: "purge" }, `Purged in ${bankDays(purge.bank_days)}, `, noSooner(purge.earliest_at));
   }
 
   function pill(text, tone) {
     return h("span", { class: "pill", "data-tone": tone ?? text }, text);
   }
 
-  return { h, append, time, gauge, fadeLabel, outOfUseLabel, purgeLabel, pill };
+  return { h, append, time, gauge, outlook, fadeLabel, outOfUseLabel, purgeLabel, pill };
 }
 
 /// Where a memory sits on its way to fading: `never`, `far`, `near`,
@@ -140,11 +141,11 @@ export function goneReason(gone) {
     case "removed":
       return "Removed by the owner.";
     case "swept":
-      return "Swept: the nightly sweep deleted the text at its horizon.";
+      return "Swept. The nightly sweep deleted the text when it reached its horizon.";
     case "forget_requested":
-      return "Never stored: the turn asked to be forgotten.";
+      return "Never stored. The turn asked to be forgotten.";
     case "redacted":
-      return "Masked by a forget.";
+      return "Masked when a memory drawn from it was forgotten.";
     default:
       return gone ? `Gone (${gone.reason}).` : null;
   }
