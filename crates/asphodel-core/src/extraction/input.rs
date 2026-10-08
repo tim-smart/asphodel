@@ -2,10 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use jiff::Timestamp;
 use jiff::ToSpan;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp};
 use rusqlite::{Connection, OptionalExtension};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -13,13 +13,15 @@ use uuid::Uuid;
 use super::{
     CALENDAR_DAYS, CANDIDATE_MEMORIES, CONTEXT_CHARS, CONTEXT_TURNS, Call1Input, Candidate,
     ContextTurnTime, ENTITY_CANDIDATE_CAP, EntityKind, ExtractError, InContextMemory,
-    PREVIOUS_CHUNK_CHARS, SpeakerRef,
+    PREVIOUS_CHUNK_CHARS, SpeakerRef, UPCOMING_EVENTS, UpcomingEvent,
 };
+use crate::agenda::has_ended;
 use crate::config::Tuning;
 use crate::ingest::TURN_SEPARATOR;
 use crate::queue::{Lease, SourceKind};
-use crate::store::strength::StrengthLoader;
-use crate::store::timestamp;
+use crate::store::strength::{StrengthLoader, world_time};
+use crate::store::{micros, timestamp};
+use crate::strength::{Kind, Phase, Window};
 
 /// What the checks and the commit need beyond the input itself.
 pub(super) struct Unit {
@@ -217,6 +219,13 @@ pub(super) fn assemble(
         }
     }
 
+    let upcoming = if is_turn {
+        let shown: BTreeSet<Uuid> = in_context_memories.iter().map(|m| m.memory).collect();
+        upcoming_events(conn, bank_id, now, &shown)?
+    } else {
+        Vec::new()
+    };
+
     let turn = turn_number(conn, bank_id, source.source_id, is_turn)?;
     let entity_boundary: i64 =
         conn.query_row("SELECT COALESCE(MAX(id), 0) FROM entities", [], |row| {
@@ -252,6 +261,7 @@ pub(super) fn assemble(
         context_times,
         candidates,
         in_context: in_context_memories,
+        upcoming,
         language: tuning.llm.language.clone(),
         guidance: tuning.extraction.guidance.clone(),
     };
@@ -596,6 +606,58 @@ fn strongest_memories(
         .take(CANDIDATE_MEMORIES)
         .map(|(_, _, content)| content)
         .collect())
+}
+
+/// The longest unit a time can have. An event whose start is further back
+/// than this has begun, whatever its precision.
+const LONGEST_UNIT: SignedDuration = SignedDuration::from_hours(24 * 366);
+
+/// Up to [`UPCOMING_EVENTS`] of the bank's current events that are
+/// upcoming now ([`Phase::Upcoming`], as the agenda has them) and haven't
+/// ended, nearest first, leaving out `shown`. Bank-wide, so an occasion
+/// dated in another session grounds a task in this one. No τ gate, as on
+/// the agenda, and reads only: grounding isn't a use.
+fn upcoming_events(
+    conn: &Connection,
+    bank_id: i64,
+    now: Timestamp,
+    shown: &BTreeSet<Uuid>,
+) -> Result<Vec<UpcomingEvent>, rusqlite::Error> {
+    let since = now.checked_sub(LONGEST_UNIT).unwrap_or(Timestamp::MIN);
+    let mut statement = conn.prepare_cached(
+        "SELECT m.uuid, m.content, m.valid_from, m.valid_from_precision, m.valid_until,
+                m.valid_until_precision, m.observed_at, s.timezone
+         FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
+         WHERE m.bank_id = ?1 AND m.kind = 'event' AND m.valid_from >= ?2
+           AND m.invalidated_at IS NULL AND m.hidden_at IS NULL
+           AND m.superseded_by IS NULL
+         ORDER BY m.valid_from, m.id",
+    )?;
+    let mut rows = statement.query((bank_id, micros(since)))?;
+    let mut upcoming = Vec::new();
+    while upcoming.len() < UPCOMING_EVENTS
+        && let Some(row) = rows.next()?
+    {
+        let memory = parse_uuid(&row.get::<_, String>(0)?);
+        if shown.contains(&memory) {
+            continue;
+        }
+        let window = Window {
+            kind: Kind::Event,
+            valid_from: world_time(row.get(2)?, row.get(3)?),
+            valid_until: world_time(row.get(4)?, row.get(5)?),
+            due_at: None,
+            observed_at: timestamp(row.get(6)?),
+        };
+        let tz = TimeZone::get(&row.get::<_, String>(7)?).unwrap_or(TimeZone::UTC);
+        if window.phase(&tz, now) == Phase::Upcoming && !has_ended(window.valid_until, &tz, now) {
+            upcoming.push(UpcomingEvent {
+                memory,
+                content: row.get(1)?,
+            });
+        }
+    }
+    Ok(upcoming)
 }
 
 /// The turn number for accesses from this source. Ingest counts every turn,

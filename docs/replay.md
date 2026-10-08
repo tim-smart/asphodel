@@ -673,9 +673,9 @@ asphodel replay --corpus <file> --mode live|replay|fast \
   simulation twice.
 
   It's an approximation, the one `fast` already makes by reusing claims
-  by chunk. A primed call 1 is shown no in-context memories or prompt block
-  text, and its candidates are only the entities ingestion
-  makes, with no memories linked, where a serial run's are what the
+  by chunk. A primed call 1 is shown no in-context memories, upcoming
+  occasions or prompt block text, and its candidates are only the
+  entities ingestion makes, with no memories linked, where a serial run's are what the
   store holds at the claim. Its reply has no `used` verdicts to reuse,
   so each pair is judged by a top-up when the simulation first meets
   it. The report marks a primed run with `flags.prime_concurrency`, null

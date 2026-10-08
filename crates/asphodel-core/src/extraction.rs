@@ -7,10 +7,10 @@
 //!    context (up to [`CONTEXT_TURNS`] earlier turns of the session, or the
 //!    text before a document chunk), the reference date and a calendar strip
 //!    in the source's timezone, the speaker, the entity candidates found
-//!    through the alias FTS, and the in-context memories. Memories cited
-//!    by the session's prompt block are shown under their own handles,
-//!    never as a copy of the block's prose; `used` credits the memory the
-//!    reply relied on.
+//!    through the alias FTS, the in-context memories, and for a turn the
+//!    bank's nearest upcoming events. Memories cited by the session's
+//!    prompt block are shown under their own handles, never as a copy of
+//!    the block's prose; `used` credits the memory the reply relied on.
 //! 2. **Call 1.** One structured-output call ([`call1_request`]) returns the
 //!    claims and the `used` verdicts.
 //! 3. **Checks in code.** A claim whose quote isn't in the chunk is dropped.
@@ -70,7 +70,7 @@ pub use prompt::call1_request;
 
 /// Call 1's template name and version, which replay's cassette keys include.
 pub const CALL1_TEMPLATE: &str = "extract_claims";
-pub const CALL1_VERSION: u32 = 14;
+pub const CALL1_VERSION: u32 = 15;
 
 /// The hash call 1's template carries for `[extraction] guidance`:
 /// lower-case hex SHA-256 of the text as the prompt inserts it, trimmed.
@@ -127,6 +127,9 @@ pub const ENTITY_CANDIDATE_CAP: usize = 30;
 /// Linked memory sentences shown with a candidate, strongest first.
 pub const CANDIDATE_MEMORIES: usize = 3;
 
+/// The bank's upcoming events shown with a turn, nearest first.
+pub const UPCOMING_EVENTS: usize = 5;
+
 /// The calendar strip: the reference date and three weeks either side.
 pub const CALENDAR_DAYS: i64 = 21;
 
@@ -174,6 +177,12 @@ pub struct Call1Input {
     /// The in-context memories call 1 judges `used` against. Always empty
     /// for a document, which has no reply to have used anything.
     pub in_context: Vec<InContextMemory>,
+    /// Up to [`UPCOMING_EVENTS`] of the bank's events that are still
+    /// upcoming, from any session, nearest first, leaving out any already
+    /// in context. They ground a task's window on a dated occasion the
+    /// current text only names. They have no handles, so the reply can't
+    /// credit them `used`. Always empty for a document.
+    pub upcoming: Vec<UpcomingEvent>,
     /// `[llm] language`: the language every claim is written in. `None`
     /// writes each in the language of the passage it quotes.
     pub language: Option<String>,
@@ -248,6 +257,12 @@ impl EntityKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InContextMemory {
     pub handle: String,
+    pub memory: Uuid,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpcomingEvent {
     pub memory: Uuid,
     pub content: String,
 }
