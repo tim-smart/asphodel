@@ -371,7 +371,7 @@ owner review after re-recording.
   were scheduled in. So a probe at a turn's `at` sees that turn's prefetch
   and, with zero latency, its memories.
 - **Extraction** is queued at a source's sync. Each bank has one simulated
-  worker with room for `[llm] concurrency` chunks, 10 by default. Whenever
+  worker with room for `[llm] concurrency` chunks, 4 by default. Whenever
   it has room, at a sync or at a completion, it
   claims the head of the production queue (turns before documents, then
   observed time), runs its LLM calls and neighbour search at once, as
@@ -391,7 +391,7 @@ owner review after re-recording.
   store without those memories. Accesses are stamped with the source's
   ingest time, as in production. The run ends at the latest of the last
   event, `--until` and the last completion.
-- **Concurrency.** Above `[llm] concurrency = 1` (10 by default for real
+- **Concurrency.** Above `[llm] concurrency = 1` (4 by default for real
   history, adjustable in `--overrides`)
   the worker keeps that many chunks out, each prepared at its claim, and
   they commit in the order they were claimed: a chunk whose latency ends
@@ -656,7 +656,7 @@ asphodel replay --corpus <file> --mode live|replay|fast \
 - **Priming** (`--prime-concurrency [N]`, `fast` only) records call 1 for
   every chunk before the simulation starts, N calls at a time in
   wall-clock time. Priming is off when the flag is omitted. A bare
-  `--prime-concurrency` selects 10; an explicit N overrides that value
+  `--prime-concurrency` selects 4; an explicit N overrides that value
   and must be at least 1. Priming is refused in `live`, `replay` and
   scenario runs. The simulation is single-threaded, and `[llm]
   concurrency` only changes simulated time, so without it a re-record

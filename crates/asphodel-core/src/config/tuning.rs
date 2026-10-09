@@ -469,7 +469,7 @@ pub struct LlmTuning {
     pub reasoning_effort: Option<String>,
 
     /// How many LLM calls may be in flight at once, daemon-wide, and how
-    /// many chunks each bank extracts at once. Defaults to 10; at 1,
+    /// many chunks each bank extracts at once. Defaults to 4; at 1,
     /// extraction is serial.
     pub concurrency: u32,
 
@@ -486,7 +486,7 @@ impl Default for LlmTuning {
             model: None,
             endpoint: None,
             reasoning_effort: None,
-            concurrency: 10,
+            concurrency: 4,
             language: None,
         }
     }
