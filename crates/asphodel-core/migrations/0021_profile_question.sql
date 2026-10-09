@@ -1,0 +1,5 @@
+-- Asphodel schema, version 21: focus the seeded profile question on the
+-- user's preferences and how they want the assistant to behave and help.
+-- No table changes: the runner updates models still asking the default
+-- question, leaving custom questions alone. The changed question changes
+-- the refresh fingerprint, so the next refresh writes again.

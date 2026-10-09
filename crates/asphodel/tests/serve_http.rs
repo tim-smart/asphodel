@@ -2224,15 +2224,23 @@ fn undo_latest_migration() -> String {
              INSERT INTO memories_fts (memories_fts, rank) VALUES ('secure-delete', 0);"
             .into();
     }
-    if *version == 18 {
-        // Version 18 changes rows, not tables. Put the seeded question back
+    if *version == 18 || *version == 21 {
+        // These versions change rows, not tables. Put the seeded question back
         // so restoring the older backup exercises the conversion again.
         const EARLIER_PROFILE_QUESTION: &str = "Who is the user: their preferences, important people, \
              work and home, the platforms they use, and how they like to be helped. Not upcoming events, \
              tasks or routines.";
+        const PREVIOUS_PROFILE_QUESTION: &str = "Who is the user: their preferences, important people and their \
+             birthdays and anniversaries, work and home, the platforms they use, and how they like to be \
+             helped. Not one-off events, tasks or routines.";
+        let question = if *version == 18 {
+            EARLIER_PROFILE_QUESTION
+        } else {
+            PREVIOUS_PROFILE_QUESTION
+        };
         return format!(
             "UPDATE mental_models SET question = '{}' WHERE question = '{}';",
-            EARLIER_PROFILE_QUESTION.replace('\'', "''"),
+            question.replace('\'', "''"),
             asphodel_core::store::bank::PROFILE_QUESTION.replace('\'', "''")
         );
     }

@@ -464,6 +464,16 @@ content: see "Restatements" in `docs/operations.md`. The replay report and
 aggregate gain `restatements.written`, so the first replay after upgrading
 differs from an earlier report by that key alone. No action is needed.
 
+## Schema version 21: the profile question focuses on how to help
+
+The seeded profile now asks: "Who is the user: How do they want the
+assistant to behave? What are their preferences? How do they like to be
+helped?" Existing models still asking the previous default question are
+updated automatically; custom questions are left alone. The built-in
+retrieval facets and filters are unchanged. The changed question changes
+the refresh fingerprint, so the next refresh writes again. No action is
+needed.
+
 ## Write template version 3: dates for possibly stale states
 
 Schema version 15 introduced `write_model` v2 and the one-answer reply

@@ -19,16 +19,19 @@ use super::{Store, StoreError, micros, nfc};
 /// The timezone a bank gets when none was given at creation.
 pub const DEFAULT_TIMEZONE: &str = "UTC";
 
-/// The seeded profile's question. It leaves out one-off events, not dates
-/// about people: the write reads it, and a birthday or anniversary belongs
-/// in a profile.
+/// The seeded profile's name.
 pub const PROFILE_NAME: &str = "User profile";
-pub const PROFILE_QUESTION: &str = "Who is the user: their preferences, important people and their \
+/// The seeded profile's question, focused on preferences and assistant behavior.
+pub const PROFILE_QUESTION: &str = "Who is the user: How do they want the assistant to behave? \
+     What are their preferences? How do they like to be helped?";
+
+/// The profile question banks were seeded with from schema version 18 to 20.
+const PERSONAL_DATES_PROFILE_QUESTION: &str = "Who is the user: their preferences, important people and their \
      birthdays and anniversaries, work and home, the platforms they use, and how they like to be \
      helped. Not one-off events, tasks or routines.";
 
 /// The profile question banks were seeded with before schema version 18,
-/// which rewords it to [`PROFILE_QUESTION`] wherever it's still stored.
+/// which rewords it to include personal dates wherever it's still stored.
 const EARLIER_PROFILE_QUESTION: &str = "Who is the user: their preferences, important people, \
      work and home, the platforms they use, and how they like to be helped. Not upcoming events, \
      tasks or routines.";
@@ -492,7 +495,17 @@ pub(crate) fn log_memory_edit(
 pub(crate) fn reword_profile_question(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(
         "UPDATE mental_models SET question = ?1 WHERE question = ?2",
-        (PROFILE_QUESTION, EARLIER_PROFILE_QUESTION),
+        (PERSONAL_DATES_PROFILE_QUESTION, EARLIER_PROFILE_QUESTION),
+    )?;
+    Ok(())
+}
+
+/// Schema 21's conversion: update the default question without changing
+/// owner-written questions. The changed question invalidates the refresh fingerprint.
+pub(crate) fn refocus_profile_question(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE mental_models SET question = ?1 WHERE question = ?2",
+        (PROFILE_QUESTION, PERSONAL_DATES_PROFILE_QUESTION),
     )?;
     Ok(())
 }

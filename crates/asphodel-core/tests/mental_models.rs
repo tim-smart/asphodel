@@ -1594,30 +1594,44 @@ const EARLIER_PROFILE_QUESTION: &str = "Who is the user: their preferences, impo
 
 #[test]
 fn a_profile_seeded_with_the_earlier_question_still_takes_the_built_in_plan() {
-    // A bank created before the question changed still asks the earlier
-    // text. Put it back with the store at the current schema version, so
-    // either a migration on open or the plan lookup has to carry it over.
-    let h = Harness::new();
-    h.seed(fact(TEA));
-    {
-        let store = h.service.store().unwrap();
-        let conn = store.connection();
-        conn.execute(
-            "UPDATE mental_models SET question = ?1 WHERE name = ?2",
-            [EARLIER_PROFILE_QUESTION, PROFILE_NAME],
-        )
-        .unwrap();
-        conn.execute_batch(
-            "DELETE FROM migrations WHERE to_version > 17; PRAGMA user_version = 17;",
-        )
-        .unwrap();
+    // Simulate banks seeded with either historical default, then upgrade.
+    const PREVIOUS_QUESTION: &str = "Who is the user: their preferences, important people and their \
+         birthdays and anniversaries, work and home, the platforms they use, and how they like to be \
+         helped. Not one-off events, tasks or routines.";
+    for (version, question) in [(17, EARLIER_PROFILE_QUESTION), (20, PREVIOUS_QUESTION)] {
+        let h = Harness::new();
+        h.seed(fact(TEA));
+        let custom = plans_model(100);
+        h.service.create_model(BANK, &custom).unwrap();
+        {
+            let store = h.service.store().unwrap();
+            let conn = store.connection();
+            conn.execute(
+                "UPDATE mental_models SET question = ?1 WHERE name = ?2",
+                [question, PROFILE_NAME],
+            )
+            .unwrap();
+            conn.execute_batch(
+                &format!("DELETE FROM migrations WHERE to_version > {version}; PRAGMA user_version = {version};"),
+            )
+            .unwrap();
+        }
+        let h = h.restart();
+        let llm = quiet_llm(1);
+        applied(h.refresh(PROFILE_NAME, &llm, true));
+        assert!(calls(&llm, PLAN_TEMPLATE).is_empty(), "planned the profile");
+        let facets = h.input(PROFILE_NAME).facets;
+        assert!(facets.len() > 1, "{facets:?}");
+        let models = h.service.list_models(BANK).unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.name == custom.name)
+                .unwrap()
+                .question,
+            custom.question
+        );
     }
-    let h = h.restart();
-    let llm = quiet_llm(1);
-    applied(h.refresh(PROFILE_NAME, &llm, true));
-    assert!(calls(&llm, PLAN_TEMPLATE).is_empty(), "planned the profile");
-    let facets = h.input(PROFILE_NAME).facets;
-    assert!(facets.len() > 1, "{facets:?}");
 }
 
 #[test]
