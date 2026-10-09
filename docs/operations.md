@@ -95,17 +95,10 @@ dashboard to write the configuration:
 1. Reach the dashboard: `kubectl port-forward hermes-0 7720` and open
    `http://127.0.0.1:7720/dashboard`, or open it on the daemon's own
    machine.
-2. Read the setup code from the data dir. The daemon's log names the file
-   but never prints the code:
-
-   ```sh
-   kubectl exec hermes-0 -c asphodel -- cat /data/setup-code
-   ```
-
-3. Enter it, and choose the LLM: an OpenAI-compatible endpoint with an
-   optional API key, a ChatGPT subscription, or none for now (chunks wait
-   on the queue until `[llm]` is set).
-4. Finish. The daemon writes the files below and goes on starting, just as
+2. Choose the LLM: an OpenAI-compatible endpoint with an optional API key,
+   a ChatGPT subscription, or none for now (chunks wait on the queue until
+   `[llm]` is set). Nothing else is asked: no code, token or credential.
+3. Finish. The daemon writes the files below and goes on starting, just as
    a restart would read them. When it listens off loopback and no token is
    configured, setup makes one and shows it once. Give it to Hermes and
    the backup job as `ASPHODEL_TOKEN`; in the example, that's the
@@ -114,13 +107,25 @@ dashboard to write the configuration:
 For a ChatGPT subscription, log in once setup is done:
 `kubectl exec -it hermes-0 -c asphodel -- asphodel llm login --data-dir /data`.
 
-Setup needs the code, which only someone who can read the data dir has, so
-nobody else who can reach the port can configure the daemon first. The
-code is 128 random bits, kept in `setup-code` with mode 0600. It stays the
-same across restarts until setup is done, and is deleted then. When
-`ASPHODEL_TOKEN` is set, it authorises setup too. Setup runs once: after
-it, `POST /v1/setup` answers 409, and the files are changed by editing them
-and restarting.
+**Setup isn't protected.** Anyone who can reach an unconfigured daemon's
+port can complete setup: choose its LLM (and so where memory content is
+sent), and receive the bearer token it makes. Keep the daemon private
+until setup is done:
+
+- Run setup through `kubectl port-forward` or on the daemon's own machine,
+  and don't put an Ingress, LoadBalancer or other proxy in front of it
+  before then.
+- In the example, the `asphodel` Service makes the port reachable from
+  other pods in the namespace. Finish setup straight after the pod starts,
+  apply the Service afterwards, or limit port 7720 with a NetworkPolicy.
+- To skip setup, give the daemon a tuning file with `--config`, or put
+  `asphodel.toml` in the data dir before its first start.
+
+Setup runs once. After it, `POST /v1/setup` answers 409, every other route
+needs the token whenever one is configured, and the files are changed by
+editing them and restarting. A daemon that was taken over before you
+finished setup is recovered by stopping it, deleting `asphodel.toml` and
+`secrets.toml` from the data dir, and starting it again.
 
 After setup, the data dir holds:
 
@@ -139,7 +144,7 @@ as you would in a file of your own.
 
 While setup waits, the daemon holds the data dir's lock, as it does once
 it's running. A second daemon pointed at the same dir refuses to start,
-so it can't read the code or write the files. Each file is written to a
+so it can't write the files. Each file is written to a
 temp file, synced, renamed into place, and the directory synced, secrets
 first, so `asphodel.toml` (which is what marks setup as done) never lands
 on disk before the secrets it needs.
@@ -982,8 +987,10 @@ A restore into the volume the daemon already used keeps `asphodel.toml`,
 new, empty volume brings back the store only, so the daemon comes up
 waiting for setup. That's a safe place to stop: it doesn't open the
 store, so nothing queued is extracted and nothing is purged until the
-configuration is back. Running the wizard again would write starting
-values over any tuning you had changed, so put your own back instead:
+configuration is back. Like any unconfigured daemon, though, anyone who
+can reach it can complete setup, so keep it private until then. Running
+the wizard again would write starting values over any tuning you had
+changed, so put your own back instead:
 
 1. Put back the tuning file. With the pod waiting for setup:
 

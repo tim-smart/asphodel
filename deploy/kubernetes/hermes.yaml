@@ -11,8 +11,11 @@
 # Then set Asphodel up from its dashboard (docs/operations.md, "First-run
 # setup"). With no tuning file in its data dir, the daemon waits for it:
 #   kubectl port-forward hermes-0 7720
-#   kubectl exec hermes-0 -c asphodel -- cat /data/setup-code
 #   open http://127.0.0.1:7720/dashboard
+# Setup asks for no code or token, so anyone who can reach the port before
+# it's done can complete it. Do it straight after the pod first starts, and
+# keep the port private until then: no Ingress or LoadBalancer, and the
+# Service below lets other pods in the namespace reach it.
 # Setup writes the tuning file and any secrets into the data volume, so they
 # survive restarts and nothing else needs mounting. Without the secret above,
 # setup makes a token and shows it once: store it as that secret and restart
@@ -23,6 +26,8 @@
 # and setup never runs (docs/operations.md, "The tuning file").
 ---
 # Only the backup CronJob uses this. Hermes reaches the daemon on loopback.
+# It also exposes first-run setup to the namespace until setup is done; apply
+# it afterwards, or limit port 7720 with a NetworkPolicy, if that matters.
 apiVersion: v1
 kind: Service
 metadata:

@@ -306,27 +306,12 @@ export function mount(root, { fetch }) {
     };
   }
 
-  /// The setup wizard: the code from the data dir, then the LLM. It writes
-  /// the tuning file and the secrets into the data dir, and the daemon goes
-  /// on starting.
+  /// The setup wizard: the LLM, or none for now. It asks for no code or
+  /// token, writes the tuning file and the secrets into the data dir, and
+  /// the daemon goes on starting.
   function setupPage(state) {
     settingUp = true;
     generation += 1;
-    const codeFile = state.code_file ?? "the data dir's setup-code file";
-    const code = field(
-      "setup-code",
-      "Setup code",
-      { type: "password", required: true, autocomplete: "one-time-code" },
-      [
-        "It's in ",
-        h("code", {}, codeFile),
-        ", which only someone with access to the daemon's data dir can read. In Kubernetes: ",
-        h("code", {}, `kubectl exec <pod> -c asphodel -- cat ${codeFile}`),
-        ". If ",
-        h("code", {}, "ASPHODEL_TOKEN"),
-        " is set, it works here too.",
-      ],
-    );
     let mode = "api_key";
     const modes = h(
       "fieldset",
@@ -394,13 +379,10 @@ export function mount(root, { fetch }) {
           submit.disabled = true;
           error.hidden = true;
           try {
-            setupDone(await api.setup(code.input.value.trim(), body));
+            setupDone(await api.setup(body));
           } catch (failure) {
             submit.disabled = false;
-            error.textContent =
-              failure instanceof ApiError && failure.status === 401
-                ? "That isn't the setup code."
-                : String(failure.message ?? failure);
+            error.textContent = failure instanceof ApiError ? failure.message : String(failure.message ?? failure);
             error.hidden = false;
             error.focus();
           }
@@ -414,7 +396,6 @@ export function mount(root, { fetch }) {
         "There's no tuning file yet. This writes one into the data dir, with any secrets beside it, and starts the daemon. Change it later by editing the file and restarting.",
       ),
       error,
-      code.nodes,
       modes,
       keyFields,
       llmFields,
@@ -441,7 +422,7 @@ export function mount(root, { fetch }) {
     );
     setMode(mode);
     root.replaceChildren(h("main", { class: "token-page" }, form));
-    code.input.focus();
+    model.input.focus();
   }
 
   /// What setup did, and the token it made, shown this once.

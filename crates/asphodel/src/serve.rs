@@ -223,8 +223,7 @@ pub(crate) async fn run_with(
         (None, Some(finished)) => {
             warn!(
                 listen = %address,
-                code = %args.data_dir.join(setup::SETUP_CODE_FILE).display(),
-                "no tuning file: open /dashboard to set up, with the code in the file named here"
+                "no tuning file: open /dashboard to set up; until then anyone who can reach this address can"
             );
             await_setup(&args, finished, stop.clone()).await
         }

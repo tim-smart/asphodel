@@ -178,9 +178,9 @@ impl Daemon {
         }
     }
 
-    /// `POST /v1/setup` with `code` as the bearer token.
-    fn setup(&self, code: Option<&str>, body: &Value) -> (u16, Value) {
-        let (status, body) = self.send("POST", "/v1/setup", code, Some(body)).unwrap();
+    /// `POST /v1/setup`, which takes no token.
+    fn setup(&self, body: &Value) -> (u16, Value) {
+        let (status, body) = self.send("POST", "/v1/setup", None, Some(body)).unwrap();
         (status, serde_json::from_str(&body).unwrap_or(Value::Null))
     }
 
@@ -356,20 +356,12 @@ fn secrets_are_read_from_the_environment_and_never_logged() {
     }
 }
 
-/// The setup code the daemon wrote into `data`.
-fn setup_code(data: &std::path::Path) -> String {
-    std::fs::read_to_string(data.join("setup-code"))
-        .unwrap()
-        .trim()
-        .to_string()
-}
-
 #[test]
 fn first_run_setup_writes_the_config_into_the_data_dir_and_survives_restarts() {
     let dir = TestDir::new();
     let data = dir.0.join("data");
-    // Off loopback with no token anywhere: setup still starts, guarded by
-    // its code, and makes the token.
+    // Off loopback with no token anywhere: setup still starts, asks for
+    // nothing, and makes the token.
     let serve_off_loopback = || {
         let (listen, addr) = every_interface();
         let mut command = serve_in(&dir);
@@ -393,25 +385,21 @@ fn first_run_setup_writes_the_config_into_the_data_dir_and_survives_restarts() {
         "model": "model-under-test",
         "api_key": LLM_KEY,
     }});
-    // Without the code, or with a wrong one, nothing is written.
-    assert_eq!(daemon.setup(None, &llm).0, 401);
-    assert_eq!(daemon.setup(Some("not-the-code"), &llm).0, 401);
     // A bad value is refused, and setup still waits.
-    let code = setup_code(&data);
     let bad = serde_json::json!({"llm": {"endpoint": "ftp://nowhere", "model": "m"}});
-    assert_eq!(daemon.setup(Some(&code), &bad).0, 400);
+    assert_eq!(daemon.setup(&bad).0, 400);
     assert!(!data.join("asphodel.toml").exists());
 
-    let (status, done) = daemon.setup(Some(&code), &llm);
+    let (status, done) = daemon.setup(&llm);
     assert_eq!(status, 200, "{done}");
     let token = done["token"]
         .as_str()
         .expect("setup makes a token")
         .to_string();
     daemon.wait_ready();
-    // Setup happens once: the code is gone and a second call is refused.
-    assert!(!data.join("setup-code").exists());
-    assert_eq!(daemon.setup(Some(&code), &llm).0, 409);
+    // Setup happens once: a second call is refused, so nobody can take
+    // the daemon over afterwards.
+    assert_eq!(daemon.setup(&llm).0, 409);
     {
         use std::os::unix::fs::PermissionsExt;
         let secrets = std::fs::metadata(data.join("secrets.toml")).unwrap();
@@ -431,7 +419,7 @@ fn first_run_setup_writes_the_config_into_the_data_dir_and_survives_restarts() {
         .unwrap();
     assert_eq!(status, 201, "{body}");
     let log = daemon.log();
-    for secret in [LLM_KEY, &token, &code] {
+    for secret in [LLM_KEY, &token] {
         assert!(!log.contains(secret), "a secret was logged:\n{log}");
     }
 
@@ -468,17 +456,15 @@ fn first_run_setup_writes_the_config_into_the_data_dir_and_survives_restarts() {
 }
 
 #[test]
-fn a_pending_setup_keeps_its_code_across_restarts_owns_its_data_dir_and_takes_the_environment_token()
- {
+fn a_pending_setup_survives_a_restart_and_owns_its_data_dir() {
     let dir = TestDir::new();
     let data = dir.0.join("data");
     let addr = loopback();
     let mut daemon = start(serve_in(&dir).args(["--listen", &addr]), &addr);
     assert_eq!(daemon.health()["setup"], true);
-    let code = setup_code(&data);
     daemon.log();
 
-    // A restart before setup is done waits again, on the same code.
+    // A restart before setup is done waits again.
     let addr = loopback();
     let daemon = start(
         serve_in(&dir)
@@ -487,21 +473,19 @@ fn a_pending_setup_keeps_its_code_across_restarts_owns_its_data_dir_and_takes_th
         &addr,
     );
     assert_eq!(daemon.health()["setup"], true);
-    assert_eq!(setup_code(&data), code);
     // Waiting for setup, the daemon owns the data dir: a second one on it
-    // refuses to start, so it can't take the code or write the files.
+    // refuses to start, so it can't write the files.
     let (listen, _) = every_interface();
     refused(
         &dir,
         serve_in(&dir).args(["--listen", &listen]),
         "locked by another asphodel process",
     );
-    assert_eq!(setup_code(&data), code);
     assert!(!data.join("asphodel.toml").exists());
     assert!(!data.join("secrets.toml").exists());
-    // `ASPHODEL_TOKEN` authorises setup too, and setup leaves the LLM for
-    // later and makes no token when one is already configured.
-    let (status, done) = daemon.setup(Some(TOKEN), &serde_json::json!({}));
+    // Setup leaves the LLM for later, and makes no token when one is
+    // already configured.
+    let (status, done) = daemon.setup(&serde_json::json!({}));
     assert_eq!(status, 200, "{done}");
     assert_eq!(done["token"], Value::Null);
     let mut daemon = daemon;

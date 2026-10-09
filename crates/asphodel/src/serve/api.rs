@@ -7,7 +7,8 @@
 //! wizard it answers 200 with `setup: true` instead, so a supervisor doesn't
 //! restart a daemon that is waiting for its operator. Every other route
 //! answers 503 until the daemon is ready, and needs the bearer token when
-//! one is configured; `/v1/setup` has its own guard ([`super::setup`]).
+//! one is configured. `/v1/setup` needs no token, and works only until
+//! setup is done ([`super::setup`]).
 //! After SIGTERM, health and ingest answer 503 while the daemon drains.
 
 use std::io::Read;
@@ -536,7 +537,7 @@ async fn authorize(
 
 /// Compares the token in time independent of where the first difference
 /// is, so the comparison doesn't leak a prefix.
-pub(crate) fn token_matches(token: &Secret, given: &str) -> bool {
+fn token_matches(token: &Secret, given: &str) -> bool {
     let expected = token.expose().as_bytes();
     let given = given.trim().as_bytes();
     let mut difference = expected.len() ^ given.len();

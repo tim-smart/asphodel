@@ -7,9 +7,12 @@
 //! to write it. The dashboard's wizard makes that call. Once the file is
 //! written, startup goes on exactly as a restart would read it.
 //!
-//! Setup is guarded by a one-time code in [`SETUP_CODE_FILE`], readable only
-//! by whoever can read the data dir. `ASPHODEL_TOKEN` is accepted in its
-//! place when it's set. The code is never logged: the log names the file.
+//! Setup asks for no code, token or credentials, and nothing guards it:
+//! anyone who can reach an unconfigured daemon can complete setup, choosing
+//! its LLM and receiving the token it makes. Keep the daemon private until
+//! setup is done. Setup runs once; after it, `POST /v1/setup` answers 409,
+//! and every other route needs the token, when one is configured, as
+//! before.
 //!
 //! The secrets the wizard keeps (the bearer token and the LLM's API key) go
 //! in [`SECRETS_FILE`], mode 0600. The environment wins over each of them.
@@ -25,24 +28,21 @@ use asphodel_core::Tuning;
 use asphodel_core::config::{Deployment, LLM_API_KEY_ENV, LlmAuth, Secret, TOKEN_ENV};
 use asphodel_core::models::LlmSettings;
 use axum::Json;
+use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequest, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::Shared;
-use super::api::{ApiError, token_matches};
+use super::api::ApiError;
 
 /// The tuning file in the data dir, read when `--config` isn't given.
 pub(crate) const CONFIG_FILE: &str = "asphodel.toml";
 
 /// The secrets the wizard keeps, as TOML: `token` and `llm_api_key`.
 pub(crate) const SECRETS_FILE: &str = "secrets.toml";
-
-/// The one-time code that authorises setup. Removed once setup is done.
-pub(crate) const SETUP_CODE_FILE: &str = "setup-code";
 
 /// The tuning file in `data_dir`, if there is one.
 pub(crate) fn data_dir_config(data_dir: &Path) -> Option<PathBuf> {
@@ -141,10 +141,7 @@ impl StartingFloors {
 
 /// Setup waiting for the wizard.
 pub(crate) struct Pending {
-    code: Secret,
     data_dir: PathBuf,
-    /// `ASPHODEL_TOKEN`, which authorises setup too.
-    env_token: Option<Secret>,
     /// Whether a token already exists, from the environment or the data dir.
     token_configured: bool,
     /// Whether the daemon listens off loopback, so needs a token.
@@ -155,8 +152,7 @@ pub(crate) struct Pending {
 }
 
 impl Pending {
-    /// Reads or makes the setup code, and returns the pending setup and
-    /// what resolves once it's done.
+    /// The pending setup, and what resolves once it's done.
     pub(crate) fn new(
         data_dir: &Path,
         needs_token: bool,
@@ -164,16 +160,12 @@ impl Pending {
     ) -> anyhow::Result<(Self, oneshot::Receiver<()>)> {
         fs::create_dir_all(data_dir)
             .with_context(|| format!("creating the data dir {}", data_dir.display()))?;
-        let code = setup_code(data_dir)?;
         let stored = StoredSecrets::read(data_dir)?;
-        let env_token = Secret::from_env(TOKEN_ENV);
-        let token_configured = env_token.is_some() || stored.token().is_some();
+        let token_configured = Secret::from_env(TOKEN_ENV).is_some() || stored.token().is_some();
         let (done, finished) = oneshot::channel();
         Ok((
             Self {
-                code,
                 data_dir: data_dir.to_owned(),
-                env_token,
                 token_configured,
                 needs_token,
                 env_llm_api_key: Secret::from_env(LLM_API_KEY_ENV),
@@ -184,18 +176,8 @@ impl Pending {
         ))
     }
 
-    fn authorised(&self, given: Option<&str>) -> bool {
-        given.is_some_and(|given| {
-            token_matches(&self.code, given)
-                || self
-                    .env_token
-                    .as_ref()
-                    .is_some_and(|token| token_matches(token, given))
-        })
-    }
-
-    /// Validates `request`, writes the secrets and the tuning file, and
-    /// removes the setup code. The tuning file goes last: it's what says
+    /// Validates `request`, and writes the secrets and the tuning file. The
+    /// tuning file goes last: it's what says
     /// setup is done, so a failure before it leaves setup to try again.
     fn complete(&self, request: SetupRequest) -> Result<SetupDone, ApiError> {
         let llm = request.llm.map(LlmChoice::normalized).transpose()?;
@@ -244,13 +226,6 @@ impl Pending {
         }
         let config = self.data_dir.join(CONFIG_FILE);
         write_file(&config, text.as_bytes(), 0o644).map_err(ApiError::internal)?;
-        // The tuning file is written, so setup is done whatever happens here:
-        // a code left behind authorises nothing once setup has run.
-        match fs::remove_file(self.data_dir.join(SETUP_CODE_FILE)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => warn!(%error, "removing the setup code failed"),
-        }
         info!(config = %config.display(), "setup wrote the tuning file");
         Ok(SetupDone {
             data_dir: self.data_dir.clone(),
@@ -276,8 +251,6 @@ pub(crate) struct SetupState {
     makes_token: bool,
     /// `ASPHODEL_LLM_API_KEY` is set, so setup takes no key.
     llm_api_key_from_env: bool,
-    /// The file holding the setup code.
-    code_file: Option<PathBuf>,
     /// The floors setup would write that are placeholders, not calibrated,
     /// as the tuning file sets them.
     uncalibrated: Vec<String>,
@@ -360,7 +333,6 @@ pub(crate) async fn state(State(app): State<Shared>) -> Json<SetupState> {
             token_configured: pending.token_configured,
             makes_token: pending.needs_token && !pending.token_configured,
             llm_api_key_from_env: pending.env_llm_api_key.is_some(),
-            code_file: Some(pending.data_dir.join(SETUP_CODE_FILE)),
             uncalibrated: pending.floors.uncalibrated(),
         },
         None => SetupState {
@@ -368,45 +340,18 @@ pub(crate) async fn state(State(app): State<Shared>) -> Json<SetupState> {
             token_configured: false,
             makes_token: false,
             llm_api_key_from_env: false,
-            code_file: None,
             uncalibrated: Vec::new(),
         },
     })
 }
 
-/// `POST /v1/setup`: writes the config and lets startup go on. Needs the
-/// setup code (or `ASPHODEL_TOKEN`) as the bearer token; 409 once setup is
-/// done or when it was never needed.
+/// `POST /v1/setup`: writes the config and lets startup go on. It needs no
+/// token: whoever reaches an unconfigured daemon first sets it up. 409 once
+/// setup is done or when it was never needed.
 pub(crate) async fn complete(
     State(app): State<Shared>,
-    request: Request,
+    body: Result<Json<SetupRequest>, JsonRejection>,
 ) -> Result<Json<SetupDone>, ApiError> {
-    let given = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    {
-        let slot = app
-            .setup
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let Some(pending) = slot.as_ref() else {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                "setup is done: change the tuning file in the data dir and restart",
-            ));
-        };
-        if !pending.authorised(given.as_deref()) {
-            return Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "setup needs the code in the data dir's setup-code file",
-            ));
-        }
-    }
-    // The body is read only once the caller is known to hold the code.
-    let body: Result<Json<SetupRequest>, JsonRejection> = Json::from_request(request, &()).await;
     let Json(body) = body?;
     let app = std::sync::Arc::clone(&app);
     tokio::task::spawn_blocking(move || {
@@ -486,21 +431,6 @@ fn tuning_text(llm: Option<&LlmChoice>, floors: &StartingFloors) -> String {
         quote(reranker)
     ));
     text
-}
-
-/// The setup code in `data_dir`, made if there isn't one yet. A restart
-/// before setup is done keeps the same code.
-fn setup_code(data_dir: &Path) -> anyhow::Result<Secret> {
-    let path = data_dir.join(SETUP_CODE_FILE);
-    match fs::read_to_string(&path) {
-        Ok(code) if !code.trim().is_empty() => return Ok(Secret::new(code.trim())),
-        Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
-    }
-    let code = random_hex(16)?;
-    write_private(&path, format!("{code}\n").as_bytes())?;
-    Ok(Secret::new(code))
 }
 
 /// `bytes` random bytes from the kernel, as lowercase hex.

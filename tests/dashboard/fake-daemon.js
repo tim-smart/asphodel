@@ -8,8 +8,7 @@ export const TOKEN = "dashboard-token";
 
 export const NOW = "2026-10-03T09:00:00Z";
 
-/// The code a daemon waiting for setup wants, and the token setup makes.
-export const SETUP_CODE = "setup-code-from-the-data-dir";
+/// The token setup makes.
 export const SETUP_TOKEN = "token-setup-made";
 
 /// The placeholder floor a daemon waiting for setup warns about.
@@ -606,22 +605,18 @@ export class FakeDaemon {
     return this.route(request);
   }
 
-  /// `/v1/setup`, which needs no token: the POST takes the setup code.
-  setup({ method, authorization, body }) {
+  /// `/v1/setup`, which needs no token.
+  setup({ method, body }) {
     if (method === "GET") {
       return json(200, {
         needed: this.settingUp,
         token_configured: false,
         makes_token: this.settingUp,
         llm_api_key_from_env: false,
-        code_file: this.settingUp ? "/data/setup-code" : null,
         uncalibrated: this.settingUp ? [UNCALIBRATED] : [],
       });
     }
     if (!this.settingUp) return error(409, "setup is done");
-    if (authorization !== `Bearer ${SETUP_CODE}`) {
-      return error(401, "setup needs the code in the data dir's setup-code file");
-    }
     if (body?.llm && !body.llm.model) return error(400, "llm.model is required");
     this.settingUp = false;
     this.token = SETUP_TOKEN;

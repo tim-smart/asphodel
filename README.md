@@ -45,10 +45,11 @@ nix build                     # or: cargo build --release, inside `nix develop`
 (or `ASPHODEL_MODEL_DIR`), checking each against the SHA-256 in the
 manifest. The daemon never downloads anything.
 
-The first time, open `http://127.0.0.1:7720/dashboard` and enter the setup
-code from `~/.local/share/asphodel/setup-code`. Setup asks for the LLM and
-writes `asphodel.toml`, with any secrets in `secrets.toml`, into the data
-dir; later starts read them from there. To keep the tuning file elsewhere,
+The first time, open `http://127.0.0.1:7720/dashboard`. Setup asks only for
+the LLM, which can wait, and writes `asphodel.toml`, with any secrets in
+`secrets.toml`, into the data dir; later starts read them from there.
+Nothing protects setup itself: anyone who can reach an unconfigured daemon
+can complete it, so keep it private until it's done. To keep the tuning file elsewhere,
 pass `--config`, which wins over the data dir's
 (`docs/operations.md`, "First-run setup" and "The tuning file").
 
