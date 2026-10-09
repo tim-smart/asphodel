@@ -1803,6 +1803,29 @@ dialog.confirm h2 {
   justify-self: start;
 }
 
+/* The setup wizard, on the token prompt's card */
+
+.setup-card {
+  width: min(36rem, 100%);
+}
+
+.setup-card [hidden] {
+  display: none;
+}
+
+.setup-modes {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.setup-fields {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.setup-fields[hidden] {
+  display: none;
+}
+
 /* Narrow screens */
 
 @media (max-width: 60rem) {

@@ -3,8 +3,11 @@
 //! calls the replay harness makes.
 //!
 //! `/v1/health` answers before the daemon is ready, with 503, so a
-//! supervisor can gate readiness on it. Every other route answers 503 until
-//! the daemon is ready, and needs the bearer token when one is configured.
+//! supervisor can gate readiness on it. While first-run setup waits for the
+//! wizard it answers 200 with `setup: true` instead, so a supervisor doesn't
+//! restart a daemon that is waiting for its operator. Every other route
+//! answers 503 until the daemon is ready, and needs the bearer token when
+//! one is configured; `/v1/setup` has its own guard ([`super::setup`]).
 //! After SIGTERM, health and ingest answer 503 while the daemon drains.
 
 use std::io::Read;
@@ -137,6 +140,10 @@ pub(crate) fn router(app: Shared) -> Router {
         .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize));
     Router::new()
         .route("/v1/health", get(health))
+        .route(
+            "/v1/setup",
+            get(super::setup::state).post(super::setup::complete),
+        )
         .route("/dashboard", get(super::dashboard::page))
         .route("/dashboard/", get(super::dashboard::page))
         .route("/dashboard/{file}", get(super::dashboard::asset))
@@ -160,7 +167,7 @@ struct ErrorBody<'a> {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
@@ -181,7 +188,7 @@ impl ApiError {
         )
     }
 
-    fn internal(error: impl std::fmt::Display) -> Self {
+    pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
         warn!(%error, "request failed");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
     }
@@ -508,7 +515,10 @@ async fn authorize(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if let Some(token) = &app.token {
+    // The token is known once the config is: until then, as during setup,
+    // nothing behind it is ready either.
+    let token = app.token.get().ok_or_else(ApiError::not_ready)?;
+    if let Some(token) = token {
         let given = request
             .headers()
             .get(header::AUTHORIZATION)
@@ -526,7 +536,7 @@ async fn authorize(
 
 /// Compares the token in time independent of where the first difference
 /// is, so the comparison doesn't leak a prefix.
-fn token_matches(token: &Secret, given: &str) -> bool {
+pub(crate) fn token_matches(token: &Secret, given: &str) -> bool {
     let expected = token.expose().as_bytes();
     let given = given.trim().as_bytes();
     let mut difference = expected.len() ^ given.len();
@@ -541,10 +551,14 @@ async fn not_found() -> ApiError {
 }
 
 /// `GET /v1/health`: 503 while the store migrates and the models load, and
-/// again once the daemon is draining; 200 with the version once ready.
+/// again once the daemon is draining; 200 with the version once ready, and
+/// 200 with `ready: false, setup: true` while setup waits for the wizard.
 async fn health(State(app): State<Shared>) -> (StatusCode, Json<Health>) {
     match app.ready() {
         Some(ready) if !app.draining() => (StatusCode::OK, Json(ready.service.health())),
+        None if !app.draining() && app.setting_up() => {
+            (StatusCode::OK, Json(Health::setup(app.clock.now())))
+        }
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(Health::starting(app.clock.now())),

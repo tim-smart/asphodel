@@ -3,9 +3,10 @@
 //! Every setting sits in one of five places:
 //!
 //! - fixed in code, in [`crate::constants`];
-//! - the daemon-wide [`Tuning`], read from an optional TOML file;
+//! - the daemon-wide [`Tuning`], read from a TOML file: `--config`, or the
+//!   one first-run setup writes into the data dir;
 //! - [`Deployment`] flags and environment variables, with secrets from the
-//!   environment only;
+//!   environment or the data dir, never a flag;
 //! - the bank's identity, which lives in the bank row;
 //! - flags on `asphodel replay` and `asphodel bench`.
 //!

@@ -28,7 +28,9 @@ models, the timezone database and BusyBox for a shell. Load it with
 `docker load < result` and push it to your registry.
 
 `deploy/kubernetes/` has the example deployment: Hermes with Asphodel as a
-native sidecar, a nightly backup CronJob and a restore pod.
+native sidecar, a nightly backup CronJob and a restore pod. It needs no
+config file: on first start the daemon waits for setup from its dashboard,
+which writes the configuration into the data volume.
 `docs/operations.md` walks through it.
 
 ### On a laptop
@@ -36,13 +38,19 @@ native sidecar, a nightly backup CronJob and a restore pod.
 ```sh
 nix build                     # or: cargo build --release, inside `nix develop`
 ./result/bin/asphodel models fetch
-./result/bin/asphodel serve --data-dir ~/.local/share/asphodel --config asphodel.toml
+./result/bin/asphodel serve --data-dir ~/.local/share/asphodel
 ```
 
 `models fetch` downloads the two models into `~/.cache/asphodel/models`
 (or `ASPHODEL_MODEL_DIR`), checking each against the SHA-256 in the
-manifest. The daemon never downloads anything. The tuning file needs the
-LLM and a floor for each model (`docs/operations.md`, "The tuning file").
+manifest. The daemon never downloads anything.
+
+The first time, open `http://127.0.0.1:7720/dashboard` and enter the setup
+code from `~/.local/share/asphodel/setup-code`. Setup asks for the LLM and
+writes `asphodel.toml`, with any secrets in `secrets.toml`, into the data
+dir; later starts read them from there. To keep the tuning file elsewhere,
+pass `--config`, which wins over the data dir's
+(`docs/operations.md`, "First-run setup" and "The tuning file").
 
 ### The plugin
 

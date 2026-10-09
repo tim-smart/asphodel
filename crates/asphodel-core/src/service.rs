@@ -900,6 +900,7 @@ impl Service {
         Health {
             version: crate::VERSION,
             ready: true,
+            setup: false,
             now: self.now(),
         }
     }
@@ -1914,7 +1915,17 @@ impl Health {
         Self {
             version: crate::VERSION,
             ready: false,
+            setup: false,
             now,
+        }
+    }
+
+    /// What `/v1/health` reports while first-run setup waits for the
+    /// wizard: not ready, and waiting on the operator rather than starting.
+    pub fn setup(now: Timestamp) -> Self {
+        Self {
+            setup: true,
+            ..Self::starting(now)
         }
     }
 }
@@ -1945,5 +1956,7 @@ pub struct Housekeeping {
 pub struct Health {
     pub version: &'static str,
     pub ready: bool,
+    /// The daemon is waiting for first-run setup (`POST /v1/setup`).
+    pub setup: bool,
     pub now: Timestamp,
 }
