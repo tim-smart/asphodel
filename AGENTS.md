@@ -54,7 +54,9 @@ Tim's machine.
 Tim granted standing authorization on 2026-10-04 for live comparisons,
 including live recordings and LLM-backed fast top-ups, using
 `https://chatgpt.com/backend-api/codex`, `auth = "chatgpt"`,
-`model = "gpt-6-luna"` and `reasoning_effort = "low"`. No per-run approval
+`model = "gpt-6-luna"` and `reasoning_effort = "medium"`. Tim changed the
+effort from `"low"` to `"medium"` himself on 2026-10-09, to match his live
+instance; recordings at `"low"` no longer replay. No per-run approval
 is needed within that boundary while the data stays private. Changes to the
 endpoint, auth, model or reasoning setting require independent Fable
 sub-agent review arranged by Mac Developer before use, under the same

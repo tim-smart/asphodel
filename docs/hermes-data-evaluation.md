@@ -32,8 +32,9 @@ prepare material. Follow these rules:
    private.** Tim granted this on 2026-10-04 for live recordings and
    LLM-backed `fast` top-ups using `https://chatgpt.com/backend-api/codex`,
    `auth = "chatgpt"`, `model = "gpt-6-luna"` and
-   `reasoning_effort = "low"`. No new per-run approval is needed within
-   this boundary, including login for this backend. Before changing the
+   `reasoning_effort = "medium"`. Tim changed the effort from `"low"` on
+   2026-10-09, to match his live instance, so recordings at `"low"` no
+   longer replay. No new per-run approval is needed within this boundary, including login for this backend. Before changing the
    endpoint, auth, model or reasoning setting, ask Mac Developer to arrange
    independent Fable review of the proposed change under rule 4. This does
    not accept labels, probes, probe re-anchors or floor selection. Browsing (step 5),
@@ -152,7 +153,7 @@ to start without floors for the exact loaded models.
 auth = "chatgpt"
 model = "gpt-6-luna"
 endpoint = "https://chatgpt.com/backend-api/codex"
-reasoning_effort = "low"
+reasoning_effort = "medium"
 
 [reconcile.embedding_floors]
 "bge-small-en-v1.5:int8" = 0.8
