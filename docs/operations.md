@@ -129,7 +129,7 @@ p02/p04 remain to be accepted. The relevance scale stays `3.564211`.
 These are configuration values, not built-in defaults: floors and scales
 must still be supplied for the exact model id.
 
-`[llm] concurrency` (default 10) is how many LLM calls may be in flight at
+`[llm] concurrency` (default 4) is how many LLM calls may be in flight at
 once across the daemon, refreshes included, and how many chunks each bank
 extracts at once. Chunks still commit in queue order, and a chunk whose
 search missed a memory another chunk committed reconciles again, so a
