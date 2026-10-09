@@ -628,14 +628,15 @@ the fingerprint; another day below it does not.
 
 New memories and significance changes that pass a model's filters request
 a refresh at `mental_models.trigger_level` or above; kept memories trigger
-regardless of significance. Requests are
-debounced per bank, by default for 5 minutes after the last trigger and
-at most 30 minutes after the first. Ordinary refreshes also wait at least
-30 minutes after a successful refresh. A correction that retracts, ends,
-refines or reopens a cited memory requests an urgent repair, including
-models citing its successor. Urgent repairs bypass the interval after a
-success, but still respect the debounce, the LLM hold and the 30-minute
-retry wait after a failure. Requests survive a restart, and a request
+regardless of significance. A correction that retracts, ends, refines or
+reopens a cited memory requests one too, including for models citing its
+successor. Requests are debounced per bank, by default for 5 minutes after
+the last trigger and at most 30 minutes after the first. All of these
+requests are urgent: they don't wait 30 minutes after a successful
+refresh, but still respect the debounce, the LLM hold and the 30-minute
+retry wait after a failure. Only an owner's edit to a model requests an
+ordinary refresh, which also waits at least 30 minutes after a successful
+one. Requests survive a restart, and a request
 made during a refresh is not cleared by that refresh. The daily bank-local
 sweep checks every enabled model too. None of this runs inside a prompt
 block fetch.

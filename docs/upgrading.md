@@ -1,5 +1,18 @@
 # Upgrading
 
+## Significant memories refresh models without the 30-minute wait
+
+A new memory at `mental_models.trigger_level` or above, a kept one, or one
+whose significance went up now requests an urgent refresh of the models
+whose filters it passes, as corrections to cited memories already did. The
+model refreshes once the bank's debounce has passed (5 minutes after the
+last trigger, at most 30 after the first) instead of also waiting 30
+minutes after its last refresh. An active conversation can therefore cost
+up to one write call per model per quiet debounce, instead of one per
+half hour. An owner's edit to a model still waits out the interval, and a
+failed refresh still waits 30 minutes before it's tried again. No action
+is needed.
+
 ## Notable memories last about 100 days
 
 The default `strength.significance.notable` drops from 0.5 to 0.31. With

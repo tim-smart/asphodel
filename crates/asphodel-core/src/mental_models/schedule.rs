@@ -5,8 +5,10 @@
 //!   refresh. The debounce is per bank: a requested model is due
 //!   `refresh_debounce_minutes` after the bank's last trigger, and never
 //!   later than `refresh_max_delay_minutes` after its first.
-//! - Ordinary refreshes wait at least [`MIN_REFRESH_INTERVAL`]; urgent
-//!   repairs bypass that wait after a successful refresh. A
+//! - Ordinary refreshes, which only an owner's edit to a model requests,
+//!   wait at least [`MIN_REFRESH_INTERVAL`]; urgent ones, for significant
+//!   memories and changes to cited ones, bypass that wait after a
+//!   successful refresh. A
 //!   failed refresh waits as long before it's tried again. A refresh the
 //!   LLM's hold kept from running isn't a failure: it's due again when the
 //!   hold lifts. Holds live in memory, like the bank's last trigger.

@@ -723,7 +723,7 @@ fn plans_model(max_tokens: u32) -> ModelSpec {
 // Refresh triggers and scheduling
 
 #[test]
-fn a_notable_memory_triggers_a_refresh_five_minutes_later_and_at_most_every_thirty() {
+fn a_notable_memory_triggers_a_refresh_five_minutes_later_even_right_after_another() {
     let h = Harness::new();
     let said = h.now();
     h.says(fact(TEA));
@@ -743,16 +743,25 @@ fn a_notable_memory_triggers_a_refresh_five_minutes_later_and_at_most_every_thir
     assert_eq!(writes(&llm), 1);
     assert_eq!(h.profile().last_refreshed_at, Some(refreshed));
 
-    // The debounce alone would run the next one at +6 minutes.
+    // A significant memory doesn't wait thirty minutes after the last
+    // refresh: the debounce alone runs the next one at +6 minutes.
     h.advance(minutes(1));
     h.says(fact("Tim keeps bees."));
-    h.set(refreshed + minutes(6));
+    h.set(refreshed + minutes(6) - secs(1));
     let waiting = h.tick(&llm);
     assert!(waiting.ran.is_empty());
-    assert_eq!(waiting.next_due, Some(refreshed + minutes(30)));
-    h.set(refreshed + minutes(30));
+    assert_eq!(waiting.next_due, Some(refreshed + minutes(6)));
+    h.set(refreshed + minutes(6));
     assert_eq!(h.tick(&llm).ran.len(), 1);
     assert_eq!(writes(&llm), 2);
+
+    // An owner's edit to the model does.
+    let again = h.now();
+    h.edit(PROFILE_NAME, json!({"max_tokens": 400})).unwrap();
+    h.advance(minutes(5));
+    let waiting = h.tick(&llm);
+    assert!(waiting.ran.is_empty());
+    assert_eq!(waiting.next_due, Some(again + minutes(30)));
 }
 
 #[test]
@@ -2054,10 +2063,11 @@ fn an_answer_renders_whole_and_a_retracted_citation_takes_the_model_out() {
     assert_eq!(h.tick(&llm).ran.len(), 1);
     assert_eq!(writes(&llm), 1);
 
-    // Completing the urgent refresh restores the ordinary write interval.
+    // Completing the urgent refresh restores the ordinary write interval
+    // for an owner's edit.
     let refreshed = h.now();
     h.advance(minutes(1));
-    h.says(fact("Tim keeps bees."));
+    h.edit(PROFILE_NAME, json!({"max_tokens": 400})).unwrap();
     h.advance(minutes(5));
     let waiting = h.tick(&llm);
     assert!(waiting.ran.is_empty());
@@ -3418,11 +3428,11 @@ impl LlmClient for KeepsDuringCall<'_> {
 }
 
 #[test]
-fn a_trigger_during_a_refresh_is_refreshed_after_the_interval() {
+fn a_trigger_during_a_refresh_is_refreshed_after_the_debounce() {
     // The refresh selected its inputs before the keep, so
     // the kept memory was never shown to the LLM. The request the keep made
-    // has to survive the refresh's completion and run once the minimum
-    // interval has passed, not wait for the next write or the 04:00 sweep.
+    // has to survive the refresh's completion and run once the debounce
+    // has passed, not wait for the next write or the 04:00 sweep.
     let (h, faded) = Harness::with_faded(|_| {}, vec![fact("Tim once tried surfing in Raglan.")]);
     h.says(fact(TEA));
     h.advance(minutes(5));
@@ -3436,9 +3446,9 @@ fn a_trigger_during_a_refresh_is_refreshed_after_the_interval() {
     assert_eq!(ran.ran.len(), 1);
     assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
     // The trigger during the refresh wasn't dropped.
-    assert_eq!(ran.next_due, Some(refreshed + minutes(30)));
+    assert_eq!(ran.next_due, Some(refreshed + minutes(5)));
 
-    h.set(refreshed + minutes(30));
+    h.set(refreshed + minutes(5));
     let quiet = quiet_llm(1);
     assert_eq!(h.tick(&quiet).ran.len(), 1);
     assert!(quiet.requests()[0].user.contains("surfing in Raglan"));
