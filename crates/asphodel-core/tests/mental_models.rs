@@ -3573,9 +3573,9 @@ fn the_whole_block_stays_within_the_budget_and_records_only_what_it_renders() {
     let renders = || h.service.show_model(BANK, PROFILE_NAME).unwrap().renders;
     assert!(renders(), "a cut answer still shows");
 
-    // Seven more appointments leave no room for the model's heading,
+    // Fourteen more appointments leave no room for the model's heading,
     // question and first sentence.
-    let more = (7..14).map(|n| {
+    let more = (7..21).map(|n| {
         let text = format!(
             "Tim has appointment number {n} with the planning committee about the new library."
         );
