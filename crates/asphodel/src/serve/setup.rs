@@ -119,6 +119,24 @@ pub(crate) struct StartingFloors {
     pub(crate) embedding: Vec<(&'static str, f64)>,
     /// The reranker, its gate floor and its relevance scale.
     pub(crate) reranker: (&'static str, f64, f64),
+    /// The embedding models whose floor is a placeholder nobody has
+    /// calibrated yet. The wizard warns about them before setup, and the
+    /// file marks them.
+    pub(crate) uncalibrated: Vec<&'static str>,
+}
+
+impl StartingFloors {
+    /// Each placeholder floor as the tuning file sets it.
+    fn uncalibrated(&self) -> Vec<String> {
+        let quote = |value: &str| toml::Value::String(value.to_owned()).to_string();
+        self.embedding
+            .iter()
+            .filter(|(model, _)| self.uncalibrated.contains(model))
+            .map(|(model, floor)| {
+                format!("reconcile.embedding_floors.{} = {floor:?}", quote(model))
+            })
+            .collect()
+    }
 }
 
 /// Setup waiting for the wizard.
@@ -260,6 +278,9 @@ pub(crate) struct SetupState {
     llm_api_key_from_env: bool,
     /// The file holding the setup code.
     code_file: Option<PathBuf>,
+    /// The floors setup would write that are placeholders, not calibrated,
+    /// as the tuning file sets them.
+    uncalibrated: Vec<String>,
 }
 
 /// `POST /v1/setup`'s body. `llm` left out sets the LLM up later: chunks
@@ -340,6 +361,7 @@ pub(crate) async fn state(State(app): State<Shared>) -> Json<SetupState> {
             makes_token: pending.needs_token && !pending.token_configured,
             llm_api_key_from_env: pending.env_llm_api_key.is_some(),
             code_file: Some(pending.data_dir.join(SETUP_CODE_FILE)),
+            uncalibrated: pending.floors.uncalibrated(),
         },
         None => SetupState {
             needed: false,
@@ -347,6 +369,7 @@ pub(crate) async fn state(State(app): State<Shared>) -> Json<SetupState> {
             makes_token: false,
             llm_api_key_from_env: false,
             code_file: None,
+            uncalibrated: Vec::new(),
         },
     })
 }
@@ -447,6 +470,13 @@ fn tuning_text(llm: Option<&LlmChoice>, floors: &StartingFloors) -> String {
          [reconcile.embedding_floors]\n",
     );
     for (model, floor) in &floors.embedding {
+        if floors.uncalibrated.contains(model) {
+            text.push_str(
+                "# A placeholder nobody has calibrated yet. It decides which claims\n\
+                 # reconcile against an existing memory, so calibrate it before relying\n\
+                 # on the store.\n",
+            );
+        }
         text.push_str(&format!("{} = {floor:?}\n", quote(model)));
     }
     let (reranker, floor, scale) = floors.reranker;
@@ -502,6 +532,12 @@ fn write_file(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
         .and_then(|()| file.sync_all())
         .with_context(|| format!("writing {}", temp.display()))?;
     fs::rename(&temp, path).with_context(|| format!("writing {}", path.display()))?;
+    // The rename is durable only once the directory is synced, so a file
+    // written before another is on disk before it, across a power loss too.
+    let dir = path.parent().unwrap_or(Path::new("."));
+    File::open(dir)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("syncing {}", dir.display()))?;
     Ok(())
 }
 

@@ -422,6 +422,21 @@ export function mount(root, { fetch }) {
       state.makes_token
         ? h("p", { class: "help" }, "The daemon listens off loopback, so setup makes a bearer token and shows it once.")
         : null,
+      state.uncalibrated?.length
+        ? h(
+            "div",
+            { class: "notice setup-uncalibrated", "data-tone": "warning", role: "note" },
+            h("p", {}, h("strong", {}, "Uncalibrated floor. "), "Setup writes this placeholder, which nobody has calibrated yet:"),
+            h("ul", {}, state.uncalibrated.map((line) => h("li", {}, h("code", {}, line)))),
+            h(
+              "p",
+              {},
+              "It decides which new claims are matched against existing memories, so a poor value can duplicate or merge memories. Calibrate it in replay (",
+              h("code", {}, "docs/replay.md"),
+              ") and edit the tuning file before relying on the store.",
+            ),
+          )
+        : null,
       submit,
     );
     setMode(mode);

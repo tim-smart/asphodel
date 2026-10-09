@@ -12,6 +12,9 @@ export const NOW = "2026-10-03T09:00:00Z";
 export const SETUP_CODE = "setup-code-from-the-data-dir";
 export const SETUP_TOKEN = "token-setup-made";
 
+/// The placeholder floor a daemon waiting for setup warns about.
+export const UNCALIBRATED = 'reconcile.embedding_floors."bge-small-en-v1.5:int8" = 0.8';
+
 export const DOCUMENT = "notes/2026/today.md";
 
 export const ids = {
@@ -612,6 +615,7 @@ export class FakeDaemon {
         makes_token: this.settingUp,
         llm_api_key_from_env: false,
         code_file: this.settingUp ? "/data/setup-code" : null,
+        uncalibrated: this.settingUp ? [UNCALIBRATED] : [],
       });
     }
     if (!this.settingUp) return error(409, "setup is done");

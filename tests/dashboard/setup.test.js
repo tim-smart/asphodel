@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { FakeDaemon, SETUP_CODE, SETUP_TOKEN } from "./fake-daemon.js";
+import { FakeDaemon, SETUP_CODE, SETUP_TOKEN, UNCALIBRATED } from "./fake-daemon.js";
 import { click, findButton, findField, findLink, findText, open, submit, type, waitFor } from "./support.js";
 
 const BANK = /\bmain\b/;
@@ -15,6 +15,9 @@ test("setup needs the code, sends the LLM and signs the tab in with the token it
   const page = await open(t, daemon);
 
   const code = await findField(page.root, /setup code/i);
+  // The placeholder floor is named before anything is written.
+  await findText(page.root, UNCALIBRATED);
+  assert.equal(daemon.calls("POST", "/v1/setup").length, 0);
   type(await findField(page.root, /^model/i), "model-under-test");
   type(await findField(page.root, /^api key$/i), "sk-key");
   type(code, "not-the-code");

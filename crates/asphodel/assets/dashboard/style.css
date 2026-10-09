@@ -477,6 +477,11 @@ label {
   background: var(--vein-soft);
 }
 
+.notice[data-tone="warning"] {
+  border-left-color: var(--pollen);
+  background: var(--pollen-soft);
+}
+
 .notice[data-tone="gone"],
 .notice[data-tone="info"] {
   border-left-color: var(--lethe);
@@ -1815,6 +1820,21 @@ dialog.confirm h2 {
 
 .setup-modes {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.setup-uncalibrated {
+  display: grid;
+  gap: 0.4rem;
+  font-size: 0.84rem;
+}
+
+.setup-uncalibrated ul {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.setup-uncalibrated code {
+  overflow-wrap: anywhere;
 }
 
 .setup-fields {

@@ -28,7 +28,7 @@ use asphodel_core::models::{
     OpenAiCompatible, RERANKER_MODEL_ID, Reranker, ResidentModels, RetryBoard, RetryPolicy,
     TokenStore,
 };
-use asphodel_core::store::{OpenOptions, Store};
+use asphodel_core::store::{LockedDir, OpenOptions, Store};
 use asphodel_core::{Clock, ResolvedConfig, Service, SystemClock, Tuning};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::signal;
@@ -166,14 +166,17 @@ pub(crate) async fn run_with(
     let gate = startup_gate();
     let model_idle_minutes = args.model_idle_minutes;
     // No tuning file anywhere: setup waits for the wizard, guarded by a code
-    // in the data dir.
-    let (pending, finished) = match &config {
-        Some(_) => (None, None),
+    // in the data dir. It takes the data dir's lock first and keeps it until
+    // the store opens, so no other daemon can read the code or write the
+    // files meanwhile.
+    let (locked, pending, finished) = match &config {
+        Some(_) => (None, None, None),
         None => {
+            let locked = LockedDir::acquire(&args.data_dir, args.allow_network_fs)
+                .with_context(|| format!("locking the data dir {}", args.data_dir.display()))?;
             let floors = models.starting_floors();
-            let (pending, finished) =
-                Pending::new(&args.data_dir, !args.listen.is_local(), floors)?;
-            (Some(pending), Some(finished))
+            let (pending, finished) = Pending::new(locked.dir(), !args.listen.is_local(), floors)?;
+            (Some(locked), Some(pending), Some(finished))
         }
     };
 
@@ -237,7 +240,7 @@ pub(crate) async fn run_with(
             let clock = Arc::clone(&clock);
             let stop = stop.clone();
             tokio::task::spawn_blocking(move || {
-                start(&args, config, clock, models, script, gate, &stop)
+                start(&args, locked, config, clock, models, script, gate, &stop)
             })
             .await
             .map_err(|error| anyhow::anyhow!("startup panicked: {error}"))
@@ -417,10 +420,13 @@ async fn bind(listen: &Listen) -> anyhow::Result<(Bound, String)> {
 }
 
 /// Opens the store, loads the models and builds the service and the LLM
-/// client, on a blocking thread. `Ok(None)` when a stop arrived while the
-/// startup gate held it.
+/// client, on a blocking thread. `locked` is the data dir setup already
+/// locked, if it ran. `Ok(None)` when a stop arrived while the startup gate
+/// held it.
+#[allow(clippy::too_many_arguments)]
 fn start(
     args: &ServeArgs,
+    locked: Option<LockedDir>,
     mut config: ResolvedConfig,
     clock: Arc<dyn Clock>,
     models: ModelsSwitch,
@@ -445,8 +451,11 @@ fn start(
         allow_network_fs: args.allow_network_fs,
         deterministic_ids: false,
     };
-    let store = Store::open(&args.data_dir, options, Arc::clone(&clock))
-        .with_context(|| format!("opening the store in {}", args.data_dir.display()))?;
+    let store = match locked {
+        Some(locked) => Store::open_locked(locked, options, Arc::clone(&clock)),
+        None => Store::open(&args.data_dir, options, Arc::clone(&clock)),
+    }
+    .with_context(|| format!("opening the store in {}", args.data_dir.display()))?;
     config.purge = store.check_fingerprint(&config.deletion_fingerprint)?;
     config.llm = llm_status(&config, &args.data_dir)?;
     // The models always sit behind their idle release; with
@@ -691,10 +700,12 @@ impl ModelsSwitch {
             ModelsSwitch::None => StartingFloors {
                 embedding: vec![(EMBEDDING_MODEL_ID, 0.8)],
                 reranker: (RERANKER_MODEL_ID, -8.5, 3.564211),
+                uncalibrated: vec![EMBEDDING_MODEL_ID],
             },
             ModelsSwitch::Fake => StartingFloors {
                 embedding: vec![(FakeEmbedder::MODEL_ID, 0.5)],
                 reranker: fake_reranker,
+                uncalibrated: Vec::new(),
             },
             ModelsSwitch::FakeV2 => StartingFloors {
                 embedding: vec![
@@ -702,6 +713,7 @@ impl ModelsSwitch {
                     (FakeEmbedder::MODEL_ID, 0.5),
                 ],
                 reranker: fake_reranker,
+                uncalibrated: Vec::new(),
             },
         }
     }

@@ -137,9 +137,25 @@ floor (0.8) that is a placeholder until it's calibrated in replay
 (`docs/replay.md`, "Labelling and the precision curve"). Recalibrate them
 as you would in a file of your own.
 
-The backup copies the store, not these files. Keep the token and the LLM
-key wherever else you keep secrets, and expect to run setup again, or to
-put back `asphodel.toml`, after restoring into an empty volume.
+While setup waits, the daemon holds the data dir's lock, as it does once
+it's running. A second daemon pointed at the same dir refuses to start,
+so it can't read the code or write the files. Each file is written to a
+temp file, synced, renamed into place, and the directory synced, secrets
+first, so `asphodel.toml` (which is what marks setup as done) never lands
+on disk before the secrets it needs.
+
+The wizard names any floor it would write that's a placeholder before you
+submit, and the file marks it. Today that's the embedding floor.
+
+The backup copies the store, not these files. Save a copy of
+`asphodel.toml` once setup is done, and keep the token and the LLM key
+wherever else you keep secrets:
+
+```sh
+kubectl cp -c asphodel hermes-0:/data/asphodel.toml ./asphodel.toml
+```
+
+"Restoring into a new volume" below says how to put them back.
 
 ### Secrets and environment
 
@@ -958,6 +974,42 @@ Then check what the restore changed:
   below says what to do.
 - A backup from an older schema migrates on the first start, as an upgrade
   does. `docs/upgrading.md` says whether that needs anything from you.
+
+### Restoring into a new volume
+
+A restore into the volume the daemon already used keeps `asphodel.toml`,
+`secrets.toml` and the ChatGPT login beside the store. A restore into a
+new, empty volume brings back the store only, so the daemon comes up
+waiting for setup. That's a safe place to stop: it doesn't open the
+store, so nothing queued is extracted and nothing is purged until the
+configuration is back. Running the wizard again would write starting
+values over any tuning you had changed, so put your own back instead:
+
+1. Put back the tuning file. With the pod waiting for setup:
+
+   ```sh
+   kubectl cp -c asphodel ./asphodel.toml hermes-0:/data/asphodel.toml
+   ```
+
+   Or mount it from a ConfigMap and pass `--config`. Use the wizard only
+   if you never changed the file it wrote.
+2. Put back the secrets the daemon kept in the data dir. If the token
+   and the LLM key come from the `asphodel` secret
+   (`ASPHODEL_TOKEN`, `ASPHODEL_LLM_API_KEY`), there is nothing to do.
+   Otherwise either add them to that secret or write `/data/secrets.toml`
+   (`token = "..."`, `llm_api_key = "..."`, mode 0600, owned by uid 65532).
+   The token must be the one Hermes and the backup job send.
+3. Restart the pod (`kubectl delete pod hermes-0`) so the daemon reads the
+   files and opens the store.
+4. For a ChatGPT subscription, log in again: the login lived in the old
+   volume. `kubectl exec -it hermes-0 -c asphodel -- asphodel llm login
+   --data-dir /data`. Until then chunks wait on the queue.
+5. Compare the tuning in `GET /v1/config` with your saved file (with
+   `kubectl port-forward hermes-0 7720`:
+   `curl -H "Authorization: Bearer $ASPHODEL_TOKEN" http://127.0.0.1:7720/v1/config`),
+   and check `asphodel status` for a purge pause. A
+   tuning that doesn't match the store's deletion fingerprint pauses purge
+   and the sweep rather than deleting on new values ("Purge pauses" below).
 
 ## Upgrading
 

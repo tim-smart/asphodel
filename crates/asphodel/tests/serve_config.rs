@@ -468,7 +468,8 @@ fn first_run_setup_writes_the_config_into_the_data_dir_and_survives_restarts() {
 }
 
 #[test]
-fn a_pending_setup_keeps_its_code_across_restarts_and_takes_the_environment_token() {
+fn a_pending_setup_keeps_its_code_across_restarts_owns_its_data_dir_and_takes_the_environment_token()
+ {
     let dir = TestDir::new();
     let data = dir.0.join("data");
     let addr = loopback();
@@ -487,6 +488,17 @@ fn a_pending_setup_keeps_its_code_across_restarts_and_takes_the_environment_toke
     );
     assert_eq!(daemon.health()["setup"], true);
     assert_eq!(setup_code(&data), code);
+    // Waiting for setup, the daemon owns the data dir: a second one on it
+    // refuses to start, so it can't take the code or write the files.
+    let (listen, _) = every_interface();
+    refused(
+        &dir,
+        serve_in(&dir).args(["--listen", &listen]),
+        "locked by another asphodel process",
+    );
+    assert_eq!(setup_code(&data), code);
+    assert!(!data.join("asphodel.toml").exists());
+    assert!(!data.join("secrets.toml").exists());
     // `ASPHODEL_TOKEN` authorises setup too, and setup leaves the LLM for
     // later and makes no token when one is already configured.
     let (status, done) = daemon.setup(Some(TOKEN), &serde_json::json!({}));
