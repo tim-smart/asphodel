@@ -21,7 +21,7 @@ use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
 
 /// The schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// How long a pre-migration copy is kept after its migration completes.
 pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
@@ -73,6 +73,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (
         21,
         include_str!("../../migrations/0021_profile_question.sql"),
+    ),
+    (
+        22,
+        include_str!("../../migrations/0022_refresh_triggers.sql"),
     ),
 ];
 

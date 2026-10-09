@@ -1851,6 +1851,7 @@ impl Service {
             )?;
             crate::mental_models::request(&conn, &self.schedule, &effects.triggered, now, false)?;
             crate::mental_models::request(&conn, &self.schedule, &effects.urgent, now, true)?;
+            crate::mental_models::record_triggers(&conn, &effects.triggers)?;
             effects
         };
         if !effects.triggered.is_empty() {

@@ -187,7 +187,7 @@ One part of a mental model's question, with a heading and a recall query of its 
 _Avoid_: Section (that's how a facet renders), sub-question, topic
 
 **Refresh**:
-Bringing a mental model up to date: one retrieval for each facet of its question, then one LLM call that writes the whole answer again with the previous one in view. It runs shortly after a conversation adds or changes something the model would care about, and once a day besides, and only when the selected memories have changed. A correction or forget of a cited memory asks for one urgently, ahead of the usual minimum interval.
+Bringing a mental model up to date: one retrieval for each facet of its question, then one LLM call that writes the whole answer again with the previous one in view. It runs shortly after a conversation adds or changes something the model would care about, and once a day besides, and only when the selected memories have changed. A significant new memory that the reranker finds relevant to one of the model's facets is always in the selection of the refresh it triggered. A correction or forget of a cited memory asks for one urgently, ahead of the usual minimum interval.
 _Avoid_: Reflect, consolidation, rebuild, regenerate
 
 **Explain**:

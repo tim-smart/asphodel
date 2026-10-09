@@ -1312,11 +1312,13 @@ pub(crate) struct Selected {
 }
 
 /// What took a facet's candidate: the facet's budget, the cited fill past
-/// it, or neither.
+/// it, a memory that asked for the refresh found relevant past it, or
+/// neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Taken {
     Budget,
     Cited,
+    Triggered,
     Cut,
 }
 
@@ -1353,6 +1355,9 @@ pub struct FacetPool {
 pub(crate) struct FacetSelection {
     pub selected: Vec<Selected>,
     pub pool: Option<FacetPool>,
+    /// The triggers the reranker found relevant to the facet. Each is in
+    /// `selected`.
+    pub related: Vec<i64>,
 }
 
 /// A refresh's selection, one facet per query: each query runs through the
@@ -1360,6 +1365,13 @@ pub(crate) struct FacetSelection {
 /// Every fused candidate is reranked and scored, the best `budget` are
 /// taken, and then the memories in `cited` that `keep` still admits, best
 /// first, until there are `with_cited`.
+///
+/// `triggers` are the memories that asked for the refresh. Each one `keep`
+/// admits is reranked against every facet with a query, found by its
+/// retrievers or not, and one whose logit reaches the injection floor is
+/// relevant to the facet: it's taken even past the budget, and listed in
+/// `related`. One the retrievers didn't find that isn't relevant is dropped,
+/// so judging it changes nothing else the facet takes or reports.
 ///
 /// The queries are embedded in one call and their candidates cleaned up
 /// in one pass over the bank, so a facet costs its search and its rerank.
@@ -1375,6 +1387,7 @@ pub(crate) fn select(
     queries: &[&str],
     keep: &dyn Fn(&Candidate) -> bool,
     cited: &[i64],
+    triggers: &[i64],
     budget: usize,
     with_cited: usize,
     log: bool,
@@ -1397,10 +1410,11 @@ pub(crate) fn select(
         cx.embed_queries(bank_id, &asked)?
     };
     vectors.reverse();
-    let found: Vec<(Vec<Candidate>, BTreeSet<i64>)> = {
+    let (found, trigger_heads) = {
         let conn = conn;
         let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning, now, keep)?;
         let cited_heads: BTreeSet<i64> = cleanup.list(cited)?.into_iter().collect();
+        let trigger_heads: BTreeSet<i64> = cleanup.list(triggers)?.into_iter().collect();
         let mut found = Vec::with_capacity(queries.len());
         for query in &queries {
             let vector = if query.is_empty() {
@@ -1429,20 +1443,39 @@ pub(crate) fn select(
                 }
                 None => Vec::new(),
             };
+            let searched = vector.is_some();
             for id in &cited_heads {
                 if !ids.contains(id) {
                     ids.push(*id);
                 }
             }
-            found.push((cleanup.take(&ids), cited_heads.clone()));
+            // Only a facet with a query can judge a trigger.
+            let mut judged = BTreeSet::new();
+            for id in trigger_heads.iter().filter(|_| searched) {
+                if !ids.contains(id) {
+                    ids.push(*id);
+                    judged.insert(*id);
+                }
+            }
+            found.push((cleanup.take(&ids), cited_heads.clone(), judged));
         }
-        found
+        (found, trigger_heads)
     };
 
     let mut selections = Vec::with_capacity(queries.len());
-    for (query, (found, cited)) in queries.iter().zip(found) {
+    for (query, (found, cited, judged)) in queries.iter().zip(found) {
         let selection = rank_facet(
-            cx, query, found, &cited, budget, with_cited, pools, now, deadline,
+            cx,
+            query,
+            found,
+            &cited,
+            &judged,
+            &trigger_heads,
+            budget,
+            with_cited,
+            pools,
+            now,
+            deadline,
         );
         if log {
             let logged: Vec<Logged> = selection
@@ -1475,15 +1508,19 @@ pub(crate) fn select(
 }
 
 /// One facet's candidates reranked for `query` and scored, best first:
-/// the best `budget`, then the memories in `cited`, best first, until
-/// there are `with_cited`. With `pool`, every candidate scored comes back
-/// too, with what took it.
+/// the best `budget`, then the `triggers` relevant to the facet, then the
+/// memories in `cited`, best first, until there are `with_cited`. A
+/// candidate in `judged`, there only to be judged, is dropped unless it's
+/// relevant. With `pool`, every candidate scored comes back too, with what
+/// took it.
 #[allow(clippy::too_many_arguments)]
 fn rank_facet(
     cx: &Context<'_>,
     query: &str,
     found: Vec<Candidate>,
     cited: &BTreeSet<i64>,
+    judged: &BTreeSet<i64>,
+    triggers: &BTreeSet<i64>,
     budget: usize,
     with_cited: usize,
     pool: bool,
@@ -1529,13 +1566,30 @@ fn rank_facet(
             .total_cmp(&left.score)
             .then(left_index.cmp(right_index))
     });
+    // A trigger is relevant to the facet where injection would find it
+    // relevant to a message: the floor gates on the raw logit.
+    let relevant = |id: i64, logit: Option<f64>| {
+        triggers.contains(&id) && logit.is_some_and(|logit| logit >= cx.reranking.floor)
+    };
+    // A trigger the retrievers didn't find goes unless it's relevant.
+    scored.retain(|(_, logit, item)| {
+        !judged.contains(&item.candidate.id) || relevant(item.candidate.id, *logit)
+    });
     let room = with_cited.saturating_sub(budget.min(scored.len()));
     let mut taken = Vec::with_capacity(scored.len());
+    let mut related = Vec::new();
     let mut cited_taken = 0;
-    for (place, (_, _, item)) in scored.iter().enumerate() {
+    for (place, (_, logit, item)) in scored.iter().enumerate() {
+        let id = item.candidate.id;
+        let relevant = relevant(id, *logit);
+        if relevant {
+            related.push(id);
+        }
         taken.push(if place < budget {
             Taken::Budget
-        } else if cited.contains(&item.candidate.id) && cited_taken < room {
+        } else if relevant {
+            Taken::Triggered
+        } else if cited.contains(&id) && cited_taken < room {
             cited_taken += 1;
             Taken::Cited
         } else {
@@ -1566,7 +1620,11 @@ fn rank_facet(
         .filter(|(_, taken)| *taken != Taken::Cut)
         .map(|((_, _, item), _)| item)
         .collect();
-    FacetSelection { selected, pool }
+    FacetSelection {
+        selected,
+        pool,
+        related,
+    }
 }
 
 /// The memories linked to `entity` or to an entity merged into it, with the

@@ -1690,10 +1690,13 @@ fn a_date_lost_under_a_compound_question_is_found_through_its_facet() {
     // with it outrank an anniversary sharing two. Asked on its own, the
     // dates facet finds the anniversary. It still has to pass the profile's
     // filters: a dinner, an event, is left out however well it matches.
+    // Only the critical dishes trigger a refresh, so nothing gives the
+    // anniversary a place but its facet.
     let h = Harness::with(|t| {
         t.mental_models.facet_budget = 5;
         t.mental_models.input_budget = 20;
         t.mental_models.input_budget_with_cited = 20;
+        t.mental_models.trigger_level = Significance::Critical;
     });
     let question = "What does Tim like to drink and eat, and which dates matter to him?";
     h.edit(PROFILE_NAME, json!({"question": question})).unwrap();
@@ -1727,11 +1730,13 @@ fn the_total_goes_round_the_facets_instead_of_taking_the_best_scores() {
     // Reranker logits for different queries aren't comparable. Every match
     // for the first facet here outscores every match for the second, and
     // the second still gets its share: the total takes each facet's next
-    // best in turn.
+    // best in turn. Only the critical bed and hive trigger a refresh, and
+    // each is its facet's best anyway.
     let h = Harness::with(|t| {
         t.mental_models.facet_budget = 3;
         t.mental_models.input_budget = 4;
         t.mental_models.input_budget_with_cited = 4;
+        t.mental_models.trigger_level = Significance::Critical;
     });
     let garden = ModelSpec {
         name: "Garden".into(),

@@ -580,7 +580,13 @@ lost beneath results for the others:
    different queries aren't comparable, so the input takes each facet's
    next best in turn, skipping duplicates, up to `input_budget` (90), and
    then the memories the model cites that still qualify, up to
-   `input_budget_with_cited` (100). The facets share one 60-second
+   `input_budget_with_cited` (100). A memory that triggered the refresh
+   (below) is reranked against every facet too, found by the facet's
+   retrievers or not. One whose logit reaches the loaded reranker's
+   `injection.reranker_floors` entry for a facet is relevant to it: it goes
+   into the input first, under the first facet it's relevant to, so
+   stronger memories can't crowd it out. One relevant to no facet competes
+   as before, and isn't added to a pool its retrievers missed. The facets share one 60-second
    reranker deadline; a facet past it is scored on strength alone and the
    refresh goes on. Each facet writes one `refresh` row to the recall log,
    its query in both `query` and `raw_query`, and no access.
@@ -628,7 +634,9 @@ the fingerprint; another day below it does not.
 
 New memories and significance changes that pass a model's filters request
 a refresh at `mental_models.trigger_level` or above; kept memories trigger
-regardless of significance. Requests are
+regardless of significance. Each such memory is held as one of the model's
+triggers until its next completed refresh has judged it against the
+facets; a failed or held refresh keeps them. Requests are
 debounced per bank, by default for 5 minutes after the last trigger and
 at most 30 minutes after the first. Ordinary refreshes also wait at least
 30 minutes after a successful refresh. A correction that retracts, ends,

@@ -474,6 +474,23 @@ retrieval facets and filters are unchanged. The changed question changes
 the refresh fingerprint, so the next refresh writes again. No action is
 needed.
 
+## Schema version 22: refresh triggers
+
+A new memory at `mental_models.trigger_level` or above, a kept one or one
+whose significance went up has always requested a refresh of the models
+whose filters it passes. The refresh then recalled each facet as usual,
+and a new memory with little strength yet could miss every facet's
+budget, so the refresh found nothing changed and the model never
+mentioned it. The migration adds an empty `mental_model_triggers` table
+that keeps those memories per model until the next completed refresh. The
+refresh reranks each against every facet's query, and one whose logit
+reaches `injection.reranker_floors` for the loaded reranker goes into the
+write's input first. A trigger relevant to no facet changes nothing.
+
+There's no backfill: memories written before the upgrade compete for
+their place as before. Replay labelling material marks a candidate taken
+this way `triggered`. No action is needed.
+
 ## Write template version 3: dates for possibly stale states
 
 Schema version 15 introduced `write_model` v2 and the one-answer reply

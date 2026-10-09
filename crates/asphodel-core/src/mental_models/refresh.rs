@@ -20,7 +20,12 @@
 //!    already in, up to `input_budget`; then every memory the model cites
 //!    that still qualifies, best first, up to `input_budget_with_cited`.
 //!    The facets share one reranker deadline: a facet that misses it scores
-//!    on strength alone, and the refresh goes on.
+//!    on strength alone, and the refresh goes on. The memories that
+//!    triggered the refresh are reranked against every facet, and one whose
+//!    logit reaches the injection floor for a facet goes in first, under the
+//!    first such facet, so stronger memories can't crowd out what
+//!    the refresh was asked for. A completed refresh clears the triggers it
+//!    judged.
 //! 3. **Fingerprint.** The selection's memory ids, sentence hashes and
 //!    significance levels, the ids of states whose confidence is below 0.9,
 //!    the question, the plan, the filters and `max_tokens` are hashed.
@@ -67,7 +72,7 @@ use super::schedule::Schedule;
 use super::{
     Answer, Applied, Facet, FailureKind, InputMemory, ModelError, ModelRow, Outcome, PLAN_TEMPLATE,
     PLAN_VERSION, RefreshInput, RejectReason, Rejected, ScoredFacet, StoredPlan, WRITE_TEMPLATE,
-    WRITE_VERSION, load_cites, volatility_str,
+    WRITE_VERSION, load_cites, load_triggers, volatility_str,
 };
 use crate::constants::{STATE_AGE_SHOWN_BELOW, TAU};
 use crate::models::{LlmClient, LlmError, LlmRequest, Template};
@@ -85,6 +90,9 @@ struct Selection {
     input: RefreshInput,
     /// Each facet's whole scored pool, when they were asked for.
     scored: Option<Vec<ScoredFacet>>,
+    /// The last trigger the selection judged, which a completed refresh
+    /// clears up to.
+    triggers_through: Option<i64>,
 }
 
 fn select(
@@ -94,7 +102,7 @@ fn select(
     log: bool,
     pools: bool,
 ) -> Result<Selection, ModelError> {
-    let (previous, cited, linked) = {
+    let (previous, cited, linked, (triggers, triggers_through)) = {
         let conn = cx.store.connection();
         let previous: Option<String> = conn.query_row(
             "SELECT answer FROM mental_models WHERE id = ?1",
@@ -109,7 +117,7 @@ fn select(
             Some(entity) => Some(linked_memories(&conn, model.bank_id, entity)?),
             None => None,
         };
-        (previous, cited, linked)
+        (previous, cited, linked, load_triggers(&conn, model.id)?)
     };
     let keep = |candidate: &Candidate| {
         // Only current memories: nothing retracted (clean-up drops those),
@@ -149,14 +157,24 @@ fn select(
         &queries,
         &keep,
         &cited,
+        &triggers,
         facet_budget,
         facet_budget + cited.len(),
         log,
         pools,
         Instant::now() + REFRESH_RERANK_DEADLINE,
     )?;
+    // Each trigger relevant to a facet goes in under the first facet it's
+    // relevant to: logits for different queries aren't comparable.
+    let mut pinned_to: BTreeMap<i64, usize> = BTreeMap::new();
+    for (index, selection) in found.iter().enumerate() {
+        for &memory in &selection.related {
+            pinned_to.entry(memory).or_insert(index);
+        }
+    }
     let mut ranked: Vec<Vec<Selected>> = Vec::with_capacity(facets.len());
     let mut extras: Vec<(usize, Selected)> = Vec::new();
+    let mut pinned: Vec<(usize, Selected)> = Vec::new();
     let mut scored: Vec<ScoredFacet> = Vec::new();
     for (index, selection) in found.into_iter().enumerate() {
         if let (Some(pool), Some(facet)) = (selection.pool, facets.get(index)) {
@@ -167,6 +185,20 @@ fn select(
             });
         }
         let mut found = selection.selected;
+        // A pinned memory stays in its facet's list too, so reaching it
+        // there still uses the facet's turn.
+        pinned.extend(
+            found
+                .iter()
+                .filter(|item| pinned_to.get(&item.candidate.id) == Some(&index))
+                .map(|item| {
+                    let pin = Selected {
+                        candidate: item.candidate.clone(),
+                        score: item.score,
+                    };
+                    (index, pin)
+                }),
+        );
         extras.extend(
             found
                 .split_off(found.len().min(facet_budget))
@@ -176,6 +208,7 @@ fn select(
         ranked.push(found);
     }
     let (selected, found_by) = interleave(
+        pinned,
         ranked,
         extras,
         &cited,
@@ -227,18 +260,21 @@ fn select(
         handles,
         input,
         scored,
+        triggers_through,
     })
 }
 
-/// The selection from each facet's best, in rank order: the first of each
-/// facet in turn, then the second of each, and so on, skipping a memory
-/// already in, until there are `budget`. Then the memories in `cited` that
+/// The selection from each facet's best, in rank order: the `pinned`
+/// triggers first, by facet, then the first of each facet in turn, then
+/// the second of each, and so on, skipping a memory already in, until there
+/// are `budget`. Then the memories in `cited` that
 /// any facet scored, best first, until there are `with_cited`. A memory
 /// keeps the best score any facet gave it, which the cited fill ranks by.
 /// Returns the selection with the index of the facet that first found each memory,
 /// or, for one the cited fill took, the facet that scored it best.
 /// `extras` are the cited memories each facet scored past its best.
 fn interleave(
+    pinned: Vec<(usize, Selected)>,
     ranked: Vec<Vec<Selected>>,
     extras: Vec<(usize, Selected)>,
     cited: &[i64],
@@ -249,6 +285,15 @@ fn interleave(
     let mut found_by: Vec<usize> = Vec::new();
     let mut position: BTreeMap<i64, usize> = BTreeMap::new();
     let mut rest: Vec<(usize, Selected)> = extras;
+    for (facet, item) in pinned {
+        if selected.len() < budget && !position.contains_key(&item.candidate.id) {
+            position.insert(item.candidate.id, selected.len());
+            selected.push(item);
+            found_by.push(facet);
+        } else {
+            rest.push((facet, item));
+        }
+    }
     let longest = ranked.iter().map(Vec::len).max().unwrap_or(0);
     let mut columns: Vec<std::vec::IntoIter<Selected>> =
         ranked.into_iter().map(Vec::into_iter).collect();
@@ -445,6 +490,7 @@ pub(crate) fn refresh(
              WHERE id = ?1",
             (model.id, started.unchanged()),
         )?;
+        clear_triggers(&conn, model, &selection)?;
         return Ok(Outcome::Unchanged);
     }
 
@@ -1006,5 +1052,21 @@ fn completed(
             started.unchanged(),
         ),
     )?;
+    clear_triggers(tx, model, selection)
+}
+
+/// Clears the triggers the selection judged. One recorded since it was
+/// made waits for the next refresh, which its request asked for.
+fn clear_triggers(
+    conn: &rusqlite::Connection,
+    model: &ModelRow,
+    selection: &Selection,
+) -> Result<(), rusqlite::Error> {
+    if let Some(through) = selection.triggers_through {
+        conn.execute(
+            "DELETE FROM mental_model_triggers WHERE model_id = ?1 AND id <= ?2",
+            (model.id, through),
+        )?;
+    }
     Ok(())
 }

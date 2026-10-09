@@ -19,7 +19,9 @@
 //! ([`schedule`]). Corrections to cited memories and forget request urgent
 //! repairs that bypass the interval after success, not debounce, failure
 //! retry waits or LLM holds. Requests survive a restart and a refresh cannot
-//! clear one made while it ran. It never runs inside a prompt block fetch.
+//! clear one made while it ran. The memories that triggered a refresh are
+//! kept until a completed refresh has judged them, and one relevant to a
+//! facet is always in its input. It never runs inside a prompt block fetch.
 //! Nothing here ever writes an access, embeds an answer or ingests one.
 //!
 //! Possibly stale states are supplied to the write with absolute observed
@@ -800,6 +802,9 @@ fn linked(conn: &Connection, memory: i64, entity: i64) -> Result<bool, rusqlite:
 pub(crate) struct Effects {
     /// Models to refresh.
     pub triggered: BTreeSet<i64>,
+    /// Each model and the memory written for it that asked for the
+    /// refresh, held until the refresh judges it ([`record_triggers`]).
+    pub triggers: BTreeSet<(i64, i64)>,
     /// Cited memories changed, so these repairs bypass the success interval.
     pub urgent: BTreeSet<i64>,
     /// The block's content may have changed.
@@ -816,8 +821,10 @@ fn agenda_kind(kind: Kind) -> bool {
 /// check is code only, with no LLM call and no retrieval:
 ///
 /// - a new memory, or one whose significance went up, at `trigger_level`
-///   or above that passes a model's filters triggers that model;
-/// - a kept memory triggers every model whose filters it passes;
+///   or above that passes a model's filters triggers that model, and is
+///   kept as one of its triggers;
+/// - a kept memory triggers every model whose filters it passes, and is
+///   kept as one of its triggers too;
 /// - the retraction, ending or refinement of a memory a model cites, or the
 ///   reopening of one, triggers that model.
 ///
@@ -902,6 +909,7 @@ pub(crate) fn effects(
                 continue;
             }
             effects.triggered.insert(model.id);
+            effects.triggers.insert((model.id, memory.id));
         }
     }
 
@@ -922,6 +930,40 @@ pub(crate) fn effects(
         }
     }
     Ok(effects)
+}
+
+/// Keeps each memory that asked for a model's refresh until the refresh
+/// has reranked it against the model's facets: one relevant to a facet is
+/// given a place in the input ([`refresh`]). A memory already waiting keeps
+/// its place in the queue.
+pub(crate) fn record_triggers(
+    conn: &Connection,
+    triggers: &BTreeSet<(i64, i64)>,
+) -> Result<(), rusqlite::Error> {
+    let mut statement = conn.prepare_cached(
+        "INSERT OR IGNORE INTO mental_model_triggers (model_id, memory_id)
+         SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM mental_models WHERE id = ?1 AND enabled = 1)",
+    )?;
+    for (model, memory) in triggers {
+        statement.execute((model, memory))?;
+    }
+    Ok(())
+}
+
+/// The memories waiting to be judged by `model`'s next refresh, oldest
+/// first, and the last row among them, which that refresh clears up to.
+pub(crate) fn load_triggers(
+    conn: &Connection,
+    model: i64,
+) -> Result<(Vec<i64>, Option<i64>), rusqlite::Error> {
+    let mut statement = conn.prepare_cached(
+        "SELECT id, memory_id FROM mental_model_triggers WHERE model_id = ?1 ORDER BY id",
+    )?;
+    let rows: Vec<(i64, i64)> = statement
+        .query_map([model], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let last = rows.last().map(|(id, _)| *id);
+    Ok((rows.into_iter().map(|(_, memory)| memory).collect(), last))
 }
 
 /// The edit log's high-water mark for `bank_id`, taken before a write so

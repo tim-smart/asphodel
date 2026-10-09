@@ -902,8 +902,9 @@ The material is one JSON object:
   them. `strength` and `score` are the memory's strength and the
   combined score the facet ranked by, and `rank` its place in that
   order. `cited` says the model cited the memory when the refresh began.
-  `taken` is `budget` when the facet's `facet_budget` took it, `cited`
-  when the cited fill took it past that, and `cut` otherwise. `input` is
+  `taken` is `budget` when the facet's `facet_budget` took it,
+  `triggered` when it triggered the refresh and is relevant to the facet
+  past that, `cited` when the cited fill took it, and `cut` otherwise. `input` is
   the handle the memory reached the write under, whichever facet took it,
   or null when the selection left it out; the same memory has the same
   handle under every facet of one refresh. `query` is the facet's query as

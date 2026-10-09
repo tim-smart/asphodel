@@ -147,12 +147,14 @@ pub struct RefreshCandidate {
 }
 
 /// What took a refresh candidate: the facet's budget, the cited fill past
-/// it, or neither.
+/// it, a memory that asked for the refresh found relevant past it, or
+/// neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TakenBy {
     Budget,
     Cited,
+    Triggered,
     Cut,
 }
 
@@ -161,6 +163,7 @@ impl From<Taken> for TakenBy {
         match taken {
             Taken::Budget => TakenBy::Budget,
             Taken::Cited => TakenBy::Cited,
+            Taken::Triggered => TakenBy::Triggered,
             Taken::Cut => TakenBy::Cut,
         }
     }
