@@ -14,11 +14,11 @@
 //! rewrites it, and a forget blanks the answer at once.
 //!
 //! A refresh is triggered by a write a model would care about, debounced
-//! per bank, ordinarily at most every [`MIN_REFRESH_INTERVAL`] per model,
-//! and once a day besides at `mental_models.sweep_time` bank-local
-//! ([`schedule`]). Corrections to cited memories and forget request urgent
-//! repairs that bypass the interval after success, not debounce, failure
-//! retry waits or LLM holds. Requests survive a restart and a refresh cannot
+//! per bank, and once a day besides at `mental_models.sweep_time`
+//! bank-local ([`schedule`]). Significant memories, corrections to cited
+//! memories and forget request urgent refreshes that bypass
+//! [`MIN_REFRESH_INTERVAL`] after success, not debounce, failure retry
+//! waits or LLM holds. An owner's edit to a model waits out the interval. Requests survive a restart and a refresh cannot
 //! clear one made while it ran. It never runs inside a prompt block fetch.
 //! Nothing here ever writes an access, embeds an answer or ingests one.
 //!
@@ -56,8 +56,8 @@ pub const PLAN_VERSION: u32 = 1;
 pub const WRITE_TEMPLATE: &str = "write_model";
 pub const WRITE_VERSION: u32 = 10;
 
-/// The least time between two refreshes of one model, and the wait before
-/// a failed refresh is tried again. Fixed
+/// The least time between two ordinary refreshes of one model, and the
+/// wait before a failed refresh is tried again. Fixed
 /// in code until the replay harness says otherwise.
 pub const MIN_REFRESH_INTERVAL: SignedDuration = SignedDuration::from_mins(30);
 
@@ -800,7 +800,8 @@ fn linked(conn: &Connection, memory: i64, entity: i64) -> Result<bool, rusqlite:
 pub(crate) struct Effects {
     /// Models to refresh.
     pub triggered: BTreeSet<i64>,
-    /// Cited memories changed, so these repairs bypass the success interval.
+    /// Models a significant memory or a change to a cited memory concerns,
+    /// so their refreshes bypass the success interval.
     pub urgent: BTreeSet<i64>,
     /// The block's content may have changed.
     pub invalidates: bool,
@@ -820,6 +821,10 @@ fn agenda_kind(kind: Kind) -> bool {
 /// - a kept memory triggers every model whose filters it passes;
 /// - the retraction, ending or refinement of a memory a model cites, or the
 ///   reopening of one, triggers that model.
+///
+/// Every one of these is urgent: the model is refreshed once the bank's
+/// debounce has passed, without waiting out [`MIN_REFRESH_INTERVAL`] since
+/// its last refresh.
 ///
 /// The block changes when a memory the agenda would list is written,
 /// ended, retracted, kept or unkept, which is a check on its kind, and when
@@ -902,6 +907,7 @@ pub(crate) fn effects(
                 continue;
             }
             effects.triggered.insert(model.id);
+            effects.urgent.insert(model.id);
         }
     }
 
