@@ -186,12 +186,12 @@ impl Pending {
         {
             if llm.auth == LlmAuth::Chatgpt {
                 return Err(bad_request(
-                    "a ChatGPT subscription takes no API key: log in with `asphodel llm login` instead",
+                    "a ChatGPT subscription doesn't use an API key; leave it out and run `asphodel llm login` after setup",
                 ));
             }
             if self.env_llm_api_key.is_some() {
                 return Err(bad_request(format!(
-                    "{LLM_API_KEY_ENV} is set, and it wins over a key given here: leave the key out"
+                    "{LLM_API_KEY_ENV} is set and overrides any key given here, so leave the key out"
                 )));
             }
         }
@@ -359,10 +359,13 @@ pub(crate) async fn complete(
             .setup
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        // Another request may have finished setup since the check above.
-        let pending = slot
-            .as_ref()
-            .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "setup is done"))?;
+        // An earlier request may already have finished setup.
+        let pending = slot.as_ref().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "setup is already done; to change a setting, edit the tuning file in the data dir and restart",
+            )
+        })?;
         let done = pending.complete(body)?;
         if let Some(pending) = slot.take() {
             let _ = pending.done.send(());
@@ -378,8 +381,8 @@ pub(crate) async fn complete(
 fn tuning_text(llm: Option<&LlmChoice>, floors: &StartingFloors) -> String {
     let quote = |value: &str| toml::Value::String(value.to_owned()).to_string();
     let mut text = String::from(
-        "# Written by the setup wizard. Edit it and restart the daemon to change\n\
-         # anything; docs/operations.md, \"The tuning file\", lists every key.\n",
+        "# Written by the setup wizard. To change a setting, edit this file and\n\
+         # restart the daemon. docs/operations.md, \"The tuning file\", lists every key.\n",
     );
     match llm {
         Some(llm) => {

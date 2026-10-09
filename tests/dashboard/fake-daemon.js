@@ -616,7 +616,7 @@ export class FakeDaemon {
         uncalibrated: this.settingUp ? [UNCALIBRATED] : [],
       });
     }
-    if (!this.settingUp) return error(409, "setup is done");
+    if (!this.settingUp) return error(409, "setup is already done; to change a setting, edit the tuning file in the data dir and restart");
     if (body?.llm && !body.llm.model) return error(400, "llm.model is required");
     this.settingUp = false;
     this.token = SETUP_TOKEN;

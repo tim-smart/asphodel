@@ -223,7 +223,7 @@ pub(crate) async fn run_with(
         (None, Some(finished)) => {
             warn!(
                 listen = %address,
-                "no tuning file: open /dashboard to set up; until then anyone who can reach this address can"
+                "no tuning file: waiting for setup at /dashboard; anyone who can reach this address can complete it, so keep it private until then"
             );
             await_setup(&args, finished, stop.clone()).await
         }

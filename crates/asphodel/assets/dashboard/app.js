@@ -316,11 +316,11 @@ export function mount(root, { fetch }) {
     const modes = h(
       "fieldset",
       { class: "segmented setup-modes" },
-      h("legend", {}, "The LLM"),
+      h("legend", {}, "LLM"),
       [
         ["api_key", "API key", "An OpenAI-compatible API"],
         ["chatgpt", "ChatGPT", "A ChatGPT subscription"],
-        ["later", "Later", "Ingest waits on the queue"],
+        ["later", "Later", "Ingest queues until you add one"],
       ].map(([value, label, detail]) =>
         h(
           "label",
@@ -331,12 +331,12 @@ export function mount(root, { fetch }) {
       ),
     );
     const endpoint = field("setup-endpoint", "Endpoint", { type: "url", placeholder: DEFAULT_ENDPOINT, value: DEFAULT_ENDPOINT });
-    const model = field("setup-model", "Model", { required: true }, "The exact model string. The floors are calibrated against one model.");
+    const model = field("setup-model", "Model", { required: true }, "The model ID exactly as your provider writes it. The starting floors were calibrated against a single model.");
     const apiKey = state.llm_api_key_from_env
-      ? { input: null, nodes: [h("p", { class: "help" }, h("code", {}, "ASPHODEL_LLM_API_KEY"), " is set, and the daemon uses it.")] }
-      : field("setup-api-key", "API key", { type: "password", autocomplete: "off" }, "Kept in the data dir's secrets file, readable by the daemon only. Leave it empty for an endpoint that takes none.");
-    const effort = field("setup-effort", "Reasoning effort", { placeholder: "low, medium or high" }, "Optional. Left empty, the backend decides.");
-    const language = field("setup-language", "Language", { placeholder: "English" }, "Optional. Every memory is written in it, translated if need be.");
+      ? { input: null, nodes: [h("p", { class: "help" }, "The daemon uses the key in ", h("code", {}, "ASPHODEL_LLM_API_KEY"), ".")] }
+      : field("setup-api-key", "API key", { type: "password", autocomplete: "off" }, "Saved to secrets.toml in the data dir, which only the daemon can read. Leave it empty if your endpoint doesn't need one.");
+    const effort = field("setup-effort", "Reasoning effort", { placeholder: "low, medium or high" }, "Optional. Leave it empty to use the provider's default.");
+    const language = field("setup-language", "Language", { placeholder: "English" }, "Optional. Memories are written in this language, translated if needed.");
     // Each mode's fields sit in a fieldset that's disabled, not just hidden,
     // so a hidden required field doesn't block the form.
     const keyFields = h("fieldset", { class: "setup-fields" }, endpoint.nodes, apiKey.nodes);
@@ -344,9 +344,9 @@ export function mount(root, { fetch }) {
     const loginNote = h(
       "p",
       { class: "help", hidden: true },
-      "Once setup is done, log the daemon in with ",
+      "After setup, log the daemon in with ",
       h("code", {}, "asphodel llm login --data-dir <data dir>"),
-      ". Extraction waits until it is.",
+      ". Nothing is extracted until you do.",
     );
     function setMode(value) {
       mode = value;
@@ -389,11 +389,11 @@ export function mount(root, { fetch }) {
         },
       },
       h("a", { class: "mark", href: "#/", tabindex: "-1" }, flower(), h("span", {}, "Asphodel")),
-      h("h1", {}, "Set up this daemon"),
+      h("h1", {}, "Set up Asphodel"),
       h(
         "p",
         { class: "help" },
-        "There's no tuning file yet. This writes one into the data dir, with any secrets beside it, and starts the daemon. Change it later by editing the file and restarting.",
+        "This daemon has no tuning file yet. Setup writes one to the data dir, saves any secrets next to it, and starts the daemon. To change a setting later, edit the file and restart.",
       ),
       error,
       modes,
@@ -401,20 +401,20 @@ export function mount(root, { fetch }) {
       llmFields,
       loginNote,
       state.makes_token
-        ? h("p", { class: "help" }, "The daemon listens off loopback, so setup makes a bearer token and shows it once.")
+        ? h("p", { class: "help" }, "Other machines can reach this daemon, so setup creates a bearer token. It's shown once, on the next screen.")
         : null,
       state.uncalibrated?.length
         ? h(
             "div",
             { class: "notice setup-uncalibrated", "data-tone": "warning", role: "note" },
-            h("p", {}, h("strong", {}, "Uncalibrated floor. "), "Setup writes this placeholder, which nobody has calibrated yet:"),
+            h("p", {}, h("strong", {}, "Uncalibrated floor. "), "Setup will write this placeholder value:"),
             h("ul", {}, state.uncalibrated.map((line) => h("li", {}, h("code", {}, line)))),
             h(
               "p",
               {},
-              "It decides which new claims are matched against existing memories, so a poor value can duplicate or merge memories. Calibrate it in replay (",
+              "It decides which new claims are compared with existing memories. A bad value can duplicate memories, or merge ones that should stay apart. Calibrate it in replay (",
               h("code", {}, "docs/replay.md"),
-              ") and edit the tuning file before relying on the store.",
+              ") and update the tuning file before you rely on the store.",
             ),
           )
         : null,
@@ -441,23 +441,23 @@ export function mount(root, { fetch }) {
             h(
               "p",
               { class: "help" },
-              "Give it to Hermes and every other client as ",
+              "Set it as ",
               h("code", {}, "ASPHODEL_TOKEN"),
-              ". It's shown here once, and kept in ",
+              " for Hermes and any other client. Copy it now, because this page won't show it again. The daemon keeps its own copy in ",
               h("code", {}, done.secrets),
               ".",
             ),
           ]
         : null,
       done.llm_login
-        ? h("p", { class: "help" }, "Log the daemon in to ChatGPT with ", h("code", {}, `asphodel llm login --data-dir ${done.data_dir}`), ". Extraction waits until it is.")
+        ? h("p", { class: "help" }, "Log the daemon in to ChatGPT with ", h("code", {}, `asphodel llm login --data-dir ${done.data_dir}`), ". Nothing is extracted until you do.")
         : null,
       h(
         "p",
         { class: "help" },
         "The tuning file is ",
         h("code", {}, done.config),
-        ". Its floors are starting values: recalibrate them in replay.",
+        ". Its floors are only starting values, so recalibrate them in replay.",
       ),
       open,
     );

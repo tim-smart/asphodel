@@ -97,35 +97,38 @@ dashboard to write the configuration:
    machine.
 2. Choose the LLM: an OpenAI-compatible endpoint with an optional API key,
    a ChatGPT subscription, or none for now (chunks wait on the queue until
-   `[llm]` is set). Nothing else is asked: no code, token or credential.
-3. Finish. The daemon writes the files below and goes on starting, just as
-   a restart would read them. When it listens off loopback and no token is
-   configured, setup makes one and shows it once. Give it to Hermes and
-   the backup job as `ASPHODEL_TOKEN`; in the example, that's the
-   `asphodel` secret, followed by a pod restart.
+   `[llm]` is set). That's the only question. There's no code, token or
+   credential to enter.
+3. Click **Finish setup**. The daemon writes the files below and carries on
+   starting, the same as it would after a restart. If it listens off
+   loopback and no token is configured, setup creates one and shows it
+   once. Give it to Hermes and the backup job as `ASPHODEL_TOKEN`. In the
+   example, that means adding it to the `asphodel` secret and restarting
+   the pod.
 
 For a ChatGPT subscription, log in once setup is done:
 `kubectl exec -it hermes-0 -c asphodel -- asphodel llm login --data-dir /data`.
 
 **Setup isn't protected.** Anyone who can reach an unconfigured daemon's
-port can complete setup: choose its LLM (and so where memory content is
-sent), and receive the bearer token it makes. Keep the daemon private
-until setup is done:
+port can complete setup. They choose its LLM, which decides where memory
+content is sent, and they get the bearer token setup creates. Keep the
+daemon private until setup is done:
 
 - Run setup through `kubectl port-forward` or on the daemon's own machine,
   and don't put an Ingress, LoadBalancer or other proxy in front of it
   before then.
 - In the example, the `asphodel` Service makes the port reachable from
-  other pods in the namespace. Finish setup straight after the pod starts,
-  apply the Service afterwards, or limit port 7720 with a NetworkPolicy.
+  other pods in the namespace. Finish setup as soon as the pod starts,
+  apply the Service once setup is done, or limit port 7720 with a
+  NetworkPolicy.
 - To skip setup, give the daemon a tuning file with `--config`, or put
   `asphodel.toml` in the data dir before its first start.
 
-Setup runs once. After it, `POST /v1/setup` answers 409, every other route
-needs the token whenever one is configured, and the files are changed by
-editing them and restarting. A daemon that was taken over before you
-finished setup is recovered by stopping it, deleting `asphodel.toml` and
-`secrets.toml` from the data dir, and starting it again.
+Setup runs once. After that, `POST /v1/setup` returns 409, every other
+route needs the token if one is configured, and you change settings by
+editing the files and restarting. If someone else completed setup before
+you did, stop the daemon, delete `asphodel.toml` and `secrets.toml` from
+the data dir, and start it again.
 
 After setup, the data dir holds:
 
@@ -144,13 +147,14 @@ as you would in a file of your own.
 
 While setup waits, the daemon holds the data dir's lock, as it does once
 it's running. A second daemon pointed at the same dir refuses to start,
-so it can't write the files. Each file is written to a
-temp file, synced, renamed into place, and the directory synced, secrets
-first, so `asphodel.toml` (which is what marks setup as done) never lands
-on disk before the secrets it needs.
+so it can't write the files. Each file is written to a temp file, synced
+and renamed into place, and then the directory is synced. The secrets go
+first, so `asphodel.toml`, which marks setup as done, never lands on disk
+before the secrets it needs.
 
-The wizard names any floor it would write that's a placeholder before you
-submit, and the file marks it. Today that's the embedding floor.
+Before you submit, the wizard lists any floor it's about to write that is
+only a placeholder, and the file marks it with a comment. Today that's
+the embedding floor.
 
 The backup copies the store, not these files. Save a copy of
 `asphodel.toml` once setup is done, and keep the token and the LLM key
