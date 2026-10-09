@@ -477,6 +477,11 @@ label {
   background: var(--vein-soft);
 }
 
+.notice[data-tone="warning"] {
+  border-left-color: var(--pollen);
+  background: var(--pollen-soft);
+}
+
 .notice[data-tone="gone"],
 .notice[data-tone="info"] {
   border-left-color: var(--lethe);
@@ -1801,6 +1806,44 @@ dialog.confirm h2 {
 
 .token-card button {
   justify-self: start;
+}
+
+/* The setup wizard, on the token prompt's card */
+
+.setup-card {
+  width: min(36rem, 100%);
+}
+
+.setup-card [hidden] {
+  display: none;
+}
+
+.setup-modes {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.setup-uncalibrated {
+  display: grid;
+  gap: 0.4rem;
+  font-size: 0.84rem;
+}
+
+.setup-uncalibrated ul {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.setup-uncalibrated code {
+  overflow-wrap: anywhere;
+}
+
+.setup-fields {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.setup-fields[hidden] {
+  display: none;
 }
 
 /* Narrow screens */

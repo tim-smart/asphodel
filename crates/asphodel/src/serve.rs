@@ -5,13 +5,15 @@
 //! on the system clock and serves the HTTP API under `/v1` ([`api`]). The
 //! handlers stay thin and call the same service functions the replay harness
 //! does. Each bank's chunks are extracted by a worker of its own ([`worker`]).
+//! With no tuning file anywhere, it waits for first-run setup ([`setup`])
+//! before it opens the store.
 
 use std::{
     fs::{self, Metadata},
     io::ErrorKind,
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, Weak},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 
@@ -21,23 +23,26 @@ use asphodel_core::config::{
     Deployment, LLM_API_KEY_ENV, LlmAuth, ModelsConfig, Secret, TOKEN_ENV,
 };
 use asphodel_core::models::{
-    CodexResponses, Embedder, FakeEmbedder, FakeEmbedderV2, FakeLlm, FakeReranker, LlmClient,
-    LlmGate, LlmRetry, LlmSettings, LlmStatus, ModelOptions, OpenAiCompatible, Reranker,
-    ResidentModels, RetryBoard, RetryPolicy, TokenStore,
+    CodexResponses, EMBEDDING_MODEL_ID, Embedder, FakeEmbedder, FakeEmbedderV2, FakeLlm,
+    FakeReranker, LlmClient, LlmGate, LlmRetry, LlmSettings, LlmStatus, ModelOptions,
+    OpenAiCompatible, RERANKER_MODEL_ID, Reranker, ResidentModels, RetryBoard, RetryPolicy,
+    TokenStore,
 };
-use asphodel_core::store::{OpenOptions, Store};
+use asphodel_core::store::{LockedDir, OpenOptions, Store};
 use asphodel_core::{Clock, ResolvedConfig, Service, SystemClock, Tuning};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::signal;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
 use crate::cli::ServeArgs;
 use crate::listen::Listen;
+use setup::{Pending, StartingFloors, StoredSecrets};
 use worker::Workers;
 
 mod api;
 mod dashboard;
+mod setup;
 mod worker;
 
 /// The longest the daemon waits between housekeeping passes. It normally
@@ -67,8 +72,11 @@ pub(crate) type Shared = Arc<App>;
 pub(crate) struct App {
     /// The clock `/v1/health` reads before the service exists.
     clock: Arc<dyn Clock>,
-    /// The bearer token clients must send, when one is configured.
-    token: Option<Secret>,
+    /// The bearer token clients must send, when one is configured. Set once
+    /// the config is resolved: at startup, or once setup is done.
+    token: OnceLock<Option<Secret>>,
+    /// First-run setup, while it waits for the wizard.
+    setup: setup::Slot,
     ready: OnceLock<Ready>,
     /// Set on SIGTERM or SIGINT: ingest stops, and so do the workers once
     /// their chunk in flight is done.
@@ -93,6 +101,13 @@ impl App {
 
     fn draining(&self) -> bool {
         *self.stop.borrow()
+    }
+
+    fn setting_up(&self) -> bool {
+        self.setup
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
     }
 }
 
@@ -140,12 +155,8 @@ pub(crate) async fn run_with(
     bound_tx: Option<tokio::sync::oneshot::Sender<String>>,
 ) -> anyhow::Result<()> {
     let config = resolve_config(&args)?;
-    if !args.listen.is_local() && config.deployment.token.is_none() {
-        bail!(
-            "listening on {} is reachable off this machine, so a bearer token is required: \
-             set {TOKEN_ENV}",
-            args.listen
-        );
+    if let Some(config) = &config {
+        require_token(&args.listen, config)?;
     }
     // The switches are read before anything binds, so a bad value stops the
     // daemon before it exists to a client.
@@ -154,11 +165,26 @@ pub(crate) async fn run_with(
     let retry_wait = retry_wait()?;
     let gate = startup_gate();
     let model_idle_minutes = args.model_idle_minutes;
+    // No tuning file anywhere: setup waits for the wizard, guarded by a code
+    // in the data dir. It takes the data dir's lock first and keeps it until
+    // the store opens, so no other daemon can read the code or write the
+    // files meanwhile.
+    let (locked, pending, finished) = match &config {
+        Some(_) => (None, None, None),
+        None => {
+            let locked = LockedDir::acquire(&args.data_dir, args.allow_network_fs)
+                .with_context(|| format!("locking the data dir {}", args.data_dir.display()))?;
+            let floors = models.starting_floors();
+            let (pending, finished) = Pending::new(locked.dir(), !args.listen.is_local(), floors)?;
+            (Some(locked), Some(pending), Some(finished))
+        }
+    };
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let app: Shared = Arc::new(App {
         clock: Arc::clone(&clock),
-        token: config.deployment.token.clone(),
+        token: OnceLock::new(),
+        setup: Mutex::new(pending),
         ready: OnceLock::new(),
         stop: stop.clone(),
     });
@@ -192,18 +218,35 @@ pub(crate) async fn run_with(
         ),
     };
 
+    let config = match (config, finished) {
+        (Some(config), _) => Ok(Some(config)),
+        (None, Some(finished)) => {
+            warn!(
+                listen = %address,
+                "no tuning file: waiting for setup at /dashboard; anyone who can reach this address can complete it, so keep it private until then"
+            );
+            await_setup(&args, finished, stop.clone()).await
+        }
+        (None, None) => unreachable!("setup is pending whenever there's no config"),
+    };
+
     // The store opens, migrates and loads its models while the listener answers
     // 503: the lock, the filesystem check, the migrations and the floors all
     // have to pass before the daemon is ready.
-    let started = {
-        let clock = Arc::clone(&clock);
-        let stop = stop.clone();
-        tokio::task::spawn_blocking(move || {
-            start(&args, config, clock, models, script, gate, &stop)
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("startup panicked: {error}"))
-        .and_then(|started| started)
+    let started = match config {
+        Ok(Some(config)) => {
+            let _ = app.token.set(config.deployment.token.clone());
+            let clock = Arc::clone(&clock);
+            let stop = stop.clone();
+            tokio::task::spawn_blocking(move || {
+                start(&args, locked, config, clock, models, script, gate, &stop)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("startup panicked: {error}"))
+            .and_then(|started| started)
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
     };
     let started = match started {
         Ok(Some(started)) => started,
@@ -318,6 +361,40 @@ pub(crate) fn run_reembed(service: Arc<Service>, workers: Option<Arc<Workers>>, 
     });
 }
 
+/// Waits for the wizard to finish setup, then resolves the config it wrote
+/// exactly as a restart would. `Ok(None)` when a stop arrives first.
+async fn await_setup(
+    args: &ServeArgs,
+    finished: oneshot::Receiver<()>,
+    stop: watch::Receiver<bool>,
+) -> anyhow::Result<Option<ResolvedConfig>> {
+    tokio::select! {
+        done = finished => {
+            if done.is_err() {
+                return Ok(None);
+            }
+        }
+        () = stopped(stop) => return Ok(None),
+    }
+    let config = resolve_config(args)?.context("setup finished without a tuning file")?;
+    require_token(&args.listen, &config)?;
+    info!("setup is done: starting");
+    Ok(Some(config))
+}
+
+/// Off loopback, every client must send a token, so the daemon refuses to
+/// start without one.
+fn require_token(listen: &Listen, config: &ResolvedConfig) -> anyhow::Result<()> {
+    if !listen.is_local() && config.deployment.token.is_none() {
+        bail!(
+            "listening on {listen} is reachable off this machine, so a bearer token is required: \
+             set {TOKEN_ENV}, or `token` in {} in the data dir",
+            setup::SECRETS_FILE
+        );
+    }
+    Ok(())
+}
+
 /// Resolves once a stop has been signalled.
 async fn stopped(mut stop: watch::Receiver<bool>) {
     let _ = stop.wait_for(|stop| *stop).await;
@@ -342,10 +419,13 @@ async fn bind(listen: &Listen) -> anyhow::Result<(Bound, String)> {
 }
 
 /// Opens the store, loads the models and builds the service and the LLM
-/// client, on a blocking thread. `Ok(None)` when a stop arrived while the
-/// startup gate held it.
+/// client, on a blocking thread. `locked` is the data dir setup already
+/// locked, if it ran. `Ok(None)` when a stop arrived while the startup gate
+/// held it.
+#[allow(clippy::too_many_arguments)]
 fn start(
     args: &ServeArgs,
+    locked: Option<LockedDir>,
     mut config: ResolvedConfig,
     clock: Arc<dyn Clock>,
     models: ModelsSwitch,
@@ -370,8 +450,11 @@ fn start(
         allow_network_fs: args.allow_network_fs,
         deterministic_ids: false,
     };
-    let store = Store::open(&args.data_dir, options, Arc::clone(&clock))
-        .with_context(|| format!("opening the store in {}", args.data_dir.display()))?;
+    let store = match locked {
+        Some(locked) => Store::open_locked(locked, options, Arc::clone(&clock)),
+        None => Store::open(&args.data_dir, options, Arc::clone(&clock)),
+    }
+    .with_context(|| format!("opening the store in {}", args.data_dir.display()))?;
     config.purge = store.check_fingerprint(&config.deletion_fingerprint)?;
     config.llm = llm_status(&config, &args.data_dir)?;
     // The models always sit behind their idle release; with
@@ -603,6 +686,38 @@ enum ModelsSwitch {
     FakeV2,
 }
 
+impl ModelsSwitch {
+    /// The floors setup writes for the models this switch runs. For the real
+    /// models: the reranker's gate floor is -8.5 from 380 labels over 10
+    /// prefetches of the call 1 v5 replay (6 of 18 relevant kept at
+    /// precision 0.21); its relevance scale is std(L-6 logits) / std(jina
+    /// logits) over the 69-query eval pools; and the embedding floor is a
+    /// placeholder still to be calibrated in replay.
+    fn starting_floors(&self) -> StartingFloors {
+        let fake_reranker = (FakeReranker::MODEL_ID, 0.0, 1.0);
+        match self {
+            ModelsSwitch::None => StartingFloors {
+                embedding: vec![(EMBEDDING_MODEL_ID, 0.8)],
+                reranker: (RERANKER_MODEL_ID, -8.5, 3.564211),
+                uncalibrated: vec![EMBEDDING_MODEL_ID],
+            },
+            ModelsSwitch::Fake => StartingFloors {
+                embedding: vec![(FakeEmbedder::MODEL_ID, 0.5)],
+                reranker: fake_reranker,
+                uncalibrated: Vec::new(),
+            },
+            ModelsSwitch::FakeV2 => StartingFloors {
+                embedding: vec![
+                    (FakeEmbedderV2::MODEL_ID, 0.5),
+                    (FakeEmbedder::MODEL_ID, 0.5),
+                ],
+                reranker: fake_reranker,
+                uncalibrated: Vec::new(),
+            },
+        }
+    }
+}
+
 fn models_switch() -> anyhow::Result<ModelsSwitch> {
     match std::env::var_os(MODELS_ENV) {
         None => Ok(ModelsSwitch::None),
@@ -637,20 +752,31 @@ fn llm_status(config: &ResolvedConfig, data_dir: &Path) -> anyhow::Result<Option
     Ok(Some(status))
 }
 
-/// Loads the tuning file and records the deployment. An unreadable file,
-/// an unknown key or an out-of-range value stops the daemon starting.
-fn resolve_config(args: &ServeArgs) -> anyhow::Result<ResolvedConfig> {
-    let tuning = Tuning::load(args.config.as_deref())?;
+/// Loads the tuning file and records the deployment. The file is
+/// `--config`, else the one in the data dir; `None` when neither is there,
+/// and setup has to write one. Each secret comes from the environment, else
+/// the data dir's secrets file. An unreadable file, an unknown key or an
+/// out-of-range value stops the daemon starting.
+fn resolve_config(args: &ServeArgs) -> anyhow::Result<Option<ResolvedConfig>> {
+    let Some(config) = args
+        .config
+        .clone()
+        .or_else(|| setup::data_dir_config(&args.data_dir))
+    else {
+        return Ok(None);
+    };
+    let tuning = Tuning::load(Some(&config))?;
+    let stored = StoredSecrets::read(&args.data_dir)?;
     let deployment = Deployment {
         listen: args.listen.to_string(),
         data_dir: Some(args.data_dir.clone()),
-        config: args.config.clone(),
+        config: Some(config),
         allow_network_fs: args.allow_network_fs,
         model_dir: args.model_dir.clone(),
-        token: Secret::from_env(TOKEN_ENV),
-        llm_api_key: Secret::from_env(LLM_API_KEY_ENV),
+        token: setup::secret(TOKEN_ENV, stored.token()),
+        llm_api_key: setup::secret(LLM_API_KEY_ENV, stored.llm_api_key()),
     };
-    Ok(ResolvedConfig::new(tuning, deployment))
+    Ok(Some(ResolvedConfig::new(tuning, deployment)))
 }
 
 /// Binds a Unix socket, recovering only a stale socket (never a file,

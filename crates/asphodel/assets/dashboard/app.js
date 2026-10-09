@@ -1,6 +1,7 @@
 // The dashboard: hash routes over the daemon's read-only list routes, the
 // Recall page's explain (which logs nothing), and the owner's actions (keep, retract, forget, remove a document, retry
 // chunks, resume purge, a model in or out of the prompt), each destructive one behind a confirmation.
+// A daemon with no tuning file yet gets the setup wizard instead.
 //
 // `mount(root, { fetch })` renders into `root` and returns a function that
 // stops it. Everything else (location, session storage, timers) comes from
@@ -14,6 +15,14 @@ import { pages, route } from "./pages.js";
 /// How often the attention banner asks the daemon again.
 const STATUS_EVERY_MS = 20_000;
 
+/// How often, and for how long, the page waits for the daemon to start
+/// after setup.
+const STARTING_EVERY_MS = 500;
+const STARTING_FOR_MS = 120_000;
+
+/// Where an OpenAI-compatible API usually is, as the endpoint's placeholder.
+const DEFAULT_ENDPOINT = "https://api.openai.com/v1";
+
 export function mount(root, { fetch }) {
   const document = root.ownerDocument;
   const window = document.defaultView;
@@ -23,6 +32,8 @@ export function mount(root, { fetch }) {
 
   let generation = 0;
   let stopped = false;
+  // Set while the setup wizard is showing: the routes wait until it's done.
+  let settingUp = false;
   let notice = null;
   // Set while an action moves to another page, so its notice survives the
   // navigation.
@@ -284,6 +295,202 @@ export function mount(root, { fetch }) {
     input.focus();
   }
 
+  /// A labelled text input in a setup card, with help under it.
+  function field(id, label, attributes, help) {
+    const input = h("input", { id, name: id, type: "text", autocomplete: "off", spellcheck: "false", ...attributes });
+    const helpId = help ? `${id}-help` : null;
+    if (helpId) input.setAttribute("aria-describedby", helpId);
+    return {
+      input,
+      nodes: [h("label", { for: id }, label), input, help ? h("p", { id: helpId, class: "help" }, help) : null],
+    };
+  }
+
+  /// The setup wizard: the LLM, or none for now. It asks for no code or
+  /// token, writes the tuning file and the secrets into the data dir, and
+  /// the daemon goes on starting.
+  function setupPage(state) {
+    settingUp = true;
+    generation += 1;
+    let mode = "api_key";
+    const modes = h(
+      "fieldset",
+      { class: "segmented setup-modes" },
+      h("legend", {}, "LLM"),
+      [
+        ["api_key", "API key", "An OpenAI-compatible API"],
+        ["chatgpt", "ChatGPT", "A ChatGPT subscription"],
+        ["later", "Later", "Ingest queues until you add one"],
+      ].map(([value, label, detail]) =>
+        h(
+          "label",
+          { class: "segment" },
+          h("input", { type: "radio", name: "setup-llm", value, checked: value === mode, onchange: () => setMode(value) }),
+          h("span", {}, h("strong", {}, label), h("span", { class: "segment-detail" }, detail)),
+        ),
+      ),
+    );
+    const endpoint = field("setup-endpoint", "Endpoint", { type: "url", placeholder: DEFAULT_ENDPOINT, value: DEFAULT_ENDPOINT });
+    const model = field("setup-model", "Model", { required: true }, "The model ID exactly as your provider writes it. The starting floors were calibrated against a single model.");
+    const apiKey = state.llm_api_key_from_env
+      ? { input: null, nodes: [h("p", { class: "help" }, "The daemon uses the key in ", h("code", {}, "ASPHODEL_LLM_API_KEY"), ".")] }
+      : field("setup-api-key", "API key", { type: "password", autocomplete: "off" }, "Saved to secrets.toml in the data dir, which only the daemon can read. Leave it empty if your endpoint doesn't need one.");
+    const effort = field("setup-effort", "Reasoning effort", { placeholder: "low, medium or high" }, "Optional. Leave it empty to use the provider's default.");
+    const language = field("setup-language", "Language", { placeholder: "English" }, "Optional. Memories are written in this language, translated if needed.");
+    // Each mode's fields sit in a fieldset that's disabled, not just hidden,
+    // so a hidden required field doesn't block the form.
+    const keyFields = h("fieldset", { class: "setup-fields" }, endpoint.nodes, apiKey.nodes);
+    const llmFields = h("fieldset", { class: "setup-fields" }, model.nodes, effort.nodes, language.nodes);
+    const loginNote = h(
+      "p",
+      { class: "help", hidden: true },
+      "After setup, log the daemon in with ",
+      h("code", {}, "asphodel llm login --data-dir <data dir>"),
+      ". Nothing is extracted until you do.",
+    );
+    function setMode(value) {
+      mode = value;
+      keyFields.disabled = keyFields.hidden = mode !== "api_key";
+      llmFields.disabled = llmFields.hidden = mode === "later";
+      loginNote.hidden = mode !== "chatgpt";
+    }
+    const error = h("p", { class: "notice", "data-tone": "error", role: "alert", tabindex: "-1", hidden: true });
+    const submit = h("button", { type: "submit" }, "Finish setup");
+    const form = h(
+      "form",
+      {
+        class: "token-card setup-card",
+        onsubmit: async (event) => {
+          event.preventDefault();
+          const value = (input) => input?.value.trim() || undefined;
+          const body =
+            mode === "later"
+              ? {}
+              : {
+                  llm: {
+                    auth: mode,
+                    endpoint: mode === "api_key" ? value(endpoint.input) : undefined,
+                    model: value(model.input),
+                    api_key: mode === "api_key" ? value(apiKey.input) : undefined,
+                    reasoning_effort: value(effort.input),
+                    language: value(language.input),
+                  },
+                };
+          submit.disabled = true;
+          error.hidden = true;
+          try {
+            setupDone(await api.setup(body));
+          } catch (failure) {
+            submit.disabled = false;
+            error.textContent = failure instanceof ApiError ? failure.message : String(failure.message ?? failure);
+            error.hidden = false;
+            error.focus();
+          }
+        },
+      },
+      h("a", { class: "mark", href: "#/", tabindex: "-1" }, flower(), h("span", {}, "Asphodel")),
+      h("h1", {}, "Set up Asphodel"),
+      h(
+        "p",
+        { class: "help" },
+        "This daemon has no tuning file yet. Setup writes one to the data dir, saves any secrets next to it, and starts the daemon. To change a setting later, edit the file and restart.",
+      ),
+      error,
+      modes,
+      keyFields,
+      llmFields,
+      loginNote,
+      state.makes_token
+        ? h("p", { class: "help" }, "Other machines can reach this daemon, so setup creates a bearer token. It's shown once, on the next screen.")
+        : null,
+      state.uncalibrated?.length
+        ? h(
+            "div",
+            { class: "notice setup-uncalibrated", "data-tone": "warning", role: "note" },
+            h("p", {}, h("strong", {}, "Uncalibrated floor. "), "Setup will write this placeholder value:"),
+            h("ul", {}, state.uncalibrated.map((line) => h("li", {}, h("code", {}, line)))),
+            h(
+              "p",
+              {},
+              "It decides which new claims are compared with existing memories. A bad value can duplicate memories, or merge ones that should stay apart. Calibrate it in replay (",
+              h("code", {}, "docs/replay.md"),
+              ") and update the tuning file before you rely on the store.",
+            ),
+          )
+        : null,
+      submit,
+    );
+    setMode(mode);
+    root.replaceChildren(h("main", { class: "token-page" }, form));
+    model.input.focus();
+  }
+
+  /// What setup did, and the token it made, shown this once.
+  function setupDone(done) {
+    if (done.token) api.token.set(done.token);
+    const open = h("button", { type: "button", onclick: () => openAfterSetup(open) }, "Open the dashboard");
+    const card = h(
+      "section",
+      { class: "token-card setup-card", "aria-labelledby": "setup-done" },
+      h("a", { class: "mark", href: "#/", tabindex: "-1" }, flower(), h("span", {}, "Asphodel")),
+      h("h1", { id: "setup-done", tabindex: "-1" }, "Asphodel is set up"),
+      done.token
+        ? [
+            h("label", { for: "setup-token" }, "Bearer token"),
+            h("input", { id: "setup-token", type: "text", readonly: true, value: done.token, spellcheck: "false" }),
+            h(
+              "p",
+              { class: "help" },
+              "Set it as ",
+              h("code", {}, "ASPHODEL_TOKEN"),
+              " for Hermes and any other client. Copy it now, because this page won't show it again. The daemon keeps its own copy in ",
+              h("code", {}, done.secrets),
+              ".",
+            ),
+          ]
+        : null,
+      done.llm_login
+        ? h("p", { class: "help" }, "Log the daemon in to ChatGPT with ", h("code", {}, `asphodel llm login --data-dir ${done.data_dir}`), ". Nothing is extracted until you do.")
+        : null,
+      h(
+        "p",
+        { class: "help" },
+        "The tuning file is ",
+        h("code", {}, done.config),
+        ". Its floors are only starting values, so recalibrate them in replay.",
+      ),
+      open,
+    );
+    root.replaceChildren(h("main", { class: "token-page" }, card));
+    card.querySelector("h1").focus();
+  }
+
+  /// Waits for the daemon to finish starting, then shows the banks.
+  async function openAfterSetup(button) {
+    button.disabled = true;
+    button.textContent = "Starting…";
+    const deadline = Date.now() + STARTING_FOR_MS;
+    while (!stopped && Date.now() < deadline) {
+      try {
+        if ((await api.health())?.ready) break;
+      } catch {
+        // Still starting.
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, STARTING_EVERY_MS));
+    }
+    if (stopped) return;
+    settingUp = false;
+    if (window.location.hash && window.location.hash !== "#/") window.location.hash = "#/";
+    else render({ focusHeading: true });
+  }
+
+  async function start() {
+    const state = await api.setupState();
+    if (stopped) return;
+    if (state?.needed) setupPage(state);
+    else render();
+  }
+
   async function render({ focusHeading = false, focusNotice = false } = {}) {
     const mine = ++generation;
     const at = route(window.location.hash);
@@ -327,6 +534,7 @@ export function mount(root, { fetch }) {
   }
 
   function onHashChange() {
+    if (settingUp) return;
     const carried = carryNotice;
     carryNotice = false;
     if (!carried) notice = null;
@@ -347,7 +555,7 @@ export function mount(root, { fetch }) {
 
   window.addEventListener("hashchange", onHashChange);
   const timer = window.setInterval(poll, STATUS_EVERY_MS);
-  render();
+  start();
 
   return () => {
     stopped = true;

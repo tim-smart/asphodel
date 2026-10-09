@@ -68,10 +68,40 @@ export function client(fetch, storage) {
     return data;
   }
 
+  /// First-run setup goes around `call`: it takes no token, and a stored
+  /// one is never sent to it or dropped by it.
+  async function setupCall(method, body) {
+    const headers = { accept: "application/json" };
+    if (body !== undefined) headers["content-type"] = "application/json";
+    const response = await fetch("/v1/setup", {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    if (!response.ok) {
+      throw new ApiError(response.status, data?.error ?? `The daemon answered ${response.status}.`);
+    }
+    return data;
+  }
+
   const bank = (name) => `/v1/banks/${path(name)}`;
 
   return {
     token,
+    // Whether the daemon waits for first-run setup. Any failure reads as
+    // no: the pages say what's wrong.
+    setupState: () => setupCall("GET").catch(() => null),
+    setup: (body) => setupCall("POST", body),
+    health: async () => {
+      const response = await fetch("/v1/health", { headers: { accept: "application/json" } });
+      return response.json();
+    },
     status: () => call("GET", "/v1/status"),
     banks: () => call("GET", "/v1/banks"),
     purgePlan: () => call("GET", "/v1/purge/plan"),

@@ -13,6 +13,10 @@
 //! 5. take the pre-migration copy and run any pending migrations;
 //! 6. delete pre-migration copies older than seven days.
 //!
+//! Steps 1 to 3 are [`LockedDir::acquire`] on their own, for a caller that
+//! must own the data dir before it opens the store: first-run setup writes
+//! its files there under the lock, then hands it to [`Store::open_locked`].
+//!
 //! The service repeats step 6 through [`Store::expire_copies`], waking at
 //! the deadline [`Store::next_copy_expiry`] gives.
 //!
@@ -146,6 +150,36 @@ pub struct Store {
     _lock: DataDirLock,
 }
 
+/// A data dir that has been checked and locked, before the store in it is
+/// opened. Dropping it releases the lock.
+#[derive(Debug)]
+pub struct LockedDir {
+    dir: PathBuf,
+    filesystem: FilesystemKind,
+    lock: DataDirLock,
+}
+
+impl LockedDir {
+    /// Steps 1 to 3 of [`Store::open`]: checks `dir` is a directory,
+    /// creating it when it is missing, refuses a network filesystem unless
+    /// `allow_network_fs`, and takes the exclusive lock.
+    pub fn acquire(dir: &Path, allow_network_fs: bool) -> Result<Self, StoreError> {
+        prepare_dir(dir)?;
+        let filesystem = fs::check_data_dir(dir, allow_network_fs)?;
+        let lock = DataDirLock::acquire(dir)?;
+        Ok(Self {
+            dir: dir.to_owned(),
+            filesystem,
+            lock,
+        })
+    }
+
+    /// The data dir.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
 impl Store {
     /// Opens the store under `dir`. See the module docs for the order of
     /// checks.
@@ -154,9 +188,24 @@ impl Store {
         options: OpenOptions,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, StoreError> {
-        prepare_dir(dir)?;
-        let filesystem = fs::check_data_dir(dir, options.allow_network_fs)?;
-        let lock = DataDirLock::acquire(dir)?;
+        let locked = LockedDir::acquire(dir, options.allow_network_fs)?;
+        Self::open_locked(locked, options, clock)
+    }
+
+    /// Opens the store in a data dir already locked, keeping the lock
+    /// [`LockedDir::acquire`] took rather than releasing and taking it
+    /// again. `options.allow_network_fs` was decided when it was taken.
+    pub fn open_locked(
+        locked: LockedDir,
+        options: OpenOptions,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, StoreError> {
+        let LockedDir {
+            dir,
+            filesystem,
+            lock,
+        } = locked;
+        let dir = dir.as_path();
 
         register_extensions();
         let path = dir.join(DB_FILE);

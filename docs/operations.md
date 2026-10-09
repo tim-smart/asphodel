@@ -56,14 +56,23 @@ native sidecar (Kubernetes 1.29 or later) in a single-replica StatefulSet.
   startup the daemon checks the filesystem and refuses NFS, SMB/CIFS,
   CephFS and FUSE, because SQLite's locking and WAL aren't safe on them.
   `--allow-network-fs` overrides that, at your own risk.
+- **Configuration.** Nothing needs mounting besides the data volume. The
+  first time the pod starts, the daemon waits for setup from the dashboard
+  ("First-run setup" below), which writes the tuning file and any secrets
+  into the data dir.
 - **Readiness.** `/v1/health` answers 503 while the store migrates and the
-  models load, and 200 with the version once the daemon is ready. It needs
-  no token. The example gates the sidecar's startup probe on it, so Hermes
-  starts once Asphodel can answer.
+  models load, and 200 with the version once the daemon is ready. While
+  first-run setup waits, it answers 200 with `"ready": false, "setup": true`,
+  so the startup probe passes and the kubelet doesn't restart the pod out
+  from under the wizard. It needs no token. The example gates the sidecar's
+  startup probe on it, so Hermes starts once Asphodel can answer; during
+  setup Hermes starts too, and the plugin warns that the daemon isn't ready
+  and spools turns until it is.
 - **Listening.** The kubelet probes the pod's IP, not its loopback, so the
   example listens on `0.0.0.0:7720`. Off loopback the daemon requires a
-  bearer token from `ASPHODEL_TOKEN` and refuses to start without one, and
-  once a token is set every client sends it, Hermes included. The `asphodel`
+  bearer token, from `ASPHODEL_TOKEN` or the data dir's `secrets.toml`, and
+  refuses to start without one; only first-run setup runs without it. Once
+  a token is set every client sends it, Hermes included. The `asphodel`
   Service exists only for the backup job; Hermes uses
   `http://127.0.0.1:7720`. A NetworkPolicy can limit port 7720 to the
   backup job's pods, but write it to allow Hermes' own ports too: a policy
@@ -77,15 +86,95 @@ native sidecar (Kubernetes 1.29 or later) in a single-replica StatefulSet.
   spools turns under `$HERMES_HOME/asphodel/spool/` and replays them once
   the daemon answers.
 
+### First-run setup
+
+When `serve` has no `--config` and its data dir has no `asphodel.toml`, it
+doesn't refuse to start. It binds, and waits for the setup wizard on the
+dashboard to write the configuration:
+
+1. Reach the dashboard: `kubectl port-forward hermes-0 7720` and open
+   `http://127.0.0.1:7720/dashboard`, or open it on the daemon's own
+   machine.
+2. Choose the LLM: an OpenAI-compatible endpoint with an optional API key,
+   a ChatGPT subscription, or none for now (chunks wait on the queue until
+   `[llm]` is set). That's the only question. There's no code, token or
+   credential to enter.
+3. Click **Finish setup**. The daemon writes the files below and carries on
+   starting, the same as it would after a restart. If it listens off
+   loopback and no token is configured, setup creates one and shows it
+   once. Give it to Hermes and the backup job as `ASPHODEL_TOKEN`. In the
+   example, that means adding it to the `asphodel` secret and restarting
+   the pod.
+
+For a ChatGPT subscription, log in once setup is done:
+`kubectl exec -it hermes-0 -c asphodel -- asphodel llm login --data-dir /data`.
+
+**Setup isn't protected.** Anyone who can reach an unconfigured daemon's
+port can complete setup. They choose its LLM, which decides where memory
+content is sent, and they get the bearer token setup creates. Keep the
+daemon private until setup is done:
+
+- Run setup through `kubectl port-forward` or on the daemon's own machine,
+  and don't put an Ingress, LoadBalancer or other proxy in front of it
+  before then.
+- In the example, the `asphodel` Service makes the port reachable from
+  other pods in the namespace. Finish setup as soon as the pod starts,
+  apply the Service once setup is done, or limit port 7720 with a
+  NetworkPolicy.
+- To skip setup, give the daemon a tuning file with `--config`, or put
+  `asphodel.toml` in the data dir before its first start.
+
+Setup runs once. After that, `POST /v1/setup` returns 409, every other
+route needs the token if one is configured, and you change settings by
+editing the files and restarting. If someone else completed setup before
+you did, stop the daemon, delete `asphodel.toml` and `secrets.toml` from
+the data dir, and start it again.
+
+After setup, the data dir holds:
+
+| File | What it is |
+|---|---|
+| `asphodel.toml` | The tuning file, read when `--config` isn't given. |
+| `secrets.toml` | Mode 0600: `token` and `llm_api_key`, when setup made or was given them. |
+| `asphodel.db` and the rest | The store, its lock and the ChatGPT login (`docs/models.md`). |
+
+The tuning file setup writes holds the `[llm]` section and starting floors
+for the models the daemon runs: the reranker's gate floor (-8.5) and
+relevance scale (3.564211) from the evaluations below, and an embedding
+floor (0.8) that is a placeholder until it's calibrated in replay
+(`docs/replay.md`, "Labelling and the precision curve"). Recalibrate them
+as you would in a file of your own.
+
+While setup waits, the daemon holds the data dir's lock, as it does once
+it's running. A second daemon pointed at the same dir refuses to start,
+so it can't write the files. Each file is written to a temp file, synced
+and renamed into place, and then the directory is synced. The secrets go
+first, so `asphodel.toml`, which marks setup as done, never lands on disk
+before the secrets it needs.
+
+Before you submit, the wizard lists any floor it's about to write that is
+only a placeholder, and the file marks it with a comment. Today that's
+the embedding floor.
+
+The backup copies the store, not these files. Save a copy of
+`asphodel.toml` once setup is done, and keep the token and the LLM key
+wherever else you keep secrets:
+
+```sh
+kubectl cp -c asphodel hermes-0:/data/asphodel.toml ./asphodel.toml
+```
+
+"Restoring into a new volume" below says how to put them back.
+
 ### Secrets and environment
 
 | Variable | Flag | What it is |
 |---|---|---|
-| `ASPHODEL_TOKEN` | none | The bearer token. Required off loopback. Clients read it too. |
-| `ASPHODEL_LLM_API_KEY` | none | The LLM key, for `auth = "api_key"`. |
+| `ASPHODEL_TOKEN` | none | The bearer token. Required off loopback, here or in `secrets.toml`. Clients read it too. |
+| `ASPHODEL_LLM_API_KEY` | none | The LLM key, for `auth = "api_key"`, here or in `secrets.toml`. |
 | `ASPHODEL_LISTEN` | `--listen` | `host:port` or `unix:/path`. Default `127.0.0.1:7720`. |
 | `ASPHODEL_DATA_DIR` | `--data-dir` | The store and its lock. Required, with no default. |
-| `ASPHODEL_CONFIG` | `--config` | The tuning file. |
+| `ASPHODEL_CONFIG` | `--config` | The tuning file. Default `asphodel.toml` in the data dir. |
 | `ASPHODEL_MODEL_DIR` | `--model-dir` | The models. The image sets it. |
 | `ASPHODEL_ALLOW_NETWORK_FS` | `--allow-network-fs` | Run on a network filesystem. |
 | `ASPHODEL_ONNX_THREADS` | `--onnx-threads` | ONNX Runtime's intra-op threads. |
@@ -93,11 +182,21 @@ native sidecar (Kubernetes 1.29 or later) in a single-replica StatefulSet.
 | `ASPHODEL_URL` | `--url` | Where a client finds the daemon. Default `http://127.0.0.1:7720`. |
 | `ASPHODEL_LOG` | none | The log filter (`docs/logging.md`). Default `info`. |
 
-Secrets have no flag, so they never show in a process list.
+Secrets have no flag, so they never show in a process list. Each one set
+in the environment wins over the same one in the data dir's
+`secrets.toml`, so a deployment that already injects them keeps working,
+and one that rotates a secret can do it in either place.
 
 ### The tuning file
 
-The tuning file is TOML, and every key in it is optional except three kinds:
+The tuning file is TOML. The daemon reads `--config` (or
+`ASPHODEL_CONFIG`) when it's given, and otherwise `asphodel.toml` in the
+data dir, which first-run setup writes; `--config` always wins, and setup
+never runs while one is given. A tuning file you manage yourself, mounted
+from a ConfigMap as earlier versions of the example did, keeps working
+unchanged.
+
+Every key in it is optional except three kinds:
 
 - `[llm] model`, the exact model string. The floors are calibrated against
   one model.
@@ -886,6 +985,44 @@ Then check what the restore changed:
 - A backup from an older schema migrates on the first start, as an upgrade
   does. `docs/upgrading.md` says whether that needs anything from you.
 
+### Restoring into a new volume
+
+A restore into the volume the daemon already used keeps `asphodel.toml`,
+`secrets.toml` and the ChatGPT login beside the store. A restore into a
+new, empty volume brings back the store only, so the daemon comes up
+waiting for setup. That's a safe place to stop: it doesn't open the
+store, so nothing queued is extracted and nothing is purged until the
+configuration is back. Like any unconfigured daemon, though, anyone who
+can reach it can complete setup, so keep it private until then. Running
+the wizard again would write starting values over any tuning you had
+changed, so put your own back instead:
+
+1. Put back the tuning file. With the pod waiting for setup:
+
+   ```sh
+   kubectl cp -c asphodel ./asphodel.toml hermes-0:/data/asphodel.toml
+   ```
+
+   Or mount it from a ConfigMap and pass `--config`. Use the wizard only
+   if you never changed the file it wrote.
+2. Put back the secrets the daemon kept in the data dir. If the token
+   and the LLM key come from the `asphodel` secret
+   (`ASPHODEL_TOKEN`, `ASPHODEL_LLM_API_KEY`), there is nothing to do.
+   Otherwise either add them to that secret or write `/data/secrets.toml`
+   (`token = "..."`, `llm_api_key = "..."`, mode 0600, owned by uid 65532).
+   The token must be the one Hermes and the backup job send.
+3. Restart the pod (`kubectl delete pod hermes-0`) so the daemon reads the
+   files and opens the store.
+4. For a ChatGPT subscription, log in again: the login lived in the old
+   volume. `kubectl exec -it hermes-0 -c asphodel -- asphodel llm login
+   --data-dir /data`. Until then chunks wait on the queue.
+5. Compare the tuning in `GET /v1/config` with your saved file (with
+   `kubectl port-forward hermes-0 7720`:
+   `curl -H "Authorization: Bearer $ASPHODEL_TOKEN" http://127.0.0.1:7720/v1/config`),
+   and check `asphodel status` for a purge pause. A
+   tuning that doesn't match the store's deletion fingerprint pauses purge
+   and the sweep rather than deleting on new values ("Purge pauses" below).
+
 ## Upgrading
 
 Upgrade by deploying the new image. Before a schema migration the daemon
@@ -1103,6 +1240,10 @@ in any retriever's top 100 isn't a candidate at all, so it isn't listed
 either.
 
 ## The dashboard
+
+While the daemon waits for first-run setup, the dashboard shows the setup
+wizard instead ("First-run setup" above). Once setup is done, the token it
+made is kept in the tab, so the dashboard opens signed in.
 
 The daemon serves a dashboard at `/dashboard` for browsing banks, documents
 and memories, and for keeping, retracting and forgetting them and removing

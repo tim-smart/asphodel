@@ -8,6 +8,12 @@ export const TOKEN = "dashboard-token";
 
 export const NOW = "2026-10-03T09:00:00Z";
 
+/// The token setup makes.
+export const SETUP_TOKEN = "token-setup-made";
+
+/// The placeholder floor a daemon waiting for setup warns about.
+export const UNCALIBRATED = 'reconcile.embedding_floors."bge-small-en-v1.5:int8" = 0.8';
+
 export const DOCUMENT = "notes/2026/today.md";
 
 export const ids = {
@@ -543,9 +549,12 @@ export class FakeDaemon {
   /// `eraseOnForget` runs the erase before forget answers, as the daemon does
   /// when nothing is queued: the forgotten chain's rows are gone at once, so
   /// reading one of its memories is a 404. Otherwise they stay, hidden, as
-  /// they do while the erase waits behind the queue.
-  constructor({ token = TOKEN, state = fixtures(), eraseOnForget = false } = {}) {
-    this.token = token;
+  /// they do while the erase waits behind the queue. `setup` is a daemon
+  /// with no tuning file, waiting for the wizard; finishing it sets the token
+  /// to `SETUP_TOKEN`.
+  constructor({ token = TOKEN, state = fixtures(), eraseOnForget = false, setup = false } = {}) {
+    this.token = setup ? null : token;
+    this.settingUp = setup;
     this.eraseOnForget = eraseOnForget;
     this.state = state;
     this.requests = [];
@@ -584,14 +593,40 @@ export class FakeDaemon {
     await Promise.resolve();
 
     if (url.pathname === "/v1/health") {
-      return json(200, { version: "0.1.0", ready: true, now: NOW });
+      return json(200, { version: "0.1.0", ready: !this.settingUp, setup: this.settingUp, now: NOW });
     }
+    if (url.pathname === "/v1/setup") return this.setup(request);
+    if (this.settingUp) return error(503, "the daemon is starting: the store and models aren't ready yet");
     if (this.token !== null && request.authorization !== `Bearer ${this.token}`) {
       return error(401, "a bearer token is required: set ASPHODEL_TOKEN on the client", {
         "www-authenticate": "Bearer",
       });
     }
     return this.route(request);
+  }
+
+  /// `/v1/setup`, which needs no token.
+  setup({ method, body }) {
+    if (method === "GET") {
+      return json(200, {
+        needed: this.settingUp,
+        token_configured: false,
+        makes_token: this.settingUp,
+        llm_api_key_from_env: false,
+        uncalibrated: this.settingUp ? [UNCALIBRATED] : [],
+      });
+    }
+    if (!this.settingUp) return error(409, "setup is already done; to change a setting, edit the tuning file in the data dir and restart");
+    if (body?.llm && !body.llm.model) return error(400, "llm.model is required");
+    this.settingUp = false;
+    this.token = SETUP_TOKEN;
+    return json(200, {
+      data_dir: "/data",
+      config: "/data/asphodel.toml",
+      secrets: "/data/secrets.toml",
+      token: SETUP_TOKEN,
+      llm_login: body?.llm?.auth === "chatgpt",
+    });
   }
 
   route({ method, path, query, body }) {

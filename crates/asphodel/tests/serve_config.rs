@@ -1,9 +1,10 @@
 //! `asphodel serve`'s deployment flags and tuning file, run as a process.
 //!
 //! Each deployment flag has an `ASPHODEL_*` environment variable,
-//! secrets come from the environment only, and an unknown key or
-//! out-of-range value in the tuning file stops the daemon starting. The
-//! tests read what the daemon resolved from `GET /v1/config`.
+//! secrets come from the environment or the data dir, never a flag, and an
+//! unknown key or out-of-range value in the tuning file stops the daemon
+//! starting. Without a tuning file, first-run setup writes one into the data
+//! dir. The tests read what the daemon resolved from `GET /v1/config`.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -91,6 +92,14 @@ fn loopback() -> String {
     free.local_addr().unwrap().to_string()
 }
 
+/// A port free now on every interface, as `--listen` takes it, and the
+/// loopback address that reaches it.
+fn every_interface() -> (String, String) {
+    let addr = loopback();
+    let port = addr.rsplit_once(':').unwrap().1;
+    (format!("0.0.0.0:{port}"), addr)
+}
+
 /// A running daemon, killed on drop.
 struct Daemon {
     child: Child,
@@ -110,9 +119,27 @@ impl Drop for Daemon {
 impl Daemon {
     /// `GET <path>` with `token` if given: the status and the body.
     fn get(&self, path: &str, token: Option<&str>) -> std::io::Result<(u16, String)> {
+        self.send("GET", path, token, None)
+    }
+
+    /// `<method> <path>` with `token` if given and a JSON body: the status
+    /// and the body.
+    fn send(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&Value>,
+    ) -> std::io::Result<(u16, String)> {
         let mut stream = TcpStream::connect(&self.addr)?;
         let auth = token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
-        write!(stream, "GET {path} HTTP/1.0\r\n{auth}\r\n")?;
+        let body = body.map_or(String::new(), Value::to_string);
+        write!(
+            stream,
+            "{method} {path} HTTP/1.0\r\n{auth}Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
         let (head, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
@@ -125,6 +152,36 @@ impl Daemon {
         let (status, body) = self.get("/v1/config", token).unwrap();
         assert_eq!(status, 200, "{body}");
         serde_json::from_str(&body).unwrap()
+    }
+
+    /// `GET /v1/health`'s body, which must answer 200.
+    fn health(&self) -> Value {
+        let (status, body) = self.get("/v1/health", None).unwrap();
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    /// Waits until `/v1/health` says the daemon is ready, not just set up.
+    /// It answers 503 while the store opens after setup.
+    fn wait_ready(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ready = |daemon: &Self| {
+            daemon
+                .get("/v1/health", None)
+                .is_ok_and(|(status, body)| status == 200 && body.contains("\"ready\":true"))
+        };
+        while !ready(self) {
+            if Instant::now() >= deadline {
+                panic!("the daemon never became ready:\n{}", self.log());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// `POST /v1/setup`, which takes no token.
+    fn setup(&self, body: &Value) -> (u16, Value) {
+        let (status, body) = self.send("POST", "/v1/setup", None, Some(body)).unwrap();
+        (status, serde_json::from_str(&body).unwrap_or(Value::Null))
     }
 
     /// Kills the daemon and returns its whole log.
@@ -297,4 +354,143 @@ fn secrets_are_read_from_the_environment_and_never_logged() {
         assert!(!config.to_string().contains(secret), "{config}");
         assert!(!log.contains(secret), "{log}");
     }
+}
+
+#[test]
+fn first_run_setup_writes_the_config_into_the_data_dir_and_survives_restarts() {
+    let dir = TestDir::new();
+    let data = dir.0.join("data");
+    // Off loopback with no token anywhere: setup still starts, asks for
+    // nothing, and makes the token.
+    let serve_off_loopback = || {
+        let (listen, addr) = every_interface();
+        let mut command = serve_in(&dir);
+        command.args(["--listen", &listen]);
+        (command, addr)
+    };
+    let (mut command, addr) = serve_off_loopback();
+    let mut daemon = start(&mut command, &addr);
+    let health = daemon.health();
+    assert_eq!(health["setup"], true, "{health}");
+    assert_eq!(health["ready"], false, "{health}");
+    assert_eq!(daemon.get("/v1/config", None).unwrap().0, 503);
+    let (status, body) = daemon.get("/v1/setup", None).unwrap();
+    assert_eq!(status, 200, "{body}");
+    let state: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(state["needed"], true, "{state}");
+    assert_eq!(state["makes_token"], true, "{state}");
+
+    let llm = serde_json::json!({"llm": {
+        "endpoint": "https://llm.example.com/v1",
+        "model": "model-under-test",
+        "api_key": LLM_KEY,
+    }});
+    // A bad value is refused, and setup still waits.
+    let bad = serde_json::json!({"llm": {"endpoint": "ftp://nowhere", "model": "m"}});
+    assert_eq!(daemon.setup(&bad).0, 400);
+    assert!(!data.join("asphodel.toml").exists());
+
+    let (status, done) = daemon.setup(&llm);
+    assert_eq!(status, 200, "{done}");
+    let token = done["token"]
+        .as_str()
+        .expect("setup makes a token")
+        .to_string();
+    daemon.wait_ready();
+    // Setup happens once: a second call is refused, so nobody can take
+    // the daemon over afterwards.
+    assert_eq!(daemon.setup(&llm).0, 409);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let secrets = std::fs::metadata(data.join("secrets.toml")).unwrap();
+        assert_eq!(
+            secrets.permissions().mode() & 0o077,
+            0,
+            "secrets.toml is private"
+        );
+    }
+    assert_eq!(daemon.get("/v1/config", None).unwrap().0, 401);
+    let config = daemon.config(Some(&token));
+    assert_eq!(config["tuning"]["llm"]["model"], "model-under-test");
+    assert_eq!(config["deployment"]["llm_api_key"], "[redacted]");
+    let bank = serde_json::json!({});
+    let (status, body) = daemon
+        .send("PUT", "/v1/banks/persisted", Some(&token), Some(&bank))
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    let log = daemon.log();
+    for secret in [LLM_KEY, &token] {
+        assert!(!log.contains(secret), "a secret was logged:\n{log}");
+    }
+
+    // A restart with nothing but the data dir reads what setup wrote: the
+    // tuning, the token and the store.
+    let (mut command, addr) = serve_off_loopback();
+    let mut daemon = start(&mut command, &addr);
+    assert_eq!(daemon.health()["setup"], false);
+    daemon.wait_ready();
+    assert_eq!(daemon.get("/v1/config", None).unwrap().0, 401);
+    let config = daemon.config(Some(&token));
+    assert_eq!(config["tuning"]["llm"]["model"], "model-under-test");
+    assert_eq!(config["llm"]["logged_in"], true, "{config}");
+    let (status, body) = daemon.get("/v1/banks", Some(&token)).unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("persisted"), "{body}");
+    drop(daemon);
+
+    // The environment still wins over the data dir's token.
+    let (mut command, addr) = serve_off_loopback();
+    let daemon = start(command.env("ASPHODEL_TOKEN", TOKEN), &addr);
+    assert_eq!(daemon.get("/v1/config", Some(&token)).unwrap().0, 401);
+    daemon.config(Some(TOKEN));
+    drop(daemon);
+
+    // And `--config` still wins over the data dir's tuning file.
+    let tuning = dir.with_floors("explicit.toml", "[clock]\nquiet_rate = 0.3\n");
+    let (mut command, addr) = serve_off_loopback();
+    let daemon = start(command.arg("--config").arg(&tuning), &addr);
+    let config = daemon.config(Some(&token));
+    assert_eq!(config["tuning"]["clock"]["quiet_rate"], 0.3);
+    assert_eq!(config["tuning"]["llm"]["model"], Value::Null);
+    assert_eq!(config["deployment"]["config"], tuning.to_str().unwrap());
+}
+
+#[test]
+fn a_pending_setup_survives_a_restart_and_owns_its_data_dir() {
+    let dir = TestDir::new();
+    let data = dir.0.join("data");
+    let addr = loopback();
+    let mut daemon = start(serve_in(&dir).args(["--listen", &addr]), &addr);
+    assert_eq!(daemon.health()["setup"], true);
+    daemon.log();
+
+    // A restart before setup is done waits again.
+    let addr = loopback();
+    let daemon = start(
+        serve_in(&dir)
+            .args(["--listen", &addr])
+            .env("ASPHODEL_TOKEN", TOKEN),
+        &addr,
+    );
+    assert_eq!(daemon.health()["setup"], true);
+    // Waiting for setup, the daemon owns the data dir: a second one on it
+    // refuses to start, so it can't write the files.
+    let (listen, _) = every_interface();
+    refused(
+        &dir,
+        serve_in(&dir).args(["--listen", &listen]),
+        "locked by another asphodel process",
+    );
+    assert!(!data.join("asphodel.toml").exists());
+    assert!(!data.join("secrets.toml").exists());
+    // Setup leaves the LLM for later, and makes no token when one is
+    // already configured.
+    let (status, done) = daemon.setup(&serde_json::json!({}));
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["token"], Value::Null);
+    let mut daemon = daemon;
+    daemon.wait_ready();
+    let config = daemon.config(Some(TOKEN));
+    assert_eq!(config["llm"], Value::Null, "{config}");
+    assert!(!data.join("secrets.toml").exists());
 }

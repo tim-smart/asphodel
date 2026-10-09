@@ -170,8 +170,9 @@ pub struct ClientArgs {
 
 /// Deployment flags. Each has an `ASPHODEL_*` environment variable, and a
 /// flag wins over its variable. The secrets, `ASPHODEL_TOKEN` and
-/// `ASPHODEL_LLM_API_KEY`, have no flag: they come from the environment only,
-/// so they never show up in a process list.
+/// `ASPHODEL_LLM_API_KEY`, have no flag, so they never show up in a process
+/// list: they come from the environment, else from `secrets.toml` in the
+/// data dir, which first-run setup writes.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
     /// Address to listen on: `host:port`, or `unix:/path` for a socket.
@@ -183,7 +184,9 @@ pub struct ServeArgs {
     #[arg(long, env = "ASPHODEL_DATA_DIR")]
     pub data_dir: PathBuf,
 
-    /// The tuning file (TOML). Without one, the code defaults apply.
+    /// The tuning file (TOML). Without one, the daemon reads `asphodel.toml`
+    /// in the data dir, and when that isn't there either it waits for
+    /// first-run setup at /dashboard to write it.
     #[arg(long, env = "ASPHODEL_CONFIG")]
     pub config: Option<PathBuf>,
 

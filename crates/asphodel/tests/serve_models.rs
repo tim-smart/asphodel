@@ -63,6 +63,10 @@ fn an_empty_model_dir_stops_startup_naming_the_missing_file() {
     std::fs::create_dir_all(&models).unwrap();
     let (home, xdg) = (dir.0.join("home"), dir.0.join("xdg"));
     let under_home = home.join(".cache/asphodel/models");
+    // A tuning file, so the daemon goes on to load the models rather than
+    // wait for first-run setup. The models load before the floors are read.
+    let tuning = dir.0.join("tuning.toml");
+    std::fs::write(&tuning, "").unwrap();
     let cases = [
         (Some(&models), Some(xdg.as_path()), &models),
         (None, Some(&xdg), &xdg.join("asphodel/models")),
@@ -71,7 +75,7 @@ fn an_empty_model_dir_stops_startup_naming_the_missing_file() {
     ];
     for (flag, xdg, expected) in cases {
         let stderr = refused(&dir, |c| {
-            c.env("HOME", &home);
+            c.env("HOME", &home).arg("--config").arg(&tuning);
             if let Some(xdg) = xdg {
                 c.env("XDG_CACHE_HOME", xdg);
             }

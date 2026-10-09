@@ -2,49 +2,32 @@
 #
 # Before applying:
 #   - push the image `nix build .#image` builds and set it below;
-#   - create the secret:
+#   - replace the Hermes container with your own;
+#   - optionally, create the token secret now, so Hermes, the backup job and
+#     the daemon share it from the start:
 #       kubectl create secret generic asphodel \
-#         --from-literal=token="$(openssl rand -hex 32)" \
-#         --from-literal=llm-api-key=<key>
-#   - fill in the tuning file, including the calibrated floors;
-#   - replace the Hermes container with your own.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: asphodel-config
-data:
-  asphodel.toml: |
-    # The tuning file. Every key is optional except the LLM
-    # model and a floor for each model the daemon runs: it refuses to start
-    # without them.
-
-    [llm]
-    model = "<the model the floors were calibrated against>"
-    endpoint = "https://api.openai.com/v1"
-    # For a ChatGPT subscription instead of an API key, set
-    #   auth = "chatgpt"
-    # drop `endpoint`, and log in once the pod is up:
-    #   kubectl exec -it hermes-0 -c asphodel -- asphodel llm login --data-dir /data
-
-    # Calibrate this embedding-floor placeholder in replay before deployment
-    # (docs/replay.md, "Labelling and the precision curve").
-    [reconcile.embedding_floors]
-    "bge-small-en-v1.5:int8" = 0.8
-
-    # From 380 labels over 10 prefetches of the call 1 v5 replay: -8.5 keeps
-    # 6 of 18 relevant at precision 0.21 (-8.0 keeps 5 at 0.22) and admits
-    # a clear top answer at -8.2. The gate uses raw logits.
-    [injection.reranker_floors]
-    "ms-marco-MiniLM-L-6-v2:int8" = -8.5
-
-    # The reranker logit is divided by this before it's added to the other
-    # ranking terms. The other weights were sized for jina-reranker-v1-turbo-en
-    # int8, so the scale is std(L-6 logits) / std(jina logits), measured over
-    # every candidate in the 69-query eval pools.
-    [ranking.relevance_scales]
-    "ms-marco-MiniLM-L-6-v2:int8" = 3.564211
+#         --from-literal=token="$(openssl rand -hex 32)"
+#
+# Then set Asphodel up from its dashboard (docs/operations.md, "First-run
+# setup"). With no tuning file in its data dir, the daemon waits for it:
+#   kubectl port-forward hermes-0 7720
+#   open http://127.0.0.1:7720/dashboard
+# Setup asks for no code or token, so anyone who reaches the port first can
+# complete it. Run it as soon as the pod first starts, and keep the port
+# private until you have. Don't add an Ingress or LoadBalancer yet, and bear
+# in mind that the Service below lets other pods in the namespace reach it.
+# Setup writes the tuning file and any secrets into the data volume, so they
+# survive restarts and nothing else needs mounting. Without the secret above,
+# setup makes a token and shows it once: store it as that secret and restart
+# the pod, so Hermes and the backup job get it too.
+#
+# To manage the tuning file yourself instead, mount it from a ConfigMap and
+# pass `--config=/etc/asphodel/asphodel.toml`; it wins over the data dir's,
+# and setup never runs (docs/operations.md, "The tuning file").
 ---
 # Only the backup CronJob uses this. Hermes reaches the daemon on loopback.
+# Until setup is done, it also exposes the setup wizard to the namespace. If
+# that matters, apply it after setup or limit port 7720 with a NetworkPolicy.
 apiVersion: v1
 kind: Service
 metadata:
@@ -94,11 +77,12 @@ spec:
             # reach it. That makes the token mandatory for every client.
             - --listen=0.0.0.0:7720
             - --data-dir=/data
-            - --config=/etc/asphodel/asphodel.toml
+          # Both are optional: the environment wins over what setup keeps in
+          # the data dir, and setup works without either.
           env:
             - name: ASPHODEL_TOKEN
               valueFrom:
-                secretKeyRef: {name: asphodel, key: token}
+                secretKeyRef: {name: asphodel, key: token, optional: true}
             - name: ASPHODEL_LLM_API_KEY
               valueFrom:
                 secretKeyRef: {name: asphodel, key: llm-api-key, optional: true}
@@ -106,7 +90,9 @@ spec:
             - name: asphodel
               containerPort: 7720
           # /v1/health answers 503 while the store migrates and the models
-          # load, and 200 once the daemon is ready. It needs no token.
+          # load, and 200 once the daemon is ready. While first-run setup
+          # waits it answers 200 with `ready: false`, so the pod isn't
+          # restarted out from under the wizard. It needs no token.
           startupProbe:
             httpGet: {path: /v1/health, port: asphodel}
             periodSeconds: 2
@@ -125,9 +111,6 @@ spec:
           volumeMounts:
             - name: asphodel-data
               mountPath: /data
-            - name: asphodel-config
-              mountPath: /etc/asphodel
-              readOnly: true
             - name: tmp
               mountPath: /tmp
       containers:
@@ -138,13 +121,10 @@ spec:
               value: http://127.0.0.1:7720
             - name: ASPHODEL_TOKEN
               valueFrom:
-                secretKeyRef: {name: asphodel, key: token}
+                secretKeyRef: {name: asphodel, key: token, optional: true}
           # ... the rest of your Hermes container, with the plugin installed
           # under $HERMES_HOME/plugins/asphodel.
       volumes:
-        - name: asphodel-config
-          configMap:
-            name: asphodel-config
         - name: tmp
           emptyDir: {}
   volumeClaimTemplates:

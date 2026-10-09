@@ -447,8 +447,9 @@ pub enum LlmAuth {
 }
 
 /// `[llm]`: the one LLM for extraction, reconciliation and refresh. Its API
-/// key is a secret and comes from the environment only; so does the
-/// subscription's token file.
+/// key is a secret and never sits in the tuning file: it comes from the
+/// environment or the data dir's secrets file, and the subscription's token
+/// file lives in the data dir.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmTuning {

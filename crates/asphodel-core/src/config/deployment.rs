@@ -1,5 +1,6 @@
 //! Deployment settings: flags with an `ASPHODEL_*` environment variable each,
-//! and secrets from the environment only.
+//! and secrets from the environment, else the data dir's secrets file, never
+//! from a flag.
 //!
 //! The binary parses the flags; this is the plain record of what it resolved,
 //! so the resolved config can show it with the secrets redacted.
@@ -24,7 +25,8 @@ pub struct Deployment {
     /// `--data-dir` / `ASPHODEL_DATA_DIR`.
     pub data_dir: Option<PathBuf>,
 
-    /// `--config` / `ASPHODEL_CONFIG`: the tuning file.
+    /// The tuning file: `--config` / `ASPHODEL_CONFIG`, else `asphodel.toml`
+    /// in the data dir.
     pub config: Option<PathBuf>,
 
     /// `--allow-network-fs` / `ASPHODEL_ALLOW_NETWORK_FS`.
@@ -33,10 +35,11 @@ pub struct Deployment {
     /// `--model-dir` / `ASPHODEL_MODEL_DIR`: the embedding and reranker models.
     pub model_dir: Option<PathBuf>,
 
-    /// `ASPHODEL_TOKEN`, environment only.
+    /// `ASPHODEL_TOKEN`, else `token` in the data dir's secrets file.
     pub token: Option<Secret>,
 
-    /// `ASPHODEL_LLM_API_KEY`, environment only.
+    /// `ASPHODEL_LLM_API_KEY`, else `llm_api_key` in the data dir's secrets
+    /// file.
     pub llm_api_key: Option<Secret>,
 }
 
