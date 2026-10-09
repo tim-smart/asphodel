@@ -1757,6 +1757,95 @@ fn the_total_goes_round_the_facets_instead_of_taking_the_best_scores() {
     assert_eq!(inputs(&h.input("Garden")), expected);
 }
 
+/// A planned "Garden" model whose beds facet has four critical matches,
+/// each sharing six of its query's words, and whose hives facet has three,
+/// refreshed twice since they were said: the first judges them, and the
+/// second writes from the facets' own best. Returns the beds.
+fn crowded_beds(h: &Harness) -> Vec<Uuid> {
+    let garden = ModelSpec {
+        name: "Garden".into(),
+        question: "What does Tim grow and keep?".into(),
+        kinds: vec![Kind::Fact],
+        ..plans_model(100)
+    };
+    h.service.create_model(BANK, &garden).unwrap();
+    let beds = "Which tomatoes, basil, chillies and garlic does Tim grow?";
+    let hives = "Which bees does Tim keep in hives?";
+    h.plan("Garden", &[("Beds", beds), ("Hives", hives)]);
+    let grows = |bed| {
+        let grows = format!("Tim grows tomatoes, basil, chillies and garlic in bed {bed}.");
+        fact(&grows).level("critical")
+    };
+    let keeps = |hive| fact(&format!("Tim keeps bees in hive {hive}.")).level("critical");
+    let mut claims: Vec<Value> = ["one", "two", "three", "four"].map(grows).into();
+    claims.extend(["one", "two", "three"].map(keeps));
+    let mut beds = h.seed_all(BANK, at(EARLIER), claims);
+    for _ in 0..2 {
+        applied(h.refresh("Garden", &quiet_llm(1), true));
+    }
+    beds.truncate(4);
+    beds
+}
+
+#[test]
+fn a_new_memory_relevant_to_a_facet_is_in_the_refresh_it_triggers() {
+    // The beds facet takes three, and four stronger memories share more of
+    // its words, so a new memory sharing two would be cut. It asked for the
+    // refresh and the reranker finds it relevant, so it goes in. One no
+    // facet finds relevant competes as before: the selection stays as it
+    // was and the refresh is skipped.
+    let h = Harness::with(|t| {
+        t.mental_models.facet_budget = 3;
+        t.mental_models.input_budget = 7;
+        t.mental_models.input_budget_with_cited = 7;
+    });
+    let beds = crowded_beds(&h);
+    let before = inputs(&h.input("Garden"));
+    assert_eq!(beds.iter().filter(|bed| !before.contains(bed)).count(), 1);
+
+    let pond = h.says(fact("Tim's garden has a pond."));
+    assert_eq!(inputs(&h.input("Garden")), before);
+    let llm = quiet_llm(1);
+    assert_eq!(h.refresh("Garden", &llm, false), Outcome::Unchanged);
+    assert_eq!(writes(&llm), 0);
+
+    let garlic = h.says(fact("Tim planted more garlic."));
+    let input = h.input("Garden");
+    let selected = inputs(&input);
+    assert!(selected.contains(&garlic) && !selected.contains(&pond));
+    assert!(before.is_subset(&selected));
+    let llm = quiet_llm(1);
+    applied(h.refresh("Garden", &llm, false));
+    let write = &calls(&llm, WRITE_TEMPLATE)[0].user;
+    assert!(write.contains("Tim planted more garlic."), "{write}");
+}
+
+#[test]
+fn a_trigger_waits_through_a_failed_refresh_and_a_restart_for_one_that_completes() {
+    let h = Harness::with(|t| {
+        t.mental_models.facet_budget = 3;
+        t.mental_models.input_budget = 7;
+        t.mental_models.input_budget_with_cited = 7;
+    });
+    let beds = crowded_beds(&h);
+    let garlic = h.says(fact("Tim planted more garlic."));
+
+    let down = FakeLlm::failing(MODEL, || LlmError::Transport {
+        reason: "connection refused".into(),
+    });
+    assert_eq!(
+        h.refresh("Garden", &down, true),
+        Outcome::Failed(FailureKind::Llm)
+    );
+    assert!(inputs(&h.input("Garden")).contains(&garlic));
+    let h = h.restart();
+    assert!(inputs(&h.input("Garden")).contains(&garlic));
+
+    // A completed refresh has judged it. Uncited, it competes as before.
+    h.refresh_adding("Garden", &[("Tim grows garlic.", &beds[..1])]);
+    assert!(!inputs(&h.input("Garden")).contains(&garlic));
+}
+
 #[test]
 fn a_changed_question_rewrites_the_answer_even_with_the_same_facets() {
     // The question is compared with the plan. Here the new question plans
