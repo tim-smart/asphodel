@@ -1760,8 +1760,9 @@ fn the_total_goes_round_the_facets_instead_of_taking_the_best_scores() {
 /// A planned "Garden" model whose beds facet has four critical matches,
 /// each sharing six of its query's words, and whose hives facet has three,
 /// refreshed twice since they were said: the first judges them, and the
-/// second writes from the facets' own best. Returns the beds.
-fn crowded_beds(h: &Harness) -> Vec<Uuid> {
+/// second writes from the facets' own best. Returns the beds, then the
+/// hives.
+fn crowded_beds(h: &Harness) -> (Vec<Uuid>, Vec<Uuid>) {
     let garden = ModelSpec {
         name: "Garden".into(),
         question: "What does Tim grow and keep?".into(),
@@ -1783,23 +1784,30 @@ fn crowded_beds(h: &Harness) -> Vec<Uuid> {
     for _ in 0..2 {
         applied(h.refresh("Garden", &quiet_llm(1), true));
     }
-    beds.truncate(4);
-    beds
+    let hives = beds.split_off(4);
+    (beds, hives)
+}
+
+/// [`Harness::with`] with each facet taking three and the input six, so
+/// the beds and hives facets of [`crowded_beds`] fill it between them.
+fn three_each() -> Harness {
+    Harness::with(|t| {
+        t.mental_models.facet_budget = 3;
+        t.mental_models.input_budget = 6;
+        t.mental_models.input_budget_with_cited = 6;
+    })
 }
 
 #[test]
 fn a_new_memory_relevant_to_a_facet_is_in_the_refresh_it_triggers() {
     // The beds facet takes three, and four stronger memories share more of
     // its words, so a new memory sharing two would be cut. It asked for the
-    // refresh and the reranker finds it relevant, so it goes in. One no
-    // facet finds relevant competes as before: the selection stays as it
-    // was and the refresh is skipped.
-    let h = Harness::with(|t| {
-        t.mental_models.facet_budget = 3;
-        t.mental_models.input_budget = 7;
-        t.mental_models.input_budget_with_cited = 7;
-    });
-    let beds = crowded_beds(&h);
+    // refresh and the reranker finds it relevant, so it goes in, in one of
+    // the beds facet's turns: the hives keep theirs. One no facet finds
+    // relevant competes as before: the selection stays as it was and the
+    // refresh is skipped.
+    let h = three_each();
+    let (beds, hives) = crowded_beds(&h);
     let before = inputs(&h.input("Garden"));
     assert_eq!(beds.iter().filter(|bed| !before.contains(bed)).count(), 1);
 
@@ -1813,7 +1821,8 @@ fn a_new_memory_relevant_to_a_facet_is_in_the_refresh_it_triggers() {
     let input = h.input("Garden");
     let selected = inputs(&input);
     assert!(selected.contains(&garlic) && !selected.contains(&pond));
-    assert!(before.is_subset(&selected));
+    assert!(hives.iter().all(|hive| selected.contains(hive)));
+    assert_eq!(beds.iter().filter(|bed| selected.contains(bed)).count(), 2);
     let llm = quiet_llm(1);
     applied(h.refresh("Garden", &llm, false));
     let write = &calls(&llm, WRITE_TEMPLATE)[0].user;
@@ -1822,12 +1831,8 @@ fn a_new_memory_relevant_to_a_facet_is_in_the_refresh_it_triggers() {
 
 #[test]
 fn a_trigger_waits_through_a_failed_refresh_and_a_restart_for_one_that_completes() {
-    let h = Harness::with(|t| {
-        t.mental_models.facet_budget = 3;
-        t.mental_models.input_budget = 7;
-        t.mental_models.input_budget_with_cited = 7;
-    });
-    let beds = crowded_beds(&h);
+    let h = three_each();
+    let (beds, _) = crowded_beds(&h);
     let garlic = h.says(fact("Tim planted more garlic."));
 
     let down = FakeLlm::failing(MODEL, || LlmError::Transport {
@@ -1844,6 +1849,89 @@ fn a_trigger_waits_through_a_failed_refresh_and_a_restart_for_one_that_completes
     // A completed refresh has judged it. Uncited, it competes as before.
     h.refresh_adding("Garden", &[("Tim grows garlic.", &beds[..1])]);
     assert!(!inputs(&h.input("Garden")).contains(&garlic));
+}
+
+#[test]
+fn relevant_triggers_past_their_facets_turns_wait_for_another_refresh() {
+    // Four memories relevant to the beds facet, and the input has three
+    // turns for it. The oldest three go in; the fourth waits, and the
+    // refresh asks for another, which has room for it. The hives keep
+    // their turns throughout. The profile is off, so only the garden's
+    // refreshes are due.
+    let h = three_each();
+    h.edit(PROFILE_NAME, json!({"enabled": false})).unwrap();
+    let (_, hives) = crowded_beds(&h);
+    let rows = ["one", "two", "three", "four"];
+    let planted = rows.map(|row| h.says(fact(&format!("Tim planted garlic in row {row}."))));
+    let selected = inputs(&h.input("Garden"));
+    assert!(planted[..3].iter().all(|row| selected.contains(row)));
+    assert!(!selected.contains(&planted[3]));
+    assert!(hives.iter().all(|hive| selected.contains(hive)));
+
+    applied(h.refresh("Garden", &quiet_llm(1), false));
+    let selected = inputs(&h.input("Garden"));
+    assert!(selected.contains(&planted[3]));
+    assert!(hives.iter().all(|hive| selected.contains(hive)));
+    let llm = quiet_llm(1);
+    let due = h.tick(&llm).next_due.expect("another refresh");
+    assert!(due < at(SWEEP), "{due}");
+    h.set(due);
+    assert_eq!(h.tick(&llm).ran.len(), 1);
+    let write = &calls(&llm, WRITE_TEMPLATE)[0].user;
+    assert!(write.contains("Tim planted garlic in row four."), "{write}");
+}
+
+/// A reranker that answers like `FakeReranker` until a test makes it fail.
+#[derive(Default)]
+struct FlakyReranker {
+    failing: AtomicBool,
+}
+
+impl Reranker for FlakyReranker {
+    fn model_id(&self) -> &str {
+        FakeReranker::MODEL_ID
+    }
+
+    fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, EmbedError> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(EmbedError::Inference {
+                model: FakeReranker::MODEL_ID.into(),
+                reason: "the test made it fail".into(),
+            });
+        }
+        FakeReranker.rerank(query, documents)
+    }
+}
+
+#[test]
+fn a_trigger_no_rerank_judged_waits_for_a_refresh_that_reranks() {
+    // Without the reranker the refresh goes on, on strength alone, and
+    // the trigger is cut. Nothing judged it, so it's still waiting when
+    // the reranker is back.
+    let reranker = Arc::new(FlakyReranker::default());
+    let models = Models {
+        embedder: Arc::new(FakeEmbedder),
+        reranker: reranker.clone(),
+    };
+    let h = Harness::build(
+        |t| {
+            t.mental_models.facet_budget = 3;
+            t.mental_models.input_budget = 6;
+            t.mental_models.input_budget_with_cited = 6;
+        },
+        models,
+        Vec::new(),
+    )
+    .0;
+    crowded_beds(&h);
+    let garlic = h.seed(fact("Tim planted more garlic."));
+
+    reranker.failing.store(true, Ordering::SeqCst);
+    assert!(!inputs(&h.input("Garden")).contains(&garlic));
+    applied(h.refresh("Garden", &quiet_llm(1), true));
+
+    reranker.failing.store(false, Ordering::SeqCst);
+    assert!(inputs(&h.input("Garden")).contains(&garlic));
 }
 
 #[test]

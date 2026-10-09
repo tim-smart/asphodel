@@ -583,10 +583,12 @@ lost beneath results for the others:
    `input_budget_with_cited` (100). A memory that triggered the refresh
    (below) is reranked against every facet too, found by the facet's
    retrievers or not. One whose logit reaches the loaded reranker's
-   `injection.reranker_floors` entry for a facet is relevant to it: it goes
-   into the input first, under the first facet it's relevant to, so
-   stronger memories can't crowd it out. One relevant to no facet competes
-   as before, and isn't added to a pool its retrievers missed. The facets share one 60-second
+   `injection.reranker_floors` entry for a facet is relevant to it, and is
+   pinned to the first facet it's relevant to: it takes that facet's turns
+   ahead of the facet's own best, oldest trigger first, so stronger
+   memories can't crowd it out and the other facets keep their turns. One
+   relevant to no facet competes as before, and isn't added to a pool its
+   retrievers missed. The facets share one 60-second
    reranker deadline; a facet past it is scored on strength alone and the
    refresh goes on. Each facet writes one `refresh` row to the recall log,
    its query in both `query` and `raw_query`, and no access.
@@ -635,8 +637,13 @@ the fingerprint; another day below it does not.
 New memories and significance changes that pass a model's filters request
 a refresh at `mental_models.trigger_level` or above; kept memories trigger
 regardless of significance. Each such memory is held as one of the model's
-triggers until its next completed refresh has judged it against the
-facets; a failed or held refresh keeps them. Requests are
+triggers until a completed refresh settles it: it went into the input,
+every facet with a query judged it and found it relevant to none, or it no
+longer qualifies for the model. A failed or held refresh keeps them all.
+A relevant trigger its facet had no turn left for stays and requests
+another refresh, which takes it ahead of newer ones. One a facet's rerank
+missed, past the deadline or by error, stays for the model's next refresh.
+Requests are
 debounced per bank, by default for 5 minutes after the last trigger and
 at most 30 minutes after the first. Ordinary refreshes also wait at least
 30 minutes after a successful refresh. A correction that retracts, ends,

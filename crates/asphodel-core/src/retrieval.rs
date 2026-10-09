@@ -1358,6 +1358,17 @@ pub(crate) struct FacetSelection {
     /// The triggers the reranker found relevant to the facet. Each is in
     /// `selected`.
     pub related: Vec<i64>,
+    /// The facet has a query but the reranker didn't score it, by error or
+    /// past the deadline, so it judged no trigger.
+    pub missed: bool,
+}
+
+/// A refresh's selection: one [`FacetSelection`] per query, and the head
+/// each trigger `keep` admits stands for. A trigger that isn't there
+/// doesn't qualify.
+pub(crate) struct Selections {
+    pub facets: Vec<FacetSelection>,
+    pub triggers: BTreeMap<i64, i64>,
 }
 
 /// A refresh's selection, one facet per query: each query runs through the
@@ -1371,7 +1382,8 @@ pub(crate) struct FacetSelection {
 /// retrievers or not, and one whose logit reaches the injection floor is
 /// relevant to the facet: it's taken even past the budget, and listed in
 /// `related`. One the retrievers didn't find that isn't relevant is dropped,
-/// so judging it changes nothing else the facet takes or reports.
+/// so judging it changes nothing else the facet takes or reports. A facet
+/// the reranker didn't score is `missed`: it judged none of them.
 ///
 /// The queries are embedded in one call and their candidates cleaned up
 /// in one pass over the bank, so a facet costs its search and its rerank.
@@ -1393,7 +1405,7 @@ pub(crate) fn select(
     log: bool,
     pools: bool,
     deadline: Instant,
-) -> Result<Vec<FacetSelection>, RecallError> {
+) -> Result<Selections, RecallError> {
     let started = Instant::now();
     let now = cx.store.now();
     let queries: Vec<&str> = queries.iter().map(|query| query.trim()).collect();
@@ -1410,11 +1422,19 @@ pub(crate) fn select(
         cx.embed_queries(bank_id, &asked)?
     };
     vectors.reverse();
-    let (found, trigger_heads) = {
+    let (found, trigger_heads, heads) = {
         let conn = conn;
         let mut cleanup = Cleanup::new(&conn, bank_id, cx.tuning, now, keep)?;
         let cited_heads: BTreeSet<i64> = cleanup.list(cited)?.into_iter().collect();
-        let trigger_heads: BTreeSet<i64> = cleanup.list(triggers)?.into_iter().collect();
+        let mut heads = BTreeMap::new();
+        for &trigger in triggers {
+            if let Some(&head) = cleanup.list(&[trigger])?.first()
+                && !cleanup.take(&[head]).is_empty()
+            {
+                heads.insert(trigger, head);
+            }
+        }
+        let trigger_heads: BTreeSet<i64> = heads.values().copied().collect();
         let mut found = Vec::with_capacity(queries.len());
         for query in &queries {
             let vector = if query.is_empty() {
@@ -1459,7 +1479,7 @@ pub(crate) fn select(
             }
             found.push((cleanup.take(&ids), cited_heads.clone(), judged));
         }
-        (found, trigger_heads)
+        (found, trigger_heads, heads)
     };
 
     let mut selections = Vec::with_capacity(queries.len());
@@ -1504,7 +1524,10 @@ pub(crate) fn select(
         }
         selections.push(selection);
     }
-    Ok(selections)
+    Ok(Selections {
+        facets: selections,
+        triggers: heads,
+    })
 }
 
 /// One facet's candidates reranked for `query` and scored, best first:
@@ -1624,6 +1647,7 @@ fn rank_facet(
         selected,
         pool,
         related,
+        missed: !query.is_empty() && logits.is_none(),
     }
 }
 

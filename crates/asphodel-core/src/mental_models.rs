@@ -21,7 +21,8 @@
 //! retry waits or LLM holds. Requests survive a restart and a refresh cannot
 //! clear one made while it ran. The memories that triggered a refresh are
 //! kept until a completed refresh has judged them, and one relevant to a
-//! facet is always in its input. It never runs inside a prompt block fetch.
+//! facet waits until a refresh has had room for it. It never runs inside a
+//! prompt block fetch.
 //! Nothing here ever writes an access, embeds an answer or ingests one.
 //!
 //! Possibly stale states are supplied to the write with absolute observed
@@ -951,19 +952,17 @@ pub(crate) fn record_triggers(
 }
 
 /// The memories waiting to be judged by `model`'s next refresh, oldest
-/// first, and the last row among them, which that refresh clears up to.
+/// first, each with its row, which that refresh clears once it's settled.
 pub(crate) fn load_triggers(
     conn: &Connection,
     model: i64,
-) -> Result<(Vec<i64>, Option<i64>), rusqlite::Error> {
+) -> Result<Vec<(i64, i64)>, rusqlite::Error> {
     let mut statement = conn.prepare_cached(
         "SELECT id, memory_id FROM mental_model_triggers WHERE model_id = ?1 ORDER BY id",
     )?;
-    let rows: Vec<(i64, i64)> = statement
+    statement
         .query_map([model], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-    let last = rows.last().map(|(id, _)| *id);
-    Ok((rows.into_iter().map(|(_, memory)| memory).collect(), last))
+        .collect()
 }
 
 /// The edit log's high-water mark for `bank_id`, taken before a write so

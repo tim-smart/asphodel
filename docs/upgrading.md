@@ -484,8 +484,10 @@ budget, so the refresh found nothing changed and the model never
 mentioned it. The migration adds an empty `mental_model_triggers` table
 that keeps those memories per model until the next completed refresh. The
 refresh reranks each against every facet's query, and one whose logit
-reaches `injection.reranker_floors` for the loaded reranker goes into the
-write's input first. A trigger relevant to no facet changes nothing.
+reaches `injection.reranker_floors` for the loaded reranker takes its
+facet's turns in the write's input ahead of the facet's own best. One its
+facet has no turn left for waits for another refresh, and so does one a
+facet's rerank missed. A trigger relevant to no facet changes nothing.
 
 There's no backfill: memories written before the upgrade compete for
 their place as before. Replay labelling material marks a candidate taken
