@@ -1,6 +1,6 @@
 // The dashboard: hash routes over the daemon's read-only list routes, the
 // Recall page's explain (which logs nothing), and the owner's actions (keep, retract, forget, remove a document, retry
-// chunks, resume purge, a model in or out of the prompt), each destructive one behind a confirmation.
+// chunks, resume purge, a model in or out of the prompt, refresh a model), each destructive one behind a confirmation.
 // A daemon with no tuning file yet gets the setup wizard instead.
 //
 // `mount(root, { fetch })` renders into `root` and returns a function that
@@ -42,6 +42,8 @@ export function mount(root, { fetch }) {
   let tabs = null;
   let main = null;
   const dialogs = new Set();
+  // The keys of the `once` actions still running.
+  const running = new Set();
 
   // The page's chrome: header, banner slot and main, rebuilt per render.
   function shell(at) {
@@ -235,19 +237,36 @@ export function mount(root, { fetch }) {
   /// Runs an action, then shows what it did, or why the daemon refused. With
   /// `then`, a success moves to that page (the action may have taken this
   /// one away); a refusal stays put.
-  async function act(work, { then } = {}) {
+  ///
+  /// With `once`, a key, the action runs one at a time: a second start
+  /// while it runs does nothing, and `running(key)` is true until it ends,
+  /// re-renders included. Such an action can outlast its page, so its
+  /// result shows only if the reader is on that page when it ends; anywhere
+  /// else a render would wipe what they're doing.
+  async function act(work, { then, once } = {}) {
+    if (once !== undefined) {
+      if (running.has(once)) return;
+      running.add(once);
+    }
+    const from = window.location.hash;
+    let said;
     try {
-      const said = await work();
-      notice = said ? { tone: "done", body: said } : null;
+      const body = await work();
+      said = body ? { tone: "done", body } : null;
       if (then && window.location.hash !== then) {
+        notice = said;
         carryNotice = true;
         window.location.hash = then;
         return;
       }
     } catch (error) {
       if (error instanceof Unauthorized) return prompt(error.rejected);
-      notice = { tone: "error", body: error instanceof ApiError ? error.message : String(error.message ?? error) };
+      said = { tone: "error", body: error instanceof ApiError ? error.message : String(error.message ?? error) };
+    } finally {
+      if (once !== undefined) running.delete(once);
     }
+    if (once !== undefined && (stopped || window.location.hash !== from)) return;
+    notice = said;
     await render({ focusNotice: true });
   }
 
@@ -509,6 +528,7 @@ export function mount(root, { fetch }) {
       },
       confirm,
       act,
+      running: (key) => running.has(key),
     };
     try {
       const [status, view] = await Promise.all([statusLoad, page(ctx)]);

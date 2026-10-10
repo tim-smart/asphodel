@@ -240,6 +240,12 @@ export function fixtures() {
     ],
     /// `mental_models.budget`.
     budget: 800,
+    /// Whether an LLM is configured, which a refresh needs.
+    llm: true,
+    /// What the next refresh comes to: `applied`, which writes
+    /// `refreshedAnswer`, or `failed` with its kind.
+    refresh: { outcome: "applied", detail: { written: true, rejected: [], trimmed: 0 } },
+    refreshedAnswer: `### Plans\n- ${sentences.dentist}`,
     /// The system prompt block the daemon has cached for `main`, or null when
     /// nothing is cached until the next fetch builds one.
     cachedBlock: {
@@ -559,6 +565,21 @@ export class FakeDaemon {
     this.state = state;
     this.requests = [];
     this.fetch = this.fetch.bind(this);
+    // A refresh answers once this settles; see `holdRefreshes`.
+    this.refreshGate = null;
+  }
+
+  /// Keeps every refresh from answering until the returned function is
+  /// called, as a refresh waits on the LLM.
+  holdRefreshes() {
+    let release;
+    this.refreshGate = new Promise((resolve) => {
+      release = resolve;
+    });
+    return () => {
+      this.refreshGate = null;
+      release();
+    };
   }
 
   /// The requests the dashboard sent to `/v1` routes, oldest first.
@@ -682,6 +703,7 @@ export class FakeDaemon {
       return json(200, { models: state.models, budget: state.budget });
     }
     if (collection === "models" && action === undefined && method === "PATCH") return this.editModel(id, body);
+    if (collection === "models" && action === "refresh" && method === "POST") return this.refresh(id);
     // The preview is the cached block, or one laid out now and not kept.
     // Fetching the block builds and caches one when nothing is cached.
     if (collection === "system-prompt" && id === "preview" && method === "GET") {
@@ -867,6 +889,26 @@ export class FakeDaemon {
     // An edit clears the bank's cached block, as the daemon's does.
     this.state.cachedBlock = null;
     return json(200, found);
+  }
+
+  /// A refresh, forced or not: the daemon answers once it's done.
+  async refresh(name) {
+    const found = this.state.models.find((m) => m.name === name);
+    if (!found) return error(404, "no such model");
+    if (!this.state.llm) return error(503, "no LLM is configured, so models can't be refreshed");
+    await this.refreshGate;
+    const done = this.state.refresh;
+    if (done.outcome === "applied") {
+      found.answer = this.state.refreshedAnswer;
+      found.last_refreshed_at = NOW;
+      found.last_error = null;
+      found.last_error_at = null;
+      this.state.cachedBlock = null;
+    } else if (done.outcome === "failed") {
+      found.last_error = done.detail;
+      found.last_error_at = NOW;
+    }
+    return json(200, done);
   }
 
   /// The block's text as it'd be built now: a heading per enabled model.

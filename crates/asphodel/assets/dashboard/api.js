@@ -126,6 +126,9 @@ export function client(fetch, storage) {
     // Never builds a block, unlike `/system-prompt`.
     previewSystemPrompt: (name) => call("GET", `${bank(name)}/system-prompt/preview`),
     editModel: (name, model, edit) => call("PATCH", `${bank(name)}/models/${path(model)}`, edit),
+    // Always forced: the owner asked for one now, inputs changed or not.
+    // The daemon answers once the refresh is done.
+    refreshModel: (name, model) => call("POST", `${bank(name)}/models/${path(model)}/refresh?force=true`),
     retryChunks: (name, chunks) => call("POST", `${bank(name)}/chunks/retry`, chunks ? { chunks } : {}),
   };
 }
