@@ -1624,7 +1624,9 @@ legend {
 }
 
 /* A refresh under way: a bar along the card's top edge, a line of words
-   above the footer, and the answer it's replacing dimmed. */
+   above the footer, and the answer it's replacing dimmed. The answer is
+   still readable, so it dims to --ink-3, which keeps AA on the card in both
+   themes, not by opacity, which doesn't. */
 
 .model {
   position: relative;
@@ -1657,8 +1659,9 @@ legend {
   opacity: 0.7;
 }
 
-.model[data-refreshing] .answer {
-  opacity: 0.55;
+.model[data-refreshing] .answer,
+.model[data-refreshing] .answer h3 {
+  color: var(--ink-3);
 }
 
 .model h2 {
@@ -2107,8 +2110,9 @@ dialog.confirm h2 {
     animation: spin 0.8s linear infinite;
   }
 
-  .model .answer {
-    transition: opacity 200ms ease-out;
+  .model .answer,
+  .model .answer h3 {
+    transition: color 200ms ease-out;
   }
 
   @keyframes sweep {
