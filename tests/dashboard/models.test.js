@@ -11,6 +11,10 @@
 // `GET .../system-prompt/preview`. Reading it never builds a block, as
 // `GET .../system-prompt` does, and never refreshes a model. The text is
 // shown verbatim in a `<pre>`.
+//
+// A model's Refresh forces a refresh through `POST .../refresh?force=true`,
+// which answers only once the refresh is done. Until then the card says so,
+// and clicking again sends nothing more.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -18,6 +22,7 @@ import assert from "node:assert/strict";
 import { FakeDaemon, TOKEN, questions, sentences } from "./fake-daemon.js";
 import {
   click,
+  findButton,
   findRow,
   findText,
   open,
@@ -200,4 +205,68 @@ test("with nothing cached the page shows the block as it'd be built now, and bui
 
   await waitFor(() => queryBlock(page, daemon.layOut()), "the block as it'd be built now");
   await stays(() => builtNothing(daemon) && daemon.state.cachedBlock === null, "no block built");
+});
+
+function refreshes(daemon, name) {
+  return daemon.calls("POST", `/v1/banks/main/models/${encodeURIComponent(name)}/refresh`);
+}
+
+/// Whether `name`'s card says a refresh is under way.
+function isRefreshing(page, name) {
+  const status = queryModel(page, name)?.querySelector('[role="status"]');
+  return Boolean(status && /refresh|rewrit/i.test(textOf(status)));
+}
+
+test("refresh forces one and shows it under way until the daemon is done, then the new answer", async (t) => {
+  const daemon = new FakeDaemon();
+  const release = daemon.holdRefreshes();
+  const page = await open(t, daemon, { hash: MODELS, token: TOKEN });
+
+  click(await findButton(await findModel(page, "Plans"), /refresh/i));
+  const sent = await waitFor(() => refreshes(daemon, "Plans")[0], "POST Plans refresh");
+  assert.equal(sent.query.get("force"), "true");
+  await waitFor(() => isRefreshing(page, "Plans"), "Plans shown refreshing");
+  await stays(() => isRefreshing(page, "Plans"), "Plans still refreshing while the daemon works");
+  assert.ok(!textOf(queryModel(page, "Plans")).includes(sentences.dentist), "the answer changed before the refresh was done");
+
+  release();
+  await waitFor(() => textOf(queryModel(page, "Plans") ?? page.root).includes(sentences.dentist), "the new answer");
+  assert.ok(!isRefreshing(page, "Plans"), "Plans still shown refreshing");
+  assert.ok(!/malformed/i.test(textOf(queryModel(page, "Plans"))), "the old error is still shown");
+});
+
+test("clicking refresh again while one runs, even after the page re-renders, sends nothing more", async (t) => {
+  const daemon = new FakeDaemon();
+  const release = daemon.holdRefreshes();
+  const page = await open(t, daemon, { hash: MODELS, token: TOKEN });
+
+  const button = await findButton(await findModel(page, "Plans"), /refresh/i);
+  click(button);
+  click(button);
+  // A refused enable re-renders the page while the refresh runs.
+  click(await findToggle(page, "Travel"));
+  await findText(page.root, "850 tokens is over the 800-token budget");
+  assert.ok(isRefreshing(page, "Plans"), "the re-rendered card lost the refresh");
+  click(await findButton(queryModel(page, "Plans"), /refresh/i));
+  await stays(() => refreshes(daemon, "Plans").length === 1, "a single refresh request");
+
+  release();
+  await waitFor(() => !isRefreshing(page, "Plans") && textOf(page.root).includes(sentences.dentist), "the refresh to finish");
+  assert.equal(refreshes(daemon, "Plans").length, 1);
+});
+
+test("a refresh that fails says why, and refresh can be tried again", async (t) => {
+  const daemon = new FakeDaemon();
+  daemon.state.refresh = { outcome: "failed", detail: "llm" };
+  const page = await open(t, daemon, { hash: MODELS, token: TOKEN });
+
+  click(await findButton(await findModel(page, "User profile"), /refresh/i));
+  await findText(page.root, /LLM call failed/i);
+  await waitFor(() => !isRefreshing(page, "User profile"), "the refresh to end");
+  assert.ok(textOf(queryModel(page, "User profile")).includes(sentences.auckland), "a failed refresh changed the answer");
+
+  daemon.state.llm = false;
+  click(await findButton(queryModel(page, "User profile"), /refresh/i));
+  await findText(page.root, "no LLM is configured, so models can't be refreshed");
+  assert.equal(refreshes(daemon, "User profile").length, 2);
 });

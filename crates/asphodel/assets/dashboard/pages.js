@@ -3,7 +3,7 @@
 // `ctx.confirm`.
 
 import { ApiError } from "./api.js";
-import { capitalize, fadeStage, goneReason, plural, shortId } from "./dom.js";
+import { capitalize, fadeStage, formatDateTime, goneReason, plural, shortId } from "./dom.js";
 
 const STATUSES = ["live", "superseded", "ended", "retracted", "forgetting"];
 const KINDS = ["fact", "event", "state", "task", "recurring"];
@@ -1658,6 +1658,10 @@ function candidateRow(ctx, c, reason) {
 // prompt. A model is in the prompt while it's enabled; the daemon refuses an
 // enable past the budget, and the page shows its reason. The prompt preview
 // is what a new session would get now, and looking writes nothing.
+//
+// A model's Refresh forces one now. The daemon answers only when it's done,
+// which waits on the LLM, so the card shows it under way until then, across
+// re-renders, and a second click meanwhile sends nothing.
 
 const REFRESH_FAILURES = {
   llm: "The LLM call failed",
@@ -1675,6 +1679,21 @@ async function models(ctx) {
   const enabled = list.filter((m) => m.enabled);
   const used = enabled.reduce((sum, m) => sum + m.max_tokens, 0);
   const left = budget - used;
+
+  const refresh = (model) =>
+    ctx.act(
+      async () => {
+        let outcome;
+        try {
+          outcome = await api.refreshModel(bank, model.name);
+        } catch (error) {
+          if (error instanceof ApiError) error.message = `${model.name} didn't refresh: ${error.message}.`;
+          throw error;
+        }
+        return refreshed(model, outcome);
+      },
+      { once: refreshKey(bank, model) },
+    );
 
   const setEnabled = (model, on) =>
     ctx.act(async () => {
@@ -1752,7 +1771,34 @@ async function models(ctx) {
       },
     });
     const kinds = m.kinds.length ? m.kinds.join(", ") : "every kind";
-    return h(
+    // The button keeps focus while the refresh runs: it's marked
+    // aria-disabled rather than disabled, and a click meanwhile is ignored.
+    const progress = h("p", { class: "model-progress", role: "status" });
+    const refreshButton = h(
+      "button",
+      {
+        type: "button",
+        class: "quiet small model-refresh",
+        "aria-label": `Refresh ${m.name}`,
+        onclick: () => {
+          if (refreshButton.getAttribute("aria-disabled") === "true") return;
+          showRefreshing();
+          refresh(m);
+        },
+      },
+      "Refresh",
+    );
+    const showRefreshing = () => {
+      card.dataset.refreshing = "true";
+      refreshButton.setAttribute("aria-disabled", "true");
+      refreshButton.setAttribute("aria-label", `Refreshing ${m.name}`);
+      refreshButton.textContent = "Refreshing…";
+      progress.replaceChildren(
+        h("span", { class: "progress-bar", "aria-hidden": "true" }),
+        h("span", {}, "Rewriting the answer. This waits on the LLM, so it can take a minute."),
+      );
+    };
+    const card = h(
       "article",
       { class: "card model", "data-enabled": m.enabled ? "true" : "false" },
       h(
@@ -1778,16 +1824,24 @@ async function models(ctx) {
             h("span", {}, REFRESH_FAILURES[m.last_error] ?? m.last_error, m.last_error_at ? [", ", time(m.last_error_at, { withTime: true })] : null),
           )
         : null,
+      progress,
       h(
-        "ul",
-        { class: "meta inline-list" },
-        h("li", {}, h("span", { class: "num" }, String(m.max_tokens)), " tokens"),
-        h("li", {}, plural(m.cites.length, "memory cited", "memories cited")),
-        h("li", {}, kinds),
-        h("li", {}, m.last_refreshed_at ? ["Refreshed ", time(m.last_refreshed_at, { withTime: true })] : "Never refreshed"),
-        m.enabled ? null : h("li", {}, "Refreshes paused"),
+        "footer",
+        { class: "model-foot" },
+        h(
+          "ul",
+          { class: "meta inline-list" },
+          h("li", {}, h("span", { class: "num" }, String(m.max_tokens)), " tokens"),
+          h("li", {}, plural(m.cites.length, "memory cited", "memories cited")),
+          h("li", {}, kinds),
+          h("li", {}, m.last_refreshed_at ? ["Refreshed ", time(m.last_refreshed_at, { withTime: true })] : "Never refreshed"),
+          m.enabled ? null : h("li", {}, "Refreshes paused"),
+        ),
+        refreshButton,
       ),
     );
+    if (ctx.running(refreshKey(bank, m))) showRefreshing();
+    return card;
   });
 
   return {
@@ -1801,6 +1855,31 @@ async function models(ctx) {
       prompt,
     ],
   };
+}
+
+function refreshKey(bank, model) {
+  return JSON.stringify(["refresh", bank, model.name]);
+}
+
+/// What a forced refresh did, in words. One that didn't happen is an error.
+function refreshed(model, { outcome, detail }) {
+  switch (outcome) {
+    case "applied":
+      if (!detail?.written) {
+        return `${model.name} is refreshed, but no answer was written: no memories matched its question, or one it cited was forgotten meanwhile.`;
+      }
+      return model.enabled
+        ? `${model.name} is refreshed. New Hermes sessions get the new answer.`
+        : `${model.name} is refreshed.`;
+    case "unchanged":
+      return `${model.name} is unchanged: its inputs are the same as at the last refresh.`;
+    case "failed":
+      throw new Error(`${model.name} didn't refresh. ${REFRESH_FAILURES[detail] ?? detail}.`);
+    case "held":
+      throw new Error(`${model.name} didn't refresh yet. The LLM is held by a usage limit until ${formatDateTime(detail.until)}, and the refresh runs then.`);
+    default:
+      throw new Error(`${model.name}'s refresh ended as ${outcome}.`);
+  }
 }
 
 async function missing(ctx) {

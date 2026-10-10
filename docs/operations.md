@@ -1295,6 +1295,13 @@ would take the enabled models over the budget, the daemon refuses with
 422, and the page shows its reason and leaves the model out. Creating,
 editing and deleting models stays with the CLI.
 
+A model's Refresh button forces a refresh now through
+`POST /v1/banks/{bank}/models/{model}/refresh?force=true`, the same as
+`asphodel model refresh --force`. The daemon answers only when the refresh
+is done, so the card shows it under way until then, including after the
+page re-renders, and a second click meanwhile sends nothing. When it ends
+the page shows the new answer, or why the refresh failed or was held.
+
 The page also shows the system prompt a new Hermes session would get now,
 with when it was built. It reads `GET /v1/banks/{bank}/system-prompt/preview`,
 which answers `{"built_at": ..., "text": ...}`: the cached block when there
