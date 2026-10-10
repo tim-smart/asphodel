@@ -2224,7 +2224,7 @@ fn undo_latest_migration() -> String {
              INSERT INTO memories_fts (memories_fts, rank) VALUES ('secure-delete', 0);"
             .into();
     }
-    if *version == 18 || *version == 21 {
+    if *version == 18 || *version == 21 || *version == 22 {
         // These versions change rows, not tables. Put the seeded question back
         // so restoring the older backup exercises the conversion again.
         const EARLIER_PROFILE_QUESTION: &str = "Who is the user: their preferences, important people, \
@@ -2233,10 +2233,12 @@ fn undo_latest_migration() -> String {
         const PREVIOUS_PROFILE_QUESTION: &str = "Who is the user: their preferences, important people and their \
              birthdays and anniversaries, work and home, the platforms they use, and how they like to be \
              helped. Not one-off events, tasks or routines.";
-        let question = if *version == 18 {
-            EARLIER_PROFILE_QUESTION
-        } else {
-            PREVIOUS_PROFILE_QUESTION
+        const WHO_PROFILE_QUESTION: &str = "Who is the user: How do they want the assistant to behave? \
+             What are their preferences? How do they like to be helped?";
+        let question = match *version {
+            18 => EARLIER_PROFILE_QUESTION,
+            21 => PREVIOUS_PROFILE_QUESTION,
+            _ => WHO_PROFILE_QUESTION,
         };
         return format!(
             "UPDATE mental_models SET question = '{}' WHERE question = '{}';",

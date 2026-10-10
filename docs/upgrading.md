@@ -487,6 +487,15 @@ retrieval facets and filters are unchanged. The changed question changes
 the refresh fingerprint, so the next refresh writes again. No action is
 needed.
 
+## Schema version 22: the profile question drops "Who is the user"
+
+The seeded profile now asks: "How does the user want the assistant to
+behave? What are their preferences? How do they like to be helped?"
+Models still asking the version 21 default are updated automatically;
+custom questions are left alone. The built-in facets are unchanged. The
+changed question changes the refresh fingerprint, so the next refresh
+writes again. No action is needed.
+
 ## Write template version 3: dates for possibly stale states
 
 Schema version 15 introduced `write_model` v2 and the one-answer reply

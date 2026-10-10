@@ -22,7 +22,11 @@ pub const DEFAULT_TIMEZONE: &str = "UTC";
 /// The seeded profile's name.
 pub const PROFILE_NAME: &str = "User profile";
 /// The seeded profile's question, focused on preferences and assistant behavior.
-pub const PROFILE_QUESTION: &str = "Who is the user: How do they want the assistant to behave? \
+pub const PROFILE_QUESTION: &str = "How does the user want the assistant to behave? What are their \
+     preferences? How do they like to be helped?";
+
+/// The profile question banks were seeded with at schema version 21.
+const WHO_PROFILE_QUESTION: &str = "Who is the user: How do they want the assistant to behave? \
      What are their preferences? How do they like to be helped?";
 
 /// The profile question banks were seeded with from schema version 18 to 20.
@@ -505,7 +509,17 @@ pub(crate) fn reword_profile_question(conn: &Connection) -> Result<(), rusqlite:
 pub(crate) fn refocus_profile_question(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(
         "UPDATE mental_models SET question = ?1 WHERE question = ?2",
-        (PROFILE_QUESTION, PERSONAL_DATES_PROFILE_QUESTION),
+        (WHO_PROFILE_QUESTION, PERSONAL_DATES_PROFILE_QUESTION),
+    )?;
+    Ok(())
+}
+
+/// Schema 22's conversion: drop the "Who is the user" lead from the
+/// default question, leaving owner-written questions alone.
+pub(crate) fn reword_who_profile_question(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE mental_models SET question = ?1 WHERE question = ?2",
+        (PROFILE_QUESTION, WHO_PROFILE_QUESTION),
     )?;
     Ok(())
 }

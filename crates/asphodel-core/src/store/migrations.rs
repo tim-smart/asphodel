@@ -21,7 +21,7 @@ use super::{DB_FILE, StoreError, micros, timestamp};
 use crate::clock::Clock;
 
 /// The schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// How long a pre-migration copy is kept after its migration completes.
 pub const PRE_MIGRATION_COPY_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
@@ -74,6 +74,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
         21,
         include_str!("../../migrations/0021_profile_question.sql"),
     ),
+    (
+        22,
+        include_str!("../../migrations/0022_profile_question.sql"),
+    ),
 ];
 
 /// The columns a migration adds, by version. Every migration is safe to run
@@ -104,6 +108,7 @@ const CONVERSIONS: &[(u32, Conversion)] = &[
     (15, crate::mental_models::entries_to_answers),
     (18, crate::store::bank::reword_profile_question),
     (21, crate::store::bank::refocus_profile_question),
+    (22, crate::store::bank::reword_who_profile_question),
 ];
 
 /// What one open applied.

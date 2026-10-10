@@ -1,0 +1,5 @@
+-- Asphodel schema, version 22: the seeded profile question drops its
+-- "Who is the user" lead. No table changes: the runner updates models
+-- still asking the version 21 default, leaving custom questions alone.
+-- The changed question changes the refresh fingerprint, so the next
+-- refresh writes again.

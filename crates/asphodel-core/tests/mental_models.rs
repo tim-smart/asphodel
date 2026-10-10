@@ -1603,11 +1603,17 @@ const EARLIER_PROFILE_QUESTION: &str = "Who is the user: their preferences, impo
 
 #[test]
 fn a_profile_seeded_with_the_earlier_question_still_takes_the_built_in_plan() {
-    // Simulate banks seeded with either historical default, then upgrade.
+    // Simulate banks seeded with each historical default, then upgrade.
     const PREVIOUS_QUESTION: &str = "Who is the user: their preferences, important people and their \
          birthdays and anniversaries, work and home, the platforms they use, and how they like to be \
          helped. Not one-off events, tasks or routines.";
-    for (version, question) in [(17, EARLIER_PROFILE_QUESTION), (20, PREVIOUS_QUESTION)] {
+    const WHO_QUESTION: &str = "Who is the user: How do they want the assistant to behave? \
+         What are their preferences? How do they like to be helped?";
+    for (version, question) in [
+        (17, EARLIER_PROFILE_QUESTION),
+        (20, PREVIOUS_QUESTION),
+        (21, WHO_QUESTION),
+    ] {
         let h = Harness::new();
         h.seed(fact(TEA));
         let custom = plans_model(100);
