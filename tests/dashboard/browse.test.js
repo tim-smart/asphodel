@@ -169,6 +169,46 @@ test("going back from a source returns to the sources list as it was left", asyn
   assert.equal((await findField(page.root, /search/i)).value, "ada");
 });
 
+test("a source reached from elsewhere goes back to the whole sources list", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: "#/banks/main/sources?q=ada", token: TOKEN });
+  await findLink(page.root, /session-1/);
+
+  click(await findLink(page.root, "Memories"));
+  click(await findLink(page.root, sentences.auckland));
+  await findText(page.root, "Sam lives in Auckland (passage)");
+  click(await findLink(page.root, DOCUMENT));
+  await findText(page.root, "Sam started at Effectful.");
+  click(await findLink(page.root, "← Sources"));
+
+  await findLink(page.root, DOCUMENT);
+});
+
+test("leaving the sources list again before it loads keeps the way back to it", async (t) => {
+  const daemon = new FakeDaemon();
+  let held = null;
+  const answer = daemon.fetch;
+  daemon.fetch = async (...request) => {
+    await held;
+    return answer(...request);
+  };
+  const page = await open(t, daemon, { hash: "#/banks/main/sources?q=ada", token: TOKEN });
+  click(await findLink(page.root, /session-1/));
+  const source = await waitFor(() => page.window.location.hash.includes(ids.turn) && queryLink(page.root, "← Sources"), "the turn's page");
+
+  let release;
+  held = new Promise((resolve) => (release = resolve));
+  click(source);
+  await waitFor(() => !queryLink(page.root, "← Sources"), "the list to start loading");
+  page.window.history.back();
+  await waitFor(() => page.window.location.hash.includes(ids.turn), "the turn's page again");
+  release();
+  click(await findLink(page.root, "← Sources"));
+
+  await findLink(page.root, /session-1/);
+  await stays(() => !queryLink(page.root, DOCUMENT), "the list to stay narrowed to the search");
+});
+
 test("a document's page shows its text, its versions and each chunk's state", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon, { hash: "#/banks/main/sources", token: TOKEN });
