@@ -19,6 +19,7 @@ import {
   queryLink,
   queryText,
   showsCount,
+  stays,
   submit,
   textOf,
   type,
@@ -147,6 +148,25 @@ test("the sources page searches and filters through the daemon", async (t) => {
   await queried(daemon, "/v1/banks/main/sources", "gone", "true");
   await findRow(page.root, "recipes.md");
   await waitFor(() => !queryLink(page.root, DOCUMENT), "only gone sources");
+});
+
+test("going back from a source returns to the sources list as it was left", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: "#/banks/main/sources", token: TOKEN });
+  await findLink(page.root, DOCUMENT);
+
+  const search = await findField(page.root, /search/i);
+  type(search, "ada");
+  submit(search);
+  await waitFor(() => !queryLink(page.root, DOCUMENT), "the list to narrow");
+  click(await findLink(page.root, /session-1/));
+  await findText(page.root, "My daughter Ada starts school next week.");
+
+  click(await findLink(page.root, "← Sources"));
+
+  await findLink(page.root, /session-1/);
+  await stays(() => !queryLink(page.root, DOCUMENT), "the list to stay narrowed to the search");
+  assert.equal((await findField(page.root, /search/i)).value, "ada");
 });
 
 test("a document's page shows its text, its versions and each chunk's state", async (t) => {
