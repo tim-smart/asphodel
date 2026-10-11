@@ -10,6 +10,9 @@
 //!   no successor, so everything that reads live memories drops it, and
 //!   whatever it ended is open again. It stays visible as retracted until
 //!   the sweep purges it.
+//! - **End is the owner saying a memory stopped holding.** It leaves the
+//!   agenda at once, and reopening undoes the latest ending, the owner's
+//!   or another memory's, but not a window that closed on its own.
 //! - **Removing a document** takes every version of its id: the memories
 //!   resting on its chunks are forgotten, its waiting chunks dequeued, and
 //!   its sources tombstoned with their keys kept. A chunk already in flight
@@ -26,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asphodel_core::config::Layer;
+use asphodel_core::end::{EndError, Ended, Reopened};
 use asphodel_core::erase::{DocumentRemoved, RemoveDocumentError, RemoveTurnError};
 use asphodel_core::extraction::Committed;
 use asphodel_core::ingest::{Document, Ingested, Outcome, Turn};
@@ -261,6 +265,14 @@ impl Harness {
 
     fn retract(&self, memory: Uuid) -> Result<Retracted, RetractError> {
         self.service.retract(BANK, &memory.to_string())
+    }
+
+    fn end(&self, memory: Uuid) -> Result<Ended, EndError> {
+        self.service.end(BANK, &memory.to_string())
+    }
+
+    fn reopen(&self, memory: Uuid) -> Result<Reopened, EndError> {
+        self.service.reopen(BANK, &memory.to_string())
     }
 
     fn remove(&self, document: &str) -> DocumentRemoved {
@@ -556,6 +568,90 @@ fn retract_refuses_a_superseded_memory_naming_its_head_and_a_repeat() {
 
     h.retract(mia).unwrap();
     assert!(matches!(h.retract(mia), Err(AlreadyRetracted)));
+}
+
+// End and reopen
+
+#[test]
+fn ending_takes_a_task_off_the_agenda_and_reopening_restores_its_window() {
+    use EndError::{AlreadyEnded, NotEnded};
+    let h = Harness::new();
+    let passport = h.says_at(at(START) - days(1), task(PASSPORT), &[]);
+    let occasion = json!({"at": "2026-10-20", "precision": "day"});
+    let bike = h.says_at(
+        at(START) - days(1),
+        with(task(BIKE), "valid_until", occasion),
+        &[],
+    );
+    let on_agenda = || h.service.agenda(BANK).unwrap().listed();
+    assert!(on_agenda().contains(&passport));
+    assert!(on_agenda().contains(&bike));
+
+    let ended = h.end(passport).unwrap();
+    assert_eq!(ended.memory, passport);
+    assert_eq!(ended.ended_at, h.now());
+    assert!(!on_agenda().contains(&passport));
+    assert_eq!(h.listed(MemoryStatus::Ended), set(&[passport]));
+    let shown = h.show(passport);
+    assert_eq!(shown.status, MemoryStatus::Ended);
+    let edit = shown
+        .edits
+        .iter()
+        .find(|edit| edit.kind == "memory_ended")
+        .expect("the ending is logged");
+    assert_eq!(edit.details["by"], "owner");
+    assert!(matches!(h.end(passport), Err(AlreadyEnded)));
+
+    h.reopen(passport).unwrap();
+    assert!(on_agenda().contains(&passport));
+    assert_eq!(h.show(passport).window.valid_until, None);
+    assert!(matches!(h.reopen(passport), Err(NotEnded)));
+
+    let stated = h.show(bike).window.valid_until;
+    h.end(bike).unwrap();
+    assert!(!on_agenda().contains(&bike));
+    h.reopen(bike).unwrap();
+    assert_eq!(h.show(bike).window.valid_until, stated);
+    assert!(on_agenda().contains(&bike));
+}
+
+#[test]
+fn reopening_clears_an_ending_by_another_memory_but_not_a_window_that_closed() {
+    use EndError::{AlreadyEnded, NotEnded, Retracted, Superseded, UnknownBank, UnknownMemory};
+    let h = Harness::new();
+    let berlin = h.fact(BERLIN);
+    h.says(changing(notable(MOVED_OUT)), &[(berlin, "ends")]);
+    let holiday = h.says(
+        with(
+            with(notable("Tim was on holiday."), "kind", json!("event")),
+            "valid_until",
+            json!({"at": "2026-09-20", "precision": "day"}),
+        ),
+        &[],
+    );
+    let maya = h.fact(MAYA);
+    let mia = h.says(changing(notable(MIA)), &[(maya, "refines")]);
+    let tea = h.fact(TEA);
+    h.retract(tea).unwrap();
+
+    h.reopen(berlin).unwrap();
+    let reopened = h.show(berlin);
+    assert_eq!(reopened.chain.ended_by, None);
+    assert_eq!(reopened.window.valid_until, None);
+    assert!(h.listed(MemoryStatus::Live).contains(&berlin));
+
+    assert!(matches!(h.end(holiday), Err(AlreadyEnded)));
+    assert!(matches!(h.reopen(holiday), Err(NotEnded)));
+    assert!(matches!(h.end(maya), Err(Superseded { head }) if head == mia));
+    assert!(matches!(h.end(tea), Err(Retracted)));
+    assert!(matches!(
+        h.service.end(BANK, "not-a-memory"),
+        Err(UnknownMemory)
+    ));
+    assert!(matches!(
+        h.service.end("nobody", &mia.to_string()),
+        Err(UnknownBank)
+    ));
 }
 
 #[test]

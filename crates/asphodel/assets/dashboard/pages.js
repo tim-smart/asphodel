@@ -74,13 +74,16 @@ function memoryCount(count) {
   return plural(count, "memory", "memories");
 }
 
-/// What a memory's page knows about where it stands, in the list's terms.
-function memoryStatus(view) {
-  if (view.hidden_at) return "forgetting";
-  if (view.retracted_at) return "retracted";
-  if (view.chain.head !== view.id) return "superseded";
-  if (view.chain.ended_by) return "ended";
-  return "live";
+const END_EDITS = ["memory_ended", "end_cleared", "end_repointed"];
+
+/// Whether an ended memory can be reopened: another memory ended it, or
+/// the owner did and nothing has changed its end since. A window that
+/// closed on its own can't be.
+function reopenable(view) {
+  if (view.status !== "ended") return false;
+  if (view.chain.ended_by) return true;
+  const latest = view.edits.findLast((edit) => END_EDITS.includes(edit.kind));
+  return latest?.kind === "memory_ended" && latest.details.by === "owner";
 }
 
 /// Children with a space between each, so their text reads apart when it's
@@ -463,7 +466,7 @@ async function memory(ctx) {
   const { api, ui, bank, at } = ctx;
   const { h, time, fadeLabel, outOfUseLabel, purgeLabel, pill, outlook } = ui;
   const view = await api.memory(bank, at.id);
-  const status = memoryStatus(view);
+  const status = view.status;
   const kept = view.significance.owner === "kept";
   const versions = view.chain.members.length;
   const link = (id, text) => h("a", { href: memoryHash(bank, id) }, text ?? `memory ${shortId(id)}`);
@@ -495,6 +498,32 @@ async function memory(ctx) {
             kept ? "Stop keeping" : "Keep",
           ),
           h("p", {}, kept ? "Let it fade again if it goes unused." : "Hold it at full strength so it never fades."),
+        ),
+      );
+    }
+    if (status === "live" || reopenable(view)) {
+      const live = status === "live";
+      actions.push(
+        h(
+          "div",
+          { class: "action" },
+          h(
+            "button",
+            {
+              type: "button",
+              onclick: () =>
+                ctx.act(async () => {
+                  if (live) {
+                    await api.end(bank, view.id);
+                    return "Ended. It's off the agenda and listed as ended.";
+                  }
+                  await api.reopen(bank, view.id);
+                  return "Reopened. It holds again.";
+                }),
+            },
+            live ? "End" : "Reopen",
+          ),
+          h("p", {}, live ? "For a memory that's no longer true, such as a task that's done or not needed." : "Undo the ending: it holds again."),
         ),
       );
     }

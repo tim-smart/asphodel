@@ -10,6 +10,7 @@ pub mod chunking;
 pub mod clock;
 pub mod config;
 pub mod constants;
+pub mod end;
 pub mod entities;
 pub mod erase;
 pub mod extraction;

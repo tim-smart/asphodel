@@ -40,7 +40,7 @@ pub use browse::{
     MemoryQuery, MemorySort, MemoryStatus, MemorySummary, SourceCounts, SourceDetail, SourcePage,
     SourceQuery, SourceSummary, SourceVersion, StatusCounts,
 };
-pub(crate) use browse::{banks, memories, source, sources};
+pub(crate) use browse::{banks, memories, source, sources, status};
 
 /// The most linked memories `entity show` lists, newest first.
 pub const ENTITY_MEMORIES: usize = 100;
@@ -93,6 +93,8 @@ pub struct MemoryView {
     pub sentence: String,
     pub kind: String,
     pub phase: Option<Phase>,
+    /// Where it stands, as the memory list's status filter has it.
+    pub status: MemoryStatus,
     pub window: WindowView,
     pub observed_at: Timestamp,
     pub created_at: Timestamp,
@@ -516,6 +518,15 @@ pub(crate) fn memory(
         sentence: row.content.clone(),
         kind: row.kind.clone(),
         phase,
+        status: status(
+            row.hidden_at.is_some(),
+            row.invalidated_at.is_some(),
+            head != memory_id,
+            row.ended_by.is_some(),
+            row.valid_until,
+            &row.timezone,
+            now,
+        ),
         window: WindowView {
             valid_from: row.valid_from,
             valid_until: row.valid_until,

@@ -109,6 +109,8 @@ export function client(fetch, storage) {
     memories: (name, params) => call("GET", `${bank(name)}/memories${query(params)}`),
     memory: (name, id) => call("GET", `${bank(name)}/memories/${path(id)}`),
     retract: (name, id) => call("POST", `${bank(name)}/memories/${path(id)}/retract`),
+    end: (name, id) => call("POST", `${bank(name)}/memories/${path(id)}/end`),
+    reopen: (name, id) => call("POST", `${bank(name)}/memories/${path(id)}/reopen`),
     forget: (name, ids) => call("POST", `${bank(name)}/forget`, { ids }),
     keep: (name, ids) => call("POST", `${bank(name)}/keep`, { ids }),
     unkeep: (name, ids) => call("POST", `${bank(name)}/unkeep`, { ids }),

@@ -590,6 +590,8 @@ whatever it says.
 - `asphodel memory translate --bank B <id>` translates a memory into
   `[llm] language`. See below.
 - `asphodel memory retract --bank B <id>`: see "Retracting a memory".
+- `asphodel memory end --bank B <id>` and `asphodel memory reopen --bank B
+  <id>`: see "Ending a memory".
 - `asphodel forget --bank B <id>...`: see "Forgetting".
 
 A memory's sentence, kind and window are never edited from the CLI. Those
@@ -1113,6 +1115,26 @@ fades, like any other memory. There's no undo.
 Only the newest version of a memory can be retracted. An older one is
 refused with 409, naming the version that replaced it, and so is a repeat.
 Use forget instead when the content itself has to go.
+
+## Ending a memory
+
+`asphodel memory end --bank B <id>` is the owner saying a memory was true
+but has stopped holding: a task that's done or no longer needed, a plan
+dropped, a state that's over. It's what extraction does when a later
+memory ends one, with no memory to point at: the window closes now. The
+memory leaves the agenda and the prompt block at once, is listed as ended,
+and is no longer offered to reconciliation as open. Models that cite it
+refresh.
+
+`asphodel memory reopen --bank B <id>` undoes the latest ending. An ending
+by the owner goes back to the window the memory had before it; an ending by
+another memory is cleared, as if that memory had been denied. A memory whose
+own stated end has passed, with nothing ending it, can't be reopened.
+
+Both act on the newest version only, like retract, and answer 409 when
+there's nothing to do: ending a memory that has ended, reopening one that
+hasn't, or either on a retracted or superseded memory. The dashboard's memory
+page has the same End and Reopen buttons.
 
 ## Removing a document
 
