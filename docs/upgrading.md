@@ -1,5 +1,22 @@
 # Upgrading
 
+## Call 1 version 20 and call 2 version 6: finished work closes its tasks
+
+Call 1 (`extract_claims`) now extracts the speaker ending remembered work,
+such as asking the assistant to delete the research for a task, as an event
+that changes something, names a task's object, and no longer makes a
+permission for the assistant to use an account or card a task. Call 2
+(`reconcile_claims`) lets `ends` close a task made unnecessary, not only
+one completed or cancelled
+("booked the flights" ends "redo the flight search"). See "The tuning file" in
+`docs/operations.md`.
+
+Stored memories are unchanged and nothing is re-extracted. Tasks that stayed
+open before this can be closed with `asphodel memory end`. No schema
+migration is needed and purge doesn't pause. Replay cassettes key both calls
+by template version, so strict `replay` misses recordings made under call 1
+version 19 or call 2 version 5, and `fast` and `live` ask the LLM again.
+
 ## Significant memories refresh models without the 30-minute wait
 
 A new memory at `mental_models.trigger_level` or above, a kept one, or one
