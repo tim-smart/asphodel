@@ -5,3 +5,4 @@ __pycache__/
 /result
 /models
 node_modules/
+.claude/
