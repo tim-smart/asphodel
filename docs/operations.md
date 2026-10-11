@@ -228,7 +228,7 @@ p02/p04 remain to be accepted. The relevance scale stays `3.564211`.
 These are configuration values, not built-in defaults: floors and scales
 must still be supplied for the exact model id.
 
-`[llm] concurrency` (default 4) is how many LLM calls may be in flight at
+`[llm] concurrency` (default 7) is how many LLM calls may be in flight at
 once across the daemon, refreshes included, and how many chunks each bank
 extracts at once. Chunks still commit in queue order, and a chunk whose
 search missed a memory another chunk committed reconciles again, so a
@@ -263,6 +263,28 @@ them. A date or path alone is not an exception. Where a durable thing is
 kept is extracted as a fact about that thing only when the supplied context
 does not already state the location. This is a context-local check, not a
 guarantee that the location has never been mentioned in the bank.
+
+Version 19 keeps what the speaker asked about when a question concerns
+their life, as an event recording the intent, and a reply's finding that
+answers such a request when the text dates or bounds it. The finding names
+its source and is never a fact. An earlier topic-based question skip had
+dropped both. Advice, general knowledge and undated findings stay out.
+Its effect on recall and on the "Hermes/The assistant" share still needs a
+reviewed recording.
+
+Version 20 closes work the speaker ends. A turn saying a remembered plan,
+task or piece of work is done, dropped or no longer needed, including
+"delete all the flight research", is an event that changes something and
+names the work as memory names it, even when the rest of the turn is a
+file operation, but not when the turn already states what ended it, and
+never for a cancelled or moved reminder. Tasks and commitments name what
+they're about ("paying the ACC invoice", not "the credit-card payment"), so
+a later completion can find them. Permission for the assistant to use an
+account or card is skipped for the request at hand and a fact when
+standing, never a task; a decision an approval carries is kept. Call 2 version 6 lets `ends` close a task
+whose goal was reached another way or that's no longer needed, but not one
+the claim only relates to. Their effect on the agenda and on false endings
+still needs a reviewed recording.
 
 The earlier version 4 rule followed a ten-day evaluation (436 turns,
 451 memories): 129 memories recorded assistant operations or reports and

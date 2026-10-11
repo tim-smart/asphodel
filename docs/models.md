@@ -201,7 +201,11 @@ location is a fact about the thing, not an edit event, and is extracted only
 when it is not already stated in the supplied context. Assistant replies
 can supply those claims while carrying out the speaker's request; requested
 assistant tasks still need a due date or an until-event beyond the turn.
-Suggestions, general knowledge and tool findings remain excluded. See
+A reply's finding is kept only when it answers a request about the
+speaker's life and the text dates or bounds it, such as a local event,
+a booking or an availability. It names its source, is never a fact and is
+usually trivial, so it leaves with its window. Advice, suggestions, general
+knowledge and undated findings remain excluded. See
 `docs/operations.md`, "The tuning file", for the evaluation behind these rules.
 
 **Guidance.** `[extraction] guidance` is added, trimmed, after call 1's fixed

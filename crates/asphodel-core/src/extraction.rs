@@ -70,7 +70,7 @@ pub use prompt::call1_request;
 
 /// Call 1's template name and version, which replay's cassette keys include.
 pub const CALL1_TEMPLATE: &str = "extract_claims";
-pub const CALL1_VERSION: u32 = 18;
+pub const CALL1_VERSION: u32 = 20;
 
 /// The hash call 1's template carries for `[extraction] guidance`:
 /// lower-case hex SHA-256 of the text as the prompt inserts it, trimmed.
@@ -80,7 +80,7 @@ pub fn guidance_hash(guidance: Option<&str>) -> Option<String> {
 
 /// Call 2's template name and version, which replay's cassette keys include.
 pub const CALL2_TEMPLATE: &str = "reconcile_claims";
-pub const CALL2_VERSION: u32 = 5;
+pub const CALL2_VERSION: u32 = 6;
 
 /// The top five neighbours per claim after fusing vector search and BM25.
 /// A flagged claim's nearest entity-linked open tasks and current states
