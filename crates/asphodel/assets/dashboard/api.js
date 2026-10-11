@@ -1,6 +1,7 @@
 // The daemon's HTTP API, one function per route the dashboard calls.
 //
-// The bearer token lives in the tab's session storage and nowhere else. A
+// The bearer token lives in same-origin local storage, shared across tabs.
+// Legacy session-storage tokens are never read or migrated. A
 // call goes without one until the daemon asks for it with a 401: a loopback
 // daemon with no token configured never does. A 401 on a call that carried
 // a token means the token is wrong, so it is dropped.

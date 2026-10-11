@@ -1311,10 +1311,14 @@ Retract, forget, document removal and the purge acknowledgement each ask
 first and say what will go.
 
 A daemon on loopback without a token is browsed without asking. Otherwise
-the dashboard asks once per browser tab, keeps the token in that tab's
-session storage, and asks again if the daemon rejects it. "Sign out" drops
-it. The page sends a Content-Security-Policy that allows nothing from
-outside the daemon.
+the dashboard keeps the token in same-origin local storage, shared across
+tabs in the same browser. It persists after closing tabs or the browser.
+"Sign out" clears the shared token; a rejected token is also cleared and
+the dashboard asks again. Tokens are not put in URLs or cookies.
+Legacy session-storage tokens are never read or migrated, so users signed
+in before this change must sign in once again. Leftover session copies
+cannot restore a token after sign-out. The page sends a
+Content-Security-Policy that allows nothing from outside the daemon.
 
 The dashboard is plain ES modules and CSS under
 `crates/asphodel/assets/dashboard/`, embedded in the binary as they are:
