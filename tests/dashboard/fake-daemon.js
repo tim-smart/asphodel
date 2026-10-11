@@ -677,7 +677,10 @@ export class FakeDaemon {
     if (collection === "memories" && action === undefined && method === "GET") {
       const found = state.views[id];
       const row = state.memories.find((m) => m.id === id);
-      return found ? json(200, { ...found, status: row.status }) : error(404, "unknown memory");
+      if (!found) return error(404, "unknown memory");
+      const endable = row.status === "live";
+      const reopenable = row.status === "ended" && Boolean(row.ended_by || row.ownerEnded);
+      return json(200, { ...found, status: row.status, endable, reopenable });
     }
     if (collection === "memories" && action === "retract" && method === "POST") return this.retract(id);
     if (collection === "memories" && action === "end" && method === "POST") return this.end(id);
@@ -800,6 +803,7 @@ export class FakeDaemon {
     if (!row || row.status === "forgetting") return error(404, "unknown memory");
     if (row.status !== "live") return error(409, `the memory is ${row.status}`);
     row.status = "ended";
+    row.ownerEnded = true;
     this.state.views[id].edits.push({ kind: "memory_ended", details: { by: "owner" } });
     return json(200, { memory: id, ended_at: "2026-10-03T09:05:00Z" });
   }
@@ -812,6 +816,7 @@ export class FakeDaemon {
     row.status = "live";
     row.ended_by = null;
     shown.chain.ended_by = null;
+    row.ownerEnded = false;
     shown.edits.push({ kind: "end_cleared", details: { by: "owner" } });
     return json(200, { memory: id });
   }

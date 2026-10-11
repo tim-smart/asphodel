@@ -95,6 +95,12 @@ pub struct MemoryView {
     pub phase: Option<Phase>,
     /// Where it stands, as the memory list's status filter has it.
     pub status: MemoryStatus,
+    /// Whether the owner can end it: nothing ended it and its window
+    /// hasn't closed.
+    pub endable: bool,
+    /// Whether the owner can reopen it: an ending to undo whose earlier
+    /// window hasn't closed since.
+    pub reopenable: bool,
     pub window: WindowView,
     pub observed_at: Timestamp,
     pub created_at: Timestamp,
@@ -513,6 +519,7 @@ pub(crate) fn memory(
     };
 
     let (passage, gone) = passage(&row);
+    let (endable, reopenable) = crate::end::actions(&conn, memory_id, now)?;
     Ok(MemoryView {
         id: uuid,
         sentence: row.content.clone(),
@@ -527,6 +534,8 @@ pub(crate) fn memory(
             &row.timezone,
             now,
         ),
+        endable,
+        reopenable,
         window: WindowView {
             valid_from: row.valid_from,
             valid_until: row.valid_until,

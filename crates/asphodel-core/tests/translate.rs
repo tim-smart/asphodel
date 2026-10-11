@@ -529,3 +529,17 @@ fn a_translation_cant_commit_while_an_extraction_is_prepared() {
         "the queue hands out the next chunk"
     );
 }
+
+#[test]
+fn an_owner_ending_carries_over_a_translation_and_can_still_be_undone() {
+    let h = Harness::new(None).restart(Models::fake());
+    let original = h.memory(RUSSIAN);
+    h.service.end(BANK, &original.to_string()).unwrap();
+    let head = translated(h.translate(original, &llm(ENGLISH)));
+    assert!(h.show(head).reopenable);
+
+    h.service.reopen(BANK, &head.to_string()).unwrap();
+    let reopened = h.show(head);
+    assert_eq!(reopened.window.valid_until, None);
+    assert!(reopened.endable);
+}

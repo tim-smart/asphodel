@@ -74,18 +74,6 @@ function memoryCount(count) {
   return plural(count, "memory", "memories");
 }
 
-const END_EDITS = ["memory_ended", "end_cleared", "end_repointed"];
-
-/// Whether an ended memory can be reopened: another memory ended it, or
-/// the owner did and nothing has changed its end since. A window that
-/// closed on its own can't be.
-function reopenable(view) {
-  if (view.status !== "ended") return false;
-  if (view.chain.ended_by) return true;
-  const latest = view.edits.findLast((edit) => END_EDITS.includes(edit.kind));
-  return latest?.kind === "memory_ended" && latest.details.by === "owner";
-}
-
 /// Children with a space between each, so their text reads apart when it's
 /// copied or read aloud.
 function spaced(children) {
@@ -501,8 +489,8 @@ async function memory(ctx) {
         ),
       );
     }
-    if (status === "live" || reopenable(view)) {
-      const live = status === "live";
+    if (view.endable || view.reopenable) {
+      const live = view.endable;
       actions.push(
         h(
           "div",

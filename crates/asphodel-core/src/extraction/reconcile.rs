@@ -50,9 +50,11 @@ use super::{
     Call1Input, Call2Candidate, Call2Input, Call2List, Label, NEIGHBOUR_CAP, NEIGHBOURS_PER_CLAIM,
     NeighbourMemory, ReconcileClaim,
 };
+use crate::agenda::has_ended;
 use crate::constants::Significance;
 use crate::retrieval::{bm25, fuse};
-use crate::store::{SqliteVec, VectorError, VectorIndex, timestamp};
+use crate::store::strength::world_time;
+use crate::store::{SqliteVec, VectorError, VectorIndex, micros, timestamp};
 use crate::strength::{Chains, Kind, Link as ChainLink};
 
 /// Hits each retriever takes at first. Superseded versions collapse into
@@ -83,7 +85,7 @@ pub(super) struct Neighbour {
     pub low_confidence: bool,
     pub significance: Significance,
     pub owner_significance: Option<String>,
-    /// Already ended by another memory.
+    /// Already ended, by another memory or the owner.
     pub ended: bool,
 }
 
@@ -248,7 +250,7 @@ pub(super) fn search(
         let mut open = Vec::new();
         if memory.flagged {
             runs = true;
-            for id in linked_open(conn, unit.bank_id, memory, vector)? {
+            for id in linked_open(conn, unit.bank_id, memory, vector, input.observed_at)? {
                 if shown(conn, &mut chains, &mut loaded, id)?.is_some() {
                     open.push(id);
                 }
@@ -430,12 +432,14 @@ fn nearest(
 /// entities, nearest the claim's `vector` first. The owner is linked to
 /// most of them, so this is close to the bank's open tasks by similarity,
 /// whichever entity the claim happened to name. One with no vector comes
-/// last, newest first.
+/// last, newest first. Open means not ended when the claim was said: a
+/// stated end still ahead then, such as a trip a task is for, keeps it.
 fn linked_open(
     conn: &Connection,
     bank_id: i64,
     memory: &NewMemory,
     vector: &[f32],
+    said_at: Timestamp,
 ) -> Result<Vec<i64>, rusqlite::Error> {
     let entities: Vec<i64> = memory
         .links
@@ -449,32 +453,34 @@ fn linked_open(
         return Ok(Vec::new());
     }
     let mut statement = conn.prepare_cached(
-        "SELECT m.id FROM memories m LEFT JOIN memory_vectors v ON v.memory_id = m.id
-         WHERE m.bank_id = ?1 AND m.kind IN ('task', 'state')
-           AND m.valid_until IS NULL AND m.ended_by IS NULL
+        "SELECT m.id, m.valid_until, m.valid_until_precision, s.timezone
+         FROM memories m JOIN chunks c ON c.id = m.chunk_id JOIN sources s ON s.id = c.source_id
+         LEFT JOIN memory_vectors v ON v.memory_id = m.id
+         WHERE m.bank_id = ?1 AND m.kind IN ('task', 'state') AND m.ended_by IS NULL
            AND m.invalidated_at IS NULL AND m.superseded_by IS NULL
            AND m.id IN (SELECT memory_id FROM memory_entities
                         WHERE entity_id IN (SELECT value FROM json_each(?2)))
          ORDER BY v.embedding IS NULL,
                   CASE WHEN v.embedding IS NOT NULL THEN vec_distance_cosine(v.embedding, ?3) END,
-                  m.observed_at DESC, m.id DESC
-         LIMIT ?4",
+                  m.observed_at DESC, m.id DESC",
     )?;
     let bytes: Vec<u8> = vector
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
-    statement
-        .query_map(
-            (
-                bank_id,
-                serde_json::to_string(&entities).expect("ids serialize"),
-                bytes,
-                NEIGHBOURS_PER_CLAIM as i64,
-            ),
-            |row| row.get(0),
-        )?
-        .collect()
+    let entities = serde_json::to_string(&entities).expect("ids serialize");
+    let mut rows = statement.query((bank_id, entities, bytes))?;
+    let mut found = Vec::new();
+    while found.len() < NEIGHBOURS_PER_CLAIM
+        && let Some(row) = rows.next()?
+    {
+        let until = world_time(row.get(1)?, row.get(2)?);
+        let tz = TimeZone::get(&row.get::<_, String>(3)?).unwrap_or(TimeZone::UTC);
+        if !has_ended(until, &tz, said_at) {
+            found.push(row.get(0)?);
+        }
+    }
+    Ok(found)
 }
 
 /// The memory a hit on `id` shows: the head of its chain, unless that head
@@ -544,7 +550,12 @@ fn load(conn: &Connection, id: i64) -> Result<Option<Neighbour>, rusqlite::Error
             ))
         },
     )?;
-    let (retracted, neighbour) = row;
+    let (retracted, mut neighbour) = row;
+    // An owner's ending has no `ended_by`, but is just as final.
+    if !neighbour.ended {
+        let until = neighbour.valid_until.map(|stamp| micros(stamp.at));
+        neighbour.ended = crate::end::owner_ending(conn, id, until)?.is_some();
+    }
     Ok((!retracted).then_some(neighbour))
 }
 
