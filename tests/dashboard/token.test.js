@@ -59,6 +59,17 @@ test("reloading the tab doesn't ask for the token again", async (t) => {
   assert.equal(page.root.querySelector('input[type="password"]'), null);
 });
 
+test("a separately opened same-origin tab stays signed in", async (t) => {
+  const daemon = new FakeDaemon();
+  const first = await open(t, daemon, { token: TOKEN });
+  await findLink(first.root, BANK);
+
+  const second = await open(t, daemon, { localStorage: first.window.localStorage });
+
+  await findLink(second.root, BANK);
+  assert.equal(second.root.querySelector('input[type="password"]'), null);
+});
+
 test("a rejected token is dropped and asked for again", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon);
