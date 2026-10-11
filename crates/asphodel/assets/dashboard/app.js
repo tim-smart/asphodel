@@ -44,6 +44,17 @@ export function mount(root, { fetch }) {
   const dialogs = new Set();
   // The keys of the `once` actions still running.
   const running = new Set();
+  // What the page on screen saves about itself when the reader leaves it,
+  // or null if it saves nothing.
+  let leaving = null;
+  // What the last page left saved: its hash and route, the scroll, and
+  // whatever the page added (the sources list adds its loaded pages and the
+  // source opened). It goes back to the page when that hash shows again.
+  let left = null;
+  // The dashboard puts a returned-to page's scroll back itself, once the
+  // page is rebuilt; the browser's own restoring would run before that.
+  const scrollRestoration = window.history.scrollRestoration;
+  window.history.scrollRestoration = "manual";
 
   // The page's chrome: header, banner slot and main, rebuilt per render.
   function shell(at) {
@@ -512,7 +523,11 @@ export function mount(root, { fetch }) {
 
   async function render({ focusHeading = false, focusNotice = false } = {}) {
     const mine = ++generation;
-    const at = route(window.location.hash);
+    const hash = window.location.hash;
+    const at = route(hash);
+    const resume = left?.hash === hash ? left : null;
+    if (resume) left = null;
+    leaving = null;
     shell(at);
     const statusLoad = loadStatus();
     const page = pages[at.page] ?? pages.missing;
@@ -523,6 +538,8 @@ export function mount(root, { fetch }) {
       bank: at.bank,
       params: at.params,
       status: statusLoad,
+      resume,
+      left,
       navigate: (hash) => {
         window.location.hash = hash;
       },
@@ -538,8 +555,12 @@ export function mount(root, { fetch }) {
       main.setAttribute("aria-busy", "false");
       showCurrentTab();
       showStatus(status, at);
+      if (view.leave) leaving = () => ({ hash, at, scroll: window.scrollY, ...view.leave() });
       if (focusNotice) main.querySelector(".notice")?.focus();
-      else if (focusHeading) main.querySelector("h1")?.focus();
+      else if (resume) {
+        (view.focus ?? main.querySelector("h1"))?.focus({ preventScroll: true });
+        (document.scrollingElement ?? document.documentElement).scrollTop = resume.scroll;
+      } else if (focusHeading) main.querySelector("h1")?.focus();
     } catch (error) {
       if (mine !== generation || stopped) return;
       if (error instanceof Unauthorized) return prompt(error.rejected);
@@ -555,6 +576,7 @@ export function mount(root, { fetch }) {
 
   function onHashChange() {
     if (settingUp) return;
+    if (leaving) left = leaving();
     const carried = carryNotice;
     carryNotice = false;
     if (!carried) notice = null;
@@ -581,6 +603,7 @@ export function mount(root, { fetch }) {
     stopped = true;
     window.removeEventListener("hashchange", onHashChange);
     window.clearInterval(timer);
+    window.history.scrollRestoration = scrollRestoration;
     for (const dialog of dialogs) dialog.remove();
     dialogs.clear();
   };
