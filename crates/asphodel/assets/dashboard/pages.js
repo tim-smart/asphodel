@@ -841,16 +841,32 @@ async function removeTurn(ctx, turn) {
 }
 
 // The bank's turns and documents, newest first: one entry per turn, and one
-// per document id with its newest version.
+// per document id with its newest version. Coming back from a source, it
+// loads as many pages as were shown and puts focus on the source opened.
 async function sources(ctx) {
-  const { api, ui, bank, params } = ctx;
+  const { api, ui, bank, params, resume } = ctx;
   const { h, time, pill } = ui;
   const filters = { q: params.q ?? "", kind: params.kind ?? "", gone: params.gone ?? "" };
   const go = (change) => ctx.navigate(listHash(bank, { ...filters, ...change }, "sources"));
   const first = await api.sources(bank, { ...filters, limit: 200 });
   const loaded = [...first.sources];
   let cursor = first.next_cursor;
-  const list = h("ul", { class: "sources" });
+  let pages = 1;
+  const loadMore = async () => {
+    const next = await api.sources(bank, { ...filters, limit: 200, cursor });
+    loaded.push(...next.sources);
+    cursor = next.next_cursor;
+    pages += 1;
+  };
+  while (cursor && pages < (resume?.pages ?? 1)) await loadMore();
+  // The source the reader opened from this list, to come back to.
+  let opened = resume?.opened ?? null;
+  const list = h("ul", {
+    class: "sources",
+    onclick: (event) => {
+      opened = event.target.closest("a.source-name")?.getAttribute("href") ?? opened;
+    },
+  });
 
   const draw = () =>
     list.replaceChildren(
@@ -909,9 +925,7 @@ async function sources(ctx) {
       class: "quiet more",
       onclick: async () => {
         more.disabled = true;
-        const next = await api.sources(bank, { ...filters, limit: 200, cursor });
-        loaded.push(...next.sources);
-        cursor = next.next_cursor;
+        await loadMore();
         draw();
         more.disabled = false;
         if (!cursor) more.remove();
@@ -964,6 +978,8 @@ async function sources(ctx) {
 
   return {
     title: `Sources · ${bank}`,
+    leave: () => ({ pages, opened }),
+    focus: resume?.opened ? [...list.querySelectorAll("a.source-name")].find((a) => a.getAttribute("href") === resume.opened) : null,
     content: [
       heading(h, "Sources"),
       toolbar,
@@ -983,9 +999,12 @@ async function sources(ctx) {
 
 // One source, a document version or a turn: its text, versions and chunks.
 async function source(ctx) {
-  const { api, ui, bank, at } = ctx;
+  const { api, ui, bank, at, left } = ctx;
   const { h, time, pill } = ui;
   const s = await api.source(bank, at.id);
+  // Back to the sources list as the reader left it, filters and all; a
+  // source opened from anywhere else goes back to the whole list.
+  const list = left?.at.page === "sources" && left.at.bank === bank ? left.hash : bankHash(bank, "sources");
   const isDocument = s.kind === "document";
   const removed = s.gone?.reason === "removed";
   const title = isDocument ? s.document_id : `Turn${s.session_id ? ` in ${s.session_id}` : ""}`;
@@ -1081,7 +1100,7 @@ async function source(ctx) {
   return {
     title,
     content: [
-      h("p", { class: "back" }, h("a", { href: bankHash(bank, "sources") }, "← Sources")),
+      h("p", { class: "back" }, h("a", { href: list }, "← Sources")),
       heading(
         h,
         title,
