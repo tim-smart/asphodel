@@ -1037,13 +1037,22 @@ pub(crate) fn commit_prepared(
             // Labels the guards dropped show as more labels than accesses
             // and edits; ids and labels only, never content.
             if let Some(search) = &prepared.search {
+                // Handles are the model's text, so only ones that resolve are
+                // logged, as positions and ids.
                 for (claim, labels) in &prepared.labels {
+                    let claims = &search.input.claims;
+                    let Some(claim) = claims.iter().position(|c| &c.handle == claim) else {
+                        continue;
+                    };
                     for (handle, label) in labels {
-                        let memory = search.input.neighbours.iter().find(|n| &n.handle == handle);
+                        let neighbours = &search.input.neighbours;
+                        let Some(memory) = neighbours.iter().find(|n| &n.handle == handle) else {
+                            continue;
+                        };
                         tracing::debug!(
                             chunk = %extracted.chunk,
                             claim,
-                            memory = ?memory.map(|n| n.memory),
+                            memory = %memory.memory,
                             label = label.as_str(),
                             "call 2 labelled a neighbour"
                         );

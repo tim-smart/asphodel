@@ -1123,18 +1123,22 @@ but has stopped holding: a task that's done or no longer needed, a plan
 dropped, a state that's over. It's what extraction does when a later
 memory ends one, with no memory to point at: the window closes now. The
 memory leaves the agenda and the prompt block at once, is listed as ended,
-and is no longer offered to reconciliation as open. Models that cite it
-refresh.
+and is no longer offered to reconciliation as open. Call 2 is shown it as
+ended, so a later claim can't end, correct or refine it over the owner's
+ending. Models that cite it refresh. A memory whose window has already
+closed, such as an event in the past, can't be ended.
 
 `asphodel memory reopen --bank B <id>` undoes the latest ending. An ending
-by the owner goes back to the window the memory had before it; an ending by
-another memory is cleared, as if that memory had been denied. A memory whose
-own stated end has passed, with nothing ending it, can't be reopened.
+by the owner goes back to the window the memory had before it, even after a
+translation; an ending by another memory is cleared, as if that memory had
+been denied. A memory whose own stated end has passed, with nothing ending
+it, can't be reopened, and neither can one whose window before the owner's
+ending has closed since.
 
 Both act on the newest version only, like retract, and answer 409 when
-there's nothing to do: ending a memory that has ended, reopening one that
-hasn't, or either on a retracted or superseded memory. The dashboard's memory
-page has the same End and Reopen buttons.
+there's nothing to do. `memory show --json` says which applies in
+`endable` and `reopenable`, and the dashboard's memory page offers End or
+Reopen from them.
 
 ## Removing a document
 

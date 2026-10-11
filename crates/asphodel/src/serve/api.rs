@@ -407,7 +407,8 @@ impl From<EndError> for ApiError {
             EndError::Superseded { .. }
             | EndError::Retracted
             | EndError::AlreadyEnded
-            | EndError::NotEnded => Self::new(StatusCode::CONFLICT, error.to_string()),
+            | EndError::NotEnded
+            | EndError::StillEnded => Self::new(StatusCode::CONFLICT, error.to_string()),
             EndError::Store(error) => error.into(),
         }
     }

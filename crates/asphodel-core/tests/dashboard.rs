@@ -11,8 +11,9 @@
 //!   whatever it ended is open again. It stays visible as retracted until
 //!   the sweep purges it.
 //! - **End is the owner saying a memory stopped holding.** It leaves the
-//!   agenda at once, and reopening undoes the latest ending, the owner's
-//!   or another memory's, but not a window that closed on its own.
+//!   agenda at once and call 2 can't relabel it. Reopening undoes the
+//!   latest ending, the owner's or another memory's, but not a window that
+//!   closed on its own, nor one whose earlier window has closed since.
 //! - **Removing a document** takes every version of its id: the memories
 //!   resting on its chunks are forgotten, its waiting chunks dequeued, and
 //!   its sources tombstoned with their keys kept. A chunk already in flight
@@ -574,7 +575,7 @@ fn retract_refuses_a_superseded_memory_naming_its_head_and_a_repeat() {
 
 #[test]
 fn ending_takes_a_task_off_the_agenda_and_reopening_restores_its_window() {
-    use EndError::{AlreadyEnded, NotEnded};
+    use EndError::{AlreadyEnded, NotEnded, StillEnded};
     let h = Harness::new();
     let passport = h.says_at(at(START) - days(1), task(PASSPORT), &[]);
     let occasion = json!({"at": "2026-10-20", "precision": "day"});
@@ -600,6 +601,7 @@ fn ending_takes_a_task_off_the_agenda_and_reopening_restores_its_window() {
         .find(|edit| edit.kind == "memory_ended")
         .expect("the ending is logged");
     assert_eq!(edit.details["by"], "owner");
+    assert!(!shown.endable && shown.reopenable);
     assert!(matches!(h.end(passport), Err(AlreadyEnded)));
 
     h.reopen(passport).unwrap();
@@ -613,6 +615,31 @@ fn ending_takes_a_task_off_the_agenda_and_reopening_restores_its_window() {
     h.reopen(bike).unwrap();
     assert_eq!(h.show(bike).window.valid_until, stated);
     assert!(on_agenda().contains(&bike));
+
+    // Reopening that would leave it ended, its stated end passed since, is
+    // refused rather than claimed.
+    h.end(bike).unwrap();
+    h.clock.set(at("2026-10-21T12:00:00Z"));
+    assert!(matches!(h.reopen(bike), Err(StillEnded)));
+    assert!(!h.show(bike).reopenable);
+}
+
+#[test]
+fn a_later_claim_cant_relabel_what_the_owner_ended() {
+    let h = Harness::new();
+    let passport = h.says_at(at(START) - days(1), task(PASSPORT), &[]);
+    h.end(passport).unwrap();
+
+    let renewed = with(notable("Tim renewed his passport."), "kind", json!("event"));
+    h.says_at(h.now(), changing(renewed), &[(passport, "ends")]);
+    let urgent = task("Tim urgently needs to renew his passport.");
+    h.says_at(h.now(), changing(urgent), &[(passport, "refines")]);
+
+    let shown = h.show(passport);
+    assert_eq!(shown.chain.head, passport);
+    assert_eq!(shown.chain.ended_by, None);
+    h.reopen(passport).unwrap();
+    assert_eq!(h.show(passport).window.valid_until, None);
 }
 
 #[test]
@@ -642,6 +669,17 @@ fn reopening_clears_an_ending_by_another_memory_but_not_a_window_that_closed() {
 
     assert!(matches!(h.end(holiday), Err(AlreadyEnded)));
     assert!(matches!(h.reopen(holiday), Err(NotEnded)));
+    // A past event has no stated end, but its window closed with its day.
+    let party = h.says(
+        with(
+            with(notable("Tim went to a party."), "kind", json!("event")),
+            "valid_from",
+            json!({"at": "2026-09-15", "precision": "day"}),
+        ),
+        &[],
+    );
+    assert!(matches!(h.end(party), Err(AlreadyEnded)));
+    assert!(!h.show(party).endable);
     assert!(matches!(h.end(maya), Err(Superseded { head }) if head == mia));
     assert!(matches!(h.end(tea), Err(Retracted)));
     assert!(matches!(

@@ -14,7 +14,7 @@
 //! would need.
 
 use jiff::Timestamp;
-use rusqlite::{OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -147,13 +147,14 @@ pub(crate) fn retract(
 
 /// The head of the chain a superseded memory belongs to.
 pub(crate) fn superseded_head(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     bank_id: i64,
     memory_id: i64,
 ) -> Result<Uuid, rusqlite::Error> {
-    let head = chain_head(&bank_links(tx, bank_id)?, memory_id);
-    let head: String = tx.query_row("SELECT uuid FROM memories WHERE id = ?1", [head], |row| {
-        row.get(0)
-    })?;
+    let head = chain_head(&bank_links(conn, bank_id)?, memory_id);
+    let head: String =
+        conn.query_row("SELECT uuid FROM memories WHERE id = ?1", [head], |row| {
+            row.get(0)
+        })?;
     Ok(head.parse().expect("a stored uuid parses"))
 }

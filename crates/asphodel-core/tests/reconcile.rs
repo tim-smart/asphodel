@@ -771,6 +771,14 @@ fn a_flagged_claim_sees_open_tasks_and_current_states_of_its_entities() {
     };
     let sort_them = h.fixture(said("Tim needs to sort the travel documents.", "task"));
     owners(sort_them);
+    // Open until a trip still ahead: a stated end that hasn't come.
+    let before_trip = said(
+        "Tim needs to sort the travel documents for the trip.",
+        "task",
+    )
+    .at("valid_until", "2026-12-01", "day");
+    let before_trip = h.fixture(before_trip);
+    owners(before_trip);
     for n in 1..=6 {
         owners(h.fixture(said(&format!("Tim needs to water plant {n}."), "task")));
         h.fixture(said(
@@ -781,6 +789,7 @@ fn a_flagged_claim_sees_open_tasks_and_current_states_of_its_entities() {
     let input = call2(&h, &reply(vec![changes(travel)])).expect("call 2 runs");
     let found = shown_for(&input, 0);
     assert!(found.contains(&sort_them), "{found:?}");
+    assert!(found.contains(&before_trip), "{found:?}");
 }
 
 #[test]
