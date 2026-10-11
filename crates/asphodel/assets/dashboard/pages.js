@@ -70,6 +70,13 @@ function listHash(bank, params, section = "memories") {
   return `${bankHash(bank, section)}${text ? `?${text}` : ""}`;
 }
 
+/// Back to the list a page was opened from as the reader left it, filters
+/// and all; a page opened from anywhere else goes back to the whole list.
+function backTo(ctx, section) {
+  const { trail, bank } = ctx;
+  return trail?.at.page === section && trail.at.bank === bank ? trail.hash : bankHash(bank, section);
+}
+
 function memoryCount(count) {
   return plural(count, "memory", "memories");
 }
@@ -292,7 +299,7 @@ function memoryRow(ctx, memory) {
 
 // A bank's memories, filtered and sorted by the daemon.
 async function memories(ctx) {
-  const { api, ui, bank, params } = ctx;
+  const { api, ui, bank, params, resume } = ctx;
   const { h } = ui;
   const filters = {
     status: params.status ?? "",
@@ -303,6 +310,17 @@ async function memories(ctx) {
     significance: params.significance ?? "",
   };
   const page = await api.memories(bank, { ...filters, limit: 50 });
+  const loaded = [...page.memories];
+  let cursor = page.next_cursor;
+  let pages = 1;
+  const loadMore = async () => {
+    const next = await api.memories(bank, { ...filters, cursor, limit: 50 });
+    loaded.push(...next.memories);
+    cursor = next.next_cursor;
+    pages += 1;
+    return next.memories;
+  };
+  while (cursor && pages < (resume?.pages ?? 1)) await loadMore();
   const go = (change) => ctx.navigate(listHash(bank, { ...filters, ...change }));
   const all = STATUSES.reduce((sum, s) => sum + (page.statuses[s] ?? 0), 0);
 
@@ -374,8 +392,7 @@ async function memories(ctx) {
     STATUSES.map((s) => chip(s, capitalize(s), page.statuses[s] ?? 0)),
   );
 
-  const rows = h("ol", { class: "memories" }, page.memories.map((m) => memoryRow(ctx, m)));
-  let cursor = page.next_cursor;
+  const rows = h("ol", { class: "memories" }, loaded.map((m) => memoryRow(ctx, m)));
   const more = h(
     "button",
     {
@@ -384,9 +401,7 @@ async function memories(ctx) {
       onclick: async () => {
         more.disabled = true;
         try {
-          const next = await api.memories(bank, { ...filters, cursor, limit: 50 });
-          rows.append(...next.memories.map((m) => memoryRow(ctx, m)));
-          cursor = next.next_cursor;
+          rows.append(...(await loadMore()).map((m) => memoryRow(ctx, m)));
         } catch (error) {
           more.after(h("p", { class: "notice", "data-tone": "error", role: "alert" }, error.message));
         }
@@ -400,11 +415,12 @@ async function memories(ctx) {
 
   return {
     title: `Memories · ${bank}`,
+    leave: () => ({ pages }),
     content: [
       heading(h, "Memories", h("p", { class: "quiet-text" }, `${capitalize(memoryCount(page.total))} as of `, ui.time(page.as_of, { withTime: true }))),
       toolbar,
       chips,
-      page.memories.length
+      loaded.length
         ? rows
         : h(
             "p",
@@ -633,7 +649,7 @@ async function memory(ctx) {
   return {
     title: view.sentence,
     content: [
-      h("p", { class: "back" }, h("a", { href: bankHash(bank, "memories") }, "← Memories")),
+      h("p", { class: "back" }, h("a", { href: backTo(ctx, "memories") }, "← Memories")),
       h(
         "article",
         { class: "specimen", "data-fade": fadeStage(view.projection.fade), "data-status": status },
@@ -847,14 +863,7 @@ async function sources(ctx) {
     pages += 1;
   };
   while (cursor && pages < (resume?.pages ?? 1)) await loadMore();
-  // The source the reader opened from this list, to come back to.
-  let opened = resume?.opened ?? null;
-  const list = h("ul", {
-    class: "sources",
-    onclick: (event) => {
-      opened = event.target.closest("a.source-name")?.getAttribute("href") ?? opened;
-    },
-  });
+  const list = h("ul", { class: "sources" });
 
   const draw = () =>
     list.replaceChildren(
@@ -966,8 +975,7 @@ async function sources(ctx) {
 
   return {
     title: `Sources · ${bank}`,
-    leave: () => ({ pages, opened }),
-    focus: resume?.opened ? [...list.querySelectorAll("a.source-name")].find((a) => a.getAttribute("href") === resume.opened) : null,
+    leave: () => ({ pages }),
     content: [
       heading(h, "Sources"),
       toolbar,
@@ -987,12 +995,10 @@ async function sources(ctx) {
 
 // One source, a document version or a turn: its text, versions and chunks.
 async function source(ctx) {
-  const { api, ui, bank, at, left } = ctx;
+  const { api, ui, bank, at } = ctx;
   const { h, time, pill } = ui;
   const s = await api.source(bank, at.id);
-  // Back to the sources list as the reader left it, filters and all; a
-  // source opened from anywhere else goes back to the whole list.
-  const list = left?.at.page === "sources" && left.at.bank === bank ? left.hash : bankHash(bank, "sources");
+  const list = backTo(ctx, "sources");
   const isDocument = s.kind === "document";
   const removed = s.gone?.reason === "removed";
   const title = isDocument ? s.document_id : `Turn${s.session_id ? ` in ${s.session_id}` : ""}`;
@@ -1316,13 +1322,16 @@ function milliseconds(ms) {
 }
 
 async function recall(ctx) {
-  const { api, ui, bank } = ctx;
+  const { api, ui, bank, resume } = ctx;
   const { h } = ui;
   const { banks: list } = await api.banks();
   const timeZone = list.find((b) => b.name === bank)?.timezone ?? "UTC";
 
-  let mode = "recall";
+  let mode = resume?.mode ?? "recall";
   let generation = 0;
+  // The last explain answer, kept so returning to the page shows it again
+  // without asking the daemon twice.
+  let answered = resume?.answered ?? null;
 
   const field = (id, label, control, hint) =>
     h("div", { class: "field" }, h("label", { for: id }, label), control, hint ? h("p", { class: "hint" }, hint) : null);
@@ -1414,6 +1423,16 @@ async function recall(ctx) {
   const run = h("button", { type: "submit" }, "Explain");
   const results = h("div", { class: "explain-results", "aria-live": "polite" });
 
+  // The boxes as the reader left them, by name.
+  const boxes = { query, on, from, to, phase, entity, limit, previousQuery, previousReply };
+  if (resume) {
+    for (const [name, box] of Object.entries(boxes)) box.value = resume.values[name] ?? "";
+    for (const box of kinds) box.checked = resume.kinds.includes(box.value);
+    to.min = from.value;
+    from.max = to.value;
+  }
+  if (answered) results.replaceChildren(...explainResults(ctx, answered.explained, answered.sent, timeZone));
+
   function setMode(next) {
     mode = next;
     queryLabel.textContent = mode === "recall" ? "Query" : "Message";
@@ -1461,9 +1480,11 @@ async function recall(ctx) {
         try {
           const explained = await api.explain(bank, sent);
           if (mine !== generation) return;
+          answered = { explained, sent };
           results.replaceChildren(...explainResults(ctx, explained, sent, timeZone));
         } catch (error) {
           if (mine !== generation) return;
+          answered = null;
           results.replaceChildren(h("p", { class: "notice", "data-tone": "error", role: "alert" }, error.message));
         } finally {
           if (mine === generation) {
@@ -1482,6 +1503,12 @@ async function recall(ctx) {
 
   return {
     title: `Recall · ${bank}`,
+    leave: () => ({
+      mode,
+      values: Object.fromEntries(Object.entries(boxes).map(([name, box]) => [name, box.value])),
+      kinds: kinds.filter((box) => box.checked).map((box) => box.value),
+      answered,
+    }),
     content: [
       heading(h, "Recall", h("p", { class: "quiet-text" }, "Try a query and see what comes back, and why the rest didn't.")),
       form,

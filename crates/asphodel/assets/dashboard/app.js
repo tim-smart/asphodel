@@ -20,6 +20,12 @@ const STATUS_EVERY_MS = 20_000;
 const STARTING_EVERY_MS = 500;
 const STARTING_FOR_MS = 120_000;
 
+/// How many left pages the dashboard keeps to return to.
+const SAVED_PAGES = 50;
+
+/// The lists a page links back to, and the page each one opens.
+const TRAILS = { sources: "source", memories: "memory" };
+
 /// Where an OpenAI-compatible API usually is, as the endpoint's placeholder.
 const DEFAULT_ENDPOINT = "https://api.openai.com/v1";
 
@@ -45,13 +51,22 @@ export function mount(root, { fetch }) {
   // The keys of the `once` actions still running.
   const running = new Set();
   // What the page on screen saves about itself when the reader leaves it,
-  // or null if it saves nothing.
+  // or null while it isn't loaded.
   let leaving = null;
-  // What the last page left saved: its hash and route, the scroll, and
-  // whatever the page added (the sources list adds its loaded pages and the
-  // source opened). It goes back to the page when that hash shows again,
-  // and is dropped once that page is on screen.
-  let left = null;
+  // What each page saved when the reader left it, by its history entry: its
+  // hash and route, the scroll, the link opened from it, and whatever the
+  // page added (a list adds its loaded pages, Recall its query and results).
+  // It goes back to the page when the reader returns to that entry, and is
+  // dropped once that page is on screen.
+  const saved = new Map();
+  // This mount's history entry keys, so a remount doesn't read an entry an
+  // earlier one keyed.
+  const mountKey = Math.random().toString(36).slice(2);
+  let entries = 0;
+  // What the last list left saved, for its pages' way back to it: a source's
+  // "← Sources" and a memory's "← Memories" link to it, and following that
+  // link brings it back as it was left. Dropped once that list is on screen.
+  let trail = null;
   // The route of the page last put on screen, loaded or not.
   let shown = null;
   // The dashboard puts a returned-to page's scroll back itself, once the
@@ -524,13 +539,28 @@ export function mount(root, { fetch }) {
     else render();
   }
 
+  /// The key of the history entry on screen, given one if it has none.
+  function entryKey() {
+    const state = window.history.state;
+    if (state?.asphodel) return state.asphodel;
+    const key = `${mountKey}:${++entries}`;
+    window.history.replaceState({ ...state, asphodel: key }, "");
+    return key;
+  }
+
   async function render({ focusHeading = false, focusNotice = false } = {}) {
     const mine = ++generation;
     const hash = window.location.hash;
     const at = route(hash);
-    const resume = left?.hash === hash ? left : null;
+    const key = entryKey();
+    const resume = saved.get(key) ?? (trail?.hash === hash ? trail : null);
     leaving = null;
     shell(at);
+    // The link the reader opened from this page, to focus when they return.
+    let opened = resume?.opened ?? null;
+    main.addEventListener("click", (event) => {
+      opened = event.target.closest?.("a[href]")?.getAttribute("href") ?? opened;
+    });
     const statusLoad = loadStatus();
     const page = pages[at.page] ?? pages.missing;
     const ctx = {
@@ -541,7 +571,7 @@ export function mount(root, { fetch }) {
       params: at.params,
       status: statusLoad,
       resume,
-      left,
+      trail,
       navigate: (hash) => {
         window.location.hash = hash;
       },
@@ -558,11 +588,13 @@ export function mount(root, { fetch }) {
       showCurrentTab();
       showStatus(status, at);
       shown = at;
-      if (resume && left === resume) left = null;
-      if (view.leave) leaving = () => ({ hash, at, scroll: window.scrollY, ...view.leave() });
+      saved.delete(key);
+      if (trail?.hash === hash) trail = null;
+      leaving = () => ({ key, hash, at, scroll: window.scrollY, opened, ...view.leave?.() });
       if (focusNotice) main.querySelector(".notice")?.focus();
       else if (resume) {
-        (view.focus ?? main.querySelector("h1"))?.focus({ preventScroll: true });
+        const link = [...main.querySelectorAll("a[href]")].find((a) => a.getAttribute("href") === resume.opened);
+        (link ?? main.querySelector("h1"))?.focus({ preventScroll: true });
         (document.scrollingElement ?? document.documentElement).scrollTop = resume.scroll;
       } else if (focusHeading) main.querySelector("h1")?.focus();
     } catch (error) {
@@ -581,11 +613,17 @@ export function mount(root, { fetch }) {
 
   function onHashChange() {
     if (settingUp) return;
-    // A saved list outlives only its own page, while that isn't back on
-    // screen yet, and the sources it links to. Anywhere else, the next
-    // source wasn't opened from it.
-    if (leaving) left = leaving();
-    else if (shown?.page !== "sources" && shown?.page !== "source") left = null;
+    const left = leaving?.();
+    if (left) {
+      saved.delete(left.key);
+      saved.set(left.key, left);
+      if (saved.size > SAVED_PAGES) saved.delete(saved.keys().next().value);
+    }
+    // The trail outlives only its own list, while that isn't back on screen
+    // yet, and the pages it links to. Anywhere else, the next source or
+    // memory wasn't opened from it.
+    if (left && TRAILS[left.at.page]) trail = left;
+    else if (shown?.page !== trail?.at.page && TRAILS[trail?.at.page] !== shown?.page) trail = null;
     const carried = carryNotice;
     carryNotice = false;
     if (!carried) notice = null;
