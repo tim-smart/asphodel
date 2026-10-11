@@ -754,9 +754,33 @@ fn a_flagged_claim_sees_open_tasks_and_current_states_of_its_entities() {
     assert!(found.contains(&job_hunting), "{found:?}");
 
     // So does remember-this.
-    let input = call2(&h, &reply(vec![travel.remember_this()])).expect("call 2 runs");
+    let input = call2(&h, &reply(vec![travel.clone().remember_this()])).expect("call 2 runs");
     assert!(input.claims[0].flagged);
     assert!(shown_for(&input, 0).contains(&passport));
+
+    // The owner is linked to most open tasks, so the ones shown are the
+    // nearest the claim, not the newest: an older related task isn't left
+    // out for newer unrelated ones while events on the same topic fill the
+    // nearest hits.
+    let owners = |memory: Uuid| {
+        let request = LinkRequest {
+            memory: memory.to_string(),
+            entity: "user".into(),
+        };
+        h.service.link_entity("main", &request).unwrap();
+    };
+    let sort_them = h.fixture(said("Tim needs to sort the travel documents.", "task"));
+    owners(sort_them);
+    for n in 1..=6 {
+        owners(h.fixture(said(&format!("Tim needs to water plant {n}."), "task")));
+        h.fixture(said(
+            &format!("Travel documents are sorted for trip {n}."),
+            "event",
+        ));
+    }
+    let input = call2(&h, &reply(vec![changes(travel)])).expect("call 2 runs");
+    let found = shown_for(&input, 0);
+    assert!(found.contains(&sort_them), "{found:?}");
 }
 
 #[test]

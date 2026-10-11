@@ -83,7 +83,8 @@ pub const CALL2_TEMPLATE: &str = "reconcile_claims";
 pub const CALL2_VERSION: u32 = 5;
 
 /// The top five neighbours per claim after fusing vector search and BM25.
-/// A flagged claim's entity-linked open tasks and current states come on top.
+/// A flagged claim's nearest entity-linked open tasks and current states
+/// alternate with them.
 pub const NEIGHBOURS_PER_CLAIM: usize = 5;
 
 /// Neighbours shown for the whole chunk, capped at 40.
@@ -1033,6 +1034,22 @@ pub(crate) fn commit_prepared(
     match committed {
         Ok(Commit::Written(written)) => {
             let (extracted, plan) = *written;
+            // Labels the guards dropped show as more labels than accesses
+            // and edits; ids and labels only, never content.
+            if let Some(search) = &prepared.search {
+                for (claim, labels) in &prepared.labels {
+                    for (handle, label) in labels {
+                        let memory = search.input.neighbours.iter().find(|n| &n.handle == handle);
+                        tracing::debug!(
+                            chunk = %extracted.chunk,
+                            claim,
+                            memory = ?memory.map(|n| n.memory),
+                            label = label.as_str(),
+                            "call 2 labelled a neighbour"
+                        );
+                    }
+                }
+            }
             tracing::info!(
                 chunk = %extracted.chunk,
                 memories = extracted.memories.len(),
@@ -1040,6 +1057,8 @@ pub(crate) fn commit_prepared(
                 dropped = extracted.dropped.len(),
                 entities_created = extracted.entities_created.len(),
                 reconciled = prepared.search.is_some(),
+                shown = prepared.search.as_ref().map_or(0, |s| s.neighbours.len()),
+                labels = prepared.labels.iter().map(|(_, l)| l.len()).sum::<usize>(),
                 accesses = plan.accesses.len(),
                 edits = plan.edits.len(),
                 "extracted a chunk"

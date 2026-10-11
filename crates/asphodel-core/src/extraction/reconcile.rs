@@ -10,8 +10,9 @@
 //! starting a new memory, and a chunk queued before a forget reconciles
 //! against the hidden memory so it's erased with it. A claim that changes
 //! something or asks to be remembered is flagged: its vector hits aren't
-//! held to the floor, and the open tasks and current states linked to its
-//! entities come on top. The chunk shows at most [`NEIGHBOUR_CAP`]
+//! held to the floor, and up to [`NEIGHBOURS_PER_CLAIM`] open tasks and
+//! current states linked to any of its entities, nearest the claim first,
+//! alternate with the fused hits. The chunk shows at most [`NEIGHBOUR_CAP`]
 //! neighbours, each once, filled best rank first across claims.
 //!
 //! **When call 2 runs.** Only the vector floor for the embedding model
@@ -242,13 +243,24 @@ pub(super) fn search(
             }
             limit *= 2;
         }
-        let mut found = fuse(&[vector_ranked.as_slice(), bm25_ranked.as_slice()]);
-        found.truncate(NEIGHBOURS_PER_CLAIM);
+        let mut fused = fuse(&[vector_ranked.as_slice(), bm25_ranked.as_slice()]);
+        fused.truncate(NEIGHBOURS_PER_CLAIM);
+        let mut open = Vec::new();
         if memory.flagged {
             runs = true;
-            for id in linked_open(conn, unit.bank_id, memory)? {
-                if !found.contains(&id) && shown(conn, &mut chains, &mut loaded, id)?.is_some() {
-                    found.push(id);
+            for id in linked_open(conn, unit.bank_id, memory, vector)? {
+                if shown(conn, &mut chains, &mut loaded, id)?.is_some() {
+                    open.push(id);
+                }
+            }
+        }
+        // Alternated, so the nearest open task ranks second and a busy
+        // chunk's cap can't leave every one of them out.
+        let mut found: Vec<i64> = Vec::with_capacity(fused.len() + open.len());
+        for rank in 0..fused.len().max(open.len()) {
+            for id in [fused.get(rank), open.get(rank)].into_iter().flatten() {
+                if !found.contains(id) {
+                    found.push(*id);
                 }
             }
         }
@@ -414,38 +426,55 @@ fn nearest(
         })
 }
 
-/// The open tasks and current states linked to the claim's known
-/// entities, newest first.
+/// The open tasks and current states linked to any of the claim's known
+/// entities, nearest the claim's `vector` first. The owner is linked to
+/// most of them, so this is close to the bank's open tasks by similarity,
+/// whichever entity the claim happened to name. One with no vector comes
+/// last, newest first.
 fn linked_open(
     conn: &Connection,
     bank_id: i64,
     memory: &NewMemory,
+    vector: &[f32],
 ) -> Result<Vec<i64>, rusqlite::Error> {
+    let entities: Vec<i64> = memory
+        .links
+        .iter()
+        .filter_map(|link| match link {
+            Link::Known { entity, .. } => Some(*entity),
+            _ => None,
+        })
+        .collect();
+    if entities.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut statement = conn.prepare_cached(
-        "SELECT m.id FROM memory_entities me JOIN memories m ON m.id = me.memory_id
-         WHERE me.entity_id = ?1 AND m.bank_id = ?2 AND m.kind IN ('task', 'state')
+        "SELECT m.id FROM memories m LEFT JOIN memory_vectors v ON v.memory_id = m.id
+         WHERE m.bank_id = ?1 AND m.kind IN ('task', 'state')
            AND m.valid_until IS NULL AND m.ended_by IS NULL
            AND m.invalidated_at IS NULL AND m.superseded_by IS NULL
-         ORDER BY m.observed_at DESC, m.id DESC
-         LIMIT ?3",
+           AND m.id IN (SELECT memory_id FROM memory_entities
+                        WHERE entity_id IN (SELECT value FROM json_each(?2)))
+         ORDER BY v.embedding IS NULL,
+                  CASE WHEN v.embedding IS NOT NULL THEN vec_distance_cosine(v.embedding, ?3) END,
+                  m.observed_at DESC, m.id DESC
+         LIMIT ?4",
     )?;
-    let mut found = Vec::new();
-    for link in &memory.links {
-        let Link::Known { entity, .. } = link else {
-            continue;
-        };
-        let ids: Vec<i64> = statement
-            .query_map((entity, bank_id, NEIGHBOURS_PER_CLAIM as i64), |row| {
-                row.get(0)
-            })?
-            .collect::<Result<_, _>>()?;
-        for id in ids {
-            if !found.contains(&id) && found.len() < NEIGHBOURS_PER_CLAIM {
-                found.push(id);
-            }
-        }
-    }
-    Ok(found)
+    let bytes: Vec<u8> = vector
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    statement
+        .query_map(
+            (
+                bank_id,
+                serde_json::to_string(&entities).expect("ids serialize"),
+                bytes,
+                NEIGHBOURS_PER_CLAIM as i64,
+            ),
+            |row| row.get(0),
+        )?
+        .collect()
 }
 
 /// The memory a hit on `id` shows: the head of its chain, unless that head
