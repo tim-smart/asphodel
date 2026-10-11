@@ -30,7 +30,7 @@ Extract:
 - From the assistant's reply, decisions, commitments, durable content and storage locations stated while carrying out the speaker's request. A promise to act, monitor or follow up is an assistant task, not a fact or state about the assistant's commitment. Extract it only if the speaker requested that task and it has a due date or an until-event beyond this turn; otherwise skip the promise as assistant bookkeeping.
 - From the assistant's reply, a finding that answers a request about the speaker's life and that the text dates or bounds (a local event, a booking, an availability). Keep its source in the sentence ("the festival listing says ...") and quote the reply. Never `fact`; usually `trivial`.
 - What the speaker wanted or asked about, when a question or request concerns their life (people, places, purchases, plans, interests). Extract an `event` recording the intent, not the asking: "Alex wanted to try the Corner Cafe's online ordering on 7 October 2026, without buying." Do not record whether the assistant acted or the outcome unless the text states it. Usually `trivial`.
-- The speaker saying that a plan, task or piece of work in the supplied memories or context is done, dropped or no longer needed, including by asking the assistant to stop, delete or discard the work done for it. Extract an `event` with `changes_something` true that names the work as the memories or context name it and gives the reason if the text does: "Alex no longer needs the Lisbon flight search, having booked the flights." Quote the current text. A request to clear up files or notes whose work continues is a routine operation, not this.
+- The speaker saying that a plan, task or piece of work in the supplied memories or context is done, dropped or no longer needed, including by asking the assistant to stop, delete or discard the work done for it. Extract an `event` with `changes_something` true that names the work as the memories or context name it and gives the reason if the text does: "Alex no longer needs the Lisbon flight search, having booked the flights." Quote the current text. When the text already states what ended the work, such as booking the flights, extract that one claim with `changes_something` true and no separate one. A request to clear up files or notes whose work continues is a routine operation, not this. Cancelling, deleting or moving a reminder or calendar entry never ends its obligation, as below.
 
 Apply the skips below to each proposition, not to the whole passage: a request, message or temporary situation can still contain an explicitly stated lasting fact worth extracting.
 
@@ -40,7 +40,7 @@ Skip:
 - The assistant's advice, suggestions, general knowledge, undated findings and findings that don't answer the speaker's request.
 - Routine operations: commands, checks, restarts, result reports, and adding, updating, saving, removing, restoring, moving or verifying notes or files. Extract the durable content, decision or commitment, or the end of the work it served as above, not an event about the operation. A date or path alone does not make an operation worth remembering.
 - Storage locations already stated in the supplied context. Extract where something durable is kept only as a fact about the thing ("the trip notes are in 07_Trips/Anniversary"), not an edit event.
-- Requests to forget something, including tasks to forget it.
+- Requests to forget something, meaning to stop remembering it, including tasks to forget it. Dropping a plan in the same words ("forget the flight search, I've booked") ends work as above.
 - Greetings, filler and small talk.
 
 # Reminder and calendar requests
@@ -84,7 +84,7 @@ Choose `kind` in this order:
 - `state`: something ongoing that is expected to change without an announcement, such as mood, location, current work or progress. Keep an explicit end condition as `until_event` ("until the release ships").
 - `fact`: everything else except claims recording written messages, assistant-drafted wording or an intent to send a message, including preferences, things whose change would be announced (a job, home or relationship), and things not expected to change (a chronic condition).
 
-A permission given to the assistant is not a task. Skip an approval for the request at hand ("use my work card for this top-up") as assistant bookkeeping; a standing permission ("you can always use my work card for SIM top-ups") is a `fact`.
+Permission for the assistant to use an account, card or other resource is not a task. Skip one given for the request at hand ("use my work card for this top-up") as assistant bookkeeping; a standing one ("you can always use my work card for SIM top-ups") is a `fact`. A decision that an approval carries ("yes, book the 200 euro hotel") is extracted as usual.
 
 Select and classify each proposition separately, including facts stated within possessive or descriptive phrases. A durable relationship is a `fact`, even when stated alongside a visit, illness or other temporary state. "Alex's grandson Ben is staying this week" supports a separate fact that Ben is Alex's grandson and a temporary claim about the stay; do not fold the relationship into a short-lived state or discard it when skipping the temporary claim. Extract only relationships actually stated, not inferred from the situation.
 

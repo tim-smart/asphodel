@@ -276,10 +276,12 @@ Version 20 closes work the speaker ends. A turn saying a remembered plan,
 task or piece of work is done, dropped or no longer needed, including
 "delete all the flight research", is an event that changes something and
 names the work as memory names it, even when the rest of the turn is a
-file operation. Tasks and commitments name what they're about ("paying the
-ACC invoice", not "the credit-card payment"), so a later completion can
-find them. A one-off permission to the assistant is skipped and a standing
-one is a fact, never a task. Call 2 version 6 lets `ends` close a task
+file operation, but not when the turn already states what ended it, and
+never for a cancelled or moved reminder. Tasks and commitments name what
+they're about ("paying the ACC invoice", not "the credit-card payment"), so
+a later completion can find them. Permission for the assistant to use an
+account or card is skipped for the request at hand and a fact when
+standing, never a task; a decision an approval carries is kept. Call 2 version 6 lets `ends` close a task
 whose goal was reached another way or that's no longer needed, but not one
 the claim only relates to. Their effect on the agenda and on false endings
 still needs a reviewed recording.

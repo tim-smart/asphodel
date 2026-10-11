@@ -5,8 +5,9 @@
 Call 1 (`extract_claims`) now extracts the speaker ending remembered work,
 such as asking the assistant to delete the research for a task, as an event
 that changes something, names a task's object, and no longer makes a
-permission given to the assistant a task. Call 2 (`reconcile_claims`) lets
-`ends` close a task made unnecessary, not only one completed or cancelled
+permission for the assistant to use an account or card a task. Call 2
+(`reconcile_claims`) lets `ends` close a task made unnecessary, not only
+one completed or cancelled
 ("booked the flights" ends "redo the flight search"). See "The tuning file" in
 `docs/operations.md`.
 
