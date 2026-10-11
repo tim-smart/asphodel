@@ -49,8 +49,11 @@ export function mount(root, { fetch }) {
   let leaving = null;
   // What the last page left saved: its hash and route, the scroll, and
   // whatever the page added (the sources list adds its loaded pages and the
-  // source opened). It goes back to the page when that hash shows again.
+  // source opened). It goes back to the page when that hash shows again,
+  // and is dropped once that page is on screen.
   let left = null;
+  // The route of the page last put on screen, loaded or not.
+  let shown = null;
   // The dashboard puts a returned-to page's scroll back itself, once the
   // page is rebuilt; the browser's own restoring would run before that.
   const scrollRestoration = window.history.scrollRestoration;
@@ -526,7 +529,6 @@ export function mount(root, { fetch }) {
     const hash = window.location.hash;
     const at = route(hash);
     const resume = left?.hash === hash ? left : null;
-    if (resume) left = null;
     leaving = null;
     shell(at);
     const statusLoad = loadStatus();
@@ -555,6 +557,8 @@ export function mount(root, { fetch }) {
       main.setAttribute("aria-busy", "false");
       showCurrentTab();
       showStatus(status, at);
+      shown = at;
+      if (resume && left === resume) left = null;
       if (view.leave) leaving = () => ({ hash, at, scroll: window.scrollY, ...view.leave() });
       if (focusNotice) main.querySelector(".notice")?.focus();
       else if (resume) {
@@ -564,6 +568,7 @@ export function mount(root, { fetch }) {
     } catch (error) {
       if (mine !== generation || stopped) return;
       if (error instanceof Unauthorized) return prompt(error.rejected);
+      shown = at;
       main.replaceChildren(
         ...[noticeElement()].filter(Boolean),
         h("h1", { tabindex: "-1" }, "This page didn't load"),
@@ -576,7 +581,11 @@ export function mount(root, { fetch }) {
 
   function onHashChange() {
     if (settingUp) return;
+    // A saved list outlives only its own page, while that isn't back on
+    // screen yet, and the sources it links to. Anywhere else, the next
+    // source wasn't opened from it.
     if (leaving) left = leaving();
+    else if (shown?.page !== "sources" && shown?.page !== "source") left = null;
     const carried = carryNotice;
     carryNotice = false;
     if (!carried) notice = null;
