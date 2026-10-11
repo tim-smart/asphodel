@@ -1,7 +1,8 @@
 // Forget, retract and removing a document or turn can't be undone, so each asks first
 // and says what will go. Nothing is sent until the owner confirms; cancelling
 // sends nothing. Afterwards the page says what the daemon did, even when what
-// it acted on is already gone.
+// it acted on is already gone. Ending a memory can be undone by reopening
+// it, so it doesn't ask.
 //
 // A document is removed with `POST /v1/banks/{bank}/documents/remove` and
 // `{"document_id": ...}`: the id is the exact string ingested, which a URL
@@ -101,6 +102,27 @@ test("a confirmed retract marks the memory retracted and links what it reopened"
   await waitFor(() => !queryDialog(page.document), "the confirmation to close");
   await findText(page.root, /\bretracted\b/i);
   await waitFor(() => page.root.querySelector(`a[href*="${ids.oldJob}"]`), "a link to the reopened memory");
+});
+
+test("ending a memory asks nothing, since reopening undoes it", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: memoryPage(ids.job), token: TOKEN });
+
+  click(await findButton(page.root, /^end$/i));
+  await waitFor(() => daemon.calls("POST", `/v1/banks/main/memories/${ids.job}/end`)[0], "POST end");
+  assert.equal(queryDialog(page.document), null);
+
+  click(await findButton(page.root, /^reopen$/i));
+  await waitFor(() => daemon.calls("POST", `/v1/banks/main/memories/${ids.job}/reopen`)[0], "POST reopen");
+  await findButton(page.root, /^end$/i);
+});
+
+test("a memory another ended can be reopened", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: memoryPage(ids.oldJob), token: TOKEN });
+
+  click(await findButton(page.root, /^reopen$/i));
+  await waitFor(() => daemon.calls("POST", `/v1/banks/main/memories/${ids.oldJob}/reopen`)[0], "POST reopen");
 });
 
 test("a refused retract shows the daemon's reason", async (t) => {

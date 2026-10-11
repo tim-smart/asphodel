@@ -2545,12 +2545,27 @@ fn retract_and_source_removal_answer_over_http() {
         .unwrap()
         .to_string();
 
-    let retract = |bank: &str, id: &str| {
+    let owner = |bank: &str, id: &str, action: &str| {
         daemon.post(
-            &format!("/v1/banks/{bank}/memories/{id}/retract"),
+            &format!("/v1/banks/{bank}/memories/{id}/{action}"),
             &json!({}),
         )
     };
+    let ended = daemon.ok(owner("main", &id, "end"));
+    assert_eq!(ended["memory"], id.as_str(), "{ended}");
+    assert!(ended["ended_at"].is_string(), "{ended}");
+    assert_eq!(daemon.memories("main", "status=ended").len(), 1);
+    for action in ["end", "reopen"] {
+        let reply = owner("main", UNKNOWN, action);
+        assert_eq!(reply.status, 404, "{action}: {}", reply.body);
+    }
+    assert_eq!(owner("main", &id, "end").status, 409);
+    let reopened = daemon.ok(owner("main", &id, "reopen"));
+    assert_eq!(reopened["memory"], id.as_str(), "{reopened}");
+    assert_eq!(owner("main", &id, "reopen").status, 409);
+    assert_eq!(daemon.memories("main", "status=live").len(), 1);
+
+    let retract = |bank: &str, id: &str| owner(bank, id, "retract");
     let retracted = daemon.ok(retract("main", &id));
     assert_eq!(retracted["memory"], id.as_str(), "{retracted}");
     assert!(retracted["retracted_at"].is_string(), "{retracted}");

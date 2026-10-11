@@ -517,6 +517,29 @@ pub enum MemoryCommand {
         id: String,
     },
 
+    /// End a memory: say it has stopped holding, such as a task that's done
+    /// or no longer needed. It leaves the agenda at once and is listed as
+    /// ended.
+    End {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        /// The memory's id.
+        id: String,
+    },
+
+    /// Reopen an ended memory, undoing the latest ending, the owner's or
+    /// another memory's.
+    Reopen {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        bank: String,
+        /// The memory's id.
+        id: String,
+    },
+
     /// Show a memory: both significance fields, its passage or why it's
     /// gone, its accesses, edits and chain, the secret-scan kinds, its
     /// strength in parts, what holds back a purge, and projected fade and
@@ -2290,7 +2313,33 @@ fn fades(memory: &Value) -> String {
     }
 }
 
-/// `asphodel memory list|show|retract|significance|translate`.
+/// `asphodel memory end` or `reopen`: posts to the memory's `action` route
+/// and prints the memory id after `done`.
+fn owner_end(
+    client: &ClientArgs,
+    bank: &str,
+    id: &str,
+    action: &str,
+    done: &str,
+) -> anyhow::Result<()> {
+    let json = client.json;
+    let client = Client::new(client)?;
+    let reply: Value = client.post(
+        &format!(
+            "/v1/banks/{}/memories/{}/{action}",
+            segment(bank),
+            segment(id)
+        ),
+        &Value::Null,
+    )?;
+    if json {
+        return print_json(&reply);
+    }
+    println!("{done} {}", text(&reply, "memory"));
+    Ok(())
+}
+
+/// `asphodel memory list|show|retract|end|reopen|significance|translate`.
 fn memory(command: MemoryCommand) -> anyhow::Result<()> {
     match command {
         MemoryCommand::List(args) => {
@@ -2368,6 +2417,10 @@ fn memory(command: MemoryCommand) -> anyhow::Result<()> {
                 println!("reopened {}", reopened.as_str().unwrap_or(""));
             }
             Ok(())
+        }
+        MemoryCommand::End { client, bank, id } => owner_end(&client, &bank, &id, "end", "ended"),
+        MemoryCommand::Reopen { client, bank, id } => {
+            owner_end(&client, &bank, &id, "reopen", "reopened")
         }
         MemoryCommand::Show { client, bank, id } => {
             let json = client.json;

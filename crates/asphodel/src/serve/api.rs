@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use asphodel_core::agenda::Agenda;
 use asphodel_core::config::Secret;
+use asphodel_core::end::{EndError, Ended, Reopened};
 use asphodel_core::entities::{
     AliasRemoval, AliasRemoved, EntityError, LinkEdited, LinkRequest, MergeRequest, Merged,
     Unmerged,
@@ -116,6 +117,8 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/v1/banks/{bank}/memories", get(memories))
         .route("/v1/banks/{bank}/memories/{memory}", get(show_memory))
         .route("/v1/banks/{bank}/memories/{memory}/retract", post(retract))
+        .route("/v1/banks/{bank}/memories/{memory}/end", post(end))
+        .route("/v1/banks/{bank}/memories/{memory}/reopen", post(reopen))
         .route(
             "/v1/banks/{bank}/memories/{memory}/significance",
             put(set_significance),
@@ -391,6 +394,21 @@ impl From<RetractError> for ApiError {
                 Self::new(StatusCode::CONFLICT, error.to_string())
             }
             RetractError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<EndError> for ApiError {
+    fn from(error: EndError) -> Self {
+        match error {
+            EndError::UnknownBank | EndError::UnknownMemory => {
+                Self::new(StatusCode::NOT_FOUND, error.to_string())
+            }
+            EndError::Superseded { .. }
+            | EndError::Retracted
+            | EndError::AlreadyEnded
+            | EndError::NotEnded => Self::new(StatusCode::CONFLICT, error.to_string()),
+            EndError::Store(error) => error.into(),
         }
     }
 }
@@ -1074,6 +1092,28 @@ async fn retract(
         .call(move |service| service.retract(&bank, &memory))
         .await?;
     Ok(Json(retracted))
+}
+
+/// `POST /v1/banks/{bank}/memories/{id}/end`: `asphodel memory end`. 409
+/// when it has already ended, is retracted, or superseded (naming the head).
+async fn end(
+    State(app): State<Shared>,
+    Path((bank, memory)): Path<(String, String)>,
+) -> Result<Json<Ended>, ApiError> {
+    let ended = app.call(move |service| service.end(&bank, &memory)).await?;
+    Ok(Json(ended))
+}
+
+/// `POST /v1/banks/{bank}/memories/{id}/reopen`: `asphodel memory reopen`.
+/// 409 when nothing ended it, it's retracted, or superseded.
+async fn reopen(
+    State(app): State<Shared>,
+    Path((bank, memory)): Path<(String, String)>,
+) -> Result<Json<Reopened>, ApiError> {
+    let reopened = app
+        .call(move |service| service.reopen(&bank, &memory))
+        .await?;
+    Ok(Json(reopened))
 }
 
 #[derive(Serialize)]

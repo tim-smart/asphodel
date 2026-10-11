@@ -18,6 +18,7 @@ use crate::agenda::Agenda;
 use crate::clock::Clock;
 use crate::config::{ConfigError, DeletionInputs, PurgePause, Tuning};
 use crate::constants::RERANKER_DEADLINE;
+use crate::end::{EndError, Ended, Reopened};
 use crate::entities::{
     AliasRemoval, AliasRemoved, EntityError, LinkEdited, LinkRequest, MergeRequest, Merged,
     Unmerged,
@@ -1235,6 +1236,28 @@ impl Service {
             },
         )?;
         Ok(retracted)
+    }
+
+    /// `memory end <id>`: the owner says the memory has stopped holding
+    /// ([`crate::end`]). It leaves the agenda and the block at once.
+    pub fn end(&self, bank: &str, id: &str) -> Result<Ended, EndError> {
+        let watermark = self.watermark_for(bank)?;
+        let (bank_id, ended) = crate::end::end(&self.store, bank, id)?;
+        if let Some((_, watermark)) = watermark {
+            self.after_writes(bank_id, watermark, &[])?;
+        }
+        Ok(ended)
+    }
+
+    /// `memory reopen <id>`: undoes the latest ending of the memory, the
+    /// owner's or another memory's.
+    pub fn reopen(&self, bank: &str, id: &str) -> Result<Reopened, EndError> {
+        let watermark = self.watermark_for(bank)?;
+        let (bank_id, reopened) = crate::end::reopen(&self.store, bank, id)?;
+        if let Some((_, watermark)) = watermark {
+            self.after_writes(bank_id, watermark, &[])?;
+        }
+        Ok(reopened)
     }
 
     /// `bank delete <bank> --confirm <bank>`: erases the bank through the

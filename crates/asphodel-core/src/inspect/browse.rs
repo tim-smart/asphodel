@@ -362,7 +362,7 @@ impl Row {
 }
 
 /// The first status that holds, in [`MemoryStatus`]'s order.
-fn status(
+pub(crate) fn status(
     hidden: bool,
     invalidated: bool,
     superseded: bool,
