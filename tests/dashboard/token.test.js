@@ -1,13 +1,13 @@
 // The bearer token. On loopback a daemon may have none, and then the
-// dashboard never asks. Otherwise it asks once per tab, keeps the token in
-// session storage only, and sends it on every `/v1` call. A token the daemon
+// dashboard never asks. Otherwise same-origin tabs share the token in local
+// storage, and send it on every `/v1` call. A token the daemon
 // rejects is dropped and asked for again.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { FakeDaemon, TOKEN } from "./fake-daemon.js";
-import { findLink, findText, findTokenInput, open, signIn, waitFor } from "./support.js";
+import { click, findButton, findLink, findText, findTokenInput, open, signIn, waitFor } from "./support.js";
 
 const BANK = /\bmain\b/;
 
@@ -37,13 +37,13 @@ test("a daemon that wants a token is asked with it on every call once it is give
   for (const r of after) assert.equal(r.authorization, `Bearer ${TOKEN}`, `${r.method} ${r.path}`);
 });
 
-test("the token stays in the tab's session storage, out of the URL and local storage", async (t) => {
+test("the token stays in shared local storage, out of session storage, URLs and cookies", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon, { token: TOKEN });
   await findLink(page.root, BANK);
 
-  assert.ok(stored(page.window.sessionStorage).some((value) => value?.includes(TOKEN)));
-  assert.equal(page.window.localStorage.length, 0);
+  assert.ok(stored(page.window.localStorage).some((value) => value?.includes(TOKEN)));
+  assert.ok(!stored(page.window.sessionStorage).some((value) => value?.includes(TOKEN)));
   assert.ok(!page.window.location.href.includes(TOKEN));
   assert.ok(!page.document.cookie.includes(TOKEN));
 });
@@ -59,6 +59,43 @@ test("reloading the tab doesn't ask for the token again", async (t) => {
   assert.equal(page.root.querySelector('input[type="password"]'), null);
 });
 
+test("a separately opened same-origin tab stays signed in", async (t) => {
+  const daemon = new FakeDaemon();
+  const first = await open(t, daemon, { token: TOKEN });
+  await findLink(first.root, BANK);
+
+  const second = await open(t, daemon, { localStorage: first.window.localStorage });
+
+  await findLink(second.root, BANK);
+  assert.equal(second.root.querySelector('input[type="password"]'), null);
+});
+
+test("sign-out cannot be undone by legacy session tokens in other existing tabs", async (t) => {
+  const daemon = new FakeDaemon();
+  const first = await open(t, daemon);
+  const second = await open(t, daemon, { localStorage: first.window.localStorage });
+  await findTokenInput(first.root);
+  await findTokenInput(second.root);
+
+  await signIn(first, TOKEN);
+  await findLink(first.root, BANK);
+  // Two tabs left over from the session-storage version. Clearing one
+  // tab's legacy copy cannot clear the other tab's copy.
+  first.window.sessionStorage.setItem("asphodel.token", TOKEN);
+  second.window.sessionStorage.setItem("asphodel.token", TOKEN);
+
+  click(await findButton(first.root, /sign out/i));
+  await findTokenInput(first.root);
+  const before = daemon.requests.length;
+
+  await first.reload();
+  await findTokenInput(first.root);
+  await second.reload();
+  await findTokenInput(second.root);
+  assert.ok(daemon.requests.slice(before).every((r) => !r.authorization),
+    "neither tab restores a legacy token after sign-out");
+});
+
 test("a rejected token is dropped and asked for again", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon);
@@ -67,6 +104,7 @@ test("a rejected token is dropped and asked for again", async (t) => {
   await waitFor(() => daemon.requests.some((r) => r.authorization === "Bearer wrong-token"), "a call with the wrong token");
   await findText(page.root, /rejected|refused|not accepted|wrong|invalid|incorrect/i);
   await findTokenInput(page.root);
+  assert.ok(!stored(page.window.localStorage).some((value) => value?.includes("wrong-token")));
   assert.ok(!stored(page.window.sessionStorage).some((value) => value?.includes("wrong-token")));
 
   await signIn(page, TOKEN);

@@ -4,7 +4,7 @@
 // A daemon with no tuning file yet gets the setup wizard instead.
 //
 // `mount(root, { fetch })` renders into `root` and returns a function that
-// stops it. Everything else (location, session storage, timers) comes from
+// stops it. Everything else (location, local storage, timers) comes from
 // the root's window. No build step: the daemon serves these files as they
 // are.
 
@@ -32,7 +32,7 @@ const DEFAULT_ENDPOINT = "https://api.openai.com/v1";
 export function mount(root, { fetch }) {
   const document = root.ownerDocument;
   const window = document.defaultView;
-  const api = client(fetch, window.sessionStorage);
+  const api = client(fetch, window.localStorage);
   const ui = elements(document);
   const { h } = ui;
 
@@ -336,7 +336,7 @@ export function mount(root, { fetch }) {
       rejected ? h("p", { id: "token-error", class: "notice", "data-tone": "error", role: "alert" }, ["The daemon rejected that token. Check ", h("code", {}, "ASPHODEL_TOKEN"), " and try again."]) : null,
       h("label", { for: "token" }, "Token"),
       input,
-      h("p", { id: "token-help", class: "help" }, "The bearer token the daemon was started with, from ", h("code", {}, "ASPHODEL_TOKEN"), ". It's kept in this tab only and cleared when you close it."),
+      h("p", { id: "token-help", class: "help" }, "The bearer token the daemon was started with, from ", h("code", {}, "ASPHODEL_TOKEN"), ". It's shared across tabs for this daemon in this browser and kept after you close them. Sign out to clear it."),
       h("button", { type: "submit" }, "Sign in"),
     );
     root.replaceChildren(h("main", { class: "token-page" }, form));

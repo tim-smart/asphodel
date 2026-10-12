@@ -27,12 +27,15 @@ const PATIENCE_MS = 1500;
 
 /// Opens the dashboard at `hash` against `daemon`. With `token`, the session
 /// is signed in first, the way a person would sign in.
-export async function start(daemon, { hash = "#/", token } = {}) {
+export async function start(daemon, { hash = "#/", token, localStorage } = {}) {
   const dom = new JSDOM(`<!doctype html><html><body><div id="app"></div></body></html>`, {
     url: `http://127.0.0.1:7720/dashboard${hash}`,
     pretendToBeVisual: true,
   });
   const window = dom.window;
+  // Independently opened same-origin tabs share local storage, but each
+  // keeps its own session storage. jsdom otherwise isolates both stores.
+  if (localStorage) Object.defineProperty(window, "localStorage", { value: localStorage });
   dialogs(window);
   scrolling(window);
   const { mount } = await import(APP.href);

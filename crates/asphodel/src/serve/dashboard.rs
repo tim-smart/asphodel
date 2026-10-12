@@ -89,8 +89,8 @@ const ASSETS: &[(&str, &str, &str, &[u8])] = &[
 
 /// Everything the page loads comes from the daemon. The scripts build the
 /// page with DOM calls, never markup, so no inline script or style is
-/// needed; the token in session storage stays out of reach of anything
-/// injected.
+/// needed. The CSP restricts scripts to this origin; the bearer token is
+/// kept in same-origin local storage.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
     font-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; \
     form-action 'none'; frame-ancestors 'none'";
