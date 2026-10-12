@@ -11,12 +11,14 @@ const LEVELS = ["trivial", "minor", "notable", "major", "critical", "kept"];
 const SORTS = [
   ["created", "Newest first"],
   ["fade", "Fading soonest"],
+  ["fade_latest", "Fading latest"],
   ["strength", "Strongest first"],
 ];
 const FADING = [
   ["faded", "Already faded"],
   ["week", "Fading within a week"],
   ["month", "Fading within a month"],
+  ["over_month", "Fading in over a month"],
   ["never", "Never fading"],
 ];
 

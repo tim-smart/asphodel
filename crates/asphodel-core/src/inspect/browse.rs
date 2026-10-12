@@ -86,6 +86,8 @@ pub enum MemorySort {
     /// The soonest to fade first; those already faded lead, and those that
     /// never fade come last.
     Fade,
+    /// The latest to fade first; those that never fade come last.
+    FadeLatest,
     /// The strongest first.
     Strength,
 }
@@ -100,6 +102,8 @@ pub enum Fading {
     Week,
     /// Recallable now, and fades within 30 bank days.
     Month,
+    /// Recallable now, and fades in more than 30 bank days.
+    OverMonth,
     /// Never fades: kept, or the lasting floor holds it up.
     Never,
 }
@@ -676,6 +680,12 @@ fn sort(all: &mut [MemorySummary], sort: MemorySort) {
             };
             days(a).total_cmp(&days(b))
         }),
+        MemorySort::FadeLatest => all.sort_by(|a, b| match (&a.fade, &b.fade) {
+            (Some(a), Some(b)) => b.bank_days.total_cmp(&a.bank_days),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }),
         MemorySort::Strength => all.sort_by(|a, b| b.strength.total_cmp(&a.strength)),
     }
 }
@@ -692,6 +702,13 @@ fn fades(memory: &MemorySummary, fading: Fading) -> bool {
         Fading::Faded => !memory.recallable,
         Fading::Week => within(7.0),
         Fading::Month => within(30.0),
+        Fading::OverMonth => {
+            memory.recallable
+                && memory
+                    .fade
+                    .as_ref()
+                    .is_some_and(|fade| fade.bank_days > 30.0)
+        }
         Fading::Never => memory.fade.is_none(),
     }
 }
