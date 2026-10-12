@@ -83,6 +83,26 @@ test("sorting by fade asks the daemon for the soonest to fade first", async (t) 
   await queried(daemon, LIST, "sort", "fade");
 });
 
+test("sorting by fade latest asks the daemon for the most bank days left first", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: MEMORIES, token: TOKEN });
+  await findText(page.root, sentences.auckland);
+
+  choose(await findField(page.root, /sort/i), "fade_latest");
+
+  await queried(daemon, LIST, "sort", "fade_latest");
+});
+
+test("filtering to fading in over a month asks the daemon for those memories", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: MEMORIES, token: TOKEN });
+  await findText(page.root, sentences.auckland);
+
+  choose(await findField(page.root, /^fading$/i), "over_month");
+
+  await queried(daemon, LIST, "fading", "over_month");
+});
+
 test("more memories load from the next page under the ones shown", async (t) => {
   const daemon = new FakeDaemon();
   daemon.state.pageSize = 4;

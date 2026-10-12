@@ -3,9 +3,10 @@
 //! version of it. The routes over these `Service` methods, and that browsing
 //! them writes nothing, are checked in `crates/asphodel/tests/serve_http.rs`.
 //!
-//! - **Fade on a list** is the same projection `memory show` gives, and
-//!   sorting by it puts the soonest first and the memories that never fade
-//!   last.
+//! - **Fade on a list** is the same projection `memory show` gives.
+//!   Sorting by it puts the soonest first, or the latest first, and the
+//!   memories that never fade last either way. Filtering by it splits at a
+//!   month: within one, or further out than one.
 //! - **Retract is a denial by the owner.** The memory is invalidated with
 //!   no successor, so everything that reads live memories drops it, and
 //!   whatever it ended is open again. It stays visible as retracted until
@@ -433,7 +434,7 @@ fn the_memory_list_filters_by_status() {
 }
 
 #[test]
-fn each_listed_memory_fades_when_memory_show_says_and_the_soonest_sorts_first() {
+fn each_listed_memory_fades_when_memory_show_says_and_the_soonest_or_latest_sorts_first() {
     let h = Harness::new();
     let notable = h.fact(BERLIN);
     let trivial = h.says_at(at(START) - days(1), trivial(TEA), &[]);
@@ -454,6 +455,45 @@ fn each_listed_memory_fades_when_memory_show_says_and_the_soonest_sorts_first() 
     for memory in &listed {
         assert_eq!(memory.fade, h.fade(memory.id), "{}", memory.id);
     }
+
+    let latest_first = MemoryQuery {
+        sort: MemorySort::FadeLatest,
+        ..MemoryQuery::default()
+    };
+    let listed = h.page(latest_first).memories;
+    let order: Vec<Uuid> = listed.iter().map(|memory| memory.id).collect();
+    assert_eq!(order, [notable, trivial, kept]);
+}
+
+#[test]
+fn the_fade_filter_splits_at_a_month_and_a_memory_that_never_fades_is_on_neither_side() {
+    // A month is 30 bank days, so a memory moves from one side of the line
+    // to the other as the clock nears its fade. A kept memory has no fade,
+    // so it is fading neither within a month nor further out.
+    let h = Harness::new();
+    let fading = h.fact(BERLIN);
+    let kept = h.fact(MAYA);
+    h.service.keep(BANK, &[kept.to_string()]).unwrap();
+    let fade = h.fade(fading).expect("a notable fact said once fades");
+    let listed = |fading: Fading| -> Vec<Uuid> {
+        let query = MemoryQuery {
+            fading: Some(fading),
+            ..MemoryQuery::default()
+        };
+        h.page(query).memories.iter().map(|m| m.id).collect()
+    };
+    let none: [Uuid; 0] = [];
+    let hour = SignedDuration::from_hours(1);
+
+    h.clock.set(fade.earliest_at - days(30) - hour);
+    assert_eq!(listed(Fading::Month), none, "just over a month out");
+    assert_eq!(listed(Fading::OverMonth), [fading], "just over a month out");
+    assert_eq!(listed(Fading::Never), [kept]);
+
+    h.clock.set(fade.earliest_at - days(30) + hour);
+    assert_eq!(listed(Fading::Month), [fading], "just under a month out");
+    assert_eq!(listed(Fading::OverMonth), none, "just under a month out");
+    assert_eq!(listed(Fading::Never), [kept]);
 }
 
 #[test]
