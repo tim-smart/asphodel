@@ -170,6 +170,23 @@ test("what recall leaves out comes after what it returns, saying it was past the
   assert.doesNotMatch(textOf(returned), /limit/i);
 });
 
+test("going back from a result's memory shows the same results where they were left", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: RECALL, token: TOKEN });
+  await explain(daemon, page.root);
+  const auckland = (await findResult(page.root, "auckland")).querySelector("a[href]");
+  page.window.scrollTo(0, 720);
+  click(auckland);
+  await findText(page.root, "Sam lives in Auckland (passage)");
+  page.window.scrollTo(0, 0);
+
+  page.window.history.back();
+
+  await findResult(page.root, "ada");
+  assert.equal((await findQuery(page.root)).value, QUERY);
+  await waitFor(() => page.window.scrollY === 720, "the results' scroll back where it was");
+});
+
 test("an injection explain sends the message and the previous turn, not the recall filters", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon, { hash: RECALL, token: TOKEN });

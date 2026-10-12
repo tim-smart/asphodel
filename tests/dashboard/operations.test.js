@@ -10,11 +10,13 @@ import {
   click,
   findButton,
   findDialog,
+  findLink,
   findRow,
   findText,
   open,
   queryButton,
   queryDialog,
+  queryLink,
   queryText,
   showsCount,
   stays,
@@ -84,6 +86,21 @@ test("failed chunks show their error and link their source, and retry puts one b
   assert.deepEqual(sent.body.chunks, [ids.chunkWork]);
   await waitFor(() => !queryText(page.root, "llm_timeout"), "the retried chunk to leave the list");
   assert.ok(queryText(page.root, "malformed"), "the other failure stays");
+});
+
+test("going back from a source to the ingestion page puts its scroll back", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: "#/banks/main/chunks", token: TOKEN });
+  const source = await findLink(page.root, /^source /);
+  page.window.scrollTo(0, 480);
+  click(source);
+  await waitFor(() => !page.window.location.hash.includes("chunks") && queryLink(page.root, "← Sources"), "the source's page");
+  page.window.scrollTo(0, 0);
+
+  page.window.history.back();
+
+  await findLink(page.root, /^source /);
+  await waitFor(() => page.window.scrollY === 480, "the ingestion page's scroll back where it was");
 });
 
 test("retry all puts every failed chunk back", async (t) => {

@@ -97,6 +97,54 @@ test("more memories load from the next page under the ones shown", async (t) => 
   assert.ok(queryText(page.root, sentences.auckland), "the first page stays");
 });
 
+test("going back from a memory returns to the memories list as it was left", async (t) => {
+  const daemon = new FakeDaemon();
+  daemon.state.pageSize = 4;
+  const page = await open(t, daemon, { hash: `${MEMORIES}?sort=fade`, token: TOKEN });
+  click(await findControl(page.root, /more/i));
+  const berlin = await findLink(page.root, sentences.berlin);
+  page.window.scrollTo(0, 640);
+  click(berlin);
+  await waitFor(() => page.window.location.hash.includes(ids.berlin) && queryLink(page.root, "← Memories"), "the memory's page");
+  page.window.scrollTo(0, 0);
+
+  click(await findLink(page.root, "← Memories"));
+
+  const opened = await findLink(page.root, sentences.berlin);
+  assert.equal((await findField(page.root, /sort/i)).value, "fade");
+  assert.equal(page.window.scrollY, 640);
+  assert.equal(page.document.activeElement, opened);
+});
+
+test("a memory reached from elsewhere goes back to the whole memories list", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: `${MEMORIES}?q=Auck`, token: TOKEN });
+  await findText(page.root, sentences.auckland);
+
+  click(await findLink(page.root, "Sources"));
+  click(await findLink(page.root, DOCUMENT));
+  click(await waitFor(() => page.root.querySelector(`a[href*="${ids.auckland}"]`), "a link to the memory its first chunk holds"));
+  await findText(page.root, "Sam lives in Auckland (passage)");
+  click(await findLink(page.root, "← Memories"));
+
+  await findText(page.root, sentences.wellington);
+});
+
+test("going back to the banks page puts its scroll back", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { token: TOKEN });
+  const bank = await findLink(page.root, /\bmain\b/);
+  page.window.scrollTo(0, 480);
+  click(bank);
+  await findText(page.root, sentences.auckland);
+  page.window.scrollTo(0, 0);
+
+  page.window.history.back();
+
+  await findLink(page.root, /\bmain\b/);
+  await waitFor(() => page.window.scrollY === 480, "the banks page's scroll back where it was");
+});
+
 test("a memory opens from the list with its passage and a link to its source", async (t) => {
   const daemon = new FakeDaemon();
   const page = await open(t, daemon, { hash: MEMORIES, token: TOKEN });
@@ -159,14 +207,18 @@ test("going back from a source returns to the sources list as it was left", asyn
   type(search, "ada");
   submit(search);
   await waitFor(() => !queryLink(page.root, DOCUMENT), "the list to narrow");
+  page.window.scrollTo(0, 640);
   click(await findLink(page.root, /session-1/));
   await findText(page.root, "My daughter Ada starts school next week.");
+  page.window.scrollTo(0, 0);
 
   click(await findLink(page.root, "← Sources"));
 
-  await findLink(page.root, /session-1/);
+  const opened = await findLink(page.root, /session-1/);
   await stays(() => !queryLink(page.root, DOCUMENT), "the list to stay narrowed to the search");
   assert.equal((await findField(page.root, /search/i)).value, "ada");
+  assert.equal(page.window.scrollY, 640);
+  assert.equal(page.document.activeElement, opened);
 });
 
 test("a source reached from elsewhere goes back to the whole sources list", async (t) => {

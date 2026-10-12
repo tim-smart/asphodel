@@ -34,6 +34,7 @@ export async function start(daemon, { hash = "#/", token } = {}) {
   });
   const window = dom.window;
   dialogs(window);
+  scrolling(window);
   const { mount } = await import(APP.href);
   let root = window.document.getElementById("app");
   let stop = mount(root, { fetch: daemon.fetch });
@@ -74,6 +75,18 @@ function dialogs(window) {
     if (value !== undefined) this.returnValue = value;
     this.removeAttribute("open");
     this.dispatchEvent(new window.Event("close"));
+  };
+}
+
+/// Gives jsdom's window the scroll position browsers have. jsdom keeps the
+/// document's `scrollTop` but leaves `scrollY` at 0 and has no `scrollTo`.
+function scrolling(window) {
+  const top = () => window.document.scrollingElement ?? window.document.documentElement;
+  for (const name of ["scrollY", "pageYOffset"]) {
+    Object.defineProperty(window, name, { configurable: true, get: () => top().scrollTop });
+  }
+  window.scrollTo = (x, y) => {
+    top().scrollTop = typeof x === "object" ? (x.top ?? top().scrollTop) : y;
   };
 }
 
