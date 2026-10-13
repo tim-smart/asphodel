@@ -413,8 +413,7 @@ Replay: `write_model` is now version 2, and its reply is `{"sections":
 [{"heading", "text"}], "cites": [...]}`. A `write_model` v1 record,
 sentence by sentence, can't stand in for a v2 write, so `--refresh
 recorded` finds nothing to substitute in a cassette recorded before this
-version, and the first replay of private history after upgrading needs
-one re-record of live refresh calls, which needs its own authorization.
+version. Re-record live refresh calls to use the new format.
 `--refresh recorded` now reuses a recorded answer only when every memory
 it cites is in the run's input, and otherwise skips the write. `--refresh
 off` skips every write rather than answering it with an empty reply.
@@ -471,8 +470,7 @@ write rather than skip.
 Replay substitutions require the current template version, so v3 to v6
 writes don't stand in for v7, and the seeded profile's question changed as
 well. `fast --refresh recorded` finds nothing to substitute until
-refreshes are recorded again under v7. Re-recording private history follows the
-evaluation policy.
+refreshes are recorded again under v7.
 
 ## Schema version 19: restatements
 
@@ -528,5 +526,3 @@ Replay substitutions require the current template version, so neither
 v1 nor v2 writes stand in for v3. To carry recorded answers over in
 `fast --refresh recorded`, use recordings made with v3 and this run's LLM
 model and language, with every cited memory present in the new input.
-Re-recording private history still requires authorization under the
-evaluation policy.

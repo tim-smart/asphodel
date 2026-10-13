@@ -8,8 +8,7 @@ models"), `docs/upgrading.md` (schema versions 14 to 16) and the module
 docs of `mental_models.rs`, `refresh.rs` and `system_prompt.rs`; this
 document doesn't repeat them.
 
-Decided by Tim Smart on 2026-10-04 (TIM-179). Shipped on 2026-10-05 in
-TIM-181 to TIM-186.
+Decided on 2026-10-04. Shipped on 2026-10-05.
 
 ## The question
 
@@ -103,19 +102,14 @@ and the date doesn't go stale in meaning. Cost 5 was accepted.
 
 | Decision | Shipped in |
 |---|---|
-| `used` by memory handle, entry snapshot removed | schema 14, TIM-181 |
-| One answer per model, `write_model` v2, whole-or-cut rendering, forget blanks | schema 15, TIM-182 |
-| Urgent refresh after a correction or forget | schema 16, TIM-183 |
-| Stale-state dates in the prose, in the fingerprint | `write_model` v3, TIM-184 |
-| `###` name, `Prompt:`, `Output:`, `####` facet headings | TIM-185 |
-| Operator docs, upgrade notes, replay notes | TIM-186 |
-| Significance in the write input and fingerprint, profile durability rule, reworded profile question | `write_model` v7, schema 18, TIM-193 |
+| `used` by memory handle, entry snapshot removed | schema 14 |
+| One answer per model, `write_model` v2, whole-or-cut rendering, forget blanks | schema 15 |
+| Urgent refresh after a correction or forget | schema 16 |
+| Stale-state dates in the prose, in the fingerprint | `write_model` v3 |
+| `###` name, `Prompt:`, `Output:`, `####` facet headings | System prompt rendering |
+| Operator docs, upgrade notes, replay notes | Documentation |
+| Significance in the write input and fingerprint, profile durability rule, reworded profile question | `write_model` v7, schema 18 |
 
-Still open after TIM-186: no `write_model` v2 or v3 cassettes were
-recorded for the scenarios under `scenarios/`, which run against the
-scripted LLM instead. Recording against private history follows
-`AGENTS.md`: it's routed through Mac Developer, stays within the standing
-authorization's backend, auth, model and reasoning boundary, keeps every
-private artifact inside `ASPHODEL_REPLAY_DIR`, and any evaluation decision
-drawn from it waits on the independent review that file requires. This is
-a validation gap, not a design one.
+The scenarios under `scenarios/` run against the scripted LLM rather
+than recorded `write_model` v2 or v3 cassettes. This is a validation gap,
+not a design one.

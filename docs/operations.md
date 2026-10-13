@@ -219,12 +219,8 @@ Every key in it is optional except three kinds:
   Like the floors, the relevance scale is keyed by the exact model string,
   quantisation included, with no fallback.
 
-The deploy and evaluation examples use a raw-logit injection floor of
-`-8.0` for `ms-marco-MiniLM-L-6-v2:int8`, as recommended in TIM-131 from
-10 labelled prefetches. It keeps over half the relevant memories; higher
-floors roughly halve those kept for little precision gain, while the token
-budget still caps injection. Live-run injected-token counts and probes
-p02/p04 remain to be accepted. The relevance scale stays `3.564211`.
+The deploy examples use a raw-logit injection floor of `-8.0` for
+`ms-marco-MiniLM-L-6-v2:int8` and a relevance scale of `3.564211`.
 These are configuration values, not built-in defaults: floors and scales
 must still be supplied for the exact model id.
 
@@ -346,22 +342,15 @@ inputs. They're meant for replay `--overrides` comparisons, not production.
 `[reconcile] promotion_gap` (default 2, from 1 to 4) is how many
 significance levels a newer claim must be above a memory call 2 labels it
 a repeat of for the claim to become the memory's refinement instead of an
-access on it. A smaller gap raises the memory's significance. The default
-was chosen after an independently reviewed evaluation on private history
-(TIM-192) as the less risky value, not a measured improvement: a gap of 1
-made 16 replacements to a gap of 2's 1, with no measured gain. With the
-shipped call 2 prompt, a gap of 2 made 1 and 3 replacements in two samples
-of the same history. Recovering the relationship that motivated the guard
-isn't measured: a claim one level above the memory that absorbed it is
-still absorbed at a gap of 2. Compare values with replay `--overrides` and
-`call2_rate.promoted`.
+access on it. A smaller gap raises the memory's significance. Compare values
+with replay `--overrides` and `call2_rate.promoted`.
 
 `[reconcile] kind_guard` (default true) rejects a refinement, call 2's or a
 promoted repeat's, between memories of kinds the containment policy treats
 as incompatible: any two different kinds, except a task or recurring claim
 refining a task. The memory is left as it was, and the claim is a new
-memory only if no other accepted label decides its fate. It contains the cross-kind merges seen on private history (TIM-196);
-it doesn't catch one preference merged into another. Turning it off is for
+memory only if no other accepted label decides its fate. It doesn't catch
+one preference merged into another. Turning it off is for
 replay `--overrides` comparisons: `call2_rate.refines_across_kinds` counts
 the pairs either way, `call2_rate.refines_rejected` only those rejected.
 Neither counts a refinement another guard already drops (`docs/replay.md`,
@@ -855,9 +844,7 @@ the right checksum and resumes after a failure (`docs/models.md`).
 
 `asphodel import`, `replay`, `report` and `bench` belong to the replay
 harness, which runs on its own store under `ASPHODEL_REPLAY_DIR` and never
-touches a `serve` data dir. `docs/replay.md` covers them, and
-`docs/hermes-data-evaluation.md` walks through an evaluation on real
-history.
+touches a `serve` data dir. `docs/replay.md` covers them.
 
 ## Backup
 
