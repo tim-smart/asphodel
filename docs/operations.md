@@ -398,7 +398,15 @@ with no token configured needs no token; the example's does.
 
 ### Installing the plugin
 
-Copy `plugin/` into `$HERMES_HOME/plugins/asphodel/`. Hermes finds it there
+Install the plugin from its GitHub subdirectory:
+
+```sh
+hermes plugins install https://github.com/tim-smart/asphodel/tree/main/plugin --enable
+```
+
+Review and accept Hermes' prompts for this custom plugin source. Hermes
+uses the manifest's name (`asphodel`) and installs it into
+`$HERMES_HOME/plugins/asphodel/`. Hermes finds it there
 because `__init__.py` names `register_memory_provider`, and it survives
 Hermes updates because the plugin declares no Python dependencies. Use the
 plugin from the same release as the daemon: the plugin warns at
