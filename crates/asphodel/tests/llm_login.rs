@@ -1,23 +1,26 @@
-//! `asphodel llm login` and `asphodel serve` in `chatgpt` mode, run as a
-//! process.
+//! `asphodel llm login`, the setup wizard's login, and `asphodel serve` in
+//! `chatgpt` mode, run as a process.
 //!
-//! The owner logs in once with the device-code flow; the daemon reads the
-//! token file under the data dir and refreshes it itself. These tests see
-//! only what an operator sees: flags, exit codes, stderr, stdout and
-//! `GET /v1/config`.
+//! The owner logs in once with the device-code flow, from the CLI or from
+//! the setup wizard; the daemon reads the token file under the data dir and
+//! refreshes it itself. These tests see only what an operator sees: flags,
+//! exit codes, stderr, stdout and the HTTP API.
 //!
 //! The login talks to the issuer over HTTPS. To test the command without
 //! the network, a hidden `ASPHODEL_LLM_ISSUER` variable, environment only
 //! and never in `--help`, points the flow at a loopback stub, in the same
-//! spirit as `ASPHODEL_MODELS=fake`.
+//! spirit as `ASPHODEL_MODELS=fake`. `ASPHODEL_LLM_LOGIN_WAIT_MS`, also
+//! hidden, shortens how long the daemon waits for approval, so an expired
+//! login doesn't take 15 minutes.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -104,8 +107,24 @@ impl Drop for Daemon {
 impl Daemon {
     /// `GET <path>`: the status and the body.
     fn get(&self, path: &str) -> std::io::Result<(u16, String)> {
+        self.request("GET", path, None)
+    }
+
+    /// `<method> <path>` with a JSON body if given: the status and the body.
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> std::io::Result<(u16, String)> {
         let mut stream = TcpStream::connect(&self.addr)?;
-        write!(stream, "GET {path} HTTP/1.0\r\n\r\n")?;
+        let body = body.map_or(String::new(), Value::to_string);
+        write!(
+            stream,
+            "{method} {path} HTTP/1.0\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
         let (head, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
@@ -113,11 +132,56 @@ impl Daemon {
         Ok((status.unwrap_or(0), body.to_string()))
     }
 
+    /// [`Daemon::request`] with the body read as JSON.
+    fn send(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
+        let (status, body) = self.request(method, path, body).unwrap();
+        (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+    }
+
     /// `GET /v1/config`, which must answer 200.
     fn config(&self) -> Value {
         let (status, body) = self.get("/v1/config").unwrap();
         assert_eq!(status, 200, "{body}");
         serde_json::from_str(&body).unwrap()
+    }
+
+    /// `GET` [`LOGIN`], which must answer 200.
+    fn login(&self) -> Value {
+        let (status, body) = self.send("GET", LOGIN, None);
+        assert_eq!(status, 200, "{body}");
+        body
+    }
+
+    /// Polls [`LOGIN`] until the login is in `state`, and returns it.
+    fn wait_login(&mut self, state: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let login = self.login();
+            if login["state"] == state {
+                return login;
+            }
+            if Instant::now() >= deadline {
+                panic!("the login never became {state}: {login}\n{}", self.log());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Waits until `/v1/health` says the daemon is ready, not just set up.
+    /// It answers 503 while the store opens after setup.
+    fn wait_ready(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ready = |daemon: &Self| {
+            daemon
+                .get("/v1/health")
+                .is_ok_and(|(status, body)| status == 200 && body.contains("\"ready\":true"))
+        };
+        while !ready(self) {
+            if Instant::now() >= deadline {
+                panic!("the daemon never became ready:\n{}", self.log());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Kills the daemon and returns its whole log.
@@ -144,12 +208,35 @@ fn serve(dir: &TestDir, data: &Path, listen: &str) -> Command {
 /// Starts [`serve`] on a free loopback port with `issuer` as the issuer,
 /// and waits until `/v1/health` answers 200.
 fn start(dir: &TestDir, data: &Path, issuer: &str) -> Daemon {
+    launch(|listen| serve(dir, data, listen), issuer)
+}
+
+/// Starts `asphodel serve` on `data` with no tuning file, so it waits for
+/// first-run setup, with `issuer` as the issuer and `env` set.
+fn start_setup(data: &Path, issuer: &str, env: &[(&str, &str)]) -> Daemon {
+    launch(
+        |listen| {
+            let mut command = asphodel(&["serve", "--data-dir"]);
+            command
+                .arg(data)
+                .args(["--listen", listen])
+                .env("ASPHODEL_MODELS", "fake")
+                .envs(env.iter().copied());
+            command
+        },
+        issuer,
+    )
+}
+
+/// Runs the daemon `command` makes for a free loopback port, with `issuer`
+/// as the issuer, and waits until `/v1/health` answers 200.
+fn launch(command: impl FnOnce(&str) -> Command, issuer: &str) -> Daemon {
     let addr = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap();
     let addr = addr.to_string();
-    let mut child = serve(dir, data, &addr)
+    let mut child = command(&addr)
         .env("ASPHODEL_LOG", "trace")
         .env("ASPHODEL_LLM_ISSUER", issuer)
         .stdin(Stdio::null())
@@ -199,66 +286,127 @@ fn jwt(claims: Value) -> String {
     format!("{header}.{payload}.{}", base64url(b"signature"))
 }
 
+/// How the stub issuer answers a poll for a device code.
+#[derive(Debug, Clone, Copy)]
+enum Poll {
+    /// 403, as the issuer answers until the owner approves.
+    Pending,
+    Approved,
+    /// 400: the issuer won't take the code.
+    Refused,
+}
+
 /// Starts a loopback issuer (usercode, two pending polls, approval,
 /// exchange) and returns its URL.
 fn issuer() -> String {
+    stub_issuer(|_, poll| {
+        if poll <= 2 {
+            Poll::Pending
+        } else {
+            Poll::Approved
+        }
+    })
+}
+
+/// Starts a loopback issuer and returns its URL. The `n`th code it hands
+/// out (from 1) is `ABCD-000n`, and `poll(n, p)` answers the `p`th poll for
+/// it (from 1).
+fn stub_issuer(poll: impl Fn(usize, usize) -> Poll + Send + Sync + 'static) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let polls = Arc::new(AtomicUsize::new(0));
+    let issuer = Arc::new(Issuer {
+        poll: Box::new(poll),
+        codes: AtomicUsize::new(0),
+        polls: Mutex::new(HashMap::new()),
+    });
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
-            let polls = Arc::clone(&polls);
-            std::thread::spawn(move || answer(stream, &polls));
+            let issuer = Arc::clone(&issuer);
+            std::thread::spawn(move || issuer.answer(stream));
         }
     });
     url
 }
 
-fn answer(mut stream: TcpStream, polls: &AtomicUsize) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let lines = reader.by_ref().lines().map_while(Result::ok);
-    let head: Vec<String> = lines.take_while(|line| !line.is_empty()).collect();
-    let Some(path) = head.first().and_then(|line| line.split_whitespace().nth(1)) else {
-        return;
-    };
-    let length = head.iter().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        key.eq_ignore_ascii_case("content-length")
-            .then(|| value.trim().parse().ok())?
-    });
-    reader
-        .read_exact(&mut vec![0; length.unwrap_or(0)])
-        .unwrap();
-    let (status, body) = match path {
-        "/api/accounts/deviceauth/usercode" => (
-            200,
-            json!({"device_auth_id": "dev_123", "user_code": "ABCD-EFGH", "interval": "0"}),
-        ),
-        "/api/accounts/deviceauth/token" if polls.fetch_add(1, Ordering::SeqCst) < 2 => {
-            (403, json!({}))
-        }
-        "/api/accounts/deviceauth/token" => (
-            200,
-            json!({"authorization_code": "code_9", "code_challenge": "chal", "code_verifier": "verif"}),
-        ),
-        "/oauth/token" => (
-            200,
-            json!({
-                "id_token": jwt(json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acct_7f3a9c"}})),
-                "access_token": jwt(json!({"sub": "first", "exp": 4_102_444_800i64})),
-                "refresh_token": "rt-first"
-            }),
-        ),
-        _ => (404, json!({})),
-    };
-    let body = body.to_string();
-    let _ = write!(
-        stream,
-        "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+struct Issuer {
+    poll: Box<dyn Fn(usize, usize) -> Poll + Send + Sync>,
+    /// Codes handed out so far.
+    codes: AtomicUsize,
+    /// Polls so far for each code.
+    polls: Mutex<HashMap<usize, usize>>,
 }
+
+impl Issuer {
+    fn answer(&self, mut stream: TcpStream) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let lines = reader.by_ref().lines().map_while(Result::ok);
+        let head: Vec<String> = lines.take_while(|line| !line.is_empty()).collect();
+        let Some(path) = head.first().and_then(|line| line.split_whitespace().nth(1)) else {
+            return;
+        };
+        let length = head.iter().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
+        });
+        let mut body = vec![0; length.unwrap_or(0)];
+        reader.read_exact(&mut body).unwrap();
+        let (status, body) = match path {
+            "/api/accounts/deviceauth/usercode" => {
+                let n = self.codes.fetch_add(1, Ordering::SeqCst) + 1;
+                (
+                    200,
+                    json!({"device_auth_id": format!("dev_{n}"), "user_code": format!("ABCD-{n:04}"), "interval": "0"}),
+                )
+            }
+            "/api/accounts/deviceauth/token" => {
+                let sent: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let n = sent["device_auth_id"]
+                    .as_str()
+                    .and_then(|id| id.strip_prefix("dev_"))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                let polls = {
+                    let mut polls = self.polls.lock().unwrap();
+                    let count = polls.entry(n).or_insert(0);
+                    *count += 1;
+                    *count
+                };
+                match (self.poll)(n, polls) {
+                    Poll::Pending => {
+                        // The daemon polls without a pause at interval 0.
+                        std::thread::sleep(Duration::from_millis(20));
+                        (403, json!({}))
+                    }
+                    Poll::Refused => (400, json!({})),
+                    Poll::Approved => (
+                        200,
+                        json!({"authorization_code": "code_9", "code_challenge": "chal", "code_verifier": "verif"}),
+                    ),
+                }
+            }
+            "/oauth/token" => (
+                200,
+                json!({
+                    "id_token": jwt(json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acct_7f3a9c"}})),
+                    "access_token": jwt(json!({"sub": "first", "exp": 4_102_444_800i64})),
+                    "refresh_token": "rt-first"
+                }),
+            ),
+            _ => (404, json!({})),
+        };
+        let body = body.to_string();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    }
+}
+
+/// The wizard's ChatGPT login: `POST` starts one, `GET` reads its state.
+const LOGIN: &str = "/v1/setup/llm-login";
 
 #[test]
 fn a_login_writes_a_private_token_file_the_daemon_reads_and_never_shows_a_token() {
@@ -281,7 +429,7 @@ fn a_login_writes_a_private_token_file_the_daemon_reads_and_never_shows_a_token(
     assert!(output.status.success(), "{}", stderr(&output));
     let shown = String::from_utf8_lossy(&output.stdout).into_owned() + &stderr(&output);
     assert!(shown.contains(&format!("{issuer}/codex/device")), "{shown}");
-    assert!(shown.contains("ABCD-EFGH"), "{shown}");
+    assert!(shown.contains("ABCD-0001"), "{shown}");
     let mode = std::fs::metadata(&token_file).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
 
@@ -333,4 +481,82 @@ fn serve_refuses_a_key_together_with_chatgpt_mode() {
     let stderr = stderr(&output);
     assert!(stderr.contains("ASPHODEL_LLM_API_KEY"), "{stderr}");
     assert!(!stderr.contains("41b2e8"), "{stderr}");
+}
+
+#[test]
+fn the_setup_wizard_logs_in_and_the_running_daemon_uses_the_login() {
+    // The wizard starts the login before setup is finished, and finishing
+    // doesn't wait for it. Its state stays readable afterwards, and once the
+    // owner approves, the running daemon is logged in without a restart.
+    // Starting again while a login waits hands back the same code, so a
+    // reloaded wizard can show it; once setup is done, only
+    // `asphodel llm login` starts one. No token is ever shown or logged.
+    let approved = Arc::new(AtomicBool::new(false));
+    let issuer = stub_issuer({
+        let approved = Arc::clone(&approved);
+        move |_, _| match approved.load(Ordering::SeqCst) {
+            true => Poll::Approved,
+            false => Poll::Pending,
+        }
+    });
+    let dir = TestDir::new();
+    let mut daemon = start_setup(&dir.data(), &issuer, &[]);
+    assert_eq!(daemon.login()["state"], "none");
+
+    let (status, started) = daemon.send("POST", LOGIN, None);
+    assert_eq!(status, 200, "{started}");
+    assert_eq!(started["state"], "pending");
+    assert_eq!(
+        started["verification_url"],
+        format!("{issuer}/codex/device")
+    );
+    assert_eq!(started["user_code"], "ABCD-0001");
+    assert_eq!(daemon.send("POST", LOGIN, None), (200, started.clone()));
+
+    let chatgpt = json!({"llm": {"auth": "chatgpt", "model": "gpt-5.1"}});
+    let (status, done) = daemon.send("POST", "/v1/setup", Some(&chatgpt));
+    assert_eq!(status, 200, "{done}");
+    daemon.wait_ready();
+    assert_eq!(daemon.login()["state"], "pending");
+    assert_eq!(daemon.config()["llm"]["logged_in"], false);
+
+    approved.store(true, Ordering::SeqCst);
+    let login = daemon.wait_login("done");
+    let config = daemon.config();
+    assert_eq!(config["llm"]["logged_in"], true, "{config}");
+    assert_eq!(daemon.send("POST", LOGIN, None).0, 409);
+
+    let everywhere = format!("{started}\n{login}\n{config}\n{}", daemon.log());
+    for forbidden in ["rt-first", "eyJ", "acct_7f3a9c"] {
+        assert!(
+            !everywhere.contains(forbidden),
+            "{forbidden}:\n{everywhere}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_or_expired_wizard_login_is_shown_and_can_be_retried() {
+    // The issuer refuses the first code, nobody approves the second before
+    // the wait runs out, and the third goes through. Each retry is a new
+    // code, and a failure says why.
+    let issuer = stub_issuer(|code, _| match code {
+        1 => Poll::Refused,
+        2 => Poll::Pending,
+        _ => Poll::Approved,
+    });
+    let dir = TestDir::new();
+    let wait = [("ASPHODEL_LLM_LOGIN_WAIT_MS", "200")];
+    let mut daemon = start_setup(&dir.data(), &issuer, &wait);
+    let mut codes = Vec::new();
+    for state in ["failed", "expired", "done"] {
+        let (status, started) = daemon.send("POST", LOGIN, None);
+        assert_eq!(status, 200, "{started}");
+        codes.push(started["user_code"].clone());
+        let login = daemon.wait_login(state);
+        if state == "failed" {
+            assert!(login["error"].is_string(), "{login}");
+        }
+    }
+    assert_eq!(codes, ["ABCD-0001", "ABCD-0002", "ABCD-0003"]);
 }
