@@ -8,7 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { FakeDaemon, SETUP_TOKEN, UNCALIBRATED, VERIFICATION_URL } from "./fake-daemon.js";
-import { click, findButton, findField, findLink, findText, open, submit, type, waitFor } from "./support.js";
+import { click, findButton, findField, findLink, findText, open, queryButton, submit, type, waitFor } from "./support.js";
 
 const BANK = /\bmain\b/;
 const LOGIN = "/v1/setup/llm-login";
@@ -82,8 +82,13 @@ test("a failed or expired ChatGPT login is shown and can be retried with a new c
   const page = await open(t, daemon);
   const retry = /log in|try again|retry/i;
 
+  // The issuer hands out no code at all.
+  daemon.refuseLoginStart("the issuer handed out no code");
   await chooseChatgpt(page);
   click(await findButton(page.root, /^log in/i));
+  await findText(page.root, "the issuer handed out no code");
+
+  click(await findButton(page.root, retry));
   await findLoginCode(page.root, "ABCD-0001");
   daemon.failLogin("the issuer refused the device code");
   await findText(page.root, "the issuer refused the device code");
@@ -97,7 +102,25 @@ test("a failed or expired ChatGPT login is shown and can be retried with a new c
   await findLoginCode(page.root, "ABCD-0003");
   daemon.approveLogin();
   await findText(page.root, /logged in/i);
-  assert.equal(daemon.calls("POST", LOGIN).length, 3);
+  assert.equal(daemon.calls("POST", LOGIN).length, 4);
+});
+
+test("a ChatGPT login that runs out after setup points to the CLI, since the daemon starts no new one", async (t) => {
+  const daemon = new FakeDaemon({ setup: true });
+  const page = await open(t, daemon);
+
+  await chooseChatgpt(page);
+  click(await findButton(page.root, /^log in/i));
+  await findLoginCode(page.root, "ABCD-0001");
+  type(await findField(page.root, /^model/i), "model-under-test");
+  click(await findButton(page.root, /finish setup/i));
+  await findField(page.root, /bearer token/i);
+
+  daemon.expireLogin();
+  await findText(page.root, /expired/i);
+  await findText(page.root, "asphodel llm login --data-dir /data");
+  assert.equal(queryButton(page.root, /log in|try again|retry/i), null);
+  assert.equal(daemon.calls("POST", LOGIN).length, 1);
 });
 
 test("setting the LLM up later sends none", async (t) => {

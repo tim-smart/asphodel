@@ -589,6 +589,12 @@ export class FakeDaemon {
     this.settleLogin({ state: "failed", error });
   }
 
+  /// The issuer hands out no code for the next login: its `POST` answers
+  /// 502 with `error`, and the login has failed.
+  refuseLoginStart(error) {
+    this.login.refuseStart = error;
+  }
+
   settleLogin(outcome) {
     if (this.login.state !== "pending") throw new Error(`no login is pending: it is ${this.login.state}`);
     this.login = { ...outcome, codes: this.login.codes };
@@ -685,6 +691,11 @@ export class FakeDaemon {
     if (method === "GET") return json(200, why === undefined ? { state } : { state, error: why });
     if (method !== "POST") return error(405, "method not allowed");
     if (!this.settingUp) return error(409, "setup is done; to log in again, run `asphodel llm login`");
+    if (state !== "pending" && this.login.refuseStart !== undefined) {
+      const refused = this.login.refuseStart;
+      this.login = { state: "failed", error: refused, codes: this.login.codes };
+      return error(502, refused);
+    }
     if (state !== "pending") {
       const codes = this.login.codes + 1;
       this.login = { state: "pending", codes, code: `ABCD-${String(codes).padStart(4, "0")}` };
