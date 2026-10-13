@@ -71,7 +71,7 @@ latency = "0s"                  # optional; the default
 [bank]                          # optional; every field is
 name = "main"
 timezone = "Pacific/Auckland"   # the bank's default timezone; "UTC" when absent
-owner = "Tim"
+owner = "Alex"
 assistant = "Hermes"
 owner_platform_ids = ["discord:1234"]
 
@@ -90,7 +90,7 @@ used = []                       # labels of memories the reply relied on
 
 [[turn.claim]]
 label = "maya"                  # how probes and later outcomes name the memory
-content = "Tim's sister is called Maya."
+content = "Alex's sister is called Maya."
 quote = "My sister is called Maya"
 kind = "fact"
 significance = "minor"
@@ -514,7 +514,7 @@ purges for the nightly sweep.
 
 ## Real history
 
-Tim's whole Hermes history replays privately. Everything derived from it lives under
+Hermes history replays privately. Everything derived from it lives under
 `ASPHODEL_REPLAY_DIR` and is refused anywhere else: the `state.db` copy, the
 manifest, the corpus, the cassettes, the replayed store with its recall
 log, the probes file, the reports and their pages, and the labelling
@@ -524,9 +524,6 @@ workspaces tree.
 
 A `live` run sends the history to the LLM endpoint `--config` names, as
 production already does. A hosted endpoint sees it.
-
-`docs/hermes-data-evaluation.md` is the step-by-step handoff for running
-this on Tim's history, with what to measure and how to report it.
 
 Errors hold no content (`docs/logging.md`). A manifest, probes file,
 corpus or cassette that doesn't parse is named with the line and column,
@@ -791,9 +788,7 @@ or metadata values. Kind keys are restricted to `fact`, `preference`,
 `event`, `state`, `task` and `recurring`; arbitrary response strings cannot
 escape through the report.
 
-This measures count and kind agreement, not semantic equivalence. Route
-Hermes comparisons to Mac Developer where the private corpus and cassettes
-live, following the [evaluation policy](hermes-data-evaluation.md#who-does-what).
+This measures count and kind agreement, not semantic equivalence.
 
 ### Report diff
 
@@ -822,9 +817,7 @@ dir, and neither may be a symlink.
 ### Labelling and the precision curve
 
 The two calibrated floors, the reranker gate floor and the
-reconcile similarity floor, are set from accepted labels, not by eye. For
-Hermes evaluations, follow the [evaluation policy](hermes-data-evaluation.md#who-does-what)
-for independent Fable review and pending-decision rules.
+reconcile similarity floor, are set from accepted labels, not by eye.
 `asphodel replay --corpus ... --labelling <file>` writes the material to
 label, inside the private dir. Writing it changes
 nothing the run simulates, and the same run writes the same bytes.
@@ -1081,7 +1074,7 @@ copied as they were, and so are the refresh samples unless
 queries. The file is TOML, a table of facet heading to query:
 
 ```toml
-"People" = "Who are the important people in Tim's life?"
+"People" = "Who are the important people in the user's life?"
 ```
 
 Every refresh sample whose `facet` has that heading, of any model, is
