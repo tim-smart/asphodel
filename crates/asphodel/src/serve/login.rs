@@ -13,7 +13,8 @@
 //! and `asphodel llm login` is the way to log in again. A login in flight
 //! outlives setup, and `GET` keeps answering without a token. It never
 //! shows the code: after setup, a reader who could approve it with their
-//! own account would have the daemon send memories there.
+//! own account would have the daemon send memories there. A login in
+//! flight stops with the daemon, so shutdown never waits for the owner.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -21,8 +22,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use asphodel_core::Clock;
+use asphodel_core::clock::StopSleeper;
 use asphodel_core::models::{
-    AUTH_ISSUER, DeviceCode, LoginError, TokenStore, device_code_login, device_code_login_within,
+    AUTH_ISSUER, DeviceCode, LOGIN_WAIT, LoginError, TokenStore, device_code_login_within,
 };
 use axum::Json;
 use axum::extract::State;
@@ -43,9 +45,11 @@ pub(crate) const LLM_LOGIN_WAIT_ENV: &str = "ASPHODEL_LLM_LOGIN_WAIT_MS";
 pub(crate) struct Login {
     data_dir: PathBuf,
     issuer: String,
-    /// `None` waits as long as `asphodel llm login` does.
-    wait: Option<Duration>,
+    /// How long a login waits for approval.
+    wait: Duration,
     clock: Arc<dyn Clock>,
+    /// What a login waits on between polls; stopped with the daemon.
+    sleeper: StopSleeper,
     state: Mutex<Phase>,
     /// Held while a login starts, so two requests can't start two.
     starting: tokio::sync::Mutex<()>,
@@ -67,7 +71,7 @@ impl Login {
         let issuer =
             std::env::var(crate::cli::LLM_ISSUER_ENV).unwrap_or_else(|_| AUTH_ISSUER.to_string());
         let wait = match std::env::var_os(LLM_LOGIN_WAIT_ENV) {
-            None => None,
+            None => LOGIN_WAIT,
             Some(value) => {
                 let wait = value
                     .to_str()
@@ -77,7 +81,7 @@ impl Login {
                         format!("{LLM_LOGIN_WAIT_ENV} isn't a whole number of milliseconds")
                     })?;
                 warn!("{LLM_LOGIN_WAIT_ENV} is set: a login waits {wait:?} for approval");
-                Some(wait)
+                wait
             }
         };
         Ok(Self {
@@ -85,9 +89,15 @@ impl Login {
             issuer,
             wait,
             clock,
+            sleeper: StopSleeper::default(),
             state: Mutex::new(Phase::None),
             starting: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Stops a login in flight, and any started later, at its next poll.
+    pub(crate) fn stop(&self) {
+        self.sleeper.stop();
     }
 
     fn phase(&self) -> Phase {
@@ -115,15 +125,22 @@ impl Login {
                 let _ = shown.send(code.clone());
             }
         };
-        let clock = self.clock.as_ref();
-        let result = match self.wait {
-            Some(wait) => device_code_login_within(&self.issuer, &store, clock, wait, &mut show),
-            None => device_code_login(&self.issuer, &store, clock, &mut show),
-        };
+        let result = device_code_login_within(
+            &self.issuer,
+            &store,
+            self.clock.as_ref(),
+            self.wait,
+            &self.sleeper,
+            &mut show,
+        );
         match result {
             Ok(_) => {
                 info!(token_file = %store.path().display(), "the wizard's login is done");
                 self.set(Phase::Done);
+            }
+            Err(LoginError::Stopped) => {
+                info!("the wizard's login stopped with the daemon");
+                self.set(Phase::Failed(LoginError::Stopped.to_string()));
             }
             Err(LoginError::Expired) => {
                 warn!("the wizard's login wasn't approved in time");

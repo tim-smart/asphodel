@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, LlmSettings, LlmUsage, unfence};
-use crate::clock::Clock;
+use crate::clock::{Clock, Sleeper, ThreadSleeper};
 use crate::config::{LlmAuth, Secret};
 
 /// The Codex backend: the default endpoint in `chatgpt` mode. `llm.endpoint`
@@ -55,7 +55,7 @@ pub const REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 const REFRESH_AFTER: Duration = Duration::from_secs(8 * 24 * 60 * 60);
 
 /// How long a login waits for the owner's approval.
-const LOGIN_WAIT: Duration = Duration::from_secs(15 * 60);
+pub const LOGIN_WAIT: Duration = Duration::from_secs(15 * 60);
 
 /// Per-request timeout for the issuer.
 const ISSUER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -395,6 +395,9 @@ pub enum LoginError {
     #[error("the login wasn't approved in time")]
     Expired,
 
+    #[error("the login stopped before it was approved")]
+    Stopped,
+
     #[error("the issuer's reply couldn't be read at {step}")]
     InvalidReply { step: &'static str },
 
@@ -455,16 +458,20 @@ pub fn device_code_login(
     clock: &dyn Clock,
     show: &mut dyn FnMut(&DeviceCode),
 ) -> Result<ChatgptTokens, LoginError> {
-    device_code_login_within(issuer, store, clock, LOGIN_WAIT, show)
+    device_code_login_within(issuer, store, clock, LOGIN_WAIT, &ThreadSleeper, show)
 }
 
 /// [`device_code_login`], giving up with [`LoginError::Expired`] once the
-/// owner hasn't approved within `wait` instead of 15 minutes.
+/// owner hasn't approved within `wait` instead of [`LOGIN_WAIT`]. It waits
+/// between polls on `sleeper`, and gives up with [`LoginError::Stopped`]
+/// once that is stopped, so a daemon shutting down doesn't wait for the
+/// owner.
 pub fn device_code_login_within(
     issuer: &str,
     store: &TokenStore,
     clock: &dyn Clock,
     wait: Duration,
+    sleeper: &dyn Sleeper,
     show: &mut dyn FnMut(&DeviceCode),
 ) -> Result<ChatgptTokens, LoginError> {
     let base = issuer.trim_end_matches('/');
@@ -520,7 +527,10 @@ pub fn device_code_login_within(
             if started.elapsed() >= wait {
                 return Err(LoginError::Expired);
             }
-            std::thread::sleep(code.interval);
+            sleeper.sleep(code.interval);
+            if sleeper.stopped() {
+                return Err(LoginError::Stopped);
+            }
             continue;
         }
         return Err(LoginError::Status { status, step });

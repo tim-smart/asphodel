@@ -195,6 +195,17 @@ pub(crate) async fn run_with(
         stop: stop.clone(),
     });
 
+    // A login waiting for the owner's approval gives up on the stop, so
+    // shutdown doesn't wait for it.
+    tokio::spawn({
+        let app = Arc::clone(&app);
+        let stop = stop.clone();
+        async move {
+            stopped(stop).await;
+            app.login.stop();
+        }
+    });
+
     let (bound, address) = bind(&args.listen).await?;
     info!(
         version = asphodel_core::VERSION,
