@@ -106,12 +106,23 @@ dashboard to write the configuration:
    example, that means adding it to the `asphodel` secret and restarting
    the pod.
 
-For a ChatGPT subscription, log in once setup is done:
+For a ChatGPT subscription, the wizard logs the daemon in. Click **Log in
+to ChatGPT**, open the link it shows and enter the code there. You don't
+have to wait for the approval: **Finish setup** works while the login is
+pending, and the next screen keeps following it. The daemon picks the
+tokens up on its next call, without a restart. An expired or failed login
+shows in the wizard, with **Try again** for a new code. Reloading the page
+during setup and choosing ChatGPT again shows the pending login's code.
+
+Once setup is done, the dashboard can't start a login. To log in again,
+or if the login didn't finish, use the CLI:
 `kubectl exec -it hermes-0 -c asphodel -- asphodel llm login --data-dir /data`.
 
 **Setup isn't protected.** Anyone who can reach an unconfigured daemon's
 port can complete setup. They choose its LLM, which decides where memory
-content is sent, and they get the bearer token setup creates. Keep the
+content is sent, and they get the bearer token setup creates. Starting a
+ChatGPT login (`POST /v1/setup/llm-login`) is open in the same way, and
+only while setup waits. Keep the
 daemon private until setup is done:
 
 - Run setup through `kubectl port-forward` or on the daemon's own machine,
@@ -124,8 +135,10 @@ daemon private until setup is done:
 - To skip setup, give the daemon a tuning file with `--config`, or put
   `asphodel.toml` in the data dir before its first start.
 
-Setup runs once. After that, `POST /v1/setup` returns 409, every other
-route needs the token if one is configured, and you change settings by
+Setup runs once. After that, `POST /v1/setup` and
+`POST /v1/setup/llm-login` return 409. `GET /v1/setup/llm-login` keeps
+answering without a token, with the login's state but never its code.
+Every other route needs the token if one is configured, and you change settings by
 editing the files and restarting. If someone else completed setup before
 you did, stop the daemon, delete `asphodel.toml` and `secrets.toml` from
 the data dir, and start it again.

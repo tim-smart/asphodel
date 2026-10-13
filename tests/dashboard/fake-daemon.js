@@ -11,6 +11,9 @@ export const NOW = "2026-10-03T09:00:00Z";
 /// The token setup makes.
 export const SETUP_TOKEN = "token-setup-made";
 
+/// Where the issuer sends the owner to enter a login's code.
+export const VERIFICATION_URL = "https://auth.openai.com/codex/device";
+
 /// The placeholder floor a daemon waiting for setup warns about.
 export const UNCALIBRATED = 'reconcile.embedding_floors."bge-small-en-v1.5:int8" = 0.8';
 
@@ -567,6 +570,34 @@ export class FakeDaemon {
     this.fetch = this.fetch.bind(this);
     // A refresh answers once this settles; see `holdRefreshes`.
     this.refreshGate = null;
+    // The wizard's ChatGPT login; see `approveLogin` and friends.
+    this.login = { state: "none", codes: 0 };
+  }
+
+  /// The issuer approves the pending login: the daemon has its tokens.
+  approveLogin() {
+    this.settleLogin({ state: "done" });
+  }
+
+  /// The pending login runs out of time before anyone approves it.
+  expireLogin() {
+    this.settleLogin({ state: "expired" });
+  }
+
+  /// The issuer refuses the pending login with `error`.
+  failLogin(error) {
+    this.settleLogin({ state: "failed", error });
+  }
+
+  /// The issuer hands out no code for the next login: its `POST` answers
+  /// 502 with `error`, and the login has failed.
+  refuseLoginStart(error) {
+    this.login.refuseStart = error;
+  }
+
+  settleLogin(outcome) {
+    if (this.login.state !== "pending") throw new Error(`no login is pending: it is ${this.login.state}`);
+    this.login = { ...outcome, codes: this.login.codes };
   }
 
   /// Keeps every refresh from answering until the returned function is
@@ -617,6 +648,7 @@ export class FakeDaemon {
       return json(200, { version: "0.1.0", ready: !this.settingUp, setup: this.settingUp, now: NOW });
     }
     if (url.pathname === "/v1/setup") return this.setup(request);
+    if (url.pathname === "/v1/setup/llm-login") return this.llmLogin(request);
     if (this.settingUp) return error(503, "the daemon is starting: the store and models aren't ready yet");
     if (this.token !== null && request.authorization !== `Bearer ${this.token}`) {
       return error(401, "a bearer token is required: set ASPHODEL_TOKEN on the client", {
@@ -648,6 +680,27 @@ export class FakeDaemon {
       token: SETUP_TOKEN,
       llm_login: body?.llm?.auth === "chatgpt",
     });
+  }
+
+  /// `/v1/setup/llm-login`, which needs no token. `POST` starts a login
+  /// while setup waits, or answers with the pending one's code; each new
+  /// login gets the next code. `GET` reads how it stands, before and after
+  /// setup, and never shows the code.
+  llmLogin({ method }) {
+    const { state, error: why } = this.login;
+    if (method === "GET") return json(200, why === undefined ? { state } : { state, error: why });
+    if (method !== "POST") return error(405, "method not allowed");
+    if (!this.settingUp) return error(409, "setup is done; to log in again, run `asphodel llm login`");
+    if (state !== "pending" && this.login.refuseStart !== undefined) {
+      const refused = this.login.refuseStart;
+      this.login = { state: "failed", error: refused, codes: this.login.codes };
+      return error(502, refused);
+    }
+    if (state !== "pending") {
+      const codes = this.login.codes + 1;
+      this.login = { state: "pending", codes, code: `ABCD-${String(codes).padStart(4, "0")}` };
+    }
+    return json(200, { state: "pending", verification_url: VERIFICATION_URL, user_code: this.login.code });
   }
 
   route({ method, path, query, body }) {

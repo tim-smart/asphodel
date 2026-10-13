@@ -20,6 +20,9 @@ const STATUS_EVERY_MS = 20_000;
 const STARTING_EVERY_MS = 500;
 const STARTING_FOR_MS = 120_000;
 
+/// How often a pending ChatGPT login asks the daemon how it stands.
+const LOGIN_EVERY_MS = 1_000;
+
 /// How many left pages the dashboard keeps to return to.
 const SAVED_PAGES = 50;
 
@@ -40,6 +43,15 @@ export function mount(root, { fetch }) {
   let stopped = false;
   // Set while the setup wizard is showing: the routes wait until it's done.
   let settingUp = false;
+  // The wizard's ChatGPT login, as the daemon last said, with the link and
+  // code it answered the start with. The page keeps the code past setup:
+  // the daemon only ever hands it to the request that started the login.
+  let login = { state: "none" };
+  // The login panel on screen, and the timer following a pending login.
+  let loginPanel = null;
+  let loginTimer = null;
+  // Whether the wizard has asked the daemon for a login from before a reload.
+  let loginResumed = false;
   let notice = null;
   // Set while an action moves to another page, so its notice survives the
   // navigation.
@@ -389,18 +401,13 @@ export function mount(root, { fetch }) {
     // so a hidden required field doesn't block the form.
     const keyFields = h("fieldset", { class: "setup-fields" }, endpoint.nodes, apiKey.nodes);
     const llmFields = h("fieldset", { class: "setup-fields" }, model.nodes, effort.nodes, language.nodes);
-    const loginNote = h(
-      "p",
-      { class: "help", hidden: true },
-      "After setup, log the daemon in with ",
-      h("code", {}, "asphodel llm login --data-dir <data dir>"),
-      ". Nothing is extracted until you do.",
-    );
+    const loginFields = h("div", { hidden: true }, loginBox());
     function setMode(value) {
       mode = value;
       keyFields.disabled = keyFields.hidden = mode !== "api_key";
       llmFields.disabled = llmFields.hidden = mode === "later";
-      loginNote.hidden = mode !== "chatgpt";
+      loginFields.hidden = mode !== "chatgpt";
+      if (mode === "chatgpt") resumeLogin();
     }
     const error = h("p", { class: "notice", "data-tone": "error", role: "alert", tabindex: "-1", hidden: true });
     const submit = h("button", { type: "submit" }, "Finish setup");
@@ -447,7 +454,7 @@ export function mount(root, { fetch }) {
       modes,
       keyFields,
       llmFields,
-      loginNote,
+      loginFields,
       state.makes_token
         ? h("p", { class: "help" }, "Other machines can reach this daemon, so setup creates a bearer token. It's shown once, on the next screen.")
         : null,
@@ -471,6 +478,106 @@ export function mount(root, { fetch }) {
     setMode(mode);
     root.replaceChildren(h("main", { class: "token-page" }, form));
     model.input.focus();
+  }
+
+  /// The ChatGPT login: a button that starts it, then the issuer's link and
+  /// code until the owner approves it there. In the wizard, an expired or
+  /// failed login can start again. After setup, `dataDir` is set: the
+  /// daemon starts no new login then, so the panel names the CLI instead.
+  function loginBox({ dataDir } = {}) {
+    const box = h("div", { class: "setup-login-state", "aria-live": "polite" });
+    loginPanel = { box, dataDir };
+    drawLogin();
+    return h("section", { class: "setup-login", "aria-labelledby": "setup-login-title" }, h("strong", { id: "setup-login-title" }, "ChatGPT login"), box);
+  }
+
+  function drawLogin() {
+    if (!loginPanel) return;
+    const { box, dataDir } = loginPanel;
+    const afterSetup = dataDir !== undefined;
+    const start = (label) =>
+      afterSetup
+        ? h("p", { class: "help" }, "Log the daemon in with ", h("code", {}, `asphodel llm login --data-dir ${dataDir}`), ". Nothing is extracted until you do.")
+        : h("button", { type: "button", class: "quiet", disabled: Boolean(login.starting), onclick: () => startLogin({ focus: true }) }, login.starting ? "Starting…" : label);
+    const nodes = {
+      none: () => [
+        afterSetup ? null : h("p", { class: "help" }, "Log the daemon in to your ChatGPT account. You can finish setup before you approve the login."),
+        start("Log in to ChatGPT"),
+      ],
+      pending: () => [
+        login.code
+          ? [
+              h("p", {}, "Open ", h("a", { href: login.code.verification_url, target: "_blank", rel: "noopener noreferrer" }, login.code.verification_url), " and enter this code:"),
+              h("p", { class: "login-code" }, h("code", {}, login.code.user_code)),
+            ]
+          : null,
+        h(
+          "p",
+          { class: "help" },
+          afterSetup
+            ? "Waiting for you to approve the login. Extraction starts once you do, with no restart."
+            : "Waiting for you to approve the login. You can finish setup now, and the next screen keeps following it.",
+        ),
+      ],
+      done: () => [h("p", { class: "notice", role: "status" }, "Logged in to ChatGPT. The daemon uses the login from its next call.")],
+      expired: () => [h("p", { class: "notice", "data-tone": "warning" }, "The code expired before the login was approved."), start("Try again")],
+      failed: () => [h("p", { class: "notice", "data-tone": "error" }, login.error ?? "The login failed."), start("Try again")],
+    };
+    box.replaceChildren(...[(nodes[login.state] ?? nodes.none)()].flat(Infinity).filter(Boolean));
+  }
+
+  /// Starts a login, or picks up the daemon's pending one and its code.
+  /// With `focus`, the owner clicked for it: focus moves to the link, or to
+  /// the button that tries again.
+  async function startLogin({ focus = false } = {}) {
+    login = { ...login, starting: true };
+    drawLogin();
+    try {
+      const code = await api.startLlmLogin();
+      login = { state: "pending", code };
+    } catch (failure) {
+      login = { state: "failed", error: failure instanceof ApiError ? failure.message : String(failure.message ?? failure) };
+    }
+    if (stopped) return;
+    drawLogin();
+    if (focus) loginPanel?.box.querySelector("a[href], button")?.focus();
+    followLogin();
+  }
+
+  /// Picks up a login the daemon already has, from before the wizard was
+  /// reloaded. Asked once, when ChatGPT is first chosen.
+  async function resumeLogin() {
+    if (loginResumed) return;
+    loginResumed = true;
+    const read = await api.llmLogin().catch(() => null);
+    if (stopped || !read || read.state === "none" || login.state !== "none" || login.starting) return;
+    if (read.state === "pending") return startLogin();
+    login = { state: read.state, error: read.error };
+    drawLogin();
+  }
+
+  /// Asks the daemon how a pending login stands until it settles, or until
+  /// its panel leaves the page.
+  function followLogin() {
+    if (loginTimer !== null || login.state !== "pending") return;
+    loginTimer = window.setInterval(async () => {
+      if (stopped || !loginPanel?.box.isConnected) return stopFollowingLogin();
+      let read;
+      try {
+        read = await api.llmLogin();
+      } catch {
+        return;
+      }
+      if (stopped || login.state !== "pending" || read.state === "pending") return;
+      login = { state: read.state, error: read.error };
+      stopFollowingLogin();
+      drawLogin();
+    }, LOGIN_EVERY_MS);
+  }
+
+  function stopFollowingLogin() {
+    window.clearInterval(loginTimer);
+    loginTimer = null;
   }
 
   /// What setup did, and the token it made, shown this once.
@@ -497,9 +604,7 @@ export function mount(root, { fetch }) {
             ),
           ]
         : null,
-      done.llm_login
-        ? h("p", { class: "help" }, "Log the daemon in to ChatGPT with ", h("code", {}, `asphodel llm login --data-dir ${done.data_dir}`), ". Nothing is extracted until you do.")
-        : null,
+      done.llm_login ? loginBox({ dataDir: done.data_dir }) : null,
       h(
         "p",
         { class: "help" },
@@ -650,6 +755,7 @@ export function mount(root, { fetch }) {
     stopped = true;
     window.removeEventListener("hashchange", onHashChange);
     window.clearInterval(timer);
+    stopFollowingLogin();
     window.history.scrollRestoration = scrollRestoration;
     for (const dialog of dialogs) dialog.remove();
     dialogs.clear();

@@ -38,9 +38,9 @@ use crate::store::bank::ModelIds;
 
 pub use crate::config::LlmAuth;
 pub use chatgpt::{
-    AUTH_ISSUER, CLIENT_ID, CODEX_ENDPOINT, ChatgptTokens, CodexResponses, DeviceCode, LlmStatus,
-    LoginError, ORIGINATOR, REFRESH_WINDOW, TOKEN_FILE, TOKEN_LOCK_FILE, TokenError, TokenLock,
-    TokenStore, device_code_login,
+    AUTH_ISSUER, CLIENT_ID, CODEX_ENDPOINT, ChatgptTokens, CodexResponses, DeviceCode, LOGIN_WAIT,
+    LlmStatus, LoginError, ORIGINATOR, REFRESH_WINDOW, TOKEN_FILE, TOKEN_LOCK_FILE, TokenError,
+    TokenLock, TokenStore, device_code_login, device_code_login_within,
 };
 pub use dir::{ModelDir, ModelError};
 pub use fake::{FakeEmbedder, FakeEmbedderV2, FakeReranker};

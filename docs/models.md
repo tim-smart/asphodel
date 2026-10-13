@@ -251,6 +251,15 @@ flow: it prints a URL and a one-time code, waits for approval, and writes
 `<dir>/llm-tokens.json` with mode 0600. The daemon reads that file before
 every call, so a login while it runs takes effect without a restart.
 
+The setup wizard runs the same flow in the daemon, so a first login needs
+no shell (`docs/operations.md`, "First-run setup"). `POST
+/v1/setup/llm-login` starts it and answers with the URL and code, or with
+the pending login's. `GET` returns its state: `none`, `pending`, `done`,
+`expired`, or `failed` with an `error`. After any of the last three, a
+`POST` starts a fresh login, which is what the wizard's **Try again** does.
+The dashboard can start a login only while setup waits; after that, the
+CLI is the way to log in again.
+
 Every write of the token file goes through an exclusive `flock` on
 `<dir>/llm-tokens.lock`, which holds nothing else. A refresh holds it from
 its re-read of the file to its save, so a login, from the CLI or anywhere
