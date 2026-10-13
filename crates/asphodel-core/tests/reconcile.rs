@@ -1633,7 +1633,6 @@ fn an_ending_closes_the_neighbour_where_the_ender_starts_or_the_day_it_was_said(
 }
 
 #[test]
-#[ignore = "TIM-234: enable when the wider neighbour search is implemented"]
 fn one_move_can_end_six_related_states_in_one_pass() {
     let h = Harness::open(tuning(0.0));
     let states: Vec<_> = ["station", "park", "river", "museum", "market", "library"]
