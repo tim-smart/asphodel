@@ -82,12 +82,15 @@ pub fn guidance_hash(guidance: Option<&str>) -> Option<String> {
 pub const CALL2_TEMPLATE: &str = "reconcile_claims";
 pub const CALL2_VERSION: u32 = 6;
 
-/// The top five neighbours per claim after fusing vector search and BM25.
+/// The top ten neighbours per claim after fusing vector search and BM25.
 /// A flagged claim's nearest entity-linked open tasks and current states
 /// alternate with them.
-pub const NEIGHBOURS_PER_CLAIM: usize = 5;
+pub const NEIGHBOURS_PER_CLAIM: usize = 10;
 
 /// Neighbours shown for the whole chunk, capped at 40.
+/// Keep this bound while widening per-claim search so the maximum number
+/// of memory bodies in call 2 does not double. Rank-first allocation can
+/// still trim lower-ranked neighbours when many claims share a chunk.
 pub const NEIGHBOUR_CAP: usize = 40;
 
 /// The edit log kinds reconciliation writes, each on the row of the memory
