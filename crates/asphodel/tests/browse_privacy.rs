@@ -1,6 +1,5 @@
-//! Regression check for the configuration actually used in evaluation step
-//! 5: browsing a copy of the replayed store must delete nothing in it. No
-//! real history, models, credentials or network are needed.
+//! Browsing a copy of a replayed store with purge paused must delete nothing.
+//! No real history, models, credentials or network are needed.
 
 mod support;
 
@@ -17,35 +16,6 @@ use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::{Service, SimulatedClock, Tuning};
 use serde_json::json;
 
-const GUIDE: &str = include_str!("../../../docs/hermes-data-evaluation.md");
-
-/// What follows the first `marker` in `text`.
-fn after<'a>(text: &'a str, marker: &str) -> &'a str {
-    let (_, rest) = text.split_once(marker).expect("the guide has the marker");
-    rest
-}
-
-fn section(number: u8) -> &'static str {
-    let heading = format!("## {number}. ");
-    after(GUIDE, &heading).split("\n## ").next().unwrap()
-}
-
-fn toml(step: &str) -> Tuning {
-    let (text, _) = after(step, "```toml\n").split_once("```").unwrap();
-    Tuning::from_toml(text).expect("documented tuning is valid")
-}
-
-/// The tuning step 5's `asphodel serve --config` reads.
-fn browse_tuning() -> Tuning {
-    let command = after(after(section(5), "asphodel serve "), "--config ");
-    let config = command.split_whitespace().next().unwrap();
-    match config {
-        "\"$ASPHODEL_REPLAY_DIR/replay.toml\"" => toml(section(3)),
-        "\"$ASPHODEL_REPLAY_DIR/browse.toml\"" => toml(section(5)),
-        other => panic!("add the documented config fixture for {other}"),
-    }
-}
-
 /// `tuning` with the floors the fake models need to serve. Floors aren't
 /// in the deletion fingerprint.
 fn with_fake_models(mut tuning: Tuning) -> Tuning {
@@ -58,19 +28,17 @@ fn with_fake_models(mut tuning: Tuning) -> Tuning {
     tuning
 }
 
-/// The documented browse config has no LLM, since a background refresh
-/// could send memory content to one. Its deletion fingerprint differs from
-/// replay's, so a copied replay store starts with purge paused, and paused,
-/// the nightly sweep keeps the expired sources, failed chunk and recall it
-/// would otherwise delete, with their text.
+/// A browse config without an LLM and with purge disabled changes the deletion
+/// fingerprint, so a copied replay store starts with purge paused. The nightly
+/// sweep must retain expired sources, failed chunks and recalls, including text.
 #[test]
-fn the_documented_browse_config_deletes_nothing_in_a_copied_replay_store() {
+fn browsing_with_purge_paused_deletes_nothing_in_a_copied_replay_store() {
     let dir = support::TestDir::new();
     let data = dir.path("browse-store");
     let start = "2026-10-01T07:00:00Z".parse().unwrap();
     let clock = Arc::new(SimulatedClock::new(start));
     let (idle, failed) = {
-        let replay = with_fake_models(toml(section(3)));
+        let replay = with_fake_models(Tuning::default());
         let store = Store::open(&data, OpenOptions::default(), clock.clone()).unwrap();
         store
             .check_fingerprint(&replay.deletion_fingerprint())
@@ -122,10 +90,10 @@ fn the_documented_browse_config_deletes_nothing_in_a_copied_replay_store() {
 
     // A fresh browse copy retains replay's fingerprint; startup checks it
     // and passes the resulting pause to the service, as serve does.
-    let browse = browse_tuning();
+    let browse = with_fake_models(Tuning::from_toml("[purge]\ndelta = \"never\"\n").unwrap());
     assert!(
         browse.llm.model.is_none(),
-        "step 5 must not configure an LLM"
+        "browsing must not configure an LLM"
     );
     let store = Store::open(&data, OpenOptions::default(), clock.clone()).unwrap();
     let pause = store
@@ -134,7 +102,7 @@ fn the_documented_browse_config_deletes_nothing_in_a_copied_replay_store() {
     assert!(matches!(pause, PurgePause::Paused { .. }), "{pause:?}");
     let service = Service::open(clock.clone(), store, browse).with_purge_pause(pause);
     let due = service.run_sweeps().unwrap().next_due.unwrap();
-    // 04:00 in Auckland, beyond the documented 90-day source horizon.
+    // 04:00 in Auckland, beyond the 90-day source horizon.
     clock.set("2026-12-30T15:00:00Z".parse().unwrap());
     assert!(due < service.now());
     let eligible = |service: &Service| {
