@@ -3,7 +3,8 @@
 //!
 //! The owner logs in once with the device-code flow, from the CLI or from
 //! the setup wizard; the daemon reads the token file under the data dir and
-//! refreshes it itself. These tests see only what an operator sees: flags,
+//! refreshes it itself. The stub issuer doubles as the Codex backend, so a
+//! test can see which credentials the daemon's LLM calls carry. These tests see only what an operator sees: flags,
 //! exit codes, stderr, stdout and the HTTP API.
 //!
 //! The login talks to the issuer over HTTPS. To test the command without
@@ -167,6 +168,37 @@ impl Daemon {
         }
     }
 
+    /// Ingests [`NOTES`] into a new bank `main`, and waits until extraction
+    /// has made its memory and recall finds it.
+    fn extract_notes(&mut self) {
+        let bank =
+            json!({"owner_name": "Tim", "assistant_name": "Ash", "timezone": "Pacific/Auckland"});
+        let (status, body) = self.send("PUT", "/v1/banks/main", Some(&bank));
+        assert_eq!(status, 201, "{body}");
+        let document = json!({
+            "document_id": "notes.md",
+            "text": NOTES,
+            "reference_date": "2026-09-30",
+            "reference_date_exact": true,
+            "timezone": null
+        });
+        let (status, body) = self.send("POST", "/v1/banks/main/documents", Some(&document));
+        assert!((200..300).contains(&status), "{status}: {body}");
+        let query = json!({"query": "where does Tim live? Auckland"});
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (status, recall) = self.send("POST", "/v1/banks/main/recall", Some(&query));
+            assert_eq!(status, 200, "{recall}");
+            if recall["results"][0]["sentence"] == SENTENCE {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("extraction never made the memory: {recall}\n{}", self.log());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Waits until `/v1/health` says the daemon is ready, not just set up.
     /// It answers 503 while the store opens after setup.
     fn wait_ready(&mut self) {
@@ -299,42 +331,107 @@ enum Poll {
 /// Starts a loopback issuer (usercode, two pending polls, approval,
 /// exchange) and returns its URL.
 fn issuer() -> String {
-    stub_issuer(|_, poll| {
+    let issuer = stub_issuer(|_, poll| {
         if poll <= 2 {
             Poll::Pending
         } else {
             Poll::Approved
         }
-    })
+    });
+    issuer.url.clone()
 }
 
-/// Starts a loopback issuer and returns its URL. The `n`th code it hands
-/// out (from 1) is `ABCD-000n`, and `poll(n, p)` answers the `p`th poll for
-/// it (from 1).
-fn stub_issuer(poll: impl Fn(usize, usize) -> Poll + Send + Sync + 'static) -> String {
+/// Starts a loopback issuer. The `n`th code asked for (from 1) is
+/// `ABCD-000n`, and `poll(n, p)` answers the `p`th poll for it (from 1);
+/// `poll(n, 0)` answers the request for the code itself, where `Refused`
+/// hands out none. `POST /responses` answers every LLM call with
+/// [`auckland_reply`].
+fn stub_issuer(poll: impl Fn(usize, usize) -> Poll + Send + Sync + 'static) -> Arc<Issuer> {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
     let issuer = Arc::new(Issuer {
+        url: format!("http://{}", listener.local_addr().unwrap()),
         poll: Box::new(poll),
         codes: AtomicUsize::new(0),
         polls: Mutex::new(HashMap::new()),
+        llm_calls: Mutex::new(Vec::new()),
     });
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { break };
-            let issuer = Arc::clone(&issuer);
-            std::thread::spawn(move || issuer.answer(stream));
+    std::thread::spawn({
+        let issuer = Arc::clone(&issuer);
+        move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let issuer = Arc::clone(&issuer);
+                std::thread::spawn(move || issuer.answer(stream));
+            }
         }
     });
-    url
+    issuer
 }
 
 struct Issuer {
+    url: String,
     poll: Box<dyn Fn(usize, usize) -> Poll + Send + Sync>,
-    /// Codes handed out so far.
+    /// Codes asked for so far.
     codes: AtomicUsize,
     /// Polls so far for each code.
     polls: Mutex<HashMap<usize, usize>>,
+    /// The headers of each LLM call, names lowercased.
+    llm_calls: Mutex<Vec<HashMap<String, String>>>,
+}
+
+/// The access token the stub's exchange hands out.
+fn access_token() -> String {
+    jwt(json!({"sub": "first", "exp": 4_102_444_800i64}))
+}
+
+/// The document the token-use test ingests, and the claim the stub's LLM
+/// makes about it.
+const NOTES: &str = "# Notes\n\nI live in Auckland and I drink tea every morning.\n";
+const SENTENCE: &str = "Tim lives in Auckland.";
+
+/// An extraction reply with one fact quoted from [`NOTES`].
+fn auckland_reply() -> Value {
+    json!({
+        "claims": [{
+            "content": SENTENCE,
+            "kind": "fact",
+            "quote": "I live in Auckland",
+            "significance": "notable",
+            "remember_this": false,
+            "changes_something": false,
+            "window_confidence": "high",
+            "entities": []
+        }],
+        "used_injected_ids": []
+    })
+}
+
+/// [`auckland_reply`] as the Codex backend streams it.
+fn completion() -> String {
+    let events = [
+        (
+            "response.output_item.done",
+            json!({"item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": auckland_reply().to_string()}]
+            }}),
+        ),
+        (
+            "response.completed",
+            json!({"response": {
+                "status": "completed",
+                "usage": {"input_tokens": 41, "output_tokens": 7, "total_tokens": 48}
+            }}),
+        ),
+    ];
+    events
+        .into_iter()
+        .map(|(kind, mut data)| {
+            data["type"] = json!(kind);
+            format!("event: {kind}\ndata: {data}\n\n")
+        })
+        .collect()
 }
 
 impl Issuer {
@@ -352,13 +449,30 @@ impl Issuer {
         });
         let mut body = vec![0; length.unwrap_or(0)];
         reader.read_exact(&mut body).unwrap();
+        if path.ends_with("/responses") {
+            let headers = head.iter().skip(1).filter_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                Some((key.trim().to_ascii_lowercase(), value.trim().to_string()))
+            });
+            self.llm_calls.lock().unwrap().push(headers.collect());
+            let body = completion();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            return;
+        }
         let (status, body) = match path {
             "/api/accounts/deviceauth/usercode" => {
                 let n = self.codes.fetch_add(1, Ordering::SeqCst) + 1;
-                (
-                    200,
-                    json!({"device_auth_id": format!("dev_{n}"), "user_code": format!("ABCD-{n:04}"), "interval": "0"}),
-                )
+                match (self.poll)(n, 0) {
+                    Poll::Refused => (503, json!({})),
+                    Poll::Pending | Poll::Approved => (
+                        200,
+                        json!({"device_auth_id": format!("dev_{n}"), "user_code": format!("ABCD-{n:04}"), "interval": "0"}),
+                    ),
+                }
             }
             "/api/accounts/deviceauth/token" => {
                 let sent: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -390,7 +504,7 @@ impl Issuer {
                 200,
                 json!({
                     "id_token": jwt(json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acct_7f3a9c"}})),
-                    "access_token": jwt(json!({"sub": "first", "exp": 4_102_444_800i64})),
+                    "access_token": access_token(),
                     "refresh_token": "rt-first"
                 }),
             ),
@@ -490,7 +604,8 @@ fn the_setup_wizard_logs_in_and_the_running_daemon_uses_the_login() {
     // owner approves, the running daemon is logged in without a restart.
     // Starting again while a login waits hands back the same code, so a
     // reloaded wizard can show it; once setup is done, only
-    // `asphodel llm login` starts one. No token is ever shown or logged.
+    // `asphodel llm login` starts one. The same daemon's LLM calls then
+    // carry the new login. No token is ever shown or logged.
     let approved = Arc::new(AtomicBool::new(false));
     let issuer = stub_issuer({
         let approved = Arc::clone(&approved);
@@ -500,7 +615,7 @@ fn the_setup_wizard_logs_in_and_the_running_daemon_uses_the_login() {
         }
     });
     let dir = TestDir::new();
-    let mut daemon = start_setup(&dir.data(), &issuer, &[]);
+    let mut daemon = start_setup(&dir.data(), &issuer.url, &[]);
     assert_eq!(daemon.login()["state"], "none");
 
     let (status, started) = daemon.send("POST", LOGIN, None);
@@ -508,16 +623,18 @@ fn the_setup_wizard_logs_in_and_the_running_daemon_uses_the_login() {
     assert_eq!(started["state"], "pending");
     assert_eq!(
         started["verification_url"],
-        format!("{issuer}/codex/device")
+        format!("{}/codex/device", issuer.url)
     );
     assert_eq!(started["user_code"], "ABCD-0001");
     assert_eq!(daemon.send("POST", LOGIN, None), (200, started.clone()));
 
-    let chatgpt = json!({"llm": {"auth": "chatgpt", "model": "gpt-5.1"}});
+    let chatgpt = json!({"llm": {"auth": "chatgpt", "model": "gpt-5.1", "endpoint": issuer.url}});
     let (status, done) = daemon.send("POST", "/v1/setup", Some(&chatgpt));
     assert_eq!(status, 200, "{done}");
     daemon.wait_ready();
-    assert_eq!(daemon.login()["state"], "pending");
+    // Read without a token, the state never carries the code.
+    let pending = daemon.login();
+    assert_eq!(pending, json!({"state": "pending"}));
     assert_eq!(daemon.config()["llm"]["logged_in"], false);
 
     approved.store(true, Ordering::SeqCst);
@@ -525,6 +642,16 @@ fn the_setup_wizard_logs_in_and_the_running_daemon_uses_the_login() {
     let config = daemon.config();
     assert_eq!(config["llm"]["logged_in"], true, "{config}");
     assert_eq!(daemon.send("POST", LOGIN, None).0, 409);
+
+    daemon.extract_notes();
+    let calls = issuer.llm_calls.lock().unwrap().clone();
+    assert!(!calls.is_empty());
+    for call in &calls {
+        let bearer = format!("Bearer {}", access_token());
+        assert_eq!(call.get("authorization"), Some(&bearer));
+        let account = call.get("chatgpt-account-id").map(String::as_str);
+        assert_eq!(account, Some("acct_7f3a9c"));
+    }
 
     let everywhere = format!("{started}\n{login}\n{config}\n{}", daemon.log());
     for forbidden in ["rt-first", "eyJ", "acct_7f3a9c"] {
@@ -537,17 +664,25 @@ fn the_setup_wizard_logs_in_and_the_running_daemon_uses_the_login() {
 
 #[test]
 fn a_failed_or_expired_wizard_login_is_shown_and_can_be_retried() {
-    // The issuer refuses the first code, nobody approves the second before
-    // the wait runs out, and the third goes through. Each retry is a new
-    // code, and a failure says why.
-    let issuer = stub_issuer(|code, _| match code {
-        1 => Poll::Refused,
-        2 => Poll::Pending,
+    // The issuer hands out no first code and refuses the second at its
+    // first poll; nobody approves the third before the wait runs out, and
+    // the fourth goes through. Each retry is a new code, and a failure says
+    // why.
+    let issuer = stub_issuer(|code, poll| match (code, poll) {
+        (1, 0) => Poll::Refused,
+        (2, 0) => Poll::Pending,
+        (2, _) => Poll::Refused,
+        (3, _) => Poll::Pending,
         _ => Poll::Approved,
     });
     let dir = TestDir::new();
     let wait = [("ASPHODEL_LLM_LOGIN_WAIT_MS", "200")];
-    let mut daemon = start_setup(&dir.data(), &issuer, &wait);
+    let mut daemon = start_setup(&dir.data(), &issuer.url, &wait);
+    let (status, refused) = daemon.send("POST", LOGIN, None);
+    assert_eq!(status, 502, "{refused}");
+    let login = daemon.login();
+    assert_eq!(login["state"], "failed", "{login}");
+    assert!(login["error"].is_string(), "{login}");
     let mut codes = Vec::new();
     for state in ["failed", "expired", "done"] {
         let (status, started) = daemon.send("POST", LOGIN, None);
@@ -558,5 +693,31 @@ fn a_failed_or_expired_wizard_login_is_shown_and_can_be_retried() {
             assert!(login["error"].is_string(), "{login}");
         }
     }
-    assert_eq!(codes, ["ABCD-0001", "ABCD-0002", "ABCD-0003"]);
+    assert_eq!(codes, ["ABCD-0002", "ABCD-0003", "ABCD-0004"]);
+}
+
+#[test]
+fn sigterm_stops_the_daemon_promptly_while_a_wizard_login_waits() {
+    // A login nobody approves waits 15 minutes for the owner; a supervisor
+    // stopping the daemon meanwhile mustn't wait with it.
+    let issuer = stub_issuer(|_, _| Poll::Pending);
+    let dir = TestDir::new();
+    let mut daemon = start_setup(&dir.data(), &issuer.url, &[]);
+    let (status, started) = daemon.send("POST", LOGIN, None);
+    assert_eq!(status, 200, "{started}");
+
+    let signalled = Command::new("kill")
+        .args(["-TERM", &daemon.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signalled.success(), "kill -TERM failed");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match daemon.child.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            None => panic!("the daemon didn't stop:\n{}", daemon.log()),
+        }
+    };
+    assert!(status.success(), "{status}\n{}", daemon.log());
 }
