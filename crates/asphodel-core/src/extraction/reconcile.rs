@@ -308,6 +308,7 @@ pub(super) fn search(
             handle: format!("c{}", index + 1),
             claim: memory.claim,
             content: memory.content.clone(),
+            kind: memory.kind.stored(),
             due_at: memory.due_at.map(|stamp| stamp.at),
             valid_from: memory.valid_from.map(|stamp| stamp.at),
             valid_until: memory.valid_until.map(|stamp| stamp.at),

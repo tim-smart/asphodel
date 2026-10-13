@@ -295,6 +295,28 @@ whose goal was reached another way or that's no longer needed, but not one
 the claim only relates to. Their effect on the agenda and on false endings
 still needs a reviewed recording.
 
+Version 21 is written for a general-purpose assistant rather than a
+personal one. It keeps the speaker's decisions and how they like things
+done, records what the speaker wanted when it shows a need, plan or interest
+beyond the step at hand, and skips what the work itself records, such as
+code, dependencies and commit history. A reply's lasting finding about
+something of the speaker's is kept at most notable. Invented work is
+recorded as content of that work, and a document's author is its speaker.
+Its significance scale matches the lifetimes the strength model gives:
+notable is a few months, and anything that would still shape how the
+assistant helps a year from now, however mundane, is major, such as a tool
+the speaker owns or the software they use. Call 2 version 7 shows each
+claim's kind, lets a switch or reversed choice end what it replaces but not
+a trial, and says a label can name any memory shown. Their effect on recall
+and on the share of major memories still needs a reviewed recording; the
+share of major memories is the headline number.
+
+The same release raises the notable default from 0.31 to 0.35, so one
+mention fades at 90 days instead of 68. Significance values are deletion
+inputs, so an upgraded store pauses purge until it is acknowledged ("Purge
+pauses" below). Memories extracted before version 21 keep their rating;
+raise one with `memory significance` if it should last longer.
+
 The earlier version 4 rule followed a ten-day evaluation (436 turns,
 451 memories): 129 memories recorded assistant operations or reports and
 91 recorded user questions. These crowded recall, while the 49 memories
@@ -318,7 +340,7 @@ at 2.5:
 [strength.significance]
 trivial = 0.0
 minor = 0.2
-notable = 0.31
+notable = 0.35
 major = 0.7
 critical = 0.9
 ```

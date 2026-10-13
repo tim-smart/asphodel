@@ -120,7 +120,7 @@ impl Significance {
         match self {
             Significance::Trivial => 0.0,
             Significance::Minor => 0.2,
-            Significance::Notable => 0.31,
+            Significance::Notable => 0.35,
             Significance::Major => 0.7,
             Significance::Critical => 0.9,
         }

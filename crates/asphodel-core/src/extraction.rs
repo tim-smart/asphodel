@@ -70,7 +70,7 @@ pub use prompt::call1_request;
 
 /// Call 1's template name and version, which replay's cassette keys include.
 pub const CALL1_TEMPLATE: &str = "extract_claims";
-pub const CALL1_VERSION: u32 = 20;
+pub const CALL1_VERSION: u32 = 21;
 
 /// The hash call 1's template carries for `[extraction] guidance`:
 /// lower-case hex SHA-256 of the text as the prompt inserts it, trimmed.
@@ -80,7 +80,7 @@ pub fn guidance_hash(guidance: Option<&str>) -> Option<String> {
 
 /// Call 2's template name and version, which replay's cassette keys include.
 pub const CALL2_TEMPLATE: &str = "reconcile_claims";
-pub const CALL2_VERSION: u32 = 6;
+pub const CALL2_VERSION: u32 = 7;
 
 /// The top ten neighbours per claim after fusing vector search and BM25.
 /// A flagged claim's nearest entity-linked open tasks and current states
@@ -331,6 +331,7 @@ pub struct ReconcileClaim {
     /// The claim's index in call 1's reply, as [`Dropped::claim`] counts it.
     pub claim: usize,
     pub content: String,
+    pub kind: crate::strength::Kind,
     pub due_at: Option<Timestamp>,
     pub valid_from: Option<Timestamp>,
     pub valid_until: Option<Timestamp>,

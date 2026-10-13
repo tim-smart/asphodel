@@ -14,7 +14,7 @@ use crate::queue::SourceKind;
 
 const SCHEMA_NAME: &str = "call1_claims";
 
-const SYSTEM: &str = r#"Extract claims worth remembering from a conversation turn or document section for a personal assistant's long-term memory. Also identify which memories in the assistant's context its reply relied on.
+const SYSTEM: &str = r#"Extract claims worth remembering from a conversation turn or document section for an AI assistant's long-term memory. Also identify which memories in the assistant's context its reply relied on.
 
 # Claims
 
@@ -22,14 +22,17 @@ Write each claim as one self-contained sentence. Use names instead of pronouns a
 
 For `quote`, copy the passage supporting the claim character for character from the text. Use context only to understand the text, never as a quote or the sole source of a claim. Claims with quotes absent from the text are discarded.
 
-Bind each claim and its source qualifications to the evidence for that proposition. Preserve a stated report, belief, record or assessment without upgrading it to an established fact or changing who or what supports it. A source named for another claim does not support this one, even if both concern the same person or topic. Do not invent a record, authority or attribution to qualify a claim.
+Bind each claim and its attribution to the evidence for that proposition. Preserve a stated report, belief, record or assessment without upgrading it to an established fact or changing who or what supports it. A source named for another claim does not support this one, even if both concern the same person or topic. Do not invent a record, authority or attribution to qualify a claim.
+
+Content of a story, script, role-play or other invented work is about that work, not the world: name the work in the sentence and link it as a `project`, not its characters as people. A fact the speaker states about themselves while asking for it is extracted as usual.
 
 Extract:
-- What the speaker says about themselves, the people, places and things in their life, and their plans, tasks and preferences. "I" and "me" mean the speaker of that passage, which may be someone else inside quoted or relayed speech.
+- What the speaker says about themselves, the people, places and things in their life and work, and their plans, tasks, decisions and preferences, including how they like things done. "I" and "me" mean the speaker of that passage, which may be someone else inside quoted or relayed speech. In a document, the author is the speaker.
 - The speaker's short answers and references to earlier context, written out in full. "Yes" after "Are you still at Acme?" becomes "Alex still works at Acme.", quoting "Yes". A "remember that" referring to an earlier statement works the same way.
-- From the assistant's reply, decisions, commitments, durable content and storage locations stated while carrying out the speaker's request. A promise to act, monitor or follow up is an assistant task, not a fact or state about the assistant's commitment. Extract it only if the speaker requested that task and it has a due date or an until-event beyond this turn; otherwise skip the promise as assistant bookkeeping.
-- From the assistant's reply, a finding that answers a request about the speaker's life and that the text dates or bounds (a local event, a booking, an availability). Keep its source in the sentence ("the festival listing says ...") and quote the reply. Never `fact`; usually `trivial`.
-- What the speaker wanted or asked about, when a question or request concerns their life (people, places, purchases, plans, interests). Extract an `event` recording the intent, not the asking: "Alex wanted to try the Corner Cafe's online ordering on 7 October 2026, without buying." Do not record whether the assistant acted or the outcome unless the text states it. Usually `trivial`.
+- From the assistant's reply, decisions the speaker made or approved, commitments, and content the speaker adopted or asked to keep and where it is stored, stated while carrying out the speaker's request. A promise to act, monitor or follow up is an assistant task, not a fact or state about the assistant's commitment. Extract it only if the speaker requested that task and it has a due date or an until-event beyond this turn; otherwise skip the promise as assistant bookkeeping.
+- From the assistant's reply, a lasting finding about something of the speaker's, such as a home, vehicle, device, account or piece of work, that the text establishes rather than guesses: a constraint it has or the cause of a recurring problem. Keep its source in the sentence.
+- From the assistant's reply, a finding that answers a request about the speaker's life or work and that the text dates or bounds (a local event, a booking, an availability). Keep its source in the sentence ("the festival listing says ...") and quote the reply.
+- What the speaker wanted or asked about, when it shows a need, plan or interest of theirs beyond the step at hand: a purchase, a trip, a hire, a topic they are learning, a library they are weighing. Skip requests that are steps in work already under way. Extract an `event` recording the intent, not the asking: "Alex wanted to try the Corner Cafe's online ordering on 7 October 2026, without buying." Do not record whether the assistant acted or the outcome unless the text states it. Usually `trivial`.
 - The speaker saying that a plan, task or piece of work in the supplied memories or context is done, dropped or no longer needed, including by asking the assistant to stop, delete or discard the work done for it. Extract an `event` with `changes_something` true that names the work as the memories or context name it and gives the reason if the text does: "Alex no longer needs the Lisbon flight search, having booked the flights." Quote the current text. When the text already states what ended the work, such as booking the flights, extract that one claim with `changes_something` true and no separate one. A request to clear up files or notes whose work continues is a routine operation, not this. Cancelling, deleting or moving a reminder or calendar entry never ends its obligation, as below.
 
 Apply the skips below to each proposition, not to the whole passage: a request, message or temporary situation can still contain an explicitly stated lasting fact worth extracting.
@@ -37,9 +40,10 @@ Apply the skips below to each proposition, not to the whole passage: a request, 
 Skip:
 - The act of asking a question or making a request. For a question or request, record only what the speaker wanted, as above.
 - Requests whose only content is the assistant operating its own tools, notes or system, unless they end remembered work as above.
-- The assistant's advice, suggestions, general knowledge, undated findings and findings that don't answer the speaker's request.
-- Routine operations: commands, checks, restarts, result reports, and adding, updating, saving, removing, restoring, moving or verifying notes or files. Extract the durable content, decision or commitment, or the end of the work it served as above, not an event about the operation. A date or path alone does not make an operation worth remembering.
+- The assistant's advice, suggestions, general knowledge, undated findings other than the lasting ones above, and findings that don't answer the speaker's request.
+- Routine operations: commands, checks, restarts, result reports, and adding, updating, saving, removing, restoring, moving or verifying notes, files or code. Extract the durable content, decision or commitment, or the end of the work it served as above, not an event about the operation. A date or path alone does not make an operation worth remembering.
 - Storage locations already stated in the supplied context. Extract where something durable is kept only as a fact about the thing ("the trip notes are in 07_Trips/Anniversary"), not an edit event.
+- What the work itself records and the assistant can read again: document text, code and its structure, commit or ticket history. Keep the speaker's reason, constraint or rule behind it.
 - Requests to forget something, meaning to stop remembering it, including tasks to forget it. Dropping a plan in the same words ("forget the flight search, I've booked") ends work as above.
 - Greetings, filler and small talk.
 
@@ -73,8 +77,6 @@ For ordinary reported speech, likewise omit a communication frame that only says
 
 Do not infer a relationship, preference or recurring date from a salutation, affectionate wording or a message's occasion. A one-time calendar date in a note is not an annual date. Emitting a separate lasting fact does not justify an extra unsupported claim. Facts the user states in their own words alongside an assistant draft are extracted as usual; the draft does not turn invented content into facts.
 
-A request scoped to one occasion does not establish a standing preference. Preserve that scope if the request is worth extracting, while separately extracting any explicitly stated lasting preference.
-
 # Kinds
 
 Choose `kind` in this order:
@@ -84,6 +86,8 @@ Choose `kind` in this order:
 - `state`: something ongoing that is expected to change without an announcement, such as mood, location, current work or progress. Keep an explicit end condition as `until_event` ("until the release ships").
 - `fact`: everything else except claims recording written messages, assistant-drafted wording or an intent to send a message, including preferences, things whose change would be announced (a job, home or relationship), and things not expected to change (a chronic condition).
 
+A request scoped to one occasion does not establish a standing preference. Preserve that scope if the request is worth extracting, while separately extracting any explicitly stated lasting preference.
+
 Permission for the assistant to use an account, card or other resource is not a task. Skip one given for the request at hand ("use my work card for this top-up") as assistant bookkeeping; a standing one ("you can always use my work card for SIM top-ups") is a `fact`. A decision that an approval carries ("yes, book the 200 euro hotel") is extracted as usual.
 
 Select and classify each proposition separately, including facts stated within possessive or descriptive phrases. A durable relationship is a `fact`, even when stated alongside a visit, illness or other temporary state. "Alex's grandson Ben is staying this week" supports a separate fact that Ben is Alex's grandson and a temporary claim about the stay; do not fold the relationship into a short-lived state or discard it when skipping the temporary claim. Extract only relationships actually stated, not inferred from the situation.
@@ -92,16 +96,17 @@ Use `volatility` only for states, to describe how quickly they go stale: `hours`
 
 # Significance
 
-Judge each claim on its own terms by how long it is worth remembering:
+Judge each claim on its own terms by how long it stays useful without being mentioned again, not by how dramatic it is:
+
 - `trivial`: about a week. "Alex had pasta for lunch." "Alex is reading the release notes."
 - `minor`: about a month. "Alex's sister is visiting next weekend." "Alex needs to reply to the landlord this week."
-- `notable`: most of a year. "Alex started learning Rust." "Alex's team ships the new API on 15 November 2026."
-- `major`: years. "Alex moved to Wellington." "Alex is allergic to penicillin."
+- `notable`: a few months. "Alex started learning Rust." "Alex's team ships the new API on 15 November 2026."
+- `major`: years. "Alex moved to Wellington." "Alex is allergic to penicillin." "Alex owns a Ryobi drill." "Alex's shop website runs on Shopify."
 - `critical`: a decade or more. "Alex's daughter Mia was born on 3 March 2026." "Alex married Jo on 12 June 2027."
 
-Most claims are trivial or minor. Major is rare; critical is a few per hundred claims.
+Rate a claim `major` when it would still shape how the assistant helps a year from now, however mundane: the people and relationships, home, job and health conditions in the speaker's life; what they own, use or have set up, such as a tool, appliance, car, device, account or piece of software; their standing preferences and rules for how their work is done; the reasons behind lasting choices and conclusions they have reached. A choice, constraint or finding tied to one task or occasion is `notable` at most. A recurring claim outlasts its period: a yearly occasion is at least `major`. Passing activity, short plans and progress are trivial or minor.
 
-`remember_this` is true only when the text explicitly asks to remember the claim ("remember this", "don't forget that"). `changes_something` is true when the claim ends, corrects, reschedules or completes something that may already be remembered, or makes a remembered task unnecessary ("I moved out of Berlin", "the dentist is now on Friday", "I filed the tax return", "I booked the flights" after a flight search).
+`remember_this` is true only when the text explicitly asks to remember the claim ("remember this", "don't forget that"). `changes_something` is true when the claim ends, corrects, reschedules or completes something that may already be remembered, or makes a remembered task unnecessary ("I moved out of Berlin", "the dentist is now on Friday", "I filed the tax return", "I booked the flights" after a flight search, "the repo now uses pnpm").
 
 # Time
 

@@ -17,21 +17,21 @@ use crate::strength::Kind;
 
 const SCHEMA_NAME: &str = "call2_labels";
 
-const SYSTEM: &str = r#"You reconcile new claims with a personal assistant's existing memories. You are given claims just extracted from a text, each with a handle (`c1`, `c2`, …), and the stored memories closest to them, each with a handle (`n1`, `n2`, …). For each claim, say what it does to the memories it's about.
+const SYSTEM: &str = r#"You reconcile new claims with an AI assistant's existing memories. You are given claims just extracted from a text, each with a handle (`c1`, `c2`, …), and the stored memories closest to them, each with a handle (`n1`, `n2`, …). For each claim, say what it does to the memories it's about.
 
 # Labels
 
 Give a claim a label on a memory only when the two are about the same thing:
 - `mentioned_again`: the claim states what the memory already says, independently. Rewording, or the same fact with less detail, is still mentioned again.
 - `confirmed`: the claim says the memory is still right, such as "yes" to a question about it, or "still" true.
-- `refines`: the claim is a more precise version of the same statement, and the memory wasn't wrong ("going to Japan in 2027" refined by "going to Tokyo in April 2027"; "needs to pack the carrots" refined by "reminder to pack the carrots at 8am on the 30th"). The claim must preserve the statement the memory makes while making that statement more precise. A different preference, plan or fact about the same person or thing is not a refinement; give that pair no label unless another label's definition applies. Adding a date or schedule to the same statement is a refinement, not a repeat, even when only the structured time fields show it.
+- `refines`: the claim is a more precise version of the same statement, and the memory wasn't wrong ("going to Japan in 2027" refined by "going to Tokyo in April 2027"; "needs to pack the carrots" refined by "needs to pack the carrots before leaving for the mountains on 30 October 2026 at 8am"). The claim must preserve the statement the memory makes while making that statement more precise. A different preference, plan or fact about the same person or thing is not a refinement; give that pair no label unless another label's definition applies. Adding a date or schedule to the same statement is a refinement, not a repeat, even when only the structured time fields show it.
 - `retracts`: the claim is a corrected version of the memory, which was wrong: a correction, or a rescheduled appointment or plan ("the dentist is on Friday, not Thursday", "her name is Mia, not Maya", "I filed the tax return on the 2nd, not the 1st").
 - `denies`: the claim says the memory didn't happen or isn't true at all, with nothing to replace it ("I haven't filed the tax return after all", "the trip to Japan isn't happening"). When unsure between `denies` and `retracts`, use `retracts`.
-- `ends`: the memory was true and the claim says it stopped being true: a move, a job left, a habit stopped, or a task completed or cancelled ("moved out of Berlin" ends "lives in Berlin"; "filed the tax return" ends "needs to file the tax return"). It also ends a task, plan or commitment whose goal the claim shows was reached another way or is no longer needed ("booked the Lisbon flights" ends "redo the Lisbon flight search"; "paid the ACC invoice" ends "Hermes will start paying the ACC invoice"). A task the claim only relates to doesn't end: "booked the Lisbon flights" doesn't end "book a Lisbon hotel". Work dropped because its goal was reached or no longer matters is `ends`, not `denies`.
+- `ends`: the memory was true and the claim says it stopped being true: a move, a job left, a habit stopped, a switch or reversed choice, or a task completed or cancelled ("moved out of Berlin" ends "lives in Berlin"; "the repo now uses pnpm" ends "the repo uses npm"; "filed the tax return" ends "needs to file the tax return"). A trial or an option under consideration ends nothing. It also ends a task, plan or commitment whose goal the claim shows was reached another way or is no longer needed ("booked the Lisbon flights" ends "redo the Lisbon flight search"; "paid the ACC invoice" ends "Hermes will start paying the ACC invoice"). A task the claim only relates to doesn't end: "booked the Lisbon flights" doesn't end "book a Lisbon hotel". Work dropped because its goal was reached or no longer matters is `ends`, not `denies`.
 
 A claim can have labels on several memories, and several claims can label the same memory. A claim about something new gets no labels. Don't label a memory just because it's on the same topic: "likes tea" and "likes coffee" are two memories.
 
-Each claim and memory shows its due_at, valid_from and valid_until alongside the sentence; none means no date was supplied. Each memory shows when it was said. Memories marked ended have already stopped being true. Judge only what each claim says about each memory; don't decide which is newer, and label a claim the same whichever was said first.
+Each claim and memory shows its due_at, valid_from and valid_until alongside the sentence; none means no date was supplied. Each memory shows when it was said. Memories marked ended have already stopped being true. Judge only what each claim says about each memory; don't decide which is newer, and label a claim the same whichever was said first. Each claim lists the memories found for it as closest; they are suggestions, and a label can name any memory.
 
 Return every claim that has at least one label, with its labels. Leave out claims with none."#;
 
@@ -58,8 +58,9 @@ fn render(input: &Call2Input) -> String {
     for claim in &input.claims {
         let _ = write!(
             out,
-            "{} (said {}): {}",
+            "{} ({}, said {}): {}",
             claim.handle,
+            kind_name(claim.kind),
             claim.observed_at.strftime("%Y-%m-%d"),
             claim.content
         );
