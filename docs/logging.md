@@ -23,6 +23,12 @@ This applies everywhere: the daemon, the CLI's error paths, HTTP access logs,
 the replay harness and the Hermes plugin. Failed chunk rows store the error
 kind and the HTTP status, never the response.
 
+**The HTTP wire dump is always off.** At `trace`, ureq hex-dumps every byte
+it sends and receives under the `ureq_proto::util` target, bearer tokens,
+API keys and the issuer's token replies included. `logging::init()` turns
+that target off whatever `ASPHODEL_LOG` says. ureq's own request and
+response lines stay, with sensitive headers redacted.
+
 **Panic messages carry ids only.** A panic that names a memory, entity or
 source names it by id. `expect` and `assert!` messages follow the same rule.
 

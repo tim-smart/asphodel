@@ -1913,6 +1913,32 @@ dialog.confirm h2 {
   display: none;
 }
 
+.setup-login {
+  display: grid;
+  gap: 0.6rem;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 0.9rem 1rem;
+}
+
+.setup-login-state {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.setup-login-state > * {
+  margin: 0;
+}
+
+.setup-login a {
+  overflow-wrap: anywhere;
+}
+
+.login-code code {
+  font-size: 1.4rem;
+  letter-spacing: 0.08em;
+}
+
 /* Narrow screens */
 
 @media (max-width: 60rem) {
