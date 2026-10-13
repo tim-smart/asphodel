@@ -1633,6 +1633,37 @@ fn an_ending_closes_the_neighbour_where_the_ender_starts_or_the_day_it_was_said(
 }
 
 #[test]
+#[ignore = "TIM-234: enable when the wider neighbour search is implemented"]
+fn one_move_can_end_six_related_states_in_one_pass() {
+    let h = Harness::open(tuning(0.0));
+    let states: Vec<_> = ["station", "park", "river", "museum", "market", "library"]
+        .into_iter()
+        .map(|landmark| h.fact(&format!("Tim lives in Berlin near the {landmark}.")))
+        .collect();
+    h.says("I moved out of Berlin and now live in Lisbon.");
+    let call1 = reply(vec![claim(
+        MOVED,
+        "event",
+        "I moved out of Berlin and now live in Lisbon",
+    )]);
+    let input = call2(&h, &call1).unwrap();
+    assert_eq!(shown_for(&input, 0), states.iter().copied().collect());
+    let labels: Vec<_> = states
+        .iter()
+        .map(|memory| (neighbour_handle(&input, *memory), "ends"))
+        .collect();
+    let result = reconcile(
+        &h,
+        call1,
+        call2_reply(vec![labelled(&input.claims[0].handle, &labels)]),
+        &[],
+    );
+    for state in states {
+        assert_eq!(h.show(state).chain.ended_by, Some(result.memories[0]));
+    }
+}
+
+#[test]
 fn labels_code_rejects_leave_the_claim_new() {
     // Code rejects any label on a neighbour that's already ended, `denies`
     // on one retracted earlier in the same unit, and a label on a neighbour
