@@ -15,7 +15,7 @@ use std::io::Read;
 use std::sync::Arc;
 
 use asphodel_core::agenda::Agenda;
-use asphodel_core::config::Secret;
+use asphodel_core::config::{LlmAuth, Secret};
 use asphodel_core::end::{EndError, Ended, Reopened};
 use asphodel_core::entities::{
     AliasRemoval, AliasRemoved, EntityError, LinkEdited, LinkRequest, MergeRequest, Merged,
@@ -34,7 +34,7 @@ use asphodel_core::keep::{
     KeepError, Kept, MemoryIds, SignificanceRequest, SignificanceSet, Unkept,
 };
 use asphodel_core::mental_models::{Model, ModelEdit, ModelError, ModelSpec, Outcome as Refreshed};
-use asphodel_core::models::LlmError;
+use asphodel_core::models::{LlmError, TokenStore};
 use asphodel_core::operations::{
     Audit, AuditError, AuditList, BACKED_UP_AT_HEADER, Backup, BackupError, LENGTH_HEADER,
     SHA256_HEADER, Status,
@@ -147,6 +147,10 @@ pub(crate) fn router(app: Shared) -> Router {
         .route(
             "/v1/setup",
             get(super::setup::state).post(super::setup::complete),
+        )
+        .route(
+            "/v1/setup/llm-login",
+            get(super::login::state).post(super::login::start),
         )
         .route("/dashboard", get(super::dashboard::page))
         .route("/dashboard/", get(super::dashboard::page))
@@ -587,11 +591,18 @@ async fn health(State(app): State<Shared>) -> (StatusCode, Json<Health>) {
 }
 
 /// `GET /v1/config`: the resolved config, secrets redacted, with the purge
-/// state as it is now, after any ack.
+/// state as it is now, after any ack, and a ChatGPT login as the token file
+/// says now, so a login after startup shows without a restart.
 async fn config(State(app): State<Shared>) -> Result<Json<ResolvedConfig>, ApiError> {
     let ready = app.ready().ok_or_else(ApiError::not_ready)?;
     let mut config = ready.config.clone();
     config.purge = ready.service.purge_pause();
+    if let Some(llm) = &mut config.llm
+        && llm.auth == LlmAuth::Chatgpt
+        && let Some(data_dir) = &config.deployment.data_dir
+    {
+        *llm = TokenStore::open(data_dir).status();
+    }
     Ok(Json(config))
 }
 

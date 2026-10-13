@@ -6,7 +6,8 @@
 //! handlers stay thin and call the same service functions the replay harness
 //! does. Each bank's chunks are extracted by a worker of its own ([`worker`]).
 //! With no tuning file anywhere, it waits for first-run setup ([`setup`])
-//! before it opens the store.
+//! before it opens the store; meanwhile the wizard can run the ChatGPT
+//! login ([`login`]).
 
 use std::{
     fs::{self, Metadata},
@@ -42,6 +43,7 @@ use worker::Workers;
 
 mod api;
 mod dashboard;
+mod login;
 mod setup;
 mod worker;
 
@@ -77,6 +79,8 @@ pub(crate) struct App {
     token: OnceLock<Option<Secret>>,
     /// First-run setup, while it waits for the wizard.
     setup: setup::Slot,
+    /// The wizard's ChatGPT login, which can outlive setup.
+    login: login::Login,
     ready: OnceLock<Ready>,
     /// Set on SIGTERM or SIGINT: ingest stops, and so do the workers once
     /// their chunk in flight is done.
@@ -181,10 +185,12 @@ pub(crate) async fn run_with(
     };
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let login = login::Login::new(args.data_dir.clone(), Arc::clone(&clock))?;
     let app: Shared = Arc::new(App {
         clock: Arc::clone(&clock),
         token: OnceLock::new(),
         setup: Mutex::new(pending),
+        login,
         ready: OnceLock::new(),
         stop: stop.clone(),
     });

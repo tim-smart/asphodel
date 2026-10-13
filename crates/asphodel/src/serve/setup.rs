@@ -186,7 +186,7 @@ impl Pending {
         {
             if llm.auth == LlmAuth::Chatgpt {
                 return Err(bad_request(
-                    "a ChatGPT subscription doesn't use an API key; leave it out and run `asphodel llm login` after setup",
+                    "a ChatGPT subscription doesn't use an API key; leave it out and log in instead",
                 ));
             }
             if self.env_llm_api_key.is_some() {
@@ -317,8 +317,8 @@ pub(crate) struct SetupDone {
     config: PathBuf,
     secrets: PathBuf,
     token: Option<String>,
-    /// The LLM is a ChatGPT subscription, which waits for
-    /// `asphodel llm login`.
+    /// The LLM is a ChatGPT subscription, which needs a login: the
+    /// wizard's, or `asphodel llm login`.
     llm_login: bool,
 }
 

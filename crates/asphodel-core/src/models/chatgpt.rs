@@ -392,7 +392,7 @@ pub enum LoginError {
     #[error("the issuer answered HTTP {status} at {step}")]
     Status { status: u16, step: &'static str },
 
-    #[error("the login wasn't approved within 15 minutes")]
+    #[error("the login wasn't approved in time")]
     Expired,
 
     #[error("the issuer's reply couldn't be read at {step}")]
@@ -455,6 +455,18 @@ pub fn device_code_login(
     clock: &dyn Clock,
     show: &mut dyn FnMut(&DeviceCode),
 ) -> Result<ChatgptTokens, LoginError> {
+    device_code_login_within(issuer, store, clock, LOGIN_WAIT, show)
+}
+
+/// [`device_code_login`], giving up with [`LoginError::Expired`] once the
+/// owner hasn't approved within `wait` instead of 15 minutes.
+pub fn device_code_login_within(
+    issuer: &str,
+    store: &TokenStore,
+    clock: &dyn Clock,
+    wait: Duration,
+    show: &mut dyn FnMut(&DeviceCode),
+) -> Result<ChatgptTokens, LoginError> {
     let base = issuer.trim_end_matches('/');
     let api = format!("{base}/api/accounts");
     let agent = issuer_agent();
@@ -505,7 +517,7 @@ pub fn device_code_login(
             break parse_login_reply(&text, step)?;
         }
         if status == 403 || status == 404 {
-            if started.elapsed() >= LOGIN_WAIT {
+            if started.elapsed() >= wait {
                 return Err(LoginError::Expired);
             }
             std::thread::sleep(code.interval);
