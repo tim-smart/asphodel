@@ -21,6 +21,40 @@ restarts it.
 
 ## Running it
 
+### With Docker
+
+The published image is `ghcr.io/tim-smart/asphodel:latest` (Linux amd64).
+It includes both models, so no separate model download is needed. `latest`
+tracks `main`; use a Git commit SHA as the tag to pin a build.
+
+Create a persistent data volume and give it to the image's non-root user
+(UID/GID 65532):
+
+```sh
+docker pull ghcr.io/tim-smart/asphodel:latest
+docker volume create asphodel-data
+docker run --rm --user 0:0 --entrypoint /bin/sh \
+  -v asphodel-data:/data ghcr.io/tim-smart/asphodel:latest \
+  -c 'chown 65532:65532 /data'
+
+docker run -d --name asphodel --restart unless-stopped \
+  -p 127.0.0.1:7720:7720 \
+  -v asphodel-data:/data \
+  ghcr.io/tim-smart/asphodel:latest \
+  serve --listen 0.0.0.0:7720 --data-dir /data
+```
+
+Open `http://127.0.0.1:7720/dashboard` to finish first-run setup. It writes
+the configuration and secrets into the data volume, alongside the memory
+store. Because the daemon listens off loopback inside the container, setup
+creates a bearer token and shows it once. Save it for the plugin's
+`ASPHODEL_TOKEN` environment variable below.
+
+Keep the host port bound to `127.0.0.1`: anyone who can reach an
+unconfigured daemon can complete setup. Hermes running on the host uses
+`http://127.0.0.1:7720`; in another container, use a shared private Docker
+network and the daemon's container name (`http://asphodel:7720`) instead.
+
 ### In Kubernetes
 
 `nix build .#image` builds the OCI image: the binary, ONNX Runtime, both
@@ -56,8 +90,33 @@ tuning file").
 
 ### The plugin
 
-Copy `plugin/` to `$HERMES_HOME/plugins/asphodel/`, then run
-`hermes memory setup` and pick `asphodel`. Setup writes the plugin's config,
+Install the plugin from its GitHub subdirectory using Hermes' shorthand
+(`owner/repo/path/to/plugin`):
+
+```sh
+hermes plugins install tim-smart/asphodel/plugin --enable
+```
+
+The `/plugin` subdirectory matters: the repository root is the daemon, not
+the plugin. Hermes installs it as `asphodel`, using `plugin/plugin.yaml`.
+Review and accept Hermes' prompts for this custom plugin source.
+
+If the daemon requires a bearer token (including the Docker setup above),
+set it in `$HERMES_HOME/.env` (`~/.hermes/.env` by default), or in the
+Hermes container's environment:
+
+```dotenv
+ASPHODEL_TOKEN=your-dashboard-token
+```
+
+Do this before memory setup so its optional history backfill can
+authenticate too. Setup does not prompt for the token.
+
+```sh
+hermes memory setup
+```
+
+Pick `asphodel` in memory setup. Setup writes the plugin's config,
 makes Asphodel the memory provider and turns Hermes' built-in memory off.
 `docs/operations.md` has the details, including the dashboard path that
 skips that last step.
