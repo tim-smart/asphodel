@@ -1711,6 +1711,10 @@ memories a skipped chunk would have made isn't known. A skipped chunk is
 not a failed one. It can't be retried, and `asphodel chunks --failed`
 doesn't list it.
 
+A chunk that failed during the rebuild and is retried later gets the same
+check: if a forget has reached it by then, it isn't extracted. The rebuild
+was over, so its `withheld` count stays as it was when it completed.
+
 ### Interruptions and failures
 
 The rebuild lives in the store. After a restart the workers carry on with

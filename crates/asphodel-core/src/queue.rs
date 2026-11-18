@@ -237,6 +237,11 @@ impl Lease {
     pub(crate) fn chunk_id(&self) -> i64 {
         self.chunk_id
     }
+
+    /// The rowid of the queue entry the lease is for.
+    pub(crate) fn queue_id(&self) -> i64 {
+        self.queue_id
+    }
 }
 
 impl PartialEq for Lease {

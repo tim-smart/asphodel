@@ -1985,6 +1985,43 @@ fn a_memory_forgotten_during_a_rebuild_doesnt_come_back_from_its_turn() {
 }
 
 #[test]
+fn a_chunk_passed_over_on_a_retry_after_a_rebuild_isnt_counted_in_it() {
+    let h = Harness::new();
+    // A turn the owner kept a memory from. It fails for good when the
+    // rebuild runs it again, and the rebuild completes without it.
+    h.said_turn(EARLIER, &format!("{MAYA} {TEA}"));
+    let maya = h.extract_one(notable(MAYA), &[]);
+    h.service.keep(BANK, &[maya.to_string()]).unwrap();
+    h.rebuild();
+    let failed = h.fail_head();
+    let done = h.rebuild_status();
+    assert_eq!(done.state, RebuildState::Complete);
+    assert_eq!((done.chunks, done.withheld, done.failed), (1, 0, 1));
+
+    // Maya is forgotten after that, and the failed chunk is retried. The
+    // erase is ahead of it on the queue, and the turn is still never shown
+    // to the LLM again.
+    h.forget(&[maya]);
+    let retried = h.service.retry_chunks(BANK, Some(&[failed])).unwrap();
+    assert_eq!(retried.retried, [failed]);
+    while h.erase_next().is_some() {}
+    let maya_again = json!({"claims": [quoting(notable(MAYA), TEA)], "used_injected_ids": []});
+    let llm = Recording {
+        sent: Mutex::new(Vec::new()),
+        replies: FakeLlm::scripted(MODEL, vec![maya_again]),
+    };
+    let passed_over = h.service.extract_next(BANK, &llm);
+    assert!(matches!(passed_over, Err(ExtractError::Forgotten)));
+    assert!(llm.sent.lock().unwrap().is_empty());
+
+    // The rebuild was over by then, so what it reports is what it reported
+    // when it completed. The chunk just isn't waiting to be retried now.
+    let after = h.rebuild_status();
+    assert_eq!(after, RebuildStatus { failed: 0, ..done });
+    assert_eq!(h.memory_count(), 0);
+}
+
+#[test]
 fn a_rebuild_keeps_what_the_owner_touched_and_carries_uses_to_the_new_memories() {
     let h = Harness::starting_with(START, "[strength]\ncorroborate_used = false\n");
     let maya = h.said(EARLIER, notable(MAYA));

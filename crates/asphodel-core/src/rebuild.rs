@@ -274,9 +274,11 @@ pub(crate) fn masked(mask: usize) -> String {
 /// ([`crate::erase::awaited`]). `false` for a chunk ingested after the
 /// bank's rebuild started, and for a bank never rebuilt.
 ///
-/// Extraction asks before call 1. A forget that arrives after that moves
-/// the bank's forget generation ([`forgot`]), which sends the chunk back
-/// to be asked again ([`Rerun::stale`]).
+/// Extraction asks in the transaction that reads the chunk, its context and
+/// the forget generation ([`rerun`]), so a forget is either seen here or
+/// moves the generation the chunk goes on to note ([`forgot`]), which
+/// sends it back to be asked again ([`Rerun::stale`]). It holds for a
+/// retry long after the rebuild, too.
 pub(crate) fn withheld(conn: &Connection, chunk_id: i64) -> Result<bool, rusqlite::Error> {
     let masked = masked(2);
     let rerun: Option<(i64, bool)> = conn
@@ -301,11 +303,19 @@ pub(crate) fn withheld(conn: &Connection, chunk_id: i64) -> Result<bool, rusqlit
 }
 
 /// Counts a chunk the rebuild took off the queue unextracted because it was
-/// [`withheld`], inside the transaction that takes it off.
-pub(crate) fn count_withheld(tx: &Transaction<'_>, bank_id: i64) -> Result<(), rusqlite::Error> {
+/// [`withheld`], inside the transaction that takes it off. Only a queue
+/// entry of the running rebuild counts: a failed chunk retried after the
+/// rebuild completed is withheld all the same, but it wasn't skipped during
+/// the rebuild, and a completed rebuild's counts don't change.
+pub(crate) fn count_withheld(
+    tx: &Transaction<'_>,
+    bank_id: i64,
+    queue_id: i64,
+) -> Result<(), rusqlite::Error> {
     tx.execute(
-        "UPDATE rebuilds SET withheld = withheld + 1 WHERE bank_id = ?1",
-        [bank_id],
+        "UPDATE rebuilds SET withheld = withheld + 1
+         WHERE bank_id = ?1 AND completed_at IS NULL AND queue_boundary >= ?2",
+        (bank_id, queue_id),
     )?;
     Ok(())
 }
