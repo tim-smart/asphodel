@@ -1745,13 +1745,26 @@ fn a_rebuild_extracts_the_banks_sources_again_with_recall_off_until_the_last_chu
     let h = h.restart_with("");
     refused_now(&h);
     assert_eq!(h.rebuild_status().remaining, 2);
+
+    // A turn that arrives now waits for the rebuild to complete, even one
+    // dated before everything in it, and even while the last chunk is out.
+    let late = turn("chat", at(LONG_AGO), BIKE);
+    h.service.ingest_turn(BANK, &late).unwrap();
     let new_tea = h.extract_one(notable(TEA), &[]);
-    let new_garden = h.extract_one(notable(GARDEN), &[]);
+    let last = h.claim().expect("queued");
+    assert!(h.claim().is_none(), "the late turn waits");
+    refused_now(&h);
+    let garden_again = json!({"claims": [notable(GARDEN)], "used_injected_ids": []});
+    let llm = FakeLlm::scripted(MODEL, vec![garden_again, json!({"claims": []})]);
+    let new_garden = h.service.extract_chunk(last, &llm, &[]).unwrap().memories[0];
 
     let done = h.rebuild_status();
     assert_eq!(done.state, RebuildState::Complete);
     assert_eq!((done.remaining, done.replaced, done.kept), (0, 3, 0));
     assert_eq!(h.memory_count(), 3);
+    h.extract_one(notable(BIKE), &[]);
+    assert!(h.claim().is_none(), "the late turn ran once");
+    assert_eq!(h.memory_count(), 4);
     for (old, new) in [(maya, new_maya), (tea, new_tea), (garden, new_garden)] {
         assert_ne!(old, new);
     }
@@ -1791,14 +1804,21 @@ fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
     h.said_turn(EARLIER, &format!("{MAYA} {TEA} {kettle}"));
     let both = h.extract_with(vec![notable(MAYA), notable(TEA)], &[]);
     let (maya, tea) = (both.memories[0], both.memories[1]);
-    // A document has no session, so nothing of the turn is its context.
-    h.doc("garden.md", "# Garden\n\nTim's garden needs water.\n");
+    // The next turn of the session had that one as its context.
+    let scones = "And the scones?";
+    h.said_turn(EARLIER, scones);
+    h.extract_nothing();
+    // So did the section after the dog's, in a document.
+    let (dog, indoors) = ("Tim's dog is called Rex.", "Rex sleeps indoors.");
+    let home = format!("# Dog\n\n{dog} {indoors}\n\n# Garden\n\n{GARDEN}\n");
+    h.doc("home.md", &home);
+    let rex = h.extract_one(notable(dog), &[]);
     h.extract_one(notable(GARDEN), &[]);
-    h.forget(&[maya]);
-    assert!(h.erase_next().is_some());
+    h.forget(&[maya, rex]);
+    while h.erase_next().is_some() {}
 
     let plan = h.service.rebuild_plan(BANK).unwrap();
-    assert_eq!((plan.chunks, plan.skipped.masked), (1, 1));
+    assert_eq!((plan.chunks, plan.skipped.masked), (2, 2));
     assert_eq!((plan.memories_replaced, plan.memories_kept), (1, 1));
     h.rebuild();
 
@@ -1809,6 +1829,7 @@ fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
         replies: FakeLlm::scripted(
             MODEL,
             vec![
+                json!({"claims": [], "used_injected_ids": []}),
                 json!({"claims": [notable(GARDEN)], "used_injected_ids": []}),
                 json!({"claims": []}),
                 maya_again,
@@ -1818,9 +1839,15 @@ fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
     };
     while h.service.extract_next(BANK, &llm).unwrap().is_some() {}
 
+    // The chunks around the masked ones ran, and what the masks left of a
+    // masked chunk wasn't shown as their context either.
     let sent = llm.sent.lock().unwrap();
-    assert!(!sent.is_empty());
-    assert!(sent.iter().all(|text| !text.contains(kettle)), "{sent:?}");
+    for ran in [scones, GARDEN] {
+        assert!(sent.iter().any(|text| text.contains(ran)), "{sent:?}");
+    }
+    for left in [kettle, indoors] {
+        assert!(sent.iter().all(|text| !text.contains(left)), "{sent:?}");
+    }
     assert_eq!(h.rebuild_status().state, RebuildState::Complete);
     // The memory on the masked chunk is as it was, and nothing says Maya.
     assert_eq!(h.exist(&[maya, tea]), [false, true]);
@@ -1870,6 +1897,28 @@ fn a_rebuild_keeps_what_the_owner_touched_and_carries_uses_to_the_new_memories()
         .collect();
     assert_eq!(kinds, ["created", "used"]);
     assert_eq!(h.memory_count(), 2);
+}
+
+#[test]
+fn a_model_over_memories_a_rebuild_kept_gets_its_answer_back() {
+    let h = Harness::new();
+    let maya = h.said(EARLIER, notable(MAYA));
+    h.service.keep(BANK, &[maya.to_string()]).unwrap();
+    h.profile_citing("Tim has a daughter called Maya.", &[maya]);
+
+    h.rebuild();
+    assert_eq!(h.profile().answer, None);
+    assert!(h.extract_with(vec![notable(MAYA)], &[]).memories.is_empty());
+    assert_eq!(h.rebuild_status().state, RebuildState::Complete);
+    assert_eq!(h.exist(&[maya]), [true]);
+
+    // The profile reads the same memory as before. Its answer was blanked
+    // all the same, so the refresh the rebuild asked for writes it again.
+    h.set(h.now() + SignedDuration::from_hours(1));
+    let input = h.service.refresh_input(BANK, PROFILE_NAME).unwrap();
+    let llm = FakeLlm::scripted(MODEL, vec![written(MAYA, &[handle(&input, maya)])]);
+    h.service.run_refreshes(&llm).unwrap();
+    assert!(h.profile().answer.is_some());
 }
 
 #[test]

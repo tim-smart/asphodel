@@ -429,13 +429,27 @@ impl Service {
     /// The first chunk in `bank`'s extraction queue that isn't out already,
     /// or `None` when there's none or the bank already has `[llm]
     /// concurrency` leases out ([`crate::queue`]).
+    ///
+    /// A chunk queued after a rebuild started waits for the rebuild to
+    /// complete. A rebuild a restart left with nothing to run is completed
+    /// here, so the chunks behind it aren't left waiting for it.
     pub fn claim_chunk(&self, bank: &str) -> Result<Option<Lease>, QueueError> {
-        crate::queue::claim(
-            &self.store,
-            &self.leases,
-            bank,
-            self.tuning.llm.concurrency as usize,
-        )
+        let limit = self.tuning.llm.concurrency as usize;
+        if let Some(lease) = crate::queue::claim(&self.store, &self.leases, bank, limit)? {
+            return Ok(Some(lease));
+        }
+        let running = {
+            let conn = self.store.connection();
+            match crate::ingest::find_bank(&conn, bank)? {
+                Some((bank_id, _)) if crate::rebuild::running(&conn, bank_id)? => Some(bank_id),
+                _ => None,
+            }
+        };
+        let Some(bank_id) = running else {
+            return Ok(None);
+        };
+        self.settle_rebuild(bank_id)?;
+        crate::queue::claim(&self.store, &self.leases, bank, limit)
     }
 
     /// Marks a leased chunk extracted and takes it off the queue.
@@ -1401,16 +1415,11 @@ impl Service {
     /// model of the bank is requested for one refresh, and its block and
     /// sessions start over.
     fn settle_rebuild(&self, bank_id: i64) -> Result<(), StoreError> {
-        let Some(models) = crate::rebuild::complete(&self.store, bank_id)? else {
+        let Some(models) = crate::rebuild::complete(&self.store, &self.schedule, bank_id)? else {
             return Ok(());
         };
-        let now = self.now();
-        {
-            let conn = self.store.connection();
-            crate::mental_models::request(&conn, &self.schedule, &models, now, false)?;
-        }
         if !models.is_empty() {
-            self.schedule.triggered(bank_id, now);
+            self.schedule.triggered(bank_id, self.now());
         }
         self.sessions.forget_bank(bank_id);
         self.blocks.invalidate(bank_id);

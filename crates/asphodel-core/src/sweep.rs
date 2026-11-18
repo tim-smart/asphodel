@@ -471,6 +471,11 @@ fn sweep_sources(
     let now = micros(now);
     let mut conn = store.connection();
     let tx = conn.transaction()?;
+    // A rebuild can start while this sweep runs. Its chunks need their text,
+    // so the hold is read again in the transaction that would delete it.
+    if crate::rebuild::held(&tx)?.contains(&bank_id) {
+        return Ok(());
+    }
 
     let swept_failed_chunks = tx.execute(
         "UPDATE chunks SET text = NULL, call1_output = NULL, tombstoned_at = ?3

@@ -1596,10 +1596,12 @@ The dry run counts what is left out:
 
 ### Cost
 
-One call 1 per chunk and a call 2 for most, so between one and two LLM
-calls per chunk, plus one refresh per mental model at the end. The dry run
-prints the chunk count. The calls go through the bank's ordinary worker,
-under `llm.concurrency`, with the usual retries and holds.
+One call 1 per chunk and a call 2 for most, so roughly one to two LLM
+calls per chunk, plus one refresh per mental model at the end. That is an
+estimate and no ceiling: a chunk that fails is retried, and a
+reconciliation made stale by another chunk's commit runs again. The dry
+run prints the chunk count. The calls go through the bank's ordinary
+worker, under `llm.concurrency`, with the usual retries and holds.
 
 Recall, prefetch, the system prompt, the agenda and mental model refreshes
 answer 503 for the bank from the start until its last chunk has run. What
@@ -1607,8 +1609,10 @@ the bank holds in between is part old and part new, so nothing is served
 from it. The Hermes plugin treats that 503 like any other outage: the
 agent runs without memory for the bank. Other banks are unaffected.
 
-Turns and documents keep arriving while it runs. They queue behind the
-rebuild and are extracted once, after it.
+Turns and documents keep arriving while it runs. They wait in the queue
+until the rebuild completes and are extracted once, after it. That holds
+whatever their dates, so a late turn dated before the chunks still to run
+doesn't go ahead of them.
 
 ### Before it starts
 
@@ -1662,9 +1666,10 @@ Kept as they are, id included:
 
 A chunk a forget masked is never extracted again, so the model can't
 rewrite what was erased from what surrounds the mask. Memories still
-resting on such a chunk stay as they are. A masked turn can still appear,
-masked, as context for a later turn of its session, as it does for any new
-turn. "What forget can't reach" above has the one case a rebuild adds.
+resting on such a chunk stay as they are. It isn't shown as context
+either: a chunk run again doesn't get a masked earlier turn of its session,
+or the text of a masked section before it in its document. "What forget
+can't reach" above has the one case a rebuild adds.
 
 A forget made while a rebuild runs hides the memory at once. Its erase
 waits in the queue behind the rebuild's chunks.

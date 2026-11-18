@@ -8,13 +8,15 @@
 //! turns and documents. The workers then extract them as they extract
 //! anything, each chunk as of its source's time ([`rerun`]). While chunks
 //! of the rebuild are queued the bank's recall, injection and agenda are
-//! off. When the last one leaves the queue, [`complete`] carries over what
-//! the rerun can't derive and the bank is served again. The nightly sweep
-//! stays off for the bank until [`ack`].
+//! off, and a chunk queued after the start isn't handed out
+//! ([`crate::queue`]). When the last one leaves the queue, [`complete`]
+//! carries over what the rerun can't derive and the bank is served again.
+//! The nightly sweep stays off for the bank until [`ack`].
 //!
 //! What a rebuild never touches:
 //!
-//! - A chunk a forget masked. It's never sent to the LLM again, and the
+//! - A chunk a forget masked. It's never sent to the LLM again, as the
+//!   chunk extracted or as the context of another ([`masked`]), and the
 //!   memories resting on it stay as they are.
 //! - A memory the owner touched: its significance or `kept` was set, the
 //!   owner retracted, ended or reopened it, it was translated, or an entity
@@ -36,6 +38,7 @@ use serde::Serialize;
 
 use crate::erase::REDACTION_MASK;
 use crate::ingest::{PRIORITY_TURN, find_bank};
+use crate::mental_models::Schedule;
 use crate::operations::META_LAST_BACKUP;
 use crate::queue::BankHold;
 use crate::store::bank::log_edit;
@@ -241,6 +244,16 @@ pub(crate) fn held(conn: &Connection) -> Result<BTreeSet<i64>, rusqlite::Error> 
     statement.query_map([], |row| row.get(0))?.collect()
 }
 
+/// SQL for "a forget masked some of chunk `c`", with [`REDACTION_MASK`] as
+/// parameter `mask`. Such a chunk is never shown to the LLM again, as the
+/// chunk extracted or as the context of another.
+pub(crate) fn masked(mask: usize) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM chunk_redactions r WHERE r.chunk_id = c.id)
+          OR instr(COALESCE(c.text, ''), ?{mask}) > 0)"
+    )
+}
+
 /// What extraction needs to know about a chunk a rebuild runs again.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Rerun {
@@ -333,16 +346,16 @@ fn survey(conn: &Connection, bank_id: i64) -> Result<Survey, rusqlite::Error> {
     let mut skipped = Skipped::default();
     let mut chunks = Vec::new();
     {
-        let mut statement = conn.prepare(
+        let masked = masked(2);
+        let mut statement = conn.prepare(&format!(
             "SELECT c.id, c.source_id, c.text IS NULL OR c.tombstoned_at IS NOT NULL
                       OR s.tombstoned_at IS NOT NULL,
                     s.removed_at IS NOT NULL,
-                    EXISTS (SELECT 1 FROM chunk_redactions r WHERE r.chunk_id = c.id)
-                      OR instr(COALESCE(c.text, ''), ?2) > 0
+                    {masked}
              FROM chunks c JOIN sources s ON s.id = c.source_id
              WHERE c.bank_id = ?1
-             ORDER BY s.observed_at, s.ingested_at, c.id",
-        )?;
+             ORDER BY s.observed_at, s.ingested_at, c.id"
+        ))?;
         let mut rows = statement.query((bank_id, REDACTION_MASK.to_string()))?;
         while let Some(row) = rows.next()? {
             let (gone, removed, masked): (bool, bool, bool) =
@@ -659,8 +672,10 @@ pub(crate) fn start(
          WHERE model_id IN (SELECT id FROM mental_models WHERE bank_id = ?1)",
         [bank_id],
     )?;
+    // The fingerprint goes too. A model whose memories were all kept would
+    // otherwise look unchanged to its refresh and stay blank.
     tx.execute(
-        "UPDATE mental_models SET answer = NULL WHERE bank_id = ?1",
+        "UPDATE mental_models SET answer = NULL, last_fingerprint = NULL WHERE bank_id = ?1",
         [bank_id],
     )?;
     // What sessions were shown names memories that are going.
@@ -760,7 +775,11 @@ pub(crate) fn start(
 /// any more, and turns the bank's recall back on. `None` while chunks are
 /// still queued, or when no rebuild is running. Returns the bank's models,
 /// which the service refreshes.
-pub(crate) fn complete(store: &Store, bank_id: i64) -> Result<Option<BTreeSet<i64>>, StoreError> {
+pub(crate) fn complete(
+    store: &Store,
+    schedule: &Schedule,
+    bank_id: i64,
+) -> Result<Option<BTreeSet<i64>>, StoreError> {
     let now = store.now();
     let mut conn = store.connection();
     let tx = conn.transaction()?;
@@ -804,6 +823,9 @@ pub(crate) fn complete(store: &Store, bank_id: i64) -> Result<Option<BTreeSet<i6
             .query_map([bank_id], |row| row.get(0))?
             .collect::<Result<_, _>>()?
     };
+    // Requested with the completion, so a restart between the two can't
+    // leave a completed rebuild whose models nothing refreshes.
+    crate::mental_models::request(&tx, schedule, &models, now, false)?;
     tx.commit()?;
     tracing::info!(bank_id, carried, dropped, "a rebuild completed");
     Ok(Some(models))

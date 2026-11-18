@@ -17,6 +17,7 @@ use super::{
 };
 use crate::agenda::has_ended;
 use crate::config::Tuning;
+use crate::erase::REDACTION_MASK;
 use crate::ingest::TURN_SEPARATOR;
 use crate::queue::{Lease, SourceKind};
 use crate::store::strength::{StrengthLoader, world_time};
@@ -154,10 +155,16 @@ pub(super) fn assemble(
         source.source_text.as_deref().unwrap_or("").chars().count() + TURN_SEPARATOR.chars().count()
     });
 
+    // A rebuild leaves out a chunk a forget masked so the model can't
+    // rewrite what was erased from what surrounds the mask. That holds for
+    // the context of the chunks it does run, too.
+    let unmasked = rerun.is_some();
     let (context, context_times) = if is_turn {
-        earlier_turns(conn, bank_id, &source)?.into_iter().unzip()
+        earlier_turns(conn, bank_id, &source, unmasked)?
+            .into_iter()
+            .unzip()
     } else {
-        (text_before(&source), Vec::new())
+        (text_before(conn, &source, unmasked)?, Vec::new())
     };
 
     let user = seeded(conn, bank_id, "user")?;
@@ -288,25 +295,37 @@ fn calendar(reference: Date) -> Vec<Date> {
 }
 
 /// Up to [`CONTEXT_TURNS`] earlier turns of the session that still have
-/// their text, oldest first, clipped to [`CONTEXT_CHARS`].
+/// their text, oldest first, clipped to [`CONTEXT_CHARS`]. With `unmasked`,
+/// a turn a forget masked isn't one of them.
 fn earlier_turns(
     conn: &Connection,
     bank_id: i64,
     source: &Source,
+    unmasked: bool,
 ) -> Result<Vec<(String, ContextTurnTime)>, rusqlite::Error> {
     let (Some(session_id), Some(message_at)) = (&source.session_id, source.message_at) else {
         return Ok(Vec::new());
     };
-    let mut statement = conn.prepare_cached(
+    let masked = crate::rebuild::masked(6);
+    let mut statement = conn.prepare_cached(&format!(
         "SELECT text, reply, observed_at, timezone FROM sources
          WHERE bank_id = ?1 AND kind = 'turn' AND session_id = ?2 AND message_at < ?3
            AND text IS NOT NULL
+           AND (?5 = 0 OR NOT EXISTS (SELECT 1 FROM chunks c
+                                      WHERE c.source_id = sources.id AND {masked}))
          ORDER BY message_at DESC, ingested_at DESC, id DESC
-         LIMIT ?4",
-    )?;
+         LIMIT ?4"
+    ))?;
     let mut turns: Vec<(String, ContextTurnTime)> = statement
         .query_map(
-            (bank_id, session_id, message_at, CONTEXT_TURNS as i64),
+            (
+                bank_id,
+                session_id,
+                message_at,
+                CONTEXT_TURNS as i64,
+                unmasked,
+                REDACTION_MASK.to_string(),
+            ),
             |row| {
                 let text: String = row.get(0)?;
                 let reply: Option<String> = row.get(1)?;
@@ -350,18 +369,38 @@ fn clip(passages: Vec<(String, ContextTurnTime)>, cap: usize) -> Vec<(String, Co
         .collect()
 }
 
-/// The [`PREVIOUS_CHUNK_CHARS`] of the document before the chunk.
-fn text_before(source: &Source) -> Vec<String> {
+/// The [`PREVIOUS_CHUNK_CHARS`] of the document before the chunk. With
+/// `unmasked`, it starts after the last chunk before this one that a forget
+/// masked, and it's nothing at all if a mask is still in it: a section this
+/// version shares with an earlier one has no chunk of its own.
+fn text_before(
+    conn: &Connection,
+    source: &Source,
+    unmasked: bool,
+) -> Result<Vec<String>, rusqlite::Error> {
     let Some(text) = &source.source_text else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let start = source.start_offset;
-    let from = start.saturating_sub(PREVIOUS_CHUNK_CHARS);
+    let mut from = start.saturating_sub(PREVIOUS_CHUNK_CHARS);
+    if unmasked {
+        let masked = crate::rebuild::masked(3);
+        let last: Option<i64> = conn.query_row(
+            &format!(
+                "SELECT MAX(c.end_offset) FROM chunks c
+                 WHERE c.source_id = ?1 AND c.start_offset < ?2 AND {masked}"
+            ),
+            (source.source_id, start as i64, REDACTION_MASK.to_string()),
+            |row| row.get(0),
+        )?;
+        let last = last.map_or(0, |end| usize::try_from(end).unwrap_or(0));
+        from = from.max(last.min(start));
+    }
     let before: String = text.chars().skip(from).take(start - from).collect();
-    if before.is_empty() {
-        Vec::new()
+    if before.is_empty() || (unmasked && before.contains(REDACTION_MASK)) {
+        Ok(Vec::new())
     } else {
-        vec![before]
+        Ok(vec![before])
     }
 }
 

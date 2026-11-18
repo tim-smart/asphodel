@@ -23,7 +23,8 @@
 //! them belong to the erase path, and are a barrier: no chunk queued after
 //! a pending erase is handed out until the erase has run, so no chunk
 //! reconciles against a memory being forgotten unless it was queued before
-//! the forget.
+//! the forget. A running rebuild ([`crate::rebuild`]) is one too: a chunk
+//! queued after it started waits until it has completed.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -306,7 +307,8 @@ fn bank_id(conn: &rusqlite::Connection, bank: &str) -> Result<i64, QueueError> {
 /// The first chunk in the bank's queue that isn't out already, or `None`
 /// when there's none, the bank has `limit` leases out, or it's held. A
 /// chunk queued after a pending erase isn't handed out until the erase has
-/// run.
+/// run, and one queued after a rebuild started isn't until the rebuild has
+/// completed: whatever its time, it's read against the rebuilt bank.
 pub(crate) fn claim(
     store: &Store,
     leases: &Leases,
@@ -332,6 +334,10 @@ pub(crate) fn claim(
            AND q.id < COALESCE(
              (SELECT MIN(e.id) FROM extraction_queue e
               WHERE e.bank_id = ?1 AND e.kind = 'erase'),
+             9223372036854775807)
+           AND q.id <= COALESCE(
+             (SELECT r.queue_boundary FROM rebuilds r
+              WHERE r.bank_id = ?1 AND r.completed_at IS NULL),
              9223372036854775807)
          ORDER BY q.priority, q.observed_at, s.ingested_at, q.id",
     )?;
