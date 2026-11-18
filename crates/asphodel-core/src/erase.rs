@@ -591,18 +591,7 @@ pub(crate) fn erase_next(
     } else {
         EraseReason::Forget
     };
-    let named: Vec<i64> = serde_json::from_str(&memory_ids).unwrap_or_default();
-    let links = bank_links(&tx, bank_id)?;
-    let mut members = BTreeSet::new();
-    for id in named {
-        let exists = tx
-            .query_row("SELECT 1 FROM memories WHERE id = ?1", [id], |_| Ok(()))
-            .optional()?
-            .is_some();
-        if exists {
-            members.extend(chain(&links, id));
-        }
-    }
+    let members = erase_members(&tx, &bank_links(&tx, bank_id)?, &memory_ids)?;
     let (memories, aftermath) = erase_chain(&tx, store, bank_id, &members, reason)?;
     tx.execute("DELETE FROM extraction_queue WHERE id = ?1", [job_id])?;
     tx.commit()?;
@@ -612,6 +601,25 @@ pub(crate) fn erase_next(
         "erased a chain"
     );
     Ok(Some((bank_id, Erased { reason, memories }, aftermath)))
+}
+
+fn erase_members(
+    conn: &Connection,
+    links: &[Link],
+    memory_ids: &str,
+) -> Result<BTreeSet<i64>, rusqlite::Error> {
+    let named: Vec<i64> = serde_json::from_str(memory_ids).unwrap_or_default();
+    let mut members = BTreeSet::new();
+    for id in named {
+        let exists = conn
+            .query_row("SELECT 1 FROM memories WHERE id = ?1", [id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if exists {
+            members.extend(chain(links, id));
+        }
+    }
+    Ok(members)
 }
 
 /// The erase both reasons share, inside the caller's transaction:
@@ -972,9 +980,9 @@ fn chain_spans(
 pub(crate) struct Awaited {
     /// The chunks, by rowid.
     pub chunks: BTreeSet<i64>,
-    /// The sources holding those chunks, and the document versions that
-    /// hold a masked passage in a section with no chunk of its own.
-    pub sources: BTreeSet<i64>,
+    /// Affected sources and their text-relative spans. A cross-version
+    /// match can span chunks and have no corresponding chunk mask.
+    pub sources: BTreeMap<i64, Spans>,
 }
 
 /// Reads what the bank's waiting forgets will mask, with the erase's own
@@ -983,28 +991,27 @@ pub(crate) struct Awaited {
 /// masked already ([`crate::rebuild::withheld`]). Empty when no forget is
 /// waiting.
 pub(crate) fn awaited(conn: &Connection, bank_id: i64) -> Result<Awaited, rusqlite::Error> {
-    let members: BTreeSet<i64> = {
-        let mut statement = conn.prepare_cached(
-            "SELECT id FROM memories WHERE bank_id = ?1 AND hidden_at IS NOT NULL",
-        )?;
-        statement
-            .query_map([bank_id], |row| row.get(0))?
-            .collect::<Result<_, _>>()?
-    };
+    let mut jobs = conn.prepare_cached(
+        "SELECT memory_ids FROM extraction_queue WHERE bank_id = ?1 AND kind = 'erase' ORDER BY id",
+    )?;
+    let jobs = jobs
+        .query_map([bank_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
     let mut awaited = Awaited::default();
-    if members.is_empty() {
+    if jobs.is_empty() {
         return Ok(awaited);
     }
-    let rows = passages(conn, &members)?;
-    let (spans, _) = chain_spans(conn, &members, &rows)?;
-    let masks = masks(conn, &spans)?;
-    awaited.sources.extend(masks.sources.keys());
-    let mut source = conn.prepare_cached("SELECT source_id FROM chunks WHERE id = ?1")?;
-    for chunk in masks.chunks.keys() {
-        awaited.chunks.insert(*chunk);
-        awaited
-            .sources
-            .insert(source.query_row([chunk], |row| row.get(0))?);
+    let links = bank_links(conn, bank_id)?;
+    for job in jobs {
+        // An exact legacy mention in another job cannot satisfy this job's search.
+        let members = erase_members(conn, &links, &job)?;
+        let rows = passages(conn, &members)?;
+        let (spans, _) = chain_spans(conn, &members, &rows)?;
+        let masks = masks(conn, &spans)?;
+        for (id, (text, _)) in masks.sources {
+            awaited.sources.entry(id).or_default().extend(text);
+        }
+        awaited.chunks.extend(masks.chunks.keys());
     }
     Ok(awaited)
 }

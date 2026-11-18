@@ -1168,6 +1168,10 @@ What forget can't reach:
   forgotten memory with a new one outside its chain, whose sentence may
   restate the forgotten content. The erase clears its `ended_by` and leaves
   it. Find it with `asphodel recall` and forget it too.
+- **Ordinary extraction already in flight.** If a later chunk read the
+  forgotten context before the forget, it can still write a memory from
+  that context. A retry can also reuse its saved call 1 reply. Forget any
+  resulting memory separately.
 - **New input.** Forget blocks the same input, not the same words. A later
   turn that repeats them, or an edited section of a document that still
   contains them, is new input and can bring the memory back. Take the words

@@ -321,7 +321,7 @@ fn earlier_turns(
             break;
         };
         let id: i64 = row.get(0)?;
-        if awaited.sources.contains(&id) {
+        if awaited.sources.contains_key(&id) {
             continue;
         }
         let text: String = row.get(1)?;
@@ -434,10 +434,20 @@ fn own_from(
         let adjoins = chars
             .get(end..cursor)
             .is_some_and(|gap| gap.iter().all(|c| c.is_whitespace()));
-        if masked || awaited.chunks.contains(&id) || !adjoins {
+        let start = usize::try_from(chunk_start).unwrap_or(0).min(end);
+        // A cross-version match can straddle a chunk boundary and exist
+        // only in the source. Check the whole chunk, not just its last 400 chars.
+        let source_mask = chars
+            .get(start..cursor)
+            .is_some_and(|part| part.contains(&REDACTION_MASK))
+            || awaited
+                .sources
+                .get(&source.source_id)
+                .is_some_and(|spans| spans.iter().any(|&(a, b)| a < cursor && b > start));
+        if masked || awaited.chunks.contains(&id) || source_mask || !adjoins {
             break;
         }
-        cursor = usize::try_from(chunk_start).unwrap_or(0).min(end);
+        cursor = start;
     }
     Ok(cursor.max(floor))
 }
