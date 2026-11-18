@@ -1796,6 +1796,84 @@ impl LlmClient for Recording {
 }
 
 #[test]
+fn later_turns_dont_receive_a_forgotten_turns_reply_as_context() {
+    let h = Harness::new();
+    let reply = "Your daughter Maya is six.";
+    let first = Turn {
+        assistant_text: reply.into(),
+        ..turn("earlier", at(EARLIER) - minutes(1), MAYA)
+    };
+    h.service.ingest_turn(BANK, &first).unwrap();
+    let maya = h.extract_one(notable(MAYA), &[]);
+
+    let queued = "Yes, she is.";
+    h.said_turn(EARLIER, queued);
+    h.forget(&[maya]);
+    let llm = Recording {
+        sent: Mutex::new(Vec::new()),
+        replies: FakeLlm::scripted(
+            MODEL,
+            vec![json!({"claims": [], "used_injected_ids": []}); 2],
+        ),
+    };
+    h.service
+        .extract_next(BANK, &llm)
+        .unwrap()
+        .expect("queued turn");
+    assert!(h.erase_next().is_some());
+
+    let later = "How about tomorrow?";
+    h.said_turn(EARLIER, later);
+    h.service
+        .extract_next(BANK, &llm)
+        .unwrap()
+        .expect("later turn");
+    let sent = llm.sent.lock().unwrap();
+    assert!(sent[0].contains(queued));
+    assert!(sent[1].contains(later));
+    assert!(sent.iter().all(|text| !text.contains(reply)), "{sent:?}");
+}
+
+#[test]
+fn a_pending_cross_version_mask_can_cut_across_sections() {
+    let h = Harness::new();
+    let passage = "Family notes\n# Maya";
+    // Inside a code block the heading is part of the same section.
+    h.doc("notes.md", &format!("~~~\n{passage}\n~~~"));
+    let maya = h.extract_one(quoting(notable(MAYA), passage), &[]);
+    let restatement = "Maya is the name of his daughter.";
+    h.doc(
+        "notes.md",
+        &format!("{passage}\n{restatement}\n# Garden\n{GARDEN}"),
+    );
+    h.extract_nothing();
+    h.extract_nothing();
+    h.forget(&[maya]);
+
+    let lease = h.claim().expect("garden section");
+    let input = h.service.call1_input(&lease, &[]).unwrap();
+    assert!(input.text.contains(GARDEN));
+    assert!(input.context.iter().all(|text| !text.contains(restatement)));
+}
+
+#[test]
+fn a_document_section_doesnt_receive_text_from_a_section_awaiting_forget() {
+    let h = Harness::new();
+    let reply = "Maya is the name of his daughter.";
+    h.doc(
+        "home.md",
+        &format!("# Family\n\n{MAYA} {reply}\n\n# Garden\n\n{GARDEN}"),
+    );
+    let maya = h.extract_one(notable(MAYA), &[]);
+    h.forget(&[maya]);
+
+    let lease = h.claim().expect("garden section");
+    let input = h.service.call1_input(&lease, &[]).unwrap();
+    assert!(input.text.contains(GARDEN));
+    assert!(input.context.iter().all(|text| !text.contains(reply)));
+}
+
+#[test]
 fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
     let h = Harness::new();
     // One turn, two memories: forgetting Maya masks her passage and leaves
@@ -2110,4 +2188,72 @@ fn the_sweep_leaves_a_rebuilt_bank_alone_until_the_rebuild_is_acknowledged() {
     assert_eq!(swept.ran.len(), 1);
     assert_eq!(swept.ran[0].purged_memories, 1);
     assert_eq!(h.exist(&[garden_again]), [false]);
+}
+
+#[test]
+fn a_second_queued_forget_doesnt_narrow_a_legacy_documents_mask() {
+    let (h, maya, tea) = maya_and_tea();
+    let loose = "Maya is my daughter.";
+    let doc = h.doc(
+        "notes.md",
+        &format!("# Drinks\n\n{TEA}\n\n# Family\n\n{loose}\n\n# Garden\n\n{GARDEN}"),
+    );
+    h.extract_nothing();
+    h.extract_mention(quoting(notable(MAYA), loose), maya);
+    h.make_legacy();
+
+    // The first job has no exact passage in the document. Only the second does.
+    h.forget(&[maya]);
+    h.forget(&[tea]);
+    let lease = h.claim().expect("garden section ahead of both erases");
+    let input = h.service.call1_input(&lease, &[]).unwrap();
+    assert!(input.text.contains(GARDEN));
+    let llm = FakeLlm::scripted(MODEL, vec![json!({"claims": [], "used_injected_ids": []})]);
+    h.service.extract_chunk(lease, &llm, &[]).unwrap();
+
+    assert_eq!(h.erase_next().unwrap().memories, BTreeSet::from([maya]));
+    assert!(!h.text(doc.source).contains(loose));
+    assert_eq!(h.erase_next().unwrap().memories, BTreeSet::from([tea]));
+    assert!(
+        input.context.iter().all(|text| !text.contains(loose)),
+        "{:?}",
+        input.context
+    );
+}
+
+#[test]
+fn document_context_excludes_a_section_the_second_erase_will_mask() {
+    let h = Harness::new();
+    h.doc("garden.md", "The blue gate sticks.");
+    let claims = h.extract_with(
+        vec![
+            quoting(notable("The gate is blue."), "blue"),
+            quoting(notable("The gate sticks."), "blue gate sticks"),
+        ],
+        &[],
+    );
+    let (color, condition) = (claims.memories[0], claims.memories[1]);
+    let passage = "gray gate sticks";
+    let edited = h.doc(
+        "garden.md",
+        &format!("# Gate\nThe {passage}.\n# Watering\n{GARDEN}"),
+    );
+    h.extract_nothing();
+    h.forget(&[color]);
+    h.forget(&[condition]);
+    let llm = Recording {
+        sent: Mutex::new(Vec::new()),
+        replies: FakeLlm::scripted(MODEL, vec![json!({"claims": [], "used_injected_ids": []})]),
+    };
+    h.service
+        .extract_next(BANK, &llm)
+        .unwrap()
+        .expect("watering section");
+    let sent = llm.sent.lock().unwrap();
+    assert!(sent[0].contains(GARDEN));
+    assert!(h.erase_next().is_some());
+    assert!(h.text(edited.source).contains(passage));
+    assert!(h.erase_next().is_some());
+    assert!(!h.text(edited.source).contains(passage));
+    assert!(!sent[0].contains(passage));
 }
