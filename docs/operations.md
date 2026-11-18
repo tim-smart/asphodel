@@ -1151,6 +1151,11 @@ The turn that asks to forget is never stored. The plugin sees the
 `memory_forget` call and sends the turn with `forget_requested`, and the
 daemon keeps only its key, as a tombstone.
 
+When building extraction context, the daemon skips the whole earlier turn
+if the forget masked any of it, including when only the reply survives.
+In a document it stops at the first masked section when reading backwards.
+Both rules apply as soon as the forget is queued.
+
 What forget can't reach:
 
 - **Backups.** A backup taken before the forget still holds the content
@@ -1167,10 +1172,6 @@ What forget can't reach:
   turn that repeats them, or an edited section of a document that still
   contains them, is new input and can bring the memory back. Take the words
   out of a document before sending its next version.
-- **Later turns of the session.** Extraction shows a turn the few turns
-  before it in its session. A turn that arrives after the forget still gets
-  what the mask left of a masked one, its reply included, and can make a
-  memory from what it reads there.
 - **A rebuild reading other turns.** A rebuild never extracts a chunk a
   forget masked. A different turn that restates the forgotten thing is
   not masked. If it made no memory the first time, because the claim was
@@ -1670,18 +1671,10 @@ Kept as they are, id included:
 
 A chunk a forget masked is never extracted again, so the model can't
 rewrite what was erased from what surrounds the mask. Memories still
-resting on such a chunk stay as they are. It isn't shown as context
-either: a chunk run again doesn't get a masked earlier turn of its session,
-or the text of a masked section before it in its document. A section that
-a document version shares with an earlier one has no chunk in that version,
-so whether a forget reached it can't be read there. The section after it
-runs again with no preceding text at all.
-
-These rules cover the chunks a rebuild runs again and nothing else. A turn
-that arrives after the rebuild started waits, then is extracted the
-ordinary way, and ordinary extraction shows it the earlier turns of its
-session, including what a mask left of one. "What forget can't reach" above
-lists that, and the one case a rebuild adds.
+resting on such a chunk stay as they are. The same context rules apply during
+and outside a rebuild. Preceding document text must come from contiguous,
+unmasked chunks in the same version. A section shared with an earlier
+version has no chunk in this version, so extraction stops there too.
 
 A forget made while a rebuild runs hides the memory at once. Its erase
 waits in the queue behind the rebuild's chunks, so the text is still there,

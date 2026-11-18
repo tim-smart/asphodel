@@ -155,21 +155,14 @@ pub(super) fn assemble(
         source.source_text.as_deref().unwrap_or("").chars().count() + TURN_SEPARATOR.chars().count()
     });
 
-    // A rebuild leaves out a chunk a forget masked so the model can't
-    // rewrite what was erased from what surrounds the mask. That holds for
-    // the context of the chunks it does run, too.
-    // A forget still waiting to mask counts as one that has.
-    let awaited = match &rerun {
-        Some(_) => Some(crate::erase::awaited(conn, bank_id)?),
-        None => None,
-    };
-    let fence = awaited.as_ref();
+    // Even a surviving reply can restate the forgotten passage.
+    let awaited = crate::erase::awaited(conn, bank_id)?;
     let (context, context_times) = if is_turn {
-        earlier_turns(conn, bank_id, &source, fence)?
+        earlier_turns(conn, bank_id, &source, &awaited)?
             .into_iter()
             .unzip()
     } else {
-        (text_before(conn, &source, fence)?, Vec::new())
+        (text_before(conn, &source, &awaited)?, Vec::new())
     };
 
     let user = seeded(conn, bank_id, "user")?;
@@ -300,40 +293,35 @@ fn calendar(reference: Date) -> Vec<Date> {
 }
 
 /// Up to [`CONTEXT_TURNS`] earlier turns of the session that still have
-/// their text, oldest first, clipped to [`CONTEXT_CHARS`]. With a `fence`,
-/// a turn a forget masked, or one still waiting will, isn't one of them.
+/// their text, oldest first, clipped to [`CONTEXT_CHARS`]. Excludes whole
+/// turns masked by a completed or queued forget.
 fn earlier_turns(
     conn: &Connection,
     bank_id: i64,
     source: &Source,
-    fence: Option<&Awaited>,
+    awaited: &Awaited,
 ) -> Result<Vec<(String, ContextTurnTime)>, rusqlite::Error> {
     let (Some(session_id), Some(message_at)) = (&source.session_id, source.message_at) else {
         return Ok(Vec::new());
     };
-    let masked = crate::rebuild::masked(5);
+    let masked = crate::rebuild::masked(4);
     let mut statement = conn.prepare_cached(&format!(
         "SELECT id, text, reply, observed_at, timezone FROM sources
          WHERE bank_id = ?1 AND kind = 'turn' AND session_id = ?2 AND message_at < ?3
            AND text IS NOT NULL
-           AND (?4 = 0 OR NOT EXISTS (SELECT 1 FROM chunks c
-                                      WHERE c.source_id = sources.id AND {masked}))
+           AND NOT EXISTS (SELECT 1 FROM chunks c
+                           WHERE c.source_id = sources.id AND {masked})
          ORDER BY message_at DESC, ingested_at DESC, id DESC"
     ))?;
-    let mut rows = statement.query((
-        bank_id,
-        session_id,
-        message_at,
-        fence.is_some(),
-        REDACTION_MASK.to_string(),
-    ))?;
+    let mut rows =
+        statement.query((bank_id, session_id, message_at, REDACTION_MASK.to_string()))?;
     let mut turns: Vec<(String, ContextTurnTime)> = Vec::new();
     while turns.len() < CONTEXT_TURNS {
         let Some(row) = rows.next()? else {
             break;
         };
         let id: i64 = row.get(0)?;
-        if fence.is_some_and(|awaited| awaited.sources.contains(&id)) {
+        if awaited.sources.contains(&id) {
             continue;
         }
         let text: String = row.get(1)?;
@@ -376,28 +364,33 @@ fn clip(passages: Vec<(String, ContextTurnTime)>, cap: usize) -> Vec<(String, Co
         .collect()
 }
 
-/// The [`PREVIOUS_CHUNK_CHARS`] of the document before the chunk. With a
-/// `fence`, only as far back as [`own_from`] allows, and nothing at all if
-/// a mask is still in it.
+/// Up to [`PREVIOUS_CHUNK_CHARS`] before the chunk, from contiguous
+/// unmasked chunks in this version of the document.
 fn text_before(
     conn: &Connection,
     source: &Source,
-    fence: Option<&Awaited>,
+    awaited: &Awaited,
 ) -> Result<Vec<String>, rusqlite::Error> {
     let Some(text) = &source.source_text else {
         return Ok(Vec::new());
     };
     let start = source.start_offset;
-    let mut from = start.saturating_sub(PREVIOUS_CHUNK_CHARS);
-    if let Some(awaited) = fence {
-        from = from.max(own_from(conn, source, text, from, awaited)?);
+    if start == 0 {
+        return Ok(Vec::new());
     }
+    let from = own_from(
+        conn,
+        source,
+        text,
+        start.saturating_sub(PREVIOUS_CHUNK_CHARS),
+        awaited,
+    )?;
     let before: String = text
         .chars()
         .skip(from)
         .take(start.saturating_sub(from))
         .collect();
-    if before.is_empty() || (fence.is_some() && before.contains(REDACTION_MASK)) {
+    if before.is_empty() || before.contains(REDACTION_MASK) {
         Ok(Vec::new())
     } else {
         Ok(vec![before])
@@ -446,7 +439,7 @@ fn own_from(
         }
         cursor = usize::try_from(chunk_start).unwrap_or(0).min(end);
     }
-    Ok(cursor)
+    Ok(cursor.max(floor))
 }
 
 fn seeded(conn: &Connection, bank_id: i64, which: &str) -> Result<i64, rusqlite::Error> {

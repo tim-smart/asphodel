@@ -1796,6 +1796,62 @@ impl LlmClient for Recording {
 }
 
 #[test]
+fn later_turns_dont_receive_a_forgotten_turns_reply_as_context() {
+    let h = Harness::new();
+    let reply = "Your daughter Maya is six.";
+    let first = Turn {
+        assistant_text: reply.into(),
+        ..turn("earlier", at(EARLIER) - minutes(1), MAYA)
+    };
+    h.service.ingest_turn(BANK, &first).unwrap();
+    let maya = h.extract_one(notable(MAYA), &[]);
+
+    let queued = "Yes, she is.";
+    h.said_turn(EARLIER, queued);
+    h.forget(&[maya]);
+    let llm = Recording {
+        sent: Mutex::new(Vec::new()),
+        replies: FakeLlm::scripted(
+            MODEL,
+            vec![json!({"claims": [], "used_injected_ids": []}); 2],
+        ),
+    };
+    h.service
+        .extract_next(BANK, &llm)
+        .unwrap()
+        .expect("queued turn");
+    assert!(h.erase_next().is_some());
+
+    let later = "How about tomorrow?";
+    h.said_turn(EARLIER, later);
+    h.service
+        .extract_next(BANK, &llm)
+        .unwrap()
+        .expect("later turn");
+    let sent = llm.sent.lock().unwrap();
+    assert!(sent[0].contains(queued));
+    assert!(sent[1].contains(later));
+    assert!(sent.iter().all(|text| !text.contains(reply)), "{sent:?}");
+}
+
+#[test]
+fn a_document_section_doesnt_receive_text_from_a_section_awaiting_forget() {
+    let h = Harness::new();
+    let reply = "Maya is the name of his daughter.";
+    h.doc(
+        "home.md",
+        &format!("# Family\n\n{MAYA} {reply}\n\n# Garden\n\n{GARDEN}"),
+    );
+    let maya = h.extract_one(notable(MAYA), &[]);
+    h.forget(&[maya]);
+
+    let lease = h.claim().expect("garden section");
+    let input = h.service.call1_input(&lease, &[]).unwrap();
+    assert!(input.text.contains(GARDEN));
+    assert!(input.context.iter().all(|text| !text.contains(reply)));
+}
+
+#[test]
 fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
     let h = Harness::new();
     // One turn, two memories: forgetting Maya masks her passage and leaves
