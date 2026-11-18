@@ -375,7 +375,12 @@ fn text_before(
         return Ok(Vec::new());
     };
     let start = source.start_offset;
-    if start == 0 {
+    if start == 0
+        || source
+            .document_id
+            .as_ref()
+            .is_some_and(|id| awaited.withheld_context.contains(id))
+    {
         return Ok(Vec::new());
     }
     let from = own_from(

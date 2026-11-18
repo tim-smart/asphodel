@@ -983,6 +983,8 @@ pub(crate) struct Awaited {
     /// Affected sources and their text-relative spans. A cross-version
     /// match can span chunks and have no corresponding chunk mask.
     pub sources: BTreeMap<i64, Spans>,
+    /// Documents whose preceding text is unsafe to predict across queued jobs.
+    pub withheld_context: BTreeSet<String>,
 }
 
 /// Reads what the bank's waiting forgets will mask, with the erase's own
@@ -1002,12 +1004,17 @@ pub(crate) fn awaited(conn: &Connection, bank_id: i64) -> Result<Awaited, rusqli
         return Ok(awaited);
     }
     let links = bank_links(conn, bank_id)?;
+    let multiple = jobs.len() > 1;
     for job in jobs {
         // An exact legacy mention in another job cannot satisfy this job's search.
         let members = erase_members(conn, &links, &job)?;
         let rows = passages(conn, &members)?;
         let (spans, _) = chain_spans(conn, &members, &rows)?;
         let masks = masks(conn, &spans)?;
+        // Earlier masks act as wildcards during a later version search.
+        if multiple {
+            awaited.withheld_context.extend(masks.documents);
+        }
         for (id, (text, _)) in masks.sources {
             awaited.sources.entry(id).or_default().extend(text);
         }
@@ -1123,6 +1130,7 @@ type Spans = Vec<(usize, usize)>;
 /// of each source's `text` and `reply` by source rowid.
 #[derive(Debug, Default)]
 struct Masks {
+    documents: BTreeSet<String>,
     chunks: BTreeMap<i64, Spans>,
     sources: BTreeMap<i64, (Spans, Spans)>,
 }
@@ -1196,6 +1204,9 @@ fn masks(
                 [source_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
+        if let Some(id) = &document_id {
+            masks.documents.insert(id.clone());
+        }
         let (in_text, in_reply) = masks.sources.entry(source_id).or_default();
         if kind == "turn" {
             let message = source_text

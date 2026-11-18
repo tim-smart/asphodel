@@ -2220,3 +2220,40 @@ fn a_second_queued_forget_doesnt_narrow_a_legacy_documents_mask() {
         input.context
     );
 }
+
+#[test]
+fn document_context_excludes_a_section_the_second_erase_will_mask() {
+    let h = Harness::new();
+    h.doc("garden.md", "The blue gate sticks.");
+    let claims = h.extract_with(
+        vec![
+            quoting(notable("The gate is blue."), "blue"),
+            quoting(notable("The gate sticks."), "blue gate sticks"),
+        ],
+        &[],
+    );
+    let (color, condition) = (claims.memories[0], claims.memories[1]);
+    let passage = "gray gate sticks";
+    let edited = h.doc(
+        "garden.md",
+        &format!("# Gate\nThe {passage}.\n# Watering\n{GARDEN}"),
+    );
+    h.extract_nothing();
+    h.forget(&[color]);
+    h.forget(&[condition]);
+    let llm = Recording {
+        sent: Mutex::new(Vec::new()),
+        replies: FakeLlm::scripted(MODEL, vec![json!({"claims": [], "used_injected_ids": []})]),
+    };
+    h.service
+        .extract_next(BANK, &llm)
+        .unwrap()
+        .expect("watering section");
+    let sent = llm.sent.lock().unwrap();
+    assert!(sent[0].contains(GARDEN));
+    assert!(h.erase_next().is_some());
+    assert!(h.text(edited.source).contains(passage));
+    assert!(h.erase_next().is_some());
+    assert!(!h.text(edited.source).contains(passage));
+    assert!(!sent[0].contains(passage));
+}

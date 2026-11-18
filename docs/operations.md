@@ -1154,7 +1154,11 @@ daemon keeps only its key, as a tombstone.
 When building extraction context, the daemon skips the whole earlier turn
 if the forget masked any of it, including when only the reply survives.
 In a document it stops at the first masked section when reading backwards.
-Both rules apply as soon as the forget is queued.
+Both rules apply as soon as the forget is queued. If two or more erases
+are waiting in the bank, extraction omits preceding text for every
+version of any document those jobs touch. A mask from the first erase can
+widen what the next one matches. The section being extracted is unchanged;
+unrelated documents keep their usual context.
 
 What forget can't reach:
 
