@@ -1364,8 +1364,8 @@ impl Service {
     /// `confirm` must repeat the name. From here until the rebuild's last
     /// chunk has run, the bank's recall, injection and agenda are refused
     /// ([`RecallError::Rebuilding`]); the bank's workers do the rest.
-    /// [`BackupCheck::Waived`] starts it with no recent backup, and then
-    /// nothing can undo it.
+    /// [`BackupCheck::Waived`] starts it with no backup from the last 24
+    /// hours.
     pub fn start_rebuild(
         &self,
         bank: &str,

@@ -877,7 +877,7 @@ chunks past the 90-day horizon.
 `asphodel rebuild --bank B` extracts a bank's memories again from the
 sources it holds, under the daemon's current prompts. Without `--confirm`
 it only counts what it would do. `--without-backup` starts one with no
-recent backup, which nothing can then undo. See "Rebuilding a bank's
+backup from the last 24 hours. See "Rebuilding a bank's
 memories" below before starting one: recall is off for the bank while it
 runs.
 
@@ -1652,7 +1652,9 @@ finish.
 ### Without a backup
 
 A rebuild doesn't read a backup. It works from the bank's own store, so it
-can run without one, as long as you accept that nothing can undo it:
+can run without one. Without a usable backup from before the rebuild, the
+memories it replaces can't be restored as they were. An older backup
+restores only its own snapshot, losing everything since it was taken.
 
 ```sh
 asphodel rebuild --bank B --without-backup              # the dry run
@@ -1660,9 +1662,9 @@ asphodel rebuild --bank B --confirm B --without-backup  # starts it
 ```
 
 The dashboard offers "Rebuild without a backup…" when a missing backup is
-the only thing stopping the start, behind a confirmation that says there's
-no way back. The `rebuild_started` edit row records that the check was
-waived, and when the last backup was, if there ever was one.
+the only thing stopping the start, behind a confirmation that says so.
+The `rebuild_started` edit row records that the check was waived, and when
+the last backup was, if there ever was one.
 
 What the rebuild needs, all of it in the live store:
 
@@ -1674,11 +1676,18 @@ What the rebuild needs, all of it in the live store:
 - a configured LLM, under the prompts you want the memories extracted with
 
 Hermes' `state.db` isn't one of them. If the store itself is gone, a
-rebuild has nothing to run on. Start the daemon on an empty data dir and
-send Hermes' history again ("Backfilling Hermes' history" above). That brings back only
-the turns Hermes still keeps, and none of the documents.
+rebuild has nothing to run on. The only way to start over is the daemon on
+an empty data dir and Hermes' history sent again ("Backfilling Hermes'
+history" above). That brings back only the turns Hermes still keeps, and
+none of the documents. It also brings back what was forgotten: the new
+store has none of the old forget masks or removed sources' keys, and the
+backfill sends every turn as an ordinary one, so anything Hermes still
+holds the text of is extracted again. Pick a `--since` date after the
+history that has to stay forgotten, or forget it again once it's back, and
+don't backfill at all when you can't tell what's safe. An in-place rebuild
+doesn't have this problem, because it keeps the masks.
 
-What can't be recovered once it starts:
+What can't be recovered once it starts, without a backup from before it:
 
 - the replaced memories as they were: their wording, ids, ratings, validity
   windows and entity links. The rerun writes new ones under new ids, and
@@ -1805,4 +1814,6 @@ status` lists the bank under `attention` and exits non-zero, as it does
 while the rebuild runs.
 
 To undo a rebuild, restore the backup taken before it ("Restore" above).
-A rebuild started with `--without-backup` can't be undone.
+A rebuild started with `--without-backup` has no such backup, so the
+memories it replaced can't be restored as they were. An older backup
+restores only its own snapshot.

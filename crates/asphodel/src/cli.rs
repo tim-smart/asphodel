@@ -773,8 +773,9 @@ pub struct RebuildArgs {
     #[arg(long)]
     pub confirm: Option<String>,
 
-    /// Rebuild with no backup from the last 24 hours. Nothing can undo the
-    /// rebuild then: the memories it replaces are gone for good.
+    /// Rebuild with no backup from the last 24 hours. Without a usable
+    /// backup from before the rebuild, the memories it replaces can't be
+    /// restored as they were.
     #[arg(long)]
     pub without_backup: bool,
 }
@@ -3248,7 +3249,7 @@ fn print_rebuild_plan(bank: &str, plan: &Value) {
     if blockers.is_empty() {
         if without_backup {
             println!(
-                "recall, injection and the agenda are off for {bank} while it runs, and nothing can undo it: the memories it replaces, their ids and their old ratings are gone for good"
+                "recall, injection and the agenda are off for {bank} while it runs; without a usable backup from before it starts, the memories it replaces can't be restored as they were, and an older backup restores only its own snapshot"
             );
         } else {
             println!(
@@ -3276,7 +3277,7 @@ fn print_rebuild_plan(bank: &str, plan: &Value) {
                 "model_unavailable" =>
                     "the daemon doesn't carry the bank's embedding model; run `asphodel reembed`",
                 "backup_stale" =>
-                    "no backup completed in the last 24 hours; run `asphodel backup`, or pass `--without-backup` to rebuild with no way back",
+                    "no backup completed in the last 24 hours; run `asphodel backup`, or pass `--without-backup` to rebuild without one",
                 "unacknowledged" => "the bank's last rebuild isn't acknowledged",
                 other => other,
             }

@@ -1141,7 +1141,7 @@ const REBUILD_BLOCKERS = {
   erase_pending: "A forget or a purge is still waiting in this bank's queue.",
   reembed_pending: "This bank is moving to another embedding model. Let the re-embed finish.",
   model_unavailable: "The daemon doesn't carry this bank's embedding model.",
-  backup_stale: "No backup completed in the last 24 hours. Take one first: it's the only way back. You can still rebuild without one, but nothing will undo it.",
+  backup_stale: "No backup completed in the last 24 hours. Take one first: it's the only way back. You can still rebuild without one.",
   unacknowledged: "This bank's last rebuild hasn't been acknowledged.",
 };
 
@@ -1304,8 +1304,8 @@ async function rebuildPanel(ctx) {
           h(
             "p",
             {},
-            h("strong", {}, "There's no backup from the last 24 hours, so nothing can undo this."),
-            " The memories it replaces, their ids and their old ratings are gone for good once it starts.",
+            h("strong", {}, "There's no backup from the last 24 hours."),
+            " Without a usable backup from before the rebuild, the memories it replaces, their ids and their old ratings can't be restored as they were. An older backup restores only its own snapshot.",
           ),
           h(
             "p",

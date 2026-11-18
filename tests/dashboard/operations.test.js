@@ -260,7 +260,7 @@ test("a rebuild that can't start says why and offers no start", async (t) => {
   assert.equal(queryButton(page.root, /rebuild/i), null);
 });
 
-test("with no recent backup, a rebuild starts only after a confirmation that nothing can undo it", async (t) => {
+test("with no recent backup, a rebuild starts only after a confirmation that the replaced memories can't be restored", async (t) => {
   const daemon = new FakeDaemon();
   daemon.state.rebuild.plan.blockers = ["backup_stale"];
   daemon.state.rebuild.plan.last_backup_at = null;
@@ -270,7 +270,7 @@ test("with no recent backup, a rebuild starts only after a confirmation that not
   assert.equal(queryButton(page.root, /rebuild memories/i), null);
   click(await findButton(page.root, /rebuild without a backup/i));
   const dialog = await findDialog(page.document);
-  assert.match(textOf(dialog), /nothing can undo/i);
+  assert.match(textOf(dialog), /can't be restored/i);
   click(actionOf(dialog));
 
   const sent = await waitFor(() => daemon.calls("POST", REBUILD)[0], "POST rebuild");

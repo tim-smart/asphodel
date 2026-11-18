@@ -140,7 +140,7 @@ export function client(fetch, storage) {
     // Rebuilding a bank's memories from its sources. The plan is the dry
     // run and writes nothing; starting repeats the bank's name, as the
     // daemon asks of anything this destructive. `withoutBackup` starts one
-    // with no recent backup, which nothing can undo.
+    // with no backup from the last 24 hours.
     rebuild: (name) => call("GET", `${bank(name)}/rebuild`),
     rebuildPlan: (name) => call("GET", `${bank(name)}/rebuild/plan`),
     startRebuild: (name, { withoutBackup = false } = {}) =>

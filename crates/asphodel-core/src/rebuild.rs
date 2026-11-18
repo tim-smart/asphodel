@@ -70,9 +70,10 @@ pub enum BackupCheck {
     /// Refused unless a backup completed in the last [`BACKUP_MAX_AGE`].
     #[default]
     Required,
-    /// The operator accepts that nothing can undo the rebuild: the
-    /// memories it replaces, their ids and their old ratings are gone for
-    /// good once it starts. Every other check still applies.
+    /// Starts with no backup from the last [`BACKUP_MAX_AGE`]. Without a
+    /// usable backup from before the rebuild, the memories it replaces
+    /// can't be restored as they were, and an older backup restores only
+    /// its own snapshot. Every other check still applies.
     Waived,
 }
 

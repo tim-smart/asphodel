@@ -1740,8 +1740,8 @@ fn a_bank_is_rebuilt_over_http_and_the_cli_with_recall_off_while_it_runs() {
     let old = daemon.seed_notes();
     let rebuild = "/v1/banks/main/rebuild";
 
-    // The dry run writes nothing, and nothing starts without a backup or
-    // without the bank's name again.
+    // The dry run writes nothing, and nothing starts without a backup, or
+    // without the bank's name again even with the backup waived.
     let plan = cli_json(&daemon, "rebuild --bank main");
     assert_eq!((&plan["sources"], &plan["chunks"]), (&json!(1), &json!(1)));
     assert_eq!(plan["memories_replaced"], 1, "{plan}");
@@ -1753,19 +1753,17 @@ fn a_bank_is_rebuilt_over_http_and_the_cli_with_recall_off_while_it_runs() {
     let waived = cli_json(&daemon, "rebuild --bank main --without-backup");
     assert_eq!(waived["blockers"], json!([]), "{waived}");
     assert_eq!(waived["without_backup"], true, "{waived}");
-    backup_to_file(&daemon, &dir.path("backup.db"));
-    assert_eq!(
-        daemon.get_ok(&format!("{rebuild}/plan"))["blockers"],
-        json!([])
-    );
-    let unconfirmed = daemon.post(rebuild, &json!({}));
+    let unconfirmed = daemon.post(&format!("{rebuild}?without_backup=true"), &json!({}));
     assert_eq!(unconfirmed.status, 400, "{}", unconfirmed.body);
     let no_bank = daemon.get("/v1/banks/nobody/rebuild/plan");
     assert_eq!(no_bank.status, 404, "{}", no_bank.body);
     assert_eq!(daemon.get_ok(rebuild)["state"], "idle");
     assert_eq!(daemon.wait_for_memory("main"), old);
 
-    let started = cli_json(&daemon, "rebuild --bank main --confirm main");
+    let started = cli_json(
+        &daemon,
+        "rebuild --bank main --confirm main --without-backup",
+    );
     assert_eq!(started["state"], "running", "{started}");
     for path in ["recall", "prefetch"] {
         let refused = daemon.post(
@@ -1800,6 +1798,13 @@ fn a_bank_is_rebuilt_over_http_and_the_cli_with_recall_off_while_it_runs() {
     assert_eq!(daemon.get_ok(rebuild)["state"], "idle");
     assert_eq!(daemon.get_ok("/v1/purge/plan")["rebuilds"], json!([]));
     assert_eq!(daemon.get_ok("/v1/status")["attention"], json!([]));
+
+    // With a backup taken, the next one needs no waiver.
+    backup_to_file(&daemon, &dir.path("backup.db"));
+    assert_eq!(
+        daemon.get_ok(&format!("{rebuild}/plan"))["blockers"],
+        json!([])
+    );
 }
 
 #[test]

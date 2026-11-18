@@ -1394,7 +1394,7 @@ struct RebuildQuery {
     /// The bank's name again, to start one.
     #[serde(default)]
     confirm: String,
-    /// Start with no recent backup. Nothing can undo the rebuild then.
+    /// Start with no backup from the last 24 hours.
     #[serde(default)]
     without_backup: bool,
 }
