@@ -78,10 +78,13 @@ pub(super) fn commit(
         // Keyed by the source and the claim's ordinal,
         // written with the chunk's position so a document's chunks can't
         // collide.
-        let uuid = store.derived_id(
-            lease.source,
-            &format!("{}:{}", lease.position, memory.claim),
-        );
+        // A chunk a rebuild ran again also keys them with the rebuild, so
+        // an id it gave before is never given to another memory.
+        let key = match &unit.rerun {
+            Some(rerun) => format!("{}:{}:{}", lease.position, memory.claim, rerun.salt),
+            None => format!("{}:{}", lease.position, memory.claim),
+        };
+        let uuid = store.derived_id(lease.source, &key);
         // A correction of the same kind with no window is silent about dates,
         // not a request to erase them, and so is a repeat promoted for its
         // significance. Keep the first such neighbour's whole window; never
@@ -577,6 +580,58 @@ fn insert_access(
             tx.execute(
                 "UPDATE accesses SET kind = ?2, at = ?3 WHERE id = ?1",
                 (id, kind, micros(unit.access_at)),
+            )?;
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+/// An access a rebuild held for a replaced memory, given to the memory that
+/// replaced it ([`crate::rebuild`]): the same rule as [`insert_access`],
+/// one per turn and source keeping the strongest, at the time, turn and
+/// source it first had.
+pub(crate) fn carry_access(
+    tx: &Transaction<'_>,
+    bank_id: i64,
+    memory_id: i64,
+    kind: &str,
+    at: i64,
+    turn: i64,
+    source_id: Option<i64>,
+) -> Result<(), rusqlite::Error> {
+    let document: Option<i64> = match source_id {
+        Some(source) => tx
+            .query_row(
+                "SELECT id FROM sources WHERE id = ?1 AND kind = 'document'",
+                [source],
+                |row| row.get(0),
+            )
+            .optional()?,
+        None => None,
+    };
+    let existing: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT a.id, a.kind FROM accesses a LEFT JOIN sources s ON s.id = a.source_id
+             WHERE a.memory_id = ?1 AND a.turn = ?2
+               AND (CASE WHEN ?3 IS NULL THEN s.kind IS NOT 'document'
+                         ELSE a.source_id = ?3 END)",
+            (memory_id, turn, document),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match existing {
+        None => {
+            tx.execute(
+                "INSERT INTO accesses (bank_id, memory_id, kind, at, turn, source_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (bank_id, memory_id, kind, at, turn, source_id),
+            )?;
+        }
+        Some((id, old)) if weight(kind) > weight(&old) => {
+            tx.execute(
+                "UPDATE accesses SET kind = ?2, at = ?3 WHERE id = ?1",
+                (id, kind, at),
             )?;
         }
         Some(_) => {}

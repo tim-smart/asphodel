@@ -18,25 +18,26 @@
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asphodel_core::config::PurgePause;
 use asphodel_core::entities::{LinkRequest, MergeRequest};
 use asphodel_core::erase::{EraseReason, Erased, ForgetRequest, Forgotten};
-use asphodel_core::extraction::Extracted;
+use asphodel_core::extraction::{DropReason, Extracted};
 use asphodel_core::ingest::{Document, Ingested, Outcome, Turn};
-use asphodel_core::inspect::{Gone, MemoryView};
+use asphodel_core::inspect::{Gone, MemoryQuery, MemoryView};
 use asphodel_core::mental_models::{
-    Model, ModelSpec, Outcome as RefreshOutcome, RefreshInput, WRITE_TEMPLATE,
+    Model, ModelError, ModelSpec, Outcome as RefreshOutcome, RefreshInput, WRITE_TEMPLATE,
 };
 use asphodel_core::models::{
     FakeEmbedder, FakeLlm, FakeReranker, LlmClient, LlmError, LlmRequest, LlmResponse, Models,
 };
 use asphodel_core::operations::{Audit, AuditList, ForgetRow, PurgeRow, RecallRow, SweepRun};
 use asphodel_core::queue::{ChunkError, Failure, Lease};
-use asphodel_core::retrieval::{PrefetchRequest, Recall, RecallRequest};
+use asphodel_core::rebuild::{Blocker, RebuildError, RebuildState, RebuildStatus};
+use asphodel_core::retrieval::{PrefetchRequest, Recall, RecallError, RecallRequest};
 use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME};
 use asphodel_core::store::{OpenOptions, Store};
 use asphodel_core::sweep::{PurgeError, Sweeps};
@@ -515,6 +516,22 @@ impl Harness {
     /// Every mention span gone, as on a store from before version 7.
     fn make_legacy(&self) {
         self.sql("UPDATE accesses SET spans = NULL; DELETE FROM mention_passages;");
+    }
+
+    /// Starts a rebuild of the bank, a backup having just completed.
+    fn rebuild(&self) -> RebuildStatus {
+        self.service.record_backup().unwrap();
+        self.service.start_rebuild(BANK, BANK).unwrap()
+    }
+
+    fn rebuild_status(&self) -> RebuildStatus {
+        self.service.rebuild_status(BANK).unwrap()
+    }
+
+    /// How many memories the bank lists.
+    fn memory_count(&self) -> usize {
+        let page = self.service.list_memories(BANK, &MemoryQuery::default());
+        page.unwrap().total
     }
 
     /// Fails the head of the queue for good. Returns the chunk.
@@ -1657,4 +1674,221 @@ fn overlapping_passages_leave_no_version_unmasked_in_one_erase_or_two() {
         }
         assert!(h.text(v3.source).contains("The roses are out."));
     }
+}
+
+// Rebuild
+
+#[test]
+fn a_rebuild_extracts_the_banks_sources_again_with_recall_off_until_the_last_chunk() {
+    let h = Harness::new();
+    let maya = h.said(EARLIER, notable(MAYA));
+    let tea = h.said(EARLIER, notable(TEA));
+    h.doc("garden.md", "# Garden\n\nTim's garden needs water.\n");
+    let garden = h.extract_one(notable(GARDEN), &[]);
+    let removed = h.doc("old.md", "# Old\n\nTim needs to fix the bike.\n");
+    h.extract_nothing();
+    h.service.remove_document(BANK, "old.md").unwrap();
+    h.forget_turn("chat", "Forget that.");
+
+    // The dry run counts and writes nothing. A backup is the only way
+    // back, so there's no start without a recent one.
+    let plan = h.service.rebuild_plan(BANK).unwrap();
+    assert_eq!((plan.sources, plan.chunks), (3, 3));
+    assert_eq!((plan.memories_replaced, plan.memories_kept), (3, 0));
+    assert_eq!(plan.skipped.removed, removed.chunks_queued);
+    assert_eq!(plan.skipped.forget_requests, 1);
+    assert_eq!(plan.blockers, [Blocker::BackupStale]);
+    let refused = h.service.start_rebuild(BANK, BANK);
+    assert!(
+        matches!(refused, Err(RebuildError::Blocked { .. })),
+        "{refused:?}"
+    );
+    h.service.record_backup().unwrap();
+    let unconfirmed = h.service.start_rebuild(BANK, "another");
+    assert!(matches!(unconfirmed, Err(RebuildError::NotConfirmed)));
+    assert_eq!(h.exist(&[maya, tea, garden]), [true, true, true]);
+    assert_eq!(h.rebuild_status().state, RebuildState::Idle);
+
+    let started = h.service.start_rebuild(BANK, BANK).unwrap();
+    assert_eq!(started.state, RebuildState::Running);
+    assert_eq!((started.chunks, started.remaining), (3, 3));
+    assert_eq!(h.exist(&[maya, tea, garden]), [false, false, false]);
+
+    // Until the last chunk has run, what the bank holds is half of each
+    // set, so nothing is served from it.
+    let refused_now = |h: &Harness| {
+        let recall = h.service.recall(BANK, &query(MAYA));
+        assert!(matches!(recall, Err(RecallError::Rebuilding)), "{recall:?}");
+        let block = h.service.system_prompt(BANK, None);
+        let rebuilding = ModelError::Retrieval(RecallError::Rebuilding);
+        assert!(matches!(&block, Err(error) if error.to_string() == rebuilding.to_string()));
+        assert!(h.service.agenda(BANK).is_err());
+    };
+    refused_now(&h);
+    let again = h.service.start_rebuild(BANK, BANK);
+    assert!(
+        matches!(again, Err(RebuildError::Blocked { .. })),
+        "{again:?}"
+    );
+    let early = h.service.ack_rebuild(BANK);
+    assert!(matches!(early, Err(RebuildError::StillRunning)));
+
+    // Oldest first, the document among the turns, under whatever the
+    // prompts say now: Maya is rated lower this time.
+    let queued = h.service.chunks(BANK, false).unwrap().queued;
+    let order: Vec<Timestamp> = queued.iter().map(|chunk| chunk.observed_at).collect();
+    assert!(order.is_sorted(), "{order:?}");
+    let minor = with(notable(MAYA), "significance", json!("minor"));
+    let new_maya = h.extract_one(minor, &[]);
+
+    // A restart in the middle picks up where it stopped.
+    let h = h.restart_with("");
+    refused_now(&h);
+    assert_eq!(h.rebuild_status().remaining, 2);
+    let new_tea = h.extract_one(notable(TEA), &[]);
+    let new_garden = h.extract_one(notable(GARDEN), &[]);
+
+    let done = h.rebuild_status();
+    assert_eq!(done.state, RebuildState::Complete);
+    assert_eq!((done.remaining, done.replaced, done.kept), (0, 3, 0));
+    assert_eq!(h.memory_count(), 3);
+    for (old, new) in [(maya, new_maya), (tea, new_tea), (garden, new_garden)] {
+        assert_ne!(old, new);
+    }
+    let rebuilt = h.memory(new_maya);
+    assert_eq!(rebuilt.significance.extracted, "minor");
+    assert!(rebuilt.observed_at < at(START), "it's dated when it was said");
+    assert!(ids(&h.recall(query(MAYA))).contains(&new_maya));
+    assert!(h.service.system_prompt(BANK, None).is_ok());
+}
+
+/// Records what it's sent, and replies from a script.
+struct Recording {
+    sent: Mutex<Vec<String>>,
+    replies: FakeLlm,
+}
+
+impl LlmClient for Recording {
+    fn model(&self) -> &str {
+        MODEL
+    }
+
+    fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.sent.lock().unwrap().push(request.user.clone());
+        self.replies.complete(request)
+    }
+}
+
+#[test]
+fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
+    let h = Harness::new();
+    // One turn, two memories: forgetting Maya masks her passage and leaves
+    // the rest of the turn, which the tea memory still rests on.
+    let kettle = "The kettle is on.";
+    h.said_turn(EARLIER, &format!("{MAYA} {TEA} {kettle}"));
+    let both = h.extract_with(vec![notable(MAYA), notable(TEA)], &[]);
+    let (maya, tea) = (both.memories[0], both.memories[1]);
+    // A document has no session, so nothing of the turn is its context.
+    h.doc("garden.md", "# Garden\n\nTim's garden needs water.\n");
+    h.extract_one(notable(GARDEN), &[]);
+    h.forget(&[maya]);
+    assert!(h.erase_next().is_some());
+
+    let plan = h.service.rebuild_plan(BANK).unwrap();
+    assert_eq!((plan.chunks, plan.skipped.masked), (1, 1));
+    assert_eq!((plan.memories_replaced, plan.memories_kept), (1, 1));
+    h.rebuild();
+
+    // An LLM that would bring Maya back from any chunk it's shown.
+    let maya_again = json!({"claims": [quoting(notable(MAYA), TEA)], "used_injected_ids": []});
+    let llm = Recording {
+        sent: Mutex::new(Vec::new()),
+        replies: FakeLlm::scripted(
+            MODEL,
+            vec![
+                json!({"claims": [notable(GARDEN)], "used_injected_ids": []}),
+                json!({"claims": []}),
+                maya_again,
+                json!({"claims": []}),
+            ],
+        ),
+    };
+    while h.service.extract_next(BANK, &llm).unwrap().is_some() {}
+
+    let sent = llm.sent.lock().unwrap();
+    assert!(!sent.is_empty());
+    assert!(sent.iter().all(|text| !text.contains(kettle)), "{sent:?}");
+    assert_eq!(h.rebuild_status().state, RebuildState::Complete);
+    // The memory on the masked chunk is as it was, and nothing says Maya.
+    assert_eq!(h.exist(&[maya, tea]), [false, true]);
+    assert_eq!(h.memory_count(), 2);
+    let named = MemoryQuery {
+        q: Some("Maya".into()),
+        ..MemoryQuery::default()
+    };
+    assert_eq!(h.service.list_memories(BANK, &named).unwrap().total, 0);
+}
+
+#[test]
+fn a_rebuild_keeps_what_the_owner_touched_and_carries_uses_to_the_new_memories() {
+    let h = Harness::starting_with(START, "[strength]\ncorroborate_used = false\n");
+    let maya = h.said(EARLIER, notable(MAYA));
+    let tea = h.said(EARLIER, notable(TEA));
+    h.service.keep(BANK, &[maya.to_string()]).unwrap();
+    h.uses(tea);
+    h.profile_citing("Tim likes green tea.", &[tea]);
+
+    let started = h.rebuild();
+    assert_eq!((started.replaced, started.kept), (1, 1));
+    // An answer restates memories that are going, so it goes with them.
+    assert_eq!(h.profile().answer, None);
+
+    // Maya's turn is read again, and its claim is dropped: the owner's
+    // memory already rests on that passage, under the id it had.
+    let again = h.extract_with(vec![notable(MAYA)], &[]);
+    assert!(again.memories.is_empty());
+    assert_eq!(again.dropped.len(), 1);
+    assert_eq!(again.dropped[0].reason, DropReason::KeptPassage);
+    let new_tea = h.extract_one(notable(TEA), &[]);
+    // The turn whose reply used the tea memory: nothing was in context
+    // this time, so the use can't be judged again. It's carried.
+    h.extract_nothing();
+
+    let done = h.rebuild_status();
+    assert_eq!(done.state, RebuildState::Complete);
+    assert_eq!((done.carried, done.dropped), (1, 0));
+    assert_eq!(h.exist(&[maya, tea]), [true, false]);
+    assert_eq!(h.memory(maya).significance.owner.as_deref(), Some("kept"));
+    let kinds: Vec<String> = h.memory(new_tea).accesses.into_iter().map(|a| a.kind).collect();
+    assert_eq!(kinds, ["created", "used"]);
+    assert_eq!(h.memory_count(), 2);
+}
+
+#[test]
+fn the_sweep_leaves_a_rebuilt_bank_alone_until_the_rebuild_is_acknowledged() {
+    let (h, garden) = Harness::with_past(|h| h.said(LONG_AGO, trivial(GARDEN)));
+    h.rebuild();
+    let garden_again = h.extract_one(trivial(GARDEN), &[]);
+    assert_ne!(garden, garden_again);
+    assert_eq!(h.rebuild_status().state, RebuildState::Complete);
+
+    // The rerun may rate things lower than they were, so the first sweep
+    // after it could delete far more than usual. It waits to be told.
+    h.set(at(SWEEP));
+    assert!(h.sweep().ran.is_empty());
+    assert_eq!(h.exist(&[garden_again]), [true]);
+    let plan = h.service.purge_plan().unwrap();
+    assert_eq!(plan.rebuilds, [BANK]);
+    assert_eq!(plan.memories, 1);
+
+    let acked = h.service.ack_rebuild(BANK).unwrap();
+    assert_eq!(acked.state, RebuildState::Idle);
+    assert!(h.service.purge_plan().unwrap().rebuilds.is_empty());
+    let twice = h.service.ack_rebuild(BANK);
+    assert!(matches!(twice, Err(RebuildError::NothingToAck)));
+    h.set(at(SWEEP) + days(1));
+    let swept = h.sweep();
+    assert_eq!(swept.ran.len(), 1);
+    assert_eq!(swept.ran[0].purged_memories, 1);
+    assert_eq!(h.exist(&[garden_again]), [false]);
 }

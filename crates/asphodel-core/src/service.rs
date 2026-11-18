@@ -43,6 +43,7 @@ use crate::operations::{Audit, AuditError, AuditList, Backup, BackupError, Statu
 use crate::queue::{
     ChunkError, ChunkList, FailedChunk, Failure, Lease, Leases, QueueError, Retried, SourceKind,
 };
+use crate::rebuild::{RebuildError, RebuildPlan, RebuildStatus};
 use crate::reembed::{ReembedError, ReembedStatus};
 use crate::retract::{RetractError, Retracted};
 use crate::retrieval::{
@@ -439,14 +440,21 @@ impl Service {
 
     /// Marks a leased chunk extracted and takes it off the queue.
     pub fn complete_chunk(&self, lease: Lease) -> Result<(), QueueError> {
-        crate::queue::complete(&self.store, &self.leases, lease)
+        let bank_id = lease.bank_id();
+        crate::queue::complete(&self.store, &self.leases, lease)?;
+        self.settle_rebuild(bank_id)?;
+        Ok(())
     }
 
     /// Counts a failed attempt on a leased chunk. At
     /// [`CHUNK_RETRY_CAP`](crate::constants::CHUNK_RETRY_CAP) the chunk is
     /// marked failed.
     pub fn fail_chunk(&self, lease: Lease, error: ChunkError) -> Result<Failure, QueueError> {
-        crate::queue::fail(&self.store, &self.leases, lease, error)
+        let bank_id = lease.bank_id();
+        let failure = crate::queue::fail(&self.store, &self.leases, lease, error)?;
+        // A rebuild's last chunk may be the one that just reached the cap.
+        self.settle_rebuild(bank_id)?;
+        Ok(failure)
     }
 
     /// What call 1 would be given for the leased chunk ([`crate::extraction`]).
@@ -510,7 +518,12 @@ impl Service {
             lease,
             llm,
             in_context,
-        )?;
+        );
+        // Whether it committed or was counted as a failure, the chunk may
+        // have been a rebuild's last.
+        let settled = self.settle_rebuild(bank_id);
+        let extracted = extracted?;
+        settled?;
         self.after_writes(bank_id, watermark, &extracted.memories)?;
         Ok(extracted)
     }
@@ -532,6 +545,7 @@ impl Service {
         request: &PrefetchRequest,
     ) -> Result<crate::retrieval::ScoredPrefetch, RecallError> {
         if let Ok(bank_id) = self.bank_id(bank) {
+            self.serving(bank_id)?;
             if let Some(block) = request.block_id {
                 self.map_held_block(bank_id, &request.session_id, block)?;
             }
@@ -544,6 +558,7 @@ impl Service {
     /// ([`crate::retrieval`]). The results join the session's in-context
     /// set when the request names a session.
     pub fn recall(&self, bank: &str, request: &RecallRequest) -> Result<Recall, RecallError> {
+        self.serving(self.bank_id(bank)?)?;
         crate::retrieval::recall(&self.retrieval()?, bank, request)
     }
 
@@ -555,6 +570,7 @@ impl Service {
         bank: &str,
         request: &crate::retrieval::ExplainRequest,
     ) -> Result<crate::retrieval::Explain, RecallError> {
+        self.serving(self.bank_id(bank)?)?;
         crate::retrieval::explain(&self.retrieval()?, bank, request)
     }
 
@@ -590,6 +606,16 @@ impl Service {
             deadline: self.reranker_deadline,
             refresh_queries: &self.refresh_queries,
         })
+    }
+
+    /// Refuses a bank whose memories are being rebuilt: what it holds is
+    /// partway between the old set and the new ([`crate::rebuild`]).
+    fn serving(&self, bank_id: i64) -> Result<(), RecallError> {
+        let conn = self.store.connection();
+        if crate::rebuild::running(&conn, bank_id)? {
+            return Err(RecallError::Rebuilding);
+        }
+        Ok(())
     }
 
     fn bank_id(&self, bank: &str) -> Result<i64, RecallError> {
@@ -700,7 +726,7 @@ impl Service {
     ) -> Result<crate::extraction::Prepared, ExtractError> {
         let models = self.models.as_ref().ok_or(ExtractError::NoModels)?;
         let bank_id = lease.bank_id();
-        crate::extraction::prepare(
+        let prepared = crate::extraction::prepare(
             &self.store,
             &self.leases,
             &self.tuning,
@@ -708,7 +734,12 @@ impl Service {
             lease,
             llm,
             in_context,
-        )
+        );
+        if prepared.is_err() {
+            // The failure may have taken a rebuild's last chunk off the queue.
+            self.settle_rebuild(bank_id)?;
+        }
+        prepared
     }
 
     /// The candidate lists call 2 was shown for a prepared chunk, with each
@@ -749,7 +780,10 @@ impl Service {
             let conn = self.store.connection();
             crate::mental_models::watermark(&conn, bank_id).map_err(StoreError::Sqlite)?
         };
-        let committed = crate::extraction::commit_prepared(&self.store, &self.leases, prepared)?;
+        let committed = crate::extraction::commit_prepared(&self.store, &self.leases, prepared);
+        let settled = self.settle_rebuild(bank_id);
+        let committed = committed?;
+        settled?;
         if let Committed::Extracted(extracted) = &committed {
             self.after_writes(bank_id, watermark, &extracted.memories)?;
         }
@@ -885,6 +919,14 @@ impl Service {
         {
             let conn = self.store.connection();
             crate::system_prompt::expire_mappings(&conn, self.now(), self.mapping_expiry())?;
+        }
+        // A rebuild whose last chunk ran just before a restart ends here.
+        let unfinished = {
+            let conn = self.store.connection();
+            crate::rebuild::unfinished(&conn)?
+        };
+        for bank_id in unfinished {
+            self.settle_rebuild(bank_id)?;
         }
         let next_due = self.store.next_copy_expiry()?;
         Ok(Housekeeping {
@@ -1290,6 +1332,92 @@ impl Service {
     }
 }
 
+/// Rebuilding a bank's memories from its sources ([`crate::rebuild`]).
+impl Service {
+    /// `asphodel rebuild --bank` without `--confirm`, the dry run: what a
+    /// rebuild would run again, skip, replace and keep, and why it can't
+    /// start if it can't. It writes nothing.
+    pub fn rebuild_plan(&self, bank: &str) -> Result<RebuildPlan, RebuildError> {
+        crate::rebuild::plan(&self.store, bank, self.serves(bank)?)
+    }
+
+    /// `POST /v1/banks/{bank}/rebuild`: starts the bank's rebuild.
+    /// `confirm` must repeat the name. From here until the rebuild's last
+    /// chunk has run, the bank's recall, injection and agenda are refused
+    /// ([`RecallError::Rebuilding`]); the bank's workers do the rest.
+    pub fn start_rebuild(&self, bank: &str, confirm: &str) -> Result<RebuildStatus, RebuildError> {
+        if bank.trim() != confirm.trim() {
+            return Err(RebuildError::NotConfirmed);
+        }
+        let serving = self.serves(bank)?;
+        let bank_id = {
+            let conn = self.store.connection();
+            crate::ingest::find_bank(&conn, bank)?
+                .ok_or(RebuildError::UnknownBank)?
+                .0
+        };
+        {
+            let hold = self
+                .leases
+                .hold(bank_id, Self::HOLD_WAIT)
+                .ok_or(RebuildError::Busy)?;
+            crate::rebuild::start(&self.store, &hold, bank, serving)?;
+        }
+        self.sessions.forget_bank(bank_id);
+        self.blocks.invalidate(bank_id);
+        // A bank with nothing to run again is complete at once.
+        self.settle_rebuild(bank_id)?;
+        self.rebuild_status(bank)
+    }
+
+    /// `GET /v1/banks/{bank}/rebuild`: where the bank's latest rebuild
+    /// stands.
+    pub fn rebuild_status(&self, bank: &str) -> Result<RebuildStatus, RebuildError> {
+        crate::rebuild::status(&self.store, bank)
+    }
+
+    /// `asphodel rebuild ack --bank`: the bank's nightly sweep runs again.
+    /// Refused while the rebuild is still running.
+    pub fn ack_rebuild(&self, bank: &str) -> Result<RebuildStatus, RebuildError> {
+        crate::rebuild::ack(&self.store, bank)?;
+        self.rebuild_status(bank)
+    }
+
+    /// Whether the daemon carries the bank's embedding model, which
+    /// extracting its chunks again needs.
+    fn serves(&self, bank: &str) -> Result<bool, RebuildError> {
+        let Some(models) = self.models.as_ref() else {
+            return Ok(false);
+        };
+        let conn = self.store.connection();
+        let Some((bank_id, _)) = crate::ingest::find_bank(&conn, bank)? else {
+            return Err(RebuildError::UnknownBank);
+        };
+        let recorded = crate::reembed::recorded_model(&conn, bank_id)?;
+        Ok(crate::models::serving(models, &self.previous_embedders, &recorded).is_some())
+    }
+
+    /// Ends the bank's rebuild if its last chunk has left the queue: every
+    /// model of the bank is requested for one refresh, and its block and
+    /// sessions start over.
+    fn settle_rebuild(&self, bank_id: i64) -> Result<(), StoreError> {
+        let Some(models) = crate::rebuild::complete(&self.store, bank_id)? else {
+            return Ok(());
+        };
+        let now = self.now();
+        {
+            let conn = self.store.connection();
+            crate::mental_models::request(&conn, &self.schedule, &models, now, false)?;
+        }
+        if !models.is_empty() {
+            self.schedule.triggered(bank_id, now);
+        }
+        self.sessions.forget_bank(bank_id);
+        self.blocks.invalidate(bank_id);
+        Ok(())
+    }
+}
+
 /// Forget, the erase path and the nightly sweep.
 impl Service {
     /// `memory_forget`: hides each named memory's whole chain at once and
@@ -1575,6 +1703,7 @@ impl Service {
     /// fingerprint. Reads only, and writes no recall row.
     pub fn refresh_input(&self, bank: &str, name: &str) -> Result<RefreshInput, ModelError> {
         let row = self.model_row(bank, name)?;
+        self.serving(row.bank_id)?;
         crate::mental_models::refresh_input(&self.retrieval()?, &row)
     }
 
@@ -1590,6 +1719,7 @@ impl Service {
     ) -> Result<RefreshOutcome, ModelError> {
         let _refreshing = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
         let row = self.model_row(bank, name)?;
+        self.serving(row.bank_id)?;
         let outcome = crate::mental_models::refresh(
             &self.retrieval()?,
             &self.schedule,
@@ -1637,6 +1767,11 @@ impl Service {
         let cx = self.retrieval()?;
         let mut ran = Vec::new();
         for (bank_id, bank, tz) in self.bank_zones()? {
+            // A bank mid-rebuild refreshes nothing: every model of it is
+            // requested once when the rebuild ends.
+            if self.serving(bank_id).is_err() {
+                continue;
+            }
             let sweep = self.schedule.next_sweep(bank_id, &tz, tuning.sweep_time) <= now;
             let models = {
                 let conn = self.store.connection();
@@ -1731,6 +1866,9 @@ impl Service {
         let mut next: Option<Timestamp> = None;
         let mut earliest = |at: Timestamp| next = Some(next.map_or(at, |next| next.min(at)));
         for (bank_id, _, tz) in self.bank_zones()? {
+            if self.serving(bank_id).is_err() {
+                continue;
+            }
             let models = {
                 let conn = self.store.connection();
                 crate::mental_models::load_models(&conn, bank_id)?
@@ -1752,6 +1890,7 @@ impl Service {
     /// The bank's agenda now.
     pub fn agenda(&self, bank: &str) -> Result<Agenda, ModelError> {
         let (bank_id, tz) = self.model_bank(bank)?;
+        self.serving(bank_id)?;
         let conn = self.store.connection();
         Ok(crate::agenda::build(&conn, &self.tuning, bank_id, &tz, self.now())?.agenda)
     }
@@ -1764,6 +1903,7 @@ impl Service {
     /// in-context set.
     pub fn system_prompt(&self, bank: &str, session: Option<&str>) -> Result<Block, ModelError> {
         let (bank_id, tz) = self.model_bank(bank)?;
+        self.serving(bank_id)?;
         let now = self.now();
         let today = now.to_zoned(tz.clone()).date();
         let block = match self.blocks.get(bank_id, today) {
@@ -1790,6 +1930,7 @@ impl Service {
     /// nothing: no block row, no cache entry, no session mapping, no access.
     pub fn preview_system_prompt(&self, bank: &str) -> Result<Preview, ModelError> {
         let (bank_id, tz) = self.model_bank(bank)?;
+        self.serving(bank_id)?;
         let now = self.now();
         if let Ok(block) = self.blocks.get(bank_id, now.to_zoned(tz.clone()).date()) {
             return Ok(Preview {

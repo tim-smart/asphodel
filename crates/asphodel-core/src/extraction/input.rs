@@ -51,6 +51,9 @@ pub(super) struct Unit {
     pub candidates: BTreeMap<String, i64>,
     /// In-context handle to memory rowid and public id.
     pub in_context: BTreeMap<String, (i64, Uuid)>,
+    /// Set for a chunk of a source older than the bank's last rebuild
+    /// ([`crate::rebuild`]).
+    pub rerun: Option<crate::rebuild::Rerun>,
 }
 
 impl Unit {
@@ -123,6 +126,17 @@ pub(super) fn assemble(
     )?;
     let tz = TimeZone::get(&source.timezone).unwrap_or(TimeZone::UTC);
     let is_turn = source.kind == SourceKind::Turn;
+    let access_at = source.message_at.map_or(source.ingested_at, |at| {
+        timestamp(at).min(source.ingested_at)
+    });
+    // A chunk a rebuild runs again is read as of its source's time, not
+    // today's: the strengths its candidates are ranked by and the events
+    // that were still ahead.
+    let rerun = crate::rebuild::rerun(conn, bank_id, chunk_id, source.ingested_at)?;
+    let now = match &rerun {
+        Some(rerun) if rerun.running => access_at.min(now),
+        _ => now,
+    };
 
     let reference_date = if is_turn {
         Some(source.observed_at.to_zoned(tz.clone()).date())
@@ -237,15 +251,14 @@ pub(super) fn assemble(
         source_id: source.source_id,
         tz,
         ingested_at: source.ingested_at,
-        access_at: source.message_at.map_or(source.ingested_at, |at| {
-            timestamp(at).min(source.ingested_at)
-        }),
+        access_at,
         document_id: source.document_id.clone(),
         turn,
         entity_boundary,
         owner_speaking: speaker_ref.as_ref().is_some_and(|speaker| speaker.owner),
         candidates: handles,
         in_context: in_context_handles,
+        rerun,
     };
     let input = Call1Input {
         chunk: source.chunk,

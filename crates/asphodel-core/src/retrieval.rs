@@ -272,6 +272,13 @@ pub enum RecallError {
     #[error("the bank's embedding model changed while the query was embedded; try again")]
     ModelChanged,
 
+    /// The bank's memories are being rebuilt ([`crate::rebuild`]): what it
+    /// holds is partway between the old set and the new, so nothing is
+    /// recalled, injected or listed from it until the rebuild's last chunk
+    /// has run.
+    #[error("the bank's memories are being rebuilt; see `asphodel rebuild --bank`")]
+    Rebuilding,
+
     #[error(transparent)]
     Store(#[from] StoreError),
 }

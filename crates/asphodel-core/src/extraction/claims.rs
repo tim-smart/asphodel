@@ -268,6 +268,14 @@ fn check_claim(
         return Err(DropReason::EmptyContent);
     }
     let (start, end) = locate(&input.text, &claim.quote).ok_or(DropReason::QuoteNotFound)?;
+    if unit.rerun.as_ref().is_some_and(|rerun| {
+        rerun
+            .kept
+            .iter()
+            .any(|&(kept_start, kept_end)| start < kept_end && kept_start < end)
+    }) {
+        return Err(DropReason::KeptPassage);
+    }
     let from_reply = input.reply_start.is_some_and(|reply| start >= reply);
     let only_in_message = input.reply_start.is_some_and(|reply| {
         only_before(

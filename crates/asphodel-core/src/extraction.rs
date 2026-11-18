@@ -65,6 +65,7 @@ use crate::queue::{self, ChunkError, Failure, Lease, Leases, QueueError, SourceK
 use crate::store::{Store, StoreError, VectorIndex};
 
 pub use call2::call2_request;
+pub(crate) use commit::carry_access;
 pub(crate) use input::{entities_named, phrase, survivor};
 pub use prompt::call1_request;
 
@@ -436,6 +437,9 @@ pub enum DropReason {
     /// A task quoted from the assistant's reply with neither a due date nor
     /// an until-event (beyond the current turn).
     AssistantTaskUndated,
+    /// A rebuild ran the chunk again and the quote overlaps the passage of
+    /// a memory it kept ([`crate::rebuild`]).
+    KeptPassage,
 }
 
 /// Why an extraction didn't commit. No variant carries the prompt, the reply

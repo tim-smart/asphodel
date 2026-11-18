@@ -22,6 +22,7 @@ pub mod mental_models;
 pub mod models;
 pub mod operations;
 pub mod queue;
+pub mod rebuild;
 pub mod reembed;
 pub mod retract;
 pub mod retrieval;

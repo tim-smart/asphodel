@@ -1306,7 +1306,10 @@ pub(crate) fn mask(text: &str, spans: &[(usize, usize)]) -> String {
 /// (`merged_into` set) and an entity another was merged into, one a mental
 /// model's filter names, and a speaker, whose platform
 /// id resolves to it.
-fn delete_orphans(conn: &Connection, entities: &BTreeSet<i64>) -> Result<(), rusqlite::Error> {
+pub(crate) fn delete_orphans(
+    conn: &Connection,
+    entities: &BTreeSet<i64>,
+) -> Result<(), rusqlite::Error> {
     let mut orphan = conn.prepare_cached(
         "SELECT 1 FROM entities e
          WHERE e.id = ?1 AND e.seeded IS NULL AND e.merged_into IS NULL
@@ -1406,6 +1409,8 @@ pub(crate) fn delete_bank(
     for sql in [
         "DELETE FROM reembed_vectors WHERE bank_id = ?1",
         "DELETE FROM reembeds WHERE bank_id = ?1",
+        "DELETE FROM rebuild_accesses WHERE bank_id = ?1",
+        "DELETE FROM rebuilds WHERE bank_id = ?1",
         "DELETE FROM mental_models WHERE bank_id = ?1",
         "DELETE FROM recalls WHERE bank_id = ?1",
         "DELETE FROM session_blocks WHERE bank_id = ?1",
