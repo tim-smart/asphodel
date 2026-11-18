@@ -1757,7 +1757,10 @@ fn a_rebuild_extracts_the_banks_sources_again_with_recall_off_until_the_last_chu
     }
     let rebuilt = h.memory(new_maya);
     assert_eq!(rebuilt.significance.extracted, "minor");
-    assert!(rebuilt.observed_at < at(START), "it's dated when it was said");
+    assert!(
+        rebuilt.observed_at < at(START),
+        "it's dated when it was said"
+    );
     assert!(ids(&h.recall(query(MAYA))).contains(&new_maya));
     assert!(h.service.system_prompt(BANK, None).is_ok());
 }
@@ -1859,7 +1862,12 @@ fn a_rebuild_keeps_what_the_owner_touched_and_carries_uses_to_the_new_memories()
     assert_eq!((done.carried, done.dropped), (1, 0));
     assert_eq!(h.exist(&[maya, tea]), [true, false]);
     assert_eq!(h.memory(maya).significance.owner.as_deref(), Some("kept"));
-    let kinds: Vec<String> = h.memory(new_tea).accesses.into_iter().map(|a| a.kind).collect();
+    let kinds: Vec<String> = h
+        .memory(new_tea)
+        .accesses
+        .into_iter()
+        .map(|a| a.kind)
+        .collect();
     assert_eq!(kinds, ["created", "used"]);
     assert_eq!(h.memory_count(), 2);
 }

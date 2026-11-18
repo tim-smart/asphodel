@@ -236,7 +236,8 @@ pub(crate) fn running(conn: &Connection, bank_id: i64) -> Result<bool, rusqlite:
 /// The banks whose nightly sweep waits for `rebuild ack`: a rebuild changes
 /// what the sweep would delete, so the operator looks first.
 pub(crate) fn held(conn: &Connection) -> Result<BTreeSet<i64>, rusqlite::Error> {
-    let mut statement = conn.prepare_cached("SELECT bank_id FROM rebuilds WHERE acked_at IS NULL")?;
+    let mut statement =
+        conn.prepare_cached("SELECT bank_id FROM rebuilds WHERE acked_at IS NULL")?;
     statement.query_map([], |row| row.get(0))?.collect()
 }
 
@@ -462,7 +463,13 @@ fn survey(conn: &Connection, bank_id: i64) -> Result<Survey, rusqlite::Error> {
             let (chunk, source, start, end) = row?;
             if !rerun.contains(&chunk) {
                 left_sources.insert(source);
-                carries.push(carry("passage", None, None, None, Some((chunk, start, end))));
+                carries.push(carry(
+                    "passage",
+                    None,
+                    None,
+                    None,
+                    Some((chunk, start, end)),
+                ));
             }
         }
         for row in accesses.query_map([memory.id], |row| {
@@ -521,7 +528,9 @@ fn blockers(
 ) -> Result<(Vec<Blocker>, Option<Timestamp>), rusqlite::Error> {
     let mut blockers = Vec::new();
     let exists = |sql: &str| -> Result<bool, rusqlite::Error> {
-        conn.query_row(&format!("SELECT EXISTS ({sql})"), [bank_id], |row| row.get(0))
+        conn.query_row(&format!("SELECT EXISTS ({sql})"), [bank_id], |row| {
+            row.get(0)
+        })
     };
     if exists("SELECT 1 FROM extraction_queue WHERE bank_id = ?1 AND kind = 'erase'")?
         || exists("SELECT 1 FROM memories WHERE bank_id = ?1 AND hidden_at IS NOT NULL")?

@@ -1917,9 +1917,7 @@ fn purge(command: PurgeCommand) -> anyhow::Result<()> {
                 count(&plan, "recalls"),
             );
             for bank in list(&plan, "rebuilds").iter().filter_map(Value::as_str) {
-                println!(
-                    "{bank}: its sweep waits for `asphodel rebuild ack --bank {bank}`"
-                );
+                println!("{bank}: its sweep waits for `asphodel rebuild ack --bank {bank}`");
             }
             Ok(())
         }
@@ -3192,8 +3190,7 @@ fn rebuild(args: RebuildArgs) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    let status: Value =
-        client.post(&format!("{path}?confirm={}", segment(&bank)), &Value::Null)?;
+    let status: Value = client.post(&format!("{path}?confirm={}", segment(&bank)), &Value::Null)?;
     if args.client.json {
         return print_json(&status);
     }
@@ -3247,8 +3244,7 @@ fn print_rebuild_plan(bank: &str, plan: &Value) {
                 "reembed_pending" => "a re-embed of the bank is recorded; let it finish",
                 "model_unavailable" =>
                     "the daemon doesn't carry the bank's embedding model; run `asphodel reembed`",
-                "backup_stale" =>
-                    "no backup completed in the last 24 hours; run `asphodel backup`",
+                "backup_stale" => "no backup completed in the last 24 hours; run `asphodel backup`",
                 "unacknowledged" => "the bank's last rebuild isn't acknowledged",
                 other => other,
             }
@@ -3290,9 +3286,7 @@ fn print_rebuild(bank: &str, status: &Value) {
         }
     }
     if failed > 0 {
-        println!(
-            "  {failed} chunks failed; see `asphodel chunks --bank {bank} --failed`"
-        );
+        println!("  {failed} chunks failed; see `asphodel chunks --bank {bank} --failed`");
     }
 }
 

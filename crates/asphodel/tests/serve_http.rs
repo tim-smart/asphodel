@@ -1731,6 +1731,71 @@ fn a_changed_fingerprint_pauses_purge_until_the_cli_acks_the_running_hash() {
 }
 
 #[test]
+fn a_bank_is_rebuilt_over_http_and_the_cli_with_recall_off_while_it_runs() {
+    // The second call 1, the rebuild's, takes long enough to look at the
+    // bank while it runs.
+    let dir = TestDir::new();
+    let script = [auckland(), step(auckland_reply(), 2000)];
+    let mut daemon = Serve::new(&dir).script(&script).ready();
+    let old = daemon.seed_notes();
+    let rebuild = "/v1/banks/main/rebuild";
+
+    // The dry run writes nothing, and nothing starts without a backup or
+    // without the bank's name again.
+    let plan = cli_json(&daemon, "rebuild --bank main");
+    assert_eq!((&plan["sources"], &plan["chunks"]), (&json!(1), &json!(1)));
+    assert_eq!(plan["memories_replaced"], 1, "{plan}");
+    assert_eq!(plan["blockers"], json!(["backup_stale"]), "{plan}");
+    let blocked = daemon.post(&format!("{rebuild}?confirm=main"), &json!({}));
+    assert_eq!(blocked.status, 409, "{}", blocked.body);
+    backup_to_file(&daemon, &dir.path("backup.db"));
+    assert_eq!(
+        daemon.get_ok(&format!("{rebuild}/plan"))["blockers"],
+        json!([])
+    );
+    let unconfirmed = daemon.post(rebuild, &json!({}));
+    assert_eq!(unconfirmed.status, 400, "{}", unconfirmed.body);
+    let no_bank = daemon.get("/v1/banks/nobody/rebuild/plan");
+    assert_eq!(no_bank.status, 404, "{}", no_bank.body);
+    assert_eq!(daemon.get_ok(rebuild)["state"], "idle");
+    assert_eq!(daemon.wait_for_memory("main"), old);
+
+    let started = cli_json(&daemon, "rebuild --bank main --confirm main");
+    assert_eq!(started["state"], "running", "{started}");
+    for path in ["recall", "prefetch"] {
+        let refused = daemon.post(
+            &format!("/v1/banks/main/{path}"),
+            &json!({"session_id": "chat", "query": "where does Tim live?"}),
+        );
+        assert_eq!(refused.status, 503, "{path}: {}", refused.body);
+    }
+    for path in ["system-prompt", "agenda"] {
+        let refused = daemon.get(&format!("/v1/banks/main/{path}"));
+        assert_eq!(refused.status, 503, "{path}: {}", refused.body);
+    }
+    // Run again, the command says where the rebuild stands.
+    let again = cli_json(&daemon, "rebuild --bank main --confirm main");
+    assert_eq!(again["state"], "running", "{again}");
+    let early = daemon.post(&format!("{rebuild}/ack"), &json!({}));
+    assert_eq!(early.status, 409, "{}", early.body);
+
+    daemon.wait_until(
+        "a complete rebuild",
+        |daemon| daemon.get_ok(rebuild),
+        |status| status["state"] == "complete",
+    );
+    assert_ne!(daemon.wait_for_memory("main"), old);
+
+    // The bank's sweep waits for the ack.
+    assert_eq!(daemon.get_ok("/v1/purge/plan")["rebuilds"], json!(["main"]));
+    assert_ne!(daemon.get_ok("/v1/status")["attention"], json!([]));
+    succeeded(run(cli(&daemon).args(["rebuild", "ack", "--bank", "main"])));
+    assert_eq!(daemon.get_ok(rebuild)["state"], "idle");
+    assert_eq!(daemon.get_ok("/v1/purge/plan")["rebuilds"], json!([]));
+    assert_eq!(daemon.get_ok("/v1/status")["attention"], json!([]));
+}
+
+#[test]
 fn a_ready_erase_runs_after_a_restart_without_an_llm() {
     // The forget arrives while a chunk queued
     // before it is in flight, so its erase waits. SIGTERM lets that chunk
