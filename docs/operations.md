@@ -317,8 +317,9 @@ inputs, so an upgraded store pauses purge until it is acknowledged ("Purge
 pauses" below). Memories extracted before version 21 keep their rating;
 raise one with `memory significance` if it should last longer.
 
-Call 1 version 22 asks the model to skip the assistant's own tool inventory
-and access status, including pending authorization. It restores the guidance
+Call 1 version 22 asks the model to skip reports about the assistant's tools
+and their current access, including pending authorization. A standing permission
+the speaker explicitly grants is still a fact. Version 22 restores the guidance
 that major is rare without changing the criteria for the speaker's own tools,
 work software or standing preferences. Existing memories are not re-rated.
 

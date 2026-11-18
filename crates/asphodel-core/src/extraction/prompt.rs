@@ -40,7 +40,7 @@ Apply the skips below to each proposition, not to the whole passage: a request, 
 Skip:
 - The act of asking a question or making a request. For a question or request, record only what the speaker wanted, as above.
 - Requests whose only content is the assistant operating its own tools, notes or system, unless they end remembered work as above.
-- The assistant's own tool inventory, capabilities, installation and access status, including pending authorization. These do not establish which tools the speaker owns or uses in their work.
+- Reports of which tools the assistant has installed, what they can do or whether they have access yet. These reports do not establish which tools the speaker owns or uses. Keep any standing permission the speaker explicitly grants as a `fact`.
 - The assistant's advice, suggestions, general knowledge, undated findings other than the lasting ones above, and findings that don't answer the speaker's request.
 - Routine operations: commands, checks, restarts, result reports, and adding, updating, saving, removing, restoring, moving or verifying notes, files or code. Extract the durable content, decision or commitment, or the end of the work it served as above, not an event about the operation. A date or path alone does not make an operation worth remembering.
 - Storage locations already stated in the supplied context. Extract where something durable is kept only as a fact about the thing ("the trip notes are in 07_Trips/Anniversary"), not an edit event.
