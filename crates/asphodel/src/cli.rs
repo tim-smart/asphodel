@@ -101,6 +101,11 @@ enum Command {
     /// The bank is served with its recorded model until the swap.
     Reembed(ReembedArgs),
 
+    /// Extract a bank's memories again from the sources it holds, under the
+    /// daemon's current prompts. Without --confirm it only shows what it
+    /// would do.
+    Rebuild(RebuildArgs),
+
     /// See and acknowledge a purge pause.
     #[command(subcommand)]
     Purge(PurgeCommand),
@@ -751,6 +756,38 @@ pub struct ReembedArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct RebuildArgs {
+    #[command(subcommand)]
+    pub command: Option<RebuildCommand>,
+
+    #[command(flatten)]
+    pub client: ClientArgs,
+
+    /// The bank to rebuild.
+    #[arg(long)]
+    pub bank: Option<String>,
+
+    /// The bank's name again, to start the rebuild. Recall is off for the
+    /// bank until it completes, and a backup is the only way back.
+    #[arg(long)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RebuildCommand {
+    /// Let the bank's nightly sweep run again after a rebuild. Look at
+    /// `asphodel purge plan` first.
+    Ack {
+        #[command(flatten)]
+        client: ClientArgs,
+
+        #[arg(long)]
+        bank: String,
+    },
+}
+
+#[derive(Debug, Args)]
 pub struct ModelCreateArgs {
     #[command(flatten)]
     pub client: ClientArgs,
@@ -1226,6 +1263,7 @@ impl Cli {
             Command::Document(command) => document(command),
             Command::Entity(command) => entity(command),
             Command::Reembed(args) => reembed(args),
+            Command::Rebuild(args) => rebuild(args),
             Command::Chunks(args) => chunks(args),
             Command::Recall(args) => recall(args),
             Command::Forget(args) => by_ids(args, IdsAction::Forget),
@@ -1878,6 +1916,9 @@ fn purge(command: PurgeCommand) -> anyhow::Result<()> {
                 count(&plan, "failed_chunks"),
                 count(&plan, "recalls"),
             );
+            for bank in list(&plan, "rebuilds").iter().filter_map(Value::as_str) {
+                println!("{bank}: its sweep waits for `asphodel rebuild ack --bank {bank}`");
+            }
             Ok(())
         }
         PurgeCommand::Ack { client: args, hash } => {
@@ -3100,6 +3141,164 @@ fn print_entity(view: &Value) {
         );
     }
     print_edits(list(view, "edits"));
+}
+
+/// `asphodel rebuild --bank`: the dry run, or with `--confirm` the start.
+/// Run again while a rebuild is going, it says how far it got.
+fn rebuild(args: RebuildArgs) -> anyhow::Result<()> {
+    if let Some(RebuildCommand::Ack { client: args, bank }) = args.command {
+        let client = Client::new(&args)?;
+        let status: Value = client.post(
+            &format!("/v1/banks/{}/rebuild/ack", segment(&bank)),
+            &Value::Null,
+        )?;
+        if args.json {
+            return print_json(&status);
+        }
+        println!("acknowledged; {bank} is swept again from the next sweep");
+        return Ok(());
+    }
+    let Some(bank) = args.bank else {
+        bail!("--bank is required");
+    };
+    if let Some(confirm) = &args.confirm
+        && confirm.trim() != bank.trim()
+    {
+        bail!("--confirm must repeat the bank's name");
+    }
+    let client = Client::new(&args.client)?;
+    let path = format!("/v1/banks/{}/rebuild", segment(&bank));
+    let status: Value = client.get(&path)?;
+    if text(&status, "state") != "idle" {
+        if args.client.json {
+            return print_json(&status);
+        }
+        print_rebuild(&bank, &status);
+        return Ok(());
+    }
+
+    let plan: Value = client.get(&format!("{path}/plan"))?;
+    let blockers = list(&plan, "blockers");
+    if args.confirm.is_none() || !blockers.is_empty() {
+        if args.client.json {
+            print_json(&plan)?;
+        } else {
+            print_rebuild_plan(&bank, &plan);
+        }
+        if !blockers.is_empty() && args.confirm.is_some() {
+            bail!("the rebuild can't start");
+        }
+        return Ok(());
+    }
+    let status: Value = client.post(&format!("{path}?confirm={}", segment(&bank)), &Value::Null)?;
+    if args.client.json {
+        return print_json(&status);
+    }
+    print_rebuild(&bank, &status);
+    Ok(())
+}
+
+/// The dry run's counts, and what stands in the way.
+fn print_rebuild_plan(bank: &str, plan: &Value) {
+    let skipped = plan.get("skipped").cloned().unwrap_or(Value::Null);
+    println!(
+        "a rebuild of {bank} would run {} chunks of {} sources again: one call 1 each, and a call 2 for most",
+        count(plan, "chunks"),
+        count(plan, "sources"),
+    );
+    println!(
+        "  skipped: {} chunks with no text left, {} of removed sources, {} masked by a forget; {} forget requests hold no text",
+        count(&skipped, "swept"),
+        count(&skipped, "removed"),
+        count(&skipped, "masked"),
+        count(&skipped, "forget_requests"),
+    );
+    println!(
+        "  memories: {} replaced, {} kept as they are",
+        count(plan, "memories_replaced"),
+        count(plan, "memories_kept"),
+    );
+    println!(
+        "  {} accesses carried to the new memories; {} mental model answers blanked until it ends",
+        count(plan, "accesses_carried"),
+        count(plan, "models"),
+    );
+    match plan.get("last_backup_at").and_then(Value::as_str) {
+        Some(at) => println!("  last backup: {at}"),
+        None => println!("  last backup: never"),
+    }
+    let blockers = list(plan, "blockers");
+    if blockers.is_empty() {
+        println!(
+            "recall, injection and the agenda are off for {bank} while it runs, and a backup is the only way back"
+        );
+        println!(
+            "a forget made while it runs stops the chunks it reaches being extracted again, and anything else they held isn't rebuilt: forget before you start or after it completes"
+        );
+        println!("start it with `asphodel rebuild --bank {bank} --confirm {bank}`");
+        return;
+    }
+    println!("it can't start now:");
+    for blocker in blockers.iter().filter_map(Value::as_str) {
+        println!(
+            "  {}",
+            match blocker {
+                "erase_pending" => "a forget or a purge is waiting in the bank's queue",
+                "reembed_pending" => "a re-embed of the bank is recorded; let it finish",
+                "model_unavailable" =>
+                    "the daemon doesn't carry the bank's embedding model; run `asphodel reembed`",
+                "backup_stale" => "no backup completed in the last 24 hours; run `asphodel backup`",
+                "unacknowledged" => "the bank's last rebuild isn't acknowledged",
+                other => other,
+            }
+        );
+    }
+}
+
+/// Where a rebuild stands.
+fn print_rebuild(bank: &str, status: &Value) {
+    let failed = count(status, "failed");
+    let withheld = count(status, "withheld");
+    match text(status, "state") {
+        "running" => {
+            println!(
+                "rebuilding {bank}: {} of {} chunks left; recall is off for the bank until they've run",
+                count(status, "remaining"),
+                count(status, "chunks"),
+            );
+            println!(
+                "  {} memories replaced, {} kept",
+                count(status, "replaced"),
+                count(status, "kept"),
+            );
+        }
+        _ => {
+            println!(
+                "the rebuild of {bank} is complete: {} chunks queued, {} memories replaced, {} kept",
+                count(status, "chunks"),
+                count(status, "replaced"),
+                count(status, "kept"),
+            );
+            println!(
+                "  {} accesses carried to the new memories, {} dropped",
+                count(status, "carried"),
+                count(status, "dropped"),
+            );
+            println!(
+                "its sweep waits: see `asphodel purge plan`, then `asphodel rebuild ack --bank {bank}`"
+            );
+        }
+    }
+    if withheld > 0 {
+        println!(
+            "  {withheld} chunks skipped after a forget made during the rebuild; they aren't extracted again and can't be retried, so anything else they held was not rebuilt"
+        );
+    }
+    if failed > 0 {
+        println!(
+            "  {failed} chunks currently failed in {bank} since the rebuild started; see `asphodel chunks --bank {bank} --failed`"
+        );
+    }
 }
 
 /// How often `asphodel reembed` looks at the job while it follows it.

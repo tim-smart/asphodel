@@ -321,7 +321,8 @@ Call 1 version 22 asks the model to skip reports about the assistant's tools
 and their current access, including pending authorization. A standing permission
 the speaker explicitly grants is still a fact. Version 22 restores the guidance
 that major is rare without changing the criteria for the speaker's own tools,
-work software or standing preferences. Existing memories are not re-rated.
+work software or standing preferences. Existing memories keep their rating
+until the bank is rebuilt ("Rebuilding a bank's memories" below).
 
 The earlier version 4 rule followed a ten-day evaluation (436 turns,
 451 memories): 129 memories recorded assistant operations or reports and
@@ -335,8 +336,9 @@ that share and on fact-targeting probes still needs a fresh recording.
 The SHA-256 of the trimmed guidance is recorded alongside the template
 version in cassette keys, replay reports and aggregate exports. Without
 guidance there is no hash; call 2, refresh and judge keys are unchanged.
-Changing guidance does not pause purge because it is not a deletion input,
-and stored memories are not re-extracted.
+Changing guidance does not pause purge because it is not a deletion input.
+Stored memories stay as they were extracted until the bank is rebuilt
+("Rebuilding a bank's memories" below).
 
 `[strength.significance]` sets the significance value of each level in
 `strength = S·significance + max(recent_use, lasting_floor)`, with S fixed
@@ -872,6 +874,11 @@ cap, with the error kind and HTTP status (never the response), and
 `--retry` puts them back on the queue. The nightly sweep deletes failed
 chunks past the 90-day horizon.
 
+`asphodel rebuild --bank B` extracts a bank's memories again from the
+sources it holds, under the daemon's current prompts. Without `--confirm`
+it only counts what it would do. See "Rebuilding a bank's memories" below
+before starting one: recall is off for the bank while it runs.
+
 ### Audit lists
 
 `asphodel purges`, `forgets`, `sweeps` and `recalls`, each with `--bank B
@@ -1116,6 +1123,13 @@ purge and the sweep of sources and recall rows pause. Forget never pauses.
 
 Running the plan first is recommended, but nothing enforces it.
 
+A rebuild holds one bank's sweep in the same way, whatever the fingerprint
+says. From the moment a rebuild starts until `asphodel rebuild ack --bank B`,
+the nightly sweep skips that bank: no purge, and no deletion of source
+text, failed chunks or recall rows. `purge plan` lists the banks waiting
+under `rebuilds`, and its counts include them. Other banks are swept as
+usual.
+
 ## Forgetting
 
 The owner forgets through the agent's `memory_forget` tool, and the
@@ -1153,6 +1167,15 @@ What forget can't reach:
   turn that repeats them, or an edited section of a document that still
   contains them, is new input and can bring the memory back. Take the words
   out of a document before sending its next version.
+- **Later turns of the session.** Extraction shows a turn the few turns
+  before it in its session. A turn that arrives after the forget still gets
+  what the mask left of a masked one, its reply included, and can make a
+  memory from what it reads there.
+- **A rebuild reading other turns.** A rebuild never extracts a chunk a
+  forget masked. A different turn that restates the forgotten thing is
+  not masked. If it made no memory the first time, because the claim was
+  absorbed as a repeat, the rebuild can extract it as a new memory. Look
+  for it with `asphodel recall` after a rebuild and forget it too.
 - **Old mentions.** A memory mentioned before schema version 7 has no
   recorded span for the mention, so forget masks more of that turn or
   document than the mention itself (`docs/upgrading.md`, version 8).
@@ -1347,6 +1370,14 @@ acknowledgement, and which mental models go into the system prompt.
 Retract, forget, document removal and the purge acknowledgement each ask
 first and say what will go.
 
+A bank's Ingestion page also rebuilds its memories ("Rebuilding a bank's
+memories" below). "Preview a rebuild" shows the dry run and changes
+nothing. Starting asks first, with the number of memories replaced, the
+LLM calls it costs and the fact that recall is off until it ends. While it
+runs the page shows how many chunks are left, and once it's complete it
+offers the acknowledgement, which shows what the next sweep would delete.
+A rebuild that can't start lists the reasons and offers no start.
+
 A daemon on loopback without a token is browsed without asking. Otherwise
 the dashboard keeps the token in same-origin local storage, shared across
 tabs in the same browser. It persists after closing tabs or the browser.
@@ -1519,3 +1550,195 @@ same way: `asphodel reembed --bank B` needs only the daemon's model.
 A reranker-only change needs only its new `injection.reranker_floors` and
 `ranking.relevance_scales` keys. Reranker scores aren't stored, so
 there's nothing to re-embed.
+
+## Rebuilding a bank's memories
+
+A change to the extraction prompts only affects what is extracted from then
+on. `asphodel rebuild` applies the current prompts to what a bank already
+holds: it extracts the bank's memories again from its stored turns and
+documents, in place, without wiping the bank and without sending anything
+again from Hermes.
+
+```sh
+asphodel rebuild --bank B               # the dry run: counts, changes nothing
+asphodel backup --out /backups/asphodel.db
+asphodel rebuild --bank B --confirm B   # starts it
+asphodel rebuild --bank B               # while it runs: how far it got
+asphodel purge plan                     # once complete: what the sweep would delete
+asphodel rebuild ack --bank B           # lets the bank's sweep run again
+```
+
+The routes behind them are `GET /v1/banks/{bank}/rebuild/plan`,
+`POST /v1/banks/{bank}/rebuild?confirm=<bank>` (202),
+`GET /v1/banks/{bank}/rebuild` and `POST /v1/banks/{bank}/rebuild/ack`.
+The dashboard does the same from a bank's Ingestion page.
+
+### What it covers
+
+A rebuild is for a whole bank. It runs every chunk that still has its text
+again, turns and documents alike, oldest first by observed time (a turn's
+message time, the start of a document's reference date), so each chunk
+reconciles against the memories of what came before it. Each chunk is read
+as of its source's time, which is a turn's message time or a document's
+ingestion: candidate memories are ranked by the strength they had then, and
+"upcoming" means upcoming on that day. Memories keep the dates of their
+sources.
+
+Documents are covered. Every version of a document that still has its text
+runs again, at the same priority as turns, so a document takes its place
+in time instead of waiting behind every turn. As at ingest, only the
+sections a version changed are chunks of it.
+
+The dry run counts what is left out:
+
+- chunks whose text the sweep has deleted (sources past the 90-day
+  horizon). Their memories stay exactly as they are, old rating included,
+  because there is nothing to extract them from.
+- chunks of a removed document or turn
+- chunks a forget masked (see "Forget safety" below)
+- turns that asked for a forget, which were never stored
+
+### Cost
+
+One call 1 per chunk and a call 2 for most, so roughly one to two LLM
+calls per chunk, plus one refresh per mental model at the end. That is an
+estimate and no ceiling: a chunk that fails is retried, and a
+reconciliation made stale by another chunk's commit runs again. The dry
+run prints the chunk count. The calls go through the bank's ordinary
+worker, under `llm.concurrency`, with the usual retries and holds.
+
+Recall, prefetch, the system prompt, the agenda and mental model refreshes
+answer 503 for the bank from the start until its last chunk has run. What
+the bank holds in between is part old and part new, so nothing is served
+from it. The Hermes plugin treats that 503 like any other outage: the
+agent runs without memory for the bank. Other banks are unaffected.
+
+Turns and documents keep arriving while it runs. They wait in the queue
+until the rebuild completes and are extracted once, after it. That holds
+whatever their dates, so a late turn dated before the chunks still to run
+doesn't go ahead of them.
+
+### Before it starts
+
+The start is refused with 409 and the reasons unless:
+
+- `POST /v1/backup` completed in the last 24 hours. A backup is the only
+  way back to the memories a rebuild replaces.
+- no forget or purge is waiting in the bank's queue
+- no re-embed of the bank is recorded, and the daemon carries the bank's
+  embedding model
+- the bank's previous rebuild, if any, was acknowledged
+
+`--confirm` has to repeat the bank's name. The start waits up to ten
+minutes for the bank's chunks in flight and answers 503 if they don't
+finish.
+
+### What happens to existing state
+
+At the start, in one transaction:
+
+- Replaced memories are deleted, with their vectors, entity links,
+  accesses and restatements. A memory extracted again gets a new id.
+- Every mental model answer in the bank is blanked. Each model is refreshed
+  once when the rebuild ends, and not during it.
+- Sessions' in-context sets and built prompt blocks are dropped.
+- Recall log rows keep their queries and lose the results that named
+  replaced memories. Edit rows stay and lose their pointer to them.
+
+Derived again by the rerun, on the original dates: `created`,
+`mentioned_again` and `confirmed` accesses, and restatements.
+
+Carried across, because the rerun can't derive them: `used` accesses,
+pending `used` credits, and mentions that came from chunks which aren't
+run again. They are held by the passage the old memory quoted, and at the
+end each goes to the new memory quoting an overlapping passage of the same
+chunk. One with no such memory is dropped. The status shows both counts.
+
+Kept as they are, id included:
+
+- memories the owner touched: significance or `kept` set, retracted, ended
+  or reopened by the owner, translated, or an entity linked or unlinked by
+  hand. The rest of such a memory's chain and the memories it ended stay
+  with it. When its chunk runs again, a claim over the same passage is
+  dropped rather than made into a second memory. A kept memory keeps the
+  rating it had; set it with `asphodel memory significance` if it's wrong.
+- memories resting on a chunk that isn't run again
+- entities and aliases. An entity left with no memory at the end is
+  deleted unless it was seeded, names a speaker or is a model's filter.
+
+### Forget safety
+
+A chunk a forget masked is never extracted again, so the model can't
+rewrite what was erased from what surrounds the mask. Memories still
+resting on such a chunk stay as they are. It isn't shown as context
+either: a chunk run again doesn't get a masked earlier turn of its session,
+or the text of a masked section before it in its document. A section that
+a document version shares with an earlier one has no chunk in that version,
+so whether a forget reached it can't be read there. The section after it
+runs again with no preceding text at all.
+
+These rules cover the chunks a rebuild runs again and nothing else. A turn
+that arrives after the rebuild started waits, then is extracted the
+ordinary way, and ordinary extraction shows it the earlier turns of its
+session, including what a mask left of one. "What forget can't reach" above
+lists that, and the one case a rebuild adds.
+
+A forget made while a rebuild runs hides the memory at once. Its erase
+waits in the queue behind the rebuild's chunks, so the text is still there,
+and the rebuild treats it as masked from that moment. A chunk the erase is
+going to mask isn't extracted again and isn't shown as context.
+
+A chunk the LLM was already reading when the forget arrived writes nothing,
+whether the forget reached the chunk itself or a turn or section it was
+shown as context. Call 1's saved replies for the rebuild's chunks are
+deleted with the forget, so a retry can't resume from one written before
+it. The chunk goes round again: it's skipped if the forget reached it, and
+otherwise read from call 1 without the forgotten context. Removing a turn
+or a document does the same. Each forget costs one extra call 1 for a chunk
+in flight.
+
+A skipped chunk costs its other memories. The rebuild deleted them when it
+started and now won't make them again, where a forget made before the
+rebuild would have left them as they were. Forget before you start a
+rebuild or after it completes when you can. The dry run and the dashboard's
+confirmation say so before you start.
+
+The rebuild's status counts the chunks skipped this way as `withheld`,
+apart from the chunks currently failed and the ones the dry run left out.
+The command and the dashboard show the count while the rebuild runs and
+before you acknowledge it. It's a count of chunks, not of memories: how
+many memories a skipped chunk would have made isn't known. A skipped chunk
+is not a failed one. It can't be retried, and `asphodel chunks --failed`
+doesn't list it.
+
+A chunk that failed during the rebuild and is retried later gets the same
+check: if a forget has reached it by then, it isn't extracted. The rebuild
+was over, so its `withheld` count stays as it was when it completed.
+
+### Interruptions and failures
+
+The rebuild lives in the store. After a restart the workers carry on with
+the chunks still queued, and nothing is extracted twice. Running
+`asphodel rebuild --bank B` again, with or without `--confirm`, reports
+progress and never starts a second one.
+
+A chunk that fails past the retry cap leaves the queue like any other, and
+the rebuild completes without it. Its memories are missing until
+`asphodel chunks --bank B --failed --retry` runs it.
+
+The rebuild's status reports these as the chunks currently failed in the
+bank since the rebuild started. That number is read when you ask, not fixed
+when the rebuild completes, and it isn't only the rebuild's own chunks. It
+falls as soon as a chunk is put back on the queue, before it has been
+extracted, and rises if a turn that arrived later fails.
+
+### After it completes
+
+Recall comes back as soon as the last chunk has run. The bank's nightly
+sweep does not: memories rated lower this time fade and purge sooner, so
+the first sweep could delete far more than usual. Check `asphodel purge
+plan`, then run `asphodel rebuild ack --bank B`. Until then `asphodel
+status` lists the bank under `attention` and exits non-zero, as it does
+while the rebuild runs.
+
+To undo a rebuild, restore the backup taken before it ("Restore" above).

@@ -65,6 +65,7 @@ use crate::queue::{self, ChunkError, Failure, Lease, Leases, QueueError, SourceK
 use crate::store::{Store, StoreError, VectorIndex};
 
 pub use call2::call2_request;
+pub(crate) use commit::carry_access;
 pub(crate) use input::{entities_named, phrase, survivor};
 pub use prompt::call1_request;
 
@@ -436,6 +437,9 @@ pub enum DropReason {
     /// A task quoted from the assistant's reply with neither a due date nor
     /// an until-event (beyond the current turn).
     AssistantTaskUndated,
+    /// A rebuild ran the chunk again and the quote overlaps the passage of
+    /// a memory it kept ([`crate::rebuild`]).
+    KeptPassage,
 }
 
 /// Why an extraction didn't commit. No variant carries the prompt, the reply
@@ -524,6 +528,21 @@ pub enum ExtractError {
     #[error("the chunk's document was removed")]
     SourceRemoved,
 
+    /// A rebuild was running the chunk again and a forget reached it: one
+    /// masked some of it, or one still waiting will. Nothing from it is
+    /// written; the chunk leaves the queue unextracted and nothing is
+    /// counted.
+    #[error("a forget reached the chunk, so the rebuild doesn't extract it again")]
+    Forgotten,
+
+    /// A rebuild was running the chunk again, and a forget or a removal
+    /// arrived after its text and context were read. What the LLM made of
+    /// them may rest on what's now forgotten, so nothing is written or
+    /// counted: the lease is released, call 1's saved reply is gone, and
+    /// the chunk is extracted again from call 1.
+    #[error("a forget arrived after the chunk was read, so the rebuild reads it again")]
+    StaleContext,
+
     #[error(transparent)]
     Queue(#[from] QueueError),
 
@@ -549,6 +568,8 @@ impl ExtractError {
             | ExtractError::ModelUnavailable { .. }
             | ExtractError::Stale
             | ExtractError::SourceRemoved
+            | ExtractError::Forgotten
+            | ExtractError::StaleContext
             | ExtractError::Queue(_)
             | ExtractError::Store(_) => None,
         }
@@ -754,19 +775,54 @@ pub(crate) fn prepare(
     in_context: &[Uuid],
 ) -> Result<Prepared, ExtractError> {
     queue::check_held(leases, &lease)?;
-    if queue::source_removed(&store.connection(), lease.chunk_id())? {
-        discard(store, &lease)?;
-        return Err(ExtractError::SourceRemoved);
-    }
-    let (input, mut unit, saved) = {
-        let conn = store.connection();
-        let (input, unit) = input::assemble(&conn, tuning, store.now(), &lease, in_context)?;
-        let saved: Option<String> = conn.query_row(
-            "SELECT call1_output FROM chunks WHERE id = ?1",
-            [lease.chunk_id()],
-            |row| row.get(0),
-        )?;
-        (input, unit, saved)
+    // Whether the chunk may be extracted at all, what it and its context
+    // say, the forget generation that goes with them and call 1's saved
+    // reply are read in one transaction. A forget or a removal on another
+    // thread then either shows in every one of them or moves the
+    // generation afterwards, which the save and the commit check. Read
+    // apart, a forget could land after the chunk was let through and
+    // before its generation was noted, and go unseen. The store is
+    // released before the LLM is called.
+    let read = {
+        let mut conn = store.connection();
+        let tx = conn.transaction()?;
+        if queue::source_removed(&tx, lease.chunk_id())? {
+            queue::drop_removed(&tx, &lease)?;
+            tx.commit()?;
+            Read::Removed
+        } else if crate::rebuild::withheld(&tx, lease.chunk_id())? {
+            // It leaves the queue as the chunks a rebuild never queues
+            // are, extracted once and no more.
+            queue::finish(&tx, store.now(), &lease)?;
+            crate::rebuild::count_withheld(&tx, lease.bank_id(), lease.queue_id())?;
+            tx.commit()?;
+            Read::Withheld
+        } else {
+            let (input, unit) = input::assemble(&tx, tuning, store.now(), &lease, in_context)?;
+            let saved: Option<String> = tx.query_row(
+                "SELECT call1_output FROM chunks WHERE id = ?1",
+                [lease.chunk_id()],
+                |row| row.get(0),
+            )?;
+            // Nothing of the store's was written. Committing keeps the
+            // scratch tables the read made in the temp schema.
+            tx.commit()?;
+            Read::Ready(Box::new((input, unit, saved)))
+        }
+    };
+    let (input, mut unit, saved) = match read {
+        Read::Ready(read) => *read,
+        Read::Removed => {
+            tracing::info!(chunk = %lease.chunk, "the chunk's document was removed; it isn't extracted");
+            return Err(ExtractError::SourceRemoved);
+        }
+        Read::Withheld => {
+            tracing::info!(
+                chunk = %lease.chunk,
+                "a forget reached the chunk; the rebuild doesn't extract it again"
+            );
+            return Err(ExtractError::Forgotten);
+        }
     };
 
     // A saved reply means call 2 failed last time: resume from it, with the
@@ -887,6 +943,11 @@ fn reconcile_claims(
     // The connection is released before the failure is counted.
     let searched = {
         let conn = store.connection();
+        // Call 2 is shown the claims, which were made from the chunk and
+        // its context. Checked under the hold the search reads through.
+        if stale(&conn, &unit)? {
+            return Err(ExtractError::StaleContext);
+        }
         reconcile::snapshot(&conn, unit.bank_id, leases.commits(unit.bank_id)).and_then(
             |snapshot| {
                 reconcile::search(&conn, floor, &input, &unit, &checked, &vectors)
@@ -912,7 +973,9 @@ fn reconcile_claims(
         ),
         Some(search) => {
             if !saved {
-                save(store, &lease, &reply, &unit)?;
+                if !save(store, &lease, &reply, &unit)? {
+                    return Err(ExtractError::StaleContext);
+                }
                 saved = true;
             }
             let labels = match llm.complete(&call2_request(&search.input)) {
@@ -986,6 +1049,11 @@ pub(crate) fn commit_prepared(
                 queue::drop_removed(&tx, &prepared.lease)?;
                 tx.commit()?;
                 return Ok(Commit::Removed);
+            }
+            // A forget arrived while the chunk was out: what the calls
+            // found in it and its context isn't written.
+            if stale(&tx, &prepared.unit)? {
+                return Ok(Commit::StaleContext);
             }
             if leases.commits(bank_id) != prepared.snapshot.commits
                 && reconcile::stale(
@@ -1086,6 +1154,13 @@ pub(crate) fn commit_prepared(
             );
             Err(ExtractError::SourceRemoved)
         }
+        Ok(Commit::StaleContext) => {
+            tracing::info!(
+                chunk = %prepared.input.chunk,
+                "a forget arrived after the chunk was read; the rebuild reads it again"
+            );
+            Err(ExtractError::StaleContext)
+        }
         Err(error) => {
             // A commit that fails every time must still reach the retry cap
             // rather than hold the bank's queue for ever. The store's hold
@@ -1103,16 +1178,32 @@ enum Commit {
     Stale,
     /// The chunk's document was removed; it left the queue.
     Removed,
+    /// A forget arrived after a chunk a rebuild was running again was
+    /// read; it stays queued.
+    StaleContext,
 }
 
-/// Takes a leased chunk whose document was removed off the queue.
-fn discard(store: &Store, lease: &Lease) -> Result<(), ExtractError> {
-    let mut conn = store.connection();
-    let tx = conn.transaction()?;
-    queue::drop_removed(&tx, lease)?;
-    tx.commit()?;
-    tracing::info!(chunk = %lease.chunk, "the chunk's document was removed; it isn't extracted");
-    Ok(())
+/// Whether a chunk a rebuild is running again was read before the bank's
+/// latest forget ([`crate::rebuild::Rerun::stale`]). Never, for any other
+/// chunk.
+fn stale(conn: &rusqlite::Connection, unit: &input::Unit) -> Result<bool, rusqlite::Error> {
+    match &unit.rerun {
+        Some(rerun) => rerun.stale(conn, unit.bank_id),
+        None => Ok(false),
+    }
+}
+
+/// What [`prepare`]'s one read of the store found.
+enum Read {
+    /// The chunk's input, the unit that goes with it, and call 1's saved
+    /// reply if there is one.
+    Ready(Box<(Call1Input, input::Unit, Option<String>)>),
+    /// The chunk's document was removed; it left the queue.
+    Removed,
+    /// A forget reached a chunk a rebuild runs again
+    /// ([`crate::rebuild::withheld`]): nothing of it is sent to the LLM,
+    /// and it left the queue.
+    Withheld,
 }
 
 /// The plan again without call 2's labels on neighbours that are no longer
@@ -1217,7 +1308,18 @@ fn embed(
 /// Saves call 1's reply on the chunk before call 2 runs, with the handles
 /// it was given, so a retry resumes from it. The commit drops it, so no
 /// claim text outlives a purge or forget.
-fn save(store: &Store, lease: &Lease, reply: &Value, unit: &input::Unit) -> Result<(), StoreError> {
+///
+/// `false`, with nothing saved, for a chunk a rebuild is running again that
+/// was read before the bank's latest forget ([`stale`]): a reply saved from
+/// a context since forgotten would be resumed from. The check and the write
+/// share one transaction, and a forget drops the replies saved before it
+/// ([`crate::rebuild::forgot`]), so a saved reply is never a stale one.
+fn save(
+    store: &Store,
+    lease: &Lease,
+    reply: &Value,
+    unit: &input::Unit,
+) -> Result<bool, StoreError> {
     let saved = json!({
         "reply": reply,
         "entity_boundary": unit.entity_boundary,
@@ -1228,11 +1330,17 @@ fn save(store: &Store, lease: &Lease, reply: &Value, unit: &input::Unit) -> Resu
             .map(|(handle, (id, uuid))| (handle.clone(), json!([id, uuid.to_string()])))
             .collect::<serde_json::Map<_, _>>(),
     });
-    store.connection().execute(
+    let mut conn = store.connection();
+    let tx = conn.transaction()?;
+    if stale(&tx, unit)? {
+        return Ok(false);
+    }
+    tx.execute(
         "UPDATE chunks SET call1_output = ?1 WHERE id = ?2",
         (saved.to_string(), lease.chunk_id()),
     )?;
-    Ok(())
+    tx.commit()?;
+    Ok(true)
 }
 
 /// Call 1's saved reply, with `unit` given back the handles call 1 saw.

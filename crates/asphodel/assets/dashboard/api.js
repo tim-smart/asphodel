@@ -137,5 +137,12 @@ export function client(fetch, storage) {
     // The daemon answers once the refresh is done.
     refreshModel: (name, model) => call("POST", `${bank(name)}/models/${path(model)}/refresh?force=true`),
     retryChunks: (name, chunks) => call("POST", `${bank(name)}/chunks/retry`, chunks ? { chunks } : {}),
+    // Rebuilding a bank's memories from its sources. The plan is the dry
+    // run and writes nothing; starting repeats the bank's name, as the
+    // daemon asks of anything this destructive.
+    rebuild: (name) => call("GET", `${bank(name)}/rebuild`),
+    rebuildPlan: (name) => call("GET", `${bank(name)}/rebuild/plan`),
+    startRebuild: (name) => call("POST", `${bank(name)}/rebuild${query({ confirm: name })}`),
+    ackRebuild: (name) => call("POST", `${bank(name)}/rebuild/ack`),
   };
 }

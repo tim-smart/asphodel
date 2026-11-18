@@ -2,7 +2,7 @@
 // title and content; actions go through `ctx.act`, destructive ones after
 // `ctx.confirm`.
 
-import { ApiError } from "./api.js";
+import { ApiError, Unauthorized } from "./api.js";
 import { capitalize, fadeStage, formatDateTime, goneReason, plural, shortId } from "./dom.js";
 
 const STATUSES = ["live", "superseded", "ended", "retracted", "forgetting"];
@@ -1136,11 +1136,231 @@ async function source(ctx) {
   };
 }
 
-// The bank's ingestion: failed chunks to retry, and the queue.
+/// Why a rebuild can't start, as the daemon names each reason.
+const REBUILD_BLOCKERS = {
+  erase_pending: "A forget or a purge is still waiting in this bank's queue.",
+  reembed_pending: "This bank is moving to another embedding model. Let the re-embed finish.",
+  model_unavailable: "The daemon doesn't carry this bank's embedding model.",
+  backup_stale: "No backup completed in the last 24 hours. Take one first: it's the only way back.",
+  unacknowledged: "This bank's last rebuild hasn't been acknowledged.",
+};
+
+/// Roughly the calls a rebuild of `chunks` chunks makes: one each, and a
+/// second for most. It's an estimate and no ceiling, since a retried chunk
+/// or a reconciliation that has to run again calls again.
+function rebuildCalls(chunks) {
+  return chunks === 0 ? "no LLM calls" : `about ${chunks} to ${chunks * 2} LLM calls`;
+}
+
+/// The message of a failed load, for the part of a page that shows it in
+/// place. A rejected token isn't one: the app asks for another.
+function loadError(error) {
+  if (error instanceof Unauthorized) throw error;
+  return error instanceof ApiError ? error.message : String(error?.message ?? error);
+}
+
+// Rebuilding the bank's memories from its sources: the dry run, the start
+// behind a confirmation, how far it got, and the acknowledgement. A load
+// that fails here shows in the panel, so the page's chunks and their retry
+// don't depend on it.
+async function rebuildPanel(ctx) {
+  const { api, ui, bank, params } = ctx;
+  const { h, time } = ui;
+  const here = bankHash(bank, "chunks");
+  const section = (title, ...children) =>
+    h("section", { class: "panel rebuild-panel", "aria-labelledby": "rebuild-title" }, h("h2", { id: "rebuild-title" }, title), ...children);
+  const unloaded = (what, error) => h("p", { class: "rebuild-unloaded", role: "alert" }, `${what} couldn't be loaded: ${loadError(error)}`);
+  let status;
+  try {
+    status = await api.rebuild(bank);
+  } catch (error) {
+    return section("Rebuild memories", unloaded("Where this bank's rebuild stands", error));
+  }
+  const failed = status.failed
+    ? h(
+        "p",
+        {},
+        `Currently failed in this bank since the rebuild started: ${plural(status.failed, "chunk")}. Their memories are missing until the chunks are retried.`,
+      )
+    : null;
+  // Not failures: nothing can be retried, and the count is of chunks, not
+  // of the memories that weren't made.
+  const skipped = status.withheld
+    ? h(
+        "p",
+        {},
+        `Skipped after a forget made during the rebuild: ${plural(status.withheld, "chunk")}. A skipped chunk isn't extracted again and can't be retried, so anything else it held was not rebuilt.`,
+      )
+    : null;
+
+  if (status.state === "running") {
+    return section(
+      "Rebuilding memories",
+      h(
+        "p",
+        {},
+        h("strong", {}, `${status.remaining} of ${plural(status.chunks, "chunk")} left.`),
+        " Recall, the system prompt and the agenda are off for this bank until they've run.",
+      ),
+      h("p", { class: "quiet-text" }, `${memoryCount(status.replaced)} replaced, ${status.kept} kept as they were. Started `, time(status.started_at, { withTime: true }), "."),
+      skipped,
+      failed,
+      h("button", { type: "button", class: "small", onclick: () => ctx.act(async () => null) }, "Check progress"),
+    );
+  }
+
+  if (status.state === "complete") {
+    // The acknowledgement shows what the next sweep would delete. Without
+    // that count there's nothing to confirm against, so only it is off.
+    let sweep = null;
+    let sweepError = null;
+    try {
+      sweep = await api.purgePlan();
+    } catch (error) {
+      sweepError = unloaded("What the next sweep would delete", error);
+    }
+    return section(
+      "Rebuild complete",
+      h(
+        "p",
+        {},
+        `${plural(status.chunks, "chunk")} queued: ${memoryCount(status.replaced)} replaced, ${status.kept} kept as they were. `,
+        `${plural(status.carried, "access", "accesses")} carried to the new memories, ${status.dropped} dropped.`,
+      ),
+      skipped,
+      failed,
+      h(
+        "p",
+        {},
+        "Recall is back on. The nightly sweep leaves this bank alone until you acknowledge the rebuild, because memories rated lower this time can be purged sooner.",
+      ),
+      sweepError,
+      sweepError ? h("p", {}, "The rebuild can't be acknowledged until it loads. Reload the page to try again.") : null,
+      h(
+        "button",
+        {
+          type: "button",
+          class: "danger-outline",
+          disabled: Boolean(sweepError),
+          onclick: async () => {
+            const confirmed = await ctx.confirm({
+              title: `Let the sweep run on ${bank} again?`,
+              body: [
+                h(
+                  "p",
+                  {},
+                  `Across every bank, the next sweep deletes ${memoryCount(sweep.memories)}, ${plural(sweep.sources, "source")}, ${plural(sweep.failed_chunks, "failed chunk")} and ${plural(sweep.recalls, "recall")}.`,
+                ),
+                h("p", {}, "Purged memories can't be brought back."),
+              ],
+              action: "Acknowledge rebuild",
+            });
+            if (!confirmed) return;
+            ctx.act(async () => {
+              await api.ackRebuild(bank);
+              return "Rebuild acknowledged. The nightly sweep runs on this bank again.";
+            });
+          },
+        },
+        "Acknowledge rebuild…",
+      ),
+    );
+  }
+
+  const last = status.completed_at
+    ? h("p", { class: "quiet-text" }, "Last rebuilt ", time(status.completed_at, { withTime: true }), ".")
+    : null;
+  if (params.rebuild !== "preview") {
+    return section(
+      "Rebuild memories",
+      h(
+        "p",
+        {},
+        "Extract this bank's memories again from the turns and documents it still holds, under the daemon's current prompts. Nothing changes until you've seen the preview and confirmed.",
+      ),
+      last,
+      h("p", {}, h("a", { href: `${here}?rebuild=preview` }, "Preview a rebuild")),
+    );
+  }
+
+  let plan;
+  try {
+    plan = await api.rebuildPlan(bank);
+  } catch (error) {
+    return section(
+      "Rebuild memories: preview",
+      unloaded("The preview", error),
+      h("p", {}, h("a", { href: here }, "Close the preview")),
+    );
+  }
+  const fact = (count, ...label) => h("li", {}, h("strong", {}, String(count)), " ", h("span", {}, ...label));
+  const blockers = plan.blockers.map((blocker) => h("li", {}, REBUILD_BLOCKERS[blocker] ?? blocker));
+  const start = async () => {
+    const confirmed = await ctx.confirm({
+      title: `Rebuild ${bank}'s memories?`,
+      body: [
+        h(
+          "p",
+          {},
+          `${memoryCount(plan.memories_replaced)} are deleted now and extracted again from ${plural(plan.chunks, "chunk")}. That costs ${rebuildCalls(plan.chunks)}, and more if chunks are retried.`,
+        ),
+        h("p", {}, `Recall, the system prompt and the agenda are off for ${bank} until the last chunk has run.`),
+        h(
+          "p",
+          {},
+          "A forget made while it runs stops the chunks it reaches being extracted again, and anything else they held isn't rebuilt. Forget before you start or after it completes.",
+        ),
+        h("p", {}, "The only way back is the backup you took before starting."),
+      ],
+      action: "Rebuild memories",
+    });
+    if (!confirmed) return;
+    ctx.act(
+      async () => {
+        await api.startRebuild(bank);
+        return "The rebuild started. Recall is off for this bank until it completes.";
+      },
+      { then: here },
+    );
+  };
+  return section(
+    "Rebuild memories: preview",
+    h("p", {}, "A rebuild now would do this. Nothing has changed yet."),
+    h(
+      "ul",
+      { class: "rebuild-facts" },
+      fact(plan.chunks, plan.chunks === 1 ? "chunk" : "chunks", ` of ${plural(plan.sources, "source")} extracted again`),
+      fact(plan.memories_replaced, plan.memories_replaced === 1 ? "memory" : "memories", " replaced"),
+      fact(plan.memories_kept, plan.memories_kept === 1 ? "memory" : "memories", " kept as they are"),
+      fact(plan.accesses_carried, plan.accesses_carried === 1 ? "access" : "accesses", " carried to the new memories"),
+      fact(plan.models, plan.models === 1 ? "mental model answer" : "mental model answers", " blanked until it ends"),
+    ),
+    h(
+      "p",
+      { class: "quiet-text" },
+      `Left out: ${plural(plan.skipped.swept, "chunk")} with no text left, ${plural(plan.skipped.removed, "chunk")} of removed sources and ${plural(plan.skipped.masked, "chunk")} a forget masked. ${plural(plan.skipped.forget_requests, "forget request")} hold no text.`,
+    ),
+    h("p", {}, `Cost: ${rebuildCalls(plan.chunks)}: one per chunk and a second for most, and more if chunks are retried.`),
+    h(
+      "p",
+      {},
+      "Last backup: ",
+      plan.last_backup_at ? time(plan.last_backup_at, { withTime: true }) : "never",
+      ".",
+    ),
+    blockers.length
+      ? [h("p", {}, h("strong", {}, "It can't start yet.")), h("ul", { class: "rebuild-blockers" }, blockers)]
+      : h("button", { type: "button", class: "danger-outline", onclick: start }, "Rebuild memories…"),
+    h("p", {}, h("a", { href: here }, "Close the preview")),
+  );
+}
+
+// The bank's ingestion: failed chunks to retry, the queue, and rebuilding
+// the bank's memories.
 async function chunks(ctx) {
   const { api, ui, bank } = ctx;
   const { h, time, pill } = ui;
-  const list = await api.chunks(bank);
+  const [list, rebuild] = await Promise.all([api.chunks(bank), rebuildPanel(ctx)]);
   const retry = (ids) =>
     ctx.act(async () => {
       const done = await api.retryChunks(bank, ids);
@@ -1220,7 +1440,7 @@ async function chunks(ctx) {
       : h("p", { class: "empty" }, "Nothing waiting. New turns and documents are extracted as they arrive."),
   );
 
-  return { title: `Ingestion · ${bank}`, content: [heading(h, "Ingestion"), tableRoles(failed), tableRoles(queued)] };
+  return { title: `Ingestion · ${bank}`, content: [heading(h, "Ingestion"), tableRoles(failed), tableRoles(queued), rebuild] };
 }
 
 // The Recall page: one query through recall or injection, with the working

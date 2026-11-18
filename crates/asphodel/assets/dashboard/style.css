@@ -794,6 +794,30 @@ label {
   justify-self: start;
 }
 
+/* Rebuilding a bank's memories, on the Ingestion page */
+
+.rebuild-panel button {
+  justify-self: start;
+}
+
+.rebuild-facts,
+.rebuild-blockers {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.rebuild-facts strong {
+  font: 600 1rem var(--mono);
+}
+
+.rebuild-blockers li,
+.rebuild-unloaded {
+  color: var(--vein);
+}
+
 
 /* The memory list */
 

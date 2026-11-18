@@ -228,6 +228,10 @@ _Avoid_: Event date, context date
 Turning a source into memories and access events using the LLM, one chunk at a time.
 _Avoid_: Retain, ingestion (ingestion is receiving the source, before extraction)
 
+**Rebuild**:
+Extracting a bank's memories again, in place, from the sources it still holds text for, under the daemon's current prompts. It replaces the memories it can derive again and leaves what the owner touched and what a forget masked.
+_Avoid_: Re-extraction, reindex, backfill (that's sending Hermes' history)
+
 **Chunk**:
 The unit a source is extracted in: a whole turn, or a section of a document, split further only when it's too long.
 _Avoid_: Segment, passage, piece

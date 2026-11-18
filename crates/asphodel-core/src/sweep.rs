@@ -85,6 +85,9 @@ pub struct PurgePlan {
     pub sources: usize,
     pub failed_chunks: usize,
     pub recalls: usize,
+    /// The banks whose sweep waits for `asphodel rebuild ack`, whatever the
+    /// pause says. The counts include them.
+    pub rebuilds: Vec<String>,
 }
 
 /// What `purge ack` takes.
@@ -172,9 +175,15 @@ pub(crate) fn run(
 ) -> Result<Sweeps, StoreError> {
     let now = store.now();
     let fingerprint = tuning.deletion_fingerprint();
+    let rebuilds = crate::rebuild::held(&store.connection())?;
     let mut ran = Vec::new();
     for (bank_id, bank, tz) in banks {
         if schedule.next(*bank_id, tz, tuning) > now {
+            continue;
+        }
+        if rebuilds.contains(bank_id) {
+            schedule.swept(*bank_id, now);
+            tracing::warn!(bank = %bank, "the sweep waits for `asphodel rebuild ack`");
             continue;
         }
         if *pause != PurgePause::Running {
@@ -401,7 +410,7 @@ pub(crate) fn purge_chain(
         )
         .optional()?
         .is_some();
-    if !exists {
+    if !exists || crate::rebuild::held(&tx)?.contains(&bank_id) {
         return Ok(None);
     }
     let links = bank_links(&tx, bank_id)?;
@@ -462,6 +471,11 @@ fn sweep_sources(
     let now = micros(now);
     let mut conn = store.connection();
     let tx = conn.transaction()?;
+    // A rebuild can start while this sweep runs. Its chunks need their text,
+    // so the hold is read again in the transaction that would delete it.
+    if crate::rebuild::held(&tx)?.contains(&bank_id) {
+        return Ok(());
+    }
 
     let swept_failed_chunks = tx.execute(
         "UPDATE chunks SET text = NULL, call1_output = NULL, tombstoned_at = ?3
@@ -593,6 +607,16 @@ pub(crate) fn plan(
         sources: 0,
         failed_chunks: 0,
         recalls: 0,
+        rebuilds: {
+            let conn = store.connection();
+            let mut statement = conn.prepare(
+                "SELECT b.name FROM rebuilds r JOIN banks b ON b.id = r.bank_id
+                 WHERE r.acked_at IS NULL ORDER BY b.name",
+            )?;
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?
+        },
     };
     let horizon = horizon(tuning, now);
     for &bank_id in banks {

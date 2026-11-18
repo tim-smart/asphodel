@@ -40,6 +40,7 @@ use asphodel_core::operations::{
     SHA256_HEADER, Status,
 };
 use asphodel_core::queue::{ChunkList, QueueError, Retried, RetryRequest};
+use asphodel_core::rebuild::{RebuildError, RebuildPlan, RebuildStatus};
 use asphodel_core::reembed::{ReembedError, ReembedState, ReembedStatus};
 use asphodel_core::retract::{RetractError, Retracted};
 use asphodel_core::retrieval::{
@@ -137,6 +138,12 @@ pub(crate) fn router(app: Shared) -> Router {
             "/v1/banks/{bank}/reembed",
             get(reembed_status).post(reembed),
         )
+        .route(
+            "/v1/banks/{bank}/rebuild",
+            get(rebuild_status).post(rebuild),
+        )
+        .route("/v1/banks/{bank}/rebuild/plan", get(rebuild_plan))
+        .route("/v1/banks/{bank}/rebuild/ack", post(rebuild_ack))
         .route("/v1/backup", post(backup))
         .route("/v1/status", get(status))
         .route("/v1/purge/plan", get(purge_plan))
@@ -267,7 +274,9 @@ impl From<RecallError> for ApiError {
             RecallError::InvertedRange => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
             RecallError::NoModels => Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
             RecallError::Model { .. } => Self::internal(error),
-            RecallError::ModelUnavailable { .. } | RecallError::ModelChanged => {
+            RecallError::ModelUnavailable { .. }
+            | RecallError::ModelChanged
+            | RecallError::Rebuilding => {
                 Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
             }
             RecallError::Store(error) => error.into(),
@@ -363,6 +372,20 @@ impl From<ReembedError> for ApiError {
             }
             ReembedError::Model { .. } => Self::internal(error),
             ReembedError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<RebuildError> for ApiError {
+    fn from(error: RebuildError) -> Self {
+        match error {
+            RebuildError::UnknownBank => Self::new(StatusCode::NOT_FOUND, error.to_string()),
+            RebuildError::NotConfirmed => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
+            RebuildError::Blocked { .. }
+            | RebuildError::NothingToAck
+            | RebuildError::StillRunning => Self::new(StatusCode::CONFLICT, error.to_string()),
+            RebuildError::Busy => Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+            RebuildError::Store(error) => error.into(),
         }
     }
 }
@@ -1363,6 +1386,64 @@ async fn reembed_status(
     let status = app
         .call(move |service| service.reembed_status(&bank))
         .await?;
+    Ok(Json(status))
+}
+
+/// `GET /v1/banks/{bank}/rebuild/plan`: the dry run. What a rebuild would
+/// run again, skip, replace and keep, and why it can't start if it can't.
+/// It writes nothing.
+async fn rebuild_plan(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+) -> Result<Json<RebuildPlan>, ApiError> {
+    let plan = app.call(move |service| service.rebuild_plan(&bank)).await?;
+    Ok(Json(plan))
+}
+
+/// `POST /v1/banks/{bank}/rebuild?confirm=<bank>`: starts the bank's
+/// rebuild and wakes its worker, which runs it. 202 with where it stands;
+/// `GET` follows it. Until it completes, the bank's recall, injection and
+/// agenda answer 503. 409 with the reasons when it can't start.
+async fn rebuild(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+    query: Result<Query<DeleteQuery>, QueryRejection>,
+) -> Result<(StatusCode, Json<RebuildStatus>), ApiError> {
+    let Query(query) = query?;
+    let ready = app.ready().ok_or_else(ApiError::not_ready)?;
+    let Some(workers) = ready.workers.clone() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no LLM is configured, so nothing would extract the bank again",
+        ));
+    };
+    let name = bank.clone();
+    let status = app
+        .call(move |service| service.start_rebuild(&name, &query.confirm))
+        .await?;
+    workers.wake(&bank);
+    Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+/// `GET /v1/banks/{bank}/rebuild`: where the bank's latest rebuild stands.
+async fn rebuild_status(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+) -> Result<Json<RebuildStatus>, ApiError> {
+    let status = app
+        .call(move |service| service.rebuild_status(&bank))
+        .await?;
+    Ok(Json(status))
+}
+
+/// `POST /v1/banks/{bank}/rebuild/ack`: the bank's nightly sweep runs
+/// again. 409 while the rebuild is still running, or when there's none to
+/// acknowledge.
+async fn rebuild_ack(
+    State(app): State<Shared>,
+    Path(bank): Path<String>,
+) -> Result<Json<RebuildStatus>, ApiError> {
+    let status = app.call(move |service| service.ack_rebuild(&bank)).await?;
     Ok(Json(status))
 }
 

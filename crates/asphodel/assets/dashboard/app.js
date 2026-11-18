@@ -1,6 +1,6 @@
 // The dashboard: hash routes over the daemon's read-only list routes, the
 // Recall page's explain (which logs nothing), and the owner's actions (keep, retract, forget, remove a document, retry
-// chunks, resume purge, a model in or out of the prompt, refresh a model), each destructive one behind a confirmation.
+// chunks, resume purge, a model in or out of the prompt, refresh a model, rebuild a bank's memories), each destructive one behind a confirmation.
 // A daemon with no tuning file yet gets the setup wizard instead.
 //
 // `mount(root, { fetch })` renders into `root` and returns a function that

@@ -557,6 +557,28 @@ pub(crate) fn status(
             },
         );
     }
+    {
+        let mut rebuilds = conn.prepare(
+            "SELECT b.name, r.completed_at IS NOT NULL FROM rebuilds r
+             JOIN banks b ON b.id = r.bank_id WHERE r.acked_at IS NULL ORDER BY b.name",
+        )?;
+        let rebuilds = rebuilds
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (name, complete) in rebuilds {
+            attention.push(if complete {
+                format!(
+                    "{name}: its rebuild is complete and its sweep waits; see `asphodel purge plan`, then `asphodel rebuild ack --bank {name}`"
+                )
+            } else {
+                format!(
+                    "{name}: its memories are being rebuilt, so recall is off; see `asphodel rebuild --bank {name}`"
+                )
+            });
+        }
+    }
     if let PurgePause::Paused { stored } = &purge {
         attention.push(format!(
             "purge is paused: the deletion fingerprint changed from {stored} to {current}; \
