@@ -1141,7 +1141,7 @@ const REBUILD_BLOCKERS = {
   erase_pending: "A forget or a purge is still waiting in this bank's queue.",
   reembed_pending: "This bank is moving to another embedding model. Let the re-embed finish.",
   model_unavailable: "The daemon doesn't carry this bank's embedding model.",
-  backup_stale: "No backup completed in the last 24 hours. Take one first: it's the only way back.",
+  backup_stale: "No backup completed in the last 24 hours. Take one first: it's the only way back. You can still rebuild without one.",
   unacknowledged: "This bank's last rebuild hasn't been acknowledged.",
 };
 
@@ -1295,9 +1295,27 @@ async function rebuildPanel(ctx) {
   }
   const fact = (count, ...label) => h("li", {}, h("strong", {}, String(count)), " ", h("span", {}, ...label));
   const blockers = plan.blockers.map((blocker) => h("li", {}, REBUILD_BLOCKERS[blocker] ?? blocker));
-  const start = async () => {
+  // A stale backup is the one reason the owner can waive: the daemon still
+  // checks everything else.
+  const backupOnly = plan.blockers.length === 1 && plan.blockers[0] === "backup_stale";
+  const start = async ({ withoutBackup = false } = {}) => {
+    const undo = withoutBackup
+      ? [
+          h(
+            "p",
+            {},
+            h("strong", {}, "There's no backup from the last 24 hours."),
+            " Without a usable backup from before the rebuild, the memories it replaces, their ids and their old ratings can't be restored as they were. An older backup restores only its own snapshot.",
+          ),
+          h(
+            "p",
+            {},
+            "Only chunks that still hold their text are extracted again. Memories resting on chunks with no text left are kept as they are.",
+          ),
+        ]
+      : [h("p", {}, "The only way back is the backup you took before starting.")];
     const confirmed = await ctx.confirm({
-      title: `Rebuild ${bank}'s memories?`,
+      title: withoutBackup ? `Rebuild ${bank}'s memories without a backup?` : `Rebuild ${bank}'s memories?`,
       body: [
         h(
           "p",
@@ -1310,14 +1328,14 @@ async function rebuildPanel(ctx) {
           {},
           "A forget made while it runs stops the chunks it reaches being extracted again, and anything else they held isn't rebuilt. Forget before you start or after it completes.",
         ),
-        h("p", {}, "The only way back is the backup you took before starting."),
+        ...undo,
       ],
-      action: "Rebuild memories",
+      action: withoutBackup ? "Rebuild without a backup" : "Rebuild memories",
     });
     if (!confirmed) return;
     ctx.act(
       async () => {
-        await api.startRebuild(bank);
+        await api.startRebuild(bank, { withoutBackup });
         return "The rebuild started. Recall is off for this bank until it completes.";
       },
       { then: here },
@@ -1349,8 +1367,18 @@ async function rebuildPanel(ctx) {
       ".",
     ),
     blockers.length
-      ? [h("p", {}, h("strong", {}, "It can't start yet.")), h("ul", { class: "rebuild-blockers" }, blockers)]
-      : h("button", { type: "button", class: "danger-outline", onclick: start }, "Rebuild memories…"),
+      ? [
+          h("p", {}, h("strong", {}, "It can't start yet.")),
+          h("ul", { class: "rebuild-blockers" }, blockers),
+          backupOnly
+            ? h(
+                "button",
+                { type: "button", class: "danger-outline", onclick: () => start({ withoutBackup: true }) },
+                "Rebuild without a backup…",
+              )
+            : null,
+        ]
+      : h("button", { type: "button", class: "danger-outline", onclick: () => start() }, "Rebuild memories…"),
     h("p", {}, h("a", { href: here }, "Close the preview")),
   );
 }

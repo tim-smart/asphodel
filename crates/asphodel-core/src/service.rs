@@ -43,7 +43,7 @@ use crate::operations::{Audit, AuditError, AuditList, Backup, BackupError, Statu
 use crate::queue::{
     ChunkError, ChunkList, FailedChunk, Failure, Lease, Leases, QueueError, Retried, SourceKind,
 };
-use crate::rebuild::{RebuildError, RebuildPlan, RebuildStatus};
+use crate::rebuild::{BackupCheck, RebuildError, RebuildPlan, RebuildStatus};
 use crate::reembed::{ReembedError, ReembedStatus};
 use crate::retract::{RetractError, Retracted};
 use crate::retrieval::{
@@ -1350,16 +1350,28 @@ impl Service {
 impl Service {
     /// `asphodel rebuild --bank` without `--confirm`, the dry run: what a
     /// rebuild would run again, skip, replace and keep, and why it can't
-    /// start if it can't. It writes nothing.
-    pub fn rebuild_plan(&self, bank: &str) -> Result<RebuildPlan, RebuildError> {
-        crate::rebuild::plan(&self.store, bank, self.serves(bank)?)
+    /// start if it can't. It writes nothing. `backup` is the check the
+    /// start would make.
+    pub fn rebuild_plan(
+        &self,
+        bank: &str,
+        backup: BackupCheck,
+    ) -> Result<RebuildPlan, RebuildError> {
+        crate::rebuild::plan(&self.store, bank, self.serves(bank)?, backup)
     }
 
     /// `POST /v1/banks/{bank}/rebuild`: starts the bank's rebuild.
     /// `confirm` must repeat the name. From here until the rebuild's last
     /// chunk has run, the bank's recall, injection and agenda are refused
     /// ([`RecallError::Rebuilding`]); the bank's workers do the rest.
-    pub fn start_rebuild(&self, bank: &str, confirm: &str) -> Result<RebuildStatus, RebuildError> {
+    /// [`BackupCheck::Waived`] starts it with no backup from the last 24
+    /// hours.
+    pub fn start_rebuild(
+        &self,
+        bank: &str,
+        confirm: &str,
+        backup: BackupCheck,
+    ) -> Result<RebuildStatus, RebuildError> {
         if bank.trim() != confirm.trim() {
             return Err(RebuildError::NotConfirmed);
         }
@@ -1375,7 +1387,7 @@ impl Service {
                 .leases
                 .hold(bank_id, Self::HOLD_WAIT)
                 .ok_or(RebuildError::Busy)?;
-            crate::rebuild::start(&self.store, &hold, bank, serving)?;
+            crate::rebuild::start(&self.store, &hold, bank, serving, backup)?;
         }
         self.sessions.forget_bank(bank_id);
         self.blocks.invalidate(bank_id);

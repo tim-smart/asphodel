@@ -876,8 +876,10 @@ chunks past the 90-day horizon.
 
 `asphodel rebuild --bank B` extracts a bank's memories again from the
 sources it holds, under the daemon's current prompts. Without `--confirm`
-it only counts what it would do. See "Rebuilding a bank's memories" below
-before starting one: recall is off for the bank while it runs.
+it only counts what it would do. `--without-backup` starts one with no
+backup from the last 24 hours. See "Rebuilding a bank's
+memories" below before starting one: recall is off for the bank while it
+runs.
 
 ### Audit lists
 
@@ -1582,6 +1584,9 @@ The routes behind them are `GET /v1/banks/{bank}/rebuild/plan`,
 `GET /v1/banks/{bank}/rebuild` and `POST /v1/banks/{bank}/rebuild/ack`.
 The dashboard does the same from a bank's Ingestion page.
 
+With no backup to take, add `--without-backup` to both the dry run and
+the start ("Without a backup" below).
+
 ### What it covers
 
 A rebuild is for a whole bank. It runs every chunk that still has its text
@@ -1632,7 +1637,9 @@ doesn't go ahead of them.
 The start is refused with 409 and the reasons unless:
 
 - `POST /v1/backup` completed in the last 24 hours. A backup is the only
-  way back to the memories a rebuild replaces.
+  way back to the memories a rebuild replaces. `--without-backup`
+  (`without_backup=true` on the plan and the start) lifts this check and
+  no other.
 - no forget or purge is waiting in the bank's queue
 - no re-embed of the bank is recorded, and the daemon carries the bank's
   embedding model
@@ -1641,6 +1648,70 @@ The start is refused with 409 and the reasons unless:
 `--confirm` has to repeat the bank's name. The start waits up to ten
 minutes for the bank's chunks in flight and answers 503 if they don't
 finish.
+
+### Without a backup
+
+A rebuild doesn't read a backup. It works from the bank's own store, so it
+can run without one. Without a usable backup from before the rebuild, the
+memories it replaces can't be restored as they were. An older backup
+restores only its own snapshot, losing everything since it was taken.
+
+```sh
+asphodel rebuild --bank B --without-backup              # the dry run
+asphodel rebuild --bank B --confirm B --without-backup  # starts it
+```
+
+The dashboard offers "Rebuild without a backup…" when a missing backup is
+the only thing stopping the start, behind a confirmation that says so.
+The `rebuild_started` edit row records that the check was waived, and when
+the last backup was, if there ever was one.
+
+What the rebuild needs, all of it in the live store:
+
+- the text of the bank's turns and document versions. A chunk is run again
+  only while its text is there. The sweep deletes a source's text once no
+  memory rests on it and it's past the 90-day horizon, and removing a
+  document or a turn deletes it at once.
+- the bank's embedding model, carried by the daemon
+- a configured LLM, under the prompts you want the memories extracted with
+
+Hermes' `state.db` isn't one of them. If the store itself is gone, a
+rebuild has nothing to run on. The only way to start over is the daemon on
+an empty data dir and Hermes' history sent again ("Backfilling Hermes'
+history" above). That brings back only the turns Hermes still keeps, and
+none of the documents. It also brings back what was forgotten: the new
+store has none of the old forget masks or removed sources' keys, and the
+backfill sends every turn as an ordinary one, so anything Hermes still
+holds the text of is extracted again. Pick a `--since` date after the
+history that has to stay forgotten, or forget it again once it's back, and
+don't backfill at all when you can't tell what's safe. An in-place rebuild
+doesn't have this problem, because it keeps the masks.
+
+What can't be recovered once it starts, without a backup from before it:
+
+- the replaced memories as they were: their wording, ids, ratings, validity
+  windows and entity links. The rerun writes new ones under new ids, and
+  anything holding an old id, such as a recall log result or an edit row,
+  no longer finds it.
+- `used` accesses and pending credits that no new memory's passage
+  overlaps. The status counts them as `dropped`.
+- every mental model answer. Each is blanked at the start and written again
+  by one refresh at the end, from the new memories.
+- whatever a chunk held if a forget made during the rebuild reaches it
+  (`withheld`). It isn't run again and can't be retried.
+
+These are left alone, so a rebuild without a backup loses nothing from
+them:
+
+- memories resting on chunks with no text left, or on chunks a forget
+  masked. The dry run counts these chunks under `skipped`.
+- memories the owner touched, and the rest of their chains
+
+A chunk that fails past the retry cap isn't lost. Its memories are missing
+until `asphodel chunks --bank B --failed --retry` runs it again, which
+works as long as its text hasn't been swept. The rebuild holds the bank's
+sweep until you acknowledge it, so retry failed chunks before running
+`asphodel rebuild ack`.
 
 ### What happens to existing state
 
@@ -1743,3 +1814,6 @@ status` lists the bank under `attention` and exits non-zero, as it does
 while the rebuild runs.
 
 To undo a rebuild, restore the backup taken before it ("Restore" above).
+A rebuild started with `--without-backup` has no such backup, so the
+memories it replaced can't be restored as they were. An older backup
+restores only its own snapshot.

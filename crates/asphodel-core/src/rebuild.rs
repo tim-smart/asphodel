@@ -64,6 +64,19 @@ pub const EDIT_REBUILD_ACKED: &str = "rebuild_acked";
 /// only way back to the memories a rebuild replaces.
 pub const BACKUP_MAX_AGE: SignedDuration = SignedDuration::from_hours(24);
 
+/// Whether a rebuild needs a recent backup to start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackupCheck {
+    /// Refused unless a backup completed in the last [`BACKUP_MAX_AGE`].
+    #[default]
+    Required,
+    /// Starts with no backup from the last [`BACKUP_MAX_AGE`]. Without a
+    /// usable backup from before the rebuild, the memories it replaces
+    /// can't be restored as they were, and an older backup restores only
+    /// its own snapshot. Every other check still applies.
+    Waived,
+}
+
 /// What a rebuild would do, `asphodel rebuild --bank` without `--confirm`.
 /// Counts only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -83,6 +96,9 @@ pub struct RebuildPlan {
     /// Mental models whose answers are blanked until the rebuild ends.
     pub models: usize,
     pub last_backup_at: Option<Timestamp>,
+    /// Whether the plan was made with the backup check waived, in which
+    /// case [`Blocker::BackupStale`] is never among the blockers.
+    pub without_backup: bool,
     /// Why the rebuild can't start now. Empty when it can.
     pub blockers: Vec<Blocker>,
 }
@@ -653,6 +669,7 @@ fn blockers(
     bank_id: i64,
     now: Timestamp,
     serving: bool,
+    backup: BackupCheck,
 ) -> Result<(Vec<Blocker>, Option<Timestamp>), rusqlite::Error> {
     let mut blockers = Vec::new();
     let exists = |sql: &str| -> Result<bool, rusqlite::Error> {
@@ -679,7 +696,9 @@ fn blockers(
         )
         .optional()?
         .and_then(|at| at.parse().ok());
-    if !last_backup_at.is_some_and(|at| at <= now && now.duration_since(at) <= BACKUP_MAX_AGE) {
+    if backup == BackupCheck::Required
+        && !last_backup_at.is_some_and(|at| at <= now && now.duration_since(at) <= BACKUP_MAX_AGE)
+    {
         blockers.push(Blocker::BackupStale);
     }
     if exists("SELECT 1 FROM rebuilds WHERE bank_id = ?1 AND acked_at IS NULL")? {
@@ -697,11 +716,16 @@ fn find(conn: &Connection, bank: &str) -> Result<(i64, String), RebuildError> {
 }
 
 /// The dry run. It writes nothing.
-pub(crate) fn plan(store: &Store, bank: &str, serving: bool) -> Result<RebuildPlan, RebuildError> {
+pub(crate) fn plan(
+    store: &Store,
+    bank: &str,
+    serving: bool,
+    backup: BackupCheck,
+) -> Result<RebuildPlan, RebuildError> {
     let conn = store.connection();
     let (bank_id, name) = find(&conn, bank)?;
     let survey = survey(&conn, bank_id)?;
-    let (blockers, last_backup_at) = blockers(&conn, bank_id, store.now(), serving)?;
+    let (blockers, last_backup_at) = blockers(&conn, bank_id, store.now(), serving, backup)?;
     let models = count(conn.query_row(
         "SELECT COUNT(*) FROM mental_models WHERE bank_id = ?1 AND answer IS NOT NULL",
         [bank_id],
@@ -726,6 +750,7 @@ pub(crate) fn plan(store: &Store, bank: &str, serving: bool) -> Result<RebuildPl
             .count(),
         models,
         last_backup_at,
+        without_backup: backup == BackupCheck::Waived,
         blockers,
     })
 }
@@ -733,18 +758,20 @@ pub(crate) fn plan(store: &Store, bank: &str, serving: bool) -> Result<RebuildPl
 /// Starts the bank's rebuild in one transaction, under the bank's hold so
 /// no extraction is in flight. A crash before it commits leaves the bank as
 /// it was. A crash after leaves the rebuild in the store, where the workers
-/// pick it up.
+/// pick it up. With the backup check waived the start edit row says so, and
+/// names the last backup there was, if any.
 pub(crate) fn start(
     store: &Store,
     _hold: &BankHold,
     bank: &str,
     serving: bool,
+    backup: BackupCheck,
 ) -> Result<i64, RebuildError> {
     let now = store.now();
     let mut conn = store.connection();
     let tx = conn.transaction()?;
     let (bank_id, _) = find(&tx, bank)?;
-    let (blockers, _) = blockers(&tx, bank_id, now, serving)?;
+    let (blockers, last_backup_at) = blockers(&tx, bank_id, now, serving, backup)?;
     if !blockers.is_empty() {
         return Err(RebuildError::Blocked { blockers });
     }
@@ -865,6 +892,8 @@ pub(crate) fn start(
         "skipped": survey.skipped,
         "replaced": survey.replaced.len(),
         "kept": survey.kept,
+        "without_backup": backup == BackupCheck::Waived,
+        "last_backup_at": last_backup_at,
     });
     log_edit(
         &tx,
@@ -880,6 +909,7 @@ pub(crate) fn start(
         chunks = survey.chunks.len(),
         replaced = survey.replaced.len(),
         kept = survey.kept,
+        without_backup = backup == BackupCheck::Waived,
         "started a rebuild"
     );
     Ok(bank_id)

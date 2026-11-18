@@ -40,7 +40,7 @@ use asphodel_core::operations::{
     SHA256_HEADER, Status,
 };
 use asphodel_core::queue::{ChunkList, QueueError, Retried, RetryRequest};
-use asphodel_core::rebuild::{RebuildError, RebuildPlan, RebuildStatus};
+use asphodel_core::rebuild::{BackupCheck, RebuildError, RebuildPlan, RebuildStatus};
 use asphodel_core::reembed::{ReembedError, ReembedState, ReembedStatus};
 use asphodel_core::retract::{RetractError, Retracted};
 use asphodel_core::retrieval::{
@@ -1389,25 +1389,51 @@ async fn reembed_status(
     Ok(Json(status))
 }
 
-/// `GET /v1/banks/{bank}/rebuild/plan`: the dry run. What a rebuild would
-/// run again, skip, replace and keep, and why it can't start if it can't.
-/// It writes nothing.
+#[derive(Debug, Default, Deserialize)]
+struct RebuildQuery {
+    /// The bank's name again, to start one.
+    #[serde(default)]
+    confirm: String,
+    /// Start with no backup from the last 24 hours.
+    #[serde(default)]
+    without_backup: bool,
+}
+
+impl RebuildQuery {
+    fn backup(&self) -> BackupCheck {
+        if self.without_backup {
+            BackupCheck::Waived
+        } else {
+            BackupCheck::Required
+        }
+    }
+}
+
+/// `GET /v1/banks/{bank}/rebuild/plan[?without_backup=true]`: the dry run.
+/// What a rebuild would run again, skip, replace and keep, and why it can't
+/// start if it can't, under the same backup check the start would make. It
+/// writes nothing.
 async fn rebuild_plan(
     State(app): State<Shared>,
     Path(bank): Path<String>,
+    query: Result<Query<RebuildQuery>, QueryRejection>,
 ) -> Result<Json<RebuildPlan>, ApiError> {
-    let plan = app.call(move |service| service.rebuild_plan(&bank)).await?;
+    let Query(query) = query?;
+    let plan = app
+        .call(move |service| service.rebuild_plan(&bank, query.backup()))
+        .await?;
     Ok(Json(plan))
 }
 
-/// `POST /v1/banks/{bank}/rebuild?confirm=<bank>`: starts the bank's
-/// rebuild and wakes its worker, which runs it. 202 with where it stands;
-/// `GET` follows it. Until it completes, the bank's recall, injection and
-/// agenda answer 503. 409 with the reasons when it can't start.
+/// `POST /v1/banks/{bank}/rebuild?confirm=<bank>[&without_backup=true]`:
+/// starts the bank's rebuild and wakes its worker, which runs it. 202 with
+/// where it stands; `GET` follows it. Until it completes, the bank's
+/// recall, injection and agenda answer 503. 409 with the reasons when it
+/// can't start. `without_backup` lifts only the backup check.
 async fn rebuild(
     State(app): State<Shared>,
     Path(bank): Path<String>,
-    query: Result<Query<DeleteQuery>, QueryRejection>,
+    query: Result<Query<RebuildQuery>, QueryRejection>,
 ) -> Result<(StatusCode, Json<RebuildStatus>), ApiError> {
     let Query(query) = query?;
     let ready = app.ready().ok_or_else(ApiError::not_ready)?;
@@ -1419,7 +1445,7 @@ async fn rebuild(
     };
     let name = bank.clone();
     let status = app
-        .call(move |service| service.start_rebuild(&name, &query.confirm))
+        .call(move |service| service.start_rebuild(&name, &query.confirm, query.backup()))
         .await?;
     workers.wake(&bank);
     Ok((StatusCode::ACCEPTED, Json(status)))

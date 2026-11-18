@@ -772,6 +772,12 @@ pub struct RebuildArgs {
     /// bank until it completes, and a backup is the only way back.
     #[arg(long)]
     pub confirm: Option<String>,
+
+    /// Rebuild with no backup from the last 24 hours. Without a usable
+    /// backup from before the rebuild, the memories it replaces can't be
+    /// restored as they were.
+    #[arg(long)]
+    pub without_backup: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3177,7 +3183,11 @@ fn rebuild(args: RebuildArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let plan: Value = client.get(&format!("{path}/plan"))?;
+    let plan: Value = if args.without_backup {
+        client.get(&format!("{path}/plan?without_backup=true"))?
+    } else {
+        client.get(&format!("{path}/plan"))?
+    };
     let blockers = list(&plan, "blockers");
     if args.confirm.is_none() || !blockers.is_empty() {
         if args.client.json {
@@ -3190,7 +3200,11 @@ fn rebuild(args: RebuildArgs) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    let status: Value = client.post(&format!("{path}?confirm={}", segment(&bank)), &Value::Null)?;
+    let mut start = format!("{path}?confirm={}", segment(&bank));
+    if args.without_backup {
+        start.push_str("&without_backup=true");
+    }
+    let status: Value = client.post(&start, &Value::Null)?;
     if args.client.json {
         return print_json(&status);
     }
@@ -3227,15 +3241,30 @@ fn print_rebuild_plan(bank: &str, plan: &Value) {
         Some(at) => println!("  last backup: {at}"),
         None => println!("  last backup: never"),
     }
+    let without_backup = plan
+        .get("without_backup")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let blockers = list(plan, "blockers");
     if blockers.is_empty() {
-        println!(
-            "recall, injection and the agenda are off for {bank} while it runs, and a backup is the only way back"
-        );
+        if without_backup {
+            println!(
+                "recall, injection and the agenda are off for {bank} while it runs; without a usable backup from before it starts, the memories it replaces can't be restored as they were, and an older backup restores only its own snapshot"
+            );
+        } else {
+            println!(
+                "recall, injection and the agenda are off for {bank} while it runs, and a backup is the only way back"
+            );
+        }
         println!(
             "a forget made while it runs stops the chunks it reaches being extracted again, and anything else they held isn't rebuilt: forget before you start or after it completes"
         );
-        println!("start it with `asphodel rebuild --bank {bank} --confirm {bank}`");
+        let waiver = if without_backup {
+            " --without-backup"
+        } else {
+            ""
+        };
+        println!("start it with `asphodel rebuild --bank {bank} --confirm {bank}{waiver}`");
         return;
     }
     println!("it can't start now:");
@@ -3247,7 +3276,8 @@ fn print_rebuild_plan(bank: &str, plan: &Value) {
                 "reembed_pending" => "a re-embed of the bank is recorded; let it finish",
                 "model_unavailable" =>
                     "the daemon doesn't carry the bank's embedding model; run `asphodel reembed`",
-                "backup_stale" => "no backup completed in the last 24 hours; run `asphodel backup`",
+                "backup_stale" =>
+                    "no backup completed in the last 24 hours; run `asphodel backup`, or pass `--without-backup` to rebuild without one",
                 "unacknowledged" => "the bank's last rebuild isn't acknowledged",
                 other => other,
             }
