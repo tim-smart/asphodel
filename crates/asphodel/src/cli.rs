@@ -3232,6 +3232,9 @@ fn print_rebuild_plan(bank: &str, plan: &Value) {
         println!(
             "recall, injection and the agenda are off for {bank} while it runs, and a backup is the only way back"
         );
+        println!(
+            "a forget made while it runs stops the chunks it reaches being extracted again, and anything else they held isn't rebuilt: forget before you start or after it completes"
+        );
         println!("start it with `asphodel rebuild --bank {bank} --confirm {bank}`");
         return;
     }
@@ -3255,6 +3258,7 @@ fn print_rebuild_plan(bank: &str, plan: &Value) {
 /// Where a rebuild stands.
 fn print_rebuild(bank: &str, status: &Value) {
     let failed = count(status, "failed");
+    let withheld = count(status, "withheld");
     match text(status, "state") {
         "running" => {
             println!(
@@ -3270,7 +3274,7 @@ fn print_rebuild(bank: &str, status: &Value) {
         }
         _ => {
             println!(
-                "the rebuild of {bank} is complete: {} chunks run, {} memories replaced, {} kept",
+                "the rebuild of {bank} is complete: {} chunks queued, {} memories replaced, {} kept",
                 count(status, "chunks"),
                 count(status, "replaced"),
                 count(status, "kept"),
@@ -3284,6 +3288,11 @@ fn print_rebuild(bank: &str, status: &Value) {
                 "its sweep waits: see `asphodel purge plan`, then `asphodel rebuild ack --bank {bank}`"
             );
         }
+    }
+    if withheld > 0 {
+        println!(
+            "  {withheld} chunks skipped after a forget made during the rebuild; they aren't extracted again and can't be retried, so anything else they held was not rebuilt"
+        );
     }
     if failed > 0 {
         println!("  {failed} chunks failed; see `asphodel chunks --bank {bank} --failed`");

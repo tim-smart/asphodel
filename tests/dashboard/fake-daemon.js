@@ -302,7 +302,7 @@ export function fixtures() {
     },
     /// Where bank `main`'s rebuild stands, and what its dry run answers.
     rebuild: {
-      status: { bank: "main", state: "idle", started_at: null, completed_at: null, acked_at: null, chunks: 0, remaining: 0, failed: 0, replaced: 0, kept: 0, carried: 0, dropped: 0 },
+      status: { bank: "main", state: "idle", started_at: null, completed_at: null, acked_at: null, chunks: 0, remaining: 0, failed: 0, replaced: 0, kept: 0, carried: 0, dropped: 0, withheld: 0 },
       plan: {
         bank: "main",
         sources: 12,

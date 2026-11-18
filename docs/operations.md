@@ -1686,13 +1686,30 @@ lists that, and the one case a rebuild adds.
 A forget made while a rebuild runs hides the memory at once. Its erase
 waits in the queue behind the rebuild's chunks, so the text is still there,
 and the rebuild treats it as masked from that moment. A chunk the erase is
-going to mask isn't extracted again and isn't shown as context. If the LLM
-has already read it, what it found isn't written.
+going to mask isn't extracted again and isn't shown as context.
 
-That costs the chunk's other memories. The rebuild deleted them when it
+A chunk the LLM was already reading when the forget arrived writes nothing,
+whether the forget reached the chunk itself or a turn or section it was
+shown as context. Call 1's saved replies for the rebuild's chunks are
+deleted with the forget, so a retry can't resume from one written before
+it. The chunk goes round again: it's skipped if the forget reached it, and
+otherwise read from call 1 without the forgotten context. Removing a turn
+or a document does the same. Each forget costs one extra call 1 for a chunk
+in flight.
+
+A skipped chunk costs its other memories. The rebuild deleted them when it
 started and now won't make them again, where a forget made before the
 rebuild would have left them as they were. Forget before you start a
-rebuild or after it completes when you can.
+rebuild or after it completes when you can. The dry run and the dashboard's
+confirmation say so before you start.
+
+The rebuild's status counts the chunks skipped this way as `withheld`,
+apart from the chunks that failed and the ones the dry run left out. The
+command and the dashboard show the count while the rebuild runs and before
+you acknowledge it. It's a count of chunks, not of memories: how many
+memories a skipped chunk would have made isn't known. A skipped chunk is
+not a failed one. It can't be retried, and `asphodel chunks --failed`
+doesn't list it.
 
 ### Interruptions and failures
 

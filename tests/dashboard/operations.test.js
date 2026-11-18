@@ -229,6 +229,7 @@ test("starting a rebuild asks first, naming the downtime and the cost, and cance
   assert.ok(showsCount(dialog, "LLM calls", 28), textOf(dialog));
   assert.ok(showsCount(dialog, "memories", 31), textOf(dialog));
   assert.match(textOf(dialog), /backup/i);
+  assert.match(textOf(dialog), /forget made while it runs/i);
   click(await findButton(dialog, /cancel/i));
   await waitFor(() => !queryDialog(page.document), "the confirmation to close");
 
@@ -274,9 +275,12 @@ function completed(daemon) {
 test("a complete rebuild is acknowledged behind a confirmation that counts the next sweep", async (t) => {
   const daemon = new FakeDaemon();
   completed(daemon);
+  daemon.state.rebuild.status.withheld = 2;
   daemon.state.plan.memories = 23;
   const page = await open(t, daemon, { hash: "#/banks/main/chunks", token: TOKEN });
 
+  // What a forget made during the run cost is said before the acknowledgement.
+  await findText(page.root, /skipped after a forget[^.]*: 2 chunks/i);
   click(await findButton(page.root, /acknowledge rebuild/i));
   const dialog = await findDialog(page.document);
   assert.ok(showsCount(dialog, "memor(y|ies)", 23), textOf(dialog));

@@ -1179,6 +1179,15 @@ async function rebuildPanel(ctx) {
   const failed = status.failed
     ? h("p", {}, `${plural(status.failed, "chunk")} failed. Their memories are missing until the chunks are retried.`)
     : null;
+  // Not failures: nothing can be retried, and the count is of chunks, not
+  // of the memories that weren't made.
+  const skipped = status.withheld
+    ? h(
+        "p",
+        {},
+        `Skipped after a forget made during the rebuild: ${plural(status.withheld, "chunk")}. A skipped chunk isn't extracted again and can't be retried, so anything else it held was not rebuilt.`,
+      )
+    : null;
 
   if (status.state === "running") {
     return section(
@@ -1190,6 +1199,7 @@ async function rebuildPanel(ctx) {
         " Recall, the system prompt and the agenda are off for this bank until they've run.",
       ),
       h("p", { class: "quiet-text" }, `${memoryCount(status.replaced)} replaced, ${status.kept} kept as they were. Started `, time(status.started_at, { withTime: true }), "."),
+      skipped,
       failed,
       h("button", { type: "button", class: "small", onclick: () => ctx.act(async () => null) }, "Check progress"),
     );
@@ -1210,9 +1220,10 @@ async function rebuildPanel(ctx) {
       h(
         "p",
         {},
-        `${plural(status.chunks, "chunk")} extracted again: ${memoryCount(status.replaced)} replaced, ${status.kept} kept as they were. `,
+        `${plural(status.chunks, "chunk")} queued: ${memoryCount(status.replaced)} replaced, ${status.kept} kept as they were. `,
         `${plural(status.carried, "access", "accesses")} carried to the new memories, ${status.dropped} dropped.`,
       ),
+      skipped,
       failed,
       h(
         "p",
@@ -1290,6 +1301,11 @@ async function rebuildPanel(ctx) {
           `${memoryCount(plan.memories_replaced)} are deleted now and extracted again from ${plural(plan.chunks, "chunk")}. That costs ${rebuildCalls(plan.chunks)}, and more if chunks are retried.`,
         ),
         h("p", {}, `Recall, the system prompt and the agenda are off for ${bank} until the last chunk has run.`),
+        h(
+          "p",
+          {},
+          "A forget made while it runs stops the chunks it reaches being extracted again, and anything else they held isn't rebuilt. Forget before you start or after it completes.",
+        ),
         h("p", {}, "The only way back is the backup you took before starting."),
       ],
       action: "Rebuild memories",

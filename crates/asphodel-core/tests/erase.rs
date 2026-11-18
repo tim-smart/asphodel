@@ -1884,15 +1884,18 @@ fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
 fn a_memory_forgotten_during_a_rebuild_doesnt_come_back_from_its_turn() {
     let h = Harness::new();
     // Two turns that each say more than the memory the owner kept from
-    // them, with a turn of the same session between.
+    // them, with a turn of the same session between them and one after.
     h.said_turn(EARLIER, &format!("{MAYA} {TEA}"));
     let maya = h.extract_one(notable(MAYA), &[]);
-    let scones = "And the scones?";
+    let scones = "The scones are in the tin.";
     h.said_turn(EARLIER, scones);
     h.extract_nothing();
     let kettle = "The kettle is on.";
     h.said_turn(EARLIER, &format!("{GARDEN} {kettle}"));
     let garden = h.extract_one(notable(GARDEN), &[]);
+    let agreed = "Yes, they are.";
+    h.said_turn(EARLIER, agreed);
+    h.extract_nothing();
     let kept = [maya.to_string(), garden.to_string()];
     h.service.keep(BANK, &kept).unwrap();
     h.rebuild();
@@ -1906,14 +1909,15 @@ fn a_memory_forgotten_during_a_rebuild_doesnt_come_back_from_its_turn() {
         replies: FakeLlm::scripted(
             MODEL,
             vec![
-                json!({"claims": [], "used_injected_ids": []}),
-                json!({"claims": [quoting(notable(MAYA), TEA)], "used_injected_ids": []}),
+                json!({"claims": [notable(scones)], "used_injected_ids": []}),
+                json!({"claims": []}),
             ],
         ),
     };
     let passed_over = h.service.extract_next(BANK, &llm);
     assert!(matches!(passed_over, Err(ExtractError::Forgotten)));
-    assert!(h.service.extract_next(BANK, &llm).unwrap().is_some());
+    let second = h.service.extract_next(BANK, &llm).unwrap();
+    let tin = second.expect("the second turn is queued").memories[0];
     {
         let sent = llm.sent.lock().unwrap();
         assert!(sent.iter().any(|text| text.contains(scones)), "{sent:?}");
@@ -1922,19 +1926,60 @@ fn a_memory_forgotten_during_a_rebuild_doesnt_come_back_from_its_turn() {
 
     // The garden is forgotten after the LLM has read its turn again and
     // before what it found is written. That claim quotes the rest of the
-    // turn, which the kept memory doesn't rest on, so it would be a new one.
+    // turn, which the kept memory doesn't rest on, so it would be a new
+    // one. Nothing is written, and the turn is passed over when it comes
+    // round again.
     let found = json!({
         "claims": [quoting(notable(GARDEN), kettle)],
         "used_injected_ids": [],
     });
     let llm = FakeLlm::scripted(MODEL, vec![found, json!({"claims": []})]);
-    let lease = h.claim().expect("the last turn is queued");
+    let lease = h.claim().expect("the third turn is queued");
     let prepared = h.service.prepare_extraction(lease, &llm, &[]).unwrap();
     h.forget(&[garden]);
     let written = h.service.commit_extraction(prepared);
-    assert!(matches!(written, Err(ExtractError::Forgotten)));
+    assert!(matches!(written, Err(ExtractError::StaleContext)));
+    let passed_over = h.service.extract_next(BANK, &llm);
+    assert!(matches!(passed_over, Err(ExtractError::Forgotten)));
 
-    assert_eq!(h.rebuild_status().state, RebuildState::Complete);
+    // The last turn says nothing by itself. The LLM read it with the scones
+    // turn as its context, and wrote the scones into a claim quoting only
+    // the last turn. Call 2 was asked about it, so call 1's reply is saved
+    // on the chunk. Then the scones are forgotten.
+    let echoed = json!({
+        "claims": [quoting(notable(scones), agreed)],
+        "used_injected_ids": [],
+    });
+    let llm = FakeLlm::scripted(MODEL, vec![echoed, json!({"claims": []})]);
+    let lease = h.claim().expect("the last turn is queued");
+    let prepared = h.service.prepare_extraction(lease, &llm, &[]).unwrap();
+    assert!(prepared.call2_input().is_some());
+    h.forget(&[tin]);
+    let written = h.service.commit_extraction(prepared);
+    assert!(matches!(written, Err(ExtractError::StaleContext)));
+    // The turn is read again from call 1, not from the reply saved before
+    // the forget, and this time without the scones.
+    let llm = Recording {
+        sent: Mutex::new(Vec::new()),
+        replies: FakeLlm::scripted(MODEL, vec![json!({"claims": [], "used_injected_ids": []})]),
+    };
+    let again = h.service.extract_next(BANK, &llm).unwrap();
+    assert!(
+        again
+            .expect("the last turn is still queued")
+            .memories
+            .is_empty()
+    );
+    {
+        let sent = llm.sent.lock().unwrap();
+        assert!(sent.iter().any(|text| text.contains(agreed)), "{sent:?}");
+        assert!(sent.iter().all(|text| !text.contains(scones)), "{sent:?}");
+    }
+
+    // The rebuild is over, and it says two of its chunks weren't run.
+    let done = h.rebuild_status();
+    assert_eq!(done.state, RebuildState::Complete);
+    assert_eq!((done.chunks, done.withheld, done.failed), (4, 2, 0));
     while h.erase_next().is_some() {}
     assert_eq!(h.memory_count(), 0);
 }

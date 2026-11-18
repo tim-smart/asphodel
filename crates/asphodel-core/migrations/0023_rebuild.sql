@@ -13,6 +13,12 @@
 -- the rerun made. `chunks`, `replaced` and `kept` count what the start did;
 -- `carried` and `dropped` count what the end did with `rebuild_accesses`.
 --
+-- `forget_generation` goes up each time a forget hides a chain of the bank
+-- or a source is removed. A chunk the rebuild runs again notes it when it
+-- reads its text and context, and writes nothing if it has moved since.
+-- `withheld` counts the chunks the rebuild queued and then took off the
+-- queue unextracted, because a forget made after the start reached them.
+--
 -- A row with no `completed_at` turns recall, injection and the agenda off
 -- for the bank. A row with no `acked_at` holds the bank's nightly sweep,
 -- until `asphodel rebuild ack` sets it. The row stays afterwards: a chunk of
@@ -41,6 +47,8 @@ CREATE TABLE IF NOT EXISTS rebuilds (
   kept            INTEGER NOT NULL,
   carried         INTEGER NOT NULL DEFAULT 0,
   dropped         INTEGER NOT NULL DEFAULT 0,
+  forget_generation INTEGER NOT NULL DEFAULT 0,
+  withheld        INTEGER NOT NULL DEFAULT 0,
   completed_at    INTEGER,
   acked_at        INTEGER
 );

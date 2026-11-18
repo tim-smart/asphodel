@@ -1784,6 +1784,8 @@ fn a_bank_is_rebuilt_over_http_and_the_cli_with_recall_off_while_it_runs() {
         |daemon| daemon.get_ok(rebuild),
         |status| status["state"] == "complete",
     );
+    // No forget reached a chunk on the way, and the status says so.
+    assert_eq!(daemon.get_ok(rebuild)["withheld"], 0);
     assert_ne!(daemon.wait_for_memory("main"), old);
 
     // The bank's sweep waits for the ack.

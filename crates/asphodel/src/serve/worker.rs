@@ -320,8 +320,11 @@ impl Worker {
             }
             ExtractError::InvalidReply { .. } => Next::Continue,
             // The document went, or a forget reached a chunk a rebuild was
-            // running again, while the chunk was out; it's off the queue.
+            // running again; it's off the queue.
             ExtractError::SourceRemoved | ExtractError::Forgotten => Next::Continue,
+            // A forget arrived while a rebuild's chunk was out. It's still
+            // queued, and the next claim reads it again.
+            ExtractError::StaleContext => Next::Continue,
             ExtractError::Search { failure, .. }
             | ExtractError::Embedding { failure, .. }
             | ExtractError::Commit { failure, .. } => {

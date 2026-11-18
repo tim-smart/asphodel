@@ -20,10 +20,11 @@
 //!   ([`masked`]), and the memories resting on it stay as they are. A
 //!   forget made while the rebuild runs counts from the moment it hides its
 //!   chain, before its erase masks anything ([`withheld`]): the chunks it
-//!   will mask aren't extracted again, and what a worker already found in
-//!   one isn't written. This is about the rebuild's own chunks. A turn
-//!   that arrives later is extracted as any turn is, earlier turns of its
-//!   session and all.
+//!   will mask aren't extracted again, and the rebuild counts them. A
+//!   chunk already out with a worker writes nothing, whether the forget
+//!   reached it or its context, and is read again ([`forgot`]). This is
+//!   about the rebuild's own chunks. A turn that arrives later is
+//!   extracted as any turn is, earlier turns of its session and all.
 //! - A memory the owner touched: its significance or `kept` was set, the
 //!   owner retracted, ended or reopened it, it was translated, or an entity
 //!   was linked or unlinked by hand. It keeps its id, with the rest of its
@@ -163,6 +164,10 @@ pub struct RebuildStatus {
     pub carried: usize,
     /// Those no new memory's passage overlapped.
     pub dropped: usize,
+    /// Chunks the rebuild queued and didn't extract again, because a forget
+    /// made after it started reached them. Not failures: they can't be
+    /// retried, and whatever else they held wasn't rebuilt.
+    pub withheld: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -204,6 +209,8 @@ struct Row {
     kept: i64,
     carried: i64,
     dropped: i64,
+    forget_generation: i64,
+    withheld: i64,
     completed_at: Option<i64>,
     acked_at: Option<i64>,
 }
@@ -211,7 +218,7 @@ struct Row {
 fn row(conn: &Connection, bank_id: i64) -> Result<Option<Row>, rusqlite::Error> {
     conn.query_row(
         "SELECT started_at, queue_boundary, memory_boundary, chunks, replaced, kept, carried,
-                dropped, completed_at, acked_at
+                dropped, completed_at, acked_at, forget_generation, withheld
          FROM rebuilds WHERE bank_id = ?1",
         [bank_id],
         |row| {
@@ -226,6 +233,8 @@ fn row(conn: &Connection, bank_id: i64) -> Result<Option<Row>, rusqlite::Error> 
                 dropped: row.get(7)?,
                 completed_at: row.get(8)?,
                 acked_at: row.get(9)?,
+                forget_generation: row.get(10)?,
+                withheld: row.get(11)?,
             })
         },
     )
@@ -265,9 +274,9 @@ pub(crate) fn masked(mask: usize) -> String {
 /// ([`crate::erase::awaited`]). `false` for a chunk ingested after the
 /// bank's rebuild started, and for a bank never rebuilt.
 ///
-/// Extraction asks before call 1, before call 2 and in the transaction that
-/// commits, so a forget that arrives while a chunk is in flight still stops
-/// anything being written from it.
+/// Extraction asks before call 1. A forget that arrives after that moves
+/// the bank's forget generation ([`forgot`]), which sends the chunk back
+/// to be asked again ([`Rerun::stale`]).
 pub(crate) fn withheld(conn: &Connection, chunk_id: i64) -> Result<bool, rusqlite::Error> {
     let masked = masked(2);
     let rerun: Option<(i64, bool)> = conn
@@ -291,6 +300,40 @@ pub(crate) fn withheld(conn: &Connection, chunk_id: i64) -> Result<bool, rusqlit
     }
 }
 
+/// Counts a chunk the rebuild took off the queue unextracted because it was
+/// [`withheld`], inside the transaction that takes it off.
+pub(crate) fn count_withheld(tx: &Transaction<'_>, bank_id: i64) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "UPDATE rebuilds SET withheld = withheld + 1 WHERE bank_id = ?1",
+        [bank_id],
+    )?;
+    Ok(())
+}
+
+/// Called inside the transaction of a forget that hid a chain of the bank,
+/// or of a source's removal. What the chunks a rebuild runs again may be
+/// shown has changed, so the forget generation moves, and a chunk that read
+/// its text and context before now writes nothing ([`Rerun::stale`]).
+/// Call 1's saved replies go too: one of them may have been written from a
+/// context that included what's now forgotten, and a retry would resume
+/// from it. Nothing happens for a bank never rebuilt.
+pub(crate) fn forgot(tx: &Transaction<'_>, bank_id: i64) -> Result<(), rusqlite::Error> {
+    let rebuilt = tx.execute(
+        "UPDATE rebuilds SET forget_generation = forget_generation + 1 WHERE bank_id = ?1",
+        [bank_id],
+    )?;
+    if rebuilt > 0 {
+        tx.execute(
+            "UPDATE chunks SET call1_output = NULL
+             WHERE bank_id = ?1 AND call1_output IS NOT NULL
+               AND EXISTS (SELECT 1 FROM sources s JOIN rebuilds r ON r.bank_id = s.bank_id
+                           WHERE s.id = chunks.source_id AND s.ingested_at <= r.started_at)",
+            [bank_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// What extraction needs to know about a chunk a rebuild runs again.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Rerun {
@@ -303,6 +346,27 @@ pub(crate) struct Rerun {
     /// The rebuild is still running: the chunk is read as of its source's
     /// time.
     pub running: bool,
+    /// The bank's forget generation when the chunk's text and context were
+    /// read.
+    pub forget_generation: i64,
+}
+
+impl Rerun {
+    /// Whether a forget has hidden something, or a source was removed,
+    /// since the chunk's text and context were read ([`forgot`]). What the
+    /// LLM made of them may then rest on forgotten text, in the chunk or in
+    /// its context, so none of it is written or sent on to call 2. The
+    /// chunk is read again from the start.
+    pub(crate) fn stale(&self, conn: &Connection, bank_id: i64) -> Result<bool, rusqlite::Error> {
+        let now: Option<i64> = conn
+            .query_row(
+                "SELECT forget_generation FROM rebuilds WHERE bank_id = ?1",
+                [bank_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(now != Some(self.forget_generation))
+    }
 }
 
 /// The rebuild context of a chunk whose source was ingested at
@@ -331,6 +395,7 @@ pub(crate) fn rerun(
         salt: row.started_at,
         kept,
         running: row.completed_at.is_none(),
+        forget_generation: row.forget_generation,
     }))
 }
 
@@ -845,7 +910,11 @@ pub(crate) fn complete(
         "UPDATE rebuilds SET completed_at = ?2, carried = ?3, dropped = ?4 WHERE bank_id = ?1",
         (bank_id, micros(now), carried, dropped),
     )?;
-    let details = serde_json::json!({ "carried": carried, "dropped": dropped });
+    let details = serde_json::json!({
+        "carried": carried,
+        "dropped": dropped,
+        "withheld": row.withheld,
+    });
     log_edit(
         &tx,
         store,
@@ -1008,6 +1077,7 @@ pub(crate) fn status(store: &Store, bank: &str) -> Result<RebuildStatus, Rebuild
             kept: 0,
             carried: 0,
             dropped: 0,
+            withheld: 0,
         });
     };
     let remaining: i64 = conn.query_row(
@@ -1038,6 +1108,7 @@ pub(crate) fn status(store: &Store, bank: &str) -> Result<RebuildStatus, Rebuild
         kept: count(row.kept),
         carried: count(row.carried),
         dropped: count(row.dropped),
+        withheld: count(row.withheld),
     })
 }
 

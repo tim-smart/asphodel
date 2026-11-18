@@ -429,6 +429,9 @@ fn remove_sources(
         }
     }
     let (forgotten, members, aftermath) = hide(tx, store, bank_id, &named, None)?;
+    // Whether or not a memory rested on them: a rebuild's chunk in flight
+    // may have read these sources as its context.
+    crate::rebuild::forgot(tx, bank_id)?;
 
     for (source, _) in sources {
         // What a memory resting elsewhere restated here goes with the text.
@@ -502,6 +505,8 @@ fn hide(
             hide.execute((member, now))?;
         }
         drop(hide);
+        // A rebuild's chunk in flight may have read what's now hidden.
+        crate::rebuild::forgot(tx, bank_id)?;
         aftermath.models = blank_answers(tx, &members)?;
         delete_recalls(tx, &members)?;
         let scrub: BTreeSet<Uuid> = uuids.iter().copied().collect();
