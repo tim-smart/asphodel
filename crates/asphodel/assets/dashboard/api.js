@@ -139,10 +139,12 @@ export function client(fetch, storage) {
     retryChunks: (name, chunks) => call("POST", `${bank(name)}/chunks/retry`, chunks ? { chunks } : {}),
     // Rebuilding a bank's memories from its sources. The plan is the dry
     // run and writes nothing; starting repeats the bank's name, as the
-    // daemon asks of anything this destructive.
+    // daemon asks of anything this destructive. `withoutBackup` starts one
+    // with no recent backup, which nothing can undo.
     rebuild: (name) => call("GET", `${bank(name)}/rebuild`),
     rebuildPlan: (name) => call("GET", `${bank(name)}/rebuild/plan`),
-    startRebuild: (name) => call("POST", `${bank(name)}/rebuild${query({ confirm: name })}`),
+    startRebuild: (name, { withoutBackup = false } = {}) =>
+      call("POST", `${bank(name)}/rebuild${query({ confirm: name, without_backup: withoutBackup ? "true" : undefined })}`),
     ackRebuild: (name) => call("POST", `${bank(name)}/rebuild/ack`),
   };
 }

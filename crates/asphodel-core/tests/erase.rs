@@ -36,7 +36,7 @@ use asphodel_core::models::{
 };
 use asphodel_core::operations::{Audit, AuditList, ForgetRow, PurgeRow, RecallRow, SweepRun};
 use asphodel_core::queue::{ChunkError, Failure, Lease};
-use asphodel_core::rebuild::{Blocker, RebuildError, RebuildState, RebuildStatus};
+use asphodel_core::rebuild::{BackupCheck, Blocker, RebuildError, RebuildState, RebuildStatus};
 use asphodel_core::retrieval::{PrefetchRequest, Recall, RecallError, RecallRequest};
 use asphodel_core::store::bank::{BankIdentity, PROFILE_NAME};
 use asphodel_core::store::{OpenOptions, Store};
@@ -521,7 +521,9 @@ impl Harness {
     /// Starts a rebuild of the bank, a backup having just completed.
     fn rebuild(&self) -> RebuildStatus {
         self.service.record_backup().unwrap();
-        self.service.start_rebuild(BANK, BANK).unwrap()
+        self.service
+            .start_rebuild(BANK, BANK, BackupCheck::Required)
+            .unwrap()
     }
 
     fn rebuild_status(&self) -> RebuildStatus {
@@ -1691,25 +1693,37 @@ fn a_rebuild_extracts_the_banks_sources_again_with_recall_off_until_the_last_chu
     h.forget_turn("chat", "Forget that.");
 
     // The dry run counts and writes nothing. A backup is the only way
-    // back, so there's no start without a recent one.
-    let plan = h.service.rebuild_plan(BANK).unwrap();
+    // back, so there's no start without a recent one unless the operator
+    // waives it, and then nothing else changes.
+    let plan = h.service.rebuild_plan(BANK, BackupCheck::Required).unwrap();
     assert_eq!((plan.sources, plan.chunks), (3, 3));
     assert_eq!((plan.memories_replaced, plan.memories_kept), (3, 0));
     assert_eq!(plan.skipped.removed, removed.chunks_queued);
     assert_eq!(plan.skipped.forget_requests, 1);
     assert_eq!(plan.blockers, [Blocker::BackupStale]);
-    let refused = h.service.start_rebuild(BANK, BANK);
+    let waived = h.service.rebuild_plan(BANK, BackupCheck::Waived).unwrap();
+    assert_eq!(waived.blockers, []);
+    assert_eq!(waived.last_backup_at, None);
+    assert_eq!(
+        (waived.chunks, waived.memories_replaced),
+        (plan.chunks, plan.memories_replaced)
+    );
+    let refused = h.service.start_rebuild(BANK, BANK, BackupCheck::Required);
     assert!(
         matches!(refused, Err(RebuildError::Blocked { .. })),
         "{refused:?}"
     );
-    h.service.record_backup().unwrap();
-    let unconfirmed = h.service.start_rebuild(BANK, "another");
+    let unconfirmed = h
+        .service
+        .start_rebuild(BANK, "another", BackupCheck::Waived);
     assert!(matches!(unconfirmed, Err(RebuildError::NotConfirmed)));
     assert_eq!(h.exist(&[maya, tea, garden]), [true, true, true]);
     assert_eq!(h.rebuild_status().state, RebuildState::Idle);
 
-    let started = h.service.start_rebuild(BANK, BANK).unwrap();
+    let started = h
+        .service
+        .start_rebuild(BANK, BANK, BackupCheck::Waived)
+        .unwrap();
     assert_eq!(started.state, RebuildState::Running);
     assert_eq!((started.chunks, started.remaining), (3, 3));
     assert_eq!(h.exist(&[maya, tea, garden]), [false, false, false]);
@@ -1725,9 +1739,10 @@ fn a_rebuild_extracts_the_banks_sources_again_with_recall_off_until_the_last_chu
         assert!(h.service.agenda(BANK).is_err());
     };
     refused_now(&h);
-    let again = h.service.start_rebuild(BANK, BANK);
+    // Waiving the backup lifts no other check.
+    let again = h.service.start_rebuild(BANK, BANK, BackupCheck::Waived);
     assert!(
-        matches!(again, Err(RebuildError::Blocked { .. })),
+        matches!(&again, Err(RebuildError::Blocked { blockers }) if blockers == &[Blocker::Unacknowledged]),
         "{again:?}"
     );
     let early = h.service.ack_rebuild(BANK);
@@ -1913,7 +1928,7 @@ fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
     h.forget(&[maya, rex, miso]);
     while h.erase_next().is_some() {}
 
-    let plan = h.service.rebuild_plan(BANK).unwrap();
+    let plan = h.service.rebuild_plan(BANK, BackupCheck::Required).unwrap();
     assert_eq!((plan.chunks, plan.skipped.masked), (6, 3));
     assert_eq!((plan.memories_replaced, plan.memories_kept), (1, 1));
     h.rebuild();

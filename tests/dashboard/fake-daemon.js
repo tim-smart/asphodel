@@ -1024,14 +1024,17 @@ export class FakeDaemon {
 
   /// The rebuild routes, as the daemon answers them: the dry run writes
   /// nothing, a start repeats the bank's name and is refused with the
-  /// plan's blockers, and only a complete rebuild is acknowledged.
+  /// plan's blockers, less a stale backup when it's waived, and only a
+  /// complete rebuild is acknowledged.
   rebuild(id, method, query) {
     const { status, plan } = this.state.rebuild;
     if (id === undefined && method === "GET") return json(200, status);
     if (id === "plan" && method === "GET") return json(200, plan);
     if (id === undefined && method === "POST") {
       if (query.get("confirm") !== "main") return error(400, "the confirmation doesn't repeat the bank's name");
-      if (status.state !== "idle" || plan.blockers.length) return error(409, "the rebuild can't start");
+      const waived = query.get("without_backup") === "true";
+      const blockers = plan.blockers.filter((b) => !(waived && b === "backup_stale"));
+      if (status.state !== "idle" || blockers.length) return error(409, "the rebuild can't start");
       Object.assign(status, {
         state: "running",
         started_at: NOW,

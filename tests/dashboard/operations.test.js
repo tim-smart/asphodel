@@ -245,11 +245,22 @@ test("a confirmed rebuild repeats the bank's name and then shows how far it got"
 
   const sent = await waitFor(() => daemon.calls("POST", REBUILD)[0], "POST rebuild");
   assert.equal(sent.query.get("confirm"), "main");
+  assert.equal(sent.query.get("without_backup"), null, "a backup was taken, so nothing is waived");
   await findText(page.root, /14 of 14 chunks left/i);
   assert.equal(queryButton(page.root, /rebuild memories/i), null, "no second start while it runs");
 });
 
 test("a rebuild that can't start says why and offers no start", async (t) => {
+  const daemon = new FakeDaemon();
+  daemon.state.rebuild.plan.blockers = ["erase_pending", "backup_stale"];
+  daemon.state.rebuild.plan.last_backup_at = null;
+  const page = await open(t, daemon, { hash: "#/banks/main/chunks?rebuild=preview", token: TOKEN });
+
+  await findText(page.root, /no backup/i);
+  assert.equal(queryButton(page.root, /rebuild/i), null);
+});
+
+test("with no recent backup, a rebuild starts only after a confirmation that nothing can undo it", async (t) => {
   const daemon = new FakeDaemon();
   daemon.state.rebuild.plan.blockers = ["backup_stale"];
   daemon.state.rebuild.plan.last_backup_at = null;
@@ -257,6 +268,15 @@ test("a rebuild that can't start says why and offers no start", async (t) => {
 
   await findText(page.root, /no backup/i);
   assert.equal(queryButton(page.root, /rebuild memories/i), null);
+  click(await findButton(page.root, /rebuild without a backup/i));
+  const dialog = await findDialog(page.document);
+  assert.match(textOf(dialog), /nothing can undo/i);
+  click(actionOf(dialog));
+
+  const sent = await waitFor(() => daemon.calls("POST", REBUILD)[0], "POST rebuild");
+  assert.equal(sent.query.get("confirm"), "main");
+  assert.equal(sent.query.get("without_backup"), "true");
+  await findText(page.root, /14 of 14 chunks left/i);
 });
 
 function completed(daemon) {

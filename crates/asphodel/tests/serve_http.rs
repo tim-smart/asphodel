@@ -1748,6 +1748,11 @@ fn a_bank_is_rebuilt_over_http_and_the_cli_with_recall_off_while_it_runs() {
     assert_eq!(plan["blockers"], json!(["backup_stale"]), "{plan}");
     let blocked = daemon.post(&format!("{rebuild}?confirm=main"), &json!({}));
     assert_eq!(blocked.status, 409, "{}", blocked.body);
+    // Waiving the backup is the operator's call, and the plan says it
+    // would start then.
+    let waived = cli_json(&daemon, "rebuild --bank main --without-backup");
+    assert_eq!(waived["blockers"], json!([]), "{waived}");
+    assert_eq!(waived["without_backup"], true, "{waived}");
     backup_to_file(&daemon, &dir.path("backup.db"));
     assert_eq!(
         daemon.get_ok(&format!("{rebuild}/plan"))["blockers"],
