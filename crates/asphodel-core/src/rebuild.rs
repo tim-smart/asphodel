@@ -16,8 +16,14 @@
 //! What a rebuild never touches:
 //!
 //! - A chunk a forget masked. It's never sent to the LLM again, as the
-//!   chunk extracted or as the context of another ([`masked`]), and the
-//!   memories resting on it stay as they are.
+//!   chunk extracted or as the context of another chunk the rebuild runs
+//!   ([`masked`]), and the memories resting on it stay as they are. A
+//!   forget made while the rebuild runs counts from the moment it hides its
+//!   chain, before its erase masks anything ([`withheld`]): the chunks it
+//!   will mask aren't extracted again, and what a worker already found in
+//!   one isn't written. This is about the rebuild's own chunks. A turn
+//!   that arrives later is extracted as any turn is, earlier turns of its
+//!   session and all.
 //! - A memory the owner touched: its significance or `kept` was set, the
 //!   owner retracted, ended or reopened it, it was translated, or an entity
 //!   was linked or unlinked by hand. It keeps its id, with the rest of its
@@ -245,13 +251,44 @@ pub(crate) fn held(conn: &Connection) -> Result<BTreeSet<i64>, rusqlite::Error> 
 }
 
 /// SQL for "a forget masked some of chunk `c`", with [`REDACTION_MASK`] as
-/// parameter `mask`. Such a chunk is never shown to the LLM again, as the
-/// chunk extracted or as the context of another.
+/// parameter `mask`. A rebuild never shows such a chunk to the LLM again,
+/// as the chunk extracted or as the context of another it runs.
 pub(crate) fn masked(mask: usize) -> String {
     format!(
         "(EXISTS (SELECT 1 FROM chunk_redactions r WHERE r.chunk_id = c.id)
           OR instr(COALESCE(c.text, ''), ?{mask}) > 0)"
     )
+}
+
+/// Whether a chunk a rebuild runs again must not be extracted: a forget
+/// masked some of it, or a forget still waiting on the queue will
+/// ([`crate::erase::awaited`]). `false` for a chunk ingested after the
+/// bank's rebuild started, and for a bank never rebuilt.
+///
+/// Extraction asks before call 1, before call 2 and in the transaction that
+/// commits, so a forget that arrives while a chunk is in flight still stops
+/// anything being written from it.
+pub(crate) fn withheld(conn: &Connection, chunk_id: i64) -> Result<bool, rusqlite::Error> {
+    let masked = masked(2);
+    let rerun: Option<(i64, bool)> = conn
+        .query_row(
+            &format!(
+                "SELECT c.bank_id, {masked} FROM chunks c
+                 JOIN sources s ON s.id = c.source_id
+                 JOIN rebuilds r ON r.bank_id = c.bank_id
+                 WHERE c.id = ?1 AND s.ingested_at <= r.started_at"
+            ),
+            (chunk_id, REDACTION_MASK.to_string()),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match rerun {
+        None => Ok(false),
+        Some((_, true)) => Ok(true),
+        Some((bank_id, false)) => Ok(crate::erase::awaited(conn, bank_id)?
+            .chunks
+            .contains(&chunk_id)),
+    }
 }
 
 /// What extraction needs to know about a chunk a rebuild runs again.

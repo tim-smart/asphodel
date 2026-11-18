@@ -1167,6 +1167,10 @@ What forget can't reach:
   turn that repeats them, or an edited section of a document that still
   contains them, is new input and can bring the memory back. Take the words
   out of a document before sending its next version.
+- **Later turns of the session.** Extraction shows a turn the few turns
+  before it in its session. A turn that arrives after the forget still gets
+  what the mask left of a masked one, its reply included, and can make a
+  memory from what it reads there.
 - **A rebuild reading other turns.** A rebuild never extracts a chunk a
   forget masked. A different turn that restates the forgotten thing is
   not masked. If it made no memory the first time, because the claim was
@@ -1668,11 +1672,27 @@ A chunk a forget masked is never extracted again, so the model can't
 rewrite what was erased from what surrounds the mask. Memories still
 resting on such a chunk stay as they are. It isn't shown as context
 either: a chunk run again doesn't get a masked earlier turn of its session,
-or the text of a masked section before it in its document. "What forget
-can't reach" above has the one case a rebuild adds.
+or the text of a masked section before it in its document. A section that
+a document version shares with an earlier one has no chunk in that version,
+so whether a forget reached it can't be read there. The section after it
+runs again with no preceding text at all.
+
+These rules cover the chunks a rebuild runs again and nothing else. A turn
+that arrives after the rebuild started waits, then is extracted the
+ordinary way, and ordinary extraction shows it the earlier turns of its
+session, including what a mask left of one. "What forget can't reach" above
+lists that, and the one case a rebuild adds.
 
 A forget made while a rebuild runs hides the memory at once. Its erase
-waits in the queue behind the rebuild's chunks.
+waits in the queue behind the rebuild's chunks, so the text is still there,
+and the rebuild treats it as masked from that moment. A chunk the erase is
+going to mask isn't extracted again and isn't shown as context. If the LLM
+has already read it, what it found isn't written.
+
+That costs the chunk's other memories. The rebuild deleted them when it
+started and now won't make them again, where a forget made before the
+rebuild would have left them as they were. Forget before you start a
+rebuild or after it completes when you can.
 
 ### Interruptions and failures
 

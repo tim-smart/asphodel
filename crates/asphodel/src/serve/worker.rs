@@ -319,8 +319,9 @@ impl Worker {
                 }
             }
             ExtractError::InvalidReply { .. } => Next::Continue,
-            // The document went while the chunk was out; it's off the queue.
-            ExtractError::SourceRemoved => Next::Continue,
+            // The document went, or a forget reached a chunk a rebuild was
+            // running again, while the chunk was out; it's off the queue.
+            ExtractError::SourceRemoved | ExtractError::Forgotten => Next::Continue,
             ExtractError::Search { failure, .. }
             | ExtractError::Embedding { failure, .. }
             | ExtractError::Commit { failure, .. } => {

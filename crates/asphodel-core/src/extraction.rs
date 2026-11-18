@@ -528,6 +528,13 @@ pub enum ExtractError {
     #[error("the chunk's document was removed")]
     SourceRemoved,
 
+    /// A rebuild was running the chunk again and a forget reached it: one
+    /// masked some of it, or one still waiting will. Nothing from it is
+    /// written; the chunk leaves the queue unextracted and nothing is
+    /// counted.
+    #[error("a forget reached the chunk, so the rebuild doesn't extract it again")]
+    Forgotten,
+
     #[error(transparent)]
     Queue(#[from] QueueError),
 
@@ -553,6 +560,7 @@ impl ExtractError {
             | ExtractError::ModelUnavailable { .. }
             | ExtractError::Stale
             | ExtractError::SourceRemoved
+            | ExtractError::Forgotten
             | ExtractError::Queue(_)
             | ExtractError::Store(_) => None,
         }
@@ -760,8 +768,10 @@ pub(crate) fn prepare(
     queue::check_held(leases, &lease)?;
     if queue::source_removed(&store.connection(), lease.chunk_id())? {
         discard(store, &lease)?;
+        tracing::info!(chunk = %lease.chunk, "the chunk's document was removed; it isn't extracted");
         return Err(ExtractError::SourceRemoved);
     }
+    withhold(store, &lease)?;
     let (input, mut unit, saved) = {
         let conn = store.connection();
         let (input, unit) = input::assemble(&conn, tuning, store.now(), &lease, in_context)?;
@@ -888,6 +898,8 @@ fn reconcile_claims(
         rules,
         ..
     } = prepared;
+    // Call 2 is shown the claims, which quote the chunk.
+    withhold(store, &lease)?;
     // The connection is released before the failure is counted.
     let searched = {
         let conn = store.connection();
@@ -991,6 +1003,14 @@ pub(crate) fn commit_prepared(
                 tx.commit()?;
                 return Ok(Commit::Removed);
             }
+            // A forget reached the chunk while it was out: what the calls
+            // found in it isn't written. It leaves the queue as the chunks
+            // a rebuild never queues are, extracted once and no more.
+            if crate::rebuild::withheld(&tx, prepared.lease.chunk_id())? {
+                queue::finish(&tx, store.now(), &prepared.lease)?;
+                tx.commit()?;
+                return Ok(Commit::Forgotten);
+            }
             if leases.commits(bank_id) != prepared.snapshot.commits
                 && reconcile::stale(
                     &tx,
@@ -1090,6 +1110,13 @@ pub(crate) fn commit_prepared(
             );
             Err(ExtractError::SourceRemoved)
         }
+        Ok(Commit::Forgotten) => {
+            tracing::info!(
+                chunk = %prepared.input.chunk,
+                "a forget reached the chunk; the rebuild's extraction of it is discarded"
+            );
+            Err(ExtractError::Forgotten)
+        }
         Err(error) => {
             // A commit that fails every time must still reach the retry cap
             // rather than hold the bank's queue for ever. The store's hold
@@ -1107,16 +1134,37 @@ enum Commit {
     Stale,
     /// The chunk's document was removed; it left the queue.
     Removed,
+    /// A forget reached a chunk a rebuild was running again; it left the
+    /// queue.
+    Forgotten,
 }
 
-/// Takes a leased chunk whose document was removed off the queue.
+/// Takes a leased chunk that isn't to be extracted off the queue.
 fn discard(store: &Store, lease: &Lease) -> Result<(), ExtractError> {
     let mut conn = store.connection();
     let tx = conn.transaction()?;
     queue::drop_removed(&tx, lease)?;
     tx.commit()?;
-    tracing::info!(chunk = %lease.chunk, "the chunk's document was removed; it isn't extracted");
     Ok(())
+}
+
+/// Stops a chunk a rebuild is running again once a forget has reached it
+/// ([`crate::rebuild::withheld`]): it leaves the queue, with call 1's saved
+/// reply, and nothing more of it is sent to the LLM.
+fn withhold(store: &Store, lease: &Lease) -> Result<(), ExtractError> {
+    let mut conn = store.connection();
+    let tx = conn.transaction()?;
+    if !crate::rebuild::withheld(&tx, lease.chunk_id())? {
+        return Ok(());
+    }
+    queue::finish(&tx, store.now(), lease)?;
+    tx.commit()?;
+    drop(conn);
+    tracing::info!(
+        chunk = %lease.chunk,
+        "a forget reached the chunk; the rebuild doesn't extract it again"
+    );
+    Err(ExtractError::Forgotten)
 }
 
 /// The plan again without call 2's labels on neighbours that are no longer

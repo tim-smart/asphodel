@@ -849,6 +849,18 @@ fn redact_chain(
     members: &BTreeSet<i64>,
     rows: &[Passage],
 ) -> Result<Redacted, rusqlite::Error> {
+    let (spans, redacted) = chain_spans(tx, members, rows)?;
+    redact(tx, &spans)?;
+    Ok(redacted)
+}
+
+/// What [`redact_chain`] masks, as chunk-relative spans by chunk rowid.
+/// Reads only.
+fn chain_spans(
+    tx: &Connection,
+    members: &BTreeSet<i64>,
+    rows: &[Passage],
+) -> Result<(BTreeMap<i64, Spans>, Redacted), rusqlite::Error> {
     let mut spans: BTreeMap<i64, Vec<(usize, usize)>> = BTreeMap::new();
     for row in rows {
         spans
@@ -946,8 +958,50 @@ fn redact_chain(
             }
         }
     }
-    redact(tx, &spans)?;
-    Ok(redacted)
+    Ok((spans, redacted))
+}
+
+/// What the forgets still waiting on a bank's queue will mask when their
+/// erases run.
+#[derive(Debug, Default)]
+pub(crate) struct Awaited {
+    /// The chunks, by rowid.
+    pub chunks: BTreeSet<i64>,
+    /// The sources holding those chunks, and the document versions that
+    /// hold a masked passage in a section with no chunk of its own.
+    pub sources: BTreeSet<i64>,
+}
+
+/// Reads what the bank's waiting forgets will mask, with the erase's own
+/// rules ([`chain_spans`], [`masks`]): a forget hides its chain at once and
+/// masks the text later, and until then a rebuild must treat that text as
+/// masked already ([`crate::rebuild::withheld`]). Empty when no forget is
+/// waiting.
+pub(crate) fn awaited(conn: &Connection, bank_id: i64) -> Result<Awaited, rusqlite::Error> {
+    let members: BTreeSet<i64> = {
+        let mut statement = conn.prepare_cached(
+            "SELECT id FROM memories WHERE bank_id = ?1 AND hidden_at IS NOT NULL",
+        )?;
+        statement
+            .query_map([bank_id], |row| row.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    let mut awaited = Awaited::default();
+    if members.is_empty() {
+        return Ok(awaited);
+    }
+    let rows = passages(conn, &members)?;
+    let (spans, _) = chain_spans(conn, &members, &rows)?;
+    let masks = masks(conn, &spans)?;
+    awaited.sources.extend(masks.sources.keys());
+    let mut source = conn.prepare_cached("SELECT source_id FROM chunks WHERE id = ?1")?;
+    for chunk in masks.chunks.keys() {
+        awaited.chunks.insert(*chunk);
+        awaited
+            .sources
+            .insert(source.query_row([chunk], |row| row.get(0))?);
+    }
+    Ok(awaited)
 }
 
 fn offset(value: i64) -> usize {
@@ -1082,6 +1136,35 @@ fn redact(
     conn: &Connection,
     spans: &BTreeMap<i64, Vec<(usize, usize)>>,
 ) -> Result<(), rusqlite::Error> {
+    let masks = masks(conn, spans)?;
+    for (chunk_id, spans) in &masks.chunks {
+        let text: Option<String> = chunk_text(conn, *chunk_id)?;
+        mask_chunk(conn, *chunk_id, text.as_deref(), spans)?;
+    }
+    for (source_id, (in_text, in_reply)) in &masks.sources {
+        let (text, reply): (Option<String>, Option<String>) = conn.query_row(
+            "SELECT text, reply FROM sources WHERE id = ?1",
+            [source_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        conn.execute(
+            "UPDATE sources SET text = ?2, reply = ?3 WHERE id = ?1",
+            (
+                source_id,
+                text.map(|text| mask(&text, in_text)),
+                reply.map(|reply| mask(&reply, in_reply)),
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+/// Everything [`redact`] masks for `spans`: the chunks, their sources and
+/// the document's other versions. Reads only.
+fn masks(
+    conn: &Connection,
+    spans: &BTreeMap<i64, Vec<(usize, usize)>>,
+) -> Result<Masks, rusqlite::Error> {
     let mut masks = Masks::default();
     let mut passages: BTreeMap<(i64, String), Vec<String>> = BTreeMap::new();
     for (&chunk_id, spans) in spans {
@@ -1142,27 +1225,7 @@ fn redact(
     for ((source_id, document_id), passages) in &passages {
         versions(conn, *source_id, document_id, passages, &mut masks)?;
     }
-
-    for (chunk_id, spans) in &masks.chunks {
-        let text: Option<String> = chunk_text(conn, *chunk_id)?;
-        mask_chunk(conn, *chunk_id, text.as_deref(), spans)?;
-    }
-    for (source_id, (in_text, in_reply)) in &masks.sources {
-        let (text, reply): (Option<String>, Option<String>) = conn.query_row(
-            "SELECT text, reply FROM sources WHERE id = ?1",
-            [source_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        conn.execute(
-            "UPDATE sources SET text = ?2, reply = ?3 WHERE id = ?1",
-            (
-                source_id,
-                text.map(|text| mask(&text, in_text)),
-                reply.map(|reply| mask(&reply, in_reply)),
-            ),
-        )?;
-    }
-    Ok(())
+    Ok(masks)
 }
 
 /// Masks `spans` in a chunk's text, drops call 1's saved reply, deletes

@@ -25,7 +25,7 @@ use std::time::Duration;
 use asphodel_core::config::PurgePause;
 use asphodel_core::entities::{LinkRequest, MergeRequest};
 use asphodel_core::erase::{EraseReason, Erased, ForgetRequest, Forgotten};
-use asphodel_core::extraction::{DropReason, Extracted};
+use asphodel_core::extraction::{DropReason, ExtractError, Extracted};
 use asphodel_core::ingest::{Document, Ingested, Outcome, Turn};
 use asphodel_core::inspect::{Gone, MemoryQuery, MemoryView};
 use asphodel_core::mental_models::{
@@ -1814,11 +1814,29 @@ fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
     h.doc("home.md", &home);
     let rex = h.extract_one(notable(dog), &[]);
     h.extract_one(notable(GARDEN), &[]);
-    h.forget(&[maya, rex]);
+    // A second version of a document changes the sections either side of
+    // the cat's and shares the cat's with the first, so only the first has
+    // a chunk for it. The forgotten sentence opens the section; its last
+    // line says the same another way, further back from the mask than a
+    // chunk's context reaches.
+    let (cat, miso_again) = ("Tim's cat is called Miso.", "Miso is the cat's name.");
+    let vet = "The vet is on Hill Street. ".repeat(20);
+    let notes = |shed: &str, gate: &str| {
+        format!("# Shed\n\n{shed}\n\n# Cat\n\n{cat} {vet}{miso_again}\n\n# Gate\n\n{gate}\n")
+    };
+    let (sticks, fixed) = ("The gate sticks.", "The gate is fixed.");
+    h.doc("notes.md", &notes("The shed is green.", sticks));
+    h.extract_nothing();
+    let miso = h.extract_one(notable(cat), &[]);
+    h.extract_nothing();
+    h.doc("notes.md", &notes("The shed is blue.", fixed));
+    h.extract_nothing();
+    h.extract_nothing();
+    h.forget(&[maya, rex, miso]);
     while h.erase_next().is_some() {}
 
     let plan = h.service.rebuild_plan(BANK).unwrap();
-    assert_eq!((plan.chunks, plan.skipped.masked), (2, 2));
+    assert_eq!((plan.chunks, plan.skipped.masked), (6, 3));
     assert_eq!((plan.memories_replaced, plan.memories_kept), (1, 1));
     h.rebuild();
 
@@ -1831,7 +1849,10 @@ fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
             vec![
                 json!({"claims": [], "used_injected_ids": []}),
                 json!({"claims": [notable(GARDEN)], "used_injected_ids": []}),
-                json!({"claims": []}),
+                json!({"claims": [], "used_injected_ids": []}),
+                json!({"claims": [], "used_injected_ids": []}),
+                json!({"claims": [], "used_injected_ids": []}),
+                json!({"claims": [], "used_injected_ids": []}),
                 maya_again,
                 json!({"claims": []}),
             ],
@@ -1842,10 +1863,10 @@ fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
     // The chunks around the masked ones ran, and what the masks left of a
     // masked chunk wasn't shown as their context either.
     let sent = llm.sent.lock().unwrap();
-    for ran in [scones, GARDEN] {
+    for ran in [scones, GARDEN, sticks, fixed] {
         assert!(sent.iter().any(|text| text.contains(ran)), "{sent:?}");
     }
-    for left in [kettle, indoors] {
+    for left in [kettle, indoors, miso_again] {
         assert!(sent.iter().all(|text| !text.contains(left)), "{sent:?}");
     }
     assert_eq!(h.rebuild_status().state, RebuildState::Complete);
@@ -1857,6 +1878,65 @@ fn a_rebuild_never_shows_the_llm_a_chunk_a_forget_masked() {
         ..MemoryQuery::default()
     };
     assert_eq!(h.service.list_memories(BANK, &named).unwrap().total, 0);
+}
+
+#[test]
+fn a_memory_forgotten_during_a_rebuild_doesnt_come_back_from_its_turn() {
+    let h = Harness::new();
+    // Two turns that each say more than the memory the owner kept from
+    // them, with a turn of the same session between.
+    h.said_turn(EARLIER, &format!("{MAYA} {TEA}"));
+    let maya = h.extract_one(notable(MAYA), &[]);
+    let scones = "And the scones?";
+    h.said_turn(EARLIER, scones);
+    h.extract_nothing();
+    let kettle = "The kettle is on.";
+    h.said_turn(EARLIER, &format!("{GARDEN} {kettle}"));
+    let garden = h.extract_one(notable(GARDEN), &[]);
+    let kept = [maya.to_string(), garden.to_string()];
+    h.service.keep(BANK, &kept).unwrap();
+    h.rebuild();
+
+    // Maya is forgotten before her turn is read again. The erase waits for
+    // the queue, so her text is still there, and the turn is passed over:
+    // not extracted, and not the context of the turn after it.
+    h.forget(&[maya]);
+    let llm = Recording {
+        sent: Mutex::new(Vec::new()),
+        replies: FakeLlm::scripted(
+            MODEL,
+            vec![
+                json!({"claims": [], "used_injected_ids": []}),
+                json!({"claims": [quoting(notable(MAYA), TEA)], "used_injected_ids": []}),
+            ],
+        ),
+    };
+    let passed_over = h.service.extract_next(BANK, &llm);
+    assert!(matches!(passed_over, Err(ExtractError::Forgotten)));
+    assert!(h.service.extract_next(BANK, &llm).unwrap().is_some());
+    {
+        let sent = llm.sent.lock().unwrap();
+        assert!(sent.iter().any(|text| text.contains(scones)), "{sent:?}");
+        assert!(sent.iter().all(|text| !text.contains(TEA)), "{sent:?}");
+    }
+
+    // The garden is forgotten after the LLM has read its turn again and
+    // before what it found is written. That claim quotes the rest of the
+    // turn, which the kept memory doesn't rest on, so it would be a new one.
+    let found = json!({
+        "claims": [quoting(notable(GARDEN), kettle)],
+        "used_injected_ids": [],
+    });
+    let llm = FakeLlm::scripted(MODEL, vec![found, json!({"claims": []})]);
+    let lease = h.claim().expect("the last turn is queued");
+    let prepared = h.service.prepare_extraction(lease, &llm, &[]).unwrap();
+    h.forget(&[garden]);
+    let written = h.service.commit_extraction(prepared);
+    assert!(matches!(written, Err(ExtractError::Forgotten)));
+
+    assert_eq!(h.rebuild_status().state, RebuildState::Complete);
+    while h.erase_next().is_some() {}
+    assert_eq!(h.memory_count(), 0);
 }
 
 #[test]
