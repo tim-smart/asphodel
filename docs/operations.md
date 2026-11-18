@@ -299,8 +299,8 @@ Version 21 is written for a general-purpose assistant rather than a
 personal one. It keeps the speaker's decisions and how they like things
 done, records what the speaker wanted when it shows a need, plan or interest
 beyond the step at hand, and skips what the work itself records, such as
-code, dependencies and commit history. A reply's lasting finding about
-something of the speaker's is kept at most notable. Invented work is
+code, dependencies and commit history. A reply can establish a lasting finding about something of the speaker's.
+A finding tied to one task or occasion is at most notable. Invented work is
 recorded as content of that work, and a document's author is its speaker.
 Its significance scale matches the lifetimes the strength model gives:
 notable is a few months, and anything that would still shape how the
@@ -316,6 +316,11 @@ mention fades at 90 days instead of 68. Significance values are deletion
 inputs, so an upgraded store pauses purge until it is acknowledged ("Purge
 pauses" below). Memories extracted before version 21 keep their rating;
 raise one with `memory significance` if it should last longer.
+
+Call 1 version 22 asks the model to skip the assistant's own tool inventory
+and access status, including pending authorization. It restores the guidance
+that major is rare without changing the criteria for the speaker's own tools,
+work software or standing preferences. Existing memories are not re-rated.
 
 The earlier version 4 rule followed a ten-day evaluation (436 turns,
 451 memories): 129 memories recorded assistant operations or reports and
