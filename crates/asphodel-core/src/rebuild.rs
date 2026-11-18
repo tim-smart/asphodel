@@ -155,8 +155,11 @@ pub struct RebuildStatus {
     pub chunks: usize,
     /// Of those, the ones still queued.
     pub remaining: usize,
-    /// Chunks of the bank that reached the retry cap since the start. Their
-    /// memories are gone until `asphodel chunks --failed --retry` runs them.
+    /// Chunks of the bank that are failed now and reached the retry cap
+    /// since the start. Their memories are gone until `asphodel chunks
+    /// --failed --retry` runs them. It's read live, not fixed when the
+    /// rebuild completes: it falls when a chunk is put back on the queue
+    /// and rises when a later turn's chunk fails.
     pub failed: usize,
     pub replaced: usize,
     pub kept: usize,

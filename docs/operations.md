@@ -1704,11 +1704,11 @@ rebuild or after it completes when you can. The dry run and the dashboard's
 confirmation say so before you start.
 
 The rebuild's status counts the chunks skipped this way as `withheld`,
-apart from the chunks that failed and the ones the dry run left out. The
-command and the dashboard show the count while the rebuild runs and before
-you acknowledge it. It's a count of chunks, not of memories: how many
-memories a skipped chunk would have made isn't known. A skipped chunk is
-not a failed one. It can't be retried, and `asphodel chunks --failed`
+apart from the chunks currently failed and the ones the dry run left out.
+The command and the dashboard show the count while the rebuild runs and
+before you acknowledge it. It's a count of chunks, not of memories: how
+many memories a skipped chunk would have made isn't known. A skipped chunk
+is not a failed one. It can't be retried, and `asphodel chunks --failed`
 doesn't list it.
 
 A chunk that failed during the rebuild and is retried later gets the same
@@ -1724,8 +1724,13 @@ progress and never starts a second one.
 
 A chunk that fails past the retry cap leaves the queue like any other, and
 the rebuild completes without it. Its memories are missing until
-`asphodel chunks --bank B --failed --retry` runs it. The rebuild's status
-counts the chunks that failed since it started.
+`asphodel chunks --bank B --failed --retry` runs it.
+
+The rebuild's status reports these as the chunks currently failed in the
+bank since the rebuild started. That number is read when you ask, not fixed
+when the rebuild completes, and it isn't only the rebuild's own chunks. It
+falls as soon as a chunk is put back on the queue, before it has been
+extracted, and rises if a turn that arrived later fails.
 
 ### After it completes
 

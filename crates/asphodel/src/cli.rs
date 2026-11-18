@@ -3295,7 +3295,9 @@ fn print_rebuild(bank: &str, status: &Value) {
         );
     }
     if failed > 0 {
-        println!("  {failed} chunks failed; see `asphodel chunks --bank {bank} --failed`");
+        println!(
+            "  {failed} chunks currently failed in {bank} since the rebuild started; see `asphodel chunks --bank {bank} --failed`"
+        );
     }
 }
 

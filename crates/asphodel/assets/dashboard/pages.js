@@ -1177,7 +1177,11 @@ async function rebuildPanel(ctx) {
     return section("Rebuild memories", unloaded("Where this bank's rebuild stands", error));
   }
   const failed = status.failed
-    ? h("p", {}, `${plural(status.failed, "chunk")} failed. Their memories are missing until the chunks are retried.`)
+    ? h(
+        "p",
+        {},
+        `Currently failed in this bank since the rebuild started: ${plural(status.failed, "chunk")}. Their memories are missing until the chunks are retried.`,
+      )
     : null;
   // Not failures: nothing can be retried, and the count is of chunks, not
   // of the memories that weren't made.
