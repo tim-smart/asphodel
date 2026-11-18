@@ -258,9 +258,22 @@ test("a rebuild that can't start says why and offers no start", async (t) => {
   assert.equal(queryButton(page.root, /rebuild memories/i), null);
 });
 
+function completed(daemon) {
+  Object.assign(daemon.state.rebuild.status, {
+    state: "complete",
+    started_at: "2026-10-02T03:10:00Z",
+    completed_at: "2026-10-02T05:00:00Z",
+    chunks: 14,
+    replaced: 31,
+    kept: 4,
+    carried: 5,
+    dropped: 1,
+  });
+}
+
 test("a complete rebuild is acknowledged behind a confirmation that counts the next sweep", async (t) => {
   const daemon = new FakeDaemon();
-  Object.assign(daemon.state.rebuild.status, { state: "complete", started_at: "2026-10-02T03:10:00Z", completed_at: "2026-10-02T05:00:00Z", chunks: 14, replaced: 31, kept: 4, carried: 5, dropped: 1 });
+  completed(daemon);
   daemon.state.plan.memories = 23;
   const page = await open(t, daemon, { hash: "#/banks/main/chunks", token: TOKEN });
 
@@ -276,4 +289,19 @@ test("a complete rebuild is acknowledged behind a confirmation that counts the n
 
   await waitFor(() => daemon.calls("POST", `${REBUILD}/ack`)[0], "POST rebuild ack");
   await findLink(page.root, /preview a rebuild/i);
+});
+
+test("when the next sweep can't be counted, only the acknowledgement is off: failed chunks still retry", async (t) => {
+  const daemon = new FakeDaemon();
+  completed(daemon);
+  daemon.state.plan = null;
+  const page = await open(t, daemon, { hash: "#/banks/main/chunks", token: TOKEN });
+
+  const ack = await findButton(page.root, /acknowledge rebuild/i);
+  assert.ok(ack.disabled, "no acknowledgement without the count it confirms against");
+  click(queryButton(await findRow(page.root, "llm_timeout"), /retry/i));
+
+  await waitFor(() => daemon.calls("POST", "/v1/banks/main/chunks/retry")[0], "POST retry");
+  await waitFor(() => !queryText(page.root, "llm_timeout"), "the retried chunk to leave the list");
+  assert.equal(daemon.calls("POST", `${REBUILD}/ack`).length, 0);
 });

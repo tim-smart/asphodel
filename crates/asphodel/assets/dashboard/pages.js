@@ -2,7 +2,7 @@
 // title and content; actions go through `ctx.act`, destructive ones after
 // `ctx.confirm`.
 
-import { ApiError } from "./api.js";
+import { ApiError, Unauthorized } from "./api.js";
 import { capitalize, fadeStage, formatDateTime, goneReason, plural, shortId } from "./dom.js";
 
 const STATUSES = ["live", "superseded", "ended", "retracted", "forgetting"];
@@ -1145,21 +1145,37 @@ const REBUILD_BLOCKERS = {
   unacknowledged: "This bank's last rebuild hasn't been acknowledged.",
 };
 
-/// The calls a rebuild of `chunks` chunks makes: one each, and a second
-/// for most.
+/// Roughly the calls a rebuild of `chunks` chunks makes: one each, and a
+/// second for most. It's an estimate and no ceiling, since a retried chunk
+/// or a reconciliation that has to run again calls again.
 function rebuildCalls(chunks) {
-  return chunks === 0 ? "no LLM calls" : `between ${chunks} and ${chunks * 2} LLM calls`;
+  return chunks === 0 ? "no LLM calls" : `about ${chunks} to ${chunks * 2} LLM calls`;
+}
+
+/// The message of a failed load, for the part of a page that shows it in
+/// place. A rejected token isn't one: the app asks for another.
+function loadError(error) {
+  if (error instanceof Unauthorized) throw error;
+  return error instanceof ApiError ? error.message : String(error?.message ?? error);
 }
 
 // Rebuilding the bank's memories from its sources: the dry run, the start
-// behind a confirmation, how far it got, and the acknowledgement.
+// behind a confirmation, how far it got, and the acknowledgement. A load
+// that fails here shows in the panel, so the page's chunks and their retry
+// don't depend on it.
 async function rebuildPanel(ctx) {
   const { api, ui, bank, params } = ctx;
   const { h, time } = ui;
-  const status = await api.rebuild(bank);
   const here = bankHash(bank, "chunks");
   const section = (title, ...children) =>
     h("section", { class: "panel rebuild-panel", "aria-labelledby": "rebuild-title" }, h("h2", { id: "rebuild-title" }, title), ...children);
+  const unloaded = (what, error) => h("p", { class: "rebuild-unloaded", role: "alert" }, `${what} couldn't be loaded: ${loadError(error)}`);
+  let status;
+  try {
+    status = await api.rebuild(bank);
+  } catch (error) {
+    return section("Rebuild memories", unloaded("Where this bank's rebuild stands", error));
+  }
   const failed = status.failed
     ? h("p", {}, `${plural(status.failed, "chunk")} failed. Their memories are missing until the chunks are retried.`)
     : null;
@@ -1180,7 +1196,15 @@ async function rebuildPanel(ctx) {
   }
 
   if (status.state === "complete") {
-    const sweep = await api.purgePlan();
+    // The acknowledgement shows what the next sweep would delete. Without
+    // that count there's nothing to confirm against, so only it is off.
+    let sweep = null;
+    let sweepError = null;
+    try {
+      sweep = await api.purgePlan();
+    } catch (error) {
+      sweepError = unloaded("What the next sweep would delete", error);
+    }
     return section(
       "Rebuild complete",
       h(
@@ -1195,11 +1219,14 @@ async function rebuildPanel(ctx) {
         {},
         "Recall is back on. The nightly sweep leaves this bank alone until you acknowledge the rebuild, because memories rated lower this time can be purged sooner.",
       ),
+      sweepError,
+      sweepError ? h("p", {}, "The rebuild can't be acknowledged until it loads. Reload the page to try again.") : null,
       h(
         "button",
         {
           type: "button",
           class: "danger-outline",
+          disabled: Boolean(sweepError),
           onclick: async () => {
             const confirmed = await ctx.confirm({
               title: `Let the sweep run on ${bank} again?`,
@@ -1241,7 +1268,16 @@ async function rebuildPanel(ctx) {
     );
   }
 
-  const plan = await api.rebuildPlan(bank);
+  let plan;
+  try {
+    plan = await api.rebuildPlan(bank);
+  } catch (error) {
+    return section(
+      "Rebuild memories: preview",
+      unloaded("The preview", error),
+      h("p", {}, h("a", { href: here }, "Close the preview")),
+    );
+  }
   const fact = (count, ...label) => h("li", {}, h("strong", {}, String(count)), " ", h("span", {}, ...label));
   const blockers = plan.blockers.map((blocker) => h("li", {}, REBUILD_BLOCKERS[blocker] ?? blocker));
   const start = async () => {
@@ -1251,7 +1287,7 @@ async function rebuildPanel(ctx) {
         h(
           "p",
           {},
-          `${memoryCount(plan.memories_replaced)} are deleted now and extracted again from ${plural(plan.chunks, "chunk")}. That costs ${rebuildCalls(plan.chunks)}.`,
+          `${memoryCount(plan.memories_replaced)} are deleted now and extracted again from ${plural(plan.chunks, "chunk")}. That costs ${rebuildCalls(plan.chunks)}, and more if chunks are retried.`,
         ),
         h("p", {}, `Recall, the system prompt and the agenda are off for ${bank} until the last chunk has run.`),
         h("p", {}, "The only way back is the backup you took before starting."),
@@ -1284,7 +1320,7 @@ async function rebuildPanel(ctx) {
       { class: "quiet-text" },
       `Left out: ${plural(plan.skipped.swept, "chunk")} with no text left, ${plural(plan.skipped.removed, "chunk")} of removed sources and ${plural(plan.skipped.masked, "chunk")} a forget masked. ${plural(plan.skipped.forget_requests, "forget request")} hold no text.`,
     ),
-    h("p", {}, `Cost: ${rebuildCalls(plan.chunks)}, one per chunk and a second for most.`),
+    h("p", {}, `Cost: ${rebuildCalls(plan.chunks)}: one per chunk and a second for most, and more if chunks are retried.`),
     h(
       "p",
       {},

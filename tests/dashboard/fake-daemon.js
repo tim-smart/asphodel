@@ -726,7 +726,10 @@ export class FakeDaemon {
     if (v1 !== "v1") return error(404, "no such route");
 
     if (top === "status" && method === "GET") return json(200, state.status);
-    if (top === "purge" && bank === "plan" && method === "GET") return json(200, state.plan);
+    // A test takes the plan away to stand for a daemon that can't answer it.
+    if (top === "purge" && bank === "plan" && method === "GET") {
+      return state.plan ? json(200, state.plan) : error(500, "the store is busy");
+    }
     if (top === "purge" && bank === "ack" && method === "POST") {
       if (body?.hash !== state.status.deletion_fingerprint) {
         return error(409, "that isn't this daemon's deletion fingerprint; `purge plan` shows it");

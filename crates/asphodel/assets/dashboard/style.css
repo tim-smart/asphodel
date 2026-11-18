@@ -813,7 +813,8 @@ label {
   font: 600 1rem var(--mono);
 }
 
-.rebuild-blockers li {
+.rebuild-blockers li,
+.rebuild-unloaded {
   color: var(--vein);
 }
 
