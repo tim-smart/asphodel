@@ -1,6 +1,6 @@
 // The v1 extras: each bank's counts on the banks page, the daemon's
-// attention lines as a banner, failed chunks with retry, and the purge pause
-// with its acknowledgement.
+// attention lines as a banner, failed chunks with retry, the purge pause
+// with its acknowledgement, and rebuilding a bank's memories.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -195,4 +195,85 @@ test("on a bank's ingestion page the banner doesn't point at the page itself", a
   const shown = await banner(page, "the last backup is more than 7 days old");
   assert.ok(!textOf(shown).includes("3 failed chunks"), textOf(shown));
   assert.equal(shown.querySelector('a[href$="#/banks/main/chunks"]'), null);
+});
+
+const REBUILD = "/v1/banks/main/rebuild";
+
+/// The button in `dialog` that isn't cancel.
+function actionOf(dialog) {
+  return [...dialog.querySelectorAll("button")].find((b) => !/cancel/i.test(textOf(b)));
+}
+
+test("a rebuild's preview counts what it would do and starts nothing", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: "#/banks/main/chunks", token: TOKEN });
+
+  click(await findLink(page.root, /preview a rebuild/i));
+
+  await findButton(page.root, /rebuild memories/i);
+  assert.ok(showsCount(page.root, "chunks?", 14), textOf(page.root));
+  assert.ok(showsCount(page.root, "sources?", 12), textOf(page.root));
+  assert.ok(showsCount(page.root, "memories replaced", 31), textOf(page.root));
+  assert.ok(showsCount(page.root, "memories kept", 4), textOf(page.root));
+  assert.ok(showsCount(page.root, "chunks a forget masked", 3), textOf(page.root));
+  await stays(() => daemon.calls("POST").length === 0, "nothing sent");
+});
+
+test("starting a rebuild asks first, naming the downtime and the cost, and cancelling sends nothing", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: "#/banks/main/chunks?rebuild=preview", token: TOKEN });
+
+  click(await findButton(page.root, /rebuild memories/i));
+  const dialog = await findDialog(page.document);
+  assert.match(textOf(dialog), /recall.*\boff\b/i);
+  assert.ok(showsCount(dialog, "LLM calls", 28), textOf(dialog));
+  assert.ok(showsCount(dialog, "memories", 31), textOf(dialog));
+  assert.match(textOf(dialog), /backup/i);
+  click(await findButton(dialog, /cancel/i));
+  await waitFor(() => !queryDialog(page.document), "the confirmation to close");
+
+  await stays(() => daemon.calls("POST").length === 0, "nothing sent");
+});
+
+test("a confirmed rebuild repeats the bank's name and then shows how far it got", async (t) => {
+  const daemon = new FakeDaemon();
+  const page = await open(t, daemon, { hash: "#/banks/main/chunks?rebuild=preview", token: TOKEN });
+
+  click(await findButton(page.root, /rebuild memories/i));
+  click(actionOf(await findDialog(page.document)));
+
+  const sent = await waitFor(() => daemon.calls("POST", REBUILD)[0], "POST rebuild");
+  assert.equal(sent.query.get("confirm"), "main");
+  await findText(page.root, /14 of 14 chunks left/i);
+  assert.equal(queryButton(page.root, /rebuild memories/i), null, "no second start while it runs");
+});
+
+test("a rebuild that can't start says why and offers no start", async (t) => {
+  const daemon = new FakeDaemon();
+  daemon.state.rebuild.plan.blockers = ["backup_stale"];
+  daemon.state.rebuild.plan.last_backup_at = null;
+  const page = await open(t, daemon, { hash: "#/banks/main/chunks?rebuild=preview", token: TOKEN });
+
+  await findText(page.root, /no backup/i);
+  assert.equal(queryButton(page.root, /rebuild memories/i), null);
+});
+
+test("a complete rebuild is acknowledged behind a confirmation that counts the next sweep", async (t) => {
+  const daemon = new FakeDaemon();
+  Object.assign(daemon.state.rebuild.status, { state: "complete", started_at: "2026-10-02T03:10:00Z", completed_at: "2026-10-02T05:00:00Z", chunks: 14, replaced: 31, kept: 4, carried: 5, dropped: 1 });
+  daemon.state.plan.memories = 23;
+  const page = await open(t, daemon, { hash: "#/banks/main/chunks", token: TOKEN });
+
+  click(await findButton(page.root, /acknowledge rebuild/i));
+  const dialog = await findDialog(page.document);
+  assert.ok(showsCount(dialog, "memor(y|ies)", 23), textOf(dialog));
+  click(await findButton(dialog, /cancel/i));
+  await waitFor(() => !queryDialog(page.document), "the confirmation to close");
+  await stays(() => daemon.calls("POST").length === 0, "nothing sent");
+
+  click(await findButton(page.root, /acknowledge rebuild/i));
+  click(actionOf(await findDialog(page.document)));
+
+  await waitFor(() => daemon.calls("POST", `${REBUILD}/ack`)[0], "POST rebuild ack");
+  await findLink(page.root, /preview a rebuild/i);
 });

@@ -300,6 +300,22 @@ export function fixtures() {
       failed_chunks: 0,
       recalls: 0,
     },
+    /// Where bank `main`'s rebuild stands, and what its dry run answers.
+    rebuild: {
+      status: { bank: "main", state: "idle", started_at: null, completed_at: null, acked_at: null, chunks: 0, remaining: 0, failed: 0, replaced: 0, kept: 0, carried: 0, dropped: 0 },
+      plan: {
+        bank: "main",
+        sources: 12,
+        chunks: 14,
+        skipped: { swept: 2, removed: 1, masked: 3, forget_requests: 0 },
+        memories_replaced: 31,
+        memories_kept: 4,
+        accesses_carried: 6,
+        models: 2,
+        last_backup_at: "2026-10-02T03:00:00Z",
+        blockers: [],
+      },
+    },
     /// Rows per memory page.
     pageSize: 50,
     /// What `recall/explain` answers in each mode, for any query.
@@ -758,6 +774,7 @@ export class FakeDaemon {
       return json(200, { queued: failedOnly ? [] : state.queued, failed: state.failed });
     }
     if (collection === "chunks" && id === "retry" && method === "POST") return this.retry(body?.chunks);
+    if (collection === "rebuild") return this.rebuild(id, method, query);
     if (collection === "models" && id === undefined && method === "GET") {
       return json(200, { models: state.models, budget: state.budget });
     }
@@ -794,6 +811,9 @@ export class FakeDaemon {
     }
     if (collection === "sources" && method === "GET") return json(200, { sources: [], total: 0, next_cursor: null });
     if (collection === "chunks" && method === "GET") return json(200, { queued: [], failed: [] });
+    if (collection === "rebuild" && id === undefined && method === "GET") {
+      return json(200, { bank: "other", state: "idle", started_at: null, completed_at: null, acked_at: null, chunks: 0, remaining: 0, failed: 0, replaced: 0, kept: 0, carried: 0, dropped: 0 });
+    }
     if (collection === "models" && method === "GET") return json(200, { models: [], budget: 800 });
     if (collection === "system-prompt" && id === "preview" && method === "GET") {
       return json(200, { built_at: NOW, text: "Built Sat 3 Oct 22:00; memories win: use memory_recall for history and detail." });
@@ -997,6 +1017,36 @@ export class FakeDaemon {
   layOut() {
     const models = this.state.models.filter((m) => m.enabled).map((m) => m.name);
     return ["Built Sat 3 Oct 22:00; memories win: use memory_recall for history and detail.", ...models].join("\n\n");
+  }
+
+  /// The rebuild routes, as the daemon answers them: the dry run writes
+  /// nothing, a start repeats the bank's name and is refused with the
+  /// plan's blockers, and only a complete rebuild is acknowledged.
+  rebuild(id, method, query) {
+    const { status, plan } = this.state.rebuild;
+    if (id === undefined && method === "GET") return json(200, status);
+    if (id === "plan" && method === "GET") return json(200, plan);
+    if (id === undefined && method === "POST") {
+      if (query.get("confirm") !== "main") return error(400, "the confirmation doesn't repeat the bank's name");
+      if (status.state !== "idle" || plan.blockers.length) return error(409, "the rebuild can't start");
+      Object.assign(status, {
+        state: "running",
+        started_at: NOW,
+        completed_at: null,
+        acked_at: null,
+        chunks: plan.chunks,
+        remaining: plan.chunks,
+        replaced: plan.memories_replaced,
+        kept: plan.memories_kept,
+      });
+      return json(202, status);
+    }
+    if (id === "ack" && method === "POST") {
+      if (status.state !== "complete") return error(409, "the bank has no rebuild to acknowledge");
+      Object.assign(status, { state: "idle", acked_at: NOW });
+      return json(200, status);
+    }
+    return error(404, "no such route");
   }
 
   retry(chunks) {
