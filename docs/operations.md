@@ -324,6 +324,11 @@ that major is rare without changing the criteria for the speaker's own tools,
 work software or standing preferences. Existing memories keep their rating
 until the bank is rebuilt ("Rebuilding a bank's memories" below).
 
+Call 1 version 23 caps claims quoted from the assistant's reply at `notable`,
+both in the prompt and in extraction validation. The speaker's own statements
+and documents keep their full range. Existing memories keep their rating until
+the bank is rebuilt ("Rebuilding a bank's memories" below).
+
 The earlier version 4 rule followed a ten-day evaluation (436 turns,
 451 memories): 129 memories recorded assistant operations or reports and
 91 recorded user questions. These crowded recall, while the 49 memories

@@ -12,6 +12,7 @@
 //!   lowers window confidence;
 //! - an annual date in plain English gets an RRULE when call 1 gave none;
 //! - an RRULE is kept only when it parses and recurs within a year;
+//! - a claim quoted from the assistant's reply is capped at `notable`;
 //! - remember-this keeps a memory only from the owner's own message.
 
 use std::collections::BTreeSet;
@@ -387,6 +388,12 @@ fn check_claim(
         && unit.owner_speaking
         && only_in_message;
 
+    let significance = if from_reply {
+        claim.significance.min(Significance::Notable)
+    } else {
+        claim.significance
+    };
+
     let links = claim
         .entities
         .into_iter()
@@ -398,7 +405,7 @@ fn check_claim(
         flagged: claim.remember_this || claim.changes_something,
         content: content.to_owned(),
         kind: claim.kind,
-        significance: claim.significance,
+        significance,
         kept,
         start,
         end,
