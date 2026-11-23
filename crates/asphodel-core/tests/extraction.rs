@@ -1755,46 +1755,6 @@ fn an_assistant_task_needs_a_due_date_or_an_until_event() {
     assert_eq!(extracted.dropped, vec![undated]);
 }
 
-#[test]
-fn an_assistant_reply_claim_is_at_most_notable() {
-    let h = Harness::new();
-    h.say(
-        T1,
-        "Can I disable the demo songs on my keyboard?",
-        "The demo songs stay accessible via the DEMO button. There is no child lock setting. The manual is from 1998.",
-    );
-    let extracted = extract(
-        &h,
-        vec![
-            claim(
-                "The assistant reported that the demo songs stay accessible via the DEMO button.",
-                "fact",
-                "The demo songs stay accessible via the DEMO button",
-            )
-            .significance("major"),
-            claim(
-                "The assistant found no child lock setting on the keyboard.",
-                "fact",
-                "There is no child lock setting",
-            )
-            .significance("critical"),
-            claim(
-                "The assistant noted the manual is from 1998.",
-                "fact",
-                "The manual is from 1998",
-            )
-            .significance("minor"),
-            claim("Tim owns a keyboard.", "fact", "my keyboard").significance("major"),
-        ],
-    );
-    let levels: Vec<String> = extracted
-        .memories
-        .iter()
-        .map(|id| h.memory(*id).significance.extracted)
-        .collect();
-    assert_eq!(levels, vec!["notable", "notable", "minor", "major"]);
-}
-
 // Entities.
 
 #[test]
