@@ -324,11 +324,11 @@ that major is rare without changing the criteria for the speaker's own tools,
 work software or standing preferences. Existing memories keep their rating
 until the bank is rebuilt ("Rebuilding a bank's memories" below).
 
-Call 1 version 23 keeps assistant-reported findings (such as product, manual or
-troubleshooting constraints the assistant looked up) at most `notable`,
-without capping speaker-made or speaker-approved decisions and preferences
-restated in the reply. Existing memories keep their rating until the bank is
-rebuilt ("Rebuilding a bank's memories" below).
+Call 1 version 23 rates a finding the assistant reports, such as a constraint
+it looked up in a product manual, at most notable. A decision or preference
+the speaker made or approved keeps its rating when the reply restates it.
+Existing memories keep their rating until the bank is rebuilt ("Rebuilding a
+bank's memories" below).
 
 The earlier version 4 rule followed a ten-day evaluation (436 turns,
 451 memories): 129 memories recorded assistant operations or reports and
